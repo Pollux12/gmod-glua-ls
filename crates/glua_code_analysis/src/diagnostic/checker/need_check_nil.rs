@@ -649,6 +649,9 @@ fn index_expr_key_reassigned(
 /// Check if the variable referenced by `assigned_expr` appears anywhere inside `expr`.
 /// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
 /// key expression `i + 1` contains a reference to `i`.
+/// Also catches indexed variable reassignment such as `self.Key = self.Key + 1`
+/// invalidating `self.Objects[self.Key + 1]`, where the key expression contains
+/// `self.Key` (an IndexExpr, not just a NameExpr).
 /// Uses semantic var/ref identity for the comparison, with text fallback only
 /// when the assigned expression doesn't resolve to a var ref.
 fn assigned_var_referenced_in_expr(
@@ -665,25 +668,35 @@ fn assigned_var_referenced_in_expr(
     // Extract root name text as a fallback for non-resolvable expressions.
     let assigned_name_text = root_name_text(assigned_expr);
 
+    // Walk all descendant expressions that can reference a variable:
+    // both NameExpr (local/global refs) and IndexExpr (field/table refs).
+    // Comparing only NameExpr would miss `self.Key` inside `self.Objects[self.Key + 1]`.
     expr.syntax()
         .descendants()
-        .filter_map(LuaNameExpr::cast)
-        .any(|name_expr| {
+        .filter_map(LuaExpr::cast)
+        .filter(|descendant_expr| {
+            matches!(
+                descendant_expr,
+                LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)
+            )
+        })
+        .any(|descendant_expr| {
             if let Some(ref assigned_ref_id) = assigned_ref_id {
-                // Semantic comparison: resolve the NameExpr and compare ref ids.
-                let name_expr_as_expr = LuaExpr::NameExpr(name_expr);
+                // Semantic comparison: resolve the descendant expr and compare ref ids.
                 let mut cache = semantic_model.get_cache().borrow_mut();
-                let name_ref_id =
-                    get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, name_expr_as_expr);
+                let descendant_ref_id = get_var_expr_var_ref_id(
+                    semantic_model.get_db(),
+                    &mut cache,
+                    descendant_expr.clone(),
+                );
                 drop(cache);
-                name_ref_id.is_some_and(|id| &id == assigned_ref_id)
+                descendant_ref_id.is_some_and(|id| &id == assigned_ref_id)
             } else {
                 // Text fallback: only when semantic resolution fails.
-                assigned_name_text.as_deref().is_some_and(|text| {
-                    name_expr
-                        .get_name_token()
-                        .is_some_and(|token| token.get_name_text() == text)
-                })
+                let descendant_text = root_name_text(&descendant_expr);
+                assigned_name_text
+                    .as_deref()
+                    .is_some_and(|text| descendant_text.as_deref().is_some_and(|dt| dt == text))
             }
         })
 }
@@ -768,7 +781,15 @@ fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr)
                 LuaExpr::ParenExpr(paren_expr) => paren_expr
                     .get_expr()
                     .is_some_and(|expr| condition_is_negative_expr_guard(&expr, guarded_expr)),
-                _ => expr_text_matches(&inner_expr, guarded_expr),
+                // Only stable expressions are safe to guard: a CallExpr
+                // (e.g. `maybeEnt()`) may return a different value on each
+                // invocation, so `not maybeEnt()` proves nothing about the
+                // next `maybeEnt()` call. NameExpr and IndexExpr reference a
+                // fixed variable/field and are stable across reads.
+                LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_) => {
+                    expr_text_matches(&inner_expr, guarded_expr)
+                }
+                _ => false,
             }
         }
         LuaExpr::BinaryExpr(binary_expr) => {

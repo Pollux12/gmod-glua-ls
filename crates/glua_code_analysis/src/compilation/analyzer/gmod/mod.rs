@@ -2716,6 +2716,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
             let table_source = call.vgui_panel_table_arg_source(0);
+            let is_actual_registration = is_vgui_register_table_call(db, file_id, call);
             let mut resolved_registration = None;
             if let Some(GmodClassCallLiteral::NameRef(table_var)) =
                 call.value_for_arg_source(&table_source)
@@ -2731,6 +2732,12 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 // producing false-positive `undefined-field` /
                 // `unchecked-nil-access` on the original panel's `self.Field`
                 // accesses.
+                //
+                // Only actual `vgui.RegisterTable` calls populate
+                // `registered_table_decl_ids`. A `CreateFromTable` call that
+                // appears before the real `RegisterTable` must NOT insert the
+                // decl_id, otherwise the later `RegisterTable` would be
+                // skipped and the real base/type synthesis lost.
                 if registered_table_decl_ids.contains(&decl_id) {
                     continue;
                 }
@@ -2746,7 +2753,9 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     region_start,
                     region_end: register_position,
                 });
-                registered_table_decl_ids.insert(decl_id);
+                if is_actual_registration {
+                    registered_table_decl_ids.insert(decl_id);
+                }
             }
             synthesize_vgui_register_table(
                 db,
@@ -4625,9 +4634,11 @@ fn find_registered_table_expr(
     })
 }
 
-/// Checks whether `register_position` falls within the RHS of the assignment
-/// statement at `write_position`. This identifies the self-assignment
-/// registration pattern `PANEL = vgui.RegisterTable(PANEL, ...)`.
+/// Checks whether `register_position` falls within the RHS expression
+/// corresponding to the LHS at `write_position`. This identifies the
+/// self-assignment registration pattern `PANEL = vgui.RegisterTable(PANEL, ...)`
+/// while rejecting multi-assignments where the registration call is on a
+/// different LHS (e.g. `PANEL, OTHER = MakePanel(), vgui.RegisterTable(...)`).
 fn write_position_contains_register(
     db: &DbIndex,
     file_id: FileId,
@@ -4648,8 +4659,59 @@ fn write_position_contains_register(
     let Some(assign_stat) = name_token.parent_ancestors().find_map(LuaAssignStat::cast) else {
         return false;
     };
-    let assign_range = assign_stat.syntax().text_range();
-    assign_range.start() <= register_position && register_position < assign_range.end()
+    // Find the specific RHS expression for the LHS at write_position.
+    // In a simple assignment `PANEL = expr`, there is one RHS at index 0.
+    // In a multi-assignment `A, B = expr1, expr2`, each LHS maps to its
+    // corresponding RHS by position index.
+    let (lhs_list, rhs_list) = assign_stat.get_var_and_expr_list();
+    let Some(lhs_idx) = lhs_list
+        .iter()
+        .position(|lhs| lhs.syntax().text_range().contains(write_position))
+    else {
+        return false;
+    };
+    let Some(rhs_expr) = rhs_list.get(lhs_idx) else {
+        return false;
+    };
+    let rhs_range = rhs_expr.syntax().text_range();
+    rhs_range.start() <= register_position && register_position < rhs_range.end()
+}
+
+/// Checks whether the call at the given metadata is `vgui.RegisterTable`
+/// (not `vgui.CreateFromTable`). Both use the `register_table` call_arg
+/// kind and land in `vgui_register_table_calls`, but only `RegisterTable`
+/// actually registers a panel class. `CreateFromTable` instantiates from
+/// an already-registered table and should not populate the dedup set.
+fn is_vgui_register_table_call(
+    db: &DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return true; // conservative: assume RegisterTable when we can't check
+    };
+    let range = call.syntax_id.get_range();
+    let Some(token) = tree
+        .get_chunk_node()
+        .syntax()
+        .token_at_offset(range.start())
+        .right_biased()
+    else {
+        return true;
+    };
+    let Some(call_expr) = token.parent_ancestors().find_map(LuaCallExpr::cast) else {
+        return true;
+    };
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return true;
+    };
+    match prefix {
+        LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key() {
+            Some(LuaIndexKey::Name(name)) => name.get_name_text() == "RegisterTable",
+            _ => true,
+        },
+        _ => true,
+    }
 }
 
 fn find_registered_table_expr_at_write_position(

@@ -2982,6 +2982,86 @@ mod test {
         );
     }
 
+    /// Regression for Oracle Blocker 3: `CreateFromTable` appearing BEFORE
+    /// `RegisterTable` for the same table must NOT prevent the real
+    /// `RegisterTable` from synthesizing the panel class. Only actual
+    /// `RegisterTable` calls should populate the dedup set.
+    #[gtest]
+    fn test_vgui_create_from_table_before_register_table_does_not_block_registration() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/create_before_register.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable Panel
+            ---@param parent? Panel
+            ---@return Panel
+            function vgui.CreateFromTable(panelTable, parent) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            -- CreateFromTable appears BEFORE RegisterTable.
+            -- The CreateFromTable call should NOT insert the decl_id into
+            -- the dedup set, so the later RegisterTable can still synthesize
+            -- the panel class.
+            vgui.CreateFromTable(PANEL)
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::UndefinedField.get_name().to_string(),
+            )),
+        ];
+        // The RegisterTable call should still synthesize the panel class,
+        // so `self.Btn` inside Init should NOT produce nil/undefined diagnostics.
+        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
+        assert!(
+            !has_nil_diag,
+            "CreateFromTable before RegisterTable should NOT block the real registration; got false-positive diagnostics: {diagnostics:?}"
+        );
+    }
+
     #[gtest]
     fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
         let mut ws = VirtualWorkspace::new();
@@ -3574,6 +3654,80 @@ mod test {
                 .iter()
                 .any(|diagnostic| diagnostic.code == undefined_field),
             "vgui.CreateFromTable must not reuse the previous RHS for a missing multi-assign value, got {diagnostics:?}"
+        );
+    }
+
+    /// Regression for Oracle Blocker 2: `write_position_contains_register`
+    /// must check the specific RHS expression for the matching LHS variable,
+    /// not the entire assignment statement range. In a multi-assignment like
+    /// `PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")`,
+    /// the registration call is inside the statement range but PANEL's RHS is
+    /// `MakePanel()`, so the stale initializer fallback must NOT fire.
+    #[gtest]
+    fn test_vgui_register_table_multi_assign_does_not_bind_stale_initializer() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_multi_assign.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local function MakePanel() return {} end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            local OTHER
+            -- Multi-assignment: PANEL's RHS is MakePanel(), not RegisterTable.
+            -- The RegisterTable call is on OTHER's RHS, not PANEL's.
+            -- The stale initializer fallback must NOT fire for PANEL.
+            PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+        ];
+        // Since PANEL's RHS is MakePanel() (not the registration call),
+        // the stale initializer fallback should NOT bind. `self.Btn` inside
+        // Init should produce nil diagnostics because self resolves to Unknown.
+        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
+        assert!(
+            has_nil_diag,
+            "multi-assignment with RegisterTable on a different LHS should NOT bind the stale initializer; expected nil diagnostics, got: {diagnostics:?}"
         );
     }
 
