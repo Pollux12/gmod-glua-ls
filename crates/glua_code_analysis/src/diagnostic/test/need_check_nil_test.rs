@@ -3624,14 +3624,18 @@ mod test {
         let consumer_file = ws.def_file(
             "consumer.lua",
             r#"
-                local x = g_AllNil.nonexistent
+                local ok = g_AllNil.field
+                local bad = g_AllNil.nonexistent
             "#,
         );
 
-        // Assert via undefined-field diagnostics: if g_AllNil resolves to
-        // MyType (Def/Ref from the library DocType), then `.nonexistent`
-        // triggers undefined-field. If the all-nil fallback regresses and
-        // g_AllNil resolves to Unknown instead, no undefined-field is emitted.
+        // Truth table for `g_AllNil.<field>`:
+        //   MyType  → `.field` no warning, `.nonexistent` undefined-field
+        //   Unknown → `.field` no warning, `.nonexistent` no warning
+        //   Nil     → `.field` warning,   `.nonexistent` warning
+        //
+        // By asserting BOTH fields we distinguish MyType from both Unknown
+        // (hard-fail regression) and Nil (early-return-without-library regression).
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -3640,17 +3644,30 @@ mod test {
             .diagnose_file(consumer_file, CancellationToken::new())
             .unwrap_or_default();
 
-        let has_undefined = diagnostics
+        let field_undefined = diagnostics.iter().any(|d| d.message.contains("`field`"));
+        let nonexistent_undefined = diagnostics
             .iter()
             .any(|d| d.message.contains("nonexistent"));
 
+        // `.field` must NOT be undefined — it exists on MyType.
+        // If this fires, g_AllNil resolved to Nil (not MyType).
         assert_that!(
-            has_undefined,
+            field_undefined,
+            is_false(),
+            "g_AllNil.field should NOT be undefined — `field` exists on MyType. \
+             If this fires, g_AllNil resolved to Nil (the all-nil tier returned \
+             Ok(Nil) but the library DocType was NOT consulted). \
+             Diagnostics: {diagnostics:#?}"
+        );
+        // `.nonexistent` MUST be undefined — it does not exist on MyType.
+        // If this does NOT fire, g_AllNil resolved to Unknown (hard-fail regression).
+        assert_that!(
+            nonexistent_undefined,
             is_true(),
-            "g_AllNil should resolve to MyType from the library DocType. If \
-             `.nonexistent` is not flagged as undefined-field, the global \
-             resolved to Unknown/Nil instead — the all-nil multidecl fallback \
-             regressed. Diagnostics: {diagnostics:#?}"
+            "g_AllNil.nonexistent should be undefined — it does not exist on MyType. \
+             If this does not fire, g_AllNil resolved to Unknown (the all-nil tier \
+             hard-failed instead of returning Ok(Nil) for fallback). \
+             Diagnostics: {diagnostics:#?}"
         );
     }
 
@@ -3707,15 +3724,21 @@ mod test {
         let consumer_file = ws.def_file(
             "consumer.lua",
             r#"
-                local x = g_Mixed.nonexistent
+                local ok = g_Mixed.field
+                local bad = g_Mixed.nonexistent
             "#,
         );
 
-        // Assert via undefined-field diagnostics: if g_Mixed resolved to
-        // MyType from the library DocType, `.nonexistent` would trigger
-        // undefined-field. The correct behavior is that the mixed nil+integer
-        // tier hard-fails, the library is NOT consulted, and g_Mixed resolves
-        // to Unknown — so `.nonexistent` does NOT trigger undefined-field.
+        // Truth table for `g_Mixed.<field>`:
+        //   MyType  → `.field` no warning, `.nonexistent` undefined-field
+        //   Unknown → `.field` no warning, `.nonexistent` no warning
+        //   Nil     → `.field` warning,   `.nonexistent` warning
+        //
+        // The correct behavior is that the mixed nil+integer tier hard-fails,
+        // the library is NOT consulted, and g_Mixed resolves to Unknown — so
+        // BOTH `.field` and `.nonexistent` should have no undefined-field.
+        // If the all-nil fallback incorrectly fires, the library DocType leaks
+        // through and BOTH would trigger undefined-field.
         ws.analysis
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
@@ -3724,17 +3747,28 @@ mod test {
             .diagnose_file(consumer_file, CancellationToken::new())
             .unwrap_or_default();
 
-        let has_undefined = diagnostics
+        let field_undefined = diagnostics.iter().any(|d| d.message.contains("`field`"));
+        let nonexistent_undefined = diagnostics
             .iter()
-            .any(|d| d.message.contains("nonexistent"));
+            .any(|d| d.message.contains("`nonexistent`"));
 
+        // Neither `.field` nor `.nonexistent` should be undefined — g_Mixed
+        // resolves to Unknown (both suppressed), NOT MyType (`.nonexistent`
+        // would fire) or Nil (both would fire).
         assert_that!(
-            has_undefined,
+            field_undefined,
             is_false(),
-            "g_Mixed must NOT resolve to MyType from the library when the same \
-             tier has a real non-nil primitive. If `.nonexistent` is flagged \
-             as undefined-field, the library DocType leaked through — the \
-             all-nil fallback fired incorrectly. Diagnostics: {diagnostics:#?}"
+            "g_Mixed.field must NOT be undefined — g_Mixed should resolve to \
+             Unknown (not MyType/Nil). If this fires, the library DocType \
+             leaked through. Diagnostics: {diagnostics:#?}"
+        );
+        assert_that!(
+            nonexistent_undefined,
+            is_false(),
+            "g_Mixed.nonexistent must NOT be undefined — g_Mixed should resolve \
+             to Unknown (not MyType). If this fires, the all-nil fallback \
+             fired incorrectly and the library DocType leaked through. \
+             Diagnostics: {diagnostics:#?}"
         );
     }
 }
