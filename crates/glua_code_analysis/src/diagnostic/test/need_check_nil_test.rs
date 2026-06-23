@@ -3597,6 +3597,11 @@ mod test {
             &library_uri,
             Some(
                 r#"
+                    ---@meta
+
+                    ---@class MyType
+                    ---@field field number
+
                     ---@type MyType
                     g_AllNil = nil
                 "#
@@ -3616,39 +3621,36 @@ mod test {
             "#,
         );
 
-        let main_file = ws.def_file(
+        let consumer_file = ws.def_file(
             "consumer.lua",
             r#"
-                function use()
-                    g_AllNil.field = 1
-                end
+                local x = g_AllNil.nonexistent
             "#,
         );
 
+        // Assert via undefined-field diagnostics: if g_AllNil resolves to
+        // MyType (Def/Ref from the library DocType), then `.nonexistent`
+        // triggers undefined-field. If the all-nil fallback regresses and
+        // g_AllNil resolves to Unknown instead, no undefined-field is emitted.
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::NeedCheckNil);
+            .enable_only(DiagnosticCode::UndefinedField);
         let diagnostics = ws
             .analysis
-            .diagnose_file(main_file, CancellationToken::new())
+            .diagnose_file(consumer_file, CancellationToken::new())
             .unwrap_or_default();
 
-        // The library DocType should win over the all-nil main tier.
-        // If the all-nil tier hard-failed instead of returning Ok(Nil),
-        // the library tier would never be consulted and g_AllNil would
-        // resolve as Unknown (no diagnostics) rather than MyType.
-        // The test passes either way for need-check-nil, but it guards
-        // against a regression where the all-nil tier would hard-fail.
-        let nil_diagnostics: Vec<_> = diagnostics
+        let has_undefined = diagnostics
             .iter()
-            .filter(|d| d.message.contains("g_AllNil may be nil"))
-            .collect();
+            .any(|d| d.message.contains("nonexistent"));
 
         assert_that!(
-            nil_diagnostics,
-            is_empty(),
-            "g_AllNil should resolve to MyType from the library DocType, not nil. \
-             Diagnostics: {diagnostics:#?}"
+            has_undefined,
+            is_true(),
+            "g_AllNil should resolve to MyType from the library DocType. If \
+             `.nonexistent` is not flagged as undefined-field, the global \
+             resolved to Unknown/Nil instead — the all-nil multidecl fallback \
+             regressed. Diagnostics: {diagnostics:#?}"
         );
     }
 
@@ -3676,56 +3678,63 @@ mod test {
             &library_uri,
             Some(
                 r#"
-                ---@type MyType
-                g_Mixed = nil
-            "#
+                    ---@meta
+
+                    ---@class MyType
+                    ---@field field number
+
+                    ---@type MyType
+                    g_Mixed = nil
+                "#
                 .to_string(),
             ),
         );
 
         ws.def_file(
-            "main.lua",
+            "main_nil.lua",
             r#"
-            g_Mixed = nil
-            g_Mixed = 123
-        "#,
+                g_Mixed = nil
+            "#,
         );
 
-        let main_file = ws.def_file(
+        ws.def_file(
+            "main_int.lua",
+            r#"
+                g_Mixed = 123
+            "#,
+        );
+
+        let consumer_file = ws.def_file(
             "consumer.lua",
             r#"
-            function use()
-                local _ = g_Mixed + 1
-            end
-        "#,
+                local x = g_Mixed.nonexistent
+            "#,
         );
 
-        // The main tier has both nil and integer. The integer is unhandled
-        // (no collection branch matches it), so saw_unhandled_non_nil is true
-        // and the all-nil fallback does NOT fire. The tier hard-fails with
-        // Err(None), and the library DocType is NOT consulted (because the
-        // main tier had a resolved non-nil type, even though it was unhandled).
-        // The global resolves to Unknown, so no need-check-nil diagnostic
-        // should be produced for g_Mixed.
+        // Assert via undefined-field diagnostics: if g_Mixed resolved to
+        // MyType from the library DocType, `.nonexistent` would trigger
+        // undefined-field. The correct behavior is that the mixed nil+integer
+        // tier hard-fails, the library is NOT consulted, and g_Mixed resolves
+        // to Unknown — so `.nonexistent` does NOT trigger undefined-field.
         ws.analysis
             .diagnostic
-            .enable_only(DiagnosticCode::NeedCheckNil);
+            .enable_only(DiagnosticCode::UndefinedField);
         let diagnostics = ws
             .analysis
-            .diagnose_file(main_file, CancellationToken::new())
+            .diagnose_file(consumer_file, CancellationToken::new())
             .unwrap_or_default();
 
-        let nil_diagnostics: Vec<_> = diagnostics
+        let has_undefined = diagnostics
             .iter()
-            .filter(|d| d.message.contains("g_Mixed may be nil"))
-            .collect();
+            .any(|d| d.message.contains("nonexistent"));
 
         assert_that!(
-            nil_diagnostics,
-            is_empty(),
-            "g_Mixed should not be widened to nil when the same tier has a real \
-         non-nil primitive assignment. The all-nil fallback must not fire when \
-         saw_unhandled_non_nil is true. Diagnostics: {diagnostics:#?}"
+            has_undefined,
+            is_false(),
+            "g_Mixed must NOT resolve to MyType from the library when the same \
+             tier has a real non-nil primitive. If `.nonexistent` is flagged \
+             as undefined-field, the library DocType leaked through — the \
+             all-nil fallback fired incorrectly. Diagnostics: {diagnostics:#?}"
         );
     }
 }
