@@ -1471,6 +1471,9 @@ fn infer_custom_type_member(
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
 ) -> InferResult {
+    let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
+    let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+
     infer_guard.check(&prefix_type_id)?;
     let type_index = db.get_type_index();
     let type_decl = type_index
@@ -1497,8 +1500,6 @@ fn infer_custom_type_member(
     }
 
     let owner = LuaMemberOwner::Type(prefix_type_id.clone());
-    let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-    let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
     let access_position = index_expr.get_position();
 
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
@@ -1566,6 +1567,10 @@ fn infer_custom_type_member(
                                 dynamic_field.typ,
                                 super_member_type,
                             ]));
+                        }
+
+                        if dynamic_field.typ.is_nil() || dynamic_field.typ.is_unknown() {
+                            return Ok(super_member_type);
                         }
 
                         return Ok(dynamic_field.typ);

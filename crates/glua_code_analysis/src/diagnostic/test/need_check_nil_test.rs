@@ -3672,6 +3672,120 @@ mod test {
     }
 
     #[test]
+    fn test_library_class_not_shadowed_by_main_empty_table_global() {
+        // Faithful reproduction of the gmod_tool / ToolObj false positives.
+        //
+        // The annotation library declares `---@class ToolObj : Tool` (with a
+        // non-nil `SWEP` field) and binds it via `ToolObj = ToolObj or {}`.
+        // The Main workspace (shipped GMod code) then RE-declares the same
+        // global with a plain table literal `ToolObj = {}` and adds runtime
+        // methods, exactly like garrysmod stool.lua:
+        //   ToolObj = {}
+        //   function ToolObj:GetWeapon() return self.SWEP end
+        //
+        // Because Main-workspace decls outrank library decls in the global
+        // priority tiers, `infer_global_type` resolves `ToolObj` to the
+        // Main-tier `TableConst` ({}) and never consults the library tier
+        // holding `@class ToolObj : Tool`. As a result `self.SWEP` is an
+        // undefined field, the runtime `GetWeapon()` return widens to nil,
+        // and `self:GetWeapon():...` produces a spurious nil-access warning.
+        //
+        // The annotation IS authoritative and correct here — the fix belongs
+        // in the LS global merge: a higher-priority bare-table decl must not
+        // shadow a lower-priority annotation `@class` (Def/Ref) for the same
+        // global; the class type should win (or merge).
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // --- Annotation library tier ---
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_class_shadow");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("toolobj.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                    ---@meta
+
+                    ---@class Weapon
+                    ---@field GetOwner fun(self: Weapon): any
+
+                    ---@class Tool
+                    ---@field SWEP Weapon
+
+                    ---@class ToolObj : Tool
+                    ToolObj = ToolObj or {}
+                "#
+                .to_string(),
+            ),
+        );
+
+        // --- Main workspace: shipped runtime pattern (garrysmod stool.lua) ---
+        // Includes the `o.SWEP = nil` initializer in Create() and the
+        // `ToolObj = nil` teardown, both present in the real file, since the
+        // nil initializer is what widens the inferred SWEP/GetWeapon type.
+        let _stool_file = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stool.lua",
+            r#"
+                ToolObj = {}
+
+                function ToolObj:Create()
+                    local o = {}
+                    setmetatable( o, self )
+                    self.__index = self
+                    o.SWEP = nil
+                    return o
+                end
+
+                function ToolObj:GetWeapon() return self.SWEP end
+
+                ToolObj = nil
+            "#,
+        );
+
+        let main_file = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/object.lua",
+            r#"
+                function ToolObj:SetStage(i)
+                    self:GetWeapon():GetOwner()
+                end
+            "#,
+        );
+
+        // The real CLI run reports this as unchecked-nil-access on the
+        // `self:GetWeapon()` receiver.
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(main_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        // `self:GetWeapon()` returns the non-nil `Weapon` field `SWEP`, so the
+        // method-call receiver is never nil. No nil diagnostic should fire.
+        let nil_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("GetWeapon"))
+            .collect();
+
+        assert_that!(
+            nil_diagnostics,
+            is_empty(),
+            "ToolObj from the Main-workspace `ToolObj = {{}}` must still inherit the \
+             library `@class ToolObj : Tool`, so `self.SWEP` is the non-nil `Weapon` \
+             field and `self:GetWeapon()` is non-nil. A higher-priority empty-table \
+             global must NOT shadow a lower-priority annotation class. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_mixed_nil_and_primitive_global_does_not_widen_to_nil() {
         // When a global has both a nil decl and a non-nil primitive decl
         // (e.g. Integer) in the same tier, infer_global_type_from_decl_ids

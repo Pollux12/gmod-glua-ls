@@ -46,6 +46,7 @@ pub fn infer_name_expr(
     let decl_id = references_index
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
+
     let result = if let Some(decl_id) = decl_id {
         infer_local_decl_name_type(db, cache, &name_expr, decl_id)
     } else {
@@ -65,10 +66,37 @@ pub fn infer_name_expr(
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
             Some(var_ref_id) => {
-                infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id)
-                    .or_else(|_| {
-                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                    })
+                let narrow_res = infer_expr_narrow_type(
+                    db,
+                    cache,
+                    LuaExpr::NameExpr(name_expr.clone()),
+                    var_ref_id,
+                );
+                if decl_id.is_none() {
+                    if let Ok(ref typ) = narrow_res {
+                        let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
+                        if should_fallback {
+                            if let Ok(global_type) = infer_global_type(
+                                db,
+                                Some(file_id),
+                                Some(name_expr.get_position()),
+                                name,
+                            ) {
+                                if global_type.is_custom_type()
+                                    || (!global_type.is_nil()
+                                        && !global_type.is_nullable()
+                                        && !global_type.is_unknown()
+                                        && !matches!(global_type, LuaType::Any | LuaType::Never))
+                                {
+                                    return Ok(global_type);
+                                }
+                            }
+                        }
+                    }
+                }
+                narrow_res.or_else(|_| {
+                    infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                })
             }
             None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
         }
@@ -106,6 +134,36 @@ fn infer_local_decl_name_type(
     let var_ref_id = VarRefId::VarRef(decl_id);
     let result =
         infer_expr_narrow_type(db, cache, LuaExpr::NameExpr(name_expr.clone()), var_ref_id);
+
+    let file_id = cache.get_file_id();
+    let is_global = db
+        .get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_global());
+
+    if is_global {
+        if let Ok(ref typ) = result {
+            let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
+            if should_fallback {
+                if let Some(name_token) = name_expr.get_name_token() {
+                    let name = name_token.get_name_text();
+                    if let Ok(global_type) =
+                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                    {
+                        if global_type.is_custom_type()
+                            || (!global_type.is_nil()
+                                && !global_type.is_nullable()
+                                && !global_type.is_unknown()
+                                && !matches!(global_type, LuaType::Any | LuaType::Never))
+                        {
+                            return Ok(global_type);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     if let Ok(typ) = &result
         && let Some(initializer_type) = try_local_decl_initializer_fallback_type(
             db,
@@ -1870,35 +1928,59 @@ pub fn infer_global_type(
     let mut saw_compatible_tier = false;
     let mut fallback_best_tier = None;
     let mut nil_fallback_type = None;
-    for (_, decl_ids) in priority_tiers {
+    let len = priority_tiers.len();
+    for i in 0..len {
+        let (_, decl_ids) = &priority_tiers[i];
         let decl_ids = if let Some(call_state_mask) = call_state_mask {
             let selected_decl_ids = select_realm_compatible_decl_ids_for_global_infer_tier(
                 db,
                 call_state_mask,
-                &decl_ids,
+                decl_ids,
             );
             if selected_decl_ids.is_empty() {
                 if fallback_best_tier.is_none() {
-                    fallback_best_tier = Some(decl_ids);
+                    fallback_best_tier = Some(decl_ids.clone());
                 }
                 continue;
             }
 
             selected_decl_ids
         } else {
-            decl_ids
+            decl_ids.clone()
         };
         if decl_ids.is_empty() {
             continue;
         }
         saw_compatible_tier = true;
-
         match infer_global_type_from_decl_ids(db, decl_ids) {
             Ok(typ) if typ.is_nil() => {
                 nil_fallback_type.get_or_insert(typ);
                 continue;
             }
-            Ok(typ) => return Ok(typ),
+            Ok(typ) => {
+                if matches!(typ, LuaType::TableConst(_)) {
+                    for (_, next_decl_ids) in priority_tiers.iter().skip(i + 1) {
+                        let next_decl_ids = if let Some(call_state_mask) = call_state_mask {
+                            select_realm_compatible_decl_ids_for_global_infer_tier(
+                                db,
+                                call_state_mask,
+                                next_decl_ids,
+                            )
+                        } else {
+                            next_decl_ids.clone()
+                        };
+                        if next_decl_ids.is_empty() {
+                            continue;
+                        }
+                        if let Ok(next_typ) = infer_global_type_from_decl_ids(db, next_decl_ids) {
+                            if matches!(next_typ, LuaType::Ref(_) | LuaType::Def(_)) {
+                                return Ok(next_typ);
+                            }
+                        }
+                    }
+                }
+                return Ok(typ);
+            }
             Err(reason) if can_fall_through_global_tier(&reason) => last_resolve_reason = reason,
             Err(reason) => return Err(reason),
         }

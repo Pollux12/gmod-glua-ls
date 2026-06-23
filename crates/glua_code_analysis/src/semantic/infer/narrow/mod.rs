@@ -240,6 +240,13 @@ pub fn get_var_ref_type(
             .get_decl(&decl_id)
             .ok_or(InferFailReason::None)?;
 
+        if decl.is_implicit_self()
+            && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+            && seed_ref.get_decl_id_ref() == Some(decl.get_id())
+        {
+            return Ok(seed_type.clone());
+        }
+
         // Parameter declarations carry their canonical type in signature metadata.
         // Flow/assignment analysis may also create a decl type cache entry for params,
         // but that inferred cache must not replace the declared parameter type.
@@ -262,13 +269,15 @@ pub fn get_var_ref_type(
 
             if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
                 let typ = type_cache.as_type();
-                if typ.is_nil()
+                let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
+                if should_fallback
                     && let Ok(global_type) =
                         infer_global_type(db, Some(cache.get_file_id()), None, decl.get_name())
-                    && !global_type.is_nil()
-                    && !global_type.is_nullable()
-                    && !global_type.is_unknown()
-                    && !matches!(global_type, LuaType::Any | LuaType::Never)
+                    && (global_type.is_custom_type()
+                        || (!global_type.is_nil()
+                            && !global_type.is_nullable()
+                            && !global_type.is_unknown()
+                            && !matches!(global_type, LuaType::Any | LuaType::Never)))
                 {
                     return Ok(global_type);
                 }
