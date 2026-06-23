@@ -507,24 +507,22 @@ fn guarded_expr_reassigned_between(
         // Local declarations shadow the guarded name and invalidate the guard.
         // `local x = nil` after `if not x then return end` means the guard
         // proved the old binding, not the new local.
+        // Only direct siblings are checked — locals inside nested blocks
+        // (do...end, if...end) have their own scope and don't shadow the
+        // outer scope at the guarded access site.
         if let Some(local_stat) = LuaLocalStat::cast(sibling.clone())
             && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
         {
             return true;
         }
 
+        // Assignments inside nested blocks can still reassign the guarded
+        // expression (e.g. `if cond then ent = nil end`), so scan descendants
+        // for assignments — but NOT for local declarations.
         if sibling.descendants().any(|node| {
-            if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
-                return assign_stat_reassigns_guarded_expr(
-                    semantic_model,
-                    &assign_stat,
-                    guarded_expr,
-                );
-            }
-            if let Some(local_stat) = LuaLocalStat::cast(node) {
-                return local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr);
-            }
-            false
+            LuaAssignStat::cast(node).is_some_and(|assign_stat| {
+                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+            })
         }) {
             return true;
         }
@@ -641,34 +639,52 @@ fn index_expr_key_reassigned(
     // First check exact match (fast path).
     if exprs_reference_same_var(semantic_model, assigned_expr, &key_expr) {
         return true;
-    }
+    };
     // Then check if the assigned variable is referenced anywhere inside the
-    // key expression (e.g. `i + 1` references `i`).
+    // key expression (e.g. `i + 1` references `i`). Walk all NameExpr
+    // descendants and compare via semantic var/ref identity.
     assigned_var_referenced_in_expr(semantic_model, assigned_expr, &key_expr)
 }
 
 /// Check if the variable referenced by `assigned_expr` appears anywhere inside `expr`.
 /// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
 /// key expression `i + 1` contains a reference to `i`.
+/// Uses semantic var/ref identity for the comparison, with text fallback only
+/// when the assigned expression doesn't resolve to a var ref.
 fn assigned_var_referenced_in_expr(
-    _semantic_model: &SemanticModel,
+    semantic_model: &SemanticModel,
     assigned_expr: &LuaExpr,
     expr: &LuaExpr,
 ) -> bool {
-    // Get the root name of the assigned expression (e.g. `i` from `i`).
-    let Some(assigned_name) = root_name_text(assigned_expr) else {
-        return false;
-    };
+    // Try to resolve the assigned expression to a var ref id.
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let assigned_ref_id =
+        get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, assigned_expr.clone());
+    drop(cache);
 
-    // Walk all NameExpr descendants of the key expression and check if any
-    // references the same variable as the assigned expression.
+    // Extract root name text as a fallback for non-resolvable expressions.
+    let assigned_name_text = root_name_text(assigned_expr);
+
     expr.syntax()
         .descendants()
         .filter_map(LuaNameExpr::cast)
         .any(|name_expr| {
-            name_expr
-                .get_name_token()
-                .is_some_and(|token| token.get_name_text() == assigned_name)
+            if let Some(ref assigned_ref_id) = assigned_ref_id {
+                // Semantic comparison: resolve the NameExpr and compare ref ids.
+                let name_expr_as_expr = LuaExpr::NameExpr(name_expr);
+                let mut cache = semantic_model.get_cache().borrow_mut();
+                let name_ref_id =
+                    get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, name_expr_as_expr);
+                drop(cache);
+                name_ref_id.is_some_and(|id| &id == assigned_ref_id)
+            } else {
+                // Text fallback: only when semantic resolution fails.
+                assigned_name_text.as_deref().is_some_and(|text| {
+                    name_expr
+                        .get_name_token()
+                        .is_some_and(|token| token.get_name_text() == text)
+                })
+            }
         })
 }
 

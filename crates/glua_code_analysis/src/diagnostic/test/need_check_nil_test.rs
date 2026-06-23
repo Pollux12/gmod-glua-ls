@@ -4058,6 +4058,9 @@ mod test {
     fn test_negation_guard_invalidated_by_key_mutation() {
         // If the index key variable is reassigned between the guard and the
         // access, the guard is invalidated (it proved the old key, not the new one).
+        // We use a COMPOUND key `self.Objects[i + 1]` so the descendant-walk
+        // logic is exercised — the old exact-key implementation would NOT catch
+        // this because `i + 1` is not the same expression as `i`.
         // We use `table<integer, Entity?>` so indexed access returns `Entity?`
         // (nullable), which triggers need-check-nil unless guarded.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
@@ -4077,9 +4080,9 @@ mod test {
 
             ---@param i integer
             function Container5:GetEnt(i)
-                if not self.Objects[i] then return end
+                if not self.Objects[i + 1] then return end
                 i = i + 1
-                self.Objects[i]:GetPos()
+                self.Objects[i + 1]:GetPos()
             end
             "#,
         );
@@ -4092,13 +4095,14 @@ mod test {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
 
-        // After `i = i + 1`, the guard on `self.Objects[i]` (old i) is invalidated.
-        // The subsequent `self.Objects[i]:GetPos()` (new i) should produce a
-        // diagnostic on `self.Objects[i]` (nullable since Entity? value type).
+        // After `i = i + 1`, the guard on `self.Objects[i + 1]` (old i) is
+        // invalidated. The subsequent `self.Objects[i + 1]:GetPos()` (new i)
+        // should produce a diagnostic on `self.Objects[i + 1]` (nullable since
+        // Entity? value type).
         //
         // We filter for diagnostics on the post-mutation line specifically,
         // not the guard condition line, to prove the guard was invalidated.
-        // The access `self.Objects[i]:GetPos()` is on the last line of the function.
+        // The access `self.Objects[i + 1]:GetPos()` is on the last line.
         let all_lines: Vec<_> = diagnostics.iter().map(|d| d.range.start.line).collect();
         let post_mutation_warnings: Vec<_> = diagnostics
             .iter()
@@ -4117,7 +4121,7 @@ mod test {
         assert_that!(
             post_mutation_warnings,
             not(is_empty()),
-            "After `i = i + 1`, `self.Objects[i]:GetPos()` should produce a nil diagnostic \
+            "After `i = i + 1`, `self.Objects[i + 1]:GetPos()` should produce a nil diagnostic \
              on the post-mutation line. All diagnostic lines: {all_lines:?}. \
              Diagnostics: {diagnostics:#?}"
         );
