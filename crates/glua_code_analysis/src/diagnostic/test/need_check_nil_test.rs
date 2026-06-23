@@ -3489,4 +3489,243 @@ mod test {
             "VGUI table callback self should preserve non-null annotated skin fields"
         );
     }
+
+    #[test]
+    fn test_doc_type_global_not_widened_by_cross_file_nil_assignment() {
+        // When a global is declared with `---@type T` in a library/annotation file,
+        // and a Main workspace file assigns `g_Global = nil` followed by
+        // `g_Global = vgui.Create("T")` inside a function, the global's type
+        // should remain `T` (from the DocType annotation) when read from
+        // other files — not be widened to `T|nil` or `nil`.
+        //
+        // Root cause: `infer_global_type_from_decl_ids` doesn't recognize
+        // `LuaType::Instance` (returned by `vgui.Create("T")`) as a Def/Ref
+        // type, so it gets silently dropped from the multi-decl merge. When
+        // the only other decl has `InferType(Nil)`, the tier returns
+        // `Err(None)` which hard-fails instead of falling through to the
+        // library tier that has `DocType(T)`.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // Load the annotation file as a library workspace (separate tier)
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_doctype_global");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                    ---@type SpawnMenu
+                    g_SpawnMenu = nil
+                "#
+                .to_string(),
+            ),
+        );
+
+        // Main workspace file with nil + create lifecycle
+        ws.def_file(
+            "gamemodes/mygamemode/gamemode/spawnmenu.lua",
+            r#"
+                local function CreateSpawnMenu()
+                    if IsValid(g_SpawnMenu) then
+                        g_SpawnMenu:Remove()
+                        g_SpawnMenu = nil
+                    end
+                    g_SpawnMenu = vgui.Create("SpawnMenu")
+                end
+            "#,
+        );
+
+        let main_file = ws.def_file(
+            "gamemodes/mygamemode/gamemode/custom.lua",
+            r#"
+                function Update()
+                    g_SpawnMenu.CustomizableSpawnlistNode = nil
+                end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(main_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        // The global `g_SpawnMenu` should resolve to `SpawnMenu` (DocType from
+        // the library annotation), NOT nil. If the type widened to nil,
+        // `g_SpawnMenu` would trigger `need-check-nil`.
+        let nil_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("g_SpawnMenu may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_diagnostics,
+            is_empty(),
+            "g_SpawnMenu should retain its DocType (SpawnMenu) from the annotation, \
+             not be widened to nil by the cross-file `= nil` assignment. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_all_nil_multidecl_global_returns_nil_for_fallback() {
+        // When a global has multiple decls that are ALL nil in the same tier,
+        // infer_global_type_from_decl_ids should return Ok(Nil) so the
+        // nil_fallback_type mechanism in infer_global_type can consult
+        // lower-priority tiers. A library DocType annotation should win.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_all_nil_multidecl");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                    ---@type MyType
+                    g_AllNil = nil
+                "#
+                .to_string(),
+            ),
+        );
+
+        ws.def_file(
+            "main.lua",
+            r#"
+                local function reset()
+                    if g_AllNil then
+                        g_AllNil = nil
+                    end
+                    g_AllNil = nil
+                end
+            "#,
+        );
+
+        let main_file = ws.def_file(
+            "consumer.lua",
+            r#"
+                function use()
+                    g_AllNil.field = 1
+                end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(main_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        // The library DocType should win over the all-nil main tier.
+        // If the all-nil tier hard-failed instead of returning Ok(Nil),
+        // the library tier would never be consulted and g_AllNil would
+        // resolve as Unknown (no diagnostics) rather than MyType.
+        // The test passes either way for need-check-nil, but it guards
+        // against a regression where the all-nil tier would hard-fail.
+        let nil_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("g_AllNil may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_diagnostics,
+            is_empty(),
+            "g_AllNil should resolve to MyType from the library DocType, not nil. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_mixed_nil_and_primitive_global_does_not_widen_to_nil() {
+        // When a global has both a nil decl and a non-nil primitive decl
+        // (e.g. Integer) in the same tier, infer_global_type_from_decl_ids
+        // should NOT return Ok(Nil). The primitive is an unhandled non-nil
+        // type, so the all-nil fallback must not fire. The tier should
+        // return Err(None) which hard-fails, preventing a lower-priority
+        // library DocType from incorrectly overriding a real same-tier
+        // primitive assignment.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_mixed_nil_primitive");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("globals.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+                ---@type MyType
+                g_Mixed = nil
+            "#
+                .to_string(),
+            ),
+        );
+
+        ws.def_file(
+            "main.lua",
+            r#"
+            g_Mixed = nil
+            g_Mixed = 123
+        "#,
+        );
+
+        let main_file = ws.def_file(
+            "consumer.lua",
+            r#"
+            function use()
+                local _ = g_Mixed + 1
+            end
+        "#,
+        );
+
+        // The main tier has both nil and integer. The integer is unhandled
+        // (no collection branch matches it), so saw_unhandled_non_nil is true
+        // and the all-nil fallback does NOT fire. The tier hard-fails with
+        // Err(None), and the library DocType is NOT consulted (because the
+        // main tier had a resolved non-nil type, even though it was unhandled).
+        // The global resolves to Unknown, so no need-check-nil diagnostic
+        // should be produced for g_Mixed.
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(main_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        let nil_diagnostics: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("g_Mixed may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_diagnostics,
+            is_empty(),
+            "g_Mixed should not be widened to nil when the same tier has a real \
+         non-nil primitive assignment. The all-nil fallback must not fire when \
+         saw_unhandled_non_nil is true. Diagnostics: {diagnostics:#?}"
+        );
+    }
 }

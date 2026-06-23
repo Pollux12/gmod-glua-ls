@@ -1963,6 +1963,8 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
     let mut table_types = Vec::new();
     let mut last_resolve_reason = InferFailReason::None;
     let mut saw_resolved_decl_type = false;
+    let mut saw_nil = false;
+    let mut saw_unhandled_non_nil = false;
     for decl_id in sorted_decl_ids {
         let decl_type_cache = db.get_type_index().get_type_cache(&decl_id.into());
         match decl_type_cache {
@@ -1977,6 +1979,11 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
                     continue;
                 }
 
+                if typ.is_nil() {
+                    saw_nil = true;
+                    continue;
+                }
+
                 if matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
                     || typ.is_function()
                 {
@@ -1987,7 +1994,9 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
                     continue;
                 }
 
-                if (typ.is_def() || typ.is_ref()) && def_or_ref_type.is_none() {
+                if (typ.is_def() || typ.is_ref() || matches!(typ, LuaType::Instance(_)))
+                    && def_or_ref_type.is_none()
+                {
                     def_or_ref_type = Some(typ.clone());
                     continue;
                 }
@@ -1995,6 +2004,11 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
                 if collect_global_table_merge_candidates(typ, &mut table_types) {
                     continue;
                 }
+
+                // The type was resolved but did not match any collection
+                // branch (e.g. Integer, String, Boolean). Mark it so the
+                // all-nil fallback below does not fire incorrectly.
+                saw_unhandled_non_nil = true;
             }
             None => {
                 last_resolve_reason = InferFailReason::UnResolveDeclType(decl_id);
@@ -2012,6 +2026,13 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
 
     if !table_types.is_empty() {
         return Ok(merge_open_table_types(db, table_types));
+    }
+
+    if saw_nil && !saw_unhandled_non_nil {
+        // Every resolved, non-template decl in this tier was nil. Return
+        // Ok(Nil) so the caller can use it as a nil_fallback_type and still
+        // consult lower-priority tiers (e.g. a library DocType annotation).
+        return Ok(LuaType::Nil);
     }
 
     if saw_resolved_decl_type {
