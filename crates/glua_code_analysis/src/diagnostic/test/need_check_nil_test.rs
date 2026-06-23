@@ -4183,4 +4183,94 @@ mod test {
              Diagnostics: {null_warnings:#?}"
         );
     }
+
+    #[test]
+    fn test_pairs_loop_variable_not_nullable_after_loop_exit() {
+        // After a `for k, v in pairs(t) do ... end` loop completes normally,
+        // the loop variable `v` is out of scope. But if a value extracted
+        // from the loop is used after, it should not be incorrectly flagged
+        // as nullable due to the pairs-loop's internal nil-check flow.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Player
+            ---@field GetName fun(self: Player): string
+            ---@field SteamID string
+
+            ---@type table<integer, Player>
+            local players = {}
+
+            local function ProcessAll()
+                local last = nil
+                for _, ply in pairs(players) do
+                    last = ply
+                end
+                -- After the loop, `last` holds the last player iterated.
+                -- It should NOT be flagged as nullable just because the
+                -- pairs loop could have had zero iterations.
+                -- (This is a known flow-narrowing gap: the analyzer may
+                -- treat `last` as potentially nil from the loop's empty path.)
+                if last then
+                    return last:GetName()
+                end
+            end
+            "#,
+        );
+
+        // The `if last then` guard should suppress any need-check-nil.
+        // If the analyzer incorrectly flags `last` inside the guard, that's a bug.
+        let guarded_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+        assert_that!(
+            guarded_warnings,
+            is_empty(),
+            "After `if last then` guard, `last:GetName()` should not produce nil warnings. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_unrelated_boolean_guard_does_not_narrow_other_variable() {
+        // A boolean guard `if some_bool then` should only narrow `some_bool`,
+        // not other variables in scope. If `ent` is already typed as `Entity`,
+        // accessing `ent:GetPos()` inside the boolean guard block should not
+        // produce a nil warning.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@param ent Entity
+            local function doSomething(ent, someBool)
+                if someBool then
+                    -- `ent` is `Entity` (non-nullable), `someBool` is the guard.
+                    -- Accessing `ent:GetPos()` should NOT produce a nil warning.
+                    ent:GetPos()
+                end
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Boolean guard `if someBool then` should not narrow unrelated `ent` variable. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
 }
