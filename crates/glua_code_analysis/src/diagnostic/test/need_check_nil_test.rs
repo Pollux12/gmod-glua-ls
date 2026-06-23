@@ -3814,23 +3814,137 @@ mod test {
 
         // The `if not self.Objects[i]` condition itself accesses `self.Objects`,
         // which IS nullable — that diagnostic is correct and expected.
-        // But the subsequent `self.Objects[i].Ent` on the next line should be
-        // guarded by the early return and NOT produce a diagnostic.
-        //
-        // We verify by checking that no diagnostic appears on the `return` line.
         // The Lua code (after def() adds one prefix line) has:
         //   line 8: `if not self.Objects[i] then return nil end`
         //   line 9: `return self.Objects[i].Ent`
+        let guard_condition_warnings: Vec<_> = nil_warnings
+            .iter()
+            .filter(|d| d.range.start.line == 8)
+            .collect();
         let post_guard_warnings: Vec<_> = nil_warnings
             .iter()
             .filter(|d| d.range.start.line >= 9)
             .collect();
 
         assert_that!(
+            guard_condition_warnings.len(),
+            eq(1),
+            "Expected exactly one nil diagnostic on the guard condition line \
+             (accessing nullable `self.Objects` inside `if not self.Objects[i]`). \
+             Diagnostics: {guard_condition_warnings:#?}"
+        );
+        assert_that!(
             post_guard_warnings.is_empty(),
             is_true(),
             "self.Objects[i] should be narrowed to non-nil after `if not self.Objects[i] then return end`. \
              Diagnostics after guard: {post_guard_warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_does_not_suppress_gmod_null() {
+        // NULL is truthy in GLua, so `not ent` does NOT prove entity validity.
+        // Only IsValid-based guards should suppress NULL diagnostics.
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+
+            ---@type NULL
+            NULL = nil
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            ---@param ent Entity|NULL
+            local function useEntity(ent)
+                if not ent then return end
+                ent:GetPos()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        // `ent:GetPos()` should still produce a NULL diagnostic because
+        // `not ent` only proves non-nil, not validity.
+        let null_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("NULL"))
+            .collect();
+
+        assert_that!(
+            null_warnings.is_empty(),
+            is_false(),
+            "`not ent` should NOT suppress NULL diagnostics — NULL is truthy in GLua, \
+             so IsValid is still required. Diagnostics: {null_warnings:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_prefix_match_is_one_directional() {
+        // The reverse prefix match (condition shorter than guarded) is
+        // intentionally NOT supported: `not self.Objects` does NOT suppress
+        // diagnostics on `self.Objects[i]`, because checking the table exists
+        // does not prove the indexed value exists.
+        //
+        // We verify by confirming that `not self.Objects` only suppresses
+        // diagnostics on `self.Objects` (exact match), not on deeper accesses
+        // like `self.Objects[i]`. Since the analyzer doesn't flag
+        // `table<integer, T>[i]` as nullable, we test with a direct nullable
+        // field instead.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_id = ws.def(
+            r#"
+            ---@class Container2
+            ---@field Objects Entity?
+            local Container2 = {}
+
+            ---@param i integer
+            local function GetEnt(self: Container2, i)
+                if not self.Objects then return end
+                self.Objects:GetPos()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        // `self.Objects:GetPos()` after `if not self.Objects` — the exact
+        // match on `self.Objects` SHOULD suppress this (correct behavior).
+        // This confirms the exact match still works and the one-directional
+        // prefix match doesn't accidentally break the simple case.
+        let post_guard_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .filter(|d| d.range.start.line >= 8)
+            .collect();
+
+        assert_that!(
+            post_guard_warnings.is_empty(),
+            is_true(),
+            "Exact match `not self.Objects` should suppress nil diagnostic on `self.Objects`. \
+             Diagnostics: {post_guard_warnings:#?}"
         );
     }
 }

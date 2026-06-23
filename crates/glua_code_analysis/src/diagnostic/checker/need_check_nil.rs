@@ -217,7 +217,9 @@ fn report_unsafe_receiver(
         return false;
     }
 
-    if is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver) {
+    // NULL is truthy in GLua, so `not ent` does NOT prove entity validity.
+    // Only IsValid-based guards suppress NULL diagnostics.
+    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
         return false;
     }
 
@@ -635,32 +637,30 @@ fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr)
     }
 }
 
-/// Text-based comparison of two expressions, ignoring leading/trailing
-/// whitespace and normalizing `:` to `.` for method-vs-field equivalence.
-/// Also matches when the guarded expression is a prefix of the condition
-/// expression: `not self.Objects[i]` guards `self.Objects` because if the
-/// table were nil, the index access would error before the guard runs.
+/// Text-based comparison of two expressions, normalizing `:` to `.` for
+/// method-vs-field equivalence.
+///
+/// `a` is the condition's inner expression (the negated expr).
+/// `b` is the guarded expression (the nullable receiver/prefix).
+///
+/// Also matches when `b` is a prefix of `a`: `not self.Objects[i]` guards
+/// `self.Objects` because accessing `self.Objects[i]` would error if
+/// `self.Objects` were nil. The reverse direction is NOT sound: checking
+/// `not self.Objects` does not prove `self.Objects[i]` is non-nil, since
+/// the indexed value may be absent even when the table exists.
 fn expr_text_matches(a: &LuaExpr, b: &LuaExpr) -> bool {
     let a_text = a.syntax().text().to_string().replacen(':', ".", 1);
     let b_text = b.syntax().text().to_string().replacen(':', ".", 1);
     if a_text == b_text {
         return true;
     }
-    // Prefix match: `self.Objects` is guarded by `not self.Objects[i]`
-    // because accessing `self.Objects[i]` would error if `self.Objects` were nil.
-    // The condition expression must be longer and start with the guarded text
-    // followed by an index delimiter (`[` or `.`).
-    if a_text.len() > b_text.len() {
-        return a_text.starts_with(&b_text)
-            && (a_text[b_text.len()..].starts_with('[')
-                || a_text[b_text.len()..].starts_with('.'));
-    }
-    if b_text.len() > a_text.len() {
-        return b_text.starts_with(&a_text)
-            && (b_text[a_text.len()..].starts_with('[')
-                || b_text[a_text.len()..].starts_with('.'));
-    }
-    false
+    // Prefix match: condition (`a`) extends guarded (`b`) with an index access.
+    // `self.Objects` (guarded) is a prefix of `self.Objects[i]` (condition),
+    // meaning the condition accessed the guarded table — so the table must
+    // have been non-nil for the condition to have evaluated.
+    a_text.len() > b_text.len()
+        && a_text.starts_with(&b_text)
+        && (a_text[b_text.len()..].starts_with('[') || a_text[b_text.len()..].starts_with('.'))
 }
 
 fn is_initialized_assignment_lhs_prefix(
