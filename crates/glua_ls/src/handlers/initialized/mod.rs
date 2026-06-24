@@ -11,7 +11,7 @@ use crate::{
     cmd_args::CmdArgs,
     context::{
         FileDiagnostic, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_emmy_config,
+        WorkspaceFileMatcher, get_client_id, load_emmy_config, validate_gmod_annotations_for_ls,
     },
     handlers::text_document::register_files_watch,
     logger::init_logger,
@@ -23,14 +23,21 @@ use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
     collect_workspace_files, fetch_schema_urls, uri_to_file_path,
 };
-use lsp_types::InitializeParams;
+use lsp_types::{InitializeParams, MessageType, ShowMessageParams};
 use tokio::sync::RwLock;
 
+/// Initialize the workspace.
+///
+/// Returns `Ok(())` on success, or `Err(reason)` with a user-facing reason
+/// string when the language server cannot start meaningfully (currently: GMod
+/// mode is enabled but required annotations could not be resolved). The caller
+/// in `server/main_loop` is expected to surface the reason to the client via
+/// `window/showMessage` and then abort/exit the server.
 pub async fn initialized_handler(
     context: ServerContextSnapshot,
     params: InitializeParams,
     cmd_args: CmdArgs,
-) -> Option<()> {
+) -> Result<(), String> {
     log::info!("initialized handler started");
     let workspace_folders = get_workspace_folders(&params);
     let main_root: Option<&str> = match workspace_folders.first() {
@@ -52,8 +59,8 @@ pub async fn initialized_handler(
     let supports_config_request = params
         .capabilities
         .workspace
-        .as_ref()?
-        .configuration
+        .as_ref()
+        .and_then(|ws| ws.configuration)
         .unwrap_or_default();
     log::info!("client_id: {:?}", client_id);
 
@@ -133,6 +140,25 @@ pub async fn initialized_handler(
     load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
     log::info!("configuration loaded");
 
+    // LS-only fail-fast: when GMod mode is enabled, require a resolved,
+    // existing, non-empty GMod annotations set. This guards against silently
+    // launching the language server without API metadata, which would dark
+    // out metadata-driven behavior (completions, hovers, diagnostics, realm
+    // inference, etc.). `glua_check`, `VirtualWorkspace`, and analysis tests
+    // never enter this path and remain exempt. To run the server without
+    // GMod annotations, set `gmod.enabled: false`.
+    if let Err(reason) = validate_gmod_annotations_for_ls(&client_config, &emmyrc) {
+        log::error!("GMod annotations validation failed: {reason}");
+        // Surface the reason to the client before aborting. The initialize
+        // handshake is already complete, so `window/showMessage` is the
+        // appropriate channel (per LSP 3.17).
+        context.client().show_message(ShowMessageParams {
+            typ: MessageType::ERROR,
+            message: reason.clone(),
+        });
+        return Err(reason);
+    }
+
     // init std lib
     if cmd_args.load_stdlib.0 {
         watchdog_status.set_phase("Loading standard libraries");
@@ -170,7 +196,7 @@ pub async fn initialized_handler(
     register_files_watch(context.clone(), &params.capabilities).await;
     log::info!("initialized handler completed; notifying workspace loaded");
     context.file_diagnostic().notify_workspace_loaded();
-    Some(())
+    Ok(())
 }
 
 pub async fn init_analysis(
