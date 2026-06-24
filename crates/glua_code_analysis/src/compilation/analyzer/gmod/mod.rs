@@ -2648,10 +2648,10 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
 
     let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
     let mut synthesis_cache = VguiSynthesisCache::default();
-    // Tracks decl_ids that have already been registered via `vgui.RegisterTable`
-    // so that subsequent `vgui.CreateFromTable` calls referencing the same table
-    // do not trigger a second (overwriting) class synthesis.
-    let mut registered_table_decl_ids: HashSet<LuaDeclId> = HashSet::new();
+    // Tracks local table regions that have already been registered via
+    // `vgui.RegisterTable` so that subsequent `vgui.CreateFromTable` calls
+    // referencing the same region do not trigger a second class synthesis.
+    let mut registered_table_regions: HashSet<(LuaDeclId, TextSize)> = HashSet::new();
 
     for file_id in file_ids.iter().copied() {
         // Borrow first and skip files with no VGUI-relevant calls before paying
@@ -2733,12 +2733,14 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                 // `unchecked-nil-access` on the original panel's `self.Field`
                 // accesses.
                 //
-                // Only actual `vgui.RegisterTable` calls populate
-                // `registered_table_decl_ids`. A `CreateFromTable` call that
-                // appears before the real `RegisterTable` must NOT insert the
-                // decl_id, otherwise the later `RegisterTable` would be
-                // skipped and the real base/type synthesis lost.
-                if registered_table_decl_ids.contains(&decl_id) {
+                // Only actual `vgui.RegisterTable` calls populate the dedup
+                // set. A `CreateFromTable` call that appears before the real
+                // `RegisterTable` must not insert a key, otherwise the later
+                // `RegisterTable` can lose its base/type synthesis. The key is
+                // region-specific so reused locals can register later table
+                // regions without being blocked by earlier registrations.
+                let registration_key = (decl_id, region_start);
+                if registered_table_regions.contains(&registration_key) {
                     continue;
                 }
                 resolved_registration = Some(ResolvedVguiRegistrationRegion {
@@ -2754,7 +2756,7 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                     region_end: register_position,
                 });
                 if is_actual_registration {
-                    registered_table_decl_ids.insert(decl_id);
+                    registered_table_regions.insert(registration_key);
                 }
             }
             synthesize_vgui_register_table(
@@ -4630,7 +4632,10 @@ fn find_registered_table_expr(
         if !write_position_contains_register(db, file_id, write_position, register_position) {
             return None;
         }
-        find_registered_table_expr_at_write_position(db, file_id, decl_id.position)
+        let table_write_position =
+            find_latest_decl_write_before_position(db, file_id, decl_id, write_position)
+                .unwrap_or(decl_id.position);
+        find_registered_table_expr_at_write_position(db, file_id, table_write_position)
     })
 }
 

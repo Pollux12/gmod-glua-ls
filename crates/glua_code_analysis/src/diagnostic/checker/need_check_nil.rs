@@ -1,14 +1,14 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
-    LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat, UnaryOperator,
+    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat,
+    LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat,
+    UnaryOperator,
 };
 use rowan::TextRange;
 
 use crate::{
     DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
-    SemanticModel,
-    semantic::{contains_gmod_null_type, get_var_expr_var_ref_id},
+    SemanticModel, get_var_expr_var_ref_id, semantic::contains_gmod_null_type,
 };
 
 use super::{
@@ -94,6 +94,17 @@ fn check_call_expr(
 
     if let LuaExpr::IndexExpr(index_expr) = &prefix {
         let receiver = index_expr.get_prefix_expr()?;
+        if !is_receiver_guarded_by_type_guard
+            && expr_has_invalidated_prior_nil_early_return(semantic_model, &receiver)
+        {
+            context.add_diagnostic(
+                DiagnosticCode::NeedCheckNil,
+                receiver.get_range(),
+                format!("{name} may be nil", name = receiver.syntax().text()).to_string(),
+                None,
+            );
+            return Some(());
+        }
         if !is_receiver_guarded_by_type_guard
             && report_unsafe_receiver(context, semantic_model, &receiver)
         {
@@ -515,6 +526,11 @@ fn guarded_expr_reassigned_between(
         {
             return true;
         }
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(sibling.clone())
+            && local_func_stat_shadows_guarded_expr(semantic_model, &local_func_stat, guarded_expr)
+        {
+            return true;
+        }
 
         // Assignments inside nested blocks can still reassign the guarded
         // expression (e.g. `if cond then ent = nil end`), so scan descendants
@@ -534,7 +550,7 @@ fn guarded_expr_reassigned_between(
 /// Check if a `local` declaration shadows the guarded expression's root name.
 /// This invalidates the guard because the guard proved the old binding.
 fn local_stat_shadows_guarded_expr(
-    _semantic_model: &SemanticModel,
+    semantic_model: &SemanticModel,
     local_stat: &LuaLocalStat,
     guarded_expr: &LuaExpr,
 ) -> bool {
@@ -546,9 +562,115 @@ fn local_stat_shadows_guarded_expr(
 
     // Check if any local name in the declaration matches the root.
     local_stat.get_local_name_list().any(|local_name| {
-        local_name
-            .get_name_token()
-            .is_some_and(|token| token.get_name_text() == root_text)
+        local_name.get_name_token().is_some_and(|token| {
+            let name = token.get_name_text();
+            name == root_text
+                || guarded_expr_key_references_name(semantic_model, guarded_expr, &name)
+        })
+    })
+}
+
+fn expr_has_invalidated_prior_nil_early_return(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    if !expr_contains_dynamic_key(expr) {
+        return false;
+    }
+    expr_has_prior_early_return_matching(semantic_model, expr, |condition, guarded| {
+        condition_is_negative_expr_guard(condition, guarded)
+    })
+}
+
+fn expr_contains_dynamic_key(expr: &LuaExpr) -> bool {
+    let mut current = expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = current {
+        if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))) {
+            return true;
+        }
+        let Some(prefix) = index_expr.get_prefix_expr() else {
+            return false;
+        };
+        current = prefix;
+    }
+    false
+}
+
+fn expr_has_prior_early_return_matching<F>(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+    condition_matches: F,
+) -> bool
+where
+    F: Fn(&LuaExpr, &LuaExpr) -> bool,
+{
+    let Some(containing_stat) = expr.syntax().ancestors().find(|node| {
+        let kind: LuaSyntaxKind = node.kind().into();
+        matches!(
+            kind,
+            LuaSyntaxKind::LocalStat
+                | LuaSyntaxKind::AssignStat
+                | LuaSyntaxKind::CallExprStat
+                | LuaSyntaxKind::IfStat
+                | LuaSyntaxKind::ReturnStat
+        )
+    }) else {
+        return false;
+    };
+
+    let Some(parent) = containing_stat.parent() else {
+        return false;
+    };
+    let stat_start = containing_stat.text_range().start();
+
+    for sibling in parent.children() {
+        if sibling.text_range().start() >= stat_start {
+            break;
+        }
+
+        let kind: LuaSyntaxKind = sibling.kind().into();
+        if kind != LuaSyntaxKind::IfStat {
+            continue;
+        }
+
+        let Some(if_stat) = LuaIfStat::cast(sibling) else {
+            continue;
+        };
+        if !if_body_has_return(&if_stat) {
+            continue;
+        }
+        let Some(condition) = if_stat.get_condition_expr() else {
+            continue;
+        };
+        if condition_matches(&condition, expr)
+            && (guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
+                || guarded_expr_reassigned_between(
+                    semantic_model,
+                    expr,
+                    &parent,
+                    if_stat.syntax().text_range(),
+                    stat_start,
+                ))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn local_func_stat_shadows_guarded_expr(
+    semantic_model: &SemanticModel,
+    local_func_stat: &LuaLocalFuncStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let Some(local_name) = local_func_stat.get_local_name() else {
+        return false;
+    };
+    local_name.get_name_token().is_some_and(|token| {
+        let name = token.get_name_text();
+        root_name_text(guarded_expr).is_some_and(|root_text| root_text == name)
+            || guarded_expr_key_references_name(semantic_model, guarded_expr, &name)
     })
 }
 
@@ -646,6 +768,37 @@ fn index_expr_key_reassigned(
     assigned_var_referenced_in_expr(semantic_model, assigned_expr, &key_expr)
 }
 
+fn guarded_expr_key_references_name(
+    _semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    local_name: &str,
+) -> bool {
+    let mut current = guarded_expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = current {
+        if index_expr_key_references_name(&index_expr, local_name) {
+            return true;
+        }
+        let Some(prefix) = index_expr.get_prefix_expr() else {
+            return false;
+        };
+        current = prefix;
+    }
+    false
+}
+
+fn index_expr_key_references_name(index_expr: &LuaIndexExpr, local_name: &str) -> bool {
+    let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+    key_expr.syntax().descendants().any(|node| {
+        LuaNameExpr::cast(node).is_some_and(|name_expr| {
+            name_expr
+                .get_name_text()
+                .is_some_and(|name| name == local_name)
+        })
+    })
+}
+
 /// Check if the variable referenced by `assigned_expr` appears anywhere inside `expr`.
 /// This catches cases like `i = i + 1` invalidating `t[i + 1]` where the
 /// key expression `i + 1` contains a reference to `i`.
@@ -673,6 +826,7 @@ fn assigned_var_referenced_in_expr(
     drop(cache);
 
     // Extract root name text as a fallback for non-resolvable expressions.
+    let assigned_expr_text = normalized_expr_text(assigned_expr);
     let assigned_name_text = root_name_text(assigned_expr);
 
     // Walk all descendant expressions that can reference a variable:
@@ -688,6 +842,16 @@ fn assigned_var_referenced_in_expr(
             )
         })
         .any(|descendant_expr| {
+            if normalized_expr_text(&descendant_expr)
+                .as_deref()
+                .is_some_and(|text| {
+                    assigned_expr_text
+                        .as_deref()
+                        .is_some_and(|assigned| assigned == text)
+                })
+            {
+                return true;
+            }
             if let Some(ref assigned_ref_id) = assigned_ref_id {
                 // Semantic comparison: resolve the descendant expr and compare ref ids.
                 let mut cache = semantic_model.get_cache().borrow_mut();
@@ -831,8 +995,12 @@ fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr)
 /// `not self.Objects` does not prove `self.Objects[i]` is non-nil, since
 /// the indexed value may be absent even when the table exists.
 fn expr_text_matches(a: &LuaExpr, b: &LuaExpr) -> bool {
-    let a_text = a.syntax().text().to_string().replacen(':', ".", 1);
-    let b_text = b.syntax().text().to_string().replacen(':', ".", 1);
+    let Some(a_text) = normalized_expr_text(a) else {
+        return false;
+    };
+    let Some(b_text) = normalized_expr_text(b) else {
+        return false;
+    };
     if a_text == b_text {
         return true;
     }
@@ -843,6 +1011,15 @@ fn expr_text_matches(a: &LuaExpr, b: &LuaExpr) -> bool {
     a_text.len() > b_text.len()
         && a_text.starts_with(&b_text)
         && (a_text[b_text.len()..].starts_with('[') || a_text[b_text.len()..].starts_with('.'))
+}
+
+fn normalized_expr_text(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .and_then(|inner| normalized_expr_text(&inner)),
+        _ => Some(expr.syntax().text().to_string().replacen(':', ".", 1)),
+    }
 }
 
 fn is_initialized_assignment_lhs_prefix(

@@ -3284,6 +3284,49 @@ mod test {
     }
 
     #[gtest]
+    fn test_istable_short_circuit_guards_after_prior_index_key_invalidation() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+            "#,
+        );
+        let code = r#"
+            local MODES = {
+                {
+                    function(client)
+                        return false
+                    end,
+                    "Off."
+                }
+            }
+
+            ---@return integer
+            local function getMode() end
+
+            local mode = getMode() or 1
+            local client
+            if not MODES[mode] then
+                return
+            end
+            mode = mode + 1
+
+            return istable(MODES[mode]) and MODES[mode][1](client)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message == "MODES[mode] may be nil"),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_shadowed_istable_short_circuit_does_not_guard_indexed_table_access() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def(
@@ -4429,29 +4472,6 @@ mod test {
 
     #[test]
     fn test_negation_guard_invalidated_by_indexed_key_reassignment() {
-        // Defensive hardening regression for `assigned_var_referenced_in_expr`:
-        // the descendant walk now includes `IndexExpr` nodes (not just
-        // `NameExpr`) when checking whether a reassigned expression is
-        // referenced inside a compound key expression.
-        //
-        // The `IndexExpr` widening is classified as defensive hardening
-        // because reverting it to `NameExpr`-only leaves all 2008 tests
-        // green — no current scenario reaches the widened branch with a
-        // differing outcome. The widening only ever adds invalidations
-        // (suppressing fewer false positives), which is the soundness-safe
-        // direction.
-        //
-        // Note: `need_check_nil` DOES flag table indexing of
-        // `table<K, V?>` as a nullable receiver (see
-        // `test_negation_guard_invalidated_by_key_mutation` above). The
-        // guard in this test's scenario suppresses the diagnostic, and
-        // the key reassignment does not currently invalidate it — which
-        // hints at a separate real gap in guard invalidation for indexed-
-        // key reassignment, not a limitation of the widening itself.
-        //
-        // This test confirms the code path runs without crashing. It does
-        // not assert a diagnostic count because the guard suppression
-        // behavior is unchanged by the widening in this scenario.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -4476,10 +4496,133 @@ mod test {
             "#,
         );
 
-        // No assertion on diagnostic count: this is a defensive hardening
-        // regression that confirms the code path runs without crashing.
-        // The guard suppresses the diagnostic, and key reassignment does
-        // not currently invalidate it — a separate gap.
-        let _ = diagnostics;
+        let nil_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_warnings,
+            not(is_empty()),
+            "`keys[1] = 2` changes the dynamic key proven by `if not t[keys[1]]`, \
+             so the later `t[keys[1]]:GetPos()` access must still require a nil check. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_invalidated_by_local_key_shadow() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@param i integer
+            local function process(i)
+                ---@type table<number, Entity?>
+                local t = {}
+
+                if not t[i] then return end
+                local i = 2
+                t[i]:GetPos()
+            end
+            "#,
+        );
+
+        let nil_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_warnings,
+            not(is_empty()),
+            "`local i = 2` shadows the key proven by `if not t[i]`, so the later \
+             `t[i]:GetPos()` access must still require a nil check. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_invalidated_by_local_function_key_shadow() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@param i integer
+            local function process(i)
+                ---@type table<any, Entity?>
+                local t = {}
+
+                if not t[i] then return end
+                local function i() end
+                t[i]:GetPos()
+            end
+            "#,
+        );
+
+        let nil_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            nil_warnings,
+            not(is_empty()),
+            "`local function i()` shadows the key proven by `if not t[i]`, so the later \
+             `t[i]:GetPos()` access must still require a nil check. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_negation_guard_matches_parenthesized_dynamic_index_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field Ent Entity
+
+            ---@class Container
+            ---@field Objects table<integer, Entity?>?
+
+            ---@param i integer
+            local function process(self, i)
+                if not self.Objects[i] then return end
+                return (self.Objects[i]).Ent
+            end
+            "#,
+        );
+
+        let post_guard_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.message.contains("may be nil"))
+            .collect();
+
+        assert_that!(
+            post_guard_warnings,
+            is_empty(),
+            "`if not self.Objects[i] then return end` must guard the equivalent \
+             parenthesized access `(self.Objects[i]).Ent`. Diagnostics: {diagnostics:#?}"
+        );
     }
 }

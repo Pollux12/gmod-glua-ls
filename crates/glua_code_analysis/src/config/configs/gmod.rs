@@ -12,6 +12,7 @@ const FILE_PARAM_DEFAULTS: &[(&str, &str)] = &[
     ("player", "Player"),
     ("ent", "Entity"),
     ("entity", "Entity"),
+    ("pentity", "Entity"),
     ("veh", "Entity"),
     ("vehicle", "Entity"),
     ("wep", "Weapon"),
@@ -1733,6 +1734,10 @@ mod tests {
         )?;
         verify_that!(
             gmod.file_param_defaults.get("vehicle"),
+            eq(Some(&"Entity".to_string()))
+        )?;
+        verify_that!(
+            gmod.file_param_defaults.get("pentity"),
             eq(Some(&"Entity".to_string()))
         )?;
         verify_that!(gmod.detect_realm_from_filename, eq(None))?;

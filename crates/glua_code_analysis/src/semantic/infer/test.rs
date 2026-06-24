@@ -64,6 +64,27 @@ mod test {
             .unwrap_or(crate::LuaType::Unknown)
     }
 
+    fn infer_index_expr_type_by_text_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        text: &str,
+    ) -> crate::LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let target = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == text)
+            .expect("Target index expr must exist");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(target))
+            .unwrap_or(crate::LuaType::Unknown)
+    }
+
     #[test]
     fn test_custom_binary() {
         let mut ws = VirtualWorkspace::new();
@@ -809,6 +830,27 @@ mod test {
         assert!(
             display.contains("Vector") && display.contains("\"not a number\""),
             "A dynamic string-key field read should include the indexed value union, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_custom_type_dynamic_index_key_is_guarded_before_recursing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class RecursiveKey
+            ---@field [string] string
+            ---@field key RecursiveKey
+            local rec
+
+            local value = rec[rec.key[rec.key]]
+            "#,
+        );
+
+        let ty = infer_index_expr_type_by_text_in_file(&ws, file_id, "rec[rec.key[rec.key]]");
+        assert!(
+            ty.is_unknown() || matches!(ty, LuaType::String),
+            "recursive dynamic key inference should terminate with a bounded type, got {ty:?}"
         );
     }
 

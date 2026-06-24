@@ -3063,6 +3063,64 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_register_table_reused_local_panel_registers_later_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_reused_local.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Alpha() end
+            PANEL = vgui.RegisterTable(PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Beta() end
+            PANEL = vgui.RegisterTable(PANEL, "EditablePanel")
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let mut resolved_classes: Vec<_> = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|name_expr| {
+                let token = name_expr.get_name_token()?;
+                if token.get_name_text() != "PANEL" {
+                    return None;
+                }
+                let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
+                match &info.typ {
+                    LuaType::Def(id) => {
+                        Some((name_expr.get_position(), id.get_simple_name().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        resolved_classes.sort_by_key(|(position, _)| *position);
+
+        let class_names: std::collections::HashSet<&str> = resolved_classes
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect();
+
+        assert!(
+            class_names.len() >= 2,
+            "expected reused local PANEL regions to resolve to distinct RegisterTable classes, got {resolved_classes:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

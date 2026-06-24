@@ -4171,14 +4171,12 @@ mod test {
         );
     }
 
-    
     #[test]
     fn test_boolean_union_narrowing_undefined_field_bug() {
         let mut ws = VirtualWorkspace::new();
         ws.def_gmod_call_arg_builtins();
 
-        assert!(ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+        let file_id = ws.def(
             r#"
             ---@return any
             local function get_any() return end
@@ -4193,6 +4191,110 @@ mod test {
                 x:GetTranslation()
             end
             "#,
-        ), "Expected undefined-field bug on GetTranslation");
+        );
+        let x_type = local_name_type(&mut ws, file_id, "x");
+        assert!(
+            x_type.is_any(),
+            "the narrowed helper return must preserve any, got {}",
+            ws.humanize_type(x_type)
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.is_empty(),
+            "VMatrix/GetTranslation-style any-or-false narrowing must preserve any and not report undefined-field"
+        );
+    }
+
+    #[test]
+    fn test_false_or_vmatrix_multi_return_guard_undefined_field_bug() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws.virtual_url_generator.new_path("__test_gmod_annotations");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("annotations.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@class VMatrix
+            local VMatrix = {}
+            function VMatrix:GetTranslation() end
+
+            ---@class Entity
+            local Entity = {}
+            ---@return VMatrix?
+            function Entity:GetBoneMatrix(bone) end
+            ---@return integer?
+            function Entity:LookupBone(name) end
+            ---@return boolean
+            function Entity:IsWorld() end
+
+            function TOOL:HandEntity() end
+            function TOOL:HandNum() end
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function IsValid(value) end
+            "#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stools/finger.lua",
+            r#"
+            function TOOL:GetHandPositions(pEntity)
+                local LeftHand = pEntity:LookupBone("ValveBiped.Bip01_L_Hand")
+                local RightHand = pEntity:LookupBone("ValveBiped.Bip01_R_Hand")
+
+                if (!LeftHand || !RightHand) then return false end
+
+                local LeftHandMatrix = pEntity:GetBoneMatrix(LeftHand)
+                local RightHandMatrix = pEntity:GetBoneMatrix(RightHand)
+                if (!LeftHandMatrix || !RightHandMatrix) then return false end
+
+                return LeftHandMatrix, RightHandMatrix
+            end
+
+            function TOOL:DrawHUD()
+                local selected = self:HandEntity()
+                local hand = self:HandNum()
+
+                if (!IsValid(selected)) then return end
+                if (selected:IsWorld()) then return end
+
+                local lefthand, righthand = self:GetHandPositions(selected)
+
+                local BoneMatrix = lefthand
+                if hand == 1 then BoneMatrix = righthand end
+                if (!BoneMatrix) then return end
+
+                BoneMatrix:GetTranslation()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.is_empty(),
+            "false-or-VMatrix guard should remove the false path before method lookup, got: {diagnostics:?}"
+        );
     }
 }

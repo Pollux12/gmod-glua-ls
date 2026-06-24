@@ -666,11 +666,11 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         }
         (LuaType::Variadic(variadic), _) => {
             let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = TypeOps::Union.apply(db, &first_type, &right);
+            let first_union_type = union_return_expr(db, first_type, right.clone());
 
             match variadic.deref() {
                 VariadicType::Base(base) => {
-                    let union_base = TypeOps::Union.apply(db, base, &LuaType::Nil);
+                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
                     LuaType::Variadic(
                         VariadicType::Multi(vec![
                             first_union_type,
@@ -684,7 +684,7 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
                     if !new_multi.is_empty() {
                         new_multi[0] = first_union_type;
                         for mult in new_multi.iter_mut().skip(1) {
-                            *mult = TypeOps::Union.apply(db, mult, &LuaType::Nil);
+                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
                         }
                     } else {
                         new_multi.push(first_union_type);
@@ -696,10 +696,10 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         }
         (_, LuaType::Variadic(variadic)) => {
             let first_type = variadic.get_type(0).cloned().unwrap_or(LuaType::Unknown);
-            let first_union_type = TypeOps::Union.apply(db, &left, &first_type);
+            let first_union_type = union_return_expr(db, left.clone(), first_type);
             match variadic.deref() {
                 VariadicType::Base(base) => {
-                    let union_base = TypeOps::Union.apply(db, base, &LuaType::Nil);
+                    let union_base = union_return_expr(db, base.clone(), LuaType::Nil);
                     LuaType::Variadic(
                         VariadicType::Multi(vec![
                             first_union_type,
@@ -713,7 +713,7 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
                     if !new_multi.is_empty() {
                         new_multi[0] = first_union_type;
                         for mult in new_multi.iter_mut().skip(1) {
-                            *mult = TypeOps::Union.apply(db, mult, &LuaType::Nil);
+                            *mult = union_return_expr(db, mult.clone(), LuaType::Nil);
                         }
                     } else {
                         new_multi.push(first_union_type);
@@ -734,5 +734,13 @@ fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRan
 }
 
 fn should_union_any_as_unknown(typ: &LuaType) -> bool {
-    !matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Boolean | LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_)) && !typ.is_nullable()
+    !matches!(
+        typ,
+        LuaType::Any
+            | LuaType::Unknown
+            | LuaType::Nil
+            | LuaType::Boolean
+            | LuaType::BooleanConst(_)
+            | LuaType::DocBooleanConst(_)
+    ) && !typ.is_nullable()
 }

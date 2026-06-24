@@ -1471,10 +1471,10 @@ fn infer_custom_type_member(
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
 ) -> InferResult {
+    infer_guard.check(&prefix_type_id)?;
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
 
-    infer_guard.check(&prefix_type_id)?;
     let type_index = db.get_type_index();
     let type_decl = type_index
         .get_type_decl(&prefix_type_id)
