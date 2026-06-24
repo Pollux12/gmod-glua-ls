@@ -734,5 +734,5 @@ fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRan
 }
 
 fn should_union_any_as_unknown(typ: &LuaType) -> bool {
-    !matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Nil) && !typ.is_nullable()
+    !matches!(typ, LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Boolean | LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_)) && !typ.is_nullable()
 }

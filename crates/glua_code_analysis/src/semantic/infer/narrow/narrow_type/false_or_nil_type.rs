@@ -37,6 +37,9 @@ pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
         LuaType::Instance(instance_type) => {
             return narrow_false_or_nil(db, instance_type.get_base().clone());
         }
+        LuaType::Unknown | LuaType::Any => {
+            return t;
+        }
         _ => {}
     }
 

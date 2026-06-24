@@ -4170,4 +4170,29 @@ mod test {
             "expected cross-file ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
         );
     }
+
+    
+    #[test]
+    fn test_boolean_union_narrowing_undefined_field_bug() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@return any
+            local function get_any() return end
+            local function test_narrow(a)
+                if not a then return false end
+                return a
+            end
+            local function test_main()
+                local x = test_narrow(get_any())
+                -- The analyzer bug incorrectly drops 'any' and infers 'x' as strictly 'boolean',
+                -- causing 'GetTranslation' to emit an undefined-field error.
+                x:GetTranslation()
+            end
+            "#,
+        ), "Expected undefined-field bug on GetTranslation");
+    }
 }
