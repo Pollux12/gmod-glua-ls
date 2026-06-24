@@ -25,6 +25,23 @@ mod test {
             .collect()
     }
 
+    fn def_isvalid_type_guard(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+    }
+
     #[test]
     fn test_issue_245() {
         let mut ws = VirtualWorkspace::new();
@@ -650,6 +667,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -683,6 +701,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -716,6 +735,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -729,18 +749,18 @@ mod test {
             "#,
         );
 
-        assert_that!(
-            ws.check_code_for(
-                DiagnosticCode::NeedCheckNil,
-                r#"
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
                 local ent = GetEntityOrNULL()
                 if IsValid(ent) then
                     ent:GetPos()
                 end
                 "#,
-            ),
-            eq(true)
         );
+
+        assert_that!(diagnostics, is_empty());
     }
 
     #[gtest]
@@ -749,6 +769,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -758,10 +779,10 @@ mod test {
             "#,
         );
 
-        assert_that!(
-            ws.check_code_for(
-                DiagnosticCode::NeedCheckNil,
-                r#"
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
                 ---@param ent NULL
                 local function takes_null(ent)
                     if IsValid(ent) then
@@ -769,9 +790,9 @@ mod test {
                     end
                 end
                 "#,
-            ),
-            eq(true)
         );
+
+        assert_that!(diagnostics, is_empty());
     }
 
     #[gtest]
@@ -814,6 +835,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -846,6 +868,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -878,6 +901,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -945,6 +969,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -976,6 +1001,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1007,6 +1033,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1038,6 +1065,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1074,6 +1102,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1107,6 +1136,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1143,6 +1173,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1176,6 +1207,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1212,6 +1244,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -1542,15 +1575,20 @@ mod test {
 
     #[gtest]
     fn test_isvalid_narrows_nil_from_nullable_type() {
-        // Bug repro: IsValid(maybe) should narrow away nil in the true branch
+        // Bug repro: annotated IsValid(maybe) should narrow away nil in the true branch.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@type string?
-            local maybe = "string"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if IsValid(maybe) then
-                maybe:reverse()
+                maybe:GetEditingData()
             end
             "#,
         ));
@@ -1558,17 +1596,22 @@ mod test {
 
     #[gtest]
     fn test_isvalid_narrows_nil_negative_branch() {
-        // Bug repro: if not IsValid(x) then return end — x should be non-nil after
+        // Bug repro: if not IsValid(x) then return end; x should be non-nil after.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@type string?
-            local maybe = "string"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if not IsValid(maybe) then
                 return
             end
-            maybe:reverse()
+            maybe:GetEditingData()
             "#,
         ));
     }
@@ -1576,6 +1619,7 @@ mod test {
     #[gtest]
     fn test_isvalid_narrows_reassigned_clientside_model_negative_branch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -1605,6 +1649,7 @@ mod test {
     #[gtest]
     fn test_isvalid_narrows_net_read_entity_negative_branch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
@@ -1631,10 +1676,12 @@ mod test {
     fn test_isvalid_narrows_loop_assigned_local_negative_branch() {
         // GMod pattern: find an object in a loop, then guard it with IsValid before use.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::UncheckedNilAccess,
             r#"
-            ---@class Player
+            ---@class Entity
+            ---@class Player : Entity
             ---@field ExitVehicle fun(self: Player)
             ---@return Player[]
             function getPlayers() end
@@ -1705,6 +1752,103 @@ mod test {
                 "#,
             ),
             eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_plain_isvalid_prior_guard_does_not_suppress_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/autorun/isvalid.lua",
+            r#"
+            function IsValid(_)
+                return true
+            end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_file_for(
+                DiagnosticCode::NeedCheckNil,
+                "lua/autorun/use.lua",
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+                ---@return Player?
+                function maybePlayer() end
+
+                local bot = maybePlayer()
+                if not IsValid(bot) then
+                    return
+                end
+
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_custom_type_guard_prior_guard_suppresses_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Player
+                ---@field ExitVehicle fun(self: Player)
+                ---@return Player?
+                function maybePlayer() end
+
+                ---@param value any
+                ---@return TypeGuard<Player>
+                function check_player(value) end
+
+                local bot = maybePlayer()
+                if not check_player(bot) then
+                    return
+                end
+
+                bot:ExitVehicle()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_method_type_guard_prior_guard_suppresses_null_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Entity
+                ---@field GetEditingData fun(self: Entity): table
+                ---@class NULL : Entity
+                ---@alias EntityOrNULL Entity|NULL
+
+                ---@return TypeGuard<Entity>
+                ---@return_cast self -NULL
+                function Entity:IsValid() end
+
+                ---@return EntityOrNULL
+                function getEntity() end
+
+                local ent = getEntity()
+                if not ent:IsValid() then
+                    return
+                end
+
+                ent:GetEditingData()
+                "#,
+            ),
+            eq(true)
         );
     }
 
@@ -1790,23 +1934,29 @@ mod test {
     }
 
     #[gtest]
-    fn test_cached_builtin_isvalid_prior_guard_suppresses_nil_diagnostic() {
+    fn test_cached_annotated_isvalid_prior_guard_suppresses_nil_diagnostic() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@class Player
-            ---@field ExitVehicle fun(self: Player)
-            ---@return Player?
-            function maybePlayer() end
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
+            ---@return Entity?
+            function maybeEntity() end
 
             local IsValid = IsValid
-            local bot = maybePlayer()
-            if not IsValid(bot) then
+            local ent = maybeEntity()
+            if not IsValid(ent) then
                 return
             end
 
-            bot:ExitVehicle()
+            ent:GetEditingData()
             "#,
         ));
     }
@@ -1831,11 +1981,9 @@ mod test {
     #[gtest]
     fn test_isvalid_with_glua_library_annotations() {
         // Test that simulates production: load an IsValid annotation from a "library" file
-        // This tests whether loading IsValid with @return boolean (as in output/global.lua)
-        // conflicts with the hardcoded try_narrow_isvalid fallback
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // and verify the TypeGuard annotation drives nil narrowing.
+        let mut ws = VirtualWorkspace::new();
 
-        // Simulate the GLua annotation library defining IsValid with boolean return
         let library_root = ws.virtual_url_generator.new_path("__test_library_isvalid");
         ws.analysis.add_library_workspace(library_root.clone());
         let library_uri =
@@ -1844,8 +1992,13 @@ mod test {
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+
             ---@param toBeValidated any The table or object to be validated.
-            ---@return boolean # True if the object is valid.
+            ---@return TypeGuard<any> # True if the object is valid.
+            ---@return_cast toBeValidated -NULL
             function _G.IsValid(toBeValidated) end
             "#
                 .to_string(),
@@ -1855,10 +2008,12 @@ mod test {
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@type string?
-            local maybe = "string"
-            if IsValid(maybe) then
-                maybe:reverse()
+            ---@return Entity?
+            function maybeEntity() end
+
+            local ent = maybeEntity()
+            if IsValid(ent) then
+                ent:GetEditingData()
             end
             "#,
         ));
@@ -1887,7 +2042,8 @@ mod test {
                 ---@alias EntityOrNULL Entity|NULL
 
                 ---@param value any
-                ---@return boolean
+                ---@return TypeGuard<any>
+                ---@return_cast value -NULL
                 function _G.IsValid(value) end
                 "#
                 .to_string(),
@@ -1926,7 +2082,8 @@ mod test {
             ---@alias EntityOrNULL Entity|NULL
 
             ---@param value any
-            ---@return boolean
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
             function _G.IsValid(value) end
             "#,
         );
@@ -1953,14 +2110,20 @@ mod test {
         // Regression: `local IsValid = IsValid` is common in GMod addons for performance.
         // The cached local must still narrow away nil.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+
+            ---@return Entity?
+            function maybeEntity() end
+
             local IsValid = IsValid
-            ---@type string?
-            local maybe = "string"
+            local maybe = maybeEntity()
             if IsValid(maybe) then
-                maybe:reverse()
+                maybe:GetEditingData()
             end
             "#,
         ));
@@ -1987,6 +2150,11 @@ mod test {
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
             local isValid = IsValid
             local ent = getEntity()
             if not isValid(ent) then
@@ -2970,6 +3138,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -3014,6 +3183,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
@@ -3056,6 +3226,7 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity

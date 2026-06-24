@@ -3646,7 +3646,8 @@ local EscapeStringMap: {
                 function _G.Vector(x, y, z) end
 
                 ---@param ent any
-                ---@return boolean
+                ---@return TypeGuard<any>
+                ---@return_cast ent -NULL
                 function _G.IsValid(ent) end
 
                 ---@class NULL
@@ -3717,7 +3718,8 @@ local EscapeStringMap: {
                 function _G.Vector(x, y, z) end
 
                 ---@param ent any
-                ---@return boolean
+                ---@return TypeGuard<any>
+                ---@return_cast ent -NULL
                 function _G.IsValid(ent) end
 
                 ---@class NULL
@@ -3797,7 +3799,8 @@ local EscapeStringMap: {
                 function _G.Vector(x, y, z) end
 
                 ---@param ent any
-                ---@return boolean
+                ---@return TypeGuard<any>
+                ---@return_cast ent -NULL
                 function _G.IsValid(ent) end
 
                 ---@class NULL

@@ -109,7 +109,8 @@ fn collect_call_site_param_types(
     }
 
     let prefix_expr = call_expr.get_prefix_expr()?;
-    let signature_id = signature_id_from_call_prefix(db, file_id, &prefix_expr)?;
+    let signature_id =
+        signature_id_from_call_prefix(db, file_id, &prefix_expr, call_expr.get_position())?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
         return None;
     }
@@ -221,12 +222,15 @@ fn signature_id_from_call_prefix(
     db: &DbIndex,
     file_id: FileId,
     prefix_expr: &LuaExpr,
+    call_position: TextSize,
 ) -> Option<LuaSignatureId> {
     match prefix_expr {
-        LuaExpr::NameExpr(name_expr) => signature_id_from_name_expr(db, file_id, name_expr),
+        LuaExpr::NameExpr(name_expr) => {
+            signature_id_from_name_expr(db, file_id, name_expr, call_position)
+        }
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().and_then(|path| {
             db.get_call_site_param_index()
-                .get_source_signature_for_file(path.as_str(), file_id)
+                .get_source_signature_for_file_at(path.as_str(), file_id, call_position)
         }),
         _ => None,
     }
@@ -236,10 +240,11 @@ fn signature_id_from_name_expr(
     db: &DbIndex,
     file_id: FileId,
     name_expr: &LuaNameExpr,
+    call_position: TextSize,
 ) -> Option<LuaSignatureId> {
     let name = name_expr.get_name_text()?;
     db.get_call_site_param_index()
-        .get_source_signature_for_file(name.as_str(), file_id)
+        .get_source_signature_for_file_at(name.as_str(), file_id, call_position)
 }
 
 fn is_call_site_realm_compatible(

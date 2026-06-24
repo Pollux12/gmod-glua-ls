@@ -2469,17 +2469,26 @@ mod test {
         ws: &VirtualWorkspace,
         file_id: crate::FileId,
     ) -> LuaSignatureId {
+        find_closure_signature_ids(ws, file_id)
+            .into_iter()
+            .next()
+            .expect("expected closure")
+    }
+
+    fn find_closure_signature_ids(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+    ) -> Vec<LuaSignatureId> {
         let semantic_model = ws
             .analysis
             .compilation
             .get_semantic_model(file_id)
             .expect("semantic model must exist");
-        let closure = semantic_model
+        semantic_model
             .get_root()
             .descendants::<LuaClosureExpr>()
-            .next()
-            .expect("expected closure");
-        LuaSignatureId::from_closure(file_id, &closure)
+            .map(|closure| LuaSignatureId::from_closure(file_id, &closure))
+            .collect()
     }
 
     #[gtest]
@@ -2711,6 +2720,58 @@ mod test {
             matches!(file_b_param, LuaType::Integer | LuaType::IntegerConst(_)),
             "expected integer evidence for file_b, got {file_b_param:?}"
         );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_call_site_param_inference_uses_visible_signature_before_redefinition() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .file_param_defaults
+            .insert("veh".to_string(), "DefaultVehicle".to_string());
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            function Handle(veh)
+                local snapshot_a = veh
+                return snapshot_a
+            end
+
+            Handle("sedan")
+
+            function Handle(veh)
+                local snapshot_b = veh
+                return snapshot_b
+            end
+
+            Handle(123)
+            "#,
+        );
+
+        let signatures = find_closure_signature_ids(&ws, file_id);
+        assert_that!(signatures.len(), eq(2));
+
+        let (first_param, second_param) = {
+            let db = ws.analysis.compilation.get_db();
+            (
+                db.get_call_site_param_index()
+                    .get_inferred_param(&signatures[0], 0)
+                    .cloned()
+                    .expect("expected call-site evidence for first Handle"),
+                db.get_call_site_param_index()
+                    .get_inferred_param(&signatures[1], 0)
+                    .cloned()
+                    .expect("expected call-site evidence for second Handle"),
+            )
+        };
+
+        assert!(ws.check_type(&first_param, &LuaType::String));
+        assert!(ws.check_type(&second_param, &LuaType::Integer));
 
         Ok(())
     }

@@ -1,21 +1,25 @@
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexKey, LuaIndexMemberExpr};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr, LuaNameExpr};
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind, LuaAliasCallType,
-    LuaFunctionType, LuaInferCache, LuaSignatureCast, LuaSignatureId, LuaType, TypeOps,
-    infer_call_expr_func, infer_expr,
-    semantic::infer::{
-        VarRefId,
-        infer_index::infer_member_by_member_key,
-        infer_param_with_cache,
-        narrow::{
-            ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow, narrow_down_type,
-            narrow_false_or_nil, remove_false_or_nil, remove_gmod_null_type,
-            var_ref_id::get_var_expr_var_ref_id,
+    LuaFunctionType, LuaInferCache, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
+    TypeOps, infer_call_expr_func, infer_expr,
+    semantic::{
+        SemanticDeclGuard, SemanticDeclLevel, get_member_value_expr,
+        infer::{
+            VarRefId,
+            infer_index::infer_member_by_member_key,
+            infer_param_with_cache,
+            narrow::{
+                ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
+                get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow,
+                narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+                var_ref_id::get_var_expr_var_ref_id,
+            },
         },
+        infer_expr_semantic_decl,
     },
 };
 
@@ -34,17 +38,22 @@ pub fn get_type_at_call_expr(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    // Keep references for potential IsValid fallback
+    // Keep references for predicate fallbacks that need the original call shape.
     let call_expr_ref = call_expr.clone();
     let prefix_expr_ref = prefix_expr.clone();
 
     // If we can't infer the function type (e.g. undefined global like `isfunction`),
-    // skip type-based narrowing but still fall through to name-based fallbacks
-    // (IsValid, isfunction, etc.) at the end.
+    // skip type-based narrowing but still fall through to supported fallback handling.
     let result = match infer_expr(db, cache, prefix_expr.clone()) {
         Err(_) => Ok(ResultTypeOrContinue::Continue),
         Ok(maybe_func) => match maybe_func {
             LuaType::DocFunction(f) => {
+                let signature_cast =
+                    get_call_prefix_signature_id(db, cache, &call_expr).and_then(|signature_id| {
+                        db.get_flow_index()
+                            .get_signature_cast(&signature_id)
+                            .map(|cast| (cast, signature_id))
+                    });
                 let return_type = f.get_ret();
                 match return_type {
                     LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
@@ -56,6 +65,7 @@ pub fn get_type_at_call_expr(
                         flow_node,
                         call_expr,
                         f,
+                        signature_cast,
                         condition_flow,
                     ),
                     _ => {
@@ -70,6 +80,7 @@ pub fn get_type_at_call_expr(
                 };
 
                 let ret = signature.get_return_type();
+                let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
                 match ret {
                     LuaType::TypeGuard(_) => {
                         return get_type_at_call_expr_by_type_guard(
@@ -81,6 +92,7 @@ pub fn get_type_at_call_expr(
                             flow_node,
                             call_expr,
                             signature.to_doc_func_type(),
+                            signature_cast.map(|cast| (cast, signature_id)),
                             condition_flow,
                         );
                     }
@@ -100,8 +112,7 @@ pub fn get_type_at_call_expr(
                     _ => {}
                 }
 
-                if let Some(signature_cast) = db.get_flow_index().get_signature_cast(&signature_id)
-                {
+                if let Some(signature_cast) = signature_cast {
                     return match signature_cast.name.as_str() {
                         "self" => get_type_at_call_expr_by_signature_self(
                             db,
@@ -131,8 +142,8 @@ pub fn get_type_at_call_expr(
                     };
                 }
 
-                // No @cast annotation found — fall through so IsValid/isfunction
-                // name-based narrowing can still run as a fallback.
+                // No @cast annotation found — fall through so supported predicate
+                // fallback narrowing can still run.
                 Ok(ResultTypeOrContinue::Continue)
             }
             _ => {
@@ -142,8 +153,8 @@ pub fn get_type_at_call_expr(
         },
     };
 
-    // Fallback: check for IsValid pattern (Garry's Mod nil check) when normal
-    // type-based narrowing didn't produce a result
+    // Fallback: check supported predicate patterns when normal type-based
+    // narrowing didn't produce a result.
     if let Ok(ResultTypeOrContinue::Continue) = result {
         if let Some(isfunction_type) = try_narrow_isfunction_member(
             db,
@@ -157,20 +168,6 @@ pub fn get_type_at_call_expr(
             condition_flow,
         )? {
             return Ok(ResultTypeOrContinue::Result(isfunction_type));
-        }
-
-        if let Some(isvalid_type) = try_narrow_isvalid(
-            db,
-            tree,
-            cache,
-            root,
-            var_ref_id,
-            flow_node,
-            &call_expr_ref,
-            &prefix_expr_ref,
-            condition_flow,
-        )? {
-            return Ok(ResultTypeOrContinue::Result(isvalid_type));
         }
 
         if let Some(fallback_target_expr) =
@@ -188,20 +185,6 @@ pub fn get_type_at_call_expr(
                 condition_flow,
             )? {
                 return Ok(ResultTypeOrContinue::Result(isfunction_type));
-            }
-
-            if let Some(isvalid_type) = try_narrow_isvalid(
-                db,
-                tree,
-                cache,
-                root,
-                var_ref_id,
-                flow_node,
-                &call_expr_ref,
-                &fallback_target_expr,
-                condition_flow,
-            )? {
-                return Ok(ResultTypeOrContinue::Result(isvalid_type));
             }
         }
     }
@@ -288,7 +271,7 @@ fn is_unshadowed_gmod_guard_global_name(
     };
 
     let helper_name = helper_name.as_str();
-    if helper_name != "IsValid" && helper_name != "isfunction" {
+    if helper_name != "isfunction" {
         return false;
     }
 
@@ -436,17 +419,14 @@ fn get_type_at_call_expr_by_type_guard(
     flow_node: &FlowNode,
     call_expr: LuaCallExpr,
     func_type: Arc<LuaFunctionType>,
+    signature_cast: Option<(&LuaSignatureCast, LuaSignatureId)>,
     condition_flow: InferConditionFlow,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    let Some(arg_list) = call_expr.get_args_list() else {
+    let Some(target_expr) = type_guard_target_expr(&call_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    let Some(first_arg) = arg_list.get_args().next() else {
-        return Ok(ResultTypeOrContinue::Continue);
-    };
-
-    let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, first_arg) else {
+    let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
@@ -460,7 +440,7 @@ fn get_type_at_call_expr_by_type_guard(
         let inst_func = infer_call_expr_func(
             db,
             cache,
-            call_expr,
+            call_expr.clone(),
             call_expr_type,
             &InferGuard::new(),
             None,
@@ -477,14 +457,44 @@ fn get_type_at_call_expr_by_type_guard(
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
-    match condition_flow {
-        InferConditionFlow::TrueCondition => Ok(ResultTypeOrContinue::Result(
-            narrow_type_guard_true_branch(db, cache, var_ref_id, antecedent_type, guard_type),
-        )),
-        InferConditionFlow::FalseCondition => Ok(ResultTypeOrContinue::Result(
-            TypeOps::Remove.apply(db, &antecedent_type, &guard_type),
-        )),
+    let result_type = match condition_flow {
+        InferConditionFlow::TrueCondition => {
+            narrow_type_guard_true_branch(db, cache, var_ref_id, antecedent_type, guard_type)
+        }
+        InferConditionFlow::FalseCondition => {
+            TypeOps::Remove.apply(db, &antecedent_type, &guard_type)
+        }
+    };
+
+    let result_type = if let Some((signature_cast, signature_id)) = signature_cast {
+        apply_signature_cast_to_type_guard_result(
+            db,
+            cache,
+            &call_expr,
+            var_ref_id,
+            result_type,
+            signature_cast,
+            signature_id,
+            condition_flow,
+        )?
+    } else {
+        result_type
+    };
+
+    Ok(ResultTypeOrContinue::Result(result_type))
+}
+
+fn type_guard_target_expr(call_expr: &LuaCallExpr) -> Option<LuaExpr> {
+    if call_expr.is_colon_call()
+        && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
+        && let Some(self_expr) = index_expr.get_prefix_expr()
+    {
+        return Some(self_expr);
     }
+
+    call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
 }
 
 fn narrow_type_guard_true_branch(
@@ -494,6 +504,14 @@ fn narrow_type_guard_true_branch(
     antecedent_type: LuaType,
     guard_type: LuaType,
 ) -> LuaType {
+    if guard_type.is_any() {
+        return if antecedent_type.is_unknown() {
+            LuaType::Any
+        } else {
+            remove_false_or_nil(antecedent_type)
+        };
+    }
+
     if guard_type.is_nullable() {
         return guard_type;
     }
@@ -544,6 +562,229 @@ fn is_inferred_mutable_param_without_declared_type(
     db.get_reference_index()
         .get_decl_references(&decl_id.file_id, &decl_id)
         .is_some_and(|decl_refs| decl_refs.mutable)
+}
+
+fn get_call_prefix_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaSignatureId> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    get_callable_expr_signature_id(db, cache, prefix_expr, 0)
+}
+
+fn get_callable_expr_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    depth: usize,
+) -> Option<LuaSignatureId> {
+    if depth > 8 {
+        return None;
+    }
+
+    if let LuaExpr::NameExpr(name_expr) = &expr
+        && let Some(signature_id) = get_local_name_signature_id(db, cache, name_expr, depth)
+    {
+        return Some(signature_id);
+    }
+
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )?;
+
+    get_signature_id_from_semantic_decl_value_expr(db, cache, semantic_decl, depth)
+}
+
+fn get_local_name_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+    depth: usize,
+) -> Option<LuaSignatureId> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let value_expr = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+
+    if let LuaExpr::ClosureExpr(closure) = &value_expr {
+        return Some(LuaSignatureId::from_closure(decl.get_file_id(), closure));
+    }
+
+    get_callable_expr_signature_id(db, cache, value_expr, depth + 1)
+}
+
+fn get_signature_id_from_semantic_decl_value_expr(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    semantic_decl: LuaSemanticDeclId,
+    depth: usize,
+) -> Option<LuaSignatureId> {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+
+    match &semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&(*decl_id).into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&(*member_id).into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+        }
+        LuaSemanticDeclId::Signature(signature_id) => return Some(*signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    }
+
+    let file_id = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
+        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+
+    let value_expr = get_semantic_decl_value_expr(db, semantic_decl)?;
+    if let LuaExpr::ClosureExpr(closure) = &value_expr {
+        return Some(LuaSignatureId::from_closure(file_id, closure));
+    }
+
+    get_callable_expr_signature_id(db, cache, value_expr, depth + 1)
+}
+
+fn get_semantic_decl_value_expr(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> Option<LuaExpr> {
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+        }
+        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn apply_signature_cast_to_type_guard_result(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    var_ref_id: &VarRefId,
+    result_type: LuaType,
+    signature_cast: &LuaSignatureCast,
+    signature_id: LuaSignatureId,
+    condition_flow: InferConditionFlow,
+) -> Result<LuaType, InferFailReason> {
+    let Some(cast_target_expr) =
+        signature_cast_target_expr(db, call_expr, signature_id, signature_cast.name.as_str())
+    else {
+        return Ok(result_type);
+    };
+
+    let Some(cast_target_ref_id) = get_var_expr_var_ref_id(db, cache, cast_target_expr) else {
+        return Ok(result_type);
+    };
+
+    if cast_target_ref_id != *var_ref_id {
+        return Ok(result_type);
+    }
+
+    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
+        return Ok(result_type);
+    };
+    let signature_root = syntax_tree.get_chunk_node();
+
+    match condition_flow {
+        InferConditionFlow::TrueCondition => {
+            let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
+                return Ok(result_type);
+            };
+            cast_type(
+                db,
+                signature_id.get_file_id(),
+                cast_op_type,
+                result_type,
+                condition_flow,
+            )
+        }
+        InferConditionFlow::FalseCondition => {
+            if let Some(fallback_cast_ptr) = &signature_cast.fallback_cast {
+                let Some(fallback_op_type) = fallback_cast_ptr.to_node(&signature_root) else {
+                    return Ok(result_type);
+                };
+                cast_type(
+                    db,
+                    signature_id.get_file_id(),
+                    fallback_op_type,
+                    result_type,
+                    InferConditionFlow::TrueCondition,
+                )
+            } else {
+                let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
+                    return Ok(result_type);
+                };
+                cast_type(
+                    db,
+                    signature_id.get_file_id(),
+                    cast_op_type,
+                    result_type,
+                    condition_flow,
+                )
+            }
+        }
+    }
+}
+
+fn signature_cast_target_expr(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    name: &str,
+) -> Option<LuaExpr> {
+    if name == "self" {
+        let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+            return None;
+        };
+        return index_expr.get_prefix_expr();
+    }
+
+    let arg_list = call_expr.get_args_list()?;
+    let signature = db.get_signature_index().get(&signature_id)?;
+    let mut param_idx = signature.find_param_idx(name)?;
+
+    match (call_expr.is_colon_call(), signature.is_colon_define) {
+        (true, false) => {
+            if param_idx == 0 {
+                return None;
+            }
+
+            param_idx -= 1;
+        }
+        (false, true) => {
+            param_idx += 1;
+        }
+        _ => {}
+    }
+
+    arg_list.get_args().nth(param_idx)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -771,87 +1012,4 @@ fn get_type_at_call_expr_by_call(
     };
 
     Ok(ResultTypeOrContinue::Continue)
-}
-
-/// Detect `IsValid(x)` or `x:IsValid()` calls and narrow the argument/self type
-/// to remove nil/false in the true branch. This is essential for Garry's Mod where
-/// IsValid is the standard nil/validity check.
-#[allow(clippy::too_many_arguments)]
-fn try_narrow_isvalid(
-    db: &DbIndex,
-    tree: &FlowTree,
-    cache: &mut LuaInferCache,
-    root: &LuaChunk,
-    var_ref_id: &VarRefId,
-    flow_node: &FlowNode,
-    call_expr: &LuaCallExpr,
-    prefix_expr: &LuaExpr,
-    condition_flow: InferConditionFlow,
-) -> Result<Option<LuaType>, InferFailReason> {
-    // Determine if this is an IsValid call and get the target expression to narrow
-    let target_expr = match prefix_expr {
-        // Global call: IsValid(x)
-        LuaExpr::NameExpr(name_expr) => {
-            if name_expr.get_name_text().as_deref() != Some("IsValid") {
-                return Ok(None);
-            }
-            if !is_unshadowed_gmod_guard_global_name(db, cache, name_expr) {
-                return Ok(None);
-            }
-            let arg_list = match call_expr.get_args_list() {
-                Some(list) => list,
-                None => return Ok(None),
-            };
-            match arg_list.get_args().next() {
-                Some(first_arg) => first_arg,
-                None => return Ok(None),
-            }
-        }
-        // Method call: x:IsValid() (only colon syntax, not dot syntax)
-        LuaExpr::IndexExpr(index_expr) => {
-            if !call_expr.is_colon_call() {
-                return Ok(None);
-            }
-            let is_isvalid = match index_expr.get_index_key() {
-                Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "IsValid",
-                _ => false,
-            };
-            if !is_isvalid {
-                return Ok(None);
-            }
-            match index_expr.get_prefix_expr() {
-                Some(self_expr) => self_expr,
-                None => return Ok(None),
-            }
-        }
-        _ => return Ok(None),
-    };
-
-    // Check if the target expression matches the variable we're narrowing
-    let Some(target_ref_id) = get_var_expr_var_ref_id(db, cache, target_expr) else {
-        return Ok(None);
-    };
-    if target_ref_id != *var_ref_id {
-        return Ok(None);
-    }
-
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-
-    let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => promote_unknown_isvalid_success_to_any(
-            remove_gmod_null_type(db, remove_false_or_nil(antecedent_type)),
-        ),
-        InferConditionFlow::FalseCondition => antecedent_type,
-    };
-
-    Ok(Some(result_type))
-}
-
-fn promote_unknown_isvalid_success_to_any(narrowed_type: LuaType) -> LuaType {
-    if narrowed_type.is_unknown() {
-        LuaType::Any
-    } else {
-        narrowed_type
-    }
 }

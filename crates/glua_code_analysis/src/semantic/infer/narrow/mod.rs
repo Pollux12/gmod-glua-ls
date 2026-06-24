@@ -6,7 +6,7 @@ mod var_ref_id;
 
 use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
-    LuaInferCache, LuaType, TypeOps,
+    LuaInferCache, LuaType,
     db_index::LuaTypeDeclId,
     get_real_type, infer_param_with_cache,
     semantic::cache::FlowOrigin,
@@ -15,6 +15,8 @@ use crate::{
         infer_name::{find_decl_member_type, infer_global_type},
     },
 };
+pub(crate) use condition_flow::InferConditionFlow;
+pub(crate) use get_type_at_cast_flow::cast_type;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
@@ -60,33 +62,6 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
             .iter()
             .any(|(member, _)| contains_gmod_null_type(db, member)),
         LuaType::Instance(instance_type) => contains_gmod_null_type(db, instance_type.get_base()),
-        _ => false,
-    }
-}
-
-pub(crate) fn remove_gmod_null_type(db: &DbIndex, typ: LuaType) -> LuaType {
-    if !db.get_emmyrc().gmod.enabled {
-        return typ;
-    }
-
-    if is_gmod_null_type(db, &typ) {
-        return LuaType::Never;
-    }
-
-    let removed_ref = TypeOps::Remove.apply(db, &typ, &gmod_null_type());
-    let null_def = LuaType::Def(gmod_null_decl_id());
-    TypeOps::Remove.apply(db, &removed_ref, &null_def)
-}
-
-fn is_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
-        return false;
-    }
-
-    let real_type = get_real_type(db, typ).unwrap_or(typ);
-    match real_type {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
-        LuaType::Instance(instance_type) => is_gmod_null_type(db, instance_type.get_base()),
         _ => false,
     }
 }

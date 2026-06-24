@@ -167,7 +167,7 @@ mod test {
             ---@field health integer
 
             ---@param obj any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(obj) end
             "#
                 .to_string(),
@@ -219,6 +219,102 @@ mod test {
             end
             "#
         ));
+    }
+
+    #[test]
+    fn test_type_guard_return_cast_removes_null_in_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+
+            local ply = GetPlayerOrNULL()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_cross_file_type_guard_return_cast_removes_null_in_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+
+            local ply = GetPlayerOrNULL()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_type_guard_any_false_branch_preserves_antecedent() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Entity?
+            function GetEntityOrNil() end
+
+            local ent = GetEntityOrNil()
+            if not IsValid(ent) then
+                ent
+            end
+            "#,
+            "ent",
+        );
+
+        assert_eq!(ty, ws.ty("Entity?"));
     }
 
     #[test]

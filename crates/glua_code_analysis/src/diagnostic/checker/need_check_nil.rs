@@ -7,8 +7,13 @@ use glua_parser::{
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType,
-    SemanticModel, get_var_expr_var_ref_id, semantic::contains_gmod_null_type,
+    DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+    LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
+    get_var_expr_var_ref_id,
+    semantic::{
+        InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
+        remove_false_or_nil,
+    },
 };
 
 use super::{
@@ -78,19 +83,12 @@ fn check_call_expr(
 
     let is_receiver_guarded_by_type_guard = if let LuaExpr::IndexExpr(index_expr) = &prefix
         && let Some(receiver) = index_expr.get_prefix_expr()
-        && is_short_circuit_type_guard_for_receiver(semantic_model, &call_expr, &receiver)
     {
-        true
+        is_short_circuit_type_guard_for_receiver(semantic_model, &call_expr, &receiver)
+            || is_non_nullable_receiver_self_type_guard(semantic_model, &call_expr, &receiver)
     } else {
         false
     };
-
-    if let LuaExpr::IndexExpr(index_expr) = &prefix
-        && let Some(receiver) = index_expr.get_prefix_expr()
-        && is_short_circuit_isvalid_guard_for_receiver(&call_expr, &receiver)
-    {
-        return Some(());
-    }
 
     if let LuaExpr::IndexExpr(index_expr) = &prefix {
         let receiver = index_expr.get_prefix_expr()?;
@@ -201,11 +199,19 @@ fn report_unsafe_receiver(
         Err(_) => return false,
     };
     if receiver_type.is_nullable() {
-        // If the type contains GMod NULL, use IsValid-only matching —
+        // If the type contains GMod NULL, use TypeGuard-only matching.
         // NULL is truthy, so `not expr` does not prove validity.
         let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &receiver_type);
         let guarded = if has_gmod_null {
-            is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver)
+            is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
+                semantic_model,
+                receiver,
+                &receiver_type,
+            ) || is_expr_guarded_by_current_null_excluding_type_guard_condition(
+                semantic_model,
+                receiver,
+                &receiver_type,
+            )
         } else {
             is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver)
         };
@@ -237,8 +243,16 @@ fn report_unsafe_receiver(
     }
 
     // NULL is truthy in GLua, so `not ent` does NOT prove entity validity.
-    // Only IsValid-based guards suppress NULL diagnostics.
-    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, receiver) {
+    // Only annotation-backed TypeGuard calls suppress NULL diagnostics.
+    if is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
+        semantic_model,
+        receiver,
+        &receiver_type,
+    ) || is_expr_guarded_by_current_null_excluding_type_guard_condition(
+        semantic_model,
+        receiver,
+        &receiver_type,
+    ) {
         return false;
     }
 
@@ -294,11 +308,19 @@ fn check_index_expr(
             return Some(());
         }
 
-        // If the type contains GMod NULL, use IsValid-only matching —
+        // If the type contains GMod NULL, use TypeGuard-only matching.
         // NULL is truthy, so `not expr` does not prove validity.
         let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &prefix_type);
         let guarded = if has_gmod_null {
-            is_expr_guarded_by_prior_isvalid_early_return(semantic_model, &prefix)
+            is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
+                semantic_model,
+                &prefix,
+                &prefix_type,
+            ) || is_expr_guarded_by_current_null_excluding_type_guard_condition(
+                semantic_model,
+                &prefix,
+                &prefix_type,
+            )
         } else {
             is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix)
         };
@@ -372,25 +394,83 @@ fn literal_member_key(index_expr: &LuaIndexExpr) -> Option<LuaMemberKey> {
     }
 }
 
-fn is_expr_guarded_by_prior_isvalid_early_return(
+fn is_expr_guarded_by_prior_type_guard_early_return(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> bool {
     is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
-        condition_is_negative_isvalid_guard(semantic_model, condition, guarded)
+        condition_is_negative_type_guard(semantic_model, condition, guarded)
     })
 }
 
-/// Combined guard: checks both IsValid-specific and general negation guards.
-/// The IsValid guard uses structural var_ref_id matching (precise but limited);
+fn is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
+        condition_is_negative_null_excluding_type_guard(
+            semantic_model,
+            condition,
+            guarded,
+            expr_type,
+        )
+    })
+}
+
+fn is_expr_guarded_by_current_null_excluding_type_guard_condition(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    let expr_range = expr.syntax().text_range();
+    for ancestor in expr.syntax().ancestors() {
+        if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
+            if let Some(condition) = if_stat.get_condition_expr()
+                && if_stat
+                    .get_block()
+                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                && condition_is_positive_null_excluding_type_guard(
+                    semantic_model,
+                    &condition,
+                    expr,
+                    expr_type,
+                )
+            {
+                return true;
+            }
+
+            for elseif_clause in if_stat.get_else_if_clause_list() {
+                if let Some(condition) = elseif_clause.get_condition_expr()
+                    && elseif_clause.get_block().is_some_and(|block| {
+                        range_contains(block.syntax().text_range(), expr_range)
+                    })
+                    && condition_is_positive_null_excluding_type_guard(
+                        semantic_model,
+                        &condition,
+                        expr,
+                        expr_type,
+                    )
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
+/// Combined guard: checks both TypeGuard-specific and general negation guards.
+/// The TypeGuard guard uses structural var_ref_id matching (precise but limited);
 /// the general negation guard uses text-based matching (handles dynamic-key
 /// index expressions like `self.Objects[i]` that var_ref_id can't track).
 fn is_expr_guarded_by_prior_nil_early_return(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> bool {
-    // Try IsValid guard first (structural, more precise)
-    if is_expr_guarded_by_prior_isvalid_early_return(semantic_model, expr) {
+    // Try annotation-backed guard first (structural, more precise)
+    if is_expr_guarded_by_prior_type_guard_early_return(semantic_model, expr) {
         return true;
     }
     // Fall back to general negation guard (text-based, handles dynamic keys)
@@ -401,7 +481,7 @@ fn is_expr_guarded_by_prior_nil_early_return(
 
 /// Walks prior sibling `if` statements to find an early-return guard for `expr`.
 /// The `condition_matches` closure determines whether the if-condition matches
-/// the guarded expression (e.g. via `IsValid` or a general negation check).
+/// the guarded expression (e.g. via a TypeGuard call or a general negation check).
 fn is_expr_guarded_by_prior_early_return<F>(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
@@ -881,7 +961,7 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
     })
 }
 
-fn condition_is_negative_isvalid_guard(
+fn condition_is_negative_type_guard(
     semantic_model: &SemanticModel,
     condition: &LuaExpr,
     guarded_expr: &LuaExpr,
@@ -899,10 +979,10 @@ fn condition_is_negative_isvalid_guard(
             };
             match inner_expr {
                 LuaExpr::CallExpr(call_expr) => {
-                    is_isvalid_call_guarding_var(semantic_model, &call_expr, guarded_expr)
+                    is_type_guard_call_guarding_expr(semantic_model, &call_expr, guarded_expr)
                 }
                 LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
-                    condition_is_negative_isvalid_guard(semantic_model, &expr, guarded_expr)
+                    condition_is_negative_type_guard(semantic_model, &expr, guarded_expr)
                 }),
                 _ => false,
             }
@@ -917,18 +997,134 @@ fn condition_is_negative_isvalid_guard(
             let Some((left, right)) = binary_expr.get_exprs() else {
                 return false;
             };
-            condition_is_negative_isvalid_guard(semantic_model, &left, guarded_expr)
-                || condition_is_negative_isvalid_guard(semantic_model, &right, guarded_expr)
+            condition_is_negative_type_guard(semantic_model, &left, guarded_expr)
+                || condition_is_negative_type_guard(semantic_model, &right, guarded_expr)
         }
         LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
-            condition_is_negative_isvalid_guard(semantic_model, &expr, guarded_expr)
+            condition_is_negative_type_guard(semantic_model, &expr, guarded_expr)
+        }),
+        _ => false,
+    }
+}
+
+fn condition_is_negative_null_excluding_type_guard(
+    semantic_model: &SemanticModel,
+    condition: &LuaExpr,
+    guarded_expr: &LuaExpr,
+    guarded_type: &LuaType,
+) -> bool {
+    match condition {
+        LuaExpr::UnaryExpr(unary_expr) => {
+            let Some(op) = unary_expr.get_op_token() else {
+                return false;
+            };
+            if op.get_op() != UnaryOperator::OpNot {
+                return false;
+            }
+            let Some(inner_expr) = unary_expr.get_expr() else {
+                return false;
+            };
+            match inner_expr {
+                LuaExpr::CallExpr(call_expr) => is_null_excluding_type_guard_call_guarding_expr(
+                    semantic_model,
+                    &call_expr,
+                    guarded_expr,
+                    guarded_type,
+                ),
+                LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+                    condition_is_negative_null_excluding_type_guard(
+                        semantic_model,
+                        &expr,
+                        guarded_expr,
+                        guarded_type,
+                    )
+                }),
+                _ => false,
+            }
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            if op != BinaryOperator::OpOr {
+                return false;
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return false;
+            };
+            condition_is_negative_null_excluding_type_guard(
+                semantic_model,
+                &left,
+                guarded_expr,
+                guarded_type,
+            ) || condition_is_negative_null_excluding_type_guard(
+                semantic_model,
+                &right,
+                guarded_expr,
+                guarded_type,
+            )
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+            condition_is_negative_null_excluding_type_guard(
+                semantic_model,
+                &expr,
+                guarded_expr,
+                guarded_type,
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn condition_is_positive_null_excluding_type_guard(
+    semantic_model: &SemanticModel,
+    condition: &LuaExpr,
+    guarded_expr: &LuaExpr,
+    guarded_type: &LuaType,
+) -> bool {
+    match condition {
+        LuaExpr::CallExpr(call_expr) => is_null_excluding_type_guard_call_guarding_expr(
+            semantic_model,
+            call_expr,
+            guarded_expr,
+            guarded_type,
+        ),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            if op != BinaryOperator::OpAnd {
+                return false;
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return false;
+            };
+            condition_is_positive_null_excluding_type_guard(
+                semantic_model,
+                &left,
+                guarded_expr,
+                guarded_type,
+            ) || condition_is_positive_null_excluding_type_guard(
+                semantic_model,
+                &right,
+                guarded_expr,
+                guarded_type,
+            )
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+            condition_is_positive_null_excluding_type_guard(
+                semantic_model,
+                &expr,
+                guarded_expr,
+                guarded_type,
+            )
         }),
         _ => false,
     }
 }
 
 /// Check if `condition` is a negated expression (`not <expr>`) where `<expr>`
-/// textually matches `guarded_expr`. This is the general form of the IsValid
+/// textually matches `guarded_expr`. This is the general form of the nil
 /// guard: `if not self.Objects[i] then return end` should suppress nil
 /// diagnostics on the subsequent `self.Objects[i]` access.
 ///
@@ -1066,17 +1262,6 @@ fn is_call_prefix(index_expr: &LuaIndexExpr) -> bool {
     call_prefix.syntax() == index_expr.syntax()
 }
 
-fn is_short_circuit_isvalid_guard_for_receiver(
-    call_expr: &LuaCallExpr,
-    receiver: &LuaExpr,
-) -> bool {
-    let Some(guard_call) = short_circuit_left_call_for_right_call(call_expr) else {
-        return false;
-    };
-
-    is_isvalid_call_guarding_expr(&guard_call, receiver)
-}
-
 fn is_short_circuit_type_guard_for_receiver(
     semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
@@ -1087,6 +1272,22 @@ fn is_short_circuit_type_guard_for_receiver(
     };
 
     is_type_guard_call_guarding_expr(semantic_model, &guard_call, receiver)
+}
+
+fn is_non_nullable_receiver_self_type_guard(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    receiver: &LuaExpr,
+) -> bool {
+    if !call_expr.is_colon_call()
+        || !is_type_guard_call_guarding_expr(semantic_model, call_expr, receiver)
+    {
+        return false;
+    }
+
+    semantic_model
+        .infer_expr(receiver.clone())
+        .is_ok_and(|receiver_type| !receiver_type.is_nullable())
 }
 
 fn short_circuit_left_call_for_right_call(call_expr: &LuaCallExpr) -> Option<LuaCallExpr> {
@@ -1117,6 +1318,13 @@ fn is_type_guard_call_guarding_expr(
         return false;
     };
 
+    if guard_call.is_colon_call()
+        && let Some(LuaExpr::IndexExpr(index_expr)) = guard_call.get_prefix_expr()
+        && let Some(self_expr) = index_expr.get_prefix_expr()
+    {
+        return exprs_reference_same_var(semantic_model, &self_expr, receiver);
+    }
+
     let Some(first_arg) = guard_call
         .get_args_list()
         .and_then(|args| args.get_args().next())
@@ -1127,53 +1335,253 @@ fn is_type_guard_call_guarding_expr(
     exprs_reference_same_var(semantic_model, &first_arg, receiver)
 }
 
+fn is_null_excluding_type_guard_call_guarding_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    guarded_expr: &LuaExpr,
+    guarded_type: &LuaType,
+) -> bool {
+    if !is_type_guard_call_guarding_expr(semantic_model, guard_call, guarded_expr) {
+        return false;
+    }
+
+    let Some((signature_id, signature_cast)) = call_signature_cast(semantic_model, guard_call)
+    else {
+        return false;
+    };
+    if !signature_cast_targets_guarded_expr(
+        semantic_model,
+        guard_call,
+        signature_id,
+        signature_cast,
+        guarded_expr,
+    ) {
+        return false;
+    }
+
+    let db = semantic_model.get_db();
+    let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
+        return false;
+    };
+    let signature_root = syntax_tree.get_chunk_node();
+    let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
+        return false;
+    };
+    let Ok(casted_type) = cast_type(
+        db,
+        signature_id.get_file_id(),
+        cast_op_type,
+        guarded_type.clone(),
+        InferConditionFlow::TrueCondition,
+    ) else {
+        return false;
+    };
+
+    !contains_gmod_null_type(db, &casted_type)
+}
+
+fn call_signature_cast<'a>(
+    semantic_model: &'a SemanticModel,
+    guard_call: &LuaCallExpr,
+) -> Option<(LuaSignatureId, &'a LuaSignatureCast)> {
+    let signature_id = call_signature_id(semantic_model, guard_call)?;
+    let signature_cast = semantic_model
+        .get_db()
+        .get_flow_index()
+        .get_signature_cast(&signature_id)?;
+    Some((signature_id, signature_cast))
+}
+
+fn call_signature_id(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+) -> Option<LuaSignatureId> {
+    let prefix = guard_call.get_prefix_expr()?;
+    if let Ok(LuaType::Signature(signature_id)) = semantic_model.infer_expr(prefix.clone()) {
+        return Some(signature_id);
+    }
+
+    let semantic_decl =
+        semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())?;
+    signature_id_from_semantic_decl(semantic_model, semantic_decl)
+}
+
+fn signature_id_from_semantic_decl(
+    semantic_model: &SemanticModel,
+    semantic_decl: LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    let db = semantic_model.get_db();
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+
+    match &semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&(*decl_id).into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&(*member_id).into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+        }
+        LuaSemanticDeclId::Signature(signature_id) => return Some(*signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    }
+
+    let file_id = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
+        LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+
+    let LuaExpr::ClosureExpr(closure) = semantic_decl_value_expr(semantic_model, semantic_decl)?
+    else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(file_id, &closure))
+}
+
+fn semantic_decl_value_expr(
+    semantic_model: &SemanticModel,
+    semantic_decl: LuaSemanticDeclId,
+) -> Option<LuaExpr> {
+    let db = semantic_model.get_db();
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+        }
+        LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+fn signature_cast_targets_guarded_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    signature_cast: &LuaSignatureCast,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    if signature_cast.name == "self" {
+        let Some(LuaExpr::IndexExpr(index_expr)) = guard_call.get_prefix_expr() else {
+            return false;
+        };
+        let Some(self_expr) = index_expr.get_prefix_expr() else {
+            return false;
+        };
+        return exprs_reference_same_var(semantic_model, &self_expr, guarded_expr);
+    }
+
+    let Some(arg_list) = guard_call.get_args_list() else {
+        return false;
+    };
+    let Some(signature) = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(&signature_id)
+    else {
+        return false;
+    };
+    let Some(mut param_idx) = signature.find_param_idx(signature_cast.name.as_str()) else {
+        return false;
+    };
+
+    match (guard_call.is_colon_call(), signature.is_colon_define) {
+        (true, false) => {
+            if param_idx == 0 {
+                return false;
+            }
+
+            param_idx -= 1;
+        }
+        (false, true) => {
+            param_idx += 1;
+        }
+        _ => {}
+    }
+
+    arg_list
+        .get_args()
+        .nth(param_idx)
+        .is_some_and(|arg_expr| exprs_reference_same_var(semantic_model, &arg_expr, guarded_expr))
+}
+
 fn call_returns_non_nullable_type_guard(
     semantic_model: &SemanticModel,
     guard_call: &LuaCallExpr,
 ) -> bool {
-    match semantic_model.infer_expr(LuaExpr::CallExpr(guard_call.clone())) {
-        Ok(LuaType::TypeGuard(inner)) => !inner.is_nullable(),
-        _ => false,
-    }
-}
-
-fn is_isvalid_call_guarding_expr(guard_call: &LuaCallExpr, receiver: &LuaExpr) -> bool {
     let Some(prefix) = guard_call.get_prefix_expr() else {
         return false;
     };
 
-    match prefix {
-        LuaExpr::NameExpr(name_expr) => {
-            if name_expr.get_name_text().as_deref() != Some("IsValid") {
-                return false;
-            }
+    if semantic_model
+        .infer_expr(prefix.clone())
+        .is_ok_and(|typ| type_returns_non_nullable_type_guard(semantic_model, &typ))
+    {
+        return true;
+    }
 
-            let Some(args_list) = guard_call.get_args_list() else {
-                return false;
-            };
-            let Some(first_arg) = args_list.get_args().next() else {
-                return false;
-            };
-            first_arg.syntax() == receiver.syntax()
-        }
-        LuaExpr::IndexExpr(index_expr) => {
-            if !guard_call.is_colon_call() {
-                return false;
-            }
+    let LuaExpr::IndexExpr(index_expr) = prefix else {
+        return false;
+    };
+    let Some(receiver) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(member_key) = index_expr
+        .get_index_key()
+        .and_then(|key| semantic_model.get_member_key(&key))
+    else {
+        return false;
+    };
+    let Ok(receiver_type) = semantic_model.infer_expr(receiver) else {
+        return false;
+    };
+    let non_nil_receiver_type = remove_false_or_nil(receiver_type);
 
-            let is_isvalid_method = match index_expr.get_index_key() {
-                Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "IsValid",
-                _ => false,
-            };
-            if !is_isvalid_method {
-                return false;
-            }
+    semantic_model
+        .infer_member_type(&non_nil_receiver_type, &member_key)
+        .is_ok_and(|typ| type_returns_non_nullable_type_guard(semantic_model, &typ))
+}
 
-            let Some(self_expr) = index_expr.get_prefix_expr() else {
-                return false;
-            };
-            self_expr.syntax() == receiver.syntax()
-        }
+fn type_returns_non_nullable_type_guard(semantic_model: &SemanticModel, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::DocFunction(func) => return_type_is_non_nullable_type_guard(func.get_ret()),
+        LuaType::Signature(signature_id) => semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(signature_id)
+            .is_some_and(|signature| {
+                return_type_is_non_nullable_type_guard(&signature.get_return_type())
+            }),
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|typ| type_returns_non_nullable_type_guard(semantic_model, typ)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(|typ| type_returns_non_nullable_type_guard(semantic_model, typ)),
+        _ => false,
+    }
+}
+
+fn return_type_is_non_nullable_type_guard(return_type: &LuaType) -> bool {
+    match return_type {
+        LuaType::TypeGuard(inner) => !inner.is_nullable(),
         _ => false,
     }
 }
@@ -1200,8 +1608,12 @@ fn check_binary_expr(
 
     if matches!(op, BinaryOperator::OpEq | BinaryOperator::OpNe) {
         if let Some(non_nil_side) = get_null_nil_comparison_operand(semantic_model, &left, &right) {
-            if is_nil_comparison_guarded_by_isvalid(semantic_model, &binary_expr, non_nil_side, op)
-            {
+            if is_nil_comparison_guarded_by_type_guard(
+                semantic_model,
+                &binary_expr,
+                non_nil_side,
+                op,
+            ) {
                 return Some(());
             }
 
@@ -1272,7 +1684,7 @@ fn check_condition_expr(
                 && matches!(op, BinaryOperator::OpAnd | BinaryOperator::OpOr)
                 && let Some((left, right)) = binary_expr.get_exprs()
             {
-                if is_short_circuit_isvalid_condition_guard(semantic_model, op, &left, &right) {
+                if is_short_circuit_type_guard_condition_guard(semantic_model, op, &left, &right) {
                     return;
                 }
 
@@ -1299,7 +1711,7 @@ fn check_condition_expr(
     }
 }
 
-fn is_short_circuit_isvalid_condition_guard(
+fn is_short_circuit_type_guard_condition_guard(
     semantic_model: &SemanticModel,
     op: BinaryOperator,
     left: &LuaExpr,
@@ -1307,18 +1719,18 @@ fn is_short_circuit_isvalid_condition_guard(
 ) -> bool {
     match op {
         BinaryOperator::OpAnd => {
-            expr_matches_isvalid_condition_guard(semantic_model, left, right, false)
-                || expr_matches_isvalid_condition_guard(semantic_model, right, left, false)
+            expr_matches_type_guard_condition_guard(semantic_model, left, right, false)
+                || expr_matches_type_guard_condition_guard(semantic_model, right, left, false)
         }
         BinaryOperator::OpOr => {
-            expr_matches_isvalid_condition_guard(semantic_model, left, right, true)
-                || expr_matches_isvalid_condition_guard(semantic_model, right, left, true)
+            expr_matches_type_guard_condition_guard(semantic_model, left, right, true)
+                || expr_matches_type_guard_condition_guard(semantic_model, right, left, true)
         }
         _ => false,
     }
 }
 
-fn expr_matches_isvalid_condition_guard(
+fn expr_matches_type_guard_condition_guard(
     semantic_model: &SemanticModel,
     maybe_truthy_expr: &LuaExpr,
     maybe_guard_expr: &LuaExpr,
@@ -1331,7 +1743,7 @@ fn expr_matches_isvalid_condition_guard(
         return false;
     };
 
-    is_isvalid_call_guarding_var(semantic_model, &guard_call, &truthy_expr)
+    is_type_guard_call_guarding_expr(semantic_model, &guard_call, &truthy_expr)
 }
 
 fn unwrap_optional_not_expr(expr: LuaExpr, negated: bool) -> Option<LuaExpr> {
@@ -1359,7 +1771,7 @@ fn unwrap_optional_not_call(expr: LuaExpr, negated: bool) -> Option<LuaCallExpr>
     }
 }
 
-fn is_nil_comparison_guarded_by_isvalid(
+fn is_nil_comparison_guarded_by_type_guard(
     semantic_model: &SemanticModel,
     comparison_expr: &LuaBinaryExpr,
     non_nil_side: &LuaExpr,
@@ -1403,111 +1815,7 @@ fn is_nil_comparison_guarded_by_isvalid(
         return false;
     };
 
-    is_isvalid_call_guarding_var(semantic_model, &guard_call, non_nil_side)
-}
-
-fn is_isvalid_call_guarding_var(
-    semantic_model: &SemanticModel,
-    guard_call: &LuaCallExpr,
-    guarded_expr: &LuaExpr,
-) -> bool {
-    let Some(prefix) = guard_call.get_prefix_expr() else {
-        return false;
-    };
-
-    match prefix {
-        LuaExpr::NameExpr(name_expr) => {
-            if !is_unshadowed_isvalid_name(semantic_model, &name_expr) {
-                return false;
-            }
-
-            let Some(args_list) = guard_call.get_args_list() else {
-                return false;
-            };
-            let Some(first_arg) = args_list.get_args().next() else {
-                return false;
-            };
-
-            exprs_reference_same_var(semantic_model, &first_arg, guarded_expr)
-        }
-        LuaExpr::IndexExpr(index_expr) => {
-            if !guard_call.is_colon_call() {
-                return false;
-            }
-
-            let is_isvalid_method = match index_expr.get_index_key() {
-                Some(LuaIndexKey::Name(name_token)) => name_token.get_name_text() == "IsValid",
-                _ => false,
-            };
-            if !is_isvalid_method {
-                return false;
-            }
-
-            let Some(self_expr) = index_expr.get_prefix_expr() else {
-                return false;
-            };
-
-            exprs_reference_same_var(semantic_model, &self_expr, guarded_expr)
-        }
-        _ => false,
-    }
-}
-
-fn is_unshadowed_isvalid_name(semantic_model: &SemanticModel, name_expr: &LuaNameExpr) -> bool {
-    if name_expr.get_name_text().as_deref() != Some("IsValid") {
-        return false;
-    }
-
-    let db = semantic_model.get_db();
-    let file_id = semantic_model.get_file_id();
-    let decl_id = db
-        .get_reference_index()
-        .get_local_reference(&file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .or_else(|| {
-            db.get_decl_index()
-                .get_decl_tree(&file_id)
-                .and_then(|decl_tree| {
-                    decl_tree
-                        .find_local_decl("IsValid", name_expr.get_position())
-                        .map(|decl| decl.get_id())
-                })
-        });
-
-    let Some(decl_id) = decl_id else {
-        return is_unshadowed_global_isvalid_name(name_expr);
-    };
-
-    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
-        return false;
-    };
-    if db
-        .get_reference_index()
-        .get_decl_references(&file_id, &decl_id)
-        .is_some_and(|decl_refs| decl_refs.mutable)
-    {
-        return false;
-    }
-
-    let Some(value_syntax_id) = decl.get_value_syntax_id() else {
-        return false;
-    };
-    let Some(node) = value_syntax_id.to_node_from_root(semantic_model.get_root().syntax()) else {
-        return false;
-    };
-    let Some(LuaExpr::NameExpr(alias_name_expr)) = LuaExpr::cast(node) else {
-        return false;
-    };
-
-    is_unshadowed_isvalid_name(semantic_model, &alias_name_expr)
-}
-
-fn is_unshadowed_global_isvalid_name(name_expr: &LuaNameExpr) -> bool {
-    if name_expr.get_name_text().as_deref() != Some("IsValid") {
-        return false;
-    }
-
-    true
+    is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
 }
 
 fn exprs_reference_same_var(

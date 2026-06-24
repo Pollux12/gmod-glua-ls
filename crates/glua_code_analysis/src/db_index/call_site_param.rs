@@ -1,5 +1,7 @@
 use std::collections::HashMap;
 
+use rowan::TextSize;
+
 use super::traits::LuaIndex;
 use crate::{FileId, LuaSignatureId, LuaType};
 
@@ -37,17 +39,20 @@ impl CallSiteParamIndex {
         self.rebuild_source_signatures();
     }
 
-    pub fn get_source_signature_for_file(
+    pub fn get_source_signature_for_file_at(
         &self,
         path: &str,
         file_id: FileId,
+        position: TextSize,
     ) -> Option<LuaSignatureId> {
         self.source_signatures_by_path
             .get(path)?
             .iter()
             .rev()
             .copied()
-            .find(|signature_id| signature_id.get_file_id() == file_id)
+            .find(|signature_id| {
+                signature_id.get_file_id() == file_id && signature_id.get_position() <= position
+            })
     }
 
     pub fn set_files_contributions(

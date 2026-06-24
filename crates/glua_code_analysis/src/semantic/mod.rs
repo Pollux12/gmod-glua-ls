@@ -22,6 +22,7 @@ use glua_parser::{
 };
 pub(crate) use infer::check_iter_var_range;
 pub use infer::infer_index_expr;
+pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };

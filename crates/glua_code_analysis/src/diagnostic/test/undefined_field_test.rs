@@ -4244,7 +4244,8 @@ mod test {
             function TOOL:HandNum() end
 
             ---@param value any
-            ---@return TypeGuard<Entity>
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
             function IsValid(value) end
             "#
                 .to_string(),

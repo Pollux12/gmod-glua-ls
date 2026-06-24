@@ -8575,12 +8575,26 @@ mod test {
     }
 
     #[test]
-    fn test_isvalid_guard_promotes_hard_nil_local_to_any_after_early_return() {
+    fn test_isvalid_guard_does_not_promote_hard_nil_local_to_any_after_early_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
 
         let file_id = ws.def(
             r#"
@@ -8592,21 +8606,35 @@ mod test {
             "#,
         );
 
-        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        let narrowed_type = local_assignment_value_type(&mut ws, file_id, "narrowed");
         assert_eq!(
             narrowed_type,
-            LuaType::Any,
-            "a successful IsValid guard proves even a previously hard-nil local is usable"
+            LuaType::Unknown,
+            "an annotated IsValid guard follows truthy-branch narrowing for a hard-nil local without promoting it to any"
         );
     }
 
     #[test]
-    fn test_isvalid_alias_guard_promotes_hard_nil_local_to_any_after_early_return() {
+    fn test_isvalid_alias_guard_does_not_promote_hard_nil_local_to_any_after_early_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
 
         let file_id = ws.def(
             r#"
@@ -8619,11 +8647,11 @@ mod test {
             "#,
         );
 
-        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        let narrowed_type = local_assignment_value_type(&mut ws, file_id, "narrowed");
         assert_eq!(
             narrowed_type,
-            LuaType::Any,
-            "an aliased successful IsValid guard should also promote a hard-nil local"
+            LuaType::Unknown,
+            "an aliased annotated IsValid guard should also avoid promoting a hard-nil local to any"
         );
     }
 

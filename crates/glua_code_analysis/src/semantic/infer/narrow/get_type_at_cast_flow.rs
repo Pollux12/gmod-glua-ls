@@ -183,7 +183,11 @@ pub fn cast_type(
                 source_type = TypeOps::Union.apply(db, &source_type, &typ);
             }
             CastAction::Remove => {
+                let original_type = source_type.clone();
                 source_type = TypeOps::Remove.apply(db, &source_type, &typ);
+                if source_type == original_type && original_type == typ {
+                    source_type = LuaType::Never;
+                }
             }
             CastAction::Force => {
                 source_type = typ;

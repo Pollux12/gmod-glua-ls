@@ -12,6 +12,23 @@ mod test {
         ws.update_emmyrc(emmyrc);
     }
 
+    fn def_isvalid_guard(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+    }
+
     fn file_has_diagnostic(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,
@@ -2367,12 +2384,16 @@ _2 = a[1]
     #[test]
     fn test_local_cached_isvalid_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
 
         ws.def(
             r#"
+            ---@return Entity?
+            function maybeEntity()
+            end
+
             local IsValid = IsValid
-            ---@type string?
-            local maybe = "string"
+            local maybe = maybeEntity()
             if IsValid(maybe) then
                 a = maybe
             end
@@ -2380,13 +2401,14 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        let expected = ws.ty("string");
+        let expected = ws.ty("Entity");
         assert_eq!(a, expected);
     }
 
     #[test]
-    fn test_local_cached_isvalid_promotes_unknown_to_any() {
+    fn test_local_cached_isvalid_narrows_unknown_to_any() {
         let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
 
         ws.def(
             r#"
@@ -2405,6 +2427,29 @@ _2 = a[1]
 
         let a = ws.expr_ty("a");
         assert_eq!(a, LuaType::Any);
+    }
+
+    #[test]
+    fn test_isvalid_unknown_does_not_force_entity_members() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Panel
+            ---@field Dock fun(self: Panel, mode: any)
+
+            ---@return unknown
+            function getMaybe()
+            end
+
+            local maybe = getMaybe()
+            if IsValid(maybe) then
+                maybe:Dock(0)
+            end
+            "#,
+        ));
     }
 
     #[test]
@@ -3461,8 +3506,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3471,10 +3519,12 @@ _2 = a[1]
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if not IsValid(maybe) then return end
-            maybe:reverse()
+            maybe:GetClass()
             "#,
         ));
     }
@@ -3853,8 +3903,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3864,10 +3917,12 @@ _2 = a[1]
             DiagnosticCode::NeedCheckNil,
             r#"
             local IsValid = IsValid
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if IsValid(maybe) then
-                maybe:reverse()
+                maybe:GetClass()
             end
             "#,
         ));
@@ -3886,8 +3941,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3897,10 +3955,12 @@ _2 = a[1]
             DiagnosticCode::NeedCheckNil,
             r#"
             local iv = IsValid
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if iv(maybe) then
-                maybe:reverse()
+                maybe:GetClass()
             end
             "#,
         ));
