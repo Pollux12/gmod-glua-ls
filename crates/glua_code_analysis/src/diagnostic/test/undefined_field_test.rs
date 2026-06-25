@@ -2469,6 +2469,117 @@ mod test {
     }
 
     #[test]
+    fn test_table_insert_array_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local queuedSearch = {}
+
+                local function Queue(tab, folder, extension, path)
+                    table.insert(queuedSearch, { tab, folder, extension, path })
+                end
+
+                Queue("models", "props/", "*.mdl", "GAME")
+                local call = queuedSearch[1]
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_or_empty_table_field_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class WheelEntity
+                local wheelEnt = {}
+
+                wheelEnt.KeyBinds = wheelEnt.KeyBinds or {}
+                numpad.Remove(wheelEnt.KeyBinds[1])
+                wheelEnt.KeyBinds[1] = 123
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_closed_table_named_missing_field_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class ClosedConfig
+                ---@field known string
+                local cfg = {}
+
+                local missing = cfg.unknown
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_union_typeguard_on_any_still_reports_unknown_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Panel
+                local Panel = {}
+                function Panel:SetVisible(visible) end
+
+                ---@class PhysObj
+                local PhysObj = {}
+                function PhysObj:Wake() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity|Panel|PhysObj>
+                function IsValid(value) end
+
+                ---@param ent any
+                local function use(ent)
+                    if IsValid(ent) then
+                        ent.someTypo()
+                    end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_union_typeguard_on_object_still_reports_unknown_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Panel
+                local Panel = {}
+                function Panel:SetVisible(visible) end
+
+                ---@class PhysObj
+                local PhysObj = {}
+                function PhysObj:Wake() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity|Panel|PhysObj>
+                function IsValid(value) end
+
+                ---@param ent { known: string }
+                local function use(ent)
+                    if IsValid(ent) then
+                        ent.someTypo()
+                    end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_export() {
         let mut ws = VirtualWorkspace::new();
         ws.def_file(

@@ -591,6 +591,14 @@ fn is_valid_member_inner(
         }
         LuaType::TableConst(id) => {
             if code == DiagnosticCode::UndefinedField
+                && !is_table_const_from_doc_tag(semantic_model, id)
+                && table_const_is_empty(semantic_model.get_db(), id)
+                && index_key_is_numeric(semantic_model, index_key)
+            {
+                return Some(());
+            }
+
+            if code == DiagnosticCode::UndefinedField
                 && matches!(index_key, LuaIndexKey::Expr(_))
                 && !is_table_const_from_doc_tag(semantic_model, id)
             {
@@ -873,6 +881,22 @@ fn is_valid_member_inner(
     }
 
     None
+}
+
+fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {
+    db.get_member_index()
+        .get_member_len(&LuaMemberOwner::Element(id.clone()))
+        == 0
+}
+
+fn index_key_is_numeric(semantic_model: &SemanticModel, index_key: &LuaIndexKey) -> bool {
+    match index_key {
+        LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) => true,
+        LuaIndexKey::Expr(expr) => semantic_model
+            .infer_expr(expr.clone())
+            .is_ok_and(|typ| typ.is_integer() || matches!(typ, LuaType::Number | LuaType::Integer)),
+        _ => false,
+    }
 }
 
 fn is_table_const_from_doc_tag(
