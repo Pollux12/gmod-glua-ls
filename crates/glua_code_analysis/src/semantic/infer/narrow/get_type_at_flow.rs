@@ -1228,8 +1228,15 @@ fn get_type_at_assign_stat(
                 expr_type,
                 LuaType::StringConst(_) | LuaType::DocStringConst(_)
             );
+        let rhs_replaces_special_call_effect = explicit_var_type.is_none()
+            && antecedent_has_relevant_special_call_effect_before_node(
+                db, tree, cache, root, flow_node, var_ref_id,
+            );
 
-        let narrowed = if rhs_is_fresh_table_literal || rhs_is_string_literal {
+        let narrowed = if rhs_is_fresh_table_literal
+            || rhs_is_string_literal
+            || rhs_replaces_special_call_effect
+        {
             Some(expr_type.clone())
         } else if source_type == LuaType::Nil {
             None
@@ -1257,6 +1264,46 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn antecedent_has_relevant_special_call_effect_before_node(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    flow_node: &FlowNode,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let mut visited = HashSet::new();
+    match flow_node.antecedent {
+        Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
+            db,
+            tree,
+            cache,
+            root,
+            prev,
+            flow_node.id,
+            var_ref_id,
+            &mut visited,
+        ),
+        Some(FlowAntecedent::Multiple(idx)) => {
+            tree.get_multi_antecedents(idx).is_some_and(|prevs| {
+                prevs.iter().copied().any(|prev| {
+                    antecedent_has_relevant_special_call_effect(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        prev,
+                        flow_node.id,
+                        var_ref_id,
+                        &mut visited,
+                    )
+                })
+            })
+        }
+        None => false,
+    }
 }
 
 fn typed_global_nil_placeholder_type(

@@ -1,8 +1,9 @@
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast,
-    LuaDocTagModule, LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam,
-    LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType,
-    LuaDocTypeFlag, LuaExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr, LuaDocDescriptionOwner, LuaDocTagAs,
+    LuaDocTagCast, LuaDocTagModule, LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload,
+    LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee,
+    LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalName, LuaTokenKind,
+    LuaVarExpr,
 };
 use std::sync::Arc;
 
@@ -25,7 +26,8 @@ use crate::{
     compilation::analyzer::common::bind_type,
     db_index::{
         AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
-        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId,
+        LuaSignatureId, LuaType,
     },
 };
 
@@ -291,29 +293,48 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         .db
         .get_signature_index_mut()
         .get_or_create(signature_id);
-    let Some(param_idx) = signature.find_param_idx(&param_name) else {
-        report_invalid_outparam(
-            analyzer,
-            &tag,
-            format!("outparam root `{param_name}` does not match any parameter"),
-        );
-        return None;
+    let root = if param_name == "self"
+        && (signature.is_colon_define || closure_is_colon_define(&closure))
+    {
+        LuaOutParamRoot::SelfReceiver
+    } else {
+        let Some(param_idx) = signature.find_param_idx(&param_name) else {
+            report_invalid_outparam(
+                analyzer,
+                &tag,
+                format!("outparam root `{param_name}` does not match any parameter"),
+            );
+            return None;
+        };
+        LuaOutParamRoot::Param(param_idx)
     };
 
     if let Some(existing) = signature
         .out_params
         .iter_mut()
-        .find(|p| p.param_idx == param_idx && p.field_path == field_path)
+        .find(|p| p.root == root && p.field_path == field_path)
     {
         existing.type_ref = type_ref;
     } else {
         signature.out_params.push(LuaOutParamInfo {
-            param_idx,
+            root,
             field_path,
             type_ref,
         });
     }
     Some(())
+}
+
+fn closure_is_colon_define(closure: &LuaClosureExpr) -> bool {
+    let Some(func_stat) = closure.get_parent::<LuaFuncStat>() else {
+        return false;
+    };
+    let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+        return false;
+    };
+    index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
 }
 
 fn report_invalid_outparam(

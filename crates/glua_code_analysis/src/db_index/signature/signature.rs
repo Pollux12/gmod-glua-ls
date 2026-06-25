@@ -590,8 +590,14 @@ mod tests {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LuaOutParamRoot {
+    Param(usize),
+    SelfReceiver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaOutParamInfo {
-    pub param_idx: usize,
+    pub root: LuaOutParamRoot,
     pub field_path: Vec<String>,
     pub type_ref: LuaType,
 }

@@ -1344,4 +1344,125 @@ mod test {
             ws.ty("string")
         );
     }
+
+    #[test]
+    fn test_outparam_self_receiver_updates_field_after_colon_call() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@type Node
+                local node = {}
+
+                node:CreateChildNodes()
+                local children = node.ChildNodes
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "node.ChildNodes"),
+            ws.ty("Panel")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_receiver_updates_explicit_dot_call_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@type Node
+                local node = {}
+
+                node.CreateChildNodes(node)
+                local children = node.ChildNodes
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "node.ChildNodes"),
+            ws.ty("Panel")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_receiver_does_not_override_later_field_write() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@param maybeChildren Panel?
+                local function reset(maybeChildren)
+                    ---@type Node
+                    local node = {}
+
+                    node:CreateChildNodes()
+                    node.ChildNodes = maybeChildren
+                    local children = node.ChildNodes
+                end
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty_at_occurrence(&ws, file_id, "node.ChildNodes", 1),
+            ws.ty("Panel?")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_root_requires_colon_method() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AnnotationUsageError,
+            r#"
+            ---@class Panel
+
+            ---@outparam self.ChildNodes Panel
+            function CreateChildNodes() end
+            "#,
+        ));
+    }
 }

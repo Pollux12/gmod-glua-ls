@@ -22,7 +22,7 @@ use crate::{
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
-    db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
+    db_index::{LuaFunctionType, LuaMemberOwner, LuaOutParamRoot, LuaSignature, LuaSignatureId},
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
@@ -475,7 +475,7 @@ struct SpecialCallParamInfo {
 
 #[derive(Debug, Clone)]
 struct SpecialCallOutParamInfo {
-    param_idx: usize,
+    root: LuaOutParamRoot,
     field_path: Vec<String>,
     type_ref: LuaType,
     is_colon_define: bool,
@@ -1134,7 +1134,10 @@ fn adjust_operator_special_call_out_param_infos(
     out_param_infos
         .into_iter()
         .filter_map(|mut out_param_info| {
-            out_param_info.param_idx = out_param_info.param_idx.checked_sub(1)?;
+            let LuaOutParamRoot::Param(param_idx) = out_param_info.root else {
+                return Some(out_param_info);
+            };
+            out_param_info.root = LuaOutParamRoot::Param(param_idx.checked_sub(1)?);
             out_param_info.is_colon_define = false;
             Some(out_param_info)
         })
@@ -1238,6 +1241,13 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
+
+            let fallback_out_params =
+                collect_same_member_key_special_call_out_params(db, member_id);
+            if !fallback_out_params.is_empty() {
+                return Ok(fallback_out_params);
+            }
+
             let type_cache = db
                 .get_type_index()
                 .get_type_cache(&member_id.into())
@@ -1255,6 +1265,28 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
             .unwrap_or_default()),
         LuaSemanticDeclId::TypeDecl(_) => Ok(Vec::new()),
     }
+}
+
+fn collect_same_member_key_special_call_out_params(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+) -> Vec<SpecialCallOutParamInfo> {
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_current_owner(&current_member_id) else {
+        return Vec::new();
+    };
+    let Some(current_member) = member_index.get_member(&current_member_id) else {
+        return Vec::new();
+    };
+    let key = current_member.get_key();
+
+    member_index
+        .get_current_owner_members_for_key(owner, key)
+        .into_iter()
+        .filter(|member| member.get_id() != current_member_id)
+        .filter_map(|member| db.get_type_index().get_type_cache(&member.get_id().into()))
+        .flat_map(|type_cache| collect_special_call_out_param_infos(db, type_cache.as_type()))
+        .collect()
 }
 
 fn get_signature_id_from_semantic_decl_value_expr(
@@ -1370,13 +1402,16 @@ fn collect_signature_special_call_out_params(
         .out_params
         .iter()
         .map(|out_param| SpecialCallOutParamInfo {
-            param_idx: out_param.param_idx,
+            root: out_param.root.clone(),
             field_path: out_param.field_path.clone(),
             type_ref: out_param.type_ref.clone(),
             is_colon_define: signature.is_colon_define,
         })
         .collect::<Vec<_>>();
-    out_params.sort_by_key(|out_param| out_param.param_idx);
+    out_params.sort_by_key(|out_param| match out_param.root {
+        LuaOutParamRoot::Param(param_idx) => (0, param_idx),
+        LuaOutParamRoot::SelfReceiver => (1, 0),
+    });
     out_params
 }
 
@@ -1426,12 +1461,7 @@ fn apply_out_param_from_call(
     out_param_info: &SpecialCallOutParamInfo,
     is_colon_call: bool,
 ) -> ResolveResult {
-    let Some(arg_expr) = get_call_arg_expr(
-        call_expr,
-        out_param_info.param_idx,
-        out_param_info.is_colon_define,
-        is_colon_call,
-    ) else {
+    let Some(arg_expr) = get_out_param_root_expr(call_expr, out_param_info, is_colon_call) else {
         return Ok(());
     };
 
@@ -1454,6 +1484,7 @@ fn apply_out_param_from_call(
         arg_expr_for_effects,
         &out_param_info.field_path,
         &target,
+        matches!(out_param_info.root, LuaOutParamRoot::Param(_)),
     );
     for effect_target in effect_targets {
         db.get_flow_index_mut().add_special_call_effect(
@@ -1465,6 +1496,28 @@ fn apply_out_param_from_call(
     }
 
     Ok(())
+}
+
+fn get_out_param_root_expr(
+    call_expr: &LuaCallExpr,
+    out_param_info: &SpecialCallOutParamInfo,
+    is_colon_call: bool,
+) -> Option<LuaExpr> {
+    match out_param_info.root {
+        LuaOutParamRoot::Param(param_idx) => get_call_arg_expr(
+            call_expr,
+            param_idx,
+            out_param_info.is_colon_define,
+            is_colon_call,
+        ),
+        LuaOutParamRoot::SelfReceiver if is_colon_call => {
+            let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+                return None;
+            };
+            index_expr.get_prefix_expr()
+        }
+        LuaOutParamRoot::SelfReceiver => call_expr.get_args_list()?.get_args().next(),
+    }
 }
 
 fn resolve_out_param_target(
@@ -1580,6 +1633,7 @@ fn collect_out_param_effect_targets(
     arg_expr: LuaExpr,
     field_path: &[String],
     target: &ResolvedOutParamTarget,
+    include_resolved_targets: bool,
 ) -> Vec<VarRefId> {
     let mut targets = Vec::new();
     let mut visited_aliases = HashSet::new();
@@ -1595,14 +1649,16 @@ fn collect_out_param_effect_targets(
         &mut visited_aliases,
     );
 
-    if let Some(owner) = target.owner.clone()
+    if include_resolved_targets
+        && let Some(owner) = target.owner.clone()
         && let Some(owner_target) = type_owner_to_var_ref_id(owner)
         && !targets.iter().any(|existing| existing == &owner_target)
     {
         targets.push(owner_target);
     }
 
-    if let Some(value_expr) = target.value_expr.clone()
+    if include_resolved_targets
+        && let Some(value_expr) = target.value_expr.clone()
         && let Some(value_target) = get_var_expr_var_ref_id(db, cache, value_expr)
         && !targets.iter().any(|existing| existing == &value_target)
     {

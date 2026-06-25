@@ -13,6 +13,7 @@ use crate::{
     LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
     get_member_value_expr,
+    semantic::find_members_with_key,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -313,6 +314,54 @@ fn get_name_expr_special_call_reason(
     }
 }
 
+fn index_expr_has_receiver_special_call_signature(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(member_key) = get_static_member_key(index_expr) else {
+        return false;
+    };
+    let Ok(receiver_type) = analyzer.infer_expr(&prefix_expr) else {
+        return false;
+    };
+    find_members_with_key(analyzer.db, &receiver_type, member_key, true).is_some_and(|members| {
+        members.into_iter().any(|member_info| {
+            type_has_special_call_signature(analyzer.special_call_direct_matcher, &member_info.typ)
+                || member_info
+                    .property_owner_id
+                    .as_ref()
+                    .and_then(|semantic_decl| {
+                        type_cache_for_semantic_decl(analyzer.db, semantic_decl)
+                    })
+                    .is_some_and(|typ| {
+                        type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
+                    })
+        })
+    })
+}
+
+fn type_cache_for_semantic_decl(
+    db: &DbIndex,
+    semantic_decl: &crate::LuaSemanticDeclId,
+) -> Option<LuaType> {
+    let owner = match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => (*decl_id).into(),
+        crate::LuaSemanticDeclId::Member(member_id) => (*member_id).into(),
+        crate::LuaSemanticDeclId::Signature(signature_id) => {
+            return Some(LuaType::Signature(*signature_id));
+        }
+        crate::LuaSemanticDeclId::TypeDecl(type_decl_id) => {
+            return Some(LuaType::Def(type_decl_id.clone()));
+        }
+    };
+    db.get_type_index()
+        .get_type_cache(&owner)
+        .map(|type_cache| type_cache.as_type().clone())
+}
+
 fn local_decl_special_call_state(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> Option<bool> {
     let decl_id = analyzer
         .db
@@ -335,6 +384,10 @@ fn get_index_expr_special_call_reason(
     analyzer: &mut LuaAnalyzer,
     index_expr: &LuaIndexExpr,
 ) -> Option<InferFailReason> {
+    if index_expr_has_receiver_special_call_signature(analyzer, index_expr) {
+        return Some(InferFailReason::None);
+    }
+
     match resolve_cached_index_expr_type(analyzer, index_expr) {
         Ok(Some(typ))
             if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ) =>

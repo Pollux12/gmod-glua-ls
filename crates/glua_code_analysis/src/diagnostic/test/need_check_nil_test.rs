@@ -1333,6 +1333,181 @@ mod test {
     }
 
     #[gtest]
+    fn test_outparam_self_receiver_method_effect_guards_optional_field_after_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class DTree_Node
+            ---@field ChildNodes? DListLayout
+            local DTree_Node = {}
+
+            ---@outparam self.ChildNodes DListLayout
+            function DTree_Node:CreateChildNodes() end
+
+            ---@type DTree_Node
+            local node = {}
+
+            node:CreateChildNodes()
+            node.ChildNodes:Add()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "receiver-rooted outparam should narrow the annotated receiver field after the call"
+        );
+    }
+
+    #[gtest]
+    fn test_outparam_self_receiver_method_effect_guards_self_field_after_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class DTree_Node
+            ---@field ChildNodes? DListLayout
+            local DTree_Node = {}
+
+            ---@outparam self.ChildNodes DListLayout
+            function DTree_Node:CreateChildNodes() end
+
+            function DTree_Node:AddPanel()
+                self:CreateChildNodes()
+                self.ChildNodes:Add()
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "receiver-rooted outparam should narrow self.<field> after self:<method>()"
+        );
+    }
+
+    #[gtest]
+    fn test_outparam_self_receiver_effect_is_receiver_specific() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class DTree_Node
+            ---@field ChildNodes? DListLayout
+            local DTree_Node = {}
+
+            ---@outparam self.ChildNodes DListLayout
+            function DTree_Node:CreateChildNodes() end
+
+            ---@type DTree_Node
+            local node = {}
+            ---@type DTree_Node
+            local other = {}
+
+            node:CreateChildNodes()
+            other.ChildNodes:Add()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "receiver-rooted outparam should only narrow the receiver used in the call"
+        );
+    }
+
+    #[gtest]
+    fn test_outparam_self_receiver_requires_annotation() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class DTree_Node
+            ---@field ChildNodes? DListLayout
+            local DTree_Node = {}
+
+            function DTree_Node:CreateChildNodes() end
+
+            ---@type DTree_Node
+            local node = {}
+
+            node:CreateChildNodes()
+            node.ChildNodes:Add()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "calling an unannotated method must not globally suppress optional-field diagnostics"
+        );
+    }
+
+    #[gtest]
+    fn test_outparam_self_receiver_does_not_leak_from_same_named_unrelated_method() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class AnnotatedNode
+            ---@field ChildNodes? DListLayout
+            local AnnotatedNode = {}
+
+            ---@outparam self.ChildNodes DListLayout
+            function AnnotatedNode:CreateChildNodes() end
+
+            ---@class RuntimeNode
+            ---@field ChildNodes? DListLayout
+            local RuntimeNode = {}
+
+            function RuntimeNode:CreateChildNodes() end
+
+            function RuntimeNode:AddPanel()
+                self:CreateChildNodes()
+                self.ChildNodes:Add()
+            end
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "same-named unrelated methods must not donate receiver-rooted outparams"
+        );
+    }
+
+    #[gtest]
     fn test_isvalid_check_does_not_report_gmod_null_check() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
