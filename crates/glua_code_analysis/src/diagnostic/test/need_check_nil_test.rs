@@ -4313,6 +4313,448 @@ mod test {
     }
 
     #[test]
+    fn test_tool_object_index_operator_slots_are_non_nil() {
+        // Faithful reproduction of the gmod_tool/object.lua pattern. ToolObj has
+        // an annotated Objects field whose ToolObjects alias maps integer keys to
+        // non-nil ToolObjectSlot values, while runtime Create/SetObject methods
+        // also write table literals into the same field. The dynamic writes must
+        // not erase the explicit indexed-slot contract.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_tool_objects_index_operator");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let tool_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("tool.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &tool_uri,
+            Some(
+                r#"
+                    ---@meta
+
+                    ---@class Entity
+                    ---@field EntIndex fun(self: Entity): number
+
+                    ---@class PhysObj
+                    ---@field WorldToLocal fun(self: PhysObj, value: any): any
+
+                    ---@param value any
+                    ---@return TypeGuard<Entity>
+                    function IsValid(value) end
+
+                    ---@class ToolObjectSlot
+                    ---@field Ent Entity
+                    ---@field Phys PhysObj|nil
+                    ---@field Pos any
+                    ---@field Normal any
+
+                    ---@alias ToolObjects table<integer, ToolObjectSlot>
+
+                    ---@class Tool
+                    ---@field Objects ToolObjects
+
+                    ---@param id number
+                    ---@return any
+                    function Tool:GetPos(id) end
+                "#
+                .to_string(),
+            ),
+        );
+        let custom_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("custom_classes.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &custom_uri,
+            Some(
+                r#"
+                    ---@meta
+
+                    ---@class ToolObj : Tool
+                    ---@field Objects ToolObjects
+                    ---@field SetObject fun(self: ToolObj, id: number, ent: Entity, pos: any, phys: PhysObj|nil)
+                    ToolObj = ToolObj or {}
+                "#
+                .to_string(),
+            ),
+        );
+
+        ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stool.lua",
+            r#"
+                ToolObj = {}
+
+                function ToolObj:Create()
+                    local o = {}
+                    setmetatable(o, self)
+                    self.__index = self
+                    o.Objects = {}
+                    return o
+                end
+
+                ToolObj = nil
+            "#,
+        );
+
+        let object_file = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/object.lua",
+            r#"
+                function ToolObj:GetPos(i)
+                    if self.Objects[i].Ent:EntIndex() == 0 then
+                        return self.Objects[i].Pos
+                    end
+                    return self.Objects[i].Ent
+                end
+
+                function ToolObj:SetObject(i, ent, pos, phys, norm)
+                    self.Objects[i] = {}
+                    self.Objects[i].Ent = ent
+                    self.Objects[i].Pos = pos
+                    self.Objects[i].Phys = phys
+
+                    if IsValid(phys) then
+                        self.Objects[i].Normal = self.Objects[i].Phys:WorldToLocal(norm)
+                        self.Objects[i].Pos = self.Objects[i].Phys:WorldToLocal(pos)
+                    else
+                        self.Objects[i].Normal = self.Objects[i].Ent:WorldToLocal(norm)
+                    end
+                end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(object_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        let nil_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| {
+                d.message.contains("Objects")
+                    || d.message.contains("Ent")
+                    || d.message.contains("Phys")
+            })
+            .collect();
+
+        assert_that!(
+            nil_warnings,
+            is_empty(),
+            "ToolObjects integer index operator should make self.Objects[i] a non-nil ToolObjectSlot. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_is_invalidated_by_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class Slot
+                ---@field Ent Entity|nil
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param ent Entity|nil
+                ---@param other Entity|nil
+                local function set_ent(ent, other)
+                    slot.Ent = ent
+                    ent = other
+
+                    if IsValid(ent) then
+                        slot.Ent:GetPos()
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Ent")),
+            eq(true),
+            "Reassigning the source expression after `slot.Ent = ent` must invalidate the assignment-backed guard. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_does_not_use_if_condition_for_elseif_body() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class Slot
+                ---@field Ent Entity|nil
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param ent Entity|nil
+                ---@param cond boolean
+                local function set_ent(ent, cond)
+                    slot.Ent = ent
+
+                    if IsValid(ent) then
+                        slot.Ent:GetPos()
+                    elseif cond then
+                        slot.Ent:GetPos()
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Ent")),
+            eq(true),
+            "The main `if IsValid(ent)` condition is false inside the elseif body and must not guard `slot.Ent`. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_is_invalidated_by_nested_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class Slot
+                ---@field Ent Entity|nil
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param ent Entity|nil
+                ---@param other Entity|nil
+                local function set_ent(ent, other)
+                    slot.Ent = ent
+                    do
+                        ent = other
+                    end
+
+                    if IsValid(ent) then
+                        slot.Ent:GetPos()
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Ent")),
+            eq(true),
+            "Nested reassignment after `slot.Ent = ent` must invalidate the assignment-backed guard. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_is_invalidated_by_index_key_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class SlotEntry
+                ---@field Phys Entity|nil
+
+                ---@class Slot
+                ---@field Objects table<integer, SlotEntry>
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param i integer
+                ---@param phys Entity|nil
+                local function set_phys(i, phys)
+                    slot.Objects[i].Phys = phys
+                    i = i + 1
+
+                    if IsValid(phys) then
+                        slot.Objects[i].Phys:GetPos()
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Objects[i].Phys")),
+            eq(true),
+            "Reassigning the index key after `slot.Objects[i].Phys = phys` must invalidate the assignment-backed guard. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_is_invalidated_by_then_block_receiver_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class SlotEntry
+                ---@field Phys Entity|nil
+
+                ---@class Slot
+                ---@field Objects table<integer, SlotEntry>
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param i integer
+                ---@param phys Entity|nil
+                ---@param other Entity|nil
+                local function set_phys(i, phys, other)
+                    slot.Objects[i].Phys = phys
+
+                    if IsValid(phys) then
+                        slot.Objects[i].Phys = other
+                        slot.Objects[i].Phys:GetPos()
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Objects[i].Phys")),
+            eq(true),
+            "Reassigning the guarded receiver from a different nullable source before the access inside the then-block must invalidate the assignment-backed guard. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_assigned_value_type_guard_is_invalidated_by_loop_back_edge_reassignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field GetPos fun(self: Entity): any
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function IsValid(value) end
+
+                ---@class SlotEntry
+                ---@field Phys Entity|nil
+
+                ---@class Slot
+                ---@field Objects table<integer, SlotEntry>
+
+                ---@type Slot
+                local slot = {}
+
+                ---@param i integer
+                ---@param phys Entity|nil
+                ---@param other Entity|nil
+                ---@param cond boolean
+                local function set_phys(i, phys, other, cond)
+                    slot.Objects[i].Phys = phys
+
+                    while cond do
+                        if IsValid(phys) then
+                            slot.Objects[i].Phys:GetPos()
+                        end
+                        slot.Objects[i].Phys = other
+                    end
+                end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("slot.Objects[i].Phys")),
+            eq(true),
+            "A receiver reassignment after the guarded if in the same loop body can feed the next iteration and must invalidate the assignment-backed guard. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_negation_guard_does_not_suppress_gmod_null() {
         // NULL is truthy in GLua, so `not ent` does NOT prove entity validity.
         // Only IsValid-based guards should suppress NULL diagnostics.

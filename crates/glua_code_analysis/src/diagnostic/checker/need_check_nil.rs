@@ -240,6 +240,10 @@ fn report_unsafe_receiver(
             )
         } else {
             is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver)
+                || is_expr_guarded_by_current_assigned_value_type_guard_condition(
+                    semantic_model,
+                    receiver,
+                )
         };
         if guarded {
             return false;
@@ -485,6 +489,395 @@ fn is_expr_guarded_by_current_null_excluding_type_guard_condition(
     }
 
     false
+}
+
+fn is_expr_guarded_by_current_assigned_value_type_guard_condition(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let expr_range = expr.syntax().text_range();
+    for ancestor in expr.syntax().ancestors() {
+        let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) else {
+            continue;
+        };
+
+        let Some(condition) = if_stat.get_condition_expr() else {
+            continue;
+        };
+
+        let in_then_block = if_stat
+            .get_block()
+            .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range));
+        if !in_then_block {
+            continue;
+        }
+
+        let Some(assigned_expr) = prior_assignment_value_for_expr(semantic_model, expr, &if_stat)
+        else {
+            continue;
+        };
+        if !is_stable_guard_expr(&assigned_expr) {
+            continue;
+        }
+        if !condition_is_positive_type_guard_call(semantic_model, &condition, &assigned_expr) {
+            continue;
+        }
+        if then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr) {
+            continue;
+        }
+        if loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr) {
+            continue;
+        }
+        return true;
+    }
+
+    false
+}
+
+fn prior_assignment_value_for_expr(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    if_stat: &LuaIfStat,
+) -> Option<LuaExpr> {
+    let guarded_text = normalized_expr_text(guarded_expr)?;
+    let path_nodes = preceding_path_sibling_nodes(if_stat);
+    let mut candidate = None;
+
+    for node in &path_nodes {
+        let Some(assign_stat) = LuaAssignStat::cast(node.clone()) else {
+            continue;
+        };
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        for (index, var) in vars.iter().enumerate() {
+            let Some(var_text) = normalized_expr_text(&var.to_expr()) else {
+                continue;
+            };
+            if var_text == guarded_text
+                && let Some(value_expr) = exprs.get(index).cloned()
+            {
+                candidate = Some((value_expr, assign_stat.syntax().text_range()));
+            }
+        }
+    }
+
+    let (assigned_expr, assign_range) = candidate?;
+    for node in &path_nodes {
+        let node_range = node.text_range();
+        if node_range.start() <= assign_range.end() {
+            continue;
+        }
+
+        if let Some(assign_stat) = LuaAssignStat::cast(node.clone())
+            && (assign_stat_reassigns_guarded_receiver_value(
+                semantic_model,
+                &assign_stat,
+                guarded_expr,
+            ) || assign_stat_reassigns_guarded_expr(
+                semantic_model,
+                &assign_stat,
+                &assigned_expr,
+            ))
+        {
+            return None;
+        }
+        if node
+            .descendants()
+            .filter_map(LuaAssignStat::cast)
+            .any(|assign_stat| {
+                assign_stat_reassigns_guarded_receiver_value(
+                    semantic_model,
+                    &assign_stat,
+                    guarded_expr,
+                ) || assign_stat_reassigns_guarded_expr(
+                    semantic_model,
+                    &assign_stat,
+                    &assigned_expr,
+                )
+            })
+        {
+            return None;
+        }
+
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone())
+            && (local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
+                || local_stat_shadows_guarded_expr(semantic_model, &local_stat, &assigned_expr))
+        {
+            return None;
+        }
+    }
+
+    Some(assigned_expr)
+}
+
+fn then_block_reassigns_guarded_expr_before_access(
+    semantic_model: &SemanticModel,
+    if_stat: &LuaIfStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let Some(block) = if_stat.get_block() else {
+        return false;
+    };
+    let access_start = guarded_expr.syntax().text_range().start();
+
+    for node in block.syntax().children() {
+        if node.text_range().end() > access_start {
+            continue;
+        }
+
+        if node
+            .descendants()
+            .filter_map(LuaAssignStat::cast)
+            .any(|assign_stat| {
+                assign_stat_reassigns_guarded_receiver_value(
+                    semantic_model,
+                    &assign_stat,
+                    guarded_expr,
+                )
+            })
+        {
+            return true;
+        }
+
+        if let Some(local_stat) = LuaLocalStat::cast(node.clone())
+            && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn loop_back_edge_reassigns_guarded_expr_after_if(
+    semantic_model: &SemanticModel,
+    if_stat: &LuaIfStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let mut current = if_stat.syntax().clone();
+
+    while let Some(parent) = current.parent() {
+        if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block
+            && parent
+                .parent()
+                .is_some_and(|loop_node| is_loop_stat_kind(LuaSyntaxKind::from(loop_node.kind())))
+            && following_siblings_reassign_guarded_receiver(
+                semantic_model,
+                &parent,
+                &current,
+                guarded_expr,
+            )
+        {
+            return true;
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+fn following_siblings_reassign_guarded_receiver(
+    semantic_model: &SemanticModel,
+    block: &LuaSyntaxNode,
+    current: &LuaSyntaxNode,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let current_end = current.text_range().end();
+
+    for sibling in block.children() {
+        if sibling.text_range().start() <= current_end {
+            continue;
+        }
+
+        if sibling
+            .descendants()
+            .filter_map(LuaAssignStat::cast)
+            .any(|assign_stat| {
+                assign_stat_reassigns_guarded_receiver_value(
+                    semantic_model,
+                    &assign_stat,
+                    guarded_expr,
+                )
+            })
+        {
+            return true;
+        }
+
+        if let Some(local_stat) = LuaLocalStat::cast(sibling.clone())
+            && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn is_loop_stat_kind(kind: LuaSyntaxKind) -> bool {
+    matches!(
+        kind,
+        LuaSyntaxKind::WhileStat
+            | LuaSyntaxKind::RepeatStat
+            | LuaSyntaxKind::ForStat
+            | LuaSyntaxKind::ForRangeStat
+    )
+}
+
+fn assign_stat_reassigns_guarded_receiver_value(
+    semantic_model: &SemanticModel,
+    assign_stat: &LuaAssignStat,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter().any(|var| {
+        assigned_expr_invalidates_guarded_receiver_value(
+            semantic_model,
+            &var.to_expr(),
+            guarded_expr,
+        )
+    })
+}
+
+fn assigned_expr_invalidates_guarded_receiver_value(
+    semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    // Assignment-backed TypeGuard suppression proves the receiver value copied
+    // from the guarded source. This invalidation is intentionally narrower than
+    // `assigned_expr_invalidates_guarded_expr`: sibling field writes such as
+    // `slot.Normal = slot.Phys:...` do not replace `slot.Phys`, but exact
+    // receiver writes, receiver-prefix writes, and index-key reassignments do.
+    if exprs_reference_same_var(semantic_model, assigned_expr, guarded_expr) {
+        return true;
+    }
+
+    if normalized_expr_text(assigned_expr) == normalized_expr_text(guarded_expr) {
+        return true;
+    }
+
+    let mut current = guarded_expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = current {
+        let Some(prefix) = index_expr.get_prefix_expr() else {
+            return false;
+        };
+
+        if normalized_expr_text(assigned_expr) == normalized_expr_text(&prefix) {
+            return true;
+        }
+        if index_expr_key_reassigned_by_lhs(semantic_model, assigned_expr, &index_expr) {
+            return true;
+        }
+
+        current = prefix;
+    }
+
+    false
+}
+
+fn index_expr_key_reassigned_by_lhs(
+    semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() else {
+        return false;
+    };
+
+    if exprs_reference_same_var(semantic_model, assigned_expr, &key_expr) {
+        return true;
+    }
+
+    let assigned_text = normalized_expr_text(assigned_expr);
+    if assigned_text == normalized_expr_text(&key_expr) {
+        return true;
+    }
+
+    let mut cache = semantic_model.get_cache().borrow_mut();
+    let assigned_ref_id =
+        get_var_expr_var_ref_id(semantic_model.get_db(), &mut cache, assigned_expr.clone());
+    drop(cache);
+
+    key_expr
+        .syntax()
+        .descendants()
+        .filter_map(LuaExpr::cast)
+        .filter(|descendant_expr| {
+            matches!(
+                descendant_expr,
+                LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)
+            )
+        })
+        .any(|descendant_expr| {
+            if assigned_text == normalized_expr_text(&descendant_expr) {
+                return true;
+            }
+            let Some(ref assigned_ref_id) = assigned_ref_id else {
+                return false;
+            };
+            let mut cache = semantic_model.get_cache().borrow_mut();
+            let descendant_ref_id = get_var_expr_var_ref_id(
+                semantic_model.get_db(),
+                &mut cache,
+                descendant_expr.clone(),
+            );
+            drop(cache);
+            descendant_ref_id.is_some_and(|id| &id == assigned_ref_id)
+        })
+}
+
+fn preceding_path_sibling_nodes(if_stat: &LuaIfStat) -> Vec<LuaSyntaxNode> {
+    let mut nodes = Vec::new();
+    let mut current = if_stat.syntax().clone();
+
+    while let Some(parent) = current.parent() {
+        if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block {
+            let current_start = current.text_range().start();
+            for sibling in parent.children() {
+                if sibling.text_range().start() >= current_start {
+                    break;
+                }
+                nodes.push(sibling);
+            }
+        }
+        current = parent;
+    }
+
+    nodes.sort_by_key(|node| (node.text_range().start(), node.text_range().end()));
+    nodes
+}
+
+fn condition_is_positive_type_guard_call(
+    semantic_model: &SemanticModel,
+    condition: &LuaExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    match condition {
+        LuaExpr::CallExpr(call_expr) => {
+            is_type_guard_call_guarding_expr(semantic_model, call_expr, guarded_expr)
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            if op != BinaryOperator::OpAnd {
+                return false;
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return false;
+            };
+            condition_is_positive_type_guard_call(semantic_model, &left, guarded_expr)
+                || condition_is_positive_type_guard_call(semantic_model, &right, guarded_expr)
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
+            condition_is_positive_type_guard_call(semantic_model, &expr, guarded_expr)
+        }),
+        _ => false,
+    }
+}
+
+fn is_stable_guard_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_))
 }
 
 /// Combined guard: checks both TypeGuard-specific and general negation guards.
