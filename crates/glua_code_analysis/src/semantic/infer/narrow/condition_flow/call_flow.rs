@@ -15,12 +15,13 @@ use crate::{
             narrow::{
                 ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
                 get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow,
-                narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+                gmod_null_type, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
                 var_ref_id::get_var_expr_var_ref_id,
             },
         },
         infer_expr_semantic_decl,
     },
+    signature_is_valid_guard,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -48,12 +49,14 @@ pub fn get_type_at_call_expr(
         Err(_) => Ok(ResultTypeOrContinue::Continue),
         Ok(maybe_func) => match maybe_func {
             LuaType::DocFunction(f) => {
-                let signature_cast =
-                    get_call_prefix_signature_id(db, cache, &call_expr).and_then(|signature_id| {
-                        db.get_flow_index()
-                            .get_signature_cast(&signature_id)
-                            .map(|cast| (cast, signature_id))
-                    });
+                let prefix_signature_id = get_call_prefix_signature_id(db, cache, &call_expr);
+                let is_valid_guard = prefix_signature_id
+                    .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id));
+                let signature_cast = prefix_signature_id.and_then(|signature_id| {
+                    db.get_flow_index()
+                        .get_signature_cast(&signature_id)
+                        .map(|cast| (cast, signature_id))
+                });
                 let return_type = f.get_ret();
                 match return_type {
                     LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
@@ -66,6 +69,7 @@ pub fn get_type_at_call_expr(
                         call_expr,
                         f,
                         signature_cast,
+                        is_valid_guard,
                         condition_flow,
                     ),
                     _ => {
@@ -81,6 +85,7 @@ pub fn get_type_at_call_expr(
 
                 let ret = signature.get_return_type();
                 let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
+                let is_valid_guard = signature_is_valid_guard(db, signature_id);
                 let mut type_guard_did_not_apply = false;
                 match ret {
                     LuaType::TypeGuard(_) => {
@@ -97,6 +102,7 @@ pub fn get_type_at_call_expr(
                             call_expr.clone(),
                             signature.to_doc_func_type(),
                             signature_cast.map(|cast| (cast, signature_id)),
+                            is_valid_guard,
                             condition_flow,
                         );
                         if !matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue)) {
@@ -461,6 +467,7 @@ fn get_type_at_call_expr_by_type_guard(
     call_expr: LuaCallExpr,
     func_type: Arc<LuaFunctionType>,
     signature_cast: Option<(&LuaSignatureCast, LuaSignatureId)>,
+    is_valid_guard: bool,
     condition_flow: InferConditionFlow,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(target_expr) = type_guard_target_expr(&call_expr) else {
@@ -499,9 +506,14 @@ fn get_type_at_call_expr_by_type_guard(
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
     let result_type = match condition_flow {
-        InferConditionFlow::TrueCondition => {
-            narrow_type_guard_true_branch(db, cache, var_ref_id, antecedent_type, guard_type)
-        }
+        InferConditionFlow::TrueCondition => narrow_type_guard_true_branch(
+            db,
+            cache,
+            var_ref_id,
+            antecedent_type,
+            guard_type,
+            is_valid_guard,
+        ),
         InferConditionFlow::FalseCondition => {
             TypeOps::Remove.apply(db, &antecedent_type, &guard_type)
         }
@@ -544,7 +556,12 @@ fn narrow_type_guard_true_branch(
     var_ref_id: &VarRefId,
     antecedent_type: LuaType,
     guard_type: LuaType,
+    is_valid_guard: bool,
 ) -> LuaType {
+    if is_valid_guard {
+        return narrow_valid_guard_true_branch(db, antecedent_type, guard_type);
+    }
+
     if guard_type.is_any() {
         return if antecedent_type.is_unknown() {
             LuaType::Any
@@ -576,6 +593,25 @@ fn narrow_type_guard_true_branch(
     }
 
     remove_false_or_nil(antecedent_type)
+}
+
+fn narrow_valid_guard_true_branch(
+    db: &DbIndex,
+    antecedent_type: LuaType,
+    guard_type: LuaType,
+) -> LuaType {
+    if let Some(narrowed_type) =
+        narrow_down_type(db, antecedent_type.clone(), guard_type.clone(), None)
+    {
+        return narrowed_type;
+    }
+
+    if antecedent_type.is_unknown() || antecedent_type.is_any() {
+        return LuaType::Any;
+    }
+
+    let truthy_type = remove_false_or_nil(antecedent_type);
+    TypeOps::Remove.apply(db, &truthy_type, &gmod_null_type())
 }
 
 fn is_inferred_mutable_param_without_declared_type(

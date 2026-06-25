@@ -2579,6 +2579,99 @@ mod test {
         ));
     }
 
+    fn def_valid_guard_fixture(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute valid_guard()
+
+                ---@class Entity
+                function Entity:SetHealth(health) end
+
+                ---@class PhysObj
+                function PhysObj:SetMass(mass) end
+
+                ---@class DTree_Node
+                function DTree_Node:InternalDoClick() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                ---@[valid_guard]
+                function IsValid(value) end
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_valid_guard_unknown_physobj_source_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function use(ent)
+                    local phys = ent:GetPhysicsObject()
+                    if not IsValid(phys) then return end
+
+                    phys:SetMass(100)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_unknown_dtree_chain_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function use(tree)
+                    local node = tree:Root():GetChildNode(0)
+                    if not IsValid(node) then return end
+
+                    node:InternalDoClick()
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_typed_physobj_preserves_type_and_reports_bogus_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param phys PhysObj
+                local function use(phys)
+                    if not IsValid(phys) then return end
+
+                    phys:SetMass(100)
+                    local typo = phys.EntityOnlyTypo
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_plain_entity_typo_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param ent Entity
+                local function use(ent)
+                    if not IsValid(ent) then return end
+
+                    ent:SetHealth(100)
+                    local typo = ent.EntityTypo
+                end
+            "#,
+        ));
+    }
+
     #[test]
     fn test_export() {
         let mut ws = VirtualWorkspace::new();

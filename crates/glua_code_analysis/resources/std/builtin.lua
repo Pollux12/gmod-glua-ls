@@ -250,6 +250,16 @@
 --- - `method`: Method name that is valid when called on callback `self`.
 ---@attribute self_call_valid(method: string)
 
+--- Marks a predicate that proves the guarded value is a valid/truthy runtime
+--- object without changing the value's static type to the predicate's return
+--- TypeGuard inner type.
+---
+--- This is intended for functions such as `IsValid`: `---@return TypeGuard<Entity>`
+--- still carries the entity/null-check shape, while `valid_guard` tells flow
+--- narrowing that an already-known `PhysObj`, `Panel`, or other valid object
+--- should remain that type after the guard.
+---@attribute valid_guard()
+
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,
 --- and the target methods must reside within the same class.

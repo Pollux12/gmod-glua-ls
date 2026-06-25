@@ -4,7 +4,8 @@
 //! currently consumed by call-arg roles (`@call_arg`, `@call_arg_field`,
 //! `@overload_call_arg`, `@overload_call_arg_field`), plus a small set of
 //! Phase 1 metadata names reserved for future annotation-driven recognizer
-//! phases (`gmod.member_guard`, `gmod.self_guard`, `gmod.net_payload`).
+//! phases (`gmod.member_guard`, `gmod.self_guard`, `gmod.valid_guard`,
+//! `gmod.net_payload`).
 //!
 //! It also exposes cheap, general-purpose helpers built on top of the existing
 //! `LuaSignature::visit_call_arg_roles_for_param` /
@@ -94,6 +95,18 @@ pub const GMOD_ATTR_SELF_GUARD: &str = "self_guard";
 /// `Weapon:GetOwner()` return type.
 pub const GMOD_ATTR_SELF_CALL_VALID: &str = "self_call_valid";
 
+/// Reserved for validity guards: predicates that prove the guarded value is a
+/// valid/truthy runtime object without reclassifying it to the guard return's
+/// inner type.
+pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
+
+/// Signature-level standalone attribute name for validity-guard metadata.
+///
+/// Example: `---@[valid_guard]` on global `IsValid` means the true branch should
+/// remove false/nil/NULL from the guarded expression while preserving its known
+/// static type when one exists.
+pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
+
 /// Reserved for future net-payload markers: a signature carrying or consuming a
 /// typed net payload. Modeled as a signature-level standalone attribute.
 pub const GMOD_DOMAIN_NET_PAYLOAD: &str = "gmod.net_payload";
@@ -118,8 +131,11 @@ pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
 ];
 
 /// Phase 1 reserved signature-level metadata domains (no call-arg roles yet).
-pub const GMOD_SIGNATURE_METADATA_DOMAINS: &[&str] =
-    &[GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_NET_PAYLOAD];
+pub const GMOD_SIGNATURE_METADATA_DOMAINS: &[&str] = &[
+    GMOD_DOMAIN_SELF_GUARD,
+    GMOD_DOMAIN_VALID_GUARD,
+    GMOD_DOMAIN_NET_PAYLOAD,
+];
 
 // ---------------------------------------------------------------------------
 // Call-arg role selection helpers.
@@ -256,6 +272,11 @@ pub fn find_signature_attribute_use<'a>(
     db.get_property_index()
         .get_property(&crate::LuaSemanticDeclId::Signature(signature_id))?
         .find_attribute_use(attribute_name)
+}
+
+/// Returns whether the signature is marked as a validity guard.
+pub fn signature_is_valid_guard(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
 }
 
 /// Returns the signature id that owns the standalone attributes attached to
