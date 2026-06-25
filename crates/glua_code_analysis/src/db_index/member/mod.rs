@@ -6,7 +6,10 @@ mod lua_owner_members;
 
 use glua_parser::LuaSyntaxKind;
 use rowan::{TextRange, TextSize};
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::OnceLock,
+};
 
 use super::traits::LuaIndex;
 use crate::{FileId, db_index::member::lua_owner_members::LuaOwnerMembers};
@@ -24,6 +27,10 @@ pub struct LuaMemberIndex {
     member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
     member_owner_key_history_index:
         HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+    /// Lazy diagnostics-phase memo for global key lookups. Reset after every
+    /// member history/current-owner mutation so it rebuilds from the owner-key
+    /// indexes on demand.
+    member_key_current_cache: OnceLock<HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
     non_overwriting_assignment_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
@@ -50,6 +57,7 @@ impl LuaMemberIndex {
             member_current_owner: HashMap::new(),
             member_owner_key_index: HashMap::new(),
             member_owner_key_history_index: HashMap::new(),
+            member_key_current_cache: OnceLock::new(),
             non_overwriting_assignment_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
             member_function_scope_ranges: HashMap::new(),
@@ -222,19 +230,29 @@ impl LuaMemberIndex {
             return;
         };
 
-        let target_index = if history {
-            &mut self.member_owner_key_history_index
-        } else {
-            &mut self.member_owner_key_index
-        };
-        let member_ids = target_index
-            .entry(owner)
-            .or_default()
-            .entry(key)
-            .or_default();
-        if !member_ids.contains(&id) {
-            member_ids.push(id);
+        {
+            let target_index = if history {
+                &mut self.member_owner_key_history_index
+            } else {
+                &mut self.member_owner_key_index
+            };
+            let member_ids = target_index
+                .entry(owner)
+                .or_default()
+                .entry(key.clone())
+                .or_default();
+            if !member_ids.contains(&id) {
+                member_ids.push(id);
+            }
         }
+
+        if history {
+            self.invalidate_member_key_history_cache();
+        }
+    }
+
+    fn invalidate_member_key_history_cache(&mut self) {
+        self.member_key_current_cache = OnceLock::new();
     }
 
     fn remove_member_from_visible_owner_key_index(
@@ -283,6 +301,10 @@ impl LuaMemberIndex {
         if remove_owner_entry {
             target_index.remove(owner);
         }
+
+        if history {
+            self.invalidate_member_key_history_cache();
+        }
     }
 
     fn remove_file_members_from_owner_key_indexes(&mut self, file_id: FileId) {
@@ -291,6 +313,7 @@ impl LuaMemberIndex {
             &mut self.member_owner_key_history_index,
             file_id,
         );
+        self.invalidate_member_key_history_cache();
     }
 
     fn remove_file_members_from_owner_key_map(
@@ -556,28 +579,56 @@ impl LuaMemberIndex {
     }
 
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
-        let mut member_ids = Vec::new();
+        let key_current_index = self
+            .member_key_current_cache
+            .get_or_init(|| self.build_member_key_current_index());
+        let Some(member_ids) = key_current_index.get(key) else {
+            return Vec::new();
+        };
+
+        member_ids
+            .iter()
+            .copied()
+            .filter_map(|member_id| self.get_member(&member_id))
+            .collect()
+    }
+
+    fn build_member_key_current_index(&self) -> HashMap<LuaMemberKey, Vec<LuaMemberId>> {
+        let mut key_history_index: HashMap<LuaMemberKey, HashSet<LuaMemberId>> = HashMap::new();
         for owner_items in self.member_owner_key_history_index.values() {
-            let Some(ids) = owner_items.get(key) else {
-                continue;
-            };
-            for id in ids {
-                if !member_ids.contains(id) {
-                    member_ids.push(*id);
-                }
+            for (key, ids) in owner_items {
+                key_history_index
+                    .entry(key.clone())
+                    .or_default()
+                    .extend(ids.iter().copied());
             }
         }
 
-        let mut members = member_ids
+        key_history_index
             .into_iter()
-            .filter_map(|member_id| {
-                self.member_current_owner.get(&member_id)?;
-                self.get_member(&member_id)
-                    .filter(|member| member.get_key() == key)
+            .filter_map(|(key, ids)| {
+                let mut members = ids
+                    .into_iter()
+                    .filter_map(|member_id| {
+                        self.member_current_owner.get(&member_id)?;
+                        self.get_member(&member_id)
+                            .filter(|member| member.get_key() == &key)
+                    })
+                    .collect::<Vec<_>>();
+                if members.is_empty() {
+                    return None;
+                }
+
+                members.sort_by_key(|member| stable_member_sort_key(member));
+                Some((
+                    key,
+                    members
+                        .into_iter()
+                        .map(|member| member.get_id())
+                        .collect::<Vec<_>>(),
+                ))
             })
-            .collect::<Vec<_>>();
-        members.sort_by_key(|member| stable_member_sort_key(member));
-        members
+            .collect()
     }
 
     pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
@@ -732,6 +783,7 @@ impl LuaIndex for LuaMemberIndex {
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
         self.member_owner_key_history_index.clear();
+        self.member_key_current_cache = OnceLock::new();
         self.non_overwriting_assignment_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
@@ -832,6 +884,16 @@ mod tests {
             .map(|member| member.get_id())
             .collect::<Vec<_>>();
         assert_eq!(new_owner_history_member_ids, vec![first_member_id]);
+
+        let key_history_member_ids = index
+            .get_current_members_for_key(&key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            key_history_member_ids,
+            vec![first_member_id, second_member_id]
+        );
     }
 
     #[test]
@@ -843,10 +905,59 @@ mod tests {
         let mut index = LuaMemberIndex::new();
         index.add_member(owner, make_member(member_id, "field"));
         assert!(index.get_member_owner(&member_id).is_some());
+        assert!(
+            !index
+                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
+                .is_empty()
+        );
 
         index.clear();
 
         assert!(index.get_member_owner(&member_id).is_none());
+        assert!(
+            index
+                .get_current_members_for_key(&LuaMemberKey::Name("field".into()))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn key_lookup_cache_invalidates_after_member_mutation() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = make_member_id(FileId::new(9), 1);
+        let second_member_id = make_member_id(FileId::new(10), 3);
+        let mut index = LuaMemberIndex::new();
+
+        index.add_member(owner.clone(), make_member(first_member_id, "field"));
+        assert_eq!(
+            index
+                .get_current_members_for_key(&key)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![first_member_id]
+        );
+
+        index.add_member(owner.clone(), make_member(second_member_id, "field"));
+        assert_eq!(
+            index
+                .get_current_members_for_key(&key)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![first_member_id, second_member_id]
+        );
+
+        index.remove(FileId::new(9));
+        assert_eq!(
+            index
+                .get_current_members_for_key(&key)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![second_member_id]
+        );
     }
 
     #[test]
@@ -1076,9 +1187,18 @@ mod tests {
                 .get_current_owner_members_for_key(&old_owner, &old_key)
                 .is_empty()
         );
+        assert!(index.get_current_members_for_key(&old_key).is_empty());
         assert_eq!(
             index
                 .get_current_owner_members_for_key(&old_owner, &new_key)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![member_id]
+        );
+        assert_eq!(
+            index
+                .get_current_members_for_key(&new_key)
                 .into_iter()
                 .map(|member| member.get_id())
                 .collect::<Vec<_>>(),
