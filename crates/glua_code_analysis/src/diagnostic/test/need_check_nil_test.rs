@@ -864,6 +864,104 @@ mod test {
     }
 
     #[gtest]
+    fn test_isentity_and_method_isvalid_chain_guards_valid_entity_methods() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_type_predicates();
+        ws.def(
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@field Team fun(self: Entity): any
+            ---@field Name fun(self: Entity): any
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class Player : Entity
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = GetEntityOrNULL()
+                if isentity(ent) and ent:IsValid() and ent:IsPlayer() then
+                    ent:Team()
+                    ent:Name()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_isentity_and_method_isvalid_chain_guards_string_or_entity_union() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_type_predicates();
+        ws.def(
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@field Team fun(self: Entity): any
+            ---@field Name fun(self: Entity): any
+            ---@field GetClass fun(self: Entity): string
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class Player : Entity
+
+            ---@return string|Entity|nil
+            function readNameOrEntity() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local attacker = readNameOrEntity()
+                if isentity(attacker) and attacker:IsValid() and attacker:IsPlayer() then
+                    attacker = attacker:Name()
+                end
+
+                if isentity(attacker) and attacker:IsValid() then
+                    attacker = attacker:GetClass()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_explicit_entity_null_union_method_requires_isvalid() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
