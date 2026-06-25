@@ -121,6 +121,13 @@ fn check_call_expr(
             );
         } else if nullable_callable_is_from_non_nullable_receiver(semantic_model, &prefix) {
             return Some(());
+        } else if nullable_callable_is_from_guarded_receiver(semantic_model, &prefix) {
+            // The receiver is nil-checked by a prior type-guard early-return (e.g.
+            // `if not ent:IsAlive() then return end`), so the function access is safe
+            // even though the receiver type still appears nullable in the semantic model
+            // (flow narrowing for colon-call guard calls is deferred to the diagnostic
+            // layer rather than the flow graph).
+            return Some(());
         } else if !should_skip_deferred_nullable_function_call(&call_expr, &prefix) {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
@@ -156,6 +163,25 @@ fn nullable_callable_is_from_non_nullable_receiver(
 
     !receiver_type.is_nullable()
         && !contains_gmod_null_type(semantic_model.get_db(), &receiver_type)
+}
+
+/// Returns `true` when the member access `prefix` has a receiver that is nil-checked
+/// by a prior type-guard early-return.  This handles colon-call guard patterns such as
+/// `if not ent:IsAlive() then return end` followed by `ent:GetEditingData()`: the
+/// receiver `ent` is guarded, so calling a method on it is safe even if the receiver
+/// type still appears nullable in the semantic model (flow narrowing for colon-call
+/// guards is deferred to the diagnostic layer).
+fn nullable_callable_is_from_guarded_receiver(
+    semantic_model: &SemanticModel,
+    prefix: &LuaExpr,
+) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = prefix else {
+        return false;
+    };
+    let Some(receiver) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    is_expr_guarded_by_prior_nil_early_return(semantic_model, &receiver)
 }
 
 fn index_expr_has_explicit_nullable_member(
@@ -980,6 +1006,11 @@ fn condition_is_negative_type_guard(
             match inner_expr {
                 LuaExpr::CallExpr(call_expr) => {
                     is_type_guard_call_guarding_expr(semantic_model, &call_expr, guarded_expr)
+                        || is_self_guard_call_guarding_expr(
+                            semantic_model,
+                            &call_expr,
+                            guarded_expr,
+                        )
                 }
                 LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_some_and(|expr| {
                     condition_is_negative_type_guard(semantic_model, &expr, guarded_expr)
@@ -1322,7 +1353,7 @@ fn is_type_guard_call_guarding_expr(
         && let Some(LuaExpr::IndexExpr(index_expr)) = guard_call.get_prefix_expr()
         && let Some(self_expr) = index_expr.get_prefix_expr()
     {
-        return exprs_reference_same_var(semantic_model, &self_expr, receiver);
+        return exprs_reference_same_var_or_text(semantic_model, &self_expr, receiver);
     }
 
     let Some(first_arg) = guard_call
@@ -1335,12 +1366,55 @@ fn is_type_guard_call_guarding_expr(
     exprs_reference_same_var(semantic_model, &first_arg, receiver)
 }
 
+fn is_self_guard_call_guarding_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    if !guard_call.is_colon_call() {
+        return false;
+    }
+
+    let Some(LuaExpr::IndexExpr(index_expr)) = guard_call.get_prefix_expr() else {
+        return false;
+    };
+    let Some(self_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    if !exprs_reference_same_var_or_text(semantic_model, &self_expr, guarded_expr) {
+        return false;
+    }
+
+    let Some(member_key) = index_expr
+        .get_index_key()
+        .and_then(|key| semantic_model.get_member_key(&key))
+    else {
+        return false;
+    };
+
+    if let Ok(receiver_type) = semantic_model.infer_expr(self_expr) {
+        let non_nil_receiver_type = remove_false_or_nil(receiver_type);
+        if semantic_model
+            .infer_member_type(&non_nil_receiver_type, &member_key)
+            .is_ok_and(|typ| type_returns_non_nullable_type_guard(semantic_model, &typ))
+        {
+            return true;
+        }
+    }
+
+    indexed_member_key_returns_non_nullable_type_guard(semantic_model, &member_key)
+}
+
 fn is_null_excluding_type_guard_call_guarding_expr(
     semantic_model: &SemanticModel,
     guard_call: &LuaCallExpr,
     guarded_expr: &LuaExpr,
     guarded_type: &LuaType,
 ) -> bool {
+    if is_self_guard_call_guarding_expr(semantic_model, guard_call, guarded_expr) {
+        return true;
+    }
+
     if !is_type_guard_call_guarding_expr(semantic_model, guard_call, guarded_expr) {
         return false;
     }
@@ -1483,7 +1557,7 @@ fn signature_cast_targets_guarded_expr(
         let Some(self_expr) = index_expr.get_prefix_expr() else {
             return false;
         };
-        return exprs_reference_same_var(semantic_model, &self_expr, guarded_expr);
+        return exprs_reference_same_var_or_text(semantic_model, &self_expr, guarded_expr);
     }
 
     let Some(arg_list) = guard_call.get_args_list() else {
@@ -1555,18 +1629,53 @@ fn call_returns_non_nullable_type_guard(
     semantic_model
         .infer_member_type(&non_nil_receiver_type, &member_key)
         .is_ok_and(|typ| type_returns_non_nullable_type_guard(semantic_model, &typ))
+        || indexed_member_key_returns_non_nullable_type_guard(semantic_model, &member_key)
+}
+
+fn indexed_member_key_returns_non_nullable_type_guard(
+    semantic_model: &SemanticModel,
+    member_key: &crate::LuaMemberKey,
+) -> bool {
+    let db = semantic_model.get_db();
+    db.get_member_index()
+        .get_current_members_for_key(member_key)
+        .into_iter()
+        .filter_map(|member| {
+            db.get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|type_cache| type_cache.as_type().clone())
+        })
+        .any(|typ| type_returns_non_nullable_type_guard(semantic_model, &typ))
 }
 
 fn type_returns_non_nullable_type_guard(semantic_model: &SemanticModel, typ: &LuaType) -> bool {
+    use crate::{GMOD_ATTR_SELF_GUARD, find_signature_attribute_use};
+
     match typ {
         LuaType::DocFunction(func) => return_type_is_non_nullable_type_guard(func.get_ret()),
-        LuaType::Signature(signature_id) => semantic_model
-            .get_db()
-            .get_signature_index()
-            .get(signature_id)
-            .is_some_and(|signature| {
-                return_type_is_non_nullable_type_guard(&signature.get_return_type())
-            }),
+        LuaType::Signature(signature_id) => {
+            let db = semantic_model.get_db();
+            // Check TypeGuard<T> return type first.
+            if db
+                .get_signature_index()
+                .get(signature_id)
+                .is_some_and(|sig| return_type_is_non_nullable_type_guard(&sig.get_return_type()))
+            {
+                return true;
+            }
+            // A standalone `self_guard` attribute marks the receiver (colon-call self)
+            // as a valid guard, so treat the method as a type guard for nil-check purposes.
+            if find_signature_attribute_use(db, *signature_id, GMOD_ATTR_SELF_GUARD).is_some() {
+                return true;
+            }
+            // A `return_cast self` annotation explicitly casts the receiver after the call.
+            if let Some(cast) = db.get_flow_index().get_signature_cast(signature_id) {
+                if cast.name == "self" {
+                    return true;
+                }
+            }
+            false
+        }
         LuaType::Union(union_type) => union_type
             .into_vec()
             .iter()
@@ -1836,6 +1945,14 @@ fn exprs_reference_same_var(
     };
 
     left_ref_id == right_ref_id
+}
+
+fn exprs_reference_same_var_or_text(
+    semantic_model: &SemanticModel,
+    left: &LuaExpr,
+    right: &LuaExpr,
+) -> bool {
+    exprs_reference_same_var(semantic_model, left, right) || expr_text_matches(left, right)
 }
 
 fn get_null_nil_comparison_operand<'a>(

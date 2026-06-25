@@ -42,8 +42,8 @@ pub fn get_type_at_call_expr(
     let call_expr_ref = call_expr.clone();
     let prefix_expr_ref = prefix_expr.clone();
 
-    // If we can't infer the function type (e.g. undefined global like `isfunction`),
-    // skip type-based narrowing but still fall through to supported fallback handling.
+    // If we can't infer the function type, skip type-based narrowing but still
+    // fall through to supported fallback handling.
     let result = match infer_expr(db, cache, prefix_expr.clone()) {
         Err(_) => Ok(ResultTypeOrContinue::Continue),
         Ok(maybe_func) => match maybe_func {
@@ -81,20 +81,29 @@ pub fn get_type_at_call_expr(
 
                 let ret = signature.get_return_type();
                 let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
+                let mut type_guard_did_not_apply = false;
                 match ret {
                     LuaType::TypeGuard(_) => {
-                        return get_type_at_call_expr_by_type_guard(
+                        // Try TypeGuard narrowing. If it doesn't apply (e.g., when the
+                        // target is a member access, not a simple variable), fall through
+                        // to the member guard fallback below.
+                        let type_guard_result = get_type_at_call_expr_by_type_guard(
                             db,
                             tree,
                             cache,
                             root,
                             var_ref_id,
                             flow_node,
-                            call_expr,
+                            call_expr.clone(),
                             signature.to_doc_func_type(),
                             signature_cast.map(|cast| (cast, signature_id)),
                             condition_flow,
                         );
+                        if !matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue)) {
+                            return type_guard_result;
+                        }
+                        // TypeGuard narrowing didn't apply; fall through to member guard fallback.
+                        type_guard_did_not_apply = true;
                     }
                     LuaType::Call(call) => {
                         return get_type_at_call_expr_by_call(
@@ -112,7 +121,11 @@ pub fn get_type_at_call_expr(
                     _ => {}
                 }
 
-                if let Some(signature_cast) = signature_cast {
+                // If TypeGuard narrowing didn't apply, skip the signature_cast path
+                // and go directly to the member guard fallback.
+                if type_guard_did_not_apply {
+                    // Fall through to the fallback at the end of the function.
+                } else if let Some(signature_cast) = signature_cast {
                     return match signature_cast.name.as_str() {
                         "self" => get_type_at_call_expr_by_signature_self(
                             db,
@@ -153,10 +166,12 @@ pub fn get_type_at_call_expr(
         },
     };
 
-    // Fallback: check supported predicate patterns when normal type-based
-    // narrowing didn't produce a result.
+    // Fallback: check metadata-driven member-guard predicate patterns when
+    // normal type-based narrowing didn't produce a result. The callee must
+    // resolve to a signature carrying `call_arg("gmod.member_guard", ...)`
+    // metadata on its first parameter; unannotated spellings are ignored.
     if let Ok(ResultTypeOrContinue::Continue) = result {
-        if let Some(isfunction_type) = try_narrow_isfunction_member(
+        if let Some(member_guard_type) = try_narrow_member_guard(
             db,
             tree,
             cache,
@@ -167,13 +182,13 @@ pub fn get_type_at_call_expr(
             &prefix_expr_ref,
             condition_flow,
         )? {
-            return Ok(ResultTypeOrContinue::Result(isfunction_type));
+            return Ok(ResultTypeOrContinue::Result(member_guard_type));
         }
 
         if let Some(fallback_target_expr) =
-            resolve_builtin_name_fallback_target(db, cache, root, &prefix_expr_ref)
+            resolve_member_guard_alias_target(db, cache, root, &prefix_expr_ref)
         {
-            if let Some(isfunction_type) = try_narrow_isfunction_member(
+            if let Some(member_guard_type) = try_narrow_member_guard(
                 db,
                 tree,
                 cache,
@@ -184,7 +199,7 @@ pub fn get_type_at_call_expr(
                 &fallback_target_expr,
                 condition_flow,
             )? {
-                return Ok(ResultTypeOrContinue::Result(isfunction_type));
+                return Ok(ResultTypeOrContinue::Result(member_guard_type));
             }
         }
     }
@@ -192,7 +207,11 @@ pub fn get_type_at_call_expr(
     result
 }
 
-fn resolve_builtin_name_fallback_target(
+/// Resolves an alias chain for member-guard predicate callees. When the
+/// `prefix_expr` is a local name bound to an immutable alias of another
+/// global that carries member-guard metadata, returns the aliased name
+/// expression so narrowing can proceed on the original call shape.
+fn resolve_member_guard_alias_target(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     root: &LuaChunk,
@@ -206,7 +225,7 @@ fn resolve_builtin_name_fallback_target(
     let local_ref = references_index.get_local_reference(&cache.get_file_id());
     let Some(decl_id) = local_ref.and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
     else {
-        return is_unshadowed_gmod_guard_global_name(db, cache, name_expr)
+        return is_member_guard_callee(db, cache, name_expr)
             .then(|| LuaExpr::NameExpr(name_expr.clone()));
     };
 
@@ -234,8 +253,7 @@ fn resolve_builtin_name_fallback_target(
         return None;
     }
 
-    is_unshadowed_gmod_guard_global_name(db, cache, &alias_name_expr)
-        .then(|| LuaExpr::NameExpr(alias_name_expr))
+    is_member_guard_callee(db, cache, &alias_name_expr).then(|| LuaExpr::NameExpr(alias_name_expr))
 }
 
 fn name_expr_has_local_binding(
@@ -261,29 +279,56 @@ fn name_expr_has_local_binding(
     by_reference || by_scope
 }
 
-fn is_unshadowed_gmod_guard_global_name(
+/// Returns `true` when `name_expr` refers to an unshadowed global whose
+/// resolved signature carries `call_arg("gmod.member_guard", ...)` metadata
+/// on its first parameter. Replaces the previous hardcoded member-guard
+/// name check.
+fn is_member_guard_callee(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &glua_parser::LuaNameExpr,
 ) -> bool {
-    let Some(helper_name) = name_expr.get_name_text() else {
-        return false;
-    };
-
-    let helper_name = helper_name.as_str();
-    if helper_name != "isfunction" {
-        return false;
-    }
+    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_call_arg_role_for_param};
 
     if name_expr_has_local_binding(db, cache, name_expr) {
         return false;
     }
 
-    true
+    // Resolve the callee's type and extract its signature.
+    let Ok(callee_type) = infer_expr(db, cache, LuaExpr::NameExpr(name_expr.clone())) else {
+        return false;
+    };
+
+    let signature_id = match callee_type {
+        LuaType::Signature(sig_id) => sig_id,
+        LuaType::DocFunction(_) => {
+            // DocFunction types don't directly carry signature IDs.
+            // Try to resolve through the semantic declaration path.
+            let Some(sig_id) =
+                get_callable_expr_signature_id(db, cache, LuaExpr::NameExpr(name_expr.clone()), 0)
+            else {
+                return false;
+            };
+            sig_id
+        }
+        _ => return false,
+    };
+
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+
+    find_best_call_arg_role_for_param(signature, 0, GMOD_DOMAIN_MEMBER_GUARD, &[]).is_some()
 }
 
+/// Metadata-driven member-guard narrowing. When `call_expr` is a call to a
+/// callee whose resolved signature carries `call_arg("gmod.member_guard", ...)`
+/// metadata on its first parameter, and that first argument is a member access
+/// on the variable tracked by `var_ref_id`, narrow the variable's type to the
+/// subtypes where the accessed member is callable (true branch) or not callable
+/// (false branch). Replaces the previous hardcoded member-guard name check.
 #[allow(clippy::too_many_arguments)]
-fn try_narrow_isfunction_member(
+fn try_narrow_member_guard(
     db: &DbIndex,
     tree: &FlowTree,
     cache: &mut LuaInferCache,
@@ -298,11 +343,7 @@ fn try_narrow_isfunction_member(
         return Ok(None);
     };
 
-    if name_expr.get_name_text().as_deref() != Some("isfunction") {
-        return Ok(None);
-    }
-
-    if !is_unshadowed_gmod_guard_global_name(db, cache, name_expr) {
+    if !is_member_guard_callee(db, cache, name_expr) {
         return Ok(None);
     }
 
@@ -329,7 +370,7 @@ fn try_narrow_isfunction_member(
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
-    let Some(candidates) = collect_isfunction_narrow_candidates(db, &antecedent_type) else {
+    let Some(candidates) = collect_member_guard_narrow_candidates(db, &antecedent_type) else {
         return Ok(None);
     };
 
@@ -373,7 +414,7 @@ fn try_narrow_isfunction_member(
     Ok(Some(narrowed_type))
 }
 
-fn collect_isfunction_narrow_candidates(
+fn collect_member_guard_narrow_candidates(
     db: &DbIndex,
     antecedent_type: &LuaType,
 ) -> Option<Vec<LuaType>> {
@@ -388,7 +429,7 @@ fn collect_isfunction_narrow_candidates(
             Some(candidates)
         }
         LuaType::Instance(instance_type) => {
-            collect_isfunction_narrow_candidates(db, instance_type.get_base())
+            collect_member_guard_narrow_candidates(db, instance_type.get_base())
         }
         _ => None,
     }

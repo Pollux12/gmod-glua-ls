@@ -1583,6 +1583,8 @@ mod test {
             r#"
             ---@class Entity
             ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
             ---@return Entity?
             function maybeEntity() end
 
@@ -1842,6 +1844,145 @@ mod test {
 
                 local ent = getEntity()
                 if not ent:IsValid() then
+                    return
+                end
+
+                ent:GetEditingData()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_custom_annotated_colon_self_guard_suppresses_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library file: declare the `self_guard` attribute and the Entity class/method.
+        // Must be in a ---@meta file so ---@attribute is recognised.
+        // NOTE: `---@[self_guard(...)]` must come AFTER `---@return` so the attribute-use
+        // ownership scan (`attribute_find_doc`) does not attach it to the `@return` tag.
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute self_guard(member: string)
+
+                ---@class Entity
+                ---@field GetEditingData fun(self: Entity): table
+                ---@class NULL : Entity
+                ---@alias EntityOrNULL Entity|NULL
+
+                ---@return boolean
+                ---@[self_guard("gmod.entity")]
+                function Entity:IsAlive() end
+
+                ---@return EntityOrNULL
+                function getEntity() end
+            "#,
+        );
+
+        // Checked code: a non-meta file that uses the `self_guard`-annotated method as a
+        // guard. The receiver is Entity|NULL rather than Entity? because a colon call on
+        // nil is not safe; this models the common GMod NULL validity pattern.
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = getEntity()
+                if not ent:IsAlive() then
+                    return
+                end
+
+                ent:GetEditingData()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    /// R4 branch 2: a method with ONLY `---@return_cast self Entity` (no `self_guard`
+    /// attribute, no `TypeGuard` return) should also suppress `NeedCheckNil` on the
+    /// receiver after a `if not ent:Method() then return end` guard.
+    #[gtest]
+    fn test_colon_call_return_cast_self_suppresses_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library: Entity class with a method annotated with `return_cast self Entity`
+        // only — no self_guard attribute, no TypeGuard return.
+        ws.def(
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+
+            ---@return_cast self Entity
+            ---@return boolean
+            function Entity:IsValid() end
+
+            ---@return EntityOrNULL
+            function getEntity() end
+            "#,
+        );
+
+        // The `return_cast self` path must recognise the method as a NULL-excluding guard.
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = getEntity()
+                if not ent:IsValid() then
+                    return
+                end
+
+                ent:GetEditingData()
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    /// R4 branch 3: a method returning `TypeGuard<Entity>` as a colon-call should
+    /// suppress `NeedCheckNil` on the receiver after a guard clause.
+    #[gtest]
+    fn test_colon_call_typeguard_return_suppresses_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        // Library: Entity class with a method that returns TypeGuard<Entity>.
+        ws.def(
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return TypeGuard<Entity>
+            function Entity:IsEntity() end
+
+            ---@return EntityOrNULL
+            function getEntity() end
+            "#,
+        );
+
+        // The `TypeGuard<T>` path applied to a colon-call method must recognise the
+        // method as a NULL-excluding guard.
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                local ent = getEntity()
+                if not ent:IsEntity() then
                     return
                 end
 
@@ -2207,6 +2348,7 @@ mod test {
         // After narrowing Entity→base_glide via isfunction(vehicle.GetFreeSeat),
         // GetFreeSeat returns Entity?, so accessing seat fields needs nil check.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
 
         ws.def(
             r#"
@@ -2245,6 +2387,7 @@ mod test {
         // Combined: vehicle.IsGlideVehicle AND isfunction(vehicle.GetFreeSeat)
         // Both conditions narrow vehicle from Entity to base_glide.
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
 
         ws.def(
             r#"

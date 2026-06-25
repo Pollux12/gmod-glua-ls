@@ -2334,6 +2334,7 @@ mod test {
     #[test]
     fn test_isfunction_member_guard_suppresses_undefined_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
                 ---@class VehicleGuardLike
@@ -4297,5 +4298,71 @@ mod test {
             diagnostics.is_empty(),
             "false-or-VMatrix guard should remove the false path before method lookup, got: {diagnostics:?}"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata-driven member guard tests (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// A custom guard function (not named `isfunction`) with `call_arg("gmod.member_guard", ...)`
+    /// metadata should suppress undefined-field for its member-access argument.
+    #[test]
+    fn test_custom_annotated_member_guard_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.member_guard", "function")]
+            ---@param value any
+            ---@return boolean
+            function isCallable(value) end
+
+            ---@class MyVehicle
+            MyVehicle = {}
+            "#,
+        );
+
+        // Use a non-conditional assignment context so that `in_conditional_statement` does NOT
+        // fire.  The suppression must come from the `is_member_guard_call_argument` metadata
+        // path, making this a load-bearing test for `call_arg("gmod.member_guard", ...)`.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle
+                local vehicle
+                local result = isCallable(vehicle.GetFreeSeat)
+            "#
+        ));
+    }
+
+    /// An unannotated `isfunction` spelling (without `gmod.member_guard` metadata)
+    /// should NOT suppress undefined-field when the member access is not in
+    /// a conditional context.
+    #[test]
+    fn test_unannotated_isfunction_does_not_suppress_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return boolean
+            function isfunction(value) end
+
+            ---@class MyVehicle2
+            MyVehicle2 = {}
+            "#,
+        );
+
+        // Without member_guard metadata, isfunction should NOT suppress.
+        // Use an assignment context (not conditional) to test the member guard path.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle2
+                local vehicle
+                local result = isfunction(vehicle.GetFreeSeat)
+            "#
+        ));
     }
 }

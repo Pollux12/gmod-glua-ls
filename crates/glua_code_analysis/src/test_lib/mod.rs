@@ -335,6 +335,11 @@ impl VirtualWorkspace {
     pub fn def_gmod_type_predicates(&mut self) -> FileId {
         self.def(
             r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@attribute self_guard(member: string)
+
+            ---@[call_arg("gmod.member_guard", "function")]
             ---@param value any
             ---@return TypeGuard<function>
             function isfunction(value) end
@@ -390,6 +395,10 @@ impl VirtualWorkspace {
             ---@param value any
             ---@return TypeGuard<Color>
             function IsColor(value) end
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function IsValid(value) end
             "#,
         )
     }

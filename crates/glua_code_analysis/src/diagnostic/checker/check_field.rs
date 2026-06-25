@@ -765,7 +765,9 @@ fn is_valid_member_inner(
 
     // nil-safe context check (ancestor walk) — only needed when flow analysis
     // didn't already resolve the field above.
-    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
+    if matches!(code, DiagnosticCode::UndefinedField)
+        && is_nil_safe_expr_context(semantic_model, index_expr)
+    {
         if allows_nil_safe_expr_undefined_field_suppression(semantic_model, prefix_typ, &index_key)
         {
             return Some(());
@@ -1052,7 +1054,7 @@ fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
     false
 }
 
-fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
+fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node: &T) -> bool {
     if in_conditional_statement(node) {
         return true;
     }
@@ -1062,7 +1064,7 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
             LuaSyntaxKind::CallExpr => {
                 if let Some(call_expr) = LuaCallExpr::cast(ancestor.clone()) {
                     let node_range = node.syntax().text_range();
-                    if is_known_member_guard_call_argument(&call_expr, node_range) {
+                    if is_member_guard_call_argument(semantic_model, &call_expr, node_range) {
                         return true;
                     }
 
@@ -1125,7 +1127,13 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
     false
 }
 
-fn is_known_member_guard_call_argument(
+/// Returns `true` when `node_range` falls inside an argument of `call_expr`
+/// whose resolved callee carries `call_arg("gmod.member_guard", ...)` metadata
+/// on the matching parameter. This replaces the previous hardcoded
+/// member-guard name check so any annotated guard predicate suppresses
+/// undefined-field diagnostics for its member-guard arguments.
+fn is_member_guard_call_argument(
+    semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
     node_range: rowan::TextRange,
 ) -> bool {
@@ -1133,20 +1141,62 @@ fn is_known_member_guard_call_argument(
         return false;
     };
 
-    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-        return false;
-    };
-    if name_expr.get_name_text().as_deref() != Some("isfunction") {
-        return false;
-    }
-
     let Some(args_list) = call_expr.get_args_list() else {
         return false;
     };
 
-    args_list
-        .get_args()
-        .any(|arg| arg.get_range().contains_range(node_range))
+    // Find which argument position the node falls in.
+    let mut arg_idx: Option<usize> = None;
+    for (idx, arg) in args_list.get_args().enumerate() {
+        if arg.get_range().contains_range(node_range) {
+            arg_idx = Some(idx);
+            break;
+        }
+    }
+    let Some(arg_idx) = arg_idx else {
+        return false;
+    };
+
+    // Resolve the callee to a signature and check for member_guard metadata
+    // on the matching parameter.
+    let Ok(callee_type) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+
+    callee_type_has_member_guard_param(semantic_model, &callee_type, arg_idx)
+}
+
+fn callee_type_has_member_guard_param(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    arg_idx: usize,
+) -> bool {
+    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_call_arg_role_for_param};
+
+    let db = semantic_model.get_db();
+    match typ {
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = db.get_signature_index().get(signature_id) else {
+                return false;
+            };
+            find_best_call_arg_role_for_param(signature, arg_idx, GMOD_DOMAIN_MEMBER_GUARD, &[])
+                .is_some()
+        }
+        LuaType::DocFunction(_) => {
+            // DocFunction types don't carry call-arg roles directly;
+            // try to resolve through the signature index.
+            false
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|t| callee_type_has_member_guard_param(semantic_model, t, arg_idx)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(|t| callee_type_has_member_guard_param(semantic_model, t, arg_idx)),
+        _ => false,
+    }
 }
 
 fn is_expression_boundary(kind: LuaSyntaxKind) -> bool {
@@ -1641,7 +1691,7 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
             }
         }
         LuaExpr::CallExpr(call) => {
-            // Handle guard calls like IsValid(field), isfunction(field), etc.
+            // Handle predicate guard calls with field arguments.
             if let Some(args) = call.get_args_list() {
                 for arg in args.get_args() {
                     if is_truthy_check_in_condition(&arg, field_text) {
@@ -1656,7 +1706,7 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
 }
 
 /// Check if a condition expression guards a field against nil.
-/// Handles: `field ~= nil`, `field` (truthy), `isfunction(field)`, and compound `and` conditions.
+/// Handles: `field ~= nil`, `field` (truthy), predicate calls, and compound `and` conditions.
 fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
     match condition {
         LuaExpr::BinaryExpr(binary) => {
@@ -1736,7 +1786,7 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
             }
         }
         LuaExpr::CallExpr(call) => {
-            // Handle guard calls like isfunction(obj.field), istable(obj.field), etc.
+            // Handle predicate guard calls with member arguments.
             if let Some(args) = call.get_args_list() {
                 for arg in args.get_args() {
                     if condition_nil_guards_field(&arg, field_text) {
@@ -1903,7 +1953,7 @@ fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
 /// Check if a condition text references a variable name.
 fn condition_references_var(cond_text: &str, var_name: &str) -> bool {
     // Simple text search: the variable appears as a word boundary in the condition
-    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, `IsValid(x)`, etc.
+    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, predicate guards, etc.
     for part in cond_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         if part == var_name {
             return true;

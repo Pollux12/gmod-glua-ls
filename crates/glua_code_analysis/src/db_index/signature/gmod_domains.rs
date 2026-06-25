@@ -79,6 +79,13 @@ pub const GMOD_DOMAIN_MEMBER_GUARD: &str = "gmod.member_guard";
 /// attribute.
 pub const GMOD_DOMAIN_SELF_GUARD: &str = "gmod.self_guard";
 
+/// Signature-level standalone attribute name for self/receiver guard metadata.
+///
+/// The domain value above is carried as an argument to this attribute; the
+/// attribute id itself intentionally stays a single name so it resolves through
+/// the current attribute storage path (`---@[self_guard("gmod.entity")]`).
+pub const GMOD_ATTR_SELF_GUARD: &str = "self_guard";
+
 /// Reserved for future net-payload markers: a signature carrying or consuming a
 /// typed net payload. Modeled as a signature-level standalone attribute.
 pub const GMOD_DOMAIN_NET_PAYLOAD: &str = "gmod.net_payload";

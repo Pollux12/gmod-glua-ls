@@ -2,8 +2,8 @@ use std::collections::{HashMap, HashSet};
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
-    LuaClosureExpr, LuaExpr, LuaIfStat, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaNameExpr,
-    LuaStat, LuaTableField, UnaryOperator,
+    LuaClosureExpr, LuaExpr, LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaNameExpr, LuaStat,
+    LuaTableField, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -510,10 +510,9 @@ fn guarded_call_target_name(
 
     match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
-            let helper_name = name_expr.get_name_text()?;
-            if helper_name != "IsValid"
-                && !call_prefix_returns_type_guard(semantic_model, &name_expr)
-            {
+            // Metadata-driven: recognize any callee whose resolved return type
+            // is `TypeGuard<...>`, regardless of the function's name.
+            if !call_prefix_returns_type_guard(semantic_model, &name_expr) {
                 return None;
             }
 
@@ -525,11 +524,10 @@ fn guarded_call_target_name(
                 return None;
             }
 
-            let is_isvalid_call = matches!(
-                index_expr.get_index_key(),
-                Some(LuaIndexKey::Name(name_token)) if name_token.get_name_text() == "IsValid"
-            );
-            if !is_isvalid_call {
+            // Metadata-driven: recognize any colon-call whose resolved method
+            // carries `self_guard` metadata, returns `TypeGuard<...>`, or has
+            // a `return_cast self` annotation. Do not check method name.
+            if !call_method_has_self_guard_metadata(semantic_model, &index_expr) {
                 return None;
             }
 
@@ -636,7 +634,7 @@ fn collect_truthy_guarded_names_with_not_chain(
     }
 }
 
-/// Walk an expression purely to register IndexExpr / IsValid-style call bases
+/// Walk an expression purely to register IndexExpr / validity-guard call bases
 /// in `condition_guard_ranges` without producing any truthy *names*.
 ///
 /// Used for binary/unary operands where the operand cannot itself act as a
@@ -693,7 +691,7 @@ fn collect_condition_guard_side_effects(
             }
         }
         LuaExpr::CallExpr(call_expr) => {
-            // `IsValid(x)` / `x:IsValid()` style helper calls already imply
+            // Validity-guard helper calls already imply
             // their target exists — reuse the existing helper so we stay in
             // sync with the truthy-path detection.
             if let Some(guarded_target) = guarded_call_target_name(semantic_model, call_expr)
@@ -732,6 +730,96 @@ fn call_prefix_returns_type_guard(semantic_model: &SemanticModel, name_expr: &Lu
             .get_signature_index()
             .get(&signature_id)
             .is_some_and(|signature| matches!(signature.get_return_type(), LuaType::TypeGuard(_))),
+        _ => false,
+    }
+}
+
+/// Returns `true` when the colon-call method referenced by `index_expr`
+/// carries self-guard metadata: a `self_guard` standalone attribute on the
+/// resolved signature, a `TypeGuard<...>` return type, or a `return_cast`
+/// targeting `self`. This replaces the previous hardcoded validity method name
+/// check so any annotated method can act as a receiver guard.
+fn call_method_has_self_guard_metadata(
+    semantic_model: &SemanticModel,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> bool {
+    let Some(member_key) = index_expr
+        .get_index_key()
+        .and_then(|key| semantic_model.get_member_key(&key))
+    else {
+        return false;
+    };
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    let Ok(receiver_type) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+
+    if let Ok(member_type) = semantic_model.infer_member_type(&receiver_type, &member_key)
+        && type_has_self_guard_metadata(semantic_model, &member_type)
+    {
+        return true;
+    }
+
+    if matches!(receiver_type, LuaType::Any | LuaType::Unknown) {
+        return any_indexed_member_with_self_guard_metadata(semantic_model, &member_key);
+    }
+
+    false
+}
+
+fn any_indexed_member_with_self_guard_metadata(
+    semantic_model: &SemanticModel,
+    member_key: &crate::LuaMemberKey,
+) -> bool {
+    let db = semantic_model.get_db();
+    db.get_member_index()
+        .get_current_members_for_key(member_key)
+        .into_iter()
+        .filter_map(|member| {
+            db.get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|type_cache| type_cache.as_type().clone())
+        })
+        .any(|typ| type_has_self_guard_metadata(semantic_model, &typ))
+}
+
+fn type_has_self_guard_metadata(semantic_model: &SemanticModel, typ: &LuaType) -> bool {
+    use crate::{GMOD_ATTR_SELF_GUARD, find_signature_attribute_use};
+
+    match typ {
+        LuaType::DocFunction(func) => matches!(func.get_ret(), LuaType::TypeGuard(_)),
+        LuaType::Signature(signature_id) => {
+            let db = semantic_model.get_db();
+            // Check for self_guard standalone attribute.
+            if find_signature_attribute_use(db, *signature_id, GMOD_ATTR_SELF_GUARD).is_some() {
+                return true;
+            }
+            // Check for TypeGuard return type.
+            if let Some(signature) = db.get_signature_index().get(signature_id) {
+                if matches!(signature.get_return_type(), LuaType::TypeGuard(_)) {
+                    return true;
+                }
+                // Check for return_cast targeting self.
+                if let Some(cast) = db.get_flow_index().get_signature_cast(signature_id) {
+                    if cast.name == "self" {
+                        return true;
+                    }
+                }
+            }
+            false
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|t| type_has_self_guard_metadata(semantic_model, t)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(|t| type_has_self_guard_metadata(semantic_model, t)),
         _ => false,
     }
 }

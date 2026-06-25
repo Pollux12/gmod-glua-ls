@@ -146,10 +146,14 @@ mod test {
         assert!(ws.check_code_for(
             DiagnosticCode::UndefinedGlobal,
             r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
             function _G.IsValid(_) end
 
             if IsValid(entMaybe) then
-                print(entMaybe)
+                local result = entMaybe + 1
             end
             "#
         ));
@@ -174,11 +178,15 @@ mod test {
         assert!(ws.check_code_for(
             DiagnosticCode::UndefinedGlobal,
             r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
             function _G.IsValid(_) end
 
             local is_valid = IsValid
             if is_valid(entMaybe) then
-                print(entMaybe)
+                local result = entMaybe + 1
             end
             "#
         ));
@@ -1437,6 +1445,241 @@ mod test {
             local typoo = typoo
             "#,
             "typoo",
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata-driven guard recognition tests (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// A custom global guard function (not named `IsValid`) with TypeGuard
+    /// return metadata should suppress undefined-global for its argument.
+    #[gtest]
+    fn test_custom_annotated_global_guard_suppresses_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function IsEntityValid(value) end
+            "#,
+        );
+
+        // IsEntityValid(UNDEF) should guard UNDEF just like IsValid would.
+        // Use an operation context inside the guarded branch so the suppression must
+        // come from TypeGuard metadata, not from a plain-read or print call path.
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if IsEntityValid(someUndefined) then
+                local result = someUndefined + 1
+            end
+            "#,
+            "someUndefined",
+        ));
+    }
+
+    /// A function with the same spelling as a guard but WITHOUT TypeGuard
+    /// metadata should NOT suppress undefined-global when used outside
+    /// a conditional context (e.g., as a standalone expression).
+    #[gtest]
+    fn test_unannotated_guard_spelling_does_not_suppress_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return boolean
+            function IsValid(value) end
+            "#,
+        );
+
+        // IsValid without TypeGuard metadata should NOT guard its argument.
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if IsValid(someUndefined) then
+                local result = someUndefined + 1
+            end
+            "#,
+            "someUndefined",
+        ));
+    }
+
+    /// A local shadow of a guard function should NOT suppress undefined-global
+    /// because the local doesn't carry the TypeGuard metadata.
+    #[gtest]
+    fn test_local_shadow_of_guard_does_not_suppress_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function IsValid(value) end
+            "#,
+        );
+
+        // Local shadow without TypeGuard metadata should NOT guard its argument.
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            local IsValid = function(x) return x ~= nil end
+            if IsValid(someUndefined) then
+                local result = someUndefined + 1
+            end
+            "#,
+            "someUndefined",
+        ));
+    }
+
+    // -----------------------------------------------------------------------
+    // Colon-call self-guard branch tests (Phase 2 / R4)
+    // -----------------------------------------------------------------------
+
+    /// A colon-call whose method has NO guard metadata should not suppress
+    /// undefined-global for the receiver.
+    #[gtest]
+    fn test_colon_call_no_guard_metadata_does_not_suppress_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@return number
+            function Entity:GetHealth() end
+            "#,
+        );
+
+        // `entMaybe` is undefined (`any` type). `Entity:GetHealth` carries no
+        // guard metadata.  The colon-call branch must not suppress the receiver.
+        assert!(has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if entMaybe:GetHealth() then
+                local result = entMaybe + 1
+            end
+            "#,
+            "entMaybe",
+        ));
+    }
+
+    /// Real `Entity:IsValid` annotation shape (`self_guard` plus `return_cast self`)
+    /// should suppress undefined-global for the receiver in operation context.
+    #[gtest]
+    fn test_colon_call_real_isvalid_shape_suppresses_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+            "#,
+        );
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if entMaybe:IsValid() then
+                local result = entMaybe + 1
+            end
+            "#,
+            "entMaybe",
+        ));
+    }
+
+    /// A custom method with only `self_guard` metadata should suppress
+    /// undefined-global for the receiver; no method name spelling is special.
+    #[gtest]
+    fn test_colon_call_self_guard_only_suppresses_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+
+            ---@return boolean
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsAlive() end
+            "#,
+        );
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if entMaybe:IsAlive() then
+                local result = entMaybe + 1
+            end
+            "#,
+            "entMaybe",
+        ));
+    }
+
+    /// A custom method with only `return_cast self` metadata should suppress
+    /// undefined-global for the receiver.
+    #[gtest]
+    fn test_colon_call_return_cast_self_only_suppresses_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@return_cast self Entity
+            ---@return boolean
+            function Entity:IsValid() end
+            "#,
+        );
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if entMaybe:IsValid() then
+                local result = entMaybe + 1
+            end
+            "#,
+            "entMaybe",
+        ));
+    }
+
+    /// A custom method returning `TypeGuard<T>` should also suppress
+    /// undefined-global for the receiver in colon-call guard position.
+    #[gtest]
+    fn test_colon_call_typeguard_return_suppresses_undefined_global() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@return TypeGuard<Entity>
+            function Entity:IsEntity() end
+            "#,
+        );
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "test.lua",
+            r#"
+            if entMaybe:IsEntity() then
+                local result = entMaybe + 1
+            end
+            "#,
+            "entMaybe",
         ));
     }
 }
