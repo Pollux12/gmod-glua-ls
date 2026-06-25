@@ -42,6 +42,40 @@ mod test {
         );
     }
 
+    fn def_swep_self_call_valid_fixture(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute self_call_valid(method: string)
+
+            ---@class Entity
+            ---@field SetHealth fun(self: Entity, health: number)
+
+            ---@class NULL : Entity
+
+            ---@class Weapon : Entity
+            ---@return Entity|NULL
+            function Weapon:GetOwner() end
+            ---@return Entity|NULL
+            function Weapon:GetActiveWeapon() end
+
+            ---@[self_call_valid("GetOwner")]
+            function Weapon:PrimaryAttack() end
+
+            ---@class SWEP : Weapon
+            SWEP = {}
+
+            ---@return Entity|NULL
+            function maybeOwner() end
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+            "#,
+        );
+    }
+
     #[test]
     fn test_issue_245() {
         let mut ws = VirtualWorkspace::new();
@@ -3467,6 +3501,197 @@ mod test {
                 "#,
             ),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_swep_callback_self_getowner_chained_not_null() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:PrimaryAttack()
+                self:GetOwner():SetHealth(1)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_swep_callback_local_owner_not_null() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:PrimaryAttack()
+                local owner = self:GetOwner()
+                owner:SetHealth(1)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_swep_callback_owner_reassigned_still_flagged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:PrimaryAttack()
+                local owner = self:GetOwner()
+                owner = maybeOwner()
+                owner:SetHealth(1)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("owner may be NULL")),
+            eq(true),
+            "Reassigned owner must still be diagnosed. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_unmarked_method_self_getowner_still_flagged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:CheckLimit()
+                self:GetOwner():SetHealth(1)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("self:GetOwner() may be NULL")),
+            eq(true),
+            "Unmarked helper method must still be diagnosed. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_marked_callback_other_nullable_self_method_still_flagged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:PrimaryAttack()
+                self:GetActiveWeapon():SetHealth(1)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics.iter().any(|diagnostic| diagnostic
+                .message
+                .contains("self:GetActiveWeapon() may be NULL")),
+            eq(true),
+            "Marker only covers GetOwner. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_getowner_in_nested_deferred_closure_still_flagged() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_swep_self_call_valid_fixture(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            function SWEP:PrimaryAttack()
+                timer.Simple(0, function()
+                    self:GetOwner():SetHealth(1)
+                end)
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("self:GetOwner() may be NULL")),
+            eq(true),
+            "Nested/deferred closures must not inherit callback owner validity. Diagnostics: {diagnostics:#?}"
         );
     }
 

@@ -239,6 +239,17 @@
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
 
+--- Marks a callback where calling a named method on callback `self` is guaranteed to return
+--- a valid value for the duration of the callback body.
+---
+--- This is intentionally narrower than changing the named method's global return type. For
+--- example, `self_call_valid("GetOwner")` on held-weapon callbacks means `self:GetOwner()` is
+--- valid in that callback, while `Weapon:GetOwner()` can still return NULL elsewhere.
+---
+--- Parameters:
+--- - `method`: Method name that is valid when called on callback `self`.
+---@attribute self_call_valid(method: string)
+
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,
 --- and the target methods must reside within the same class.

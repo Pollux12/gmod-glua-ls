@@ -1,15 +1,15 @@
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat,
-    LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode, LuaWhileStat,
-    UnaryOperator,
+    LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey,
+    LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaSyntaxKind, LuaSyntaxNode,
+    LuaVarExpr, LuaWhileStat, UnaryOperator,
 };
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
-    LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
-    get_var_expr_var_ref_id,
+    DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, InferFailReason, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel,
+    SemanticModel, find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
@@ -197,7 +197,7 @@ fn nullable_callable_is_from_guarded_receiver(
             semantic_model,
             &receiver,
             &receiver_type,
-        )
+        ) || is_expr_valid_by_enclosing_self_call_context(semantic_model, &receiver)
     } else {
         is_expr_guarded_by_prior_nil_early_return(semantic_model, &receiver)
     }
@@ -301,7 +301,8 @@ fn report_unsafe_receiver(
         semantic_model,
         receiver,
         &receiver_type,
-    ) {
+    ) || is_expr_valid_by_enclosing_self_call_context(semantic_model, receiver)
+    {
         return false;
     }
 
@@ -316,6 +317,303 @@ fn report_unsafe_receiver(
         None,
     );
     true
+}
+
+fn is_expr_valid_by_enclosing_self_call_context(
+    semantic_model: &SemanticModel,
+    receiver: &LuaExpr,
+) -> bool {
+    if let Some((call_expr, method_name)) = self_call_method(receiver) {
+        return enclosing_callback_marks_self_call_valid(semantic_model, receiver, &method_name)
+            && self_call_uses_unshadowed_callback_self(semantic_model, receiver, &call_expr);
+    }
+
+    if let Some((assigned_call, method_name, assign_range)) =
+        prior_local_self_call_assignment(receiver)
+    {
+        return enclosing_callback_marks_self_call_valid(semantic_model, receiver, &method_name)
+            && self_call_uses_unshadowed_callback_self(semantic_model, receiver, &assigned_call)
+            && !local_alias_reassigned_after_assignment(semantic_model, receiver, assign_range);
+    }
+
+    false
+}
+
+fn self_call_method(expr: &LuaExpr) -> Option<(LuaCallExpr, String)> {
+    let LuaExpr::CallExpr(call_expr) = expr else {
+        return None;
+    };
+    if !call_expr.is_colon_call() {
+        return None;
+    }
+
+    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let self_expr = index_expr.get_prefix_expr()?;
+    if normalized_expr_text(&self_expr).as_deref() != Some("self") {
+        return None;
+    }
+
+    let method_name = literal_member_name(&index_expr)?;
+    Some((call_expr.clone(), method_name))
+}
+
+fn prior_local_self_call_assignment(
+    receiver: &LuaExpr,
+) -> Option<(LuaCallExpr, String, TextRange)> {
+    let receiver_text = normalized_expr_text(receiver)?;
+    let mut candidate = None;
+
+    let mut current = receiver.syntax().clone();
+    while let Some(parent) = current.parent() {
+        if LuaClosureExpr::cast(parent.clone()).is_some() {
+            break;
+        }
+
+        if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block {
+            for sibling in parent.children() {
+                let sibling_range = sibling.text_range();
+                if sibling_range.start() >= current.text_range().start() {
+                    break;
+                }
+                let Some(local_stat) = LuaLocalStat::cast(sibling) else {
+                    continue;
+                };
+
+                let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+                let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+                for (index, local_name) in names.iter().enumerate() {
+                    if local_name.get_text() != receiver_text {
+                        continue;
+                    }
+                    let Some(value_expr) = values.get(index) else {
+                        continue;
+                    };
+                    let Some((call_expr, method_name)) = self_call_method(value_expr) else {
+                        continue;
+                    };
+                    // Keep the nearest visible alias candidate found while walking
+                    // outward. If an inner `local owner = ...` shadows an outer
+                    // callback-owner alias, `local_alias_reassigned_after_assignment`
+                    // must invalidate the outer candidate before suppression.
+                    candidate = Some((call_expr, method_name, local_stat.syntax().text_range()));
+                }
+            }
+        }
+
+        current = parent;
+    }
+
+    candidate
+}
+
+fn local_alias_reassigned_after_assignment(
+    semantic_model: &SemanticModel,
+    receiver: &LuaExpr,
+    assign_range: TextRange,
+) -> bool {
+    let mut current = receiver.syntax().clone();
+    while let Some(parent) = current.parent() {
+        if LuaClosureExpr::cast(parent.clone()).is_some() {
+            break;
+        }
+
+        if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block {
+            for sibling in parent.children() {
+                let sibling_range = sibling.text_range();
+                if sibling_range.end() <= assign_range.end() {
+                    continue;
+                }
+                if sibling_range.start() >= current.text_range().start() {
+                    break;
+                }
+
+                if let Some(assign_stat) = LuaAssignStat::cast(sibling.clone())
+                    && assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, receiver)
+                {
+                    return true;
+                }
+
+                if let Some(local_stat) = LuaLocalStat::cast(sibling.clone())
+                    && local_stat_shadows_guarded_expr(semantic_model, &local_stat, receiver)
+                {
+                    return true;
+                }
+
+                if sibling.descendants().any(|node| {
+                    LuaAssignStat::cast(node).is_some_and(|assign_stat| {
+                        assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, receiver)
+                    })
+                }) {
+                    return true;
+                }
+            }
+        }
+
+        current = parent;
+    }
+
+    false
+}
+
+fn self_call_uses_unshadowed_callback_self(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    if enclosing_colon_method(guarded_expr).is_none() {
+        return false;
+    }
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(call_receiver) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    if normalized_expr_text(&call_receiver).as_deref() != Some("self") {
+        return false;
+    }
+
+    !self_receiver_shadowed_before_call(semantic_model, guarded_expr, &call_receiver)
+}
+
+fn self_receiver_shadowed_before_call(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    self_expr: &LuaExpr,
+) -> bool {
+    let Some(parent) = guarded_expr
+        .syntax()
+        .ancestors()
+        .find(|node| LuaSyntaxKind::from(node.kind()) == LuaSyntaxKind::Block)
+    else {
+        return true;
+    };
+    let guard_start = guarded_expr.syntax().text_range().start();
+
+    parent.children().any(|sibling| {
+        sibling.text_range().start() < guard_start
+            && LuaLocalStat::cast(sibling).is_some_and(|local_stat| {
+                local_stat_shadows_guarded_expr(semantic_model, &local_stat, self_expr)
+            })
+    })
+}
+
+fn enclosing_callback_marks_self_call_valid(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+    valid_method_name: &str,
+) -> bool {
+    let Some((_, receiver_expr, callback_key)) = enclosing_colon_method(expr) else {
+        return false;
+    };
+    let Ok(receiver_type) = semantic_model.infer_expr(receiver_expr) else {
+        return false;
+    };
+    semantic_model
+        .infer_member_type(&receiver_type, &callback_key)
+        .is_ok_and(|callback_type| {
+            type_has_self_call_valid_attribute(semantic_model, &callback_type, valid_method_name)
+        })
+        // User callback definitions can shadow library callback signatures. Fall
+        // back to the global member-key metadata index so annotation-provided
+        // callback markers still apply to overrides, matching the existing
+        // self_guard member-key fallback. This is intentionally key-scoped, not
+        // type-scoped; only annotate callback names whose owner-valid contract is
+        // safe for that method name.
+        || indexed_member_key_has_self_call_valid_attribute(
+            semantic_model,
+            &callback_key,
+            valid_method_name,
+        )
+}
+
+fn enclosing_colon_method(expr: &LuaExpr) -> Option<(LuaFuncStat, LuaExpr, LuaMemberKey)> {
+    for ancestor in expr.syntax().ancestors() {
+        if let Some(closure_expr) = LuaClosureExpr::cast(ancestor.clone()) {
+            let func_stat = closure_expr.get_parent::<LuaFuncStat>()?;
+            let LuaVarExpr::IndexExpr(index_expr) = func_stat.get_func_name()? else {
+                return None;
+            };
+            let receiver_expr = index_expr.get_prefix_expr()?;
+            let member_key = literal_member_key(&index_expr)?;
+            return Some((func_stat, receiver_expr, member_key));
+        }
+    }
+
+    None
+}
+
+fn literal_member_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+        LuaIndexKey::String(string) => Some(string.get_value().to_string()),
+        _ => None,
+    }
+}
+
+fn type_has_self_call_valid_attribute(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    method_name: &str,
+) -> bool {
+    match typ {
+        LuaType::Signature(signature_id) => {
+            signature_has_self_call_valid_attribute(semantic_model, *signature_id, method_name)
+        }
+        LuaType::Union(union_type) => union_type
+            .into_vec()
+            .iter()
+            .any(|typ| type_has_self_call_valid_attribute(semantic_model, typ, method_name)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(|typ| type_has_self_call_valid_attribute(semantic_model, typ, method_name)),
+        _ => false,
+    }
+}
+
+fn indexed_member_key_has_self_call_valid_attribute(
+    semantic_model: &SemanticModel,
+    member_key: &LuaMemberKey,
+    method_name: &str,
+) -> bool {
+    let db = semantic_model.get_db();
+    db.get_member_index()
+        .get_current_members_for_key(member_key)
+        .into_iter()
+        .filter_map(|member| {
+            db.get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|type_cache| type_cache.as_type().clone())
+        })
+        .any(|typ| type_has_self_call_valid_attribute(semantic_model, &typ, method_name))
+}
+
+fn signature_has_self_call_valid_attribute(
+    semantic_model: &SemanticModel,
+    signature_id: LuaSignatureId,
+    method_name: &str,
+) -> bool {
+    let Some(attribute_use) = find_signature_attribute_use(
+        semantic_model.get_db(),
+        signature_id,
+        GMOD_ATTR_SELF_CALL_VALID,
+    ) else {
+        return false;
+    };
+    // `find_signature_attribute_use` returns the first matching standalone
+    // attribute. Current callback metadata uses one valid self-call method per
+    // callback; if a future callback needs multiple methods, iterate all
+    // signature attributes instead of stacking repeated `self_call_valid` tags.
+    let Some(method_arg) = attribute_use.get_param_by_name("method") else {
+        return false;
+    };
+    matches!(
+        method_arg,
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) if value.as_str() == method_name
+    )
 }
 
 fn should_skip_deferred_nullable_function_call(call_expr: &LuaCallExpr, prefix: &LuaExpr) -> bool {
