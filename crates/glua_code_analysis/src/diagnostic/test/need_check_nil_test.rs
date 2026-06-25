@@ -1131,6 +1131,43 @@ mod test {
     }
 
     #[gtest]
+    fn test_nil_sentinel_branch_before_isvalid_elseif_does_not_report_gmod_null_check() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): any
+
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return EntityOrNULL
+            function GetEntityOrNULL() end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::GmodNullCheck,
+                r#"
+                local owner = {}
+                owner.Founder = GetEntityOrNULL()
+                if ( owner.Founder == nil ) then
+                    return NULL
+                elseif ( IsValid(owner.Founder) ) then
+                    owner.Founder:GetPos()
+                end
+                "#,
+            ),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_isvalid_check_does_not_report_gmod_null_check() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

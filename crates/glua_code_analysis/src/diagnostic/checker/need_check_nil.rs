@@ -2448,6 +2448,11 @@ fn check_binary_expr(
                 &binary_expr,
                 non_nil_side,
                 op,
+            ) || is_nil_sentinel_comparison_before_type_guard_elseif(
+                semantic_model,
+                &binary_expr,
+                non_nil_side,
+                op,
             ) {
                 return Some(());
             }
@@ -2651,6 +2656,77 @@ fn is_nil_comparison_guarded_by_type_guard(
     };
 
     is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
+}
+
+fn is_nil_sentinel_comparison_before_type_guard_elseif(
+    semantic_model: &SemanticModel,
+    comparison_expr: &LuaBinaryExpr,
+    non_nil_side: &LuaExpr,
+    comparison_op: BinaryOperator,
+) -> bool {
+    if comparison_op != BinaryOperator::OpEq {
+        return false;
+    }
+
+    let Some(if_stat) = comparison_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaIfStat::cast)
+    else {
+        return false;
+    };
+    if !if_body_has_return(&if_stat) {
+        return false;
+    }
+    let comparison_range = comparison_expr.syntax().text_range();
+    if !if_stat
+        .get_condition_expr()
+        .is_some_and(|condition| range_contains(condition.syntax().text_range(), comparison_range))
+    {
+        return false;
+    }
+
+    if_stat.get_else_if_clause_list().any(|elseif_clause| {
+        let Some(condition) = elseif_clause.get_condition_expr() else {
+            return false;
+        };
+        let Some(guard_call) = unwrap_paren_call(condition) else {
+            return false;
+        };
+
+        is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
+            || type_guard_call_textually_guards_expr(semantic_model, &guard_call, non_nil_side)
+    })
+}
+
+fn unwrap_paren_call(expr: LuaExpr) -> Option<LuaCallExpr> {
+    match expr {
+        LuaExpr::CallExpr(call_expr) => Some(call_expr),
+        LuaExpr::ParenExpr(paren_expr) => unwrap_paren_call(paren_expr.get_expr()?),
+        _ => None,
+    }
+}
+
+fn type_guard_call_textually_guards_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let Some(first_arg) = guard_call
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+    else {
+        return false;
+    };
+
+    if !exprs_reference_same_var_or_text(semantic_model, &first_arg, guarded_expr) {
+        return false;
+    }
+
+    // Prefer semantic TypeGuard resolution. The canonical `IsValid` fallback exists
+    // only for this returning-sentinel/elseif shape because combined workspace
+    // loading can fail to resolve the global signature at shipped-code call sites.
+    call_returns_non_nullable_type_guard(semantic_model, guard_call) || is_isvalid_call(guard_call)
 }
 
 fn exprs_reference_same_var(
