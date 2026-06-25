@@ -9,6 +9,7 @@ dhat-heap.json
 .pommelignore
 .grepai/
 .context-engine/
+.cortexkit/
 .slim/deepwork/
 .codex-artifacts/
 
