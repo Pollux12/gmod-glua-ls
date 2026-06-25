@@ -294,6 +294,9 @@ fn get_required_fields_for_types(
         is_cancelled: &mut impl FnMut() -> bool,
     ) -> Option<()> {
         let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
+        let mut type_required_fields = HashSet::new();
+        let mut type_optional_fields = HashSet::new();
+
         for member in members {
             if is_cancelled() {
                 return Some(());
@@ -328,11 +331,23 @@ fn get_required_fields_for_types(
                     }
             };
             if has_default {
-                optional_type.insert(name);
+                type_optional_fields.insert(name);
                 continue;
             }
 
-            record_required_fields(required_fields, optional_type, name, decl_type);
+            record_required_fields(
+                &mut type_required_fields,
+                &mut type_optional_fields,
+                name,
+                decl_type,
+            );
+        }
+
+        optional_type.extend(type_optional_fields.iter().cloned());
+        for name in type_required_fields {
+            if !optional_type.contains(&name) {
+                required_fields.insert(name);
+            }
         }
 
         Some(())

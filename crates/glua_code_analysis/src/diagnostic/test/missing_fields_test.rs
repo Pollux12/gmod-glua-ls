@@ -420,6 +420,30 @@ foo({})
     }
 
     #[test]
+    fn test_later_partial_optional_field_suppresses_same_class_required() {
+        let mut ws = VirtualWorkspace::new();
+        // Generated annotations can be followed by custom partial overrides.
+        // A later optional field for the same class should make the field
+        // optional-for-writing without relying on source-order-specific table
+        // construction inference.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class (partial) DrawTextData
+            ---@field text string
+            ---@field pos table
+
+            ---@class (partial) DrawTextData
+            ---@field text? string
+            ---@field pos? table
+
+            ---@type DrawTextData
+            local text = {}
+            "#
+        ));
+    }
+
+    #[test]
     fn test_child_required_overrides_parent_default() {
         let mut ws = VirtualWorkspace::new();
         // Child redeclares a parent-defaulted field WITHOUT a default;
