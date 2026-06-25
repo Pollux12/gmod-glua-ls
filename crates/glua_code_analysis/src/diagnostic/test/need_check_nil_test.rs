@@ -3362,6 +3362,75 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_isvalid_type_guard_entity_excludes_null_after_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+
+            ---@param ent any
+            ---@return TypeGuard<Entity>
+            function IsValid(ent) end
+            "#,
+        );
+
+        let guarded_file = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if not IsValid(balloon) then return NULL end
+            balloon:Spawn()
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(guarded_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "`if not IsValid(balloon) then return NULL end` should prove `balloon` is not NULL."
+        );
+
+        let unguarded_file = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            balloon:Spawn()
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(unguarded_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
+            eq(true),
+            "Unguarded Entity|NULL factory results must still warn. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
     /// Same as above but using `if IsValid(seat) then` (positive branch).
     #[gtest]
     fn test_isvalid_narrows_instance_type_union_null_positive_branch() {

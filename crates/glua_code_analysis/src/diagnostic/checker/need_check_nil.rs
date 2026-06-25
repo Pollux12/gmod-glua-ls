@@ -166,11 +166,11 @@ fn nullable_callable_is_from_non_nullable_receiver(
 }
 
 /// Returns `true` when the member access `prefix` has a receiver that is nil-checked
-/// by a prior type-guard early-return.  This handles colon-call guard patterns such as
-/// `if not ent:IsAlive() then return end` followed by `ent:GetEditingData()`: the
-/// receiver `ent` is guarded, so calling a method on it is safe even if the receiver
-/// type still appears nullable in the semantic model (flow narrowing for colon-call
-/// guards is deferred to the diagnostic layer).
+/// by a TypeGuard. This handles guard patterns such as `if IsValid(ent) then
+/// ent:Nick() end` and `if not ent:IsAlive() then return end; ent:GetEditingData()`:
+/// the receiver is guarded, so calling a method on it is safe even if the receiver type
+/// still appears nullable in the semantic model (some guard narrowing is deferred to the
+/// diagnostic layer rather than the flow graph).
 fn nullable_callable_is_from_guarded_receiver(
     semantic_model: &SemanticModel,
     prefix: &LuaExpr,
@@ -181,7 +181,26 @@ fn nullable_callable_is_from_guarded_receiver(
     let Some(receiver) = index_expr.get_prefix_expr() else {
         return false;
     };
-    is_expr_guarded_by_prior_nil_early_return(semantic_model, &receiver)
+    let Ok(receiver_type) = semantic_model.infer_expr(receiver.clone()) else {
+        return false;
+    };
+
+    if contains_gmod_null_type(semantic_model.get_db(), &receiver_type) {
+        // GMod NULL is truthy, so nullable-callable suppression for NULL-typed
+        // receivers must use the same explicit validity guards as receiver
+        // diagnostics instead of the plain `not expr then return` nil path.
+        is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
+            semantic_model,
+            &receiver,
+            &receiver_type,
+        ) || is_expr_guarded_by_current_null_excluding_type_guard_condition(
+            semantic_model,
+            &receiver,
+            &receiver_type,
+        )
+    } else {
+        is_expr_guarded_by_prior_nil_early_return(semantic_model, &receiver)
+    }
 }
 
 fn index_expr_has_explicit_nullable_member(
@@ -1812,6 +1831,15 @@ fn is_null_excluding_type_guard_call_guarding_expr(
         return false;
     }
 
+    let db = semantic_model.get_db();
+    if is_isvalid_call(guard_call) && contains_gmod_null_type(db, guarded_type) {
+        // Global `IsValid` is the canonical GLua NULL-excluding validity guard.
+        // Generated annotations currently model it as `TypeGuard<Entity>` without
+        // a scoped `return_cast ent -NULL`; keep this local fallback constrained by
+        // the TypeGuard/same-expression checks above until that metadata exists.
+        return true;
+    }
+
     let Some((signature_id, signature_cast)) = call_signature_cast(semantic_model, guard_call)
     else {
         return false;
@@ -1826,7 +1854,6 @@ fn is_null_excluding_type_guard_call_guarding_expr(
         return false;
     }
 
-    let db = semantic_model.get_db();
     let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
         return false;
     };
@@ -1845,6 +1872,14 @@ fn is_null_excluding_type_guard_call_guarding_expr(
     };
 
     !contains_gmod_null_type(db, &casted_type)
+}
+
+fn is_isvalid_call(guard_call: &LuaCallExpr) -> bool {
+    let Some(prefix) = guard_call.get_prefix_expr() else {
+        return false;
+    };
+
+    normalized_expr_text(&prefix).is_some_and(|text| text == "IsValid" || text == "_G.IsValid")
 }
 
 fn call_signature_cast<'a>(
