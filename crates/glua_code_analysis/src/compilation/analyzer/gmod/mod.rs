@@ -11,7 +11,7 @@ use glua_parser::{
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
     LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat, LuaSyntaxId,
-    LuaSyntaxNode, LuaTableExpr, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
 };
 
 use crate::{
@@ -892,6 +892,15 @@ impl FileFunctionMap {
                     }
                     all_blocks.push(block);
                 }
+            }
+            if let Some(table_field) = LuaTableField::cast(node.clone()) {
+                let Some(LuaExpr::ClosureExpr(closure)) = table_field.get_value_expr() else {
+                    continue;
+                };
+                let Some(block) = closure.get_block() else {
+                    continue;
+                };
+                all_blocks.push(block);
             }
         }
         FileFunctionMap {

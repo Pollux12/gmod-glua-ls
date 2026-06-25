@@ -1,16 +1,16 @@
 use std::{collections::HashSet, sync::Arc, time::Duration};
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaIndexKey,
-    LuaVarExpr, PathTrait,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaVarExpr, PathTrait, UnaryOperator,
 };
 use rowan::TextRange;
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaFunctionType, LuaMemberId, LuaMemberKey, LuaMemberOwner,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaSignature, LuaSignatureId,
-    LuaType, LuaTypeOwner, LuaUnionType, RenderLevel, SemanticDeclLevel, SemanticModel,
-    TypeCheckFailReason, TypeCheckResult, TypeVisitTrait, VariadicType,
+    DbIndex, DiagnosticCode, LuaDeclExtra, LuaFunctionType, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType, RenderLevel, SemanticDeclLevel,
+    SemanticModel, TypeCheckFailReason, TypeCheckResult, TypeOps, TypeVisitTrait, VariadicType,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type, infer_index_expr,
     resolve_alias_type,
 };
@@ -574,6 +574,24 @@ fn check_call_expr(
                     continue;
                 }
 
+                if let Some(arg_expr) = arg_expr
+                    && let Some(refined_arg_type) =
+                        correlated_overload_param_type_at_call(semantic_model, &call_expr, arg_expr)
+                {
+                    let selected_accepts = semantic_model
+                        .type_check_detail(&check_type, &refined_arg_type)
+                        .is_ok();
+                    let candidate_accepts = call_param_has_candidate_accepting_refined_arg(
+                        semantic_model,
+                        &call_expr,
+                        idx,
+                        &refined_arg_type,
+                    );
+                    if selected_accepts || candidate_accepts {
+                        continue;
+                    }
+                }
+
                 try_add_diagnostic(
                     context,
                     semantic_model,
@@ -874,6 +892,740 @@ fn expr_access_path(expr: &LuaExpr) -> Option<String> {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
         _ => None,
+    }
+}
+
+#[derive(Clone)]
+struct CorrelatedParamState {
+    params: Vec<LuaType>,
+}
+
+fn correlated_overload_param_type_at_call(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    arg_expr: &LuaExpr,
+) -> Option<LuaType> {
+    let LuaExpr::NameExpr(name_expr) = arg_expr else {
+        return None;
+    };
+    let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_model.find_decl(
+        name_expr.syntax().clone().into(),
+        SemanticDeclLevel::default(),
+    )?
+    else {
+        return None;
+    };
+
+    let db = semantic_model.get_db();
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let LuaDeclExtra::Param {
+        idx: param_idx,
+        signature_id,
+        owner_member_id,
+        ..
+    } = decl.extra
+    else {
+        return None;
+    };
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if param_idx >= signature.params.len() {
+        return None;
+    }
+
+    let mut states = correlated_param_states_for_implementation_signature(
+        semantic_model,
+        signature,
+        owner_member_id,
+    );
+    if states.len() <= 1 {
+        return None;
+    }
+
+    let call_start = call_expr.get_range().start();
+    let block = call_expr.syntax().ancestors().find_map(LuaBlock::cast)?;
+    for stat in block.get_stats() {
+        let stat_range = stat.get_range();
+        if stat_range.start() >= call_start || stat_range.contains_range(call_expr.get_range()) {
+            break;
+        }
+        apply_correlated_stat(semantic_model, &mut states, &stat, call_start, signature);
+    }
+
+    if states.is_empty() {
+        return None;
+    }
+
+    project_correlated_param_type(db, &states, param_idx)
+}
+
+fn correlated_param_states_from_signature(
+    db: &DbIndex,
+    signature: &LuaSignature,
+) -> Vec<CorrelatedParamState> {
+    correlated_param_states_from_implementation_and_overloads(db, signature, &signature.overloads)
+}
+
+fn correlated_param_states_for_implementation_signature(
+    semantic_model: &SemanticModel,
+    signature: &LuaSignature,
+    owner_member_id: Option<LuaMemberId>,
+) -> Vec<CorrelatedParamState> {
+    let db = semantic_model.get_db();
+    if !signature.overloads.is_empty() {
+        return correlated_param_states_from_signature(db, signature);
+    }
+
+    let Some(current_member_id) = owner_member_id else {
+        return Vec::new();
+    };
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_current_owner(&current_member_id) else {
+        return Vec::new();
+    };
+    let Some(current_member) = member_index.get_member(&current_member_id) else {
+        return Vec::new();
+    };
+    let key = current_member.get_key();
+
+    let mut states = Vec::new();
+    for member in member_index.get_current_owner_members_for_key(owner, key) {
+        if member.get_id() == current_member_id {
+            continue;
+        }
+        let Some(member_type_cache) = db.get_type_index().get_type_cache(&member.get_id().into())
+        else {
+            continue;
+        };
+        states.extend(correlated_param_states_from_property_type(
+            db,
+            signature,
+            member_type_cache.as_type(),
+        ));
+    }
+    states
+}
+
+fn correlated_param_states_from_property_type(
+    db: &DbIndex,
+    implementation_signature: &LuaSignature,
+    property_type: &LuaType,
+) -> Vec<CorrelatedParamState> {
+    match property_type {
+        LuaType::Signature(signature_id) => db
+            .get_signature_index()
+            .get(signature_id)
+            .map(|signature| {
+                correlated_param_states_from_implementation_and_overloads(
+                    db,
+                    implementation_signature,
+                    &signature.overloads,
+                )
+            })
+            .unwrap_or_default(),
+        LuaType::DocFunction(func) => correlated_param_states_from_implementation_and_overloads(
+            db,
+            implementation_signature,
+            std::slice::from_ref(func),
+        ),
+        LuaType::Union(union) => union
+            .into_vec()
+            .iter()
+            .flat_map(|component| {
+                correlated_param_states_from_property_type(db, implementation_signature, component)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn correlated_param_states_from_implementation_and_overloads(
+    db: &DbIndex,
+    implementation_signature: &LuaSignature,
+    overloads: &[std::sync::Arc<LuaFunctionType>],
+) -> Vec<CorrelatedParamState> {
+    let param_count = implementation_signature.params.len();
+    if param_count == 0 || overloads.is_empty() {
+        return Vec::new();
+    }
+
+    let mut states = Vec::with_capacity(overloads.len() + 1);
+    states.extend(expand_correlated_state(CorrelatedParamState {
+        params: (0..param_count)
+            .map(|idx| signature_param_type_or_nil(db, implementation_signature, idx))
+            .collect(),
+    }));
+    for overload in overloads {
+        let receiver_offset = correlated_body_receiver_offset(implementation_signature, overload);
+        let params = (0..param_count)
+            .map(|idx| {
+                if idx < receiver_offset {
+                    return signature_param_type_or_nil(db, implementation_signature, idx);
+                }
+                let adjusted_idx =
+                    adjust_correlated_body_param_idx(idx - receiver_offset, overload);
+                overload
+                    .get_params()
+                    .get(adjusted_idx)
+                    .and_then(|(_, typ)| typ.clone())
+                    .unwrap_or(LuaType::Nil)
+            })
+            .collect();
+        states.extend(expand_correlated_state(CorrelatedParamState { params }));
+    }
+    states
+}
+
+fn expand_correlated_state(state: CorrelatedParamState) -> Vec<CorrelatedParamState> {
+    const MAX_CORRELATED_STATES: usize = 32;
+    let original = state.clone();
+    let mut states = vec![CorrelatedParamState { params: Vec::new() }];
+    for param_type in state.params {
+        let components = match param_type {
+            LuaType::Union(union) => union.into_vec(),
+            other => vec![other],
+        };
+        let mut next = Vec::new();
+        for existing in &states {
+            for component in &components {
+                if next.len() >= MAX_CORRELATED_STATES {
+                    return vec![original];
+                }
+                let mut params = existing.params.clone();
+                params.push(component.clone());
+                next.push(CorrelatedParamState { params });
+            }
+        }
+        states = next;
+    }
+    states
+}
+
+fn signature_param_type_or_nil(db: &DbIndex, signature: &LuaSignature, idx: usize) -> LuaType {
+    let Some(param_info) = signature.get_param_info_by_id(idx) else {
+        return LuaType::Nil;
+    };
+    let mut typ = param_info.type_ref.clone();
+    if param_info.nullable && !typ.is_nullable() {
+        typ = TypeOps::Union.apply(db, &typ, &LuaType::Nil);
+    }
+    typ
+}
+
+fn adjust_correlated_body_param_idx(param_idx: usize, overload: &LuaFunctionType) -> usize {
+    if overload
+        .get_params()
+        .first()
+        .is_some_and(|(name, _)| name == "self")
+    {
+        param_idx + 1
+    } else {
+        param_idx
+    }
+}
+
+fn correlated_body_receiver_offset(signature: &LuaSignature, overload: &LuaFunctionType) -> usize {
+    let overload_has_self = overload
+        .get_params()
+        .first()
+        .is_some_and(|(name, _)| name == "self");
+    if overload_has_self || signature.params.len() <= overload.get_params().len() {
+        return 0;
+    }
+
+    let Some(first_param) = signature.params.first() else {
+        return 0;
+    };
+    if matches!(first_param.as_str(), "self" | "ent" | "entity" | "selfent") {
+        1
+    } else {
+        0
+    }
+}
+
+fn apply_correlated_stat(
+    semantic_model: &SemanticModel,
+    states: &mut Vec<CorrelatedParamState>,
+    stat: &glua_parser::LuaStat,
+    stop_at: rowan::TextSize,
+    signature: &LuaSignature,
+) {
+    if let Some(assign_stat) = LuaAssignStat::cast(stat.syntax().clone()) {
+        apply_correlated_assign(semantic_model, states, &assign_stat, signature);
+        return;
+    }
+
+    if let Some(if_stat) = LuaIfStat::cast(stat.syntax().clone()) {
+        let mut merged = Vec::new();
+        let mut remaining = states.clone();
+
+        if let Some(condition) = if_stat.get_condition_expr() {
+            let mut branch =
+                filter_correlated_states(semantic_model, &remaining, &condition, true, signature);
+            if let Some(block) = if_stat.get_block() {
+                apply_correlated_block(semantic_model, &mut branch, &block, stop_at, signature);
+            }
+            merged.extend(branch);
+            remaining =
+                filter_correlated_states(semantic_model, &remaining, &condition, false, signature);
+        }
+
+        for elseif in if_stat.get_else_if_clause_list() {
+            let Some(condition) = elseif.get_condition_expr() else {
+                continue;
+            };
+            let mut branch =
+                filter_correlated_states(semantic_model, &remaining, &condition, true, signature);
+            if let Some(block) = elseif.get_block() {
+                apply_correlated_block(semantic_model, &mut branch, &block, stop_at, signature);
+            }
+            merged.extend(branch);
+            remaining =
+                filter_correlated_states(semantic_model, &remaining, &condition, false, signature);
+        }
+
+        if let Some(else_clause) = if_stat.get_else_clause() {
+            if let Some(block) = else_clause.get_block() {
+                apply_correlated_block(semantic_model, &mut remaining, &block, stop_at, signature);
+            }
+        }
+        merged.extend(remaining);
+        *states = merged;
+    }
+}
+
+fn apply_correlated_block(
+    semantic_model: &SemanticModel,
+    states: &mut Vec<CorrelatedParamState>,
+    block: &LuaBlock,
+    stop_at: rowan::TextSize,
+    signature: &LuaSignature,
+) {
+    for stat in block.get_stats() {
+        if stat.get_range().start() >= stop_at {
+            break;
+        }
+        apply_correlated_stat(semantic_model, states, &stat, stop_at, signature);
+    }
+}
+
+fn apply_correlated_assign(
+    semantic_model: &SemanticModel,
+    states: &mut [CorrelatedParamState],
+    assign_stat: &LuaAssignStat,
+    signature: &LuaSignature,
+) {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    for (idx, var) in vars.iter().enumerate() {
+        let LuaVarExpr::NameExpr(name_expr) = var else {
+            continue;
+        };
+        let Some(param_idx) = name_expr
+            .get_name_text()
+            .and_then(|name| signature.find_param_idx(&name))
+        else {
+            continue;
+        };
+        let Some(expr) = exprs.get(idx) else {
+            continue;
+        };
+
+        let projected_source = if let LuaExpr::NameExpr(source_name) = expr {
+            source_name
+                .get_name_text()
+                .and_then(|name| signature.find_param_idx(&name))
+        } else {
+            None
+        };
+
+        for state in states.iter_mut() {
+            let new_type = if let Some(source_idx) = projected_source {
+                state
+                    .params
+                    .get(source_idx)
+                    .cloned()
+                    .unwrap_or(LuaType::Nil)
+            } else {
+                semantic_model
+                    .infer_expr(expr.clone())
+                    .unwrap_or(LuaType::Any)
+            };
+            if let Some(slot) = state.params.get_mut(param_idx) {
+                *slot = new_type;
+            }
+        }
+    }
+}
+
+fn filter_correlated_states(
+    semantic_model: &SemanticModel,
+    states: &[CorrelatedParamState],
+    condition: &LuaExpr,
+    desired: bool,
+    signature: &LuaSignature,
+) -> Vec<CorrelatedParamState> {
+    states
+        .iter()
+        .filter(|state| {
+            correlated_condition_possible(semantic_model, state, condition, desired, signature)
+        })
+        .cloned()
+        .collect()
+}
+
+fn correlated_condition_possible(
+    semantic_model: &SemanticModel,
+    state: &CorrelatedParamState,
+    condition: &LuaExpr,
+    desired: bool,
+    signature: &LuaSignature,
+) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren_expr) => paren_expr.get_expr().is_none_or(|expr| {
+            correlated_condition_possible(semantic_model, state, &expr, desired, signature)
+        }),
+        LuaExpr::UnaryExpr(unary_expr) => {
+            if unary_expr
+                .get_op_token()
+                .is_some_and(|token| token.get_op() == UnaryOperator::OpNot)
+            {
+                return unary_expr.get_expr().is_some_and(|expr| {
+                    correlated_condition_possible(semantic_model, state, &expr, !desired, signature)
+                });
+            }
+            true
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
+                return true;
+            };
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return true;
+            };
+            match (op, desired) {
+                (BinaryOperator::OpAnd, true) => {
+                    correlated_condition_possible(semantic_model, state, &left, true, signature)
+                        && correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &right,
+                            true,
+                            signature,
+                        )
+                }
+                (BinaryOperator::OpAnd, false) => {
+                    correlated_condition_possible(semantic_model, state, &left, false, signature)
+                        || (correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &left,
+                            true,
+                            signature,
+                        ) && correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &right,
+                            false,
+                            signature,
+                        ))
+                }
+                (BinaryOperator::OpOr, true) => {
+                    correlated_condition_possible(semantic_model, state, &left, true, signature)
+                        || (correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &left,
+                            false,
+                            signature,
+                        ) && correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &right,
+                            true,
+                            signature,
+                        ))
+                }
+                (BinaryOperator::OpOr, false) => {
+                    correlated_condition_possible(semantic_model, state, &left, false, signature)
+                        && correlated_condition_possible(
+                            semantic_model,
+                            state,
+                            &right,
+                            false,
+                            signature,
+                        )
+                }
+                _ => true,
+            }
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            correlated_type_guard_possible(semantic_model, state, call_expr, desired, signature)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            correlated_truthiness_possible(state, name_expr, desired, signature)
+        }
+        _ => true,
+    }
+}
+
+fn correlated_type_guard_possible(
+    semantic_model: &SemanticModel,
+    state: &CorrelatedParamState,
+    call_expr: &LuaCallExpr,
+    desired: bool,
+    signature: &LuaSignature,
+) -> bool {
+    let Some(LuaExpr::NameExpr(prefix)) = call_expr.get_prefix_expr() else {
+        return true;
+    };
+    let guard_type = match prefix.get_name_text().as_deref() {
+        Some("isstring") => LuaType::String,
+        Some("istable") => LuaType::Table,
+        _ => return true,
+    };
+    let Some(LuaExpr::NameExpr(arg_name)) = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+    else {
+        return true;
+    };
+    let Some(param_idx) = arg_name
+        .get_name_text()
+        .and_then(|name| signature.find_param_idx(&name))
+    else {
+        return true;
+    };
+    let Some(param_type) = state.params.get(param_idx) else {
+        return true;
+    };
+
+    let guard_matches = semantic_model
+        .type_check_detail(&guard_type, param_type)
+        .is_ok();
+    if desired {
+        guard_matches
+    } else {
+        !guard_matches
+    }
+}
+
+fn correlated_truthiness_possible(
+    state: &CorrelatedParamState,
+    name_expr: &glua_parser::LuaNameExpr,
+    desired_truthy: bool,
+    signature: &LuaSignature,
+) -> bool {
+    let Some(param_idx) = name_expr
+        .get_name_text()
+        .and_then(|name| signature.find_param_idx(&name))
+    else {
+        return true;
+    };
+    let Some(param_type) = state.params.get(param_idx) else {
+        return true;
+    };
+    if desired_truthy {
+        type_may_be_truthy(param_type)
+    } else {
+        type_may_be_falsy(param_type)
+    }
+}
+
+fn type_may_be_truthy(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => false,
+        LuaType::Union(union) => union.into_vec().iter().any(type_may_be_truthy),
+        _ => true,
+    }
+}
+
+fn type_may_be_falsy(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => true,
+        LuaType::Boolean | LuaType::DocBooleanConst(_) => true,
+        LuaType::Union(union) => union.into_vec().iter().any(type_may_be_falsy),
+        _ => false,
+    }
+}
+
+fn project_correlated_param_type(
+    db: &DbIndex,
+    states: &[CorrelatedParamState],
+    param_idx: usize,
+) -> Option<LuaType> {
+    let mut projected = None;
+    for state in states {
+        let typ = state.params.get(param_idx)?.clone();
+        projected = Some(match projected {
+            Some(existing) => TypeOps::Union.apply(db, &existing, &typ),
+            None => typ,
+        });
+    }
+    projected
+}
+
+fn call_param_has_candidate_accepting_refined_arg(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+    refined_arg_type: &LuaType,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if let Some(decl) = semantic_model.find_decl(
+        prefix_expr.syntax().clone().into(),
+        SemanticDeclLevel::default(),
+    ) {
+        let decl_owner = match decl {
+            LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
+            LuaSemanticDeclId::Member(member_id) => member_id.into(),
+            _ => return false,
+        };
+        let decl_type = semantic_model.get_type(decl_owner);
+        if type_has_param_candidate_accepting_refined_arg(
+            semantic_model,
+            &decl_type,
+            param_idx,
+            call_expr.is_colon_call(),
+            refined_arg_type,
+        ) {
+            return true;
+        }
+    }
+
+    let Ok(prefix_type) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+    type_has_param_candidate_accepting_refined_arg(
+        semantic_model,
+        &prefix_type,
+        param_idx,
+        call_expr.is_colon_call(),
+        refined_arg_type,
+    )
+}
+
+fn type_has_param_candidate_accepting_refined_arg(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    param_idx: usize,
+    colon_call: bool,
+    refined_arg_type: &LuaType,
+) -> bool {
+    match typ {
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = semantic_model
+                .get_db()
+                .get_signature_index()
+                .get(signature_id)
+            else {
+                return false;
+            };
+            signature_param_candidates(signature, param_idx, colon_call)
+                .iter()
+                .any(|candidate| {
+                    semantic_model
+                        .type_check_detail(candidate, refined_arg_type)
+                        .is_ok()
+                })
+        }
+        LuaType::DocFunction(func) => doc_function_param_type(func, param_idx, colon_call)
+            .is_some_and(|candidate| {
+                semantic_model
+                    .type_check_detail(&candidate, refined_arg_type)
+                    .is_ok()
+            }),
+        LuaType::Union(union) => union.into_vec().iter().any(|component| {
+            type_has_param_candidate_accepting_refined_arg(
+                semantic_model,
+                component,
+                param_idx,
+                colon_call,
+                refined_arg_type,
+            )
+        }),
+        _ => false,
+    }
+}
+
+fn signature_param_candidates(
+    signature: &LuaSignature,
+    param_idx: usize,
+    colon_call: bool,
+) -> Vec<LuaType> {
+    let mut candidates = Vec::new();
+    let signature_idx = adjust_call_arg_to_signature_param_idx(
+        param_idx,
+        colon_call,
+        signature.is_colon_define,
+        signature.params.first().is_some_and(|name| name == "self"),
+    );
+    if let Some(param_info) = signature.get_param_info_by_id(signature_idx) {
+        candidates.push(param_info.type_ref.clone());
+    }
+    for overload in &signature.overloads {
+        let overload_idx =
+            adjust_call_arg_to_overload_param_idx(signature, overload, param_idx, colon_call);
+        if let Some(candidate) = overload
+            .get_params()
+            .get(overload_idx)
+            .and_then(|(_, typ)| typ.clone())
+        {
+            candidates.push(candidate);
+        }
+    }
+    candidates
+}
+
+fn adjust_call_arg_to_overload_param_idx(
+    signature: &LuaSignature,
+    overload: &LuaFunctionType,
+    param_idx: usize,
+    colon_call: bool,
+) -> usize {
+    let overload_has_self = overload
+        .get_params()
+        .first()
+        .is_some_and(|(name, _)| name == "self");
+    if !colon_call && signature.is_colon_define && !overload_has_self {
+        param_idx.saturating_sub(1)
+    } else if colon_call && overload_has_self {
+        param_idx + 1
+    } else {
+        param_idx
+    }
+}
+
+fn doc_function_param_type(
+    func: &LuaFunctionType,
+    param_idx: usize,
+    colon_call: bool,
+) -> Option<LuaType> {
+    let adjusted_idx = adjust_call_arg_to_signature_param_idx(
+        param_idx,
+        colon_call,
+        func.is_colon_define(),
+        func.get_params()
+            .first()
+            .is_some_and(|(name, _)| name == "self"),
+    );
+    func.get_params()
+        .get(adjusted_idx)
+        .and_then(|(_, typ)| typ.clone())
+}
+
+fn adjust_call_arg_to_signature_param_idx(
+    param_idx: usize,
+    colon_call: bool,
+    colon_define: bool,
+    explicit_self_param: bool,
+) -> usize {
+    if !colon_call && colon_define && !explicit_self_param {
+        param_idx.saturating_sub(1)
+    } else if colon_call && (colon_define || explicit_self_param) {
+        param_idx + 1
+    } else {
+        param_idx
     }
 }
 

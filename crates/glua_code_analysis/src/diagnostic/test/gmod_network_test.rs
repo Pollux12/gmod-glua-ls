@@ -450,6 +450,51 @@ mod tests {
         );
     }
 
+    #[gtest]
+    fn test_table_literal_wrapped_start_suppresses_missing_sender_counterpart() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            local meta = {
+                MsgStart = function(self)
+                    net.Start("properties")
+                    net.WriteString(self.InternalName)
+                end,
+                MsgEnd = function(self)
+                    net.SendToServer()
+                end,
+            }
+
+            meta:MsgStart()
+            meta:MsgEnd()
+            "#,
+        );
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("properties")
+            net.Receive("properties", function()
+                local name = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
     // ---- Dynamic read/write tests (writes/reads inside if/for/while/repeat
     // are treated as 0..N occurrences of their kind, eliminating false
     // positives when one side uses a runtime-decided loop or branch).

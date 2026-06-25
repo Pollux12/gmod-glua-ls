@@ -47,6 +47,182 @@ mod test {
     }
 
     #[test]
+    fn test_correlated_overload_params_narrow_after_body_normalization() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            local function takesNumber(value) end
+
+            ---@return number
+            local function findIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@overload fun(slot: string)
+            ---@overload fun(slot: nil, name: string)
+            ---@param slot number
+            ---@param name string
+            local function wrapper(slot, name)
+                if isstring(slot) and not name then
+                    name = slot
+                    slot = findIndex()
+                elseif not slot and isstring(name) then
+                    slot = findIndex()
+                end
+
+                takesNumber(slot)
+            end
+
+            wrapper(1, "Age")
+            wrapper("Age")
+            wrapper(nil, "Age")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_overload_param_string_slot_without_normalization_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            local function takesNumber(value) end
+
+            ---@overload fun(slot: string)
+            ---@param slot number
+            local function wrapper(slot)
+                takesNumber(slot)
+            end
+
+            wrapper(1)
+            wrapper("Name")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_dtvar_string_slot_with_name_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            local function DTVar(type, slot, name) end
+
+            DTVar("Float", "bad", "Name")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_params_forward_to_colon_method_dot_call() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:DTVar(type, slot, name) end
+
+            ---@return number
+            local function findIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            ---@param extended? table
+            function Entity:NetworkVar(type, slot, name, extended)
+                if isstring(slot) and (istable(name) or not name) then
+                    extended = name
+                    name = slot
+                    slot = findIndex()
+                elseif not slot and isstring(name) then
+                    slot = findIndex()
+                end
+
+                self.DTVar(self, type, slot, name)
+            end
+
+            Entity:NetworkVar("Float", 1, "Age")
+            Entity:NetworkVar("Float", "Age")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_params_forward_from_member_assigned_closure() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:DTVar(type, slot, name) end
+
+            ---@return number
+            local function FindUnusedIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@param ent Entity
+            ---@param typename string
+            ---@param index number
+            ---@param name string
+            ---@param other_data? table
+            Entity.NetworkVar = function(ent, typename, index, name, other_data)
+                if isstring(index) and (istable(name) or not name) then
+                    other_data = name
+                    name = index
+                    index = FindUnusedIndex()
+                elseif not index and isstring(name) then
+                    index = FindUnusedIndex()
+                end
+
+                ent.DTVar(ent, typename, index, name)
+            end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_82() {
         let mut ws = VirtualWorkspace::new();
 

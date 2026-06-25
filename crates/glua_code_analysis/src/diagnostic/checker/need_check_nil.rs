@@ -1885,20 +1885,14 @@ fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr)
             let Some(inner_expr) = unary_expr.get_expr() else {
                 return false;
             };
-            match &inner_expr {
-                LuaExpr::ParenExpr(paren_expr) => paren_expr
-                    .get_expr()
-                    .is_some_and(|expr| condition_is_negative_expr_guard(&expr, guarded_expr)),
-                // Only stable expressions are safe to guard: a CallExpr
-                // (e.g. `maybeEnt()`) may return a different value on each
-                // invocation, so `not maybeEnt()` proves nothing about the
-                // next `maybeEnt()` call. NameExpr and IndexExpr reference a
-                // fixed variable/field and are stable across reads.
-                LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_) => {
-                    expr_text_matches(&inner_expr, guarded_expr)
-                }
-                _ => false,
-            }
+            // Only stable expressions are safe to guard: a CallExpr
+            // (e.g. `maybeEnt()`) may return a different value on each
+            // invocation, so `not maybeEnt()` proves nothing about the
+            // next `maybeEnt()` call. NameExpr and IndexExpr reference a
+            // fixed variable/field and are stable across reads. A negated
+            // conjunction (`not (a and b)`) with an early return proves each
+            // stable operand truthy on the continuing path.
+            truthy_conjunction_operand_matches(&inner_expr, guarded_expr)
         }
         LuaExpr::BinaryExpr(binary_expr) => {
             let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
@@ -1916,6 +1910,35 @@ fn condition_is_negative_expr_guard(condition: &LuaExpr, guarded_expr: &LuaExpr)
         LuaExpr::ParenExpr(paren_expr) => paren_expr
             .get_expr()
             .is_some_and(|expr| condition_is_negative_expr_guard(&expr, guarded_expr)),
+        _ => false,
+    }
+}
+
+fn negated_conjunction_guards_expr(binary_expr: &LuaBinaryExpr, guarded_expr: &LuaExpr) -> bool {
+    let Some(op) = binary_expr.get_op_token().map(|token| token.get_op()) else {
+        return false;
+    };
+    if op != BinaryOperator::OpAnd {
+        return false;
+    }
+
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return false;
+    };
+
+    truthy_conjunction_operand_matches(&left, guarded_expr)
+        || truthy_conjunction_operand_matches(&right, guarded_expr)
+}
+
+fn truthy_conjunction_operand_matches(expr: &LuaExpr, guarded_expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|expr| truthy_conjunction_operand_matches(&expr, guarded_expr)),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            negated_conjunction_guards_expr(binary_expr, guarded_expr)
+        }
+        LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_) => expr_text_matches(expr, guarded_expr),
         _ => false,
     }
 }
@@ -2073,7 +2096,7 @@ fn is_type_guard_call_guarding_expr(
         return false;
     };
 
-    exprs_reference_same_var(semantic_model, &first_arg, receiver)
+    exprs_reference_same_var_or_text(semantic_model, &first_arg, receiver)
 }
 
 fn is_self_guard_call_guarding_expr(
@@ -2481,7 +2504,9 @@ fn check_binary_expr(
     ) {
         let left_type = semantic_model.infer_expr(left.clone()).ok()?;
 
-        if left_type.is_nullable() {
+        if left_type.is_nullable()
+            && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &left)
+        {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
                 left.get_range(),
@@ -2491,7 +2516,9 @@ fn check_binary_expr(
         }
 
         let right_type = semantic_model.infer_expr(right.clone()).ok()?;
-        if right_type.is_nullable() {
+        if right_type.is_nullable()
+            && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &right)
+        {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
                 right.get_range(),

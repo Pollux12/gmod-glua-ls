@@ -1168,6 +1168,73 @@ mod test {
     }
 
     #[gtest]
+    fn test_negated_conjunction_early_return_guards_each_stable_operand() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param r number?
+            ---@param g number?
+            ---@param b number?
+            ---@param a number?
+            local function make_color(r, g, b, a)
+                if not (r and g and b and a) then
+                    return error("invalid color")
+                end
+
+                return r * 16 + g, b * 16 + a
+            end
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "negated conjunction early return should guard arithmetic operands"
+        );
+    }
+
+    #[gtest]
+    fn test_global_type_guard_on_optional_field_guards_same_field_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@field Clear fun(self: Panel)
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            function IsValid(value) end
+            "#,
+        );
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Node
+            ---@field ChildNodes? Panel
+
+            ---@type Node
+            local node = {}
+
+            if IsValid(node.ChildNodes) then
+                node.ChildNodes:Clear()
+            end
+
+            if not IsValid(node.ChildNodes) then return end
+            node.ChildNodes:Clear()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "IsValid on an optional object field should guard that same field"
+        );
+    }
+
+    #[gtest]
     fn test_isvalid_check_does_not_report_gmod_null_check() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
