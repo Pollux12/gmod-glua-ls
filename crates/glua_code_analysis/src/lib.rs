@@ -8,6 +8,7 @@
     )
 )]
 
+mod ast_util;
 mod compilation;
 mod config;
 mod db_index;

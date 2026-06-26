@@ -7,9 +7,10 @@ use glua_parser::{
 use rowan::TextRange;
 
 use crate::{
-    DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, InferFailReason, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel,
-    SemanticModel, find_signature_attribute_use, get_var_expr_var_ref_id,
+    DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
+    GMOD_ROLE_REFERENCE, InferFailReason, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+    LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel, SemanticModel,
+    find_best_call_arg_role_from_type, find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
@@ -299,6 +300,7 @@ fn report_unsafe_receiver(
                     semantic_model,
                     receiver,
                 )
+                || is_expr_guarded_by_current_type_guard_condition(semantic_model, receiver)
         };
         if guarded {
             return false;
@@ -1241,7 +1243,11 @@ fn condition_is_positive_type_guard_call(
 ) -> bool {
     match condition {
         LuaExpr::CallExpr(call_expr) => {
-            is_type_guard_call_guarding_expr(semantic_model, call_expr, guarded_expr)
+            is_string_registry_exists_call_guarding_reference_expr(
+                semantic_model,
+                call_expr,
+                guarded_expr,
+            ) || is_type_guard_call_guarding_expr(semantic_model, call_expr, guarded_expr)
         }
         LuaExpr::BinaryExpr(binary_expr) => {
             let Some(op) = binary_expr.get_op_token().map(|op| op.get_op()) else {
@@ -1906,7 +1912,11 @@ fn condition_is_negative_type_guard(
             };
             match inner_expr {
                 LuaExpr::CallExpr(call_expr) => {
-                    is_type_guard_call_guarding_expr(semantic_model, &call_expr, guarded_expr)
+                    is_string_registry_exists_call_guarding_reference_expr(
+                        semantic_model,
+                        &call_expr,
+                        guarded_expr,
+                    ) || is_type_guard_call_guarding_expr(semantic_model, &call_expr, guarded_expr)
                         || is_self_guard_call_guarding_expr(
                             semantic_model,
                             &call_expr,
@@ -2297,6 +2307,60 @@ fn is_type_guard_call_guarding_expr(
     is_stable_guard_expr(&first_arg)
         && is_stable_guard_expr(receiver)
         && exprs_reference_same_var_or_text(semantic_model, &first_arg, receiver)
+}
+
+fn is_string_registry_exists_call_guarding_reference_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let Some((guard_domain, guard_key)) =
+        static_string_call_arg_role(semantic_model, guard_call, &[GMOD_ROLE_EXISTS])
+    else {
+        return false;
+    };
+
+    let LuaExpr::CallExpr(reference_call) = guarded_expr else {
+        return false;
+    };
+    let Some((reference_domain, reference_key)) =
+        static_string_call_arg_role(semantic_model, reference_call, &[GMOD_ROLE_REFERENCE])
+    else {
+        return false;
+    };
+
+    guard_domain == reference_domain && guard_key == reference_key
+}
+
+fn static_string_call_arg_role(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    roles: &[&str],
+) -> Option<(String, String)> {
+    // Batch 1 intentionally supports non-method registry functions only: raw
+    // call argument indices match signature parameter indices for these calls.
+    if call_expr.is_colon_call() {
+        return None;
+    }
+
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let callee_type = semantic_model.infer_expr(prefix_expr).ok()?;
+    let db = semantic_model.get_db();
+    let args = call_expr.get_args_list()?;
+    for (arg_idx, _) in args.get_args().enumerate() {
+        let Some(key) = crate::ast_util::literal_string_arg_value(call_expr, arg_idx) else {
+            continue;
+        };
+        for domain in GMOD_CALL_ARG_DOMAINS {
+            if let Some(role) =
+                find_best_call_arg_role_from_type(db, &callee_type, arg_idx, domain, roles)
+            {
+                return Some((role.domain.to_string(), key));
+            }
+        }
+    }
+
+    None
 }
 
 fn is_isvalid_call_guarding_stable_expr(

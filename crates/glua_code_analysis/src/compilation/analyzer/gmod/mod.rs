@@ -1975,16 +1975,7 @@ fn extract_bit_width_arg(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Option<
 }
 
 fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> Option<String> {
-    let arg_expr = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
-    let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
-        return None;
-    };
-
-    let LuaLiteralToken::String(string_token) = literal_expr.get_literal()? else {
-        return None;
-    };
-
-    Some(string_token.get_value())
+    crate::ast_util::literal_string_arg_value(call_expr, arg_idx)
 }
 
 fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {

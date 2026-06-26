@@ -66,6 +66,17 @@ pub const GMOD_DOMAIN_TIMER: &str = "gmod.timer";
 /// File discovery (`file.Find`) domain.
 pub const GMOD_DOMAIN_FILE_FIND: &str = "gmod.file_find";
 
+/// Generic string-registry lookup/reference role, domain-scoped.
+///
+/// A true-branch call carrying [`GMOD_ROLE_EXISTS`] may prove a direct call carrying this role
+/// non-nil when both roles share the same domain and static string key.
+pub const GMOD_ROLE_REFERENCE: &str = "reference";
+
+/// Generic string-registry existence predicate role, domain-scoped.
+///
+/// See [`GMOD_ROLE_REFERENCE`] for the diagnostic-layer existence guard contract.
+pub const GMOD_ROLE_EXISTS: &str = "exists";
+
 // ---------------------------------------------------------------------------
 // Phase 1 reserved metadata names.
 // ---------------------------------------------------------------------------

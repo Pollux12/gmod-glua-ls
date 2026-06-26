@@ -42,6 +42,36 @@ mod test {
         );
     }
 
+    fn def_convar_role_fixture(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+            ---@meta
+            ---@class ConVar
+            ---@field GetInt fun(self: ConVar): number
+
+            ---@[call_arg("gmod.convar", "exists")]
+            ---@param name string
+            ---@return boolean
+            function ConVarExists(name) end
+
+            ---@[call_arg("gmod.convar", "reference")]
+            ---@param name string
+            ---@return ConVar?
+            function GetConVar(name) end
+
+            ---@[call_arg("gmod.vgui_panel", "exists")]
+            ---@param name string
+            ---@return boolean
+            function PanelExists(name) end
+
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param name string
+            ---@return ConVar?
+            function GetPanelLikeConVar(name) end
+            "#,
+        );
+    }
+
     fn def_swep_self_call_valid_fixture(ws: &mut VirtualWorkspace) {
         ws.def(
             r#"
@@ -404,6 +434,176 @@ mod test {
             diagnostics[0].message.as_str(),
             contains_substring("owner.callback")
         );
+    }
+
+    #[test]
+    fn test_getconvar_without_existence_guard_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            GetConVar("cl_drawhud"):GetInt()
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_suppresses_matching_lookup_call_in_then_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            if ConVarExists("cl_drawhud") then
+                GetConVar("cl_drawhud"):GetInt()
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_suppresses_matching_lookup_call_after_early_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            if not ConVarExists("cl_drawhud") then
+                return
+            end
+            GetConVar("cl_drawhud"):GetInt()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_cached_lookup_local_yet() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local cv = GetConVar("cl_drawhud")
+            if ConVarExists("cl_drawhud") then
+                cv:GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_different_lookup_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            if ConVarExists("cl_drawhud") then
+                GetConVar("sv_cheats"):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_dynamic_lookup_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local name = "cl_drawhud"
+            if ConVarExists("cl_drawhud") then
+                GetConVar(name):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_dynamic_guard_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local name = "cl_drawhud"
+            if ConVarExists(name) then
+                GetConVar("cl_drawhud"):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_shadowed_functions() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function ConVarExists(name)
+                return true
+            end
+            ---@return ConVar?
+            local function GetConVar(name)
+                return maybeConVar
+            end
+            if ConVarExists("cl_drawhud") then
+                GetConVar("cl_drawhud"):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_cross_registry_domains() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            if PanelExists("cl_drawhud") then
+                GetConVar("cl_drawhud"):GetInt()
+            end
+            if ConVarExists("panel_name") then
+                GetPanelLikeConVar("panel_name"):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(2_usize));
+    }
+
+    #[test]
+    fn test_metadata_exists_guard_does_not_suppress_else_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            if ConVarExists("cl_drawhud") then
+                return
+            else
+                GetConVar("cl_drawhud"):GetInt()
+            end
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
     }
 
     #[test]

@@ -12,10 +12,10 @@ pub use gmod_domains::{
     GMOD_DOMAIN_DERMA_SKIN, GMOD_DOMAIN_FILE_FIND, GMOD_DOMAIN_GAMEMODE, GMOD_DOMAIN_HOOK,
     GMOD_DOMAIN_LOAD, GMOD_DOMAIN_MEMBER_GUARD, GMOD_DOMAIN_NET_MESSAGE, GMOD_DOMAIN_NET_PAYLOAD,
     GMOD_DOMAIN_NETWORK_VAR, GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_TIMER, GMOD_DOMAIN_VALID_GUARD,
-    GMOD_DOMAIN_VGUI_PANEL, GMOD_SIGNATURE_METADATA_DOMAINS, collect_call_arg_roles_for_param,
-    find_best_call_arg_role_for_param, find_best_call_arg_role_from_type,
-    find_signature_attribute_use, signature_attribute_uses, signature_is_valid_guard,
-    signature_owner_for,
+    GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
+    collect_call_arg_roles_for_param, find_best_call_arg_role_for_param,
+    find_best_call_arg_role_from_type, find_signature_attribute_use, signature_attribute_uses,
+    signature_is_valid_guard, signature_owner_for,
 };
 pub use signature::{
     CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE, LuaCallArgRole, LuaDocDefaultValue,
