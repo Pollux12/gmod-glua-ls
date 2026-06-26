@@ -243,8 +243,39 @@ fn signature_id_from_name_expr(
     call_position: TextSize,
 ) -> Option<LuaSignatureId> {
     let name = name_expr.get_name_text()?;
-    db.get_call_site_param_index()
-        .get_source_signature_for_file_at(name.as_str(), file_id, call_position)
+    let signature_id = db
+        .get_call_site_param_index()
+        .get_source_signature_for_file_at(name.as_str(), file_id, call_position)?;
+
+    if name_expr_resolves_to_different_local_decl(db, file_id, name_expr, signature_id) {
+        return None;
+    }
+
+    Some(signature_id)
+}
+
+fn name_expr_resolves_to_different_local_decl(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    signature_id: LuaSignatureId,
+) -> bool {
+    let Some(call_decl_id) = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+    else {
+        return false;
+    };
+
+    let Some(call_decl) = db.get_decl_index().get_decl(&call_decl_id) else {
+        return false;
+    };
+    // Source signatures in the raw path map come from function statements, so this
+    // currently rejects any local shadow. The signature comparison keeps the rule
+    // correct if local-function signatures are ever added to the same map.
+    matches!(call_decl.extra, LuaDeclExtra::Local { .. })
+        && db.get_signature_index().local_func_decl_for(&signature_id) != Some(call_decl_id)
 }
 
 fn is_call_site_realm_compatible(

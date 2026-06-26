@@ -2011,6 +2011,58 @@ mod test {
     }
 
     #[test]
+    fn test_module_function_does_not_take_call_site_params_from_shadowed_global_constructor() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        ws.def(
+            r#"
+                ---@meta
+
+                ---@class Color
+                ---@field r number
+                ---@field g number
+                ---@field b number
+                ---@field a number
+
+                ---@param r number
+                ---@param g number
+                ---@param b number
+                ---@param a? number
+                ---@return Color
+                function Color(r, g, b, a) end
+            "#,
+        );
+        let file_id = ws.def(
+            r#"
+                local _Color = Color
+
+                module("markup")
+
+                function Color(col)
+                    return col.r + col.g + col.b + (col.a or 0)
+                end
+
+                local Color = _Color
+                local white = Color(255, 255, 255)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code != code),
+            "expected no undefined-field diagnostics, got {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_enum_field_1() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
