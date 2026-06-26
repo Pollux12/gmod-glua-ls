@@ -27,6 +27,7 @@ pub(in crate::compilation::analyzer) struct SpecialCallDirectMatcher {
     special_signatures: FxHashSet<LuaSignatureId>,
     name_expr_names: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
     access_paths: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
+    receiver_member_names: FxHashSet<String>,
 }
 
 impl SpecialCallDirectMatcher {
@@ -60,6 +61,10 @@ impl SpecialCallDirectMatcher {
             .into_iter()
             .flatten()
             .any(|binding| binding.is_visible_to(db, caller_file_id, caller_position))
+    }
+
+    fn may_have_receiver_member_signature(&self, member_name: &str) -> bool {
+        self.receiver_member_names.contains(member_name)
     }
 }
 
@@ -113,6 +118,11 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
             .filter_map(|(signature_id, signature)| {
                 signature.has_special_call_params().then_some(*signature_id)
             })
+            .collect(),
+        receiver_member_names: db
+            .get_signature_index()
+            .receiver_out_param_member_names()
+            .map(str::to_string)
             .collect(),
         ..Default::default()
     };
@@ -191,6 +201,13 @@ fn add_direct_special_call_var_expr(
             let Some(access_path) = index_expr.get_access_path() else {
                 return;
             };
+            if let Some(member_name) = access_path.rsplit('.').next()
+                && !member_name.is_empty()
+            {
+                matcher
+                    .receiver_member_names
+                    .insert(member_name.to_string());
+            }
             matcher
                 .access_paths
                 .entry(access_path)
@@ -324,6 +341,15 @@ fn index_expr_has_receiver_special_call_signature(
     let Some(member_key) = get_static_member_key(index_expr) else {
         return false;
     };
+    let LuaMemberKey::Name(member_name) = &member_key else {
+        return false;
+    };
+    if !analyzer
+        .special_call_direct_matcher
+        .may_have_receiver_member_signature(member_name.as_str())
+    {
+        return false;
+    }
     let Ok(receiver_type) = analyzer.infer_expr(&prefix_expr) else {
         return false;
     };

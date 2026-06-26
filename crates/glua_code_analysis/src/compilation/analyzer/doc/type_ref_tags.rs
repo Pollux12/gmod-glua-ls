@@ -1,9 +1,9 @@
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr, LuaDocDescriptionOwner, LuaDocTagAs,
-    LuaDocTagCast, LuaDocTagModule, LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload,
-    LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee,
-    LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalName, LuaTokenKind,
-    LuaVarExpr,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr,
+    LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule, LuaDocTagOther,
+    LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast,
+    LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 use std::sync::Arc;
 
@@ -317,10 +317,18 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         existing.type_ref = type_ref;
     } else {
         signature.out_params.push(LuaOutParamInfo {
-            root,
+            root: root.clone(),
             field_path,
             type_ref,
         });
+    }
+    if matches!(root, LuaOutParamRoot::SelfReceiver)
+        && let Some(member_name) = receiver_member_name_for_closure(&closure)
+    {
+        analyzer
+            .db
+            .get_signature_index_mut()
+            .add_receiver_out_param_member_name(analyzer.file_id, member_name);
     }
     Some(())
 }
@@ -335,6 +343,33 @@ fn closure_is_colon_define(closure: &LuaClosureExpr) -> bool {
     index_expr
         .get_index_token()
         .is_some_and(|token| token.is_colon())
+}
+
+fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
+    if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+            return None;
+        };
+        return static_member_name(&index_expr);
+    }
+
+    let assign_stat = closure.get_parent::<LuaAssignStat>()?;
+    let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+    let value_idx = value_exprs
+        .iter()
+        .position(|expr| expr.get_position() == closure.get_position())?;
+    let Some(LuaVarExpr::IndexExpr(index_expr)) = vars.get(value_idx) else {
+        return None;
+    };
+    static_member_name(index_expr)
+}
+
+fn static_member_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+        LuaIndexKey::String(name) => Some(name.get_value().to_string()),
+        _ => None,
+    }
 }
 
 fn report_invalid_outparam(

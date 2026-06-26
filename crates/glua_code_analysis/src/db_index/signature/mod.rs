@@ -34,6 +34,8 @@ pub struct LuaSignatureIndex {
     signatures: HashMap<LuaSignatureId, LuaSignature>,
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
+    receiver_out_param_member_names: HashMap<String, usize>,
+    in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
 }
 
 impl Default for LuaSignatureIndex {
@@ -48,6 +50,8 @@ impl LuaSignatureIndex {
             signatures: HashMap::new(),
             in_file_signatures: HashMap::new(),
             local_func_decls: HashMap::new(),
+            receiver_out_param_member_names: HashMap::new(),
+            in_file_receiver_out_param_member_names: HashMap::new(),
         }
     }
 
@@ -78,6 +82,33 @@ impl LuaSignatureIndex {
     pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
         self.local_func_decls.insert(signature_id, decl_id);
     }
+
+    pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
+        if !self
+            .in_file_receiver_out_param_member_names
+            .entry(file_id)
+            .or_default()
+            .insert(member_name.clone())
+        {
+            return;
+        }
+
+        *self
+            .receiver_out_param_member_names
+            .entry(member_name)
+            .or_default() += 1;
+    }
+
+    pub fn has_receiver_out_param_member_name(&self, member_name: &str) -> bool {
+        self.receiver_out_param_member_names
+            .contains_key(member_name)
+    }
+
+    pub fn receiver_out_param_member_names(&self) -> impl Iterator<Item = &str> {
+        self.receiver_out_param_member_names
+            .keys()
+            .map(String::as_str)
+    }
 }
 
 impl LuaIndex for LuaSignatureIndex {
@@ -86,6 +117,21 @@ impl LuaIndex for LuaSignatureIndex {
             for signature_id in signature_ids {
                 self.signatures.remove(&signature_id);
                 self.local_func_decls.remove(&signature_id);
+            }
+        }
+
+        if let Some(member_names) = self
+            .in_file_receiver_out_param_member_names
+            .remove(&file_id)
+        {
+            for member_name in member_names {
+                match self.receiver_out_param_member_names.get_mut(&member_name) {
+                    Some(count) if *count > 1 => *count -= 1,
+                    Some(_) => {
+                        self.receiver_out_param_member_names.remove(&member_name);
+                    }
+                    None => {}
+                }
             }
         }
 
@@ -99,5 +145,7 @@ impl LuaIndex for LuaSignatureIndex {
         self.signatures.clear();
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
+        self.receiver_out_param_member_names.clear();
+        self.in_file_receiver_out_param_member_names.clear();
     }
 }

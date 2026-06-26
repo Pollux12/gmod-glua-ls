@@ -1633,6 +1633,54 @@ mod test {
     }
 
     #[gtest]
+    fn test_outparam_self_receiver_library_method_effect_guards_optional_field_after_call() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_receiver_outparam");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("dtree_node.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@class DListLayout
+            local DListLayout = {}
+            function DListLayout:Add() end
+
+            ---@class DTree_Node
+            ---@field ChildNodes? DListLayout
+            local DTree_Node = {}
+
+            ---@outparam self.ChildNodes DListLayout
+            function DTree_Node:CreateChildNodes() end
+            "#
+                .to_string(),
+            ),
+        );
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@type DTree_Node
+            local node = {}
+
+            node:CreateChildNodes()
+            node.ChildNodes:Add()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "receiver-rooted outparam from a library workspace should narrow main-workspace calls"
+        );
+    }
+
+    #[gtest]
     fn test_outparam_self_receiver_method_effect_guards_self_field_after_call() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
