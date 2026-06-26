@@ -1964,9 +1964,9 @@ mod test {
     }
 
     #[test]
-    fn test_unknown_dynamic_key_does_not_suppress_exact_undefined_field() {
+    fn test_dynamic_key_only_table_suppresses_exact_undefined_field() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
                 local test = {}
@@ -1974,6 +1974,36 @@ mod test {
                 local function assign(key)
                     test[key] = true
                 end
+
+                print(test.meow)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_literal_key_table_still_reports_exact_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+
+                test.known = true
+
+                print(test.meow)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_integer_literal_key_table_still_reports_exact_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+
+                test[1] = true
 
                 print(test.meow)
             "#

@@ -629,6 +629,13 @@ fn is_valid_member_inner(
                 Err(_) => {}
             }
 
+            if code == DiagnosticCode::UndefinedField
+                && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
+                && index_key_is_literal_member(index_key)
+            {
+                return Some(());
+            }
+
             if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
                 return Some(());
             }
@@ -887,6 +894,32 @@ fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> 
     db.get_member_index()
         .get_member_len(&LuaMemberOwner::Element(id.clone()))
         == 0
+}
+
+fn table_const_has_only_dynamic_key_members(
+    db: &DbIndex,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    // Literal-key writes fold to `Name`/`Integer` in `LuaMemberKey::from_expr_type`.
+    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct.
+    let owner = LuaMemberOwner::Element(id.clone());
+    let Some(members) = db.get_member_index().get_members(&owner) else {
+        return false;
+    };
+    !members.is_empty()
+        && members
+            .iter()
+            .all(|member| matches!(member.get_key(), LuaMemberKey::ExprType(_)))
+}
+
+fn index_key_is_literal_member(index_key: &LuaIndexKey) -> bool {
+    matches!(
+        index_key,
+        LuaIndexKey::Name(_)
+            | LuaIndexKey::String(_)
+            | LuaIndexKey::Integer(_)
+            | LuaIndexKey::Idx(_)
+    )
 }
 
 fn index_key_is_numeric(semantic_model: &SemanticModel, index_key: &LuaIndexKey) -> bool {
