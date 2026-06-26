@@ -395,6 +395,193 @@ mod test {
     }
 
     #[test]
+    fn test_setmetatable_factory_fields_visible_to_class_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local DermaAnimation = {}
+                DermaAnimation.__index = DermaAnimation
+
+                function DermaAnimation:Run()
+                    self.Func(self.Panel, self)
+                end
+
+                function Derma_Anim(panel, func)
+                    local anim = {}
+                    anim.Panel = panel
+                    anim.Func = func
+                    return setmetatable(anim, DermaAnimation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_do_not_hide_method_typos() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local DermaAnimation = {}
+                DermaAnimation.__index = DermaAnimation
+
+                function DermaAnimation:Run()
+                    self.Fnc(self.Panel, self)
+                end
+
+                function Derma_Anim(panel, func)
+                    local anim = {}
+                    anim.Panel = panel
+                    anim.Func = func
+                    return setmetatable(anim, DermaAnimation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_do_not_leak_to_other_classes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                local Other = {}
+                Other.__index = Other
+
+                function Other:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_alias_writes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    local alias = anim
+                    alias.Func = func
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_nested_closure_writes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    local function assign()
+                        anim.Func = func
+                    end
+                    assign()
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_reassigned_factory_local() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    anim = {}
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_require_self_referential_index() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                local Other = {}
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, { __index = Other })
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_require_named_self_referential_index() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                local Other = {}
+                Animation.__index = Other
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
     fn test_included_server_scripted_class_reverse_numeric_for_does_not_report_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

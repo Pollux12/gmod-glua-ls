@@ -1,10 +1,15 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr};
+    use glua_parser::{
+        LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr,
+    };
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, LuaSignatureId, LuaType, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, InFiled, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
+        VirtualWorkspace,
+    };
 
     fn signature_return_type(ws: &VirtualWorkspace, file_id: crate::FileId, name: &str) -> LuaType {
         let semantic_model = ws
@@ -302,6 +307,65 @@ mod test {
         assert!(
             undefined_field_diags.is_empty(),
             "unexpected UndefinedField diagnostics for in-place setmetatable: {undefined_field_diags:?}"
+        );
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_transfer_to_class_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local Animation = {}
+            Animation.__index = Animation
+
+            function MakeAnimation()
+                local anim = {}
+                anim.Func = function() end
+                anim.Panel = "panel"
+                return setmetatable(anim, Animation)
+            end
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let animation_range = root
+            .descendants::<glua_parser::LuaLocalStat>()
+            .find_map(|stat| {
+                let names = stat.get_local_name_list().collect::<Vec<_>>();
+                let values = stat.get_value_exprs().collect::<Vec<_>>();
+                let idx = names
+                    .iter()
+                    .position(|name| name.get_text() == "Animation")?;
+                match values.get(idx)? {
+                    LuaExpr::TableExpr(table) => Some(table.get_range()),
+                    _ => None,
+                }
+            })
+            .expect("expected Animation table literal");
+        let owner = LuaMemberOwner::Element(InFiled::new(file_id, animation_range));
+        let members = semantic_model
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected class owner members");
+
+        assert!(
+            members
+                .iter()
+                .any(|member| member.get_key() == &LuaMemberKey::Name("Func".into())),
+            "expected Func to be transferred to class owner, got {members:#?}"
+        );
+        assert!(
+            members
+                .iter()
+                .any(|member| member.get_key() == &LuaMemberKey::Name("Panel".into())),
+            "expected Panel to be transferred to class owner, got {members:#?}"
         );
     }
 }

@@ -450,6 +450,87 @@ mod tests {
     }
 
     #[gtest]
+    fn setmetatable_factory_field_transfer_survives_noop_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let uri = ws.virtual_url_generator.new_uri("lua/derma/animation.lua");
+        let original = r#"
+            local Animation = {}
+            Animation.__index = Animation
+
+            function Animation:Run()
+                self.Func()
+                self.Fnc()
+            end
+
+            function MakeAnimation(func)
+                local anim = {}
+                anim.Func = func
+                return setmetatable(anim, Animation)
+            end
+            "#;
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(original.to_string()))
+            .expect("animation file id");
+
+        fn undefined_snapshots(
+            ws: &VirtualWorkspace,
+            file_id: FileId,
+        ) -> BTreeSet<DiagnosticSnapshot> {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            ws.diagnostic_snapshots_for_file(file_id, diagnostics)
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.code == Some(DiagnosticCode::UndefinedField.get_name().to_string())
+                })
+                .collect()
+        }
+
+        fn line_independent_messages(
+            snapshots: &BTreeSet<DiagnosticSnapshot>,
+        ) -> BTreeSet<(u32, u32, Option<i32>, Option<String>, String)> {
+            snapshots
+                .iter()
+                .map(|snapshot| {
+                    (
+                        snapshot.range_start_character,
+                        snapshot.range_end_character,
+                        snapshot.severity,
+                        snapshot.code.clone(),
+                        snapshot.message.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        let baseline = undefined_snapshots(&ws, file_id);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(format!("\n{original}")));
+        let after_add = undefined_snapshots(&ws, file_id);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(original.to_string()));
+        let after_remove = undefined_snapshots(&ws, file_id);
+
+        assert_that!(baseline.len(), eq(1));
+        assert_that!(
+            baseline.iter().next().unwrap().message.contains("Fnc"),
+            eq(true)
+        );
+        assert_eq!(baseline, after_remove);
+        assert_eq!(
+            line_independent_messages(&baseline),
+            line_independent_messages(&after_add)
+        );
+    }
+
+    #[gtest]
     fn gmod_dynamic_table_named_field_fallback_respects_non_global_dynamic_fields() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

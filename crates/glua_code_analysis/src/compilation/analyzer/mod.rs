@@ -8,6 +8,7 @@ pub(crate) mod gmod;
 mod infer_cache_manager;
 mod lua;
 mod parallel;
+mod setmetatable_factory;
 pub(crate) mod unresolve;
 
 pub(crate) use lua::infer_for_range_iter_expr_func;
@@ -73,6 +74,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) ->
         }
 
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+        setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
 
@@ -80,6 +82,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) ->
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+            setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
             resolve_uninformative_local_decl_caches(db, &mut context);
         }
 

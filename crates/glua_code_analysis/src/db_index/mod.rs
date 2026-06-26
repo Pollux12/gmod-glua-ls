@@ -38,7 +38,7 @@ pub use gmod_infer::*;
 pub use gmod_load::*;
 pub use gmod_network::*;
 pub use member::*;
-pub use metatable::LuaMetatableIndex;
+pub use metatable::{LuaMetatableIndex, SetmetatableFactoryBinding};
 pub use module::*;
 pub use operators::*;
 pub use property::*;

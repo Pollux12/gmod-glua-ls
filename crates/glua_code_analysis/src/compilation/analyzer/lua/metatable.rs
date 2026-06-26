@@ -1,7 +1,8 @@
 use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableField};
 
 use crate::{
-    InFiled, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, OperatorFunction,
+    InFiled, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
+    OperatorFunction, SetmetatableFactoryBinding,
 };
 
 use super::LuaAnalyzer;
@@ -27,6 +28,19 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
         metatable_range.clone(),
     );
 
+    if let Some(binding) = setmetatable_factory_binding(
+        analyzer,
+        &call_expr,
+        &table,
+        &metatable,
+        metatable_range.clone(),
+    ) {
+        analyzer
+            .db
+            .get_metatable_index_mut()
+            .add_factory_binding(binding);
+    }
+
     if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
         analyzer
             .db
@@ -42,6 +56,49 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     }
 
     Some(())
+}
+
+fn setmetatable_factory_binding(
+    analyzer: &mut LuaAnalyzer,
+    call_expr: &LuaCallExpr,
+    table: &LuaExpr,
+    metatable: &LuaExpr,
+    metatable_range: InFiled<rowan::TextRange>,
+) -> Option<SetmetatableFactoryBinding> {
+    // The post-UnResolve transfer is intentionally limited to the canonical
+    // factory idiom: a direct local table variable is given a direct class table
+    // metatable. Inline metatables, aliases, and reassigned locals are handled by
+    // ordinary table/metatable inference and are not bridged into class members.
+    let LuaExpr::NameExpr(table_name) = table else {
+        return None;
+    };
+    let LuaExpr::NameExpr(_) = metatable else {
+        return None;
+    };
+
+    let decl_id = analyzer
+        .db
+        .get_reference_index()
+        .get_var_reference_decl(&analyzer.file_id, table_name.get_range())?;
+    let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+    if !decl.is_local() {
+        return None;
+    }
+
+    let table_range = resolve_metatable_backing_table(analyzer, table)?;
+    let function_scope = analyzer
+        .db
+        .get_member_index()
+        .enclosing_function_scope_range(analyzer.file_id, call_expr.get_position())?;
+
+    Some(SetmetatableFactoryBinding {
+        file_id: analyzer.file_id,
+        table_range,
+        metatable_range,
+        local_name: table_name.get_name_text()?.into(),
+        call_position: call_expr.get_position(),
+        function_scope,
+    })
 }
 
 fn resolve_metatable_backing_table(
