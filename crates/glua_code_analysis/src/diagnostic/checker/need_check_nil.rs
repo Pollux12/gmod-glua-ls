@@ -1240,40 +1240,115 @@ where
         return false;
     };
 
-    let Some(parent) = containing_stat.parent() else {
-        return false;
-    };
-    let stat_start = containing_stat.text_range().start();
+    let scan_scopes = preceding_sibling_scan_scopes(&containing_stat);
+    for (scope_index, (parent, stat_start)) in scan_scopes.iter().enumerate() {
+        for sibling in parent.children() {
+            if sibling.text_range().start() >= *stat_start {
+                break;
+            }
 
+            let kind: LuaSyntaxKind = sibling.kind().into();
+            if kind != LuaSyntaxKind::IfStat {
+                continue;
+            }
+
+            let Some(if_stat) = LuaIfStat::cast(sibling) else {
+                continue;
+            };
+            if !if_body_has_return(&if_stat) {
+                continue;
+            }
+            let Some(condition) = if_stat.get_condition_expr() else {
+                continue;
+            };
+            if condition_matches(&condition, expr)
+                && !guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
+                && !guarded_expr_reassigned_between(
+                    semantic_model,
+                    expr,
+                    parent,
+                    if_stat.syntax().text_range(),
+                    *stat_start,
+                )
+                && !descendant_path_reassigns_guarded_expr(
+                    semantic_model,
+                    expr,
+                    &scan_scopes,
+                    scope_index,
+                )
+            {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn preceding_sibling_scan_scopes(
+    containing_stat: &LuaSyntaxNode,
+) -> Vec<(LuaSyntaxNode, rowan::TextSize)> {
+    let mut scopes = Vec::new();
+    let mut current = containing_stat.clone();
+
+    while let Some(parent) = current.parent() {
+        if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block {
+            scopes.push((parent.clone(), current.text_range().start()));
+        }
+        current = parent;
+    }
+
+    scopes
+}
+
+fn descendant_path_reassigns_guarded_expr(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    scan_scopes: &[(LuaSyntaxNode, rowan::TextSize)],
+    guard_scope_index: usize,
+) -> bool {
+    scan_scopes
+        .iter()
+        .take(guard_scope_index)
+        .any(|(parent, stat_start)| {
+            guarded_expr_reassigned_before_stat(semantic_model, guarded_expr, parent, *stat_start)
+        })
+}
+
+fn guarded_expr_reassigned_before_stat(
+    semantic_model: &SemanticModel,
+    guarded_expr: &LuaExpr,
+    parent: &LuaSyntaxNode,
+    stat_start: rowan::TextSize,
+) -> bool {
     for sibling in parent.children() {
         if sibling.text_range().start() >= stat_start {
             break;
         }
 
-        let kind: LuaSyntaxKind = sibling.kind().into();
-        if kind != LuaSyntaxKind::IfStat {
-            continue;
+        if let Some(assign_stat) = LuaAssignStat::cast(sibling.clone())
+            && assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+        {
+            return true;
         }
 
-        let Some(if_stat) = LuaIfStat::cast(sibling) else {
-            continue;
-        };
-        if !if_body_has_return(&if_stat) {
-            continue;
-        }
-        let Some(condition) = if_stat.get_condition_expr() else {
-            continue;
-        };
-        if condition_matches(&condition, expr)
-            && !guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
-            && !guarded_expr_reassigned_between(
-                semantic_model,
-                expr,
-                &parent,
-                if_stat.syntax().text_range(),
-                stat_start,
-            )
+        if let Some(local_stat) = LuaLocalStat::cast(sibling.clone())
+            && local_stat_shadows_guarded_expr(semantic_model, &local_stat, guarded_expr)
         {
+            return true;
+        }
+
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(sibling.clone())
+            && local_func_stat_shadows_guarded_expr(semantic_model, &local_func_stat, guarded_expr)
+        {
+            return true;
+        }
+
+        if sibling.descendants().any(|node| {
+            LuaAssignStat::cast(node).is_some_and(|assign_stat| {
+                assign_stat_reassigns_guarded_expr(semantic_model, &assign_stat, guarded_expr)
+            })
+        }) {
             return true;
         }
     }
@@ -1434,41 +1509,45 @@ where
         return false;
     };
 
-    let Some(parent) = containing_stat.parent() else {
-        return false;
-    };
-    let stat_start = containing_stat.text_range().start();
+    let scan_scopes = preceding_sibling_scan_scopes(&containing_stat);
+    for (scope_index, (parent, stat_start)) in scan_scopes.iter().enumerate() {
+        for sibling in parent.children() {
+            if sibling.text_range().start() >= *stat_start {
+                break;
+            }
 
-    for sibling in parent.children() {
-        if sibling.text_range().start() >= stat_start {
-            break;
-        }
+            let kind: LuaSyntaxKind = sibling.kind().into();
+            if kind != LuaSyntaxKind::IfStat {
+                continue;
+            }
 
-        let kind: LuaSyntaxKind = sibling.kind().into();
-        if kind != LuaSyntaxKind::IfStat {
-            continue;
-        }
-
-        let Some(if_stat) = LuaIfStat::cast(sibling) else {
-            continue;
-        };
-        if !if_body_has_return(&if_stat) {
-            continue;
-        }
-        let Some(condition) = if_stat.get_condition_expr() else {
-            continue;
-        };
-        if condition_matches(&condition, expr)
-            && (guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
-                || guarded_expr_reassigned_between(
-                    semantic_model,
-                    expr,
-                    &parent,
-                    if_stat.syntax().text_range(),
-                    stat_start,
-                ))
-        {
-            return true;
+            let Some(if_stat) = LuaIfStat::cast(sibling) else {
+                continue;
+            };
+            if !if_body_has_return(&if_stat) {
+                continue;
+            }
+            let Some(condition) = if_stat.get_condition_expr() else {
+                continue;
+            };
+            if condition_matches(&condition, expr)
+                && (guard_continuing_clauses_reassign_guarded_expr(semantic_model, expr, &if_stat)
+                    || guarded_expr_reassigned_between(
+                        semantic_model,
+                        expr,
+                        parent,
+                        if_stat.syntax().text_range(),
+                        *stat_start,
+                    )
+                    || descendant_path_reassigns_guarded_expr(
+                        semantic_model,
+                        expr,
+                        &scan_scopes,
+                        scope_index,
+                    ))
+            {
+                return true;
+            }
         }
     }
 

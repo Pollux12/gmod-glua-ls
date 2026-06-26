@@ -3779,24 +3779,17 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
         ws.def(
             r#"
             ---@class Entity
             ---@field Spawn fun(self: Entity)
-
-            ---@class NULL : Entity
-            ---@type NULL
-            NULL = nil
 
             ents = {}
             ---@generic T : Entity
             ---@param class `T`
             ---@return (instance) T|NULL
             function ents.Create(class) end
-
-            ---@param ent any
-            ---@return TypeGuard<Entity>
-            function IsValid(ent) end
             "#,
         );
 
@@ -3839,6 +3832,259 @@ mod test {
                 .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
             eq(true),
             "Unguarded Entity|NULL factory results must still warn. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_isvalid_type_guard_entity_excludes_null_in_nested_descendant_after_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+
+            ---@param ent any
+            ---@return TypeGuard<Entity>
+            function IsValid(ent) end
+            "#,
+        );
+
+        let guarded_file = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if not IsValid(balloon) then return NULL end
+
+            if enabled then
+                balloon:Spawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(guarded_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Early-return IsValid guards should narrow inferred Entity|NULL locals inside descendant blocks."
+        );
+    }
+
+    #[gtest]
+    fn test_nested_descendant_entity_null_access_without_isvalid_guard_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+
+        let unguarded_file = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if enabled then
+                balloon:Spawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(unguarded_file, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
+            eq(true),
+            "Nested access without an IsValid guard must still warn. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_nested_descendant_isvalid_guard_in_conditional_sibling_does_not_dominate_later_access()
+    {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if should_check then
+                if not IsValid(balloon) then return NULL end
+            end
+
+            if enabled then
+                balloon:Spawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
+            eq(true),
+            "A guard nested inside a conditional sibling does not dominate later access. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_nested_descendant_isvalid_guard_invalidated_by_same_block_reassignment_before_access() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if not IsValid(balloon) then return NULL end
+
+            if enabled then
+                balloon = ents.Create("gmod_balloon")
+                balloon:Spawn()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
+            eq(true),
+            "A later nullable reassignment in the access block must invalidate an outer IsValid guard. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_nested_descendant_isvalid_guard_invalidated_by_intermediate_block_reassignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        def_isvalid_type_guard(&mut ws);
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field Spawn fun(self: Entity)
+
+            ents = {}
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+            "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+            local balloon = ents.Create("gmod_balloon")
+            if not IsValid(balloon) then return NULL end
+
+            if outer then
+                balloon = ents.Create("gmod_balloon")
+                if inner then
+                    balloon:Spawn()
+                end
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("balloon may be NULL")),
+            eq(true),
+            "A later nullable reassignment in an intermediate block must invalidate an outer IsValid guard. Diagnostics: {diagnostics:#?}"
         );
     }
 
