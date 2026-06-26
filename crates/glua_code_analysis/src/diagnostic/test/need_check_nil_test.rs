@@ -379,6 +379,72 @@ mod test {
     }
 
     #[test]
+    fn test_optional_callable_member_on_guarded_receiver_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class CallbackOwner
+            ---@field callback? fun()
+
+            ---@return CallbackOwner?
+            function maybeOwner() end
+
+            local owner = maybeOwner()
+            if IsValid(owner) then
+                owner.callback()
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+        assert_that!(
+            diagnostics[0].message.as_str(),
+            contains_substring("owner.callback")
+        );
+    }
+
+    #[test]
+    fn test_optional_callable_member_on_gmod_null_guarded_receiver_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
+            ---@class CallbackOwner : Entity
+            ---@field callback? fun()
+
+            ---@return CallbackOwner|NULL
+            function maybeOwner() end
+
+            local owner = maybeOwner()
+            if IsValid(owner) then
+                owner.callback()
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+        assert_that!(
+            diagnostics[0].message.as_str(),
+            contains_substring("owner.callback")
+        );
+    }
+
+    #[test]
     fn test_cast() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -2030,6 +2096,83 @@ mod test {
     }
 
     #[gtest]
+    fn test_isvalid_valid_guard_entity_typeguard_suppresses_panel_field_nil_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute valid_guard()
+
+            ---@class Entity
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@[valid_guard]
+            function _G.IsValid(value) end
+
+            ---@class DVScrollBar
+            ---@field Remove fun(self: DVScrollBar)
+            ---@field SetZPos fun(self: DVScrollBar, z: number)
+            ---@class Panel
+            ---@generic T: Panel
+            ---@param className `T`
+            ---@return T
+            function vgui.Create(className, parent) end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local PANEL = {}
+            function PANEL:Init()
+                self.VBar = vgui.Create("DVScrollBar", self)
+                self.VBar:SetZPos(20)
+            end
+            function PANEL:DisableScrollbar()
+                if ( IsValid( self.VBar ) ) then
+                    self.VBar:Remove()
+                end
+                self.VBar = nil
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_isvalid_unstable_lvalue_guards_still_report_nil_diagnostics() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_isvalid_type_guard(&mut ws);
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Entity
+                ---@field Foo fun(self: Entity)
+                ---@return Entity?
+                function getEnt() end
+
+                IsValid(getEnt()) && getEnt():Foo()
+                "#,
+            ),
+            eq(false)
+        );
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@class Entity
+                ---@field Foo fun(self: Entity)
+                ---@return table<string, Entity?>
+                function getTable() end
+                local i = "x"
+
+                IsValid(getTable()[i]) && getTable()[i]:Foo()
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_isvalid_narrows_reassigned_clientside_model_negative_branch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         def_isvalid_type_guard(&mut ws);
@@ -2262,6 +2405,45 @@ mod test {
                 "#,
             ),
             eq(true)
+        );
+    }
+
+    #[gtest]
+    fn test_method_type_guard_repeated_call_receiver_still_reports_null_diagnostic() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetEditingData fun(self: Entity): table
+            ---@class NULL : Entity
+            ---@alias EntityOrNULL Entity|NULL
+
+            ---@return TypeGuard<Entity>
+            ---@return_cast self -NULL
+            function Entity:IsValid() end
+
+            ---@return EntityOrNULL
+            function getEntity() end
+
+            if not getEntity():IsValid() then
+                return
+            end
+
+            getEntity():GetEditingData()
+            "#,
+        );
+
+        assert_that!(diagnostics.is_empty(), eq(false));
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.message.contains("getEntity()"))
         );
     }
 

@@ -14,6 +14,7 @@ use crate::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
     },
+    signature_is_valid_guard,
 };
 
 use super::{
@@ -185,6 +186,10 @@ fn nullable_callable_is_from_guarded_receiver(
         return false;
     };
 
+    if index_expr_has_explicit_nullable_member(semantic_model, index_expr, receiver_type.clone()) {
+        return false;
+    }
+
     if contains_gmod_null_type(semantic_model.get_db(), &receiver_type) {
         // GMod NULL is truthy, so nullable-callable suppression for NULL-typed
         // receivers must use the same explicit validity guards as receiver
@@ -200,6 +205,7 @@ fn nullable_callable_is_from_guarded_receiver(
         ) || is_expr_valid_by_enclosing_self_call_context(semantic_model, &receiver)
     } else {
         is_expr_guarded_by_prior_nil_early_return(semantic_model, &receiver)
+            || is_expr_guarded_by_current_type_guard_condition(semantic_model, &receiver)
     }
 }
 
@@ -208,15 +214,45 @@ fn index_expr_has_explicit_nullable_member(
     index_expr: &LuaIndexExpr,
     receiver_type: LuaType,
 ) -> bool {
-    let Some(owner) = member_owner_for_type(receiver_type) else {
-        return false;
-    };
     let Some(key) = literal_member_key(index_expr) else {
         return false;
     };
 
+    type_has_explicit_nullable_member(semantic_model, index_expr, receiver_type, &key)
+}
+
+fn type_has_explicit_nullable_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    receiver_type: LuaType,
+    key: &LuaMemberKey,
+) -> bool {
+    match receiver_type {
+        LuaType::Union(union) => union.into_vec().into_iter().any(|component| {
+            !matches!(component, LuaType::Nil | LuaType::BooleanConst(false))
+                && type_has_explicit_nullable_member(semantic_model, index_expr, component, key)
+        }),
+        LuaType::Intersection(intersection) => intersection.get_types().iter().any(|component| {
+            type_has_explicit_nullable_member(semantic_model, index_expr, component.clone(), key)
+        }),
+        receiver_type => {
+            owner_has_explicit_nullable_member(semantic_model, index_expr, receiver_type, key)
+        }
+    }
+}
+
+fn owner_has_explicit_nullable_member(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+    receiver_type: LuaType,
+    key: &LuaMemberKey,
+) -> bool {
+    let Some(owner) = member_owner_for_type(receiver_type) else {
+        return false;
+    };
+
     let db = semantic_model.get_db();
-    let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
+    let Some(member_item) = db.get_member_index().get_member_item(&owner, key) else {
         return false;
     };
     member_item
@@ -808,6 +844,40 @@ fn is_expr_guarded_by_current_null_excluding_type_guard_condition(
     false
 }
 
+fn is_expr_guarded_by_current_type_guard_condition(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let expr_range = expr.syntax().text_range();
+    for ancestor in expr.syntax().ancestors() {
+        if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
+            if let Some(condition) = if_stat.get_condition_expr()
+                && if_stat
+                    .get_block()
+                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                && condition_is_positive_type_guard_call(semantic_model, &condition, expr)
+                && !then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr)
+                && !loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr)
+            {
+                return true;
+            }
+
+            for elseif_clause in if_stat.get_else_if_clause_list() {
+                if let Some(condition) = elseif_clause.get_condition_expr()
+                    && elseif_clause.get_block().is_some_and(|block| {
+                        range_contains(block.syntax().text_range(), expr_range)
+                    })
+                    && condition_is_positive_type_guard_call(semantic_model, &condition, expr)
+                {
+                    return true;
+                }
+            }
+        }
+    }
+
+    false
+}
+
 fn is_expr_guarded_by_current_assigned_value_type_guard_condition(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
@@ -1194,7 +1264,49 @@ fn condition_is_positive_type_guard_call(
 }
 
 fn is_stable_guard_expr(expr: &LuaExpr) -> bool {
-    matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_))
+    match expr {
+        LuaExpr::NameExpr(_) => true,
+        LuaExpr::IndexExpr(index_expr) => {
+            let Some(prefix) = index_expr.get_prefix_expr() else {
+                return false;
+            };
+            is_stable_guard_expr(&prefix)
+                && index_expr
+                    .get_index_key()
+                    .is_some_and(|key| is_stable_guard_index_key(&key))
+        }
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|inner| is_stable_guard_expr(&inner)),
+        _ => false,
+    }
+}
+
+fn is_stable_guard_index_key(key: &LuaIndexKey) -> bool {
+    match key {
+        LuaIndexKey::Name(_)
+        | LuaIndexKey::String(_)
+        | LuaIndexKey::Integer(_)
+        | LuaIndexKey::Idx(_) => true,
+        LuaIndexKey::Expr(expr) => is_stable_guard_key_expr(expr),
+    }
+}
+
+fn is_stable_guard_key_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::LiteralExpr(_) | LuaExpr::NameExpr(_) => true,
+        LuaExpr::IndexExpr(_) => is_stable_guard_expr(expr),
+        LuaExpr::ParenExpr(paren_expr) => paren_expr
+            .get_expr()
+            .is_some_and(|inner| is_stable_guard_key_expr(&inner)),
+        LuaExpr::UnaryExpr(unary_expr) => unary_expr
+            .get_expr()
+            .is_some_and(|inner| is_stable_guard_key_expr(&inner)),
+        LuaExpr::BinaryExpr(binary_expr) => binary_expr.get_exprs().is_some_and(|(left, right)| {
+            is_stable_guard_key_expr(&left) && is_stable_guard_key_expr(&right)
+        }),
+        _ => false,
+    }
 }
 
 /// Combined guard: checks both TypeGuard-specific and general negation guards.
@@ -2157,6 +2269,10 @@ fn is_type_guard_call_guarding_expr(
     guard_call: &LuaCallExpr,
     receiver: &LuaExpr,
 ) -> bool {
+    if is_isvalid_call_guarding_stable_expr(semantic_model, guard_call, receiver) {
+        return true;
+    }
+
     if !call_returns_non_nullable_type_guard(semantic_model, guard_call) {
         return false;
     };
@@ -2165,6 +2281,9 @@ fn is_type_guard_call_guarding_expr(
         && let Some(LuaExpr::IndexExpr(index_expr)) = guard_call.get_prefix_expr()
         && let Some(self_expr) = index_expr.get_prefix_expr()
     {
+        if !is_stable_guard_expr(&self_expr) || !is_stable_guard_expr(receiver) {
+            return false;
+        }
         return exprs_reference_same_var_or_text(semantic_model, &self_expr, receiver);
     }
 
@@ -2175,7 +2294,36 @@ fn is_type_guard_call_guarding_expr(
         return false;
     };
 
-    exprs_reference_same_var_or_text(semantic_model, &first_arg, receiver)
+    is_stable_guard_expr(&first_arg)
+        && is_stable_guard_expr(receiver)
+        && exprs_reference_same_var_or_text(semantic_model, &first_arg, receiver)
+}
+
+fn is_isvalid_call_guarding_stable_expr(
+    semantic_model: &SemanticModel,
+    guard_call: &LuaCallExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    let Some(signature_id) = call_signature_id(semantic_model, guard_call) else {
+        return false;
+    };
+    if !is_isvalid_call(guard_call)
+        || !signature_is_valid_guard(semantic_model.get_db(), signature_id)
+            && !call_returns_non_nullable_type_guard(semantic_model, guard_call)
+        || !is_stable_guard_expr(guarded_expr)
+    {
+        return false;
+    }
+
+    let Some(first_arg) = guard_call
+        .get_args_list()
+        .and_then(|args| args.get_args().next())
+    else {
+        return false;
+    };
+
+    is_stable_guard_expr(&first_arg)
+        && exprs_reference_same_var_or_text(semantic_model, &first_arg, guarded_expr)
 }
 
 fn is_self_guard_call_guarding_expr(
@@ -2193,6 +2341,9 @@ fn is_self_guard_call_guarding_expr(
     let Some(self_expr) = index_expr.get_prefix_expr() else {
         return false;
     };
+    if !is_stable_guard_expr(&self_expr) || !is_stable_guard_expr(guarded_expr) {
+        return false;
+    }
     if !exprs_reference_same_var_or_text(semantic_model, &self_expr, guarded_expr) {
         return false;
     }
@@ -2889,4 +3040,47 @@ fn expr_can_be_gmod_null(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool
     semantic_model
         .infer_expr(expr.clone())
         .is_ok_and(|expr_type| contains_gmod_null_type(semantic_model.get_db(), &expr_type))
+}
+
+#[cfg(test)]
+mod tests {
+    use googletest::prelude::*;
+
+    use super::*;
+    use crate::VirtualWorkspace;
+
+    fn expr_by_text(code: &str, text: &str) -> LuaExpr {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file("test.lua", code);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        semantic_model
+            .get_root()
+            .descendants::<LuaExpr>()
+            .find(|expr| normalized_expr_text(expr).as_deref() == Some(text))
+            .unwrap_or_else(|| panic!("expected expression `{text}` in `{code}`"))
+    }
+
+    #[gtest]
+    fn recursive_stable_guard_expr_rejects_calls_in_prefix_or_key() {
+        assert_that!(
+            is_stable_guard_expr(&expr_by_text("return t[key]", "t[key]")),
+            eq(true)
+        );
+        assert_that!(
+            is_stable_guard_expr(&expr_by_text("return t[key + 1]", "t[key + 1]")),
+            eq(true)
+        );
+        assert_that!(
+            is_stable_guard_expr(&expr_by_text("return getTable()[key]", "getTable()[key]")),
+            eq(false)
+        );
+        assert_that!(
+            is_stable_guard_expr(&expr_by_text("return t[getKey()]", "t[getKey()]")),
+            eq(false)
+        );
+    }
 }
