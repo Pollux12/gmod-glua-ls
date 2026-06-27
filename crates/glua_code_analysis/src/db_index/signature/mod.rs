@@ -14,9 +14,10 @@ pub use gmod_domains::{
     GMOD_DOMAIN_NETWORK_VAR, GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_TIMER, GMOD_DOMAIN_VALID_GUARD,
     GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
     collect_call_arg_roles_for_param, find_best_call_arg_role_for_param,
-    find_best_call_arg_role_from_type, find_signature_attribute_use, signature_attribute_uses,
-    signature_is_valid_guard, signature_is_valid_guard_or_base_runtime_isvalid,
-    signature_owner_for,
+    find_best_call_arg_role_from_type, find_signature_attribute_use,
+    semantic_decl_signature_has_valid_guard_metadata, semantic_decl_signature_is_valid_guard,
+    signature_attribute_uses, signature_is_valid_guard,
+    signature_is_valid_guard_or_base_runtime_isvalid, signature_owner_for,
 };
 pub use signature::{
     CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE, LuaCallArgRole, LuaDocDefaultValue,

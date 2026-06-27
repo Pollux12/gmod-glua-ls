@@ -19,7 +19,10 @@
 //! without duplicating literals, and without introducing broad per-call
 //! semantic inference or whole-workspace scans.
 
-use crate::{DbIndex, LuaSignatureId};
+use crate::{
+    DbIndex, FileId, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
+    db_index::declaration::LuaDeclExtra,
+};
 
 use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_type};
 
@@ -314,6 +317,133 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid(
         .and_then(|path| path.to_str())
         .map(|path| path.replace('\\', "/"))
         .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+/// Returns whether a resolved call should behave as a GMod validity guard.
+///
+/// Direct signature metadata wins first. For shipped source that shadows a
+/// metadata-bearing annotation declaration, also consult declarations of the
+/// same global/member identity through indexed global/member maps. This keeps
+/// guard contracts annotation-driven without per-function path hardcodes.
+pub fn semantic_decl_signature_is_valid_guard(
+    db: &DbIndex,
+    current_file_id: FileId,
+    signature_id: LuaSignatureId,
+    semantic_decl: &LuaSemanticDeclId,
+) -> bool {
+    if signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id) {
+        return true;
+    }
+
+    semantic_decl_signature_has_valid_guard_metadata(
+        db,
+        current_file_id,
+        signature_id,
+        semantic_decl,
+    )
+}
+
+/// Returns whether the resolved signature or another declaration of the same
+/// identity has explicit `valid_guard` metadata, without applying compatibility
+/// bridges such as the shipped `util.lua` `IsValid` source fallback.
+pub fn semantic_decl_signature_has_valid_guard_metadata(
+    db: &DbIndex,
+    current_file_id: FileId,
+    signature_id: LuaSignatureId,
+    semantic_decl: &LuaSemanticDeclId,
+) -> bool {
+    if signature_is_valid_guard(db, signature_id) {
+        return true;
+    }
+
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+                return false;
+            };
+            if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
+                return false;
+            }
+
+            global_identity_has_valid_guard(db, current_file_id, decl.get_name())
+                || global_member_identity_has_valid_guard(db, decl.get_name())
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            let member_index = db.get_member_index();
+            let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
+                return false;
+            };
+            let Some(member) = member_index.get_member(member_id) else {
+                return false;
+            };
+            member_index
+                .get_current_owner_members_for_key(&owner, member.get_key())
+                .into_iter()
+                .any(|member| semantic_decl_signature_has_valid_guard(db, member.get_id().into()))
+        }
+        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => false,
+    }
+}
+
+fn global_identity_has_valid_guard(db: &DbIndex, current_file_id: FileId, name: &str) -> bool {
+    let global_index = db.get_global_index();
+    let module_index = db.get_module_index();
+    let decl_ids = module_index
+        .get_workspace_id(current_file_id)
+        .and_then(|workspace_id| {
+            global_index.get_global_decl_ids_in_workspace(name, module_index, workspace_id)
+        })
+        .or_else(|| global_index.get_global_decl_ids(name).cloned());
+
+    decl_ids.is_some_and(|decl_ids| {
+        decl_ids
+            .into_iter()
+            .any(|decl_id| semantic_decl_signature_has_valid_guard(db, decl_id.into()))
+    })
+}
+
+fn global_member_identity_has_valid_guard(db: &DbIndex, name: &str) -> bool {
+    let key = LuaMemberKey::Name(name.into());
+    db.get_member_index()
+        .get_current_members_for_key(&key)
+        .into_iter()
+        .filter(|member| {
+            member
+                .get_global_id()
+                .is_some_and(|global_id| global_id.get_name().rsplit('.').next() == Some(name))
+        })
+        .any(|member| semantic_decl_signature_has_valid_guard(db, member.get_id().into()))
+}
+
+fn semantic_decl_signature_has_valid_guard(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> bool {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return signature_is_valid_guard(db, signature_id);
+    }
+
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .and_then(|type_cache| match type_cache.as_type() {
+                crate::LuaType::Signature(signature_id) => Some(*signature_id),
+                _ => None,
+            })
+            .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id)),
+        LuaSemanticDeclId::Member(member_id) => db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .and_then(|type_cache| match type_cache.as_type() {
+                crate::LuaType::Signature(signature_id) => Some(*signature_id),
+                _ => None,
+            })
+            .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id)),
+        LuaSemanticDeclId::Signature(signature_id) => signature_is_valid_guard(db, signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => false,
+    }
 }
 
 /// Returns the signature id that owns the standalone attributes attached to

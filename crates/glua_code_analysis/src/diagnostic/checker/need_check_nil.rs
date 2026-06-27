@@ -17,6 +17,7 @@ use crate::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
     },
+    semantic_decl_signature_has_valid_guard_metadata, semantic_decl_signature_is_valid_guard,
     signature_is_valid_guard_or_base_runtime_isvalid,
 };
 
@@ -2747,7 +2748,7 @@ fn is_isvalid_call_guarding_stable_expr(
         return false;
     };
     if !is_isvalid_call(guard_call)
-        || !signature_is_valid_guard_or_base_runtime_isvalid(semantic_model.get_db(), signature_id)
+        || !call_signature_is_valid_guard(semantic_model, guard_call, signature_id)
             && !call_returns_non_nullable_type_guard(semantic_model, guard_call)
         || !is_stable_guard_expr(guarded_expr)
     {
@@ -2763,6 +2764,56 @@ fn is_isvalid_call_guarding_stable_expr(
 
     is_stable_guard_expr(&first_arg)
         && exprs_reference_same_var_or_text(semantic_model, &first_arg, guarded_expr)
+}
+
+fn call_signature_is_valid_guard(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> bool {
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return signature_is_valid_guard_or_base_runtime_isvalid(
+            semantic_model.get_db(),
+            signature_id,
+        );
+    };
+    let Some(semantic_decl) =
+        semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())
+    else {
+        return signature_is_valid_guard_or_base_runtime_isvalid(
+            semantic_model.get_db(),
+            signature_id,
+        );
+    };
+
+    semantic_decl_signature_is_valid_guard(
+        semantic_model.get_db(),
+        semantic_model.get_file_id(),
+        signature_id,
+        &semantic_decl,
+    )
+}
+
+fn call_signature_has_valid_guard_metadata(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> bool {
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return crate::signature_is_valid_guard(semantic_model.get_db(), signature_id);
+    };
+    let Some(semantic_decl) =
+        semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())
+    else {
+        return crate::signature_is_valid_guard(semantic_model.get_db(), signature_id);
+    };
+
+    semantic_decl_signature_has_valid_guard_metadata(
+        semantic_model.get_db(),
+        semantic_model.get_file_id(),
+        signature_id,
+        &semantic_decl,
+    )
 }
 
 fn is_self_guard_call_guarding_expr(
@@ -3019,6 +3070,12 @@ fn call_returns_non_nullable_type_guard(
     let Some(prefix) = guard_call.get_prefix_expr() else {
         return false;
     };
+
+    if call_signature_id(semantic_model, guard_call).is_some_and(|signature_id| {
+        call_signature_has_valid_guard_metadata(semantic_model, guard_call, signature_id)
+    }) {
+        return true;
+    }
 
     if semantic_model
         .infer_expr(prefix.clone())

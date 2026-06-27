@@ -21,7 +21,7 @@ use crate::{
         },
         infer_expr_semantic_decl,
     },
-    signature_is_valid_guard_or_base_runtime_isvalid,
+    semantic_decl_signature_is_valid_guard, signature_is_valid_guard_or_base_runtime_isvalid,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -51,7 +51,7 @@ pub fn get_type_at_call_expr(
             LuaType::DocFunction(f) => {
                 let prefix_signature_id = get_call_prefix_signature_id(db, cache, &call_expr);
                 let is_valid_guard = prefix_signature_id.is_some_and(|signature_id| {
-                    signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id)
+                    call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id)
                 });
                 let signature_cast = prefix_signature_id.and_then(|signature_id| {
                     db.get_flow_index()
@@ -87,7 +87,7 @@ pub fn get_type_at_call_expr(
                 let ret = signature.get_return_type();
                 let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
                 let is_valid_guard =
-                    signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
+                    call_prefix_signature_is_valid_guard(db, cache, &call_expr_ref, signature_id);
                 let mut type_guard_did_not_apply = false;
                 match ret {
                     LuaType::TypeGuard(_) => {
@@ -650,6 +650,28 @@ fn get_call_prefix_signature_id(
 ) -> Option<LuaSignatureId> {
     let prefix_expr = call_expr.get_prefix_expr()?;
     get_callable_expr_signature_id(db, cache, prefix_expr, 0)
+}
+
+fn call_prefix_signature_is_valid_guard(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
+    };
+    let Some(semantic_decl) = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    ) else {
+        return signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
+    };
+
+    semantic_decl_signature_is_valid_guard(db, cache.get_file_id(), signature_id, &semantic_decl)
 }
 
 fn get_callable_expr_signature_id(
