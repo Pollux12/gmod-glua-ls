@@ -14,7 +14,7 @@ use crate::{
         UnResolveCallClosureParams, UnResolveClosureReturn, UnResolveParentAst,
         UnResolveParentClosureParams, UnResolveReturn,
     },
-    db_index::{LuaDocReturnInfo, LuaMemberOwner, LuaSignatureId},
+    db_index::{LuaDocReturnInfo, LuaMemberOwner, LuaReturnCorrelation, LuaSignatureId},
     infer_expr,
 };
 
@@ -469,11 +469,20 @@ fn analyze_return(
                 .get_signature_index_mut()
                 .get_or_create(*signature_id);
             signature.resolve_return = SignatureReturnStatus::InferResolve;
+            signature.set_return_correlations(Vec::new());
             return Some(());
         }
     };
 
     let return_points = analyze_func_body_returns(block);
+    let return_correlations = analyze_return_correlations(
+        analyzer.db,
+        analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id),
+        &return_points,
+    );
     let returns = match analyze_return_point(
         analyzer.db,
         analyzer
@@ -512,6 +521,7 @@ fn analyze_return(
     signature.resolve_return = SignatureReturnStatus::InferResolve;
 
     signature.return_docs = returns;
+    signature.set_return_correlations(return_correlations);
 
     Some(())
 }
@@ -612,6 +622,101 @@ pub fn analyze_return_point(
         attributes: None,
         return_kind: ReturnTypeKind::default(),
     }])
+}
+
+fn analyze_return_correlations(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    return_points: &[LuaReturnPoint],
+) -> Vec<LuaReturnCorrelation> {
+    let mut shapes = Vec::new();
+    for point in return_points {
+        match return_point_shape(db, cache, point) {
+            Some(shape) => shapes.push(shape),
+            None => return Vec::new(),
+        }
+    }
+
+    let max_len = shapes.iter().map(Vec::len).max().unwrap_or(0);
+    let mut correlations = Vec::new();
+    for discriminant_slot in 0..max_len {
+        let mut implied_non_nil_slots = Vec::new();
+        for implied_slot in 0..max_len {
+            if implied_slot == discriminant_slot {
+                continue;
+            }
+            if return_shapes_imply_non_nil_slot(&shapes, discriminant_slot, implied_slot) {
+                implied_non_nil_slots.push(implied_slot);
+            }
+        }
+        if !implied_non_nil_slots.is_empty() {
+            correlations.push(LuaReturnCorrelation {
+                discriminant_slot,
+                implied_non_nil_slots,
+            });
+        }
+    }
+
+    correlations
+}
+
+fn return_point_shape(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    point: &LuaReturnPoint,
+) -> Option<Vec<LuaType>> {
+    match point {
+        LuaReturnPoint::Nil => Some(vec![LuaType::Nil]),
+        LuaReturnPoint::Error => Some(Vec::new()),
+        LuaReturnPoint::Expr(expr) => Some(first_class_return_shape(
+            infer_expr(db, cache, expr.clone()).ok()?,
+        )),
+        LuaReturnPoint::MuliExpr(exprs) => {
+            let mut shape = Vec::with_capacity(exprs.len());
+            for expr in exprs {
+                shape.push(infer_expr(db, cache, expr.clone()).ok()?);
+            }
+            Some(shape)
+        }
+    }
+}
+
+fn first_class_return_shape(typ: LuaType) -> Vec<LuaType> {
+    match typ {
+        LuaType::Variadic(variadic) => match variadic.deref() {
+            VariadicType::Multi(types) => types.clone(),
+            VariadicType::Base(base) => vec![base.clone()],
+        },
+        other => vec![other],
+    }
+}
+
+fn return_shapes_imply_non_nil_slot(
+    shapes: &[Vec<LuaType>],
+    discriminant_slot: usize,
+    implied_slot: usize,
+) -> bool {
+    let mut saw_truthy_discriminant = false;
+    let mut saw_falsy_discriminant = false;
+
+    for shape in shapes {
+        let discriminant = shape.get(discriminant_slot).unwrap_or(&LuaType::Nil);
+        if discriminant.is_always_falsy() {
+            saw_falsy_discriminant = true;
+            continue;
+        }
+        if !discriminant.is_always_truthy() {
+            return false;
+        }
+
+        saw_truthy_discriminant = true;
+        let implied = shape.get(implied_slot).unwrap_or(&LuaType::Nil);
+        if implied.is_optional() {
+            return false;
+        }
+    }
+
+    saw_truthy_discriminant && saw_falsy_discriminant
 }
 
 fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {

@@ -6868,4 +6868,255 @@ mod test {
             "Expected no NeedCheckNil warnings with valid STOOL helper pattern. Diagnostics: {diagnostics:#?}"
         );
     }
+
+    #[gtest]
+    fn test_utf8_optional_param_defaulted_via_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param startPos? integer
+            function decode(str, startPos)
+                startPos = startPos or 1
+                local endPos = startPos + 1
+            end
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Optional parameter defaulted via assignment then used arithmetically should not report NeedCheckNil"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_multi_return_correlated_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode(str, pos)
+                if pos > 10 then
+                    return nil
+                end
+                return 1, 2, 3
+            end
+
+            local seqStartPos, seqEndPos = decode("abc", 1)
+            if not seqStartPos then
+                error("error")
+            end
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Early error/return proving the first return is present should also clear need-check-nil on the correlated return"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_multi_return_correlated_return_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode(pos)
+                if pos > 10 then
+                    return nil
+                end
+                return 1, 2, 3
+            end
+
+            local seqStartPos, seqEndPos = decode(1)
+            if not seqStartPos then
+                return
+            end
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Return guard on the discriminant slot should prove correlated sibling returns non-nil"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_independent_optional_returns_negative_soundness() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@return integer? a
+            ---@return integer? b
+            local function decode() end
+
+            local a, b = decode()
+            if not a then
+                return
+            end
+            local x = b + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Independent optional returns should still report NeedCheckNil on b after guarding a"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_mixed_success_shape_negative_soundness() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode(pos)
+                if pos == 1 then
+                    return nil
+                elseif pos == 2 then
+                    return 1, nil
+                else
+                    return 1, 2
+                end
+            end
+
+            local seqStartPos, seqEndPos = decode(3)
+            if not seqStartPos then
+                error("invalid")
+            end
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Using slot 2 after guarding slot 1 should still report if one return statement has a nil in slot 2"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_nullable_param_passthrough_negative_soundness() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param value? integer
+            local function decode(value)
+                if math.random() > 0.5 then
+                    return nil
+                end
+                return 1, value
+            end
+
+            ---@type integer?
+            local maybe
+            local seqStartPos, seqEndPos = decode(maybe)
+            if not seqStartPos then
+                return
+            end
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Guarding slot 1 must not prove a sibling slot non-nil when that slot passes through a nullable parameter"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_reassignment_between_guard_and_use_negative() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode()
+                if math.random() > 0.5 then
+                    return nil
+                end
+                return 1, 2
+            end
+
+            local seqStartPos, seqEndPos = decode()
+            if not seqStartPos then
+                error("invalid")
+            end
+            seqEndPos = nil
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Reassigning seqEndPos to nil after the guard should report NeedCheckNil"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_discriminant_reassignment_between_guard_and_use_negative() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode()
+                if math.random() > 0.5 then
+                    return nil
+                end
+                return 1, 2
+            end
+
+            local seqStartPos, seqEndPos = decode()
+            if not seqStartPos then
+                return
+            end
+            seqStartPos = nil
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Reassigning the guarded discriminant after the guard should invalidate sibling return correlation"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_recall_after_guard_negative() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function decode()
+                if math.random() > 0.5 then
+                    return nil
+                end
+                return 1, 2
+            end
+
+            local seqStartPos = decode()
+            if not seqStartPos then
+                return
+            end
+            local _, seqEndPos = decode()
+            local startPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "Guarding a different decode() call must not prove a later re-call's sibling return non-nil"
+        );
+    }
 }

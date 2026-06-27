@@ -32,6 +32,13 @@ pub struct LuaSignature {
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
     require_guard_param: Option<usize>,
+    return_correlations: Vec<LuaReturnCorrelation>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaReturnCorrelation {
+    pub discriminant_slot: usize,
+    pub implied_non_nil_slots: Vec<usize>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -70,7 +77,23 @@ impl LuaSignature {
             nodiscard: None,
             is_vararg: false,
             require_guard_param: None,
+            return_correlations: Vec::new(),
         }
+    }
+
+    pub fn set_return_correlations(&mut self, correlations: Vec<LuaReturnCorrelation>) {
+        self.return_correlations = correlations;
+    }
+
+    pub fn return_correlation_implies(
+        &self,
+        discriminant_slot: usize,
+        implied_slot: usize,
+    ) -> bool {
+        self.return_correlations.iter().any(|correlation| {
+            correlation.discriminant_slot == discriminant_slot
+                && correlation.implied_non_nil_slots.contains(&implied_slot)
+        })
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
