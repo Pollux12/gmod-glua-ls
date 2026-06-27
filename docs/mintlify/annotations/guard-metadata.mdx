@@ -1,0 +1,90 @@
+---
+title: Guard metadata
+description: Mark functions and callbacks that prove values are valid.
+---
+
+## Overview
+
+Guard metadata tells GLuaLS that a function proves a value is safe to use.
+
+Most addons do not need these annotations. The official annotations already use them for common Garry's Mod helpers and callbacks.
+
+Use guard metadata only when a wrapper or callback has the same runtime guarantee as the API it represents.
+
+---
+
+## `valid_guard`
+
+Use `valid_guard` on a function that returns `TypeGuard<T>` and proves its first argument is valid.
+
+Place it after the `@return` line.
+
+```lua
+---@param ent Entity?
+---@return TypeGuard<Entity>
+---@[valid_guard]
+function IsValidEntity(ent) end
+
+---@type Entity?
+local ent
+
+if IsValidEntity(ent) then
+    ent:GetClass() -- ent is valid here
+end
+```
+
+This only applies when that function is called. A local function with the same name is treated as a separate function.
+
+---
+
+## `self_guard`
+
+Use `self_guard` on a colon method that proves its receiver is valid after the call.
+
+Place it after the `@return` or `@return_cast` line.
+
+```lua
+---@return TypeGuard<Entity>
+---@[self_guard("gmod.entity")]
+function Entity:IsValid() end
+```
+
+This only applies to the annotated method.
+
+---
+
+## `self_call_valid`
+
+Use `self_call_valid` on callbacks where a specific `self` method is known to return a valid value.
+
+```lua
+---@return nil
+---@[self_call_valid("GetOwner")]
+function WEAPON:Think() end
+```
+
+Inside that callback, `self:GetOwner()` can be treated as valid.
+
+This is callback-scoped. It does not propagate into helper methods called by the callback.
+
+---
+
+## Member guards
+
+Use `gmod.member_guard` through [`@call_arg`](/annotations/call-arg) when a function argument names the member being guarded.
+
+```lua
+---@[call_arg("gmod.member_guard", "function")]
+---@param methodName string
+local function GuardMember(methodName) end
+```
+
+Use this only for wrappers that really guard the named member.
+
+---
+
+## Keep it narrow
+
+Guard metadata can hide nil or NULL diagnostics. Keep it close to the exact function or callback that has the runtime guarantee.
+
+Do not use it to silence diagnostics for helper methods unless the helper itself guarantees the value is valid.

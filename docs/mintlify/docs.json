@@ -115,7 +115,8 @@
               "annotations/hook",
               "annotations/fileparam",
               "annotations/accessorfunc",
-              "annotations/call-arg"
+              "annotations/call-arg",
+              "annotations/guard-metadata"
             ]
           },
           {

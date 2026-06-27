@@ -68,6 +68,8 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `need-check-nil` | On | Hint | Potential nil dereference (try `if x then ... end`) |
 | `unchecked-nil-access` | On | Warning | Chained access or call through an opaque table member that may be nil |
 
+Nil diagnostics understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
+
 ### Fields & access
 
 | Code | Default | Severity | Description |

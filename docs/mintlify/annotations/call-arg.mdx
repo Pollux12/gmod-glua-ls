@@ -68,9 +68,12 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.network_var` | `type`, `define`, `define_element` | Entity `NetworkVar` and `NetworkVarElement` accessor generation |
 | `gmod.class_base` | `reference` | `DEFINE_BASECLASS` inheritance metadata |
 | `gmod.gamemode` | `reference` | `DeriveGamemode` inheritance metadata |
+| `gmod.member_guard` | `function` | Member-name guard wrappers |
 | `gmod.color` | `r`, `g`, `b`, `a` | Color previews for custom color constructors |
 
 Unknown domains and roles are stored as metadata but ignored until GLuaLS adds a consumer for them. This is intentional to prevent errors for outdated clients.
+
+Guard metadata such as `valid_guard`, `self_guard`, and `self_call_valid` belongs on functions and callbacks, not parameters. Use [Guard metadata](/annotations/guard-metadata) for functions and callbacks that prove values are valid.
 
 ---
 
@@ -250,3 +253,4 @@ Higher priority wins. You normally do not need this unless you are annotating a 
 - [Network analysis](/language/network-analysis): net message tracking
 - [Hook intelligence](/language/hook-intelligence): hook completion and callback inference
 - [VGUI support](/language/vgui-support): panels and Derma skins
+- [Guard metadata](/annotations/guard-metadata): validity guards for nil and NULL checks
