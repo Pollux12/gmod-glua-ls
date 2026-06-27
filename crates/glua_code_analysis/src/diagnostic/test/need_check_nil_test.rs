@@ -48,6 +48,8 @@ mod test {
             ---@meta
             ---@class ConVar
             ---@field GetInt fun(self: ConVar): number
+            ---@field GetBool fun(self: ConVar): boolean
+            ---@field SetBool fun(self: ConVar, value: boolean)
 
             ---@[call_arg("gmod.convar", "exists")]
             ---@param name string
@@ -447,6 +449,149 @@ mod test {
             GetConVar("cl_drawhud"):GetInt()
             "#,
         );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_load_ordered_convar_registration_suppresses_cached_getconvar_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+        ws.def_file(
+            "lua/includes/util.lua",
+            r#"
+            local ConVarCache = {}
+
+            function GetConVar(name)
+                local c = ConVarCache[name]
+                if not c then
+                    c = GetConVar_Internal(name)
+                    if not c then
+                        return
+                    end
+
+                    ConVarCache[name] = c
+                end
+
+                return c
+            end
+            "#,
+        );
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_init.lua",
+            r#"include("cl_spawnmenu.lua")"#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/cl_spawnmenu.lua",
+            r#"include("spawnmenu/spawnmenu.lua")"#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/spawnmenu.lua",
+            r#"
+            CreateConVar("spawnmenu_toggle", "1")
+            include("contextmenu.lua")
+            "#,
+        );
+        let contextmenu_file = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/contextmenu.lua",
+            r#"
+            local spawnmenu_toggle = GetConVar("spawnmenu_toggle")
+
+            GM = {}
+
+            function GM:OnContextMenuOpen()
+                if spawnmenu_toggle:GetBool() then return end
+            end
+
+            function GM:OnContextMenuClose()
+                if spawnmenu_toggle:GetBool() then
+                    spawnmenu_toggle:SetBool(false)
+                end
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(contextmenu_file, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_unregistered_cached_getconvar_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        def_convar_role_fixture(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local missing_toggle = GetConVar("missing_toggle")
+            missing_toggle:GetBool()
+            "#,
+        );
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_load_ordered_convar_does_not_suppress_shadowed_getconvar() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/spawnmenu.lua",
+            r#"
+            CreateConVar("spawnmenu_toggle", "1")
+            include("contextmenu.lua")
+            "#,
+        );
+        let contextmenu_file = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/contextmenu.lua",
+            r#"
+            ---@return ConVar?
+            local function GetConVar(name) end
+
+            local spawnmenu_toggle = GetConVar("spawnmenu_toggle")
+            spawnmenu_toggle:GetBool()
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(contextmenu_file, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
         assert_that!(diagnostics.len(), eq(1_usize));
     }
 

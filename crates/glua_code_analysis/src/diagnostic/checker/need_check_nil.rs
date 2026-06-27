@@ -5,13 +5,14 @@ use glua_parser::{
     LuaSyntaxNode, LuaVarExpr, LuaWhileStat, UnaryOperator,
 };
 use rowan::TextRange;
+use rustc_hash::FxHashSet;
 
 use crate::{
-    DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
-    GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel,
-    SemanticModel, find_best_call_arg_role_from_type, find_signature_attribute_use,
-    get_var_expr_var_ref_id,
+    DiagnosticCode, FileId, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_DOMAIN_CONVAR,
+    GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GmodLoadEdgeKind, InferFailReason, LuaDeclId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
+    LuaUnionType, SemanticDeclLevel, SemanticModel, find_best_call_arg_role_from_type,
+    find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
@@ -93,9 +94,18 @@ fn check_call_expr(
         false
     };
 
+    let is_receiver_known_non_nullable = if let LuaExpr::IndexExpr(index_expr) = &prefix
+        && let Some(receiver) = index_expr.get_prefix_expr()
+    {
+        is_receiver_guarded_by_type_guard
+            || is_load_ordered_convar_reference_local(semantic_model, &receiver)
+    } else {
+        is_receiver_guarded_by_type_guard
+    };
+
     if let LuaExpr::IndexExpr(index_expr) = &prefix {
         let receiver = index_expr.get_prefix_expr()?;
-        if !is_receiver_guarded_by_type_guard
+        if !is_receiver_known_non_nullable
             && expr_has_invalidated_prior_nil_early_return(semantic_model, &receiver)
         {
             context.add_diagnostic(
@@ -106,7 +116,7 @@ fn check_call_expr(
             );
             return Some(());
         }
-        if !is_receiver_guarded_by_type_guard
+        if !is_receiver_known_non_nullable
             && report_unsafe_receiver(context, semantic_model, &receiver)
         {
             return Some(());
@@ -1334,6 +1344,124 @@ fn is_expr_guarded_by_prior_nil_early_return(
     is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
         condition_is_negative_expr_guard(condition, guarded)
     })
+}
+
+fn is_load_ordered_convar_reference_local(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some((call_expr, ret_idx)) = local_call_initializer_slot(semantic_model, expr) else {
+        return false;
+    };
+    if ret_idx != 0 {
+        return false;
+    }
+
+    let Some(convar_name) = static_convar_reference_key(semantic_model, &call_expr) else {
+        return false;
+    };
+
+    load_ancestor_registers_convar(semantic_model, convar_name.as_str())
+}
+
+fn static_convar_reference_key(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> Option<String> {
+    if let Some((domain, key)) =
+        static_string_call_arg_role(semantic_model, call_expr, &[GMOD_ROLE_REFERENCE])
+    {
+        return (domain == GMOD_DOMAIN_CONVAR).then_some(key);
+    }
+
+    if !base_runtime_getconvar_reference_call(semantic_model, call_expr) {
+        return None;
+    }
+    crate::ast_util::literal_string_arg_value(call_expr, 0)
+}
+
+fn base_runtime_getconvar_reference_call(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if normalized_expr_text(&prefix_expr).as_deref() != Some("GetConVar") {
+        return false;
+    }
+    let Some(signature_id) = call_signature_id(semantic_model, call_expr) else {
+        return false;
+    };
+    if !semantic_model.get_emmyrc().gmod.enabled {
+        return false;
+    }
+    semantic_model
+        .get_db()
+        .get_vfs()
+        .get_file_path(&signature_id.get_file_id())
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+fn load_ancestor_registers_convar(semantic_model: &SemanticModel, convar_name: &str) -> bool {
+    let convar_name = convar_name.trim();
+    if convar_name.is_empty() {
+        return false;
+    }
+
+    let db = semantic_model.get_db();
+    let mut pending = vec![semantic_model.get_file_id()];
+    let mut visited = FxHashSet::default();
+    while let Some(file_id) = pending.pop() {
+        if !visited.insert(file_id) {
+            continue;
+        }
+
+        // Registration order inside an ancestor is intentionally not rechecked here: a resolved
+        // executing load edge proves the current file is reached from that loader, and the common
+        // base-game pattern registers systems before including dependent files.
+        if file_registers_convar(db.get_gmod_infer_index(), file_id, convar_name) {
+            return true;
+        }
+
+        let Some(load_info) = db.get_gmod_load_index().get_file_info(&file_id) else {
+            continue;
+        };
+        for edge in &load_info.incoming_edges {
+            if load_edge_executes_target(edge.kind) {
+                pending.push(edge.source_file_id);
+            }
+        }
+    }
+
+    false
+}
+
+fn file_registers_convar(
+    infer_index: &crate::GmodInferIndex,
+    file_id: FileId,
+    convar_name: &str,
+) -> bool {
+    infer_index
+        .get_system_file_metadata(&file_id)
+        .is_some_and(|metadata| {
+            metadata.convar_create_calls.iter().any(|site| {
+                site.convar_name
+                    .as_deref()
+                    .map(str::trim)
+                    .is_some_and(|registered| !registered.is_empty() && registered == convar_name)
+            })
+        })
+}
+
+fn load_edge_executes_target(kind: GmodLoadEdgeKind) -> bool {
+    matches!(
+        kind,
+        GmodLoadEdgeKind::Include
+            | GmodLoadEdgeKind::IncludeCS
+            | GmodLoadEdgeKind::Require
+            | GmodLoadEdgeKind::WrapperInclude
+            | GmodLoadEdgeKind::DynamicInclude
+    )
 }
 
 fn is_expr_guarded_by_correlated_multi_return(
