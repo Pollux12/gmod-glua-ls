@@ -17,8 +17,7 @@ use crate::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
     },
-    semantic_decl_signature_has_valid_guard_metadata, semantic_decl_signature_is_valid_guard,
-    signature_is_valid_guard_or_base_runtime_isvalid,
+    signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
 use super::{
@@ -2771,26 +2770,14 @@ fn call_signature_is_valid_guard(
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let Some(prefix) = call_expr.get_prefix_expr() else {
-        return signature_is_valid_guard_or_base_runtime_isvalid(
-            semantic_model.get_db(),
-            signature_id,
-        );
-    };
-    let Some(semantic_decl) =
-        semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())
-    else {
-        return signature_is_valid_guard_or_base_runtime_isvalid(
-            semantic_model.get_db(),
-            signature_id,
-        );
-    };
-
-    semantic_decl_signature_is_valid_guard(
+    let call_realm = semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&semantic_model.get_file_id(), call_expr.get_position());
+    signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
         semantic_model.get_db(),
-        semantic_model.get_file_id(),
         signature_id,
-        &semantic_decl,
+        call_realm,
     )
 }
 
@@ -2799,21 +2786,11 @@ fn call_signature_has_valid_guard_metadata(
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let Some(prefix) = call_expr.get_prefix_expr() else {
-        return crate::signature_is_valid_guard(semantic_model.get_db(), signature_id);
-    };
-    let Some(semantic_decl) =
-        semantic_model.find_decl(prefix.syntax().clone().into(), SemanticDeclLevel::default())
-    else {
-        return crate::signature_is_valid_guard(semantic_model.get_db(), signature_id);
-    };
-
-    semantic_decl_signature_has_valid_guard_metadata(
-        semantic_model.get_db(),
-        semantic_model.get_file_id(),
-        signature_id,
-        &semantic_decl,
-    )
+    let call_realm = semantic_model
+        .get_db()
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&semantic_model.get_file_id(), call_expr.get_position());
+    signature_is_valid_guard_in_realm(semantic_model.get_db(), signature_id, call_realm)
 }
 
 fn is_self_guard_call_guarding_expr(

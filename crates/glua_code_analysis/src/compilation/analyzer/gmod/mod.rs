@@ -23,6 +23,7 @@ use crate::{
     LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
     LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
+    db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
         GmodConcommandSiteMetadata, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
@@ -386,6 +387,8 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         if let Some(t2) = t2 {
             log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
         }
+
+        rebuild_effective_valid_guard_signatures(db);
     }
 }
 

@@ -20,8 +20,8 @@
 //! semantic inference or whole-workspace scans.
 
 use crate::{
-    DbIndex, FileId, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
-    db_index::declaration::LuaDeclExtra,
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberKey, LuaSemanticDeclId,
+    LuaSignatureId, db_index::declaration::LuaDeclExtra,
 };
 
 use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_type};
@@ -288,23 +288,94 @@ pub fn find_signature_attribute_use<'a>(
         .find_attribute_use(attribute_name)
 }
 
-/// Returns whether the signature is marked as a validity guard.
-pub fn signature_is_valid_guard(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+pub fn signature_is_valid_guard_in_realm(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    call_realm: GmodRealm,
+) -> bool {
+    if signature_has_valid_guard_attribute(db, signature_id) {
+        return true;
+    }
+
+    db.get_signature_index()
+        .effective_valid_guard_signature_mask(&signature_id)
+        .is_some_and(|guard_mask| guard_mask.is_compatible_with(call_realm.state_mask()))
+}
+
+fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
 }
 
-/// Returns whether a signature should behave as a GMod validity guard.
+/// Rebuilds the effective valid-guard signature set consumed by hot flow paths.
 ///
-/// Prefer explicit annotation metadata when present. As a compatibility bridge
-/// for shipped base Lua loaded alongside annotations, also treat the runtime
-/// `lua/includes/util.lua` `IsValid` redeclaration as the same base guard: it is
-/// the source implementation of the annotated `_G.IsValid`, and otherwise
-/// shadows the metadata-bearing library signature in combined workspaces.
-pub fn signature_is_valid_guard_or_base_runtime_isvalid(
+/// Source functions can shadow metadata-bearing annotation declarations of the
+/// same global/member identity. Resolve that identity once after declarations
+/// and docs are indexed, before flow/lua analysis, so call narrowing remains an
+/// O(1) signature lookup instead of re-inferring semantic declarations per call.
+pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
+    db.get_signature_index_mut()
+        .clear_effective_valid_guard_signatures();
+
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+
+    let mut effective_signatures = Vec::new();
+
+    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+        let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+            continue;
+        };
+        if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
+            continue;
+        }
+        let semantic_decl = LuaSemanticDeclId::from(decl_id);
+        let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+            continue;
+        };
+        let state_mask = union_valid_guard_masks(
+            global_identity_direct_valid_guard_mask(db, decl_id.file_id, decl.get_name()),
+            global_member_identity_direct_valid_guard_mask(db, decl.get_name()),
+        );
+        if let Some(state_mask) = state_mask
+            && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+        {
+            effective_signatures.push((signature_id, state_mask));
+        }
+    }
+
+    for file_id in db.get_vfs().get_all_file_ids() {
+        let member_ids = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        for member_id in member_ids {
+            let semantic_decl = LuaSemanticDeclId::from(member_id);
+            let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+                continue;
+            };
+            if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
+                && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+            {
+                effective_signatures.push((signature_id, state_mask));
+            }
+        }
+    }
+
+    let signature_index = db.get_signature_index_mut();
+    for (signature_id, state_mask) in effective_signatures {
+        signature_index.mark_effective_valid_guard_signature(signature_id, state_mask);
+    }
+}
+
+pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
     db: &DbIndex,
     signature_id: LuaSignatureId,
+    call_realm: GmodRealm,
 ) -> bool {
-    if signature_is_valid_guard(db, signature_id) {
+    if signature_is_valid_guard_in_realm(db, signature_id, call_realm) {
         return true;
     }
 
@@ -319,77 +390,11 @@ pub fn signature_is_valid_guard_or_base_runtime_isvalid(
         .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
 }
 
-/// Returns whether a resolved call should behave as a GMod validity guard.
-///
-/// Direct signature metadata wins first. For shipped source that shadows a
-/// metadata-bearing annotation declaration, also consult declarations of the
-/// same global/member identity through indexed global/member maps. This keeps
-/// guard contracts annotation-driven without per-function path hardcodes.
-pub fn semantic_decl_signature_is_valid_guard(
+fn global_identity_direct_valid_guard_mask(
     db: &DbIndex,
     current_file_id: FileId,
-    signature_id: LuaSignatureId,
-    semantic_decl: &LuaSemanticDeclId,
-) -> bool {
-    if signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id) {
-        return true;
-    }
-
-    semantic_decl_signature_has_valid_guard_metadata(
-        db,
-        current_file_id,
-        signature_id,
-        semantic_decl,
-    )
-}
-
-/// Returns whether the resolved signature or another declaration of the same
-/// identity has explicit `valid_guard` metadata, without applying compatibility
-/// bridges such as the shipped `util.lua` `IsValid` source fallback.
-pub fn semantic_decl_signature_has_valid_guard_metadata(
-    db: &DbIndex,
-    current_file_id: FileId,
-    signature_id: LuaSignatureId,
-    semantic_decl: &LuaSemanticDeclId,
-) -> bool {
-    if signature_is_valid_guard(db, signature_id) {
-        return true;
-    }
-
-    if !db.get_emmyrc().gmod.enabled {
-        return false;
-    }
-
-    match semantic_decl {
-        LuaSemanticDeclId::LuaDecl(decl_id) => {
-            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
-                return false;
-            };
-            if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
-                return false;
-            }
-
-            global_identity_has_valid_guard(db, current_file_id, decl.get_name())
-                || global_member_identity_has_valid_guard(db, decl.get_name())
-        }
-        LuaSemanticDeclId::Member(member_id) => {
-            let member_index = db.get_member_index();
-            let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
-                return false;
-            };
-            let Some(member) = member_index.get_member(member_id) else {
-                return false;
-            };
-            member_index
-                .get_current_owner_members_for_key(&owner, member.get_key())
-                .into_iter()
-                .any(|member| semantic_decl_signature_has_valid_guard(db, member.get_id().into()))
-        }
-        LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => false,
-    }
-}
-
-fn global_identity_has_valid_guard(db: &DbIndex, current_file_id: FileId, name: &str) -> bool {
+    name: &str,
+) -> Option<GmodStateMask> {
     let global_index = db.get_global_index();
     let module_index = db.get_module_index();
     let decl_ids = module_index
@@ -399,16 +404,26 @@ fn global_identity_has_valid_guard(db: &DbIndex, current_file_id: FileId, name: 
         })
         .or_else(|| global_index.get_global_decl_ids(name).cloned());
 
-    decl_ids.is_some_and(|decl_ids| {
-        decl_ids
-            .into_iter()
-            .any(|decl_id| semantic_decl_signature_has_valid_guard(db, decl_id.into()))
-    })
+    let mut state_mask = None;
+    if let Some(decl_ids) = decl_ids {
+        for decl_id in decl_ids {
+            state_mask = union_valid_guard_masks(
+                state_mask,
+                semantic_decl_direct_valid_guard_mask(db, &decl_id.into()),
+            );
+        }
+    }
+    state_mask
 }
 
-fn global_member_identity_has_valid_guard(db: &DbIndex, name: &str) -> bool {
+fn global_member_identity_direct_valid_guard_mask(
+    db: &DbIndex,
+    name: &str,
+) -> Option<GmodStateMask> {
     let key = LuaMemberKey::Name(name.into());
-    db.get_member_index()
+    let mut state_mask = None;
+    for member in db
+        .get_member_index()
         .get_current_members_for_key(&key)
         .into_iter()
         .filter(|member| {
@@ -416,33 +431,89 @@ fn global_member_identity_has_valid_guard(db: &DbIndex, name: &str) -> bool {
                 .get_global_id()
                 .is_some_and(|global_id| global_id.get_name().rsplit('.').next() == Some(name))
         })
-        .any(|member| semantic_decl_signature_has_valid_guard(db, member.get_id().into()))
+    {
+        state_mask = union_valid_guard_masks(
+            state_mask,
+            semantic_decl_direct_valid_guard_mask(db, &member.get_id().into()),
+        );
+    }
+    state_mask
 }
 
-fn semantic_decl_signature_has_valid_guard(db: &DbIndex, semantic_decl: LuaSemanticDeclId) -> bool {
+fn member_identity_direct_valid_guard_mask(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+) -> Option<GmodStateMask> {
+    let member_index = db.get_member_index();
+    let owner = member_index.get_member_owner(&member_id).cloned()?;
+    let member = member_index.get_member(&member_id)?;
+    let mut state_mask = None;
+    for member in member_index
+        .get_current_owner_members_for_key(&owner, member.get_key())
+        .into_iter()
+    {
+        state_mask = union_valid_guard_masks(
+            state_mask,
+            semantic_decl_direct_valid_guard_mask(db, &member.get_id().into()),
+        );
+    }
+    state_mask
+}
+
+fn semantic_decl_direct_valid_guard_mask(
+    db: &DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+) -> Option<GmodStateMask> {
+    let signature_id = signature_id_for_semantic_decl(db, semantic_decl)?;
+    if !signature_has_valid_guard_attribute(db, signature_id) {
+        return None;
+    }
+    Some(signature_realm_mask(db, signature_id))
+}
+
+fn signature_realm_mask(db: &DbIndex, signature_id: LuaSignatureId) -> GmodStateMask {
+    let realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&signature_id.get_file_id(), signature_id.get_position());
+    realm.state_mask()
+}
+
+fn union_valid_guard_masks(
+    left: Option<GmodStateMask>,
+    right: Option<GmodStateMask>,
+) -> Option<GmodStateMask> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.union(right)),
+        (Some(mask), None) | (None, Some(mask)) => Some(mask),
+        (None, None) => None,
+    }
+}
+
+fn signature_id_for_semantic_decl(
+    db: &DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
     if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
-        return signature_is_valid_guard(db, signature_id);
+        return Some(signature_id);
     }
 
-    match semantic_decl {
+    match *semantic_decl {
         LuaSemanticDeclId::LuaDecl(decl_id) => db
             .get_type_index()
             .get_type_cache(&decl_id.into())
             .and_then(|type_cache| match type_cache.as_type() {
                 crate::LuaType::Signature(signature_id) => Some(*signature_id),
                 _ => None,
-            })
-            .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id)),
+            }),
         LuaSemanticDeclId::Member(member_id) => db
             .get_type_index()
             .get_type_cache(&member_id.into())
             .and_then(|type_cache| match type_cache.as_type() {
                 crate::LuaType::Signature(signature_id) => Some(*signature_id),
                 _ => None,
-            })
-            .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id)),
-        LuaSemanticDeclId::Signature(signature_id) => signature_is_valid_guard(db, signature_id),
-        LuaSemanticDeclId::TypeDecl(_) => false,
+            }),
+        LuaSemanticDeclId::Signature(signature_id) => Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => None,
     }
 }
 

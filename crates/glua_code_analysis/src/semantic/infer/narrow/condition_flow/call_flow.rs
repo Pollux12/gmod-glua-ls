@@ -21,7 +21,7 @@ use crate::{
         },
         infer_expr_semantic_decl,
     },
-    semantic_decl_signature_is_valid_guard, signature_is_valid_guard_or_base_runtime_isvalid,
+    signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -658,20 +658,10 @@ fn call_prefix_signature_is_valid_guard(
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
 ) -> bool {
-    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-        return signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
-    };
-    let Some(semantic_decl) = infer_expr_semantic_decl(
-        db,
-        cache,
-        prefix_expr,
-        SemanticDeclGuard::default(),
-        SemanticDeclLevel::default(),
-    ) else {
-        return signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
-    };
-
-    semantic_decl_signature_is_valid_guard(db, cache.get_file_id(), signature_id, &semantic_decl)
+    let call_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&cache.get_file_id(), call_expr.get_position());
+    signature_is_valid_guard_or_base_runtime_isvalid_in_realm(db, signature_id, call_realm)
 }
 
 fn get_callable_expr_signature_id(

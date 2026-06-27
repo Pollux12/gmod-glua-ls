@@ -15,9 +15,9 @@ pub use gmod_domains::{
     GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
     collect_call_arg_roles_for_param, find_best_call_arg_role_for_param,
     find_best_call_arg_role_from_type, find_signature_attribute_use,
-    semantic_decl_signature_has_valid_guard_metadata, semantic_decl_signature_is_valid_guard,
-    signature_attribute_uses, signature_is_valid_guard,
-    signature_is_valid_guard_or_base_runtime_isvalid, signature_owner_for,
+    rebuild_effective_valid_guard_signatures, signature_attribute_uses,
+    signature_is_valid_guard_in_realm, signature_is_valid_guard_or_base_runtime_isvalid_in_realm,
+    signature_owner_for,
 };
 pub use signature::{
     CALL_ARG_ATTRIBUTE, CALL_ARG_FIELD_ATTRIBUTE, LuaCallArgRole, LuaDocDefaultValue,
@@ -27,7 +27,7 @@ pub use signature::{
     SignatureReturnStatus, find_call_arg_role_from_type, visit_call_arg_roles_from_type,
 };
 
-use crate::{FileId, db_index::LuaDeclId};
+use crate::{FileId, GmodStateMask, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
@@ -36,6 +36,7 @@ pub struct LuaSignatureIndex {
     signatures: HashMap<LuaSignatureId, LuaSignature>,
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
+    effective_valid_guard_signatures: HashMap<LuaSignatureId, GmodStateMask>,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
 }
@@ -52,6 +53,7 @@ impl LuaSignatureIndex {
             signatures: HashMap::new(),
             in_file_signatures: HashMap::new(),
             local_func_decls: HashMap::new(),
+            effective_valid_guard_signatures: HashMap::new(),
             receiver_out_param_member_names: HashMap::new(),
             in_file_receiver_out_param_member_names: HashMap::new(),
         }
@@ -83,6 +85,35 @@ impl LuaSignatureIndex {
 
     pub fn bind_local_func_decl(&mut self, signature_id: LuaSignatureId, decl_id: LuaDeclId) {
         self.local_func_decls.insert(signature_id, decl_id);
+    }
+
+    pub fn clear_effective_valid_guard_signatures(&mut self) {
+        self.effective_valid_guard_signatures.clear();
+    }
+
+    pub fn mark_effective_valid_guard_signature(
+        &mut self,
+        signature_id: LuaSignatureId,
+        state_mask: GmodStateMask,
+    ) {
+        self.effective_valid_guard_signatures
+            .entry(signature_id)
+            .and_modify(|existing| existing.insert(state_mask))
+            .or_insert(state_mask);
+    }
+
+    pub fn is_effective_valid_guard_signature(&self, signature_id: &LuaSignatureId) -> bool {
+        self.effective_valid_guard_signatures
+            .contains_key(signature_id)
+    }
+
+    pub fn effective_valid_guard_signature_mask(
+        &self,
+        signature_id: &LuaSignatureId,
+    ) -> Option<GmodStateMask> {
+        self.effective_valid_guard_signatures
+            .get(signature_id)
+            .copied()
     }
 
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
@@ -121,6 +152,8 @@ impl LuaIndex for LuaSignatureIndex {
                 self.local_func_decls.remove(&signature_id);
             }
         }
+        self.effective_valid_guard_signatures
+            .retain(|signature_id, _| signature_id.get_file_id() != file_id);
 
         if let Some(member_names) = self
             .in_file_receiver_out_param_member_names
@@ -147,6 +180,7 @@ impl LuaIndex for LuaSignatureIndex {
         self.signatures.clear();
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
+        self.effective_valid_guard_signatures.clear();
         self.receiver_out_param_member_names.clear();
         self.in_file_receiver_out_param_member_names.clear();
     }

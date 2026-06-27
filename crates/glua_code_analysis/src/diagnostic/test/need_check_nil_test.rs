@@ -7410,6 +7410,51 @@ mod test {
     }
 
     #[gtest]
+    fn test_server_only_shadowed_valid_guard_does_not_suppress_client_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/autorun/server/sv_canconstrain.lua",
+            r#"
+            ---@meta
+            ---@realm server
+            ---@attribute valid_guard()
+
+            ---@class Entity
+            ---@field GetPhysicsObjectNum fun(self: Entity, bone: integer): any
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@param bone integer
+            ---@return TypeGuard<any>
+            ---@[valid_guard]
+            function _G.CanConstrain(value, bone) end
+            "#,
+        );
+
+        assert_that!(
+            ws.check_file_for(
+                DiagnosticCode::NeedCheckNil,
+                "lua/autorun/client/cl_use.lua",
+                r#"
+                function CanConstrain(value, bone)
+                    return value ~= nil
+                end
+
+                ---@type Entity?
+                local Ent1
+                local Bone1 = 0
+                if not CanConstrain(Ent1, Bone1) then return false end
+                Ent1:GetPhysicsObjectNum(Bone1)
+                "#,
+            ),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_constraint_repro_valid_guard_ent_x_pos() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
