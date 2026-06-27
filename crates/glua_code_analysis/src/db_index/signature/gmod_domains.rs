@@ -290,6 +290,32 @@ pub fn signature_is_valid_guard(db: &DbIndex, signature_id: LuaSignatureId) -> b
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
 }
 
+/// Returns whether a signature should behave as a GMod validity guard.
+///
+/// Prefer explicit annotation metadata when present. As a compatibility bridge
+/// for shipped base Lua loaded alongside annotations, also treat the runtime
+/// `lua/includes/util.lua` `IsValid` redeclaration as the same base guard: it is
+/// the source implementation of the annotated `_G.IsValid`, and otherwise
+/// shadows the metadata-bearing library signature in combined workspaces.
+pub fn signature_is_valid_guard_or_base_runtime_isvalid(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> bool {
+    if signature_is_valid_guard(db, signature_id) {
+        return true;
+    }
+
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    db.get_vfs()
+        .get_file_path(&signature_id.get_file_id())
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
 /// Returns the signature id that owns the standalone attributes attached to
 /// the given semantic-decl owner, when the owner resolves back to a signature
 /// via the property index's signature-owner map.

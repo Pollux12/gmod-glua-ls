@@ -21,7 +21,7 @@ use crate::{
         },
         infer_expr_semantic_decl,
     },
-    signature_is_valid_guard,
+    signature_is_valid_guard_or_base_runtime_isvalid,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -50,8 +50,9 @@ pub fn get_type_at_call_expr(
         Ok(maybe_func) => match maybe_func {
             LuaType::DocFunction(f) => {
                 let prefix_signature_id = get_call_prefix_signature_id(db, cache, &call_expr);
-                let is_valid_guard = prefix_signature_id
-                    .is_some_and(|signature_id| signature_is_valid_guard(db, signature_id));
+                let is_valid_guard = prefix_signature_id.is_some_and(|signature_id| {
+                    signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id)
+                });
                 let signature_cast = prefix_signature_id.and_then(|signature_id| {
                     db.get_flow_index()
                         .get_signature_cast(&signature_id)
@@ -85,7 +86,8 @@ pub fn get_type_at_call_expr(
 
                 let ret = signature.get_return_type();
                 let signature_cast = db.get_flow_index().get_signature_cast(&signature_id);
-                let is_valid_guard = signature_is_valid_guard(db, signature_id);
+                let is_valid_guard =
+                    signature_is_valid_guard_or_base_runtime_isvalid(db, signature_id);
                 let mut type_guard_did_not_apply = false;
                 match ret {
                     LuaType::TypeGuard(_) => {

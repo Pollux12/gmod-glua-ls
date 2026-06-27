@@ -6728,4 +6728,144 @@ mod test {
              parenthesized access `(self.Objects[i]).Ent`. Diagnostics: {diagnostics:#?}"
         );
     }
+
+    #[gtest]
+    fn test_isvalid_prior_guard_not_invalidated_by_guarded_root_field_assignment() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetTable fun(self: Entity): table
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@[valid_guard]
+            function _G.IsValid(value) end
+
+            ---@return Entity|NULL
+            function makeEntity() end
+
+            local ent = makeEntity()
+            if ( !IsValid( ent ) ) then return end
+
+            ent.StoredValue = 1
+            ent:GetTable()
+            "#,
+        );
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Assigning a field on a guarded root local must not invalidate the root validity guard. Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[gtest]
+    fn test_stool_helper_pattern_valid_guard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@class Entity
+            ---@field SetAngles fun(self: Entity, angles: any)
+            ---@field GetTable fun(self: Entity): table
+
+            ---@class base_gmodentity : Entity
+
+            ---@class gmod_hoverball : base_gmodentity
+
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            ---@[valid_guard]
+            function _G.IsValid(value) end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/includes/util.lua",
+            r#"
+            function IsValid(object)
+                if ( !object ) then return false end
+
+                local isvalid = object.IsValid
+                if ( !isvalid ) then return false end
+
+                return isvalid( object )
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stools/hoverball.lua",
+            r#"
+            ---@class ents
+            ents = {}
+
+            ---@generic T : Entity
+            ---@param class `T`
+            ---@return (instance) T|NULL
+            function ents.Create(class) end
+
+            ---@class Tool
+            TOOL = {}
+
+            ---@class Player : Entity
+
+            duplicator = {}
+            ---@param name string
+            ---@param _function fun(ply: Player, ...: any):(ent: Entity)
+            ---@param ... any
+            function duplicator.RegisterEntityClass(name, _function, ...) end
+
+            function TOOL:LeftClick()
+                if ( CLIENT ) then return true end
+
+                local ball = MakeHoverBall(nil, nil, nil, nil, nil, nil, nil, nil, nil, nil)
+                if ( !IsValid( ball ) ) then return false end
+
+                ball:SetAngles(nil)
+                return true
+            end
+
+            if SERVER then
+                function MakeHoverBall(ply, pos, key_d, key_u, speed, resistance, strength, model, nocollide, key_o, Data)
+                    local ball = ents.Create("gmod_hoverball")
+                    if ( !IsValid( ball ) ) then return NULL end
+
+                    ball:SetAngles(nil)
+                    ball.NumDown = 1
+                    ball:GetTable()
+                    return ball
+                end
+                duplicator.RegisterEntityClass("gmod_hoverball", MakeHoverBall, "Pos", "key_d", "key_u", "speed", "resistance", "strength", "model", "nocollide", "key_o", "Data")
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "Expected no NeedCheckNil warnings with valid STOOL helper pattern. Diagnostics: {diagnostics:#?}"
+        );
+    }
 }

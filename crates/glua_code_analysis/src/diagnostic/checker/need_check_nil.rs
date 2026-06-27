@@ -15,7 +15,7 @@ use crate::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
     },
-    signature_is_valid_guard,
+    signature_is_valid_guard_or_base_runtime_isvalid,
 };
 
 use super::{
@@ -1721,6 +1721,10 @@ fn assigned_expr_invalidates_guarded_expr(
     assigned_expr: &LuaExpr,
     guarded_expr: &LuaExpr,
 ) -> bool {
+    if assigned_index_root_references_guarded_name(semantic_model, assigned_expr, guarded_expr) {
+        return false;
+    }
+
     if exprs_reference_same_var(semantic_model, assigned_expr, guarded_expr) {
         return true;
     }
@@ -1753,6 +1757,32 @@ fn assigned_expr_invalidates_guarded_expr(
     }
 
     false
+}
+
+fn assigned_index_root_references_guarded_name(
+    semantic_model: &SemanticModel,
+    assigned_expr: &LuaExpr,
+    guarded_expr: &LuaExpr,
+) -> bool {
+    if !matches!(guarded_expr, LuaExpr::NameExpr(_)) {
+        return false;
+    }
+
+    let LuaExpr::IndexExpr(index_expr) = assigned_expr else {
+        return false;
+    };
+    let Some(mut root) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    while let LuaExpr::IndexExpr(prefix_index) = root {
+        let Some(prefix) = prefix_index.get_prefix_expr() else {
+            return false;
+        };
+        root = prefix;
+    }
+
+    exprs_reference_same_var(semantic_model, &root, guarded_expr)
 }
 
 /// Check if the assigned expression is referenced inside the index key.
@@ -2372,7 +2402,7 @@ fn is_isvalid_call_guarding_stable_expr(
         return false;
     };
     if !is_isvalid_call(guard_call)
-        || !signature_is_valid_guard(semantic_model.get_db(), signature_id)
+        || !signature_is_valid_guard_or_base_runtime_isvalid(semantic_model.get_db(), signature_id)
             && !call_returns_non_nullable_type_guard(semantic_model, guard_call)
         || !is_stable_guard_expr(guarded_expr)
     {
