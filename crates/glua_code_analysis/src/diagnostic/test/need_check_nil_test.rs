@@ -7119,4 +7119,75 @@ mod test {
             "Guarding a different decode() call must not prove a later re-call's sibling return non-nil"
         );
     }
+
+    #[gtest]
+    fn test_utf8_str_rel_to_abs_vararg_unpack() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function strRelToAbs(str, ...)
+                local args = { ... }
+                return unpack(args)
+            end
+            local function decode(str, startPos)
+                startPos = strRelToAbs(str, startPos or 1)
+                local endPos = startPos + 1
+                return startPos, endPos
+            end
+            local seqStartPos, seqEndPos = decode('abc')
+            if not seqStartPos then return end
+            local nextPos = seqEndPos + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            is_empty(),
+            "unpack(args) passthrough should preserve non-nil tuple elements and not produce NeedCheckNil"
+        );
+    }
+
+    #[gtest]
+    fn test_utf8_vararg_unpack_soundness_negative() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function passthrough(...)
+                local args = { ... }
+                return unpack(args)
+            end
+
+            ---@type integer?
+            local maybe_int = nil
+            local n1 = passthrough(maybe_int)
+            local x = n1 + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "unpack(args) should not clear nil/nullable type when a genuinely nullable value is passed in"
+        );
+    }
+
+    #[gtest]
+    fn test_unpack_explicit_nil_element_soundness_negative() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local _, maybe_int = unpack({ 1, nil, 3 })
+            local next_int = maybe_int + 1
+            "#,
+        );
+        assert_that!(
+            diagnostics,
+            not(is_empty()),
+            "unpack precision must preserve explicit nil elements"
+        );
+    }
 }

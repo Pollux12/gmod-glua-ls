@@ -160,4 +160,20 @@ mod test {
         "#,
         ));
     }
+
+    #[test]
+    fn test_unpack_passthrough_vararg() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            local function passthrough(...)
+                local args = { ... }
+                return unpack(args)
+            end
+            n1, n2 = passthrough(1, 2)
+            "#,
+        );
+        assert!(!ws.expr_ty("n1").is_optional());
+        assert!(!ws.expr_ty("n2").is_optional());
+    }
 }

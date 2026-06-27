@@ -83,8 +83,12 @@ fn infer_table_array_summary(
             match &first_expr_type {
                 LuaType::Variadic(multi) => match &multi.deref() {
                     VariadicType::Base(base) => {
-                        return Ok(LuaType::Array(
-                            LuaArrayType::from_base_type(base.clone()).into(),
+                        return Ok(LuaType::Tuple(
+                            LuaTupleType::new(
+                                vec![LuaType::Variadic(VariadicType::Base(base.clone()).into())],
+                                LuaTupleStatus::InferResolve,
+                            )
+                            .into(),
                         ));
                     }
                     VariadicType::Multi(tuple) => {
