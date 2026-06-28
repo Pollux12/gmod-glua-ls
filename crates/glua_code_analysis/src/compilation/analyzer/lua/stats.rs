@@ -478,6 +478,11 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
         return Some(());
     }
 
+    if let Some(member_owner) = cached_literal_index_prefix_member_owner(analyzer, &prefix_expr) {
+        apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
+        return Some(());
+    }
+
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
             if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
@@ -921,6 +926,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
         assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
+        update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
     }
 
     // The complexity brought by multiple return values is too high
@@ -974,6 +980,66 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+fn cached_literal_index_prefix_member_owner(
+    analyzer: &LuaAnalyzer,
+    prefix_expr: &LuaExpr,
+) -> Option<LuaMemberOwner> {
+    let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
+        return None;
+    };
+    if !is_literal_index_cache_candidate(index_expr) {
+        return None;
+    }
+
+    let access_path = index_expr.get_access_path()?;
+    analyzer
+        .literal_index_member_owner_cache
+        .get(&access_path)
+        .cloned()
+}
+
+fn update_literal_index_member_owner_cache(
+    analyzer: &mut LuaAnalyzer,
+    var: &LuaVarExpr,
+    expr_type: &LuaType,
+) -> Option<()> {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return None;
+    };
+    if !is_literal_index_cache_candidate(index_expr) {
+        return None;
+    }
+
+    let access_path = index_expr.get_access_path()?;
+    if let Some(owner) = current_file_table_member_owner(analyzer, expr_type) {
+        analyzer
+            .literal_index_member_owner_cache
+            .insert(access_path, owner);
+    } else {
+        analyzer
+            .literal_index_member_owner_cache
+            .remove(&access_path);
+    }
+    Some(())
+}
+
+fn is_literal_index_cache_candidate(index_expr: &LuaIndexExpr) -> bool {
+    matches!(
+        index_expr.get_index_key(),
+        Some(LuaIndexKey::String(_) | LuaIndexKey::Integer(_))
+    )
+}
+
+fn current_file_table_member_owner(
+    analyzer: &LuaAnalyzer,
+    typ: &LuaType,
+) -> Option<LuaMemberOwner> {
+    let LuaType::TableConst(range) = typ else {
+        return None;
+    };
+    (range.file_id == analyzer.file_id).then(|| LuaMemberOwner::Element(range.clone()))
 }
 
 fn should_skip_nil_table_shape_assignment(

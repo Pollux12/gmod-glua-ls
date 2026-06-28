@@ -190,6 +190,51 @@ local T = {}
         start.elapsed()
     }
 
+    fn index_repeated_literal_index_member_assignments(count: usize) -> std::time::Duration {
+        let mut body = String::from("local T = {}\nT.entries = {}\n");
+        for i in 0..count {
+            body.push_str(&format!(
+                r#"
+T.entries["entry_{i}"] = {{}}
+T.entries["entry_{i}"].name = "Entry {i}"
+T.entries["entry_{i}"].offset = {{ Vector(0, 0, 0), Angle(0, 0, 0) }}
+"#
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    #[test]
+    fn repeated_literal_index_member_assignments_index_quick_smoke() {
+        let elapsed = index_repeated_literal_index_member_assignments(30);
+
+        assert!(
+            elapsed.as_millis() < 250,
+            "literal-index member assignment smoke took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn literal_index_member_owner_cache_invalidates_after_non_table_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+local T = {}
+T["entry"] = {}
+T["entry"] = false
+T["entry"].name = "stale"
+local result = T["entry"].name
+"#,
+        );
+
+        let result_type = ws.expr_ty("result");
+        assert_ne!(ws.humanize_type(result_type), "string");
+    }
+
     #[test]
     #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
     fn dynamic_key_collection_assignments_do_not_scan_owner_members_quadratically() {
