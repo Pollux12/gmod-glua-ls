@@ -824,6 +824,9 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         if should_skip_nil_table_shape_assignment(analyzer, &var, expr) {
             continue;
         }
+        if should_skip_nullable_collection_append_shape_assignment(analyzer, &var, expr) {
+            continue;
+        }
 
         let type_owner = get_var_owner(analyzer, var.clone());
 
@@ -1067,7 +1070,13 @@ fn should_skip_nil_table_shape_assignment(
         return false;
     }
 
-    let Some((owner, _)) = resolve_index_expr_member_owner(&prefix_type) else {
+    if is_typed_collection_cleanup_type(&prefix_type) {
+        return true;
+    }
+
+    let Some((owner, _)) =
+        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+    else {
         return false;
     };
 
@@ -1092,6 +1101,33 @@ fn should_skip_nil_table_shape_assignment(
         .db
         .get_member_index()
         .has_visible_member_for_owner_key_other_than(&owner, &member_key, member_id)
+}
+
+fn should_skip_nullable_collection_append_shape_assignment(
+    analyzer: &mut LuaAnalyzer,
+    var: &LuaVarExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return false;
+    };
+    if !is_collection_append_write(index_expr).unwrap_or(false) {
+        return false;
+    }
+
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(prefix_type) = analyzer.infer_expr(&prefix_expr) else {
+        return false;
+    };
+    if !is_typed_collection_cleanup_type(&prefix_type) {
+        return false;
+    }
+
+    analyzer
+        .infer_expr(expr)
+        .is_ok_and(|expr_type| expr_type.is_nullable())
 }
 
 fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
@@ -1134,6 +1170,37 @@ fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
             !types.is_empty()
                 && types.iter().all(|(typ, _)| {
                     typ.is_nil() || typ.is_never() || is_table_shape_cleanup_type(typ)
+                })
+        }
+        _ => false,
+    }
+}
+
+fn is_typed_collection_cleanup_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TableGeneric(_) | LuaType::Array(_) | LuaType::Tuple(_) | LuaType::TableOf(_) => {
+            true
+        }
+        LuaType::TypeGuard(inner) => is_typed_collection_cleanup_type(inner),
+        LuaType::Union(union) => {
+            union.types().next().is_some()
+                && union.types().all(|typ| {
+                    typ.is_nil() || typ.is_never() || is_typed_collection_cleanup_type(typ)
+                })
+        }
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_typed_collection_cleanup_type),
+        LuaType::MergedTable(merged_table) => merged_table
+            .get_types()
+            .iter()
+            .all(is_typed_collection_cleanup_type),
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types.iter().all(|(typ, _)| {
+                    typ.is_nil() || typ.is_never() || is_typed_collection_cleanup_type(typ)
                 })
         }
         _ => false,
@@ -1435,6 +1502,15 @@ fn get_cached_widened_member_assignment_type(
         return Some(None);
     }
 
+    if let Some(doc_type) = merge_cached_assignment_types(
+        analyzer,
+        compatible_states
+            .iter()
+            .filter_map(|state| state.doc_type.as_ref()),
+    ) {
+        return Some(Some(doc_type));
+    }
+
     if let Some(class_type) = prefer_class_assignment_type(incoming_type) {
         if !is_class_bootstrap_compatible_type(incoming_type, &class_type) {
             return None;
@@ -1505,6 +1581,12 @@ fn record_member_assignment_widening_cache(
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
     let no_table_literal_widen_type = widen_related_assignment_type(assigned_type, false);
     let table_literal_widen_type = widen_related_assignment_type(assigned_type, true);
+    let doc_type = analyzer
+        .db
+        .get_type_index()
+        .get_type_cache(&(*member_id).into())
+        .filter(|cache| cache.is_doc())
+        .map(|cache| cache.as_type().clone());
     let all_table_assignment_merge_types = is_table_assignment_merge_type(assigned_type);
     let (class_bootstrap_type, class_bootstrap_compatible) =
         class_bootstrap_cache_state(assigned_type);
@@ -1540,6 +1622,12 @@ fn record_member_assignment_widening_cache(
                 &state.table_literal_widen_type,
                 &table_literal_widen_type,
             );
+            if let Some(doc_type) = doc_type {
+                state.doc_type = Some(match state.doc_type.take() {
+                    Some(current) => TypeOps::Union.apply(analyzer.db, &current, &doc_type),
+                    None => doc_type,
+                });
+            }
             state.all_table_assignment_merge_types &= all_table_assignment_merge_types;
             merge_class_bootstrap_cache_state(
                 state,
@@ -1554,6 +1642,7 @@ fn record_member_assignment_widening_cache(
                 MemberAssignmentWideningState {
                     no_table_literal_widen_type,
                     table_literal_widen_type,
+                    doc_type,
                     all_table_assignment_merge_types,
                     class_bootstrap_type,
                     class_bootstrap_compatible,
@@ -2274,6 +2363,10 @@ fn direct_local_table_prefix_member_owner(
     prefix_expr: &LuaExpr,
 ) -> Option<LuaMemberOwner> {
     let decl_id = direct_local_prefix_decl_id(analyzer, prefix_expr)?;
+    if local_decl_binds_class_type(analyzer, decl_id) {
+        return None;
+    }
+
     if let Some(cached_owner) = analyzer
         .direct_local_table_member_owner_cache
         .get(&decl_id)
@@ -2298,6 +2391,22 @@ fn direct_local_prefix_decl_id(analyzer: &LuaAnalyzer, prefix_expr: &LuaExpr) ->
         .get_reference_index()
         .get_local_reference(&analyzer.file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+}
+
+fn local_decl_binds_class_type(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {
+    let Some(type_cache) = analyzer.db.get_type_index().get_type_cache(&decl_id.into()) else {
+        return false;
+    };
+    let type_id = match type_cache.as_type() {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id,
+        _ => return false,
+    };
+
+    analyzer
+        .db
+        .get_type_index()
+        .get_type_decl(type_id)
+        .is_some_and(|decl| decl.is_class())
 }
 
 fn resolve_direct_local_table_prefix_member_owner(
@@ -2982,14 +3091,17 @@ fn set_guarded_table_assignment_index_owner(
 ) -> Option<()> {
     match var {
         LuaVarExpr::IndexExpr(index_expr) => {
-            let cache_key = guarded_table_assignment_cache_key(analyzer, left)?;
-            apply_index_expr_member_owner_with_guarded(
-                analyzer,
-                index_expr,
-                cache_key.owner,
-                false,
-                true,
-            )
+            if let Some(cache_key) = guarded_table_assignment_cache_key(analyzer, left) {
+                apply_index_expr_member_owner_with_guarded(
+                    analyzer,
+                    index_expr,
+                    cache_key.owner,
+                    false,
+                    true,
+                )
+            } else {
+                set_index_expr_owner(analyzer, LuaVarExpr::IndexExpr(index_expr))
+            }
         }
         other => set_index_expr_owner(analyzer, other),
     }
@@ -3075,7 +3187,8 @@ fn guarded_table_assignment_cache_key(
     let prefix_expr = index_expr.get_prefix_expr()?;
     let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
         let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
-        get_member_owner_for_prefix_type(prefix_type)
+        resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+            .map(|(owner, _)| owner)
     })?;
     let index_key = index_expr.get_index_key()?;
     let cache = analyzer

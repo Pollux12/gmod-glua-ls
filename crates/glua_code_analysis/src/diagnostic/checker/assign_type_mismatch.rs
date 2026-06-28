@@ -63,14 +63,16 @@ fn check_assign_stat(
                 );
             }
             LuaVarExpr::NameExpr(name_expr) => {
-                let value_type = semantic_model.infer_expr_list_value_type_at(&exprs, idx)?;
-                check_name_expr(
-                    context,
-                    semantic_model,
-                    name_expr,
-                    exprs.get(idx).cloned(),
-                    value_type,
-                );
+                if let Some(value_type) = semantic_model.infer_expr_list_value_type_at(&exprs, idx)
+                {
+                    check_name_expr(
+                        context,
+                        semantic_model,
+                        name_expr,
+                        exprs.get(idx).cloned(),
+                        value_type,
+                    );
+                }
             }
         }
     }

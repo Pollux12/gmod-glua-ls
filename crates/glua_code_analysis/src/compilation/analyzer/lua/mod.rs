@@ -338,6 +338,7 @@ struct MemberAssignmentWideningCache {
 struct MemberAssignmentWideningState {
     no_table_literal_widen_type: LuaType,
     table_literal_widen_type: LuaType,
+    doc_type: Option<LuaType>,
     all_table_assignment_merge_types: bool,
     class_bootstrap_type: Option<LuaType>,
     class_bootstrap_compatible: bool,

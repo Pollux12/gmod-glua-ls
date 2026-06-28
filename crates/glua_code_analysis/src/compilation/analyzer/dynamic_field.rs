@@ -916,15 +916,20 @@ fn find_declared_member_types_for_dynamic_field(
     key: LuaMemberKey,
     member_id: LuaMemberId,
 ) -> Option<Vec<LuaType>> {
-    if let Some(member_type) = db
+    let current_member_type = db
         .get_type_index()
         .get_type_cache(&LuaTypeOwner::Member(member_id))
-        .map(|cache| cache.as_type().clone())
-    {
+        .map(|cache| (cache.is_doc(), cache.as_type().clone()));
+
+    if let Some((true, member_type)) = current_member_type.clone() {
         return Some(vec![member_type]);
     }
 
     if let LuaType::TableConst(table_range) = owner_type {
+        if let Some((_, member_type)) = current_member_type {
+            return Some(vec![member_type]);
+        }
+
         let owner = LuaMemberOwner::Element(table_range.clone());
         let member_types = db
             .get_member_index()
@@ -939,12 +944,19 @@ fn find_declared_member_types_for_dynamic_field(
         return (!member_types.is_empty()).then_some(member_types);
     }
 
-    find_members_with_key(db, owner_type, key, true).map(|member_infos| {
-        member_infos
-            .into_iter()
-            .map(|member_info| member_info.typ)
-            .collect()
-    })
+    if let Some(member_types) =
+        find_members_with_key(db, owner_type, key, true).and_then(|member_infos| {
+            let member_types = member_infos
+                .into_iter()
+                .map(|member_info| member_info.typ)
+                .collect::<Vec<_>>();
+            (!member_types.is_empty()).then_some(member_types)
+        })
+    {
+        return Some(member_types);
+    }
+
+    current_member_type.map(|(_, member_type)| vec![member_type])
 }
 
 fn infer_setmetatable_target_type(
