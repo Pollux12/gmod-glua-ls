@@ -860,6 +860,13 @@ fn resolve_decl_annotation_realm_at_offset(
             .map(|entry| entry.realm);
     }
 
+    // Fast path: GmodInferIndex already holds the per-file member realm ranges computed
+    // during gmod_pre. Prefer its O(log n) binary-search over an AST re-walk.
+    let infer_index = semantic_model.get_db().get_gmod_infer_index();
+    if infer_index.has_member_realm_ranges(file_id) {
+        return infer_index.get_member_annotation_realm_at_offset(file_id, offset);
+    }
+
     let file_entries = decl_annotation_cache
         .entry(file_id.clone())
         .or_insert_with(|| {
@@ -878,6 +885,13 @@ fn resolve_decl_annotation_realm_at_offset_from_db(
     offset: TextSize,
     decl_annotation_cache: &mut DeclAnnotationRealmCache,
 ) -> Option<GmodRealm> {
+    // Fast path: GmodInferIndex already holds the per-file member realm ranges computed
+    // during gmod_pre. Prefer its O(log n) binary-search over an AST re-walk.
+    let infer_index = db.get_gmod_infer_index();
+    if infer_index.has_member_realm_ranges(file_id) {
+        return infer_index.get_member_annotation_realm_at_offset(file_id, offset);
+    }
+
     let file_entries = decl_annotation_cache
         .entry(*file_id)
         .or_insert_with(|| collect_decl_annotation_realms_for_file_from_db(db, file_id));

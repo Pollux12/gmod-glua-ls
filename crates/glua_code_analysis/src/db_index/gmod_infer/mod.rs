@@ -508,6 +508,13 @@ impl GmodInferIndex {
         self.member_realm_ranges.insert(file_id, ranges);
     }
 
+    /// Returns `true` if gmod_pre already populated member realm ranges for this file.
+    /// Use as a guard before calling `get_member_annotation_realm_at_offset` to distinguish
+    /// "no ranges for this file" (pre ran, file had none) from "pre not yet run" (fall back).
+    pub fn has_member_realm_ranges(&self, file_id: &FileId) -> bool {
+        self.member_realm_ranges.contains_key(file_id)
+    }
+
     /// `---@realm` covering decl at `offset`. O(log n).
     pub fn get_member_annotation_realm_at_offset(
         &self,
