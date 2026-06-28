@@ -108,23 +108,13 @@ fn maybe_field_exist_narrow(
     let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
 
     // Base type already owns field directly: skip subtype expansion (avoids Entity -> EFFECT).
-    if matches!(condition_flow, InferConditionFlow::TrueCondition)
-        && let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type
-    {
+    if let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type {
         let index_member = LuaIndexMemberExpr::IndexExpr(index_expr.clone());
         if let Some(index_key) = index_member.get_index_key()
             && let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key)
+            && type_directly_owns_member(db, type_id, &member_key)
         {
-            let member_index = db.get_member_index();
-            let owner = LuaMemberOwner::Type(type_id.clone());
-            let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
-            if member_index.get_member_item(&owner, &member_key).is_some()
-                || member_index
-                    .get_member_item(&global_owner, &member_key)
-                    .is_some()
-            {
-                return Ok(ResultTypeOrContinue::Result(left_type));
-            }
+            return Ok(ResultTypeOrContinue::Result(left_type));
         }
     }
 
@@ -205,6 +195,23 @@ fn maybe_field_exist_narrow(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn type_directly_owns_member(
+    db: &DbIndex,
+    type_id: &crate::LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> bool {
+    let member_index = db.get_member_index();
+    let owner = LuaMemberOwner::Type(type_id.clone());
+    if member_index.get_member_item(&owner, member_key).is_some() {
+        return true;
+    }
+
+    let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
+    member_index
+        .get_member_item(&global_owner, member_key)
+        .is_some()
 }
 
 fn collect_field_exist_narrow_candidates(
@@ -331,7 +338,6 @@ fn filter_candidates_by_caller_realm(
     let Ok(key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
         return candidates;
     };
-    let member_index = db.get_member_index();
 
     let filtered: Vec<LuaType> = candidates
         .iter()
@@ -342,8 +348,8 @@ fn filter_candidates_by_caller_realm(
             };
             let owner = LuaMemberOwner::Type(type_id.clone());
             let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
-            let mut decls = member_index.get_members_for_owner_key(&owner, &key);
-            decls.extend(member_index.get_members_for_owner_key(&global_owner, &key));
+            let mut decls = direct_members_for_owner_key(db, &owner, &key);
+            decls.extend(direct_members_for_owner_key(db, &global_owner, &key));
             if decls.is_empty() {
                 // Inherited member, can't decide — keep.
                 return true;
@@ -366,6 +372,25 @@ fn filter_candidates_by_caller_realm(
     } else {
         filtered
     }
+}
+
+fn direct_members_for_owner_key<'db>(
+    db: &'db DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+) -> Vec<&'db crate::LuaMember> {
+    let Some(member_item) = db.get_member_index().get_member_item(owner, key) else {
+        return Vec::new();
+    };
+
+    member_item
+        .get_member_ids()
+        .into_iter()
+        .filter_map(|member_id| {
+            let member = db.get_member_index().get_member(&member_id)?;
+            (member.get_key() == key).then_some(member)
+        })
+        .collect()
 }
 
 /// Walk up an index chain looking for the leftmost prefix that resolves to the
