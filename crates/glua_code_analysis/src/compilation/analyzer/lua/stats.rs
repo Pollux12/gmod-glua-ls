@@ -2546,10 +2546,6 @@ fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwn
     resolve_index_expr_member_owner_for_file(&prefix_type, None).map(|(owner, _)| owner)
 }
 
-fn resolve_index_expr_member_owner(prefix_type: &LuaType) -> Option<(LuaMemberOwner, bool)> {
-    resolve_index_expr_member_owner_for_file(prefix_type, None)
-}
-
 fn resolve_index_expr_member_owner_for_file(
     prefix_type: &LuaType,
     preferred_file_id: Option<FileId>,
