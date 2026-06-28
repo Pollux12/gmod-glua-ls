@@ -610,6 +610,27 @@ impl LuaMemberIndex {
             .unwrap_or(0)
     }
 
+    pub fn has_visible_member_for_owner_key_other_than(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+        excluded_member_id: LuaMemberId,
+    ) -> bool {
+        let Some(member_ids) = self
+            .member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+        else {
+            return false;
+        };
+
+        match member_ids.as_slice() {
+            [] => false,
+            [member_id] => *member_id != excluded_member_id,
+            _ => true,
+        }
+    }
+
     pub fn get_members_for_owner_key(
         &self,
         owner: &LuaMemberOwner,
@@ -1219,6 +1240,39 @@ mod tests {
             .map(|member| member.get_id())
             .collect::<Vec<_>>();
         assert_eq!(history_member_ids, vec![first_member_id, second_member_id]);
+    }
+
+    #[test]
+    fn visible_owner_key_other_member_check_uses_current_visible_members() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = make_index_member_id(FileId::new(4), 1);
+        let second_member_id = make_index_member_id(FileId::new(4), 3);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                first_member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        assert!(!index.has_visible_member_for_owner_key_other_than(&owner, &key, first_member_id));
+
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                second_member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        assert!(index.has_visible_member_for_owner_key_other_than(&owner, &key, second_member_id));
     }
 
     #[test]

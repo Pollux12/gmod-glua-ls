@@ -18,6 +18,7 @@ use glua_parser::{
     LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind, LuaTableExpr,
     LuaTableField, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
+use rustc_hash::FxHashMap;
 
 use super::{
     DynamicKeyCollectionWideningKey, LuaAnalyzer, MemberAssignmentWideningCacheKey,
@@ -1024,9 +1025,7 @@ fn should_skip_nil_table_shape_assignment(
     !analyzer
         .db
         .get_member_index()
-        .get_members_for_owner_key(&owner, &member_key)
-        .into_iter()
-        .any(|member| member.get_id() != member_id)
+        .has_visible_member_for_owner_key_other_than(&owner, &member_key, member_id)
 }
 
 fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
@@ -1339,10 +1338,6 @@ fn get_cached_widened_member_assignment_type(
     incoming_type: &LuaType,
     _preserve_table_literals: bool,
 ) -> Option<Option<LuaType>> {
-    if prefer_class_assignment_type(incoming_type).is_some() {
-        return None;
-    }
-
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return None;
     };
@@ -1372,6 +1367,25 @@ fn get_cached_widened_member_assignment_type(
         .collect::<Vec<_>>();
     if compatible_states.is_empty() {
         return Some(None);
+    }
+
+    if let Some(class_type) = prefer_class_assignment_type(incoming_type) {
+        if !is_class_bootstrap_compatible_type(incoming_type, &class_type) {
+            return None;
+        }
+
+        let class_bootstrap_compatible = compatible_states.iter().all(|state| {
+            state.class_bootstrap_compatible
+                && state
+                    .class_bootstrap_type
+                    .as_ref()
+                    .is_none_or(|cached_class| is_same_class_type(cached_class, &class_type))
+        });
+        if class_bootstrap_compatible {
+            return Some(Some(class_type));
+        }
+
+        return None;
     }
 
     let should_widen_table_literals = is_table_assignment_merge_type(incoming_type)
@@ -1426,6 +1440,8 @@ fn record_member_assignment_widening_cache(
     let no_table_literal_widen_type = widen_related_assignment_type(assigned_type, false);
     let table_literal_widen_type = widen_related_assignment_type(assigned_type, true);
     let all_table_assignment_merge_types = is_table_assignment_merge_type(assigned_type);
+    let (class_bootstrap_type, class_bootstrap_compatible) =
+        class_bootstrap_cache_state(assigned_type);
 
     let mut cache = analyzer
         .member_assignment_widening_cache
@@ -1459,6 +1475,12 @@ fn record_member_assignment_widening_cache(
                 &table_literal_widen_type,
             );
             state.all_table_assignment_merge_types &= all_table_assignment_merge_types;
+            merge_class_bootstrap_cache_state(
+                state,
+                assigned_type,
+                class_bootstrap_type,
+                class_bootstrap_compatible,
+            );
         }
         None => {
             cache.by_realm.insert(
@@ -1467,6 +1489,8 @@ fn record_member_assignment_widening_cache(
                     no_table_literal_widen_type,
                     table_literal_widen_type,
                     all_table_assignment_merge_types,
+                    class_bootstrap_type,
+                    class_bootstrap_compatible,
                 },
             );
         }
@@ -1475,6 +1499,46 @@ fn record_member_assignment_widening_cache(
     analyzer
         .member_assignment_widening_cache
         .insert(cache_key, cache);
+}
+
+fn class_bootstrap_cache_state(typ: &LuaType) -> (Option<LuaType>, bool) {
+    if let Some(class_type) = prefer_class_assignment_type(typ) {
+        let compatible = is_class_bootstrap_compatible_type(typ, &class_type);
+        return (Some(class_type), compatible);
+    }
+
+    (None, is_class_neutral_bootstrap_type(typ))
+}
+
+fn merge_class_bootstrap_cache_state(
+    state: &mut MemberAssignmentWideningState,
+    assigned_type: &LuaType,
+    assigned_class_type: Option<LuaType>,
+    assigned_class_compatible: bool,
+) {
+    if !state.class_bootstrap_compatible {
+        return;
+    }
+
+    match (&state.class_bootstrap_type, assigned_class_type) {
+        (_, Some(class_type)) => {
+            state.class_bootstrap_compatible = assigned_class_compatible
+                && state
+                    .class_bootstrap_type
+                    .as_ref()
+                    .is_none_or(|current_class| is_same_class_type(current_class, &class_type));
+            if state.class_bootstrap_compatible && state.class_bootstrap_type.is_none() {
+                state.class_bootstrap_type = Some(class_type);
+            }
+        }
+        (Some(class_type), None) => {
+            state.class_bootstrap_compatible =
+                is_class_bootstrap_compatible_type(assigned_type, class_type);
+        }
+        (None, None) => {
+            state.class_bootstrap_compatible = is_class_neutral_bootstrap_type(assigned_type);
+        }
+    }
 }
 
 fn merge_cached_assignment_types<'a>(
@@ -1996,6 +2060,26 @@ fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bo
     }
 }
 
+fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
+    if is_table_bootstrap_type(typ) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
+        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_class_neutral_bootstrap_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
+        _ => false,
+    }
+}
+
 fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
     match (
         class_decl_id_from_type(left),
@@ -2194,21 +2278,42 @@ fn record_pending_dynamic_key_collection_widening(
 
 pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaAnalyzer) {
     let pending = std::mem::take(&mut analyzer.pending_dynamic_key_collection_widenings);
+    let mut pending_by_owner: FxHashMap<LuaMemberOwner, Vec<(LuaMemberKey, LuaType)>> =
+        FxHashMap::default();
     for (cache_key, additional_base) in pending {
-        let Some(access_key_type) = member_key_as_expr_type(&cache_key.key) else {
+        if member_key_as_expr_type(&cache_key.key).is_none() {
+            continue;
+        }
+
+        pending_by_owner
+            .entry(cache_key.owner)
+            .or_default()
+            .push((cache_key.key, additional_base));
+    }
+
+    for (owner, pending_items) in pending_by_owner {
+        let Some(members) = analyzer.db.get_member_index().get_members(&owner) else {
             continue;
         };
-        let Some(members) = analyzer.db.get_member_index().get_members(&cache_key.owner) else {
-            continue;
-        };
-        let member_ids = members
+        let mut member_ids_by_pending_key = vec![Vec::new(); pending_items.len()];
+
+        for member in members {
+            for (index, (member_key, _)) in pending_items.iter().enumerate() {
+                let Some(access_key_type) = member_key_as_expr_type(member_key) else {
+                    continue;
+                };
+                if member_key_matches_type(analyzer.db, access_key_type, member.get_key()) {
+                    member_ids_by_pending_key[index].push(member.get_id());
+                }
+            }
+        }
+
+        for ((_, additional_base), member_ids) in pending_items
             .into_iter()
-            .filter(|member| {
-                member_key_matches_type(analyzer.db, access_key_type, member.get_key())
-            })
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        widen_member_collections_with_element_type(analyzer, &member_ids, &additional_base);
+            .zip(member_ids_by_pending_key.into_iter())
+        {
+            widen_member_collections_with_element_type(analyzer, &member_ids, &additional_base);
+        }
     }
 }
 
@@ -3012,7 +3117,7 @@ mod tests {
     use glua_parser::LuaSyntaxId;
     use rowan::{TextRange, TextSize};
 
-    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};
+    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaTypeDeclId, LuaUnionType};
 
     use super::*;
 
@@ -3207,6 +3312,102 @@ mod tests {
             }
 
             assert_eq!(cache_hits, 511);
+        });
+    }
+
+    #[test]
+    fn member_assignment_widening_cache_tracks_many_same_class_bootstrap_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+        let class_type = LuaType::Def(LuaTypeDeclId::global("ClassType"));
+
+        with_analyzer(&mut db, |analyzer| {
+            let mut cache_hits = 0;
+            for i in 0..512 {
+                let member_id = member_id_at(i * 2 + 1);
+                add_typed_file_define_member(
+                    analyzer.db,
+                    owner.clone(),
+                    member_id,
+                    key.clone(),
+                    class_type.clone(),
+                );
+
+                if i > 0 {
+                    let cached_type = get_cached_widened_member_assignment_type(
+                        analyzer,
+                        &LuaTypeOwner::Member(member_id),
+                        &class_type,
+                        false,
+                    )
+                    .expect("class bootstrap cache should stay enabled")
+                    .expect("same class bootstrap should return cached class type");
+                    assert_eq!(cached_type, class_type, "unexpected type at member {i}");
+                    cache_hits += 1;
+                }
+
+                record_member_assignment_widening_cache(
+                    analyzer,
+                    &LuaTypeOwner::Member(member_id),
+                    &class_type,
+                    false,
+                );
+            }
+
+            assert_eq!(cache_hits, 511);
+        });
+    }
+
+    #[test]
+    fn member_assignment_widening_cache_rejects_different_class_bootstrap_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+        let first_class = LuaType::Def(LuaTypeDeclId::global("FirstClass"));
+        let second_class = LuaType::Def(LuaTypeDeclId::global("SecondClass"));
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            first_class.clone(),
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &first_class,
+                false,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner,
+                second_member,
+                key,
+                second_class.clone(),
+            );
+
+            assert!(
+                get_cached_widened_member_assignment_type(
+                    analyzer,
+                    &LuaTypeOwner::Member(second_member),
+                    &second_class,
+                    false,
+                )
+                .is_none(),
+                "different class bootstraps must fall back to the full compatibility scan"
+            );
         });
     }
 
