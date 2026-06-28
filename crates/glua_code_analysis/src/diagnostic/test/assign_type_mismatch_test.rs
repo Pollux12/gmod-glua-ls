@@ -2797,3 +2797,56 @@ fn test_entity_subtype_assignable_to_null_local() {
         "#
     ));
 }
+
+#[test]
+fn test_initialized_dot_placeholder_replaced_by_function_still_reports() {
+    let mut ws = crate::test_lib::VirtualWorkspace::new();
+
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        cityrp = {}
+        cityrp.eventManager = {}
+        cityrp.eventManager.comDo = {}
+
+        function cityrp.eventManager.comDo(admin, text, icon, broadcast, hidden)
+        end
+        "#
+    ));
+}
+
+#[test]
+fn repeated_initialized_index_member_assignments_diagnose_quick_smoke() {
+    let mut ws = crate::VirtualWorkspace::new();
+    let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");
+    for i in 0..250 {
+        body.push_str(&format!(
+            r#"
+                WepHolster.defData["weapon_{i}"] = {{}}
+                WepHolster.defData["weapon_{i}"].Model = "models/weapons/w_{i}.mdl"
+                WepHolster.defData["weapon_{i}"].Bone = "ValveBiped.Bip01_Spine"
+                WepHolster.defData["weapon_{i}"].BoneOffset = {{Vector(0, 0, 0), Angle(0, 0, 0)}}
+"#
+        ));
+    }
+
+    ws.analysis
+        .diagnostic
+        .enable_only(crate::DiagnosticCode::AssignTypeMismatch);
+    let file_id = ws.def(&body);
+    let start = std::time::Instant::now();
+    let diagnostics = ws
+        .analysis
+        .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+        .unwrap_or_default();
+    let elapsed = start.elapsed();
+
+    assert!(
+        diagnostics.is_empty(),
+        "unexpected assign-type diagnostics: {diagnostics:#?}"
+    );
+    assert!(
+        elapsed.as_millis() < 250,
+        "repeated initialized member assignments took too long: {elapsed:?}"
+    );
+}

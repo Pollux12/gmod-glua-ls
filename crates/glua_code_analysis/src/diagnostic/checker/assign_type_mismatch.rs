@@ -14,7 +14,10 @@ use crate::{
     infer_index_expr,
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type};
+use super::{
+    AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
+    is_initialized_assignment_prefix,
+};
 
 pub struct AssignTypeMismatchChecker;
 
@@ -22,10 +25,13 @@ impl Checker for AssignTypeMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::AssignTypeMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let root = semantic_model.get_root().clone();
+        let assignment_prefixes = context.get_assignment_prefix_events(&root);
+
+        for node in root.descendants::<LuaAst>() {
             match node {
                 LuaAst::LuaAssignStat(assign) => {
-                    check_assign_stat(context, semantic_model, &assign);
+                    check_assign_stat(context, semantic_model, &assign, &assignment_prefixes);
                 }
                 LuaAst::LuaLocalStat(local) => {
                     check_local_stat(context, semantic_model, &local);
@@ -40,9 +46,9 @@ fn check_assign_stat(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     assign: &LuaAssignStat,
+    assignment_prefixes: &AssignmentPrefixEvents,
 ) -> Option<()> {
     let (vars, exprs) = assign.get_var_and_expr_list();
-    let value_types = semantic_model.infer_expr_list_types(&exprs, Some(vars.len()));
 
     for (idx, var) in vars.iter().enumerate() {
         match var {
@@ -51,17 +57,19 @@ fn check_assign_stat(
                     context,
                     semantic_model,
                     index_expr,
-                    exprs.get(idx).cloned(),
-                    value_types.get(idx)?.0.clone(),
+                    &exprs,
+                    idx,
+                    is_initialized_assignment_prefix(index_expr, assign, assignment_prefixes),
                 );
             }
             LuaVarExpr::NameExpr(name_expr) => {
+                let value_type = semantic_model.infer_expr_list_value_type_at(&exprs, idx)?;
                 check_name_expr(
                     context,
                     semantic_model,
                     name_expr,
                     exprs.get(idx).cloned(),
-                    value_types.get(idx)?.0.clone(),
+                    value_type,
                 );
             }
         }
@@ -150,12 +158,29 @@ fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
-    expr: Option<LuaExpr>,
-    value_type: LuaType,
+    exprs: &[LuaExpr],
+    value_idx: usize,
+    is_initialized_assignment_prefix: bool,
 ) -> Option<()> {
     let inferred_append_collection_target =
         is_inferred_member_collection_append_target(semantic_model, index_expr).unwrap_or(false);
     if inferred_append_collection_target {
+        return Some(());
+    }
+
+    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
+    let expr = exprs.get(value_idx).cloned();
+
+    if !strict_inferred_mismatch
+        && is_initialized_assignment_prefix
+        && !expr
+            .as_ref()
+            .is_some_and(|expr| expr_blocks_initialized_assignment_fast_path(expr, index_expr))
+        && !expr
+            .as_ref()
+            .is_some_and(inferred_target_requires_explicit_table_field_checks)
+        && is_only_current_inferred_member_assignment(semantic_model, index_expr)
+    {
         return Some(());
     }
 
@@ -175,6 +200,7 @@ fn check_index_expr(
         .ok()
     });
 
+    let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -184,7 +210,6 @@ fn check_index_expr(
         true,
         source_is_inferred,
     );
-    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
         if !source_is_inferred
             || strict_inferred_mismatch
@@ -200,6 +225,79 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+fn expr_blocks_initialized_assignment_fast_path(expr: &LuaExpr, index_expr: &LuaIndexExpr) -> bool {
+    match expr {
+        LuaExpr::ClosureExpr(_) => true,
+        LuaExpr::TableExpr(table_expr) if table_expr.get_fields().next().is_none() => {
+            matches!(index_expr.get_index_key(), Some(LuaIndexKey::Name(_)))
+        }
+        _ => false,
+    }
+}
+
+fn is_only_current_inferred_member_assignment(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let member_index = semantic_model.get_db().get_member_index();
+    let Some(member) = member_index.get_member(&member_id) else {
+        return false;
+    };
+    let Some(type_cache) = semantic_model
+        .get_db()
+        .get_type_index()
+        .get_type_cache(&member_id.into())
+    else {
+        return false;
+    };
+    if !type_cache.is_infer() {
+        return false;
+    }
+
+    let Some(owner) = member_index.get_member_owner(&member_id) else {
+        return false;
+    };
+    !has_visible_prior_member_for_owner_key(
+        semantic_model,
+        owner,
+        member.get_key(),
+        member_id,
+        index_expr.get_range().start(),
+    )
+}
+
+fn has_visible_prior_member_for_owner_key(
+    semantic_model: &SemanticModel,
+    owner: &crate::LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    current_member_id: crate::LuaMemberId,
+    position: rowan::TextSize,
+) -> bool {
+    let member_ids = semantic_model
+        .get_db()
+        .get_member_index()
+        .get_current_owner_members_for_key(owner, member_key)
+        .into_iter()
+        .filter(|member| {
+            let member_id = member.get_id();
+            member_id != current_member_id
+                && (member_id.file_id != semantic_model.get_file_id()
+                    || member_id.get_position() < position)
+        })
+        .map(|member| member.get_id())
+        .collect();
+
+    !crate::LuaMemberIndexItem::Many(member_ids)
+        .visible_member_ids_with_realm_at_offset_from_history(
+            semantic_model.get_db(),
+            &semantic_model.get_file_id(),
+            position,
+        )
+        .is_empty()
 }
 
 /// Resolve the **pre-write** source type for an indexed assignment target by
@@ -770,9 +868,7 @@ fn should_check_nested_table_fields(source_type: &LuaType) -> bool {
     }
 
     match source_type {
-        LuaType::Union(union_type) => union_type
-            .types()
-            .any(should_check_nested_table_fields),
+        LuaType::Union(union_type) => union_type.types().any(should_check_nested_table_fields),
         LuaType::MultiLineUnion(multi_union) => multi_union
             .get_unions()
             .iter()
