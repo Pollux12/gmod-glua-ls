@@ -114,8 +114,7 @@ pub fn infer_call_expr_func(
         LuaType::Union(union) => {
             // 此时我们将其视为泛型实例化联合体
             if union
-                .into_vec()
-                .iter()
+                .types()
                 .all(|t| matches!(t, LuaType::DocFunction(_)))
             {
                 infer_generic_doc_function_union(db, cache, union, call_expr.clone(), args_count)
@@ -410,8 +409,7 @@ fn infer_generic_doc_function_union(
     args_count: Option<usize>,
 ) -> InferCallFuncResult {
     let overloads = union
-        .into_vec()
-        .iter()
+        .types()
         .filter_map(|typ| match typ {
             LuaType::DocFunction(f) => Some(f.clone()),
             _ => None,
@@ -1068,8 +1066,7 @@ fn apply_definition_return_type(return_type: LuaType) -> LuaType {
         }
         LuaType::Union(union) => LuaType::from_vec(
             union
-                .into_vec()
-                .iter()
+                .types()
                 .cloned()
                 .map(apply_definition_return_type)
                 .collect(),

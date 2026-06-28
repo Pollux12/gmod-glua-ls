@@ -477,11 +477,11 @@ fn infer_union_member_semantic_info(
     member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
-    for typ in union_type.into_vec() {
+    for typ in union_type.types() {
         if let Some(property_owner_id) = infer_member_semantic_decl_by_member_key(
             db,
             cache,
-            &typ,
+            typ,
             member_key,
             member_access_position,
             semantic_guard.next_level()?,

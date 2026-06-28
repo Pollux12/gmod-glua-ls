@@ -1192,8 +1192,8 @@ fn owner_type_to_member_owners_inner(
         LuaType::TableOf(inner) => owner_type_to_member_owners_inner(inner, db, visited),
         LuaType::Union(union_type) => {
             let mut owners = Vec::new();
-            for sub in union_type.into_vec() {
-                owners.extend(owner_type_to_member_owners_inner(&sub, db, visited));
+            for sub in union_type.types() {
+                owners.extend(owner_type_to_member_owners_inner(sub, db, visited));
             }
             owners
         }

@@ -617,7 +617,7 @@ fn callable_accepts_call_args(
             }
             effective_min_call_args_count <= expected_params_len
         }
-        LuaType::Union(union_type) => union_type.into_vec().iter().any(|union_member| {
+        LuaType::Union(union_type) => union_type.types().any(|union_member| {
             callable_accepts_call_args(db, union_member, min_call_args_count, colon_call)
         }),
         _ => false,

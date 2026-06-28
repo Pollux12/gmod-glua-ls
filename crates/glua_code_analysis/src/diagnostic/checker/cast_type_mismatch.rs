@@ -74,12 +74,12 @@ fn check_cast_compatibility(
     // 检查是否可以从原始类型转换为目标类型, 允许父类转为子类
     let result = match origin_type {
         LuaType::Union(union_type) => {
-            for member_type in union_type.into_vec() {
+            for member_type in union_type.types() {
                 // 不检查 nil 类型
                 if member_type.is_nil() {
                     continue;
                 }
-                if cast_type_check(semantic_model, &member_type, target_type, 0).is_ok() {
+                if cast_type_check(semantic_model, member_type, target_type, 0).is_ok() {
                     return Some(());
                 }
             }
@@ -165,11 +165,11 @@ fn cast_type_check(
         }
         (_, LuaType::Union(union)) => {
             // 通常来说这个的原始类型为 alias / enum-field 的集合
-            for member_type in union.into_vec() {
+            for member_type in union.types() {
                 match cast_type_check(
                     semantic_model,
                     origin_type,
-                    &member_type,
+                    member_type,
                     recursion_depth + 1,
                 ) {
                     Ok(_) => {}
@@ -249,16 +249,16 @@ fn expand_type_recursive(
             // 递归展开 union 中的每个类型
             let mut expanded_types = HashSet::new();
             let mut has_nil = false;
-            for inner_type in union_type.into_vec() {
+            for inner_type in union_type.types() {
                 if inner_type.is_nil() {
                     has_nil = true;
                     continue;
                 }
-                if let Some(expanded) = expand_type_recursive(db, &inner_type, visited) {
+                if let Some(expanded) = expand_type_recursive(db, inner_type, visited) {
                     match expanded {
                         LuaType::Union(inner_union) => {
                             // 如果展开后还是 union，则将其成员类型添加到结果中
-                            expanded_types.extend(inner_union.into_vec().iter().cloned());
+                            expanded_types.extend(inner_union.types().cloned());
                         }
                         _ => {
                             expanded_types.insert(expanded);

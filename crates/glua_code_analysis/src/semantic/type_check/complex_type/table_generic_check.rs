@@ -107,11 +107,11 @@ pub fn check_table_generic_type_compact(
             return Ok(());
         }
         LuaType::Union(union) => {
-            for union_type in union.into_vec() {
+            for union_type in union.types() {
                 check_table_generic_type_compact(
                     context,
                     source_generic_param,
-                    &union_type,
+                    union_type,
                     check_guard,
                 )?;
             }

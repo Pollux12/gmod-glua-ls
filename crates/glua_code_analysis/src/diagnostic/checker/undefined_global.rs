@@ -813,8 +813,7 @@ fn type_has_self_guard_metadata(semantic_model: &SemanticModel, typ: &LuaType) -
             false
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| type_has_self_guard_metadata(semantic_model, t)),
         LuaType::Intersection(intersection_type) => intersection_type
             .get_types()

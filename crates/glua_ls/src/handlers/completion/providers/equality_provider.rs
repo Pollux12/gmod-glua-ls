@@ -234,7 +234,7 @@ fn find_previous_equality_op_token(token: LuaSyntaxToken) -> Option<LuaSyntaxTok
 pub fn contain_function_types(db: &DbIndex, typ: &LuaType) -> Option<()> {
     match typ {
         LuaType::Union(union_typ) => {
-            for member in union_typ.into_vec().iter() {
+            for member in union_typ.types() {
                 match member {
                     _ if member.is_function() => {
                         return Some(());

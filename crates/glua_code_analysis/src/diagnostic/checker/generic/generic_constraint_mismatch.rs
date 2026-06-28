@@ -208,7 +208,7 @@ fn check_param(
         LuaType::Union(union_type) => {
             // 如果不是来自 union, 才展开 union 中的每个类型进行检查
             if !from_union {
-                for union_member_type in union_type.into_vec().iter() {
+                for union_member_type in union_type.types() {
                     check_param(
                         context,
                         semantic_model,
@@ -305,8 +305,8 @@ fn classify_str_tpl_arg(
         }
         LuaType::Union(union) => {
             let mut best = StrTplArgClass::Incompatible;
-            for member in union.into_vec() {
-                match classify_str_tpl_arg(semantic_model, str_tpl_ref, &member, extend_type) {
+            for member in union.types() {
+                match classify_str_tpl_arg(semantic_model, str_tpl_ref, member, extend_type) {
                     StrTplArgClass::Compatible => return StrTplArgClass::Compatible,
                     StrTplArgClass::Unprovable => best = StrTplArgClass::Unprovable,
                     StrTplArgClass::Incompatible => {}
@@ -368,11 +368,11 @@ fn first_unprovable_str_tpl_const(
             Some(str.to_string())
         }
         LuaType::Union(union) => {
-            for member in union.into_vec() {
+            for member in union.types() {
                 if let Some(str) = first_unprovable_str_tpl_const(
                     semantic_model,
                     str_tpl_ref,
-                    &member,
+                    member,
                     extend_type,
                 ) {
                     return Some(str);

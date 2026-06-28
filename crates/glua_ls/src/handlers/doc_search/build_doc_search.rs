@@ -805,8 +805,8 @@ fn collect_signature_ids(typ: &LuaType, signature_ids: &mut Vec<LuaSignatureId>)
             }
         }
         LuaType::Union(union) => {
-            for inner in union.into_vec() {
-                collect_signature_ids(&inner, signature_ids);
+            for inner in union.types() {
+                collect_signature_ids(inner, signature_ids);
             }
         }
         _ => {}

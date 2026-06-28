@@ -453,7 +453,7 @@ pub fn goto_str_tpl_ref_definition(
 
     // 如果参数类型是union，尝试从中提取StrTplRef类型
     if let Some(LuaType::Union(union_type)) = target_param.1.clone() {
-        for union_member in union_type.into_vec().iter() {
+        for union_member in union_type.types() {
             if let Some(locations) = try_extract_str_tpl_ref_locations(
                 semantic_model,
                 &Some(union_member.clone()),

@@ -483,11 +483,11 @@ fn process_function_type(
         }
         LuaType::Union(union) => {
             let mut contents = Vec::new();
-            for typ in union.into_vec() {
+            for typ in union.types() {
                 if let Some(content) = process_function_type(
                     builder,
                     db,
-                    &typ,
+                    typ,
                     function_member,
                     function_name,
                     is_local,
@@ -935,8 +935,7 @@ pub fn is_function(typ: &LuaType) -> bool {
     typ.is_function()
         || match &typ {
             LuaType::Union(union) => union
-                .into_vec()
-                .iter()
+                .types()
                 .all(|t| matches!(t, LuaType::DocFunction(_) | LuaType::Signature(_))),
             _ => false,
         }

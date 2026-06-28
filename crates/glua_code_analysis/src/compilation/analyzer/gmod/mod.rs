@@ -5995,8 +5995,8 @@ fn static_arg_kind_matches_type(kind: StaticArgKind, param_type: &LuaType) -> St
         LuaType::Nil => match_bool(kind == StaticArgKind::Nil),
         LuaType::Union(union) => {
             let mut saw_unknown = false;
-            for typ in union.into_vec() {
-                match static_arg_kind_matches_type(kind, &typ) {
+            for typ in union.types() {
+                match static_arg_kind_matches_type(kind, typ) {
                     StaticArgTypeMatch::Match => return StaticArgTypeMatch::Match,
                     StaticArgTypeMatch::Unknown => saw_unknown = true,
                     StaticArgTypeMatch::Mismatch => {}

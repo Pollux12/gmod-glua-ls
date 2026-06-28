@@ -79,8 +79,8 @@ pub fn build_label_parts(semantic_model: &SemanticModel, typ: &LuaType) -> Vec<I
     let mut parts: Vec<InlayHintLabelPart> = Vec::new();
     match typ {
         LuaType::Union(union) => {
-            for typ in union.into_vec() {
-                if let Some(part) = get_part(semantic_model, &typ) {
+            for typ in union.types() {
+                if let Some(part) = get_part(semantic_model, typ) {
                     parts.push(part);
                 }
             }

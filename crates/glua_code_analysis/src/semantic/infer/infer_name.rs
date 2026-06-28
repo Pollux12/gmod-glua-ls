@@ -669,7 +669,7 @@ fn is_concrete_self_receiver_type(typ: &LuaType) -> bool {
         | LuaType::TableConst(_)
         | LuaType::Instance(_)
         | LuaType::Object(_) => true,
-        LuaType::Union(union) => union.into_vec().iter().any(is_concrete_self_receiver_type),
+        LuaType::Union(union) => union.types().any(is_concrete_self_receiver_type),
         _ => false,
     }
 }
@@ -1281,8 +1281,7 @@ fn is_structured_factory_param_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Object(_) | LuaType::TableGeneric(_) => true,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(is_structured_factory_param_type),
         LuaType::Intersection(intersection) => intersection
             .get_types()
@@ -2133,8 +2132,7 @@ fn collect_global_table_merge_candidates(typ: &LuaType, table_types: &mut Vec<Lu
         LuaType::Union(union) => {
             let mut nested = Vec::new();
             if union
-                .into_vec()
-                .iter()
+                .types()
                 .all(|typ| collect_global_table_merge_candidates(typ, &mut nested))
             {
                 table_types.extend(nested);
@@ -2354,7 +2352,7 @@ fn contains_self_infer(typ: &LuaType) -> bool {
     match typ {
         LuaType::SelfInfer => true,
         LuaType::TableOf(inner) => contains_self_infer(inner),
-        LuaType::Union(u) => u.into_vec().iter().any(contains_self_infer),
+        LuaType::Union(u) => u.types().any(contains_self_infer),
         _ => false,
     }
 }
@@ -2366,8 +2364,7 @@ fn resolve_self_infer(typ: &LuaType, self_type: &LuaType) -> LuaType {
         LuaType::TableOf(inner) => LuaType::TableOf(Box::new(resolve_self_infer(inner, self_type))),
         LuaType::Union(u) => {
             let types: Vec<_> = u
-                .into_vec()
-                .iter()
+                .types()
                 .map(|t| resolve_self_infer(t, self_type))
                 .collect();
             LuaType::Union(crate::LuaUnionType::from_vec(types).into())

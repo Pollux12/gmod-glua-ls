@@ -771,8 +771,7 @@ fn should_check_nested_table_fields(source_type: &LuaType) -> bool {
 
     match source_type {
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(should_check_nested_table_fields),
         LuaType::MultiLineUnion(multi_union) => multi_union
             .get_unions()

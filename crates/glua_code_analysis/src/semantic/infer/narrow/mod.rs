@@ -54,8 +54,7 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     match real_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|member| contains_gmod_null_type(db, member)),
         LuaType::MultiLineUnion(multi_union) => multi_union
             .get_unions()

@@ -915,8 +915,7 @@ fn antecedent_can_be_target_class(
             antecedent_can_be_target_class(db, instance_type.get_base(), target_type_id)
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|ty| antecedent_can_be_target_class(db, ty, target_type_id)),
         LuaType::MultiLineUnion(multi_line_union) => multi_line_union
             .get_unions()
@@ -940,8 +939,7 @@ fn antecedent_already_target_or_more_specific(
             antecedent_already_target_or_more_specific(db, instance_type.get_base(), target_type_id)
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .all(|ty| antecedent_already_target_or_more_specific(db, ty, target_type_id)),
         LuaType::MultiLineUnion(multi_line_union) => multi_line_union
             .get_unions()

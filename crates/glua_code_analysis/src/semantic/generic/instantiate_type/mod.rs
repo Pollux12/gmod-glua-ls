@@ -1092,8 +1092,8 @@ pub(super) fn key_type_to_member_key(key_ty: &LuaType) -> Option<LuaMemberKey> {
 fn collect_mapped_key_atoms(key_ty: &LuaType, acc: &mut Vec<LuaType>) {
     match key_ty {
         LuaType::Union(union) => {
-            for member in union.into_vec() {
-                collect_mapped_key_atoms(&member, acc);
+            for member in union.types() {
+                collect_mapped_key_atoms(member, acc);
             }
         }
         LuaType::MultiLineUnion(multi) => {

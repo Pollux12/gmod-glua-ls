@@ -212,7 +212,7 @@ fn collect_field_exist_narrow_candidates(
     left_type: &LuaType,
 ) -> Option<Vec<LuaType>> {
     match left_type {
-        LuaType::Union(union_type) => Some(union_type.into_vec().to_vec()),
+        LuaType::Union(union_type) => Some(union_type.types().cloned().collect()),
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             let mut candidates = vec![LuaType::Ref(type_decl_id.clone())];
             let all_sub_types = db.get_type_index().get_all_sub_types(type_decl_id);

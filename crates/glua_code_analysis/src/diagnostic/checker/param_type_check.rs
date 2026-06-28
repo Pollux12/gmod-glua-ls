@@ -1028,8 +1028,7 @@ fn correlated_param_states_from_property_type(
             std::slice::from_ref(func),
         ),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .flat_map(|component| {
                 correlated_param_states_from_property_type(db, implementation_signature, component)
             })
@@ -1433,7 +1432,7 @@ fn correlated_truthiness_possible(
 fn type_may_be_truthy(typ: &LuaType) -> bool {
     match typ {
         LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => false,
-        LuaType::Union(union) => union.into_vec().iter().any(type_may_be_truthy),
+        LuaType::Union(union) => union.types().any(type_may_be_truthy),
         _ => true,
     }
 }
@@ -1442,7 +1441,7 @@ fn type_may_be_falsy(typ: &LuaType) -> bool {
     match typ {
         LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => true,
         LuaType::Boolean | LuaType::DocBooleanConst(_) => true,
-        LuaType::Union(union) => union.into_vec().iter().any(type_may_be_falsy),
+        LuaType::Union(union) => union.types().any(type_may_be_falsy),
         _ => false,
     }
 }
@@ -1535,7 +1534,7 @@ fn type_has_param_candidate_accepting_refined_arg(
                     .type_check_detail(&candidate, refined_arg_type)
                     .is_ok()
             }),
-        LuaType::Union(union) => union.into_vec().iter().any(|component| {
+        LuaType::Union(union) => union.types().any(|component| {
             type_has_param_candidate_accepting_refined_arg(
                 semantic_model,
                 component,
@@ -1779,7 +1778,7 @@ fn is_any_only_uninformative_or_nil(ty: &LuaType) -> bool {
 fn contains_any(ty: &LuaType) -> bool {
     match ty {
         LuaType::Any => true,
-        LuaType::Union(union) => union.into_vec().iter().any(contains_any),
+        LuaType::Union(union) => union.types().any(contains_any),
         LuaType::MultiLineUnion(union) => union.get_unions().iter().any(|(ty, _)| contains_any(ty)),
         _ => false,
     }
@@ -1788,7 +1787,7 @@ fn contains_any(ty: &LuaType) -> bool {
 fn is_only_any_unknown_or_nil(ty: &LuaType) -> bool {
     match ty {
         LuaType::Any | LuaType::Unknown | LuaType::Nil => true,
-        LuaType::Union(union) => union.into_vec().iter().all(is_only_any_unknown_or_nil),
+        LuaType::Union(union) => union.types().all(is_only_any_unknown_or_nil),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()

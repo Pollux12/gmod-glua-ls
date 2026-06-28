@@ -203,7 +203,12 @@ async fn main() {
     let diag_file_count = main_file_ids.len();
 
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
+    let precompute_t = Instant::now();
     let shared_data = analysis.precompute_diagnostic_shared_data();
+    eprintln!(
+        "  [diag] precompute_shared_data: {:.3}s",
+        precompute_t.elapsed().as_secs_f64()
+    );
 
     let parallelism = match std::env::var("BENCH_THREADS") {
         Ok(val) => match val.parse::<usize>() {

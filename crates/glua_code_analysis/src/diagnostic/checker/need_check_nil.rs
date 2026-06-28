@@ -241,9 +241,14 @@ fn type_has_explicit_nullable_member(
     key: &LuaMemberKey,
 ) -> bool {
     match receiver_type {
-        LuaType::Union(union) => union.into_vec().into_iter().any(|component| {
+        LuaType::Union(union) => union.types().any(|component| {
             !matches!(component, LuaType::Nil | LuaType::BooleanConst(false))
-                && type_has_explicit_nullable_member(semantic_model, index_expr, component, key)
+                && type_has_explicit_nullable_member(
+                    semantic_model,
+                    index_expr,
+                    component.clone(),
+                    key,
+                )
         }),
         LuaType::Intersection(intersection) => intersection.get_types().iter().any(|component| {
             type_has_explicit_nullable_member(semantic_model, index_expr, component.clone(), key)
@@ -614,8 +619,7 @@ fn type_has_self_call_valid_attribute(
             signature_has_self_call_valid_attribute(semantic_model, *signature_id, method_name)
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| type_has_self_call_valid_attribute(semantic_model, typ, method_name)),
         LuaType::Intersection(intersection_type) => intersection_type
             .get_types()
@@ -3129,8 +3133,7 @@ fn type_returns_non_nullable_type_guard(semantic_model: &SemanticModel, typ: &Lu
             false
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| type_returns_non_nullable_type_guard(semantic_model, typ)),
         LuaType::Intersection(intersection_type) => intersection_type
             .get_types()

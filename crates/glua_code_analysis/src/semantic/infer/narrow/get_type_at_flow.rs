@@ -902,7 +902,7 @@ fn var_ref_has_explicit_any(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
 fn type_contains_bare_any(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any => true,
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_bare_any),
+        LuaType::Union(union) => union.types().any(type_contains_bare_any),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -921,8 +921,7 @@ fn is_inferred_any_or_table_shape_branch(typ: &LuaType) -> bool {
         || typ.is_never()
         || is_table_shape_type(typ)
         || matches!(typ, LuaType::Union(union) if union
-            .into_vec()
-            .iter()
+            .types()
             .all(is_inferred_any_or_table_shape_branch))
 }
 

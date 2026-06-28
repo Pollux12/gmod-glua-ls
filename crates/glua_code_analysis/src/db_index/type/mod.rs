@@ -880,7 +880,7 @@ pub fn first_param_may_not_self(typ: &LuaType) -> bool {
     }
 
     if let LuaType::Union(u) = typ {
-        return u.into_vec().iter().any(first_param_may_not_self);
+        return u.types().any(first_param_may_not_self);
     }
     false
 }

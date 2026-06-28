@@ -547,8 +547,8 @@ fn collect_distinct_index_expr_member_owners(
         LuaType::TableOf(inner) => collect_distinct_index_expr_member_owners(inner, owners),
         LuaType::TypeGuard(inner) => collect_distinct_index_expr_member_owners(inner, owners),
         LuaType::Union(union) => {
-            for typ in union.into_vec() {
-                if collect_distinct_index_expr_member_owners(&typ, owners) {
+            for typ in union.types() {
+                if collect_distinct_index_expr_member_owners(typ, owners) {
                     return true;
                 }
             }
@@ -1007,10 +1007,9 @@ fn is_table_shape_cleanup_type(typ: &LuaType) -> bool {
         | LuaType::TableOf(_) => true,
         LuaType::TypeGuard(inner) => is_table_shape_cleanup_type(inner),
         LuaType::Union(union) => {
-            let types = union.into_vec();
-            !types.is_empty()
-                && types
-                    .iter()
+            union.types().next().is_some()
+                && union
+                    .types()
                     .all(|typ| typ.is_nil() || typ.is_never() || is_table_shape_cleanup_type(typ))
         }
         LuaType::Intersection(intersection) => intersection
@@ -1543,7 +1542,7 @@ fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
         LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
         LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
         LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
-        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.into_vec().iter()),
+        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
         LuaType::Intersection(intersection) => {
             prefer_class_assignment_type_from_iter(intersection.get_types().iter())
         }
@@ -1578,8 +1577,7 @@ fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bo
                 || is_table_bootstrap_type(typ)
         }
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
         LuaType::Intersection(intersection) => intersection
             .get_types()
@@ -1740,7 +1738,7 @@ fn resolve_index_expr_member_owner_for_file(
             resolve_index_expr_member_owner_for_file(inner, preferred_file_id)
         }
         LuaType::Union(union) => {
-            pick_preferred_index_expr_member_owner(union.into_vec().iter(), preferred_file_id)
+            pick_preferred_index_expr_member_owner(union.types(), preferred_file_id)
         }
         LuaType::Intersection(intersection) => pick_preferred_index_expr_member_owner(
             intersection.get_types().iter(),

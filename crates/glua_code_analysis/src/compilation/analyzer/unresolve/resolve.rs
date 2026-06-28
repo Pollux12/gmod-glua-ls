@@ -183,8 +183,7 @@ fn local_cached_type_is_informative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(local_cached_type_is_informative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
@@ -780,7 +779,7 @@ fn collect_special_call_param_infos_from_callable_operators(
             caller_position,
             inner,
         ),
-        LuaType::Union(union) => union.into_vec().iter().fold(
+        LuaType::Union(union) => union.types().fold(
             SpecialCallOperatorCollection::default(),
             |mut collection, union_type| {
                 collection.extend(collect_special_call_param_infos_from_callable_operators(
@@ -928,7 +927,7 @@ fn collect_special_call_out_param_infos_from_callable_operators(
             caller_position,
             inner,
         ),
-        LuaType::Union(union) => union.into_vec().iter().fold(
+        LuaType::Union(union) => union.types().fold(
             SpecialCallOutParamOperatorCollection::default(),
             |mut collection, union_type| {
                 collection.extend(
@@ -1319,8 +1318,7 @@ fn collect_special_call_param_infos(
         LuaType::DocFunction(func) => collect_doc_function_special_call_params(func),
         LuaType::TypeGuard(inner) => collect_special_call_param_infos(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .flat_map(|union_type| collect_special_call_param_infos(db, union_type))
             .collect(),
         LuaType::Intersection(intersection) => intersection
@@ -1350,8 +1348,7 @@ fn collect_special_call_out_param_infos(
             .unwrap_or_default(),
         LuaType::TypeGuard(inner) => collect_special_call_out_param_infos(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .flat_map(|union_type| collect_special_call_out_param_infos(db, union_type))
             .collect(),
         LuaType::Intersection(intersection) => intersection
@@ -1440,7 +1437,7 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
         LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Union(union) => union.types().any(type_contains_str_tpl_ref),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()
@@ -2093,8 +2090,7 @@ fn find_str_tpl_ref(db: &DbIndex, typ: &LuaType) -> Option<Arc<crate::LuaStringT
         LuaType::StrTplRef(str_tpl) => Some(str_tpl.clone()),
         LuaType::TypeGuard(inner) => find_str_tpl_ref(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .filter_map(|union_type| find_str_tpl_ref(db, union_type))
             .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         LuaType::Intersection(intersection) => intersection

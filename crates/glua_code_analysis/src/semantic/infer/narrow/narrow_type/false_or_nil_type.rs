@@ -22,8 +22,7 @@ pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
         LuaType::Union(u) => {
             // For unions, collect all the falsy parts from each member
             let falsy_types: Vec<_> = u
-                .into_vec()
-                .iter()
+                .types()
                 .map(|member| narrow_false_or_nil(db, member.clone()))
                 .filter(|falsy| !falsy.is_never())
                 .collect();
@@ -66,9 +65,8 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
         LuaType::Boolean => LuaType::BooleanConst(true),
         LuaType::Unknown => LuaType::Unknown,
         LuaType::Union(u) => {
-            let types = u.into_vec();
             let mut new_types = Vec::new();
-            for it in types.iter() {
+            for it in u.types() {
                 match it {
                     LuaType::Nil => {}
                     LuaType::BooleanConst(false) => {}

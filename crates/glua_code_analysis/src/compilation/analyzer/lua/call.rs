@@ -1075,8 +1075,7 @@ fn type_has_special_call_signature(matcher: &SpecialCallDirectMatcher, typ: &Lua
         }),
         LuaType::TypeGuard(inner) => type_has_special_call_signature(matcher, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|union_type| type_has_special_call_signature(matcher, union_type)),
         LuaType::Intersection(intersection) => intersection
             .get_types()
@@ -1129,7 +1128,7 @@ fn type_has_special_call_operator_signature(
         LuaType::TypeGuard(inner) => {
             type_has_special_call_operator_signature(db, matcher, file_id, caller_position, inner)
         }
-        LuaType::Union(union) => union.into_vec().iter().any(|union_type| {
+        LuaType::Union(union) => union.types().any(|union_type| {
             type_has_special_call_operator_signature(
                 db,
                 matcher,
@@ -1203,7 +1202,7 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
         LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Union(union) => union.types().any(type_contains_str_tpl_ref),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()

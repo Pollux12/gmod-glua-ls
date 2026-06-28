@@ -205,8 +205,7 @@ fn resolve_call_param_doc_function(
             LuaType::DocFunction(func) => return Some(func.clone()),
             LuaType::Union(union_types) => {
                 if let Some(LuaType::DocFunction(func)) = union_types
-                    .into_vec()
-                    .iter()
+                    .types()
                     .filter(|typ| matches!(typ, LuaType::DocFunction(_)))
                     .min_by_key(|typ| stable_type_selection_key(db, typ))
                 {

@@ -793,8 +793,8 @@ fn get_vgui_panel_name(db: &DbIndex, typ: &LuaType) -> Option<(String, Option<St
         }
         LuaType::Instance(instance) => get_vgui_panel_name(db, instance.get_base()),
         LuaType::Union(union_type) => {
-            for union_member in union_type.into_vec() {
-                if let Some(panel_info) = get_vgui_panel_name(db, &union_member) {
+            for union_member in union_type.types() {
+                if let Some(panel_info) = get_vgui_panel_name(db, union_member) {
                     return Some(panel_info);
                 }
             }
@@ -1194,8 +1194,7 @@ fn contains_open_table_any(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any => true,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| matches!(typ, LuaType::Any)),
         _ => false,
     }

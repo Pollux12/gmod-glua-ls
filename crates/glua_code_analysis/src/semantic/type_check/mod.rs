@@ -167,11 +167,11 @@ fn check_general_type_compact(
     }
 
     if let LuaType::Union(union_type) = compact_type {
-        for compact_sub_type in union_type.into_vec() {
+        for compact_sub_type in union_type.types() {
             check_general_type_compact(
                 context,
                 source,
-                &compact_sub_type,
+                compact_sub_type,
                 check_guard.next_level()?,
             )?;
         }

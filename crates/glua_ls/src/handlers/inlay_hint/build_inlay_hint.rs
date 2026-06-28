@@ -567,8 +567,8 @@ fn get_vgui_panel_name(
         }
         LuaType::Instance(instance) => get_vgui_panel_name(semantic_model, instance.get_base()),
         LuaType::Union(union_type) => {
-            for union_member in union_type.into_vec() {
-                if let Some(panel_info) = get_vgui_panel_name(semantic_model, &union_member) {
+            for union_member in union_type.types() {
+                if let Some(panel_info) = get_vgui_panel_name(semantic_model, union_member) {
                     return Some(panel_info);
                 }
             }

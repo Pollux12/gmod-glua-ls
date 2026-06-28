@@ -404,8 +404,7 @@ fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> b
     let is_tableof = match prefix_typ {
         LuaType::TableOf(_) => true,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| matches!(t, LuaType::TableOf(_))),
         _ => false,
     };
@@ -679,7 +678,7 @@ fn is_valid_member_inner(
             let db = semantic_model.get_db();
             let field_name = index_key.get_path_part();
             let key = LuaMemberKey::Name(field_name.into());
-            for member in union.into_vec().iter() {
+            for member in union.types() {
                 if member.is_nil() {
                     continue;
                 }
@@ -977,7 +976,7 @@ fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSe
         visited.insert(current_type.clone());
         match &current_type {
             LuaType::Union(union_typ) => {
-                for t in union_typ.into_vec() {
+                for t in union_typ.types() {
                     stack.push(t.clone());
                 }
             }
@@ -1011,7 +1010,7 @@ fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> Ha
                 type_set.insert(current_type);
             }
             LuaType::Union(union_typ) => {
-                for t in union_typ.into_vec() {
+                for t in union_typ.types() {
                     stack.push(t.clone());
                 }
             }
@@ -1245,8 +1244,7 @@ fn callee_type_has_member_guard_param(
             false
         }
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| callee_type_has_member_guard_param(semantic_model, t, arg_idx)),
         LuaType::Intersection(intersection_type) => intersection_type
             .get_types()
@@ -1305,16 +1303,11 @@ fn allows_nil_safe_expr_undefined_field_suppression(
             index_key,
         ),
         LuaType::Union(union_type) => {
-            let members = union_type.into_vec();
             // Treat `T | nil` as equivalent to `T` for nil-safe context checks:
             // accessing a field on `T?` in an `and`/`or` expression is safe because
             // the surrounding boolean expression guards against the nil case.
-            let non_nil: Vec<_> = members
-                .iter()
-                .filter(|t| !matches!(t, LuaType::Nil))
-                .collect();
-            !non_nil.is_empty()
-                && non_nil.iter().all(|t| {
+            union_type.types().any(|t| !matches!(t, LuaType::Nil))
+                && union_type.types().filter(|t| !matches!(t, LuaType::Nil)).all(|t| {
                     allows_nil_safe_expr_undefined_field_suppression(semantic_model, t, index_key)
                 })
         }
@@ -2097,8 +2090,7 @@ fn has_dynamic_field_for_type(
         }
         LuaType::TableOf(inner) => has_dynamic_field_for_type(db, index, inner, field_name),
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
         _ => false,
     }
@@ -2131,8 +2123,7 @@ fn field_exists_on_subclass(
         LuaType::TableOf(inner) => return field_exists_on_subclass(context, db, inner, field_name),
         LuaType::Union(union) => {
             return union
-                .into_vec()
-                .iter()
+                .types()
                 .any(|t| field_exists_on_subclass(context, db, t, field_name));
         }
         _ => return false,

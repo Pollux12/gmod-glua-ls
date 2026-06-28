@@ -52,9 +52,9 @@ fn build_member_map(
         let typ = &member.typ;
         // 通常是泛型实例化推断结果
         if let LuaType::Union(u) = typ
-            && u.into_vec().iter().all(|f| f.is_function())
+            && u.types().all(|f| f.is_function())
         {
-            for (index, f) in u.into_vec().iter().enumerate() {
+            for (index, f) in u.types().enumerate() {
                 let new_member = LuaMemberInfo {
                     key: key.clone(),
                     typ: f.clone(),

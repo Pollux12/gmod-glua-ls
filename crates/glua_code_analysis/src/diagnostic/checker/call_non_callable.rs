@@ -160,8 +160,7 @@ fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {
             .get_constraint()
             .is_some_and(|constraint| has_non_callable_member(db, constraint)),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| has_non_callable_member(db, t)),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
@@ -201,8 +200,8 @@ fn collect_non_callable_union_types(
     };
     match typ {
         LuaType::Union(union) => {
-            for t in union.into_vec() {
-                insert_if_non_callable(&t);
+            for t in union.types() {
+                insert_if_non_callable(t);
             }
         }
         LuaType::MultiLineUnion(union) => {

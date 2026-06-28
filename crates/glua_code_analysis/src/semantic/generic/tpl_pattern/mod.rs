@@ -170,8 +170,8 @@ fn infer_str_tpl_target_type(
         }
         LuaType::Union(union) => {
             let mut inferred = Vec::new();
-            for member in union.into_vec() {
-                let member = escape_alias(context.db, &member);
+            for member in union.types() {
+                let member = escape_alias(context.db, member);
                 match member {
                     LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
                         inferred.push(infer_str_tpl_member_type(context, str_tpl, s.as_str()));
@@ -611,8 +611,8 @@ fn union_tpl_pattern_match(
 ) -> TplPatternMatchResult {
     let mut error_count = 0;
     let mut last_error = InferFailReason::None;
-    for u in union.into_vec() {
-        match tpl_pattern_match(context, &u, target) {
+    for u in union.types() {
+        match tpl_pattern_match(context, u, target) {
             // 返回 ok 时并不一定匹配成功, 仅表示没有发生错误
             Ok(_) => {}
             Err(e) => {
@@ -622,7 +622,7 @@ fn union_tpl_pattern_match(
         }
     }
 
-    if error_count == union.into_vec().len() {
+    if error_count == union.types().count() {
         Err(last_error)
     } else {
         Ok(())

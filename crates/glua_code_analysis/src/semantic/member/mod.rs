@@ -565,8 +565,7 @@ fn unknown_index_key_matches_access(access_key_type: &LuaType) -> bool {
         }
         LuaType::TypeGuard(inner) => unknown_index_key_matches_access(inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(unknown_index_key_matches_access),
         _ => false,
     }

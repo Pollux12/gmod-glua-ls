@@ -150,7 +150,7 @@ fn type_cache_is_uninformative(type_cache: Option<&LuaTypeCache>) -> bool {
 fn type_is_uninformative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.into_vec().iter().all(type_is_uninformative),
+        LuaType::Union(union) => union.types().all(type_is_uninformative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()

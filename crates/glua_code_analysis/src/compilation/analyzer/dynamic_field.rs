@@ -658,8 +658,8 @@ fn collect_helper_patterns_from_type(
             result.extend(helpers.patterns_for_signature(db, *signature_id));
         }
         LuaType::Union(union_type) => {
-            for typ in union_type.into_vec() {
-                collect_helper_patterns_from_type(db, &typ, helpers, result);
+            for typ in union_type.types() {
+                collect_helper_patterns_from_type(db, typ, helpers, result);
             }
         }
         LuaType::TypeGuard(inner) => collect_helper_patterns_from_type(db, inner, helpers, result),
@@ -1044,10 +1044,7 @@ fn infer_index_type_from_metatable_type(db: &DbIndex, metatable_type: &LuaType) 
 
 fn is_supported_metatable_index_type(typ: &LuaType) -> bool {
     match typ {
-        LuaType::Union(union) => union
-            .into_vec()
-            .iter()
-            .any(is_supported_metatable_index_type),
+        LuaType::Union(union) => union.types().any(is_supported_metatable_index_type),
         LuaType::TypeGuard(inner) => is_supported_metatable_index_type(inner),
         LuaType::Instance(instance) => is_supported_metatable_index_type(instance.get_base()),
         _ => typ.is_table() || typ.is_custom_type() || typ.is_object(),
@@ -1153,16 +1150,24 @@ fn dynamic_index_key_has_inferred_string_names(
 }
 
 fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {
+    let mut names = Vec::new();
+    if let Some(typ) = typ {
+        collect_string_const_names(typ, &mut names);
+    }
+    names
+}
+
+fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     match typ {
-        Some(LuaType::StringConst(name)) | Some(LuaType::DocStringConst(name)) => {
-            vec![name.as_ref().clone()]
+        LuaType::StringConst(name) | LuaType::DocStringConst(name) => {
+            names.push(name.as_ref().clone());
         }
-        Some(LuaType::Union(union_type)) => union_type
-            .into_vec()
-            .iter()
-            .flat_map(|typ| string_const_names(&Some(typ.clone())))
-            .collect(),
-        _ => Vec::new(),
+        LuaType::Union(union_type) => {
+            for member in union_type.types() {
+                collect_string_const_names(member, names);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1190,8 +1195,8 @@ fn collect_wildcard_for_type(
             collect_wildcard_for_type(inner, file_id, range, result);
         }
         LuaType::Union(union_type) => {
-            for t in union_type.into_vec() {
-                collect_wildcard_for_type(&t, file_id, range, result);
+            for t in union_type.types() {
+                collect_wildcard_for_type(t, file_id, range, result);
             }
         }
         _ => {}
@@ -1229,8 +1234,8 @@ fn collect_for_type(
             collect_for_type(inner, field_name, file_id, range, result);
         }
         LuaType::Union(union_type) => {
-            for t in union_type.into_vec() {
-                collect_for_type(&t, field_name, file_id, range, result);
+            for t in union_type.types() {
+                collect_for_type(t, field_name, file_id, range, result);
             }
         }
         _ => {}

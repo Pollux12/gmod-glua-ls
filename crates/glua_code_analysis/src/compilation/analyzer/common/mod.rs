@@ -121,7 +121,7 @@ fn should_inferred_signature_replace_uninformative_cache(
 fn is_uninformative_inferred_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.into_vec().iter().all(is_uninformative_inferred_type),
+        LuaType::Union(union) => union.types().all(is_uninformative_inferred_type),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -133,7 +133,7 @@ fn is_uninformative_inferred_type(typ: &LuaType) -> bool {
 fn is_informative_inferred_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union.into_vec().iter().any(is_informative_inferred_type),
+        LuaType::Union(union) => union.types().any(is_informative_inferred_type),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -204,7 +204,7 @@ fn member_owner_from_type(typ: &LuaType) -> Option<LuaMemberOwner> {
         LuaType::Instance(inst) => member_owner_from_type(inst.get_base())
             .or_else(|| Some(LuaMemberOwner::Element(inst.get_range().clone()))),
         LuaType::TypeGuard(inner) => member_owner_from_type(inner),
-        LuaType::Union(union) => preferred_owner_from_types(union.into_vec().iter()),
+        LuaType::Union(union) => preferred_owner_from_types(union.types()),
         LuaType::Intersection(intersection) => {
             preferred_owner_from_types(intersection.get_types().iter())
         }

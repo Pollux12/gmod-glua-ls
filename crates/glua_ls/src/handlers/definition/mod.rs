@@ -357,10 +357,10 @@ fn collect_dynamic_field_locations(
             );
         }
         LuaType::Union(union_type) => {
-            for union_member in union_type.into_vec() {
+            for union_member in union_type.types() {
                 collect_dynamic_field_locations(
                     semantic_model,
-                    &union_member,
+                    union_member,
                     field_name,
                     locations,
                     caller_file_id,

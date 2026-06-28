@@ -667,8 +667,7 @@ fn metatable_index_type_points_to_table(typ: &LuaType, table_range: &InFiled<Tex
         LuaType::TableConst(range) => range == table_range,
         LuaType::Instance(instance) => instance.get_range() == table_range,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| metatable_index_type_points_to_table(typ, table_range)),
         LuaType::TypeGuard(inner) => metatable_index_type_points_to_table(inner, table_range),
         _ => false,
@@ -757,7 +756,7 @@ fn owner_has_precise_dynamic_value(
 fn type_is_uninformative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.into_vec().iter().all(type_is_uninformative),
+        LuaType::Union(union) => union.types().all(type_is_uninformative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -963,8 +962,7 @@ fn expr_dynamic_access_matches_unknown_member(access_key_type: &LuaType) -> bool
         | LuaType::FloatConst(_) => true,
         LuaType::TypeGuard(inner) => expr_dynamic_access_matches_unknown_member(inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(expr_dynamic_access_matches_unknown_member),
         _ => false,
     }
@@ -1117,8 +1115,8 @@ fn is_precise_unknown_wildcard_value_type(typ: &LuaType) -> bool {
         LuaType::TypeGuard(inner) => is_precise_unknown_wildcard_value_type(inner),
         LuaType::TableOf(inner) => is_precise_unknown_wildcard_value_type(inner),
         LuaType::Union(union) => {
-            let members = union.into_vec();
-            !members.is_empty() && members.iter().all(is_precise_unknown_wildcard_value_type)
+            union.types().next().is_some()
+                && union.types().all(is_precise_unknown_wildcard_value_type)
         }
         _ => false,
     }
@@ -1129,8 +1127,7 @@ fn is_broad_wildcard_key_type(typ: &LuaType) -> bool {
         LuaType::Any | LuaType::String | LuaType::Number | LuaType::Integer => true,
         LuaType::TypeGuard(inner) => is_broad_wildcard_key_type(inner),
         LuaType::Union(union) => {
-            let members = union.into_vec();
-            !members.is_empty() && members.iter().all(is_broad_wildcard_key_type)
+            union.types().next().is_some() && union.types().all(is_broad_wildcard_key_type)
         }
         _ => false,
     }
@@ -1446,9 +1443,8 @@ fn is_entity_or_derived_type(db: &DbIndex, typ: &LuaType) -> bool {
         LuaType::Instance(instance) => is_entity_or_derived_type(db, instance.get_base()),
         LuaType::TableOf(base) => is_entity_or_derived_type(db, base),
         LuaType::Union(union) => {
-            let types = union.into_vec();
             let mut saw_non_nil = false;
-            for typ in types.iter().filter(|typ| !matches!(typ, LuaType::Nil)) {
+            for typ in union.types().filter(|typ| !matches!(typ, LuaType::Nil)) {
                 saw_non_nil = true;
                 if !is_entity_or_derived_type(db, typ) {
                     return false;
@@ -1736,7 +1732,7 @@ fn get_all_member_key(db: &DbIndex, origin_type: &LuaType) -> Option<Vec<LuaMemb
                 }
             }
             LuaType::Union(union_type) => {
-                for typ in union_type.into_vec() {
+                for typ in union_type.types() {
                     if let LuaType::Ref(_) = typ {
                         stack.push(typ.clone()); // 推入堆栈
                     }
@@ -1912,7 +1908,7 @@ fn infer_union_member(
 ) -> InferResult {
     let mut member_types = Vec::new();
     let mut meet_string = false;
-    for sub_type in union_type.into_vec() {
+    for sub_type in union_type.types() {
         if sub_type.is_string() {
             if meet_string {
                 continue;
@@ -1922,7 +1918,7 @@ fn infer_union_member(
         let result = infer_member_by_member_key(
             db,
             cache,
-            &sub_type,
+            sub_type,
             index_expr.clone(),
             &infer_guard.fork(),
         );
@@ -2599,9 +2595,9 @@ fn infer_member_by_index_union(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     let mut member_type = LuaType::Unknown;
-    for member in union.into_vec() {
+    for member in union.types() {
         let result =
-            infer_member_by_operator(db, cache, &member, index_expr.clone(), &infer_guard.fork());
+            infer_member_by_operator(db, cache, member, index_expr.clone(), &infer_guard.fork());
         match result {
             Ok(typ) => {
                 member_type = TypeOps::Union.apply(db, &member_type, &typ);
@@ -2853,8 +2849,8 @@ fn get_expr_member_key(
                 }
             }
             LuaType::Union(union_typ) => {
-                for t in union_typ.into_vec() {
-                    if !visited.contains(&t) {
+                for t in union_typ.types() {
+                    if !visited.contains(t) {
                         stack.push(t.clone());
                     }
                 }

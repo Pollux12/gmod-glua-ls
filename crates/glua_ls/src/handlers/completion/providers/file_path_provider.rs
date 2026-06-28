@@ -186,9 +186,9 @@ fn infer_path_kind_from_call_type(
         }
         LuaType::Union(union_type) => {
             let mut kind = None;
-            for member_type in union_type.into_vec() {
+            for member_type in union_type.types() {
                 let member_kind =
-                    infer_path_kind_from_call_type(builder, &member_type, call_is_colon, arg_idx)?;
+                    infer_path_kind_from_call_type(builder, member_type, call_is_colon, arg_idx)?;
                 kind = Some(merge_path_completion_kind(kind, member_kind));
             }
             kind
@@ -218,8 +218,8 @@ fn classify_path_type(typ: &LuaType) -> Option<PathCompletionKind> {
         LuaType::Language(name) => name.to_string(),
         LuaType::Union(union_type) => {
             let mut kind = None;
-            for member_type in union_type.into_vec() {
-                let member_kind = classify_path_type(&member_type)?;
+            for member_type in union_type.types() {
+                let member_kind = classify_path_type(member_type)?;
                 kind = Some(merge_path_completion_kind(kind, member_kind));
             }
             return kind;

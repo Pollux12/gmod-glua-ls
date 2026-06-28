@@ -47,7 +47,7 @@ fn check_table_expr(
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
         LuaType::Union(union) => {
             let mut set = HashSet::new();
-            for ty in union.into_vec().iter() {
+            for ty in union.types() {
                 if context.is_cancelled() {
                     return Some(());
                 }

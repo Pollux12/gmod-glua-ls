@@ -129,8 +129,7 @@ fn check_ref_enum(
     let compact_type = match compact_type {
         LuaType::Union(union_types) => {
             let new_types: Vec<_> = union_types
-                .into_vec()
-                .iter()
+                .types()
                 .filter(
                     |typ| !matches!(typ, LuaType::Def(id) | LuaType::Ref(id) if id == source_id),
                 )
@@ -158,8 +157,7 @@ fn check_ref_enum(
     // 当 enum 的值全为整数常量时, 可能会用于位运算, 此时右值推断为整数
     if let LuaType::Union(union_types) = &enum_fields
         && union_types
-            .into_vec()
-            .iter()
+            .types()
             .all(|t| matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_)))
         && matches!(
             compact_type,
@@ -234,11 +232,11 @@ fn check_ref_class(
                     compact_decl.get_enum_field_type(context.db)
             {
                 let source = LuaType::Ref(source_id.clone());
-                for field in enum_fields.into_vec() {
+                for field in enum_fields.types() {
                     check_general_type_compact(
                         context,
                         &source,
-                        &field,
+                        field,
                         check_guard.next_level()?,
                     )?;
                 }
@@ -279,11 +277,11 @@ fn check_ref_class(
             check_guard.next_level()?,
         ),
         LuaType::Union(union_type) => {
-            for typ in union_type.into_vec() {
+            for typ in union_type.types() {
                 check_general_type_compact(
                     context,
                     &LuaType::Ref(source_id.clone()),
-                    &typ,
+                    typ,
                     check_guard.next_level()?,
                 )?;
             }
@@ -583,8 +581,7 @@ fn check_ref_type_compact_tuple(
 fn is_all_integer_const_origin(origin_type: &LuaType) -> bool {
     match origin_type {
         LuaType::Union(union_types) => union_types
-            .into_vec()
-            .iter()
+            .types()
             .all(|t| matches!(t, LuaType::DocIntegerConst(_) | LuaType::IntegerConst(_))),
         LuaType::MultiLineUnion(multi_union) => {
             let unions = multi_union.get_unions();

@@ -1103,7 +1103,7 @@ fn build_node_semantic_token(
                         );
                     }
                 }
-                LuaType::Union(union) if union.into_vec().iter().any(is_function_like_type) => {
+                LuaType::Union(union) if union.types().any(is_function_like_type) => {
                     if let Some(field_name) = table_field.get_field_key()?.get_name() {
                         let modifiers = [
                             SemanticTokenModifier::DECLARATION,
@@ -1520,7 +1520,7 @@ fn render_callable_name_token(
             SemanticTokenType::FUNCTION,
             CustomSemanticTokenModifier::CALLABLE,
         ),
-        Some(LuaType::Union(union)) if union.into_vec().iter().any(|typ| typ.is_function()) => {
+        Some(LuaType::Union(union)) if union.types().any(|typ| typ.is_function()) => {
             builder.push_with_modifier(
                 token,
                 SemanticTokenType::FUNCTION,
@@ -1627,8 +1627,7 @@ fn is_object_like_value_type(semantic_model: &SemanticModel, decl_type: &LuaType
         | LuaType::TableGeneric(_)
         | LuaType::TableOf(_) => true,
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| is_object_like_value_type(semantic_model, typ)),
         _ => false,
     }
@@ -1690,7 +1689,7 @@ fn is_scoped_scripted_class_name(semantic_model: &SemanticModel, name: &str) -> 
 fn is_function_like_type(decl_type: &LuaType) -> bool {
     match decl_type {
         LuaType::DocFunction(_) => true,
-        LuaType::Union(union) => union.into_vec().iter().any(|typ| typ.is_function()),
+        LuaType::Union(union) => union.types().any(|typ| typ.is_function()),
         _ => decl_type.is_function(),
     }
 }
@@ -1726,8 +1725,7 @@ fn is_default_library_type(semantic_model: &SemanticModel, decl_type: &LuaType) 
                 || module_index.is_meta_file(&file_id)
         }
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|typ| is_default_library_type(semantic_model, typ)),
         _ => false,
     }

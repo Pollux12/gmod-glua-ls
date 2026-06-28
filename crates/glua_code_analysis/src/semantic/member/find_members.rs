@@ -595,7 +595,7 @@ fn find_union_members(
 ) -> FindMembersResult {
     let mut members = Vec::new();
     let mut meet_string = false;
-    for typ in union_type.into_vec().iter() {
+    for typ in union_type.types() {
         let instantiated_type = ctx.instantiate_type(db, typ);
         if instantiated_type.is_string() {
             if meet_string {

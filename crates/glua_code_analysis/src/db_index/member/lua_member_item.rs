@@ -612,7 +612,7 @@ fn collect_override_callable_shape(
     fn type_has_callable(typ: &LuaType) -> bool {
         match typ {
             LuaType::DocFunction(_) | LuaType::Signature(_) => true,
-            LuaType::Union(union_type) => union_type.into_vec().iter().any(type_has_callable),
+            LuaType::Union(union_type) => union_type.types().any(type_has_callable),
             _ => false,
         }
     }
@@ -629,8 +629,7 @@ fn collect_override_callable_shape(
                         && !signature.to_doc_func_type().contain_tpl()
                 }),
             LuaType::Union(union_type) => union_type
-                .into_vec()
-                .iter()
+                .types()
                 .any(|union_member| type_has_non_generic_callable(db, union_member)),
             _ => false,
         }
@@ -659,8 +658,8 @@ fn collect_override_callable_shape(
                 }
             }
             LuaType::Union(union_type) => {
-                for union_member in union_type.into_vec() {
-                    collect_from_type(db, &union_member, shape);
+                for union_member in union_type.types() {
+                    collect_from_type(db, union_member, shape);
                 }
             }
             _ => {}
@@ -717,8 +716,8 @@ fn extract_generic_callables(db: &DbIndex, typ: &LuaType) -> Vec<Arc<LuaFunction
                 }
             }
             LuaType::Union(union_type) => {
-                for union_member in union_type.into_vec() {
-                    collect(db, &union_member, out);
+                for union_member in union_type.types() {
+                    collect(db, union_member, out);
                 }
             }
             _ => {}
@@ -749,8 +748,7 @@ fn prune_non_generic_callables_for_adapter_merge(db: &DbIndex, typ: &LuaType) ->
     match typ {
         LuaType::Union(union_type) => {
             let pruned_members = union_type
-                .into_vec()
-                .iter()
+                .types()
                 .filter(|union_member| {
                     if matches!(
                         union_member,
@@ -978,7 +976,7 @@ fn member_type_is_uninformative(db: &DbIndex, member_id: LuaMemberId) -> bool {
 fn type_is_uninformative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.into_vec().iter().all(type_is_uninformative),
+        LuaType::Union(union) => union.types().all(type_is_uninformative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
