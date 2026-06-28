@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{sync::Arc, time::Instant};
 
     use crate::{DiagnosticCode, VirtualWorkspace};
     #[test]
@@ -197,5 +197,46 @@ mod tests {
                 function PANEL:Init() end
         "#
         ));
+    }
+    #[test]
+    fn repeated_scopes_with_many_visible_locals_diagnose_quick_smoke() {
+        let mut code = String::new();
+        for i in 0..300 {
+            code.push_str(&format!(
+                "local visible_{i} = {i}\ndo\n    local scoped_{i} = visible_{i}\nend\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
+        let elapsed = start.elapsed();
+
+        assert!(no_redefined_local);
+        assert!(
+            elapsed.as_millis() < 250,
+            "redefined-local repeated-scope smoke took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_syntax_vgui_registration_reuse_diagnose_quick_smoke() {
+        let mut code = String::new();
+        for i in 0..80 {
+            code.push_str(&format!(
+                "local PANEL = {{}}\nfunction PANEL:Init() end\nvgui.Register(\"Panel{i}\", PANEL, \"Panel\")\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
+        let elapsed = start.elapsed();
+
+        assert!(no_redefined_local);
+        assert!(
+            elapsed.as_millis() < 250,
+            "redefined-local vgui registration smoke took too long: {elapsed:?}"
+        );
     }
 }

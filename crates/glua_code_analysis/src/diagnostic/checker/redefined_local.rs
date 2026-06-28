@@ -6,6 +6,7 @@ use crate::{
     ScopeOrDeclId, SemanticModel,
 };
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind, PathTrait};
+use rowan::{TextRange, TextSize};
 
 use super::{Checker, DiagnosticContext};
 
@@ -28,17 +29,22 @@ impl Checker for RedefinedLocalChecker {
             return;
         };
         let mut diagnostics = HashSet::new();
-        let mut root_locals = HashMap::new();
+        let mut visible_locals = HashMap::new();
+        let mut changes = Vec::new();
         let gmod_enabled = semantic_model.get_emmyrc().gmod.enabled;
+        let syntax_registrations =
+            collect_syntax_vgui_registration_calls(semantic_model.get_db(), file_id);
 
         check_scope_for_redefined_locals(
             semantic_model.get_db(),
             &file_id,
             decl_tree,
             root_scope,
-            &mut root_locals,
+            &mut visible_locals,
+            &mut changes,
             &mut diagnostics,
             gmod_enabled,
+            &syntax_registrations,
         );
 
         // 添加诊断信息
@@ -61,13 +67,14 @@ fn check_scope_for_redefined_locals(
     file_id: &crate::FileId,
     decl_tree: &LuaDeclarationTree,
     scope: &LuaScope,
-    parent_locals: &mut HashMap<String, LuaDeclId>,
+    visible_locals: &mut HashMap<String, LuaDeclId>,
+    changes: &mut Vec<VisibleLocalChange>,
     diagnostics: &mut HashSet<LuaDeclId>,
     gmod_enabled: bool,
+    syntax_registrations: &[SyntaxVguiRegistrationCall],
 ) {
     let should_add_to_parent = should_add_to_parent_scope(scope);
-
-    let mut current_locals = parent_locals.clone();
+    let scope_change_start = changes.len();
 
     // 检查当前作用域中的声明
     for child in scope.get_children() {
@@ -82,8 +89,8 @@ fn check_scope_for_redefined_locals(
                 if decl.is_seeded_class_local() {
                     continue;
                 }
-                if current_locals.contains_key(&name) {
-                    let old_decl = current_locals
+                if visible_locals.contains_key(&name) {
+                    let old_decl = visible_locals
                         .get(&name)
                         .and_then(|id| decl_tree.get_decl(id));
                     if var_name_not_conflicts_with_function_param_name(decl, old_decl).is_some() {
@@ -91,9 +98,16 @@ fn check_scope_for_redefined_locals(
                     }
                     if gmod_enabled
                         && let Some(old_decl) = old_decl
-                        && gmod_registered_local_reuse(db, file_id, &name, old_decl, decl)
+                        && gmod_registered_local_reuse(
+                            db,
+                            file_id,
+                            &name,
+                            old_decl,
+                            decl,
+                            syntax_registrations,
+                        )
                     {
-                        current_locals.insert(name.clone(), *decl_id);
+                        insert_visible_local(visible_locals, changes, name, *decl_id);
                         continue;
                     }
 
@@ -101,7 +115,7 @@ fn check_scope_for_redefined_locals(
                     diagnostics.insert(*decl_id);
                 }
                 // 将当前声明加入映射
-                current_locals.insert(name.clone(), *decl_id);
+                insert_visible_local(visible_locals, changes, name, *decl_id);
             }
         }
     }
@@ -116,17 +130,55 @@ fn check_scope_for_redefined_locals(
                 file_id,
                 decl_tree,
                 child_scope,
-                &mut current_locals,
+                visible_locals,
+                changes,
                 diagnostics,
                 gmod_enabled,
+                syntax_registrations,
             );
         }
     }
 
     // 更新到父作用域
-    if should_add_to_parent {
-        for (name, decl_id) in current_locals {
-            parent_locals.insert(name, decl_id);
+    if !should_add_to_parent {
+        rollback_visible_locals(visible_locals, changes, scope_change_start);
+    }
+}
+
+struct SyntaxVguiRegistrationCall {
+    table_name: String,
+    table_arg_range: TextRange,
+    call_range: TextRange,
+    call_start: TextSize,
+}
+
+struct VisibleLocalChange {
+    name: String,
+    previous: Option<LuaDeclId>,
+}
+
+fn insert_visible_local(
+    visible_locals: &mut HashMap<String, LuaDeclId>,
+    changes: &mut Vec<VisibleLocalChange>,
+    name: String,
+    decl_id: LuaDeclId,
+) {
+    let previous = visible_locals.insert(name.clone(), decl_id);
+    changes.push(VisibleLocalChange { name, previous });
+}
+
+fn rollback_visible_locals(
+    visible_locals: &mut HashMap<String, LuaDeclId>,
+    changes: &mut Vec<VisibleLocalChange>,
+    scope_change_start: usize,
+) {
+    while changes.len() > scope_change_start {
+        if let Some(change) = changes.pop() {
+            if let Some(previous) = change.previous {
+                visible_locals.insert(change.name, previous);
+            } else {
+                visible_locals.remove(&change.name);
+            }
         }
     }
 }
@@ -160,6 +212,7 @@ fn gmod_registered_local_reuse(
     name: &str,
     old_decl: &LuaDecl,
     current_decl: &LuaDecl,
+    syntax_registrations: &[SyntaxVguiRegistrationCall],
 ) -> bool {
     if db
         .get_gmod_class_metadata_index()
@@ -201,7 +254,46 @@ fn gmod_registered_local_reuse(
         return true;
     }
 
-    syntax_vgui_registration_consumes_decl_before_reuse(db, *file_id, name, old_decl, current_decl)
+    syntax_vgui_registration_consumes_decl_before_reuse(
+        db,
+        *file_id,
+        name,
+        old_decl,
+        current_decl,
+        syntax_registrations,
+    )
+}
+
+fn collect_syntax_vgui_registration_calls(
+    db: &DbIndex,
+    file_id: crate::FileId,
+) -> Vec<SyntaxVguiRegistrationCall> {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return Vec::new();
+    };
+
+    tree.get_chunk_node()
+        .descendants::<LuaCallExpr>()
+        .filter_map(|call_expr| {
+            let table_arg_idx = match call_expr.get_access_path().as_deref() {
+                Some("vgui.Register") => 1,
+                Some("vgui.RegisterTable") => 0,
+                Some("derma.DefineControl") => 2,
+                _ => return None,
+            };
+            let args_list = call_expr.get_args_list()?;
+            let table_arg = args_list.get_args().nth(table_arg_idx)?;
+            let LuaExpr::NameExpr(name_expr) = table_arg else {
+                return None;
+            };
+            Some(SyntaxVguiRegistrationCall {
+                table_name: name_expr.get_name_text()?.to_string(),
+                table_arg_range: name_expr.get_range(),
+                call_range: call_expr.get_range(),
+                call_start: call_expr.get_range().start(),
+            })
+        })
+        .collect()
 }
 
 fn syntax_vgui_registration_consumes_decl_before_reuse(
@@ -210,64 +302,19 @@ fn syntax_vgui_registration_consumes_decl_before_reuse(
     name: &str,
     old_decl: &LuaDecl,
     current_decl: &LuaDecl,
+    syntax_registrations: &[SyntaxVguiRegistrationCall],
 ) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
-        return false;
-    };
-
-    tree.get_chunk_node()
-        .descendants::<LuaCallExpr>()
-        .any(|call_expr| {
-            let table_arg_idx = match call_expr.get_access_path().as_deref() {
-                Some("vgui.Register") => 1,
-                Some("vgui.RegisterTable") => 0,
-                Some("derma.DefineControl") => 2,
-                _ => return false,
-            };
-            syntax_registration_call_consumes_decl_before_reuse(
-                db,
-                file_id,
-                name,
-                old_decl,
-                current_decl,
-                &call_expr,
-                table_arg_idx,
-            )
-        })
-}
-
-fn syntax_registration_call_consumes_decl_before_reuse(
-    db: &DbIndex,
-    file_id: crate::FileId,
-    name: &str,
-    old_decl: &LuaDecl,
-    current_decl: &LuaDecl,
-    call_expr: &LuaCallExpr,
-    table_arg_idx: usize,
-) -> bool {
-    let Some(args_list) = call_expr.get_args_list() else {
-        return false;
-    };
-    let Some(table_arg) = args_list.get_args().nth(table_arg_idx) else {
-        return false;
-    };
-    if !matches!(&table_arg, LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some(name))
-    {
-        return false;
-    }
-    if db
-        .get_reference_index()
-        .get_var_reference_decl(&file_id, table_arg.get_range())
-        != Some(old_decl.get_id())
-    {
-        return false;
-    }
-
-    let call_start = call_expr.get_range().start();
-    call_start < current_decl.get_range().start()
-        || current_decl
-            .get_value_syntax_id()
-            .is_some_and(|value_syntax_id| value_syntax_id.get_range() == call_expr.get_range())
+    syntax_registrations.iter().any(|call| {
+        call.table_name == name
+            && db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, call.table_arg_range)
+                == Some(old_decl.get_id())
+            && (call.call_start < current_decl.get_range().start()
+                || current_decl
+                    .get_value_syntax_id()
+                    .is_some_and(|value_syntax_id| value_syntax_id.get_range() == call.call_range))
+    })
 }
 
 fn gmod_registration_consumes_decl_before_reuse(
