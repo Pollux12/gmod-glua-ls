@@ -916,15 +916,15 @@ fn find_declared_member_types_for_dynamic_field(
     key: LuaMemberKey,
     member_id: LuaMemberId,
 ) -> Option<Vec<LuaType>> {
-    if let LuaType::TableConst(table_range) = owner_type {
-        if let Some(member_type) = db
-            .get_type_index()
-            .get_type_cache(&LuaTypeOwner::Member(member_id))
-            .map(|cache| cache.as_type().clone())
-        {
-            return Some(vec![member_type]);
-        }
+    if let Some(member_type) = db
+        .get_type_index()
+        .get_type_cache(&LuaTypeOwner::Member(member_id))
+        .map(|cache| cache.as_type().clone())
+    {
+        return Some(vec![member_type]);
+    }
 
+    if let LuaType::TableConst(table_range) = owner_type {
         let owner = LuaMemberOwner::Element(table_range.clone());
         let member_types = db
             .get_member_index()
@@ -1316,5 +1316,123 @@ fn collect_for_type(
             }
         }
         _ => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use crate::{
+        DbIndex, FileId, InFiled, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+        LuaMemberOwner, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeOwner,
+    };
+
+    use super::find_declared_member_types_for_dynamic_field;
+
+    fn member_id_at(start: u32) -> LuaMemberId {
+        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
+        LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
+            FileId::new(0),
+        )
+    }
+
+    fn table_range_at(start: u32) -> InFiled<TextRange> {
+        InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(start), TextSize::new(start + 1)),
+        )
+    }
+
+    fn add_typed_member(
+        db: &mut DbIndex,
+        owner: LuaMemberOwner,
+        member_id: LuaMemberId,
+        key: LuaMemberKey,
+        typ: LuaType,
+    ) {
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(member_id, key, LuaMemberFeature::FileDefine, None),
+        );
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Member(member_id),
+            LuaTypeCache::InferType(typ),
+        );
+    }
+
+    #[test]
+    fn declared_member_field_collection_uses_current_member_type_for_ref_owners() {
+        let mut db = DbIndex::new();
+        let member_id = member_id_at(1);
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Member(member_id),
+            LuaTypeCache::InferType(LuaType::Table),
+        );
+
+        let member_types = find_declared_member_types_for_dynamic_field(
+            &db,
+            &LuaType::Ref(LuaTypeDeclId::global("DynamicOwner")),
+            LuaMemberKey::from("field"),
+            member_id,
+        )
+        .expect("current member type cache should be enough for non-table owners");
+
+        assert_eq!(member_types, vec![LuaType::Table]);
+    }
+
+    #[test]
+    fn declared_member_field_collection_uses_current_member_type_before_owner_key_fallback() {
+        let mut db = DbIndex::new();
+        let table_range = table_range_at(10);
+        let owner = LuaMemberOwner::Element(table_range.clone());
+        add_typed_member(
+            &mut db,
+            owner,
+            member_id_at(1),
+            LuaMemberKey::from("field"),
+            LuaType::String,
+        );
+        let current_member_id = member_id_at(3);
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Member(current_member_id),
+            LuaTypeCache::InferType(LuaType::Boolean),
+        );
+
+        let member_types = find_declared_member_types_for_dynamic_field(
+            &db,
+            &LuaType::TableConst(table_range),
+            LuaMemberKey::from("field"),
+            current_member_id,
+        )
+        .expect("current member type cache should take precedence");
+
+        assert_eq!(member_types, vec![LuaType::Boolean]);
+    }
+
+    #[test]
+    fn declared_member_field_collection_keeps_table_owner_fallback_without_current_cache() {
+        let mut db = DbIndex::new();
+        let table_range = table_range_at(10);
+        let owner = LuaMemberOwner::Element(table_range.clone());
+        add_typed_member(
+            &mut db,
+            owner,
+            member_id_at(1),
+            LuaMemberKey::from("field"),
+            LuaType::String,
+        );
+
+        let member_types = find_declared_member_types_for_dynamic_field(
+            &db,
+            &LuaType::TableConst(table_range),
+            LuaMemberKey::from("field"),
+            member_id_at(99),
+        )
+        .expect("table owner/key fallback should still provide member types");
+
+        assert_eq!(member_types, vec![LuaType::String]);
     }
 }

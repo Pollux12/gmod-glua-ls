@@ -2858,9 +2858,10 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
 
 #[cfg(test)]
 mod tests {
+    use glua_parser::LuaSyntaxId;
     use rowan::{TextRange, TextSize};
 
-    use crate::{FileId, InFiled, LuaMergedTableType, LuaUnionType};
+    use crate::{DbIndex, FileId, InFiled, LuaMergedTableType, LuaUnionType};
 
     use super::*;
 
@@ -2869,6 +2870,39 @@ mod tests {
             FileId::new(0),
             TextRange::new(TextSize::new(start), TextSize::new(end)),
         ))
+    }
+
+    fn member_id_at(start: u32) -> LuaMemberId {
+        let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
+        LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
+            FileId::new(0),
+        )
+    }
+
+    fn add_typed_file_define_member(
+        db: &mut DbIndex,
+        owner: LuaMemberOwner,
+        member_id: LuaMemberId,
+        key: LuaMemberKey,
+        typ: LuaType,
+    ) {
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(member_id, key, LuaMemberFeature::FileDefine, None),
+        );
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Member(member_id),
+            LuaTypeCache::InferType(typ),
+        );
+    }
+
+    fn with_analyzer<T>(db: &mut DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
+        let mut context = crate::compilation::analyzer::AnalyzeContext::new();
+        let matcher = super::super::call::SpecialCallDirectMatcher::default();
+        let mut analyzer =
+            LuaAnalyzer::new(db, FileId::new(0), &mut context, false, false, &matcher);
+        run(&mut analyzer)
     }
 
     #[test]
@@ -2886,5 +2920,142 @@ mod tests {
         );
 
         assert!(has_multiple_distinct_index_expr_member_owners(&typ));
+    }
+
+    #[test]
+    fn member_assignment_widening_uses_cache_for_sequential_same_key_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            LuaType::Integer,
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &LuaType::Integer,
+                false,
+            );
+            add_typed_file_define_member(analyzer.db, owner, second_member, key, LuaType::String);
+
+            let widened = get_cached_widened_member_assignment_type(
+                analyzer,
+                &LuaTypeOwner::Member(second_member),
+                &LuaType::String,
+                false,
+            )
+            .expect("sequential owner/key cache should be usable")
+            .expect("second same-key assignment should widen with cached prior type");
+
+            assert_eq!(
+                widened,
+                TypeOps::Union.apply(analyzer.db, &LuaType::Integer, &LuaType::String)
+            );
+        });
+    }
+
+    #[test]
+    fn member_collection_assignment_widening_uses_cache_for_sequential_same_key_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("items");
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+        let first_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
+        let second_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            first_array.clone(),
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            record_member_collection_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &first_array,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner,
+                second_member,
+                key,
+                second_array.clone(),
+            );
+            let (owner, key) = {
+                let member_index = analyzer.db.get_member_index();
+                (
+                    member_index
+                        .get_member_owner(&second_member)
+                        .expect("member owner")
+                        .clone(),
+                    member_index
+                        .get_member(&second_member)
+                        .expect("member")
+                        .get_key()
+                        .clone(),
+                )
+            };
+
+            let widened = get_cached_widened_member_collection_assignment_type(
+                analyzer,
+                &owner,
+                &key,
+                second_member,
+                &LuaType::String,
+            )
+            .expect("sequential collection cache should be usable");
+
+            assert_eq!(
+                widened,
+                LuaType::Array(
+                    LuaArrayType::from_base_type(TypeOps::Union.apply(
+                        analyzer.db,
+                        &LuaType::String,
+                        &LuaType::Integer,
+                    ))
+                    .into()
+                )
+            );
+        });
+    }
+
+    #[test]
+    fn expr_key_members_are_detected_as_dynamic_assignments() {
+        let mut db = DbIndex::new();
+        let member_id = member_id_at(1);
+        add_typed_file_define_member(
+            &mut db,
+            LuaMemberOwner::Element(InFiled::new(
+                FileId::new(0),
+                TextRange::new(TextSize::new(10), TextSize::new(11)),
+            )),
+            member_id,
+            LuaMemberKey::ExprType(LuaType::String),
+            LuaType::Table,
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            assert!(is_dynamic_expr_key_member_assignment(
+                analyzer,
+                &LuaTypeOwner::Member(member_id)
+            ));
+        });
     }
 }
