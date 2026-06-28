@@ -37,6 +37,19 @@ mod test {
         start.elapsed()
     }
 
+    fn index_repeated_guarded_bootstrap_assignments(count: usize) -> std::time::Duration {
+        let mut body = String::from("local T = {}\n");
+        for _ in 0..count {
+            body.push_str("T.field = T.field or {}\n");
+        }
+        body.push_str("return T\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
     #[test]
     #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
     fn repeated_field_assignment_indexing_stays_near_linear() {
@@ -85,6 +98,35 @@ mod test {
         };
         // The decl tree exists and analysis completed without hanging/panicking.
         assert!(result_type.is_some(), "file failed to index");
+    }
+
+    #[test]
+    fn repeated_guarded_bootstrap_assignment_still_indexes_quick_smoke() {
+        let elapsed = index_repeated_guarded_bootstrap_assignments(30);
+
+        assert!(
+            elapsed.as_millis() < 250,
+            "small guarded bootstrap smoke took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "wall-clock performance smoke for repeated guarded table bootstraps"]
+    fn repeated_guarded_bootstrap_assignment_indexing_stays_near_linear() {
+        let _ = index_repeated_guarded_bootstrap_assignments(200);
+
+        let small = index_repeated_guarded_bootstrap_assignments(1000);
+        let large = index_repeated_guarded_bootstrap_assignments(4000);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        eprintln!(
+            "guarded bootstrap assignment scaling: 1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x"
+        );
+        assert!(
+            ratio < 12.0,
+            "indexing scaled super-linearly with guarded bootstrap assignments \
+             (1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x)"
+        );
     }
 
     fn index_distinct_self_field_assignments(count: usize) -> std::time::Duration {

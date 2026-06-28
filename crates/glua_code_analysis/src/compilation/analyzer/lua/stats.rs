@@ -684,9 +684,25 @@ fn apply_index_expr_member_owner(
     member_owner: LuaMemberOwner,
     set_owner_only: bool,
 ) -> Option<()> {
+    let guarded_table_assignment = is_guarded_table_assignment_index_expr(&index_expr);
+    apply_index_expr_member_owner_with_guarded(
+        analyzer,
+        index_expr,
+        member_owner,
+        set_owner_only,
+        guarded_table_assignment,
+    )
+}
+
+fn apply_index_expr_member_owner_with_guarded(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: LuaIndexExpr,
+    member_owner: LuaMemberOwner,
+    set_owner_only: bool,
+    guarded_table_assignment: bool,
+) -> Option<()> {
     let index_key = index_expr.get_index_key()?;
     let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
-    let guarded_table_assignment = is_guarded_table_assignment_index_expr(&index_expr);
 
     if analyzer
         .db
@@ -709,6 +725,14 @@ fn apply_index_expr_member_owner(
             LuaMemberFeature::FileDefine
         };
         let member = LuaMember::new(member_id, member_key, decl_feature, None);
+        let guarded_file_define =
+            guarded_table_assignment && matches!(decl_feature, LuaMemberFeature::FileDefine);
+        if guarded_table_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+        }
         let member_index = analyzer.db.get_member_index_mut();
         member_index.add_member(member_owner, member);
         // `add_member` already records the enclosing function scope for
@@ -720,17 +744,19 @@ fn apply_index_expr_member_owner(
                 .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
-        if guarded_table_assignment {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
+        if guarded_table_assignment && !guarded_file_define {
             preserve_guarded_table_assignment_members(analyzer, member_id);
         }
         return Some(());
     }
 
     if set_owner_only {
+        if guarded_table_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+        }
         let function_scope = analyzer
             .db
             .get_member_index()
@@ -741,15 +767,24 @@ fn apply_index_expr_member_owner(
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         if guarded_table_assignment {
-            analyzer
-                .db
-                .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
             preserve_guarded_table_assignment_members(analyzer, member_id);
         }
         return Some(());
     }
 
+    let guarded_existing_file_define = guarded_table_assignment
+        && analyzer
+            .db
+            .get_member_index()
+            .get_member(&member_id)
+            .is_some_and(|member| member.get_feature() == LuaMemberFeature::FileDefine);
+
+    if guarded_table_assignment {
+        analyzer
+            .db
+            .get_member_index_mut()
+            .mark_non_overwriting_assignment_member(member_id);
+    }
     let function_scope = analyzer
         .db
         .get_member_index()
@@ -759,11 +794,7 @@ fn apply_index_expr_member_owner(
         .db
         .get_member_index_mut()
         .set_member_function_scope_range(member_id, function_scope);
-    if guarded_table_assignment {
-        analyzer
-            .db
-            .get_member_index_mut()
-            .mark_non_overwriting_assignment_member(member_id);
+    if guarded_table_assignment && !guarded_existing_file_define {
         preserve_guarded_table_assignment_members(analyzer, member_id);
     }
 
@@ -1237,11 +1268,17 @@ fn assign_merge_type_owner_and_expr_type(
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         if guarded_table_assignment {
-            analyzer
+            let already_preserved = analyzer
                 .db
-                .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(*member_id);
-            preserve_guarded_table_assignment_members(analyzer, *member_id);
+                .get_member_index()
+                .is_non_overwriting_assignment_member(*member_id);
+            if !already_preserved {
+                analyzer
+                    .db
+                    .get_member_index_mut()
+                    .mark_non_overwriting_assignment_member(*member_id);
+                preserve_guarded_table_assignment_members(analyzer, *member_id);
+            }
         } else if !dynamic_expr_key_member
             && !is_member_assignment_in_conditional_branch(analyzer, *member_id)
             && analyzer
@@ -1300,9 +1337,9 @@ fn get_cached_widened_member_assignment_type(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
     incoming_type: &LuaType,
-    preserve_table_literals: bool,
+    _preserve_table_literals: bool,
 ) -> Option<Option<LuaType>> {
-    if preserve_table_literals || prefer_class_assignment_type(incoming_type).is_some() {
+    if prefer_class_assignment_type(incoming_type).is_some() {
         return None;
     }
 
@@ -1364,12 +1401,8 @@ fn record_member_assignment_widening_cache(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
     assigned_type: &LuaType,
-    preserve_table_literals: bool,
+    _preserve_table_literals: bool,
 ) {
-    if preserve_table_literals {
-        return;
-    }
-
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return;
     };
@@ -1876,8 +1909,23 @@ fn get_widened_member_assignment_type(
 }
 
 fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    if widen_table_literals {
+        return widen_table_literals_for_assignment(typ);
+    }
+
+    crate::widen_literal_type_for_assignment(typ)
+}
+
+fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
     match typ {
-        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
+        LuaType::TableConst(_) => LuaType::Table,
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
+                .collect(),
+        ),
         _ => crate::widen_literal_type_for_assignment(typ),
     }
 }
@@ -2072,7 +2120,7 @@ fn dynamic_key_owner_and_member_key(
 }
 
 fn direct_local_table_prefix_member_owner(
-    analyzer: &LuaAnalyzer,
+    analyzer: &mut LuaAnalyzer,
     prefix_expr: &LuaExpr,
 ) -> Option<LuaMemberOwner> {
     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
@@ -2083,6 +2131,25 @@ fn direct_local_table_prefix_member_owner(
         .get_reference_index()
         .get_local_reference(&analyzer.file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
+    if let Some(cached_owner) = analyzer
+        .direct_local_table_member_owner_cache
+        .get(&decl_id)
+        .cloned()
+    {
+        return cached_owner;
+    }
+
+    let owner = resolve_direct_local_table_prefix_member_owner(analyzer, decl_id);
+    analyzer
+        .direct_local_table_member_owner_cache
+        .insert(decl_id, owner.clone());
+    owner
+}
+
+fn resolve_direct_local_table_prefix_member_owner(
+    analyzer: &LuaAnalyzer,
+    decl_id: LuaDeclId,
+) -> Option<LuaMemberOwner> {
     if is_local_mutable(analyzer, decl_id) {
         return None;
     }
@@ -2696,7 +2763,7 @@ fn special_assign_pattern(
     match expr_type {
         Ok(expr_type) => {
             if guarded_table_expr {
-                set_index_expr_owner(analyzer, var);
+                set_guarded_table_assignment_index_owner(analyzer, var, &left);
             }
 
             // Register inferred string default for `x = x or "literal"`.
@@ -2734,6 +2801,26 @@ fn special_assign_pattern(
     Some(())
 }
 
+fn set_guarded_table_assignment_index_owner(
+    analyzer: &mut LuaAnalyzer,
+    var: LuaVarExpr,
+    left: &LuaExpr,
+) -> Option<()> {
+    match var {
+        LuaVarExpr::IndexExpr(index_expr) => {
+            let cache_key = guarded_table_assignment_cache_key(analyzer, left)?;
+            apply_index_expr_member_owner_with_guarded(
+                analyzer,
+                index_expr,
+                cache_key.owner,
+                false,
+                true,
+            )
+        }
+        other => set_index_expr_owner(analyzer, other),
+    }
+}
+
 fn infer_guarded_table_assignment_type(
     analyzer: &mut LuaAnalyzer,
     binary_expr: &LuaExpr,
@@ -2741,12 +2828,54 @@ fn infer_guarded_table_assignment_type(
     right: &LuaExpr,
 ) -> Result<LuaType, InferFailReason> {
     let right_type = analyzer.infer_expr(right)?;
+    let cache_key = guarded_table_assignment_cache_key(analyzer, left);
+    if let Some(cached_left_type) = cache_key
+        .as_ref()
+        .and_then(|key| analyzer.guarded_table_assignment_type_cache.get(key))
+        .cloned()
+    {
+        if matches!(cached_left_type, LuaType::Table) && is_empty_table_expr(right) {
+            return Ok(LuaType::Table);
+        }
+        return merge_guarded_table_assignment_type(
+            analyzer,
+            binary_expr,
+            left,
+            cached_left_type,
+            right_type,
+        );
+    }
+
     let left_type = match analyzer.infer_expr(left) {
         Ok(left_type) => left_type,
         Err(reason) if reason.is_need_resolve() => LuaType::Nil,
         Err(reason) => return Err(reason),
     };
 
+    let result =
+        merge_guarded_table_assignment_type(analyzer, binary_expr, left, left_type, right_type)?;
+    if let Some(cache_key) = cache_key
+        && (result.is_any() || result.is_table())
+    {
+        analyzer
+            .guarded_table_assignment_type_cache
+            .insert(cache_key, widen_related_assignment_type(&result, true));
+    }
+
+    Ok(result)
+}
+
+fn is_empty_table_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::TableExpr(table_expr) if table_expr.get_fields().next().is_none())
+}
+
+fn merge_guarded_table_assignment_type(
+    analyzer: &mut LuaAnalyzer,
+    binary_expr: &LuaExpr,
+    left: &LuaExpr,
+    left_type: LuaType,
+    right_type: LuaType,
+) -> Result<LuaType, InferFailReason> {
     let left_type = remove_false_or_nil(left_type);
     if left_type.is_nil() || left_type.is_unknown() || left_type.is_never() {
         return Ok(right_type);
@@ -2759,6 +2888,28 @@ fn infer_guarded_table_assignment_type(
     }
 
     Ok(TypeOps::Union.apply(analyzer.db, &left_type, &right_type))
+}
+
+fn guarded_table_assignment_cache_key(
+    analyzer: &mut LuaAnalyzer,
+    left: &LuaExpr,
+) -> Option<MemberAssignmentWideningCacheKey> {
+    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
+    let LuaVarExpr::IndexExpr(index_expr) = left_var else {
+        return None;
+    };
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
+        let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
+        get_member_owner_for_prefix_type(prefix_type)
+    })?;
+    let index_key = index_expr.get_index_key()?;
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let key = LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
+    (!key.is_expr()).then_some(MemberAssignmentWideningCacheKey { owner, key })
 }
 
 fn should_prefer_guarded_dynamic_index_rhs(
@@ -2966,6 +3117,100 @@ mod tests {
     }
 
     #[test]
+    fn member_assignment_widening_cache_tracks_many_same_key_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+
+        with_analyzer(&mut db, |analyzer| {
+            let mut cache_hits = 0;
+            for i in 0..512 {
+                let member_id = member_id_at(i * 2 + 1);
+                add_typed_file_define_member(
+                    analyzer.db,
+                    owner.clone(),
+                    member_id,
+                    key.clone(),
+                    LuaType::String,
+                );
+
+                if i > 0 {
+                    assert!(
+                        get_cached_widened_member_assignment_type(
+                            analyzer,
+                            &LuaTypeOwner::Member(member_id),
+                            &LuaType::String,
+                            false,
+                        )
+                        .is_some(),
+                        "cache should stay enabled at member {i}"
+                    );
+                    cache_hits += 1;
+                }
+
+                record_member_assignment_widening_cache(
+                    analyzer,
+                    &LuaTypeOwner::Member(member_id),
+                    &LuaType::String,
+                    false,
+                );
+            }
+
+            assert_eq!(cache_hits, 511);
+        });
+    }
+
+    #[test]
+    fn member_assignment_widening_cache_tracks_many_preserved_table_literal_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+
+        with_analyzer(&mut db, |analyzer| {
+            let mut cache_hits = 0;
+            for i in 0..512 {
+                let member_id = member_id_at(i * 2 + 1);
+                let table_type = table_const(i * 2 + 1000, i * 2 + 1001);
+                add_typed_file_define_member(
+                    analyzer.db,
+                    owner.clone(),
+                    member_id,
+                    key.clone(),
+                    table_type.clone(),
+                );
+
+                if i > 0 {
+                    let cached_type = get_cached_widened_member_assignment_type(
+                        analyzer,
+                        &LuaTypeOwner::Member(member_id),
+                        &table_type,
+                        true,
+                    )
+                    .expect("preserved table-literal cache should stay enabled")
+                    .expect("preserved table-literal cache should return a widened type");
+                    assert_eq!(cached_type, LuaType::Table, "unexpected type at member {i}");
+                    cache_hits += 1;
+                }
+
+                record_member_assignment_widening_cache(
+                    analyzer,
+                    &LuaTypeOwner::Member(member_id),
+                    &table_type,
+                    true,
+                );
+            }
+
+            assert_eq!(cache_hits, 511);
+        });
+    }
+
+    #[test]
     fn member_collection_assignment_widening_uses_cache_for_sequential_same_key_members() {
         let mut db = DbIndex::new();
         let owner = LuaMemberOwner::Element(InFiled::new(
@@ -3033,6 +3278,54 @@ mod tests {
                     .into()
                 )
             );
+        });
+    }
+
+    #[test]
+    fn member_collection_assignment_widening_cache_tracks_many_same_key_members() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("items");
+        let array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
+
+        with_analyzer(&mut db, |analyzer| {
+            let mut cache_hits = 0;
+            for i in 0..512 {
+                let member_id = member_id_at(i * 2 + 1);
+                add_typed_file_define_member(
+                    analyzer.db,
+                    owner.clone(),
+                    member_id,
+                    key.clone(),
+                    array.clone(),
+                );
+
+                if i > 0 {
+                    assert!(
+                        get_cached_widened_member_collection_assignment_type(
+                            analyzer,
+                            &owner,
+                            &key,
+                            member_id,
+                            &LuaType::String,
+                        )
+                        .is_some(),
+                        "collection cache should stay enabled at member {i}"
+                    );
+                    cache_hits += 1;
+                }
+
+                record_member_collection_assignment_widening_cache(
+                    analyzer,
+                    &LuaTypeOwner::Member(member_id),
+                    &array,
+                );
+            }
+
+            assert_eq!(cache_hits, 511);
         });
     }
 

@@ -27,7 +27,7 @@ use log::info;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Emmyrc, FileId, GmodRealm, InferFailReason, LuaMemberKey, LuaMemberOwner,
+    Emmyrc, FileId, GmodRealm, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
     compilation::analyzer::{
         AnalysisPipeline,
         lua::call::{analyze_call, build_special_call_direct_matcher},
@@ -65,7 +65,8 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
         let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
-        let slow_log_enabled = log::log_enabled!(log::Level::Info);
+        let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+        let slow_log_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
         let total_start = slow_log_enabled.then(Instant::now);
         let mut workspace_profile = slow_log_enabled.then(LuaAnalyzeProfile::default);
         let mut file_count: usize = 0;
@@ -112,18 +113,40 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         if let Some(profile) = profile.as_ref() {
                             profile.log_slow_file(&path);
                         }
+                        if stderr_profile_enabled {
+                            eprintln!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                            if let Some(profile) = profile.as_ref() {
+                                eprintln!(
+                                    "lua analyze slow file node profile: {} [{}]",
+                                    path,
+                                    profile.summary(8)
+                                );
+                            }
+                        }
                     }
                 }
             }
         }
         if let Some(total_start) = total_start {
+            let total_elapsed = total_start.elapsed();
             info!(
                 "lua analyze total: {} files in {:?}",
-                file_count,
-                total_start.elapsed()
+                file_count, total_elapsed
             );
             if let Some(workspace_profile) = workspace_profile.as_ref() {
                 workspace_profile.log_workspace();
+            }
+            if stderr_profile_enabled {
+                eprintln!(
+                    "lua analyze total: {} files in {:?}",
+                    file_count, total_elapsed
+                );
+                if let Some(workspace_profile) = workspace_profile.as_ref() {
+                    eprintln!(
+                        "lua analyze workspace node profile: [{}]",
+                        workspace_profile.summary(8)
+                    );
+                }
             }
         }
     }
@@ -237,6 +260,8 @@ struct LuaAnalyzer<'a> {
     member_collection_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberCollectionAssignmentWideningCache>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
+    guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
+    direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -291,6 +316,8 @@ impl LuaAnalyzer<'_> {
             member_assignment_widening_cache: FxHashMap::default(),
             member_collection_assignment_widening_cache: FxHashMap::default(),
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
+            guarded_table_assignment_type_cache: FxHashMap::default(),
+            direct_local_table_member_owner_cache: FxHashMap::default(),
         }
     }
 
