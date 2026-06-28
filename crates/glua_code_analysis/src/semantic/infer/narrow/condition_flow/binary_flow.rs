@@ -6,22 +6,28 @@ use rowan::TextSize;
 
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaArrayLen, LuaArrayType,
-    LuaInferCache, LuaType, TypeOps, infer_expr,
-    semantic::infer::{
-        VarRefId,
-        infer_index::infer_member_by_member_key,
-        narrow::{
-            ResultTypeOrContinue,
-            condition_flow::{
-                InferConditionFlow, call_flow::get_type_at_call_expr, get_type_at_condition_flow,
+    LuaInferCache, LuaMemberKey, LuaType, TypeOps, infer_expr,
+    semantic::type_check::is_sub_type_of,
+    semantic::{
+        infer::{
+            VarRefId,
+            infer_index::infer_member_by_member_key,
+            narrow::{
+                ResultTypeOrContinue,
+                condition_flow::{
+                    InferConditionFlow, call_flow::get_type_at_call_expr,
+                    get_type_at_condition_flow,
+                },
+                get_single_antecedent,
+                get_type_at_flow::get_type_at_flow,
+                get_var_ref_type, narrow_down_type,
+                var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
             },
-            get_single_antecedent,
-            get_type_at_flow::get_type_at_flow,
-            get_var_ref_type, narrow_down_type,
-            var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
+        },
+        member::{
+            cached_local_class_table_member_ids, find_members_with_key, infer_raw_member_type,
         },
     },
-    semantic::type_check::is_sub_type_of,
 };
 
 #[allow(clippy::too_many_arguments)]
@@ -415,22 +421,44 @@ fn maybe_type_guard_binary(
         return Ok(ResultTypeOrContinue::Continue);
     };
 
-    if maybe_var_ref_id != *var_ref_id {
-        let guard_position = type_guard_expr.get_range().start();
-        if !can_narrow_type_guard_through_decl_alias(
-            db,
-            cache,
-            root,
-            var_ref_id,
-            &maybe_var_ref_id,
-            guard_position,
-        ) {
-            return Ok(ResultTypeOrContinue::Continue);
+    let related_member_query = if maybe_var_ref_id != *var_ref_id {
+        let related_member_query =
+            static_member_suffix_for_related_var_ref(db, var_ref_id, &maybe_var_ref_id);
+        if related_member_query.is_some() {
+            related_member_query
+        } else {
+            let guard_position = type_guard_expr.get_range().start();
+            if !can_narrow_type_guard_through_decl_alias(
+                db,
+                cache,
+                root,
+                var_ref_id,
+                &maybe_var_ref_id,
+                guard_position,
+            ) {
+                return Ok(ResultTypeOrContinue::Continue);
+            }
+
+            None
         }
-    }
+    } else {
+        None
+    };
 
     let anatecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, anatecedent_flow_id)?;
+    let narrowed_var_ref_id = if related_member_query.is_some() {
+        &maybe_var_ref_id
+    } else {
+        var_ref_id
+    };
+    let antecedent_type = get_type_at_flow(
+        db,
+        tree,
+        cache,
+        root,
+        narrowed_var_ref_id,
+        anatecedent_flow_id,
+    )?;
 
     let narrow = match literal_string.as_str() {
         "number" => LuaType::Number,
@@ -454,6 +482,19 @@ fn maybe_type_guard_binary(
 
             if !can_target_class_be_a_more_specific_narrowing(db, &antecedent_type, target_type_id)
             {
+                if let Some(member_keys) = related_member_query.as_ref()
+                    && antecedent_already_target_or_more_specific(
+                        db,
+                        &antecedent_type,
+                        target_type_id,
+                    )
+                {
+                    return Ok(
+                        infer_static_member_path(db, cache, antecedent_type, member_keys)
+                            .map(ResultTypeOrContinue::Result)
+                            .unwrap_or(ResultTypeOrContinue::Continue),
+                    );
+                }
                 return Ok(ResultTypeOrContinue::Continue);
             }
 
@@ -468,7 +509,121 @@ fn maybe_type_guard_binary(
         InferConditionFlow::FalseCondition => TypeOps::Remove.apply(db, &antecedent_type, &narrow),
     };
 
+    if let Some(member_keys) = related_member_query {
+        return Ok(
+            infer_static_member_path(db, cache, result_type, &member_keys)
+                .map(ResultTypeOrContinue::Result)
+                .unwrap_or(ResultTypeOrContinue::Continue),
+        );
+    }
+
     Ok(ResultTypeOrContinue::Result(result_type))
+}
+
+fn static_member_suffix_for_related_var_ref(
+    db: &DbIndex,
+    query_var_ref_id: &VarRefId,
+    guarded_var_ref_id: &VarRefId,
+) -> Option<Vec<LuaMemberKey>> {
+    if !query_var_ref_id.start_with(guarded_var_ref_id) {
+        return None;
+    }
+
+    let VarRefId::IndexRef(query_root, query_path) = query_var_ref_id else {
+        return None;
+    };
+    let query_path = query_path.as_str();
+    let suffix = match guarded_var_ref_id {
+        VarRefId::VarRef(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            strip_member_suffix(query_path, decl.get_name())?
+        }
+        VarRefId::SelfRef(_) => strip_member_suffix(query_path, "self")?,
+        VarRefId::IndexRef(guarded_root, guarded_path) => {
+            if guarded_root != query_root {
+                return None;
+            }
+            strip_member_suffix(query_path, guarded_path.as_str())?
+        }
+        VarRefId::GlobalName(_, _) => return None,
+    };
+
+    static_member_path_keys(suffix)
+}
+
+fn strip_member_suffix<'a>(query_path: &'a str, prefix_path: &str) -> Option<&'a str> {
+    if query_path == prefix_path {
+        return Some("");
+    }
+
+    query_path
+        .strip_prefix(prefix_path)
+        .and_then(|suffix| suffix.strip_prefix('.'))
+}
+
+fn static_member_path_keys(path: &str) -> Option<Vec<LuaMemberKey>> {
+    if path.is_empty() {
+        return None;
+    }
+
+    path.split('.')
+        .map(|part| {
+            if part.is_empty() {
+                return None;
+            }
+
+            Some(
+                part.parse::<i64>()
+                    .map_or_else(|_| LuaMemberKey::Name(part.into()), LuaMemberKey::Integer),
+            )
+        })
+        .collect()
+}
+
+fn infer_static_member_path(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root_type: LuaType,
+    member_keys: &[LuaMemberKey],
+) -> Option<LuaType> {
+    let mut current_type = root_type;
+    for member_key in member_keys {
+        current_type = find_members_with_key(db, &current_type, member_key.clone(), false)
+            .and_then(|members| members.first().map(|member| member.typ.clone()))
+            .or_else(|| infer_local_class_table_member_type(db, cache, &current_type, member_key))
+            .or_else(|| infer_raw_member_type(db, &current_type, member_key).ok())?;
+    }
+
+    Some(current_type)
+}
+
+fn infer_local_class_table_member_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    class_type: &LuaType,
+    member_key: &LuaMemberKey,
+) -> Option<LuaType> {
+    let type_id = match class_type {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id,
+        LuaType::TypeGuard(inner) => {
+            return infer_local_class_table_member_type(db, cache, inner, member_key);
+        }
+        LuaType::TableOf(inner) => {
+            return infer_local_class_table_member_type(db, cache, inner, member_key);
+        }
+        _ => return None,
+    };
+
+    let member_ids = cached_local_class_table_member_ids(db, cache, type_id, member_key);
+    match member_ids.as_slice() {
+        [] => None,
+        [member_id] => crate::LuaMemberIndexItem::One(*member_id)
+            .resolve_type(db)
+            .ok(),
+        _ => crate::LuaMemberIndexItem::Many(member_ids)
+            .resolve_type(db)
+            .ok(),
+    }
 }
 
 fn can_narrow_type_guard_through_decl_alias(
