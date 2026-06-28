@@ -75,6 +75,24 @@ pub struct DbIndex {
     global_index: LuaGlobalIndex,
     json_schema_index: JsonSchemaIndex,
     emmyrc: Arc<Emmyrc>,
+    /// Revision-keyed cache for workspace-wide derived structures that are pure
+    /// functions of VFS content (currently the gmod net-helper registry). Stored
+    /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
+    /// Invalidated automatically by comparing `Vfs::content_revision`.
+    helper_registry_cache: RevisionedCache,
+}
+
+/// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
+#[derive(Default)]
+struct RevisionedCache(Option<(u64, Arc<dyn std::any::Any + Send + Sync>)>);
+
+impl std::fmt::Debug for RevisionedCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some((rev, _)) => write!(f, "RevisionedCache(rev={rev})"),
+            None => write!(f, "RevisionedCache(empty)"),
+        }
+    }
 }
 
 #[allow(unused)]
@@ -111,7 +129,33 @@ impl DbIndex {
             global_index: LuaGlobalIndex::new(),
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
+            helper_registry_cache: RevisionedCache::default(),
         }
+    }
+
+    /// Fetch the cached gmod net-helper registry if it was built at `revision`.
+    /// Type-erased so the `db_index` layer need not name the analyzer's registry
+    /// type; the caller downcasts to its concrete `T`.
+    pub fn get_cached_helper_registry<T: std::any::Any + Send + Sync>(
+        &self,
+        revision: u64,
+    ) -> Option<Arc<T>> {
+        match &self.helper_registry_cache.0 {
+            Some((cached_rev, value)) if *cached_rev == revision => {
+                value.clone().downcast::<T>().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Store a freshly built gmod net-helper registry keyed by the VFS content
+    /// revision it was derived from.
+    pub fn set_cached_helper_registry<T: std::any::Any + Send + Sync>(
+        &mut self,
+        revision: u64,
+        value: Arc<T>,
+    ) {
+        self.helper_registry_cache.0 = Some((revision, value));
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {

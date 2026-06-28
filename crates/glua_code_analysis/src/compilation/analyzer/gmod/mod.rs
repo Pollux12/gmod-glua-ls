@@ -167,7 +167,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // Sources from the VFS rather than `tree_list` because per-file
         // incremental analysis (`update_file_by_uri`) only places the changed
         // file in `tree_list`, but helpers can live in any file.
-        let helper_registry = build_helper_registry(db);
+        let helper_registry = get_or_build_helper_registry(db);
 
         // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
         let formatted_hook_prefixes: Vec<String> = db
@@ -656,9 +656,25 @@ fn collect_annotated_load_dependency_site(
 /// `Send + Sync` and can be shared across the parallel per-file collection
 /// workers. Each entry is resolved back to a `(LuaBlock, LuaChunk)` on demand by
 /// rebuilding the owning file's red tree from the (Send) green tree in the VFS.
-struct HelperRegistry {
+#[derive(Default)]
+pub(crate) struct HelperRegistry {
     map: HashMap<String, (FileId, LuaSyntaxId)>,
     methods: HashMap<String, (FileId, LuaSyntaxId)>,
+}
+
+/// Returns the workspace-wide net-helper registry, reusing a cached build when the
+/// VFS content has not changed since it was last computed. `build_helper_registry`
+/// scans every "net."-containing file's full AST, so on incremental edits and the
+/// cold-index stabilization re-run (which share a VFS content revision with the
+/// preceding pass) this avoids a redundant whole-workspace rescan.
+fn get_or_build_helper_registry(db: &mut DbIndex) -> Arc<HelperRegistry> {
+    let revision = db.get_vfs().content_revision();
+    if let Some(cached) = db.get_cached_helper_registry(revision) {
+        return cached;
+    }
+    let registry = Arc::new(build_helper_registry(db));
+    db.set_cached_helper_registry(revision, registry.clone());
+    registry
 }
 
 fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
