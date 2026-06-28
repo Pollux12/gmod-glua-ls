@@ -11,12 +11,11 @@ mod test {
     /// On large generated files this made a single file take seconds and timed
     /// the whole workspace out.
     ///
-    /// The per-assignment related-member scan is now bounded
-    /// (`MAX_RELATED_MEMBER_WIDENING_SCAN`), so analysis is linear in the number
-    /// of assignments. This test asserts that doubling the assignment count does
-    /// not super-linearly blow up indexing time. Timing-based, but with a wide
-    /// margin: the pre-fix code was ~quadratic (≈16× from 1k→4k), so even a
-    /// generous ratio bound reliably catches a regression without flaking.
+    /// Analysis should stay close to linear in the number of assignments. This
+    /// test asserts that doubling the assignment count does not super-linearly
+    /// blow up indexing time. Timing-based, but with a wide margin: the pre-fix
+    /// code was ~quadratic (≈16× from 1k→4k), so even a generous ratio check
+    /// reliably catches a regression without flaking.
     fn index_repeated_branched_assignments(count: usize) -> std::time::Duration {
         let mut body = String::from("local T = {}\n");
         for i in 0..count {
@@ -58,8 +57,8 @@ mod test {
 
     #[test]
     fn repeated_field_assignment_still_infers_field() {
-        // Behaviour guard: even past the widening-scan budget, the field must
-        // still resolve to a usable table type (analysis must not bail or panic).
+        // Behaviour guard: the field must still resolve to a usable table type
+        // after many guarded writes (analysis must not bail or panic).
         let mut ws = VirtualWorkspace::new();
         let mut body = String::from("local T = {}\n");
         for i in 0..300 {
