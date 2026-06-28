@@ -446,9 +446,7 @@ fn collect_member_guard_narrow_candidates(
 fn contains_callable_member_type(member_type: &LuaType) -> bool {
     match member_type {
         LuaType::Function | LuaType::Signature(_) | LuaType::DocFunction(_) => true,
-        LuaType::Union(union_type) => union_type
-            .types()
-            .any(contains_callable_member_type),
+        LuaType::Union(union_type) => union_type.types().any(contains_callable_member_type),
         LuaType::Intersection(intersection_type) => intersection_type
             .get_types()
             .iter()

@@ -234,12 +234,7 @@ fn check_union_type_compact_union(
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
     for compact_sub_type in compact_union.types() {
-        check_general_type_compact(
-            context,
-            source,
-            compact_sub_type,
-            check_guard.next_level()?,
-        )?;
+        check_general_type_compact(context, source, compact_sub_type, check_guard.next_level()?)?;
     }
 
     Ok(())

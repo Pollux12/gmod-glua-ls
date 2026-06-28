@@ -1280,9 +1280,7 @@ fn is_broad_factory_param_type(typ: &LuaType) -> bool {
 fn is_structured_factory_param_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Object(_) | LuaType::TableGeneric(_) => true,
-        LuaType::Union(union) => union
-            .types()
-            .any(is_structured_factory_param_type),
+        LuaType::Union(union) => union.types().any(is_structured_factory_param_type),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()

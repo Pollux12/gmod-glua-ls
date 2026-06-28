@@ -1520,13 +1520,12 @@ fn render_callable_name_token(
             SemanticTokenType::FUNCTION,
             CustomSemanticTokenModifier::CALLABLE,
         ),
-        Some(LuaType::Union(union)) if union.types().any(|typ| typ.is_function()) => {
-            builder.push_with_modifier(
+        Some(LuaType::Union(union)) if union.types().any(|typ| typ.is_function()) => builder
+            .push_with_modifier(
                 token,
                 SemanticTokenType::FUNCTION,
                 CustomSemanticTokenModifier::CALLABLE,
-            )
-        }
+            ),
         Some(other) if other.is_function() => builder.push_with_modifier(
             token,
             SemanticTokenType::FUNCTION,

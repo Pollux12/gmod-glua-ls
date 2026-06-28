@@ -113,10 +113,7 @@ pub fn infer_call_expr_func(
         ),
         LuaType::Union(union) => {
             // 此时我们将其视为泛型实例化联合体
-            if union
-                .types()
-                .all(|t| matches!(t, LuaType::DocFunction(_)))
-            {
+            if union.types().all(|t| matches!(t, LuaType::DocFunction(_))) {
                 infer_generic_doc_function_union(db, cache, union, call_expr.clone(), args_count)
             } else {
                 infer_union(db, cache, union, call_expr.clone(), args_count)

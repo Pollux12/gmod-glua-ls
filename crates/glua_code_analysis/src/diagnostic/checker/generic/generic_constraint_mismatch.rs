@@ -369,12 +369,9 @@ fn first_unprovable_str_tpl_const(
         }
         LuaType::Union(union) => {
             for member in union.types() {
-                if let Some(str) = first_unprovable_str_tpl_const(
-                    semantic_model,
-                    str_tpl_ref,
-                    member,
-                    extend_type,
-                ) {
+                if let Some(str) =
+                    first_unprovable_str_tpl_const(semantic_model, str_tpl_ref, member, extend_type)
+                {
                     return Some(str);
                 }
             }

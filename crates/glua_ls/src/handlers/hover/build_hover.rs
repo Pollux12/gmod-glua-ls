@@ -1193,9 +1193,7 @@ fn prefer_concrete_assignment_type_for_token(
 fn contains_open_table_any(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any => true,
-        LuaType::Union(union) => union
-            .types()
-            .any(|typ| matches!(typ, LuaType::Any)),
+        LuaType::Union(union) => union.types().any(|typ| matches!(typ, LuaType::Any)),
         _ => false,
     }
 }

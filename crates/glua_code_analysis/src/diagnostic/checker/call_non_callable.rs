@@ -159,9 +159,7 @@ fn has_non_callable_member(db: &DbIndex, typ: &LuaType) -> bool {
         LuaType::StrTplRef(str_tpl) => str_tpl
             .get_constraint()
             .is_some_and(|constraint| has_non_callable_member(db, constraint)),
-        LuaType::Union(union) => union
-            .types()
-            .any(|t| has_non_callable_member(db, t)),
+        LuaType::Union(union) => union.types().any(|t| has_non_callable_member(db, t)),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()

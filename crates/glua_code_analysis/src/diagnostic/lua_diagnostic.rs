@@ -170,14 +170,32 @@ impl LuaDiagnostic {
             let send_flows =
                 s.spawn(|| precompute_sorted_send_flows(db.get_gmod_network_index(), db.get_vfs()));
             (
-                workspace_realms.join().expect("workspace realm precompute panicked"),
-                missing.join().expect("precompute_missing_required_fields panicked"),
-                subclass.join().expect("precompute_subclass_fields panicked"),
-                await_c.join().expect("precompute_await_candidates panicked"),
-                param_type.join().expect("precompute_param_type_candidates panicked"),
-                nodiscard.join().expect("precompute_nodiscard_candidates panicked"),
-                decl_realms.join().expect("precompute_decl_annotation_realms panicked"),
-                Arc::new(send_flows.join().expect("precompute_sorted_send_flows panicked")),
+                workspace_realms
+                    .join()
+                    .expect("workspace realm precompute panicked"),
+                missing
+                    .join()
+                    .expect("precompute_missing_required_fields panicked"),
+                subclass
+                    .join()
+                    .expect("precompute_subclass_fields panicked"),
+                await_c
+                    .join()
+                    .expect("precompute_await_candidates panicked"),
+                param_type
+                    .join()
+                    .expect("precompute_param_type_candidates panicked"),
+                nodiscard
+                    .join()
+                    .expect("precompute_nodiscard_candidates panicked"),
+                decl_realms
+                    .join()
+                    .expect("precompute_decl_annotation_realms panicked"),
+                Arc::new(
+                    send_flows
+                        .join()
+                        .expect("precompute_sorted_send_flows panicked"),
+                ),
             )
         });
         let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =

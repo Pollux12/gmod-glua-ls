@@ -233,12 +233,7 @@ fn check_ref_class(
             {
                 let source = LuaType::Ref(source_id.clone());
                 for field in enum_fields.types() {
-                    check_general_type_compact(
-                        context,
-                        &source,
-                        field,
-                        check_guard.next_level()?,
-                    )?;
+                    check_general_type_compact(context, &source, field, check_guard.next_level()?)?;
                 }
                 return Ok(());
             }

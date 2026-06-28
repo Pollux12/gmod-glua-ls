@@ -236,7 +236,11 @@ async fn main() {
             total += elapsed;
             worst = worst.max(elapsed);
             edited += 1;
-            eprintln!("  [incremental] re-index {:?}: {:.3}s", file_id, elapsed.as_secs_f64());
+            eprintln!(
+                "  [incremental] re-index {:?}: {:.3}s",
+                file_id,
+                elapsed.as_secs_f64()
+            );
         }
         if edited > 0 {
             eprintln!(

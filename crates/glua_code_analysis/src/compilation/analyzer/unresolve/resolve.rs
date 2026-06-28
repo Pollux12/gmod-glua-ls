@@ -182,9 +182,7 @@ fn cached_local_name_expr_type(db: &DbIndex, file_id: FileId, expr: &LuaExpr) ->
 fn local_cached_type_is_informative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union
-            .types()
-            .any(local_cached_type_is_informative),
+        LuaType::Union(union) => union.types().any(local_cached_type_is_informative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
