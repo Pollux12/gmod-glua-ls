@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    CacheEntry, FileId, InFiled, InferFailReason, LuaArrayType, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
+    CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
+    LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::{
         analyzer::{
             common::{add_member, bind_type},
@@ -19,7 +19,7 @@ use glua_parser::{
     LuaTableField, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
-use super::LuaAnalyzer;
+use super::{LuaAnalyzer, MemberAssignmentWideningCacheKey, MemberAssignmentWideningState};
 
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
     let name_list: Vec<_> = local_stat.get_local_name_list().collect();
@@ -1183,13 +1183,26 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = widened_type;
     }
 
-    if let Some(widened_type) = get_widened_member_assignment_type(
+    match get_cached_widened_member_assignment_type(
         analyzer,
         &type_owner,
         &expr_type,
         preserve_table_literals,
     ) {
-        expr_type = widened_type;
+        Some(Some(widened_type)) => {
+            expr_type = widened_type;
+        }
+        Some(None) => {}
+        None => {
+            if let Some(widened_type) = get_widened_member_assignment_type(
+                analyzer,
+                &type_owner,
+                &expr_type,
+                preserve_table_literals,
+            ) {
+                expr_type = widened_type;
+            }
+        }
     }
 
     if is_global_decl_owner(analyzer, &type_owner) {
@@ -1199,33 +1212,40 @@ fn assign_merge_type_owner_and_expr_type(
     bind_type(
         analyzer.db,
         type_owner.clone(),
-        LuaTypeCache::InferType(expr_type),
+        LuaTypeCache::InferType(expr_type.clone()),
     );
 
-    if let LuaTypeOwner::Member(member_id) = type_owner
-        && is_assignment_file_define_member(analyzer.db, member_id)
+    if let LuaTypeOwner::Member(member_id) = &type_owner
+        && is_assignment_file_define_member(analyzer.db, *member_id)
     {
         let guarded_table_assignment =
-            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, member_id);
+            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         if guarded_table_assignment {
             analyzer
                 .db
                 .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(member_id);
-            preserve_guarded_table_assignment_members(analyzer, member_id);
-        } else if !is_member_assignment_in_conditional_branch(analyzer, member_id)
+                .mark_non_overwriting_assignment_member(*member_id);
+            preserve_guarded_table_assignment_members(analyzer, *member_id);
+        } else if !is_member_assignment_in_conditional_branch(analyzer, *member_id)
             && analyzer
                 .db
                 .get_member_index()
-                .member_function_scope_range(member_id)
+                .member_function_scope_range(*member_id)
                 .is_none()
         {
             analyzer
                 .db
                 .get_member_index_mut()
-                .retain_only_member_for_owner_key(member_id);
+                .retain_only_member_for_owner_key(*member_id);
         }
     }
+
+    record_member_assignment_widening_cache(
+        analyzer,
+        &type_owner,
+        &expr_type,
+        preserve_table_literals,
+    );
 
     Some(())
 }
@@ -1240,6 +1260,187 @@ fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bo
         .get_decl_index()
         .get_decl(decl_id)
         .is_some_and(|decl| decl.is_global())
+}
+
+fn get_cached_widened_member_assignment_type(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    incoming_type: &LuaType,
+    preserve_table_literals: bool,
+) -> Option<Option<LuaType>> {
+    if preserve_table_literals || prefer_class_assignment_type(incoming_type).is_some() {
+        return None;
+    }
+
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return None;
+    };
+    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+        return None;
+    }
+
+    let member_index = analyzer.db.get_member_index();
+    let owner = member_index.get_member_owner(member_id)?.clone();
+    let key = member_index.get_member(member_id)?.get_key().clone();
+    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
+    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
+
+    let Some(cache) = analyzer.member_assignment_widening_cache.get(&cache_key) else {
+        return (visible_count == 1).then_some(None);
+    };
+    if cache.disabled || cache.seen_count + 1 != visible_count {
+        return None;
+    }
+
+    let current_realm = member_assignment_realm(analyzer, *member_id);
+    let compatible_states = cache
+        .by_realm
+        .iter()
+        .filter(|(realm, _)| member_assignment_realms_compatible(analyzer, current_realm, **realm))
+        .map(|(_, state)| state.clone())
+        .collect::<Vec<_>>();
+    if compatible_states.is_empty() {
+        return Some(None);
+    }
+
+    let should_widen_table_literals = is_table_assignment_merge_type(incoming_type)
+        && compatible_states
+            .iter()
+            .all(|state| state.all_table_assignment_merge_types);
+    let previous_type = merge_cached_assignment_types(
+        analyzer,
+        compatible_states.iter().map(|state| {
+            if should_widen_table_literals {
+                &state.table_literal_widen_type
+            } else {
+                &state.no_table_literal_widen_type
+            }
+        }),
+    )?;
+    let incoming_type = widen_related_assignment_type(incoming_type, should_widen_table_literals);
+
+    Some(Some(TypeOps::Union.apply(
+        analyzer.db,
+        &previous_type,
+        &incoming_type,
+    )))
+}
+
+fn record_member_assignment_widening_cache(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    assigned_type: &LuaType,
+    preserve_table_literals: bool,
+) {
+    if preserve_table_literals {
+        return;
+    }
+
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return;
+    };
+    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+        return;
+    }
+
+    let member_index = analyzer.db.get_member_index();
+    let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
+        return;
+    };
+    let Some(key) = member_index
+        .get_member(member_id)
+        .map(|member| member.get_key().clone())
+    else {
+        return;
+    };
+    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
+    let realm = member_assignment_realm(analyzer, *member_id);
+    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
+    let no_table_literal_widen_type = widen_related_assignment_type(assigned_type, false);
+    let table_literal_widen_type = widen_related_assignment_type(assigned_type, true);
+    let all_table_assignment_merge_types = is_table_assignment_merge_type(assigned_type);
+
+    let mut cache = analyzer
+        .member_assignment_widening_cache
+        .remove(&cache_key)
+        .unwrap_or_default();
+    if cache.disabled {
+        analyzer
+            .member_assignment_widening_cache
+            .insert(cache_key, cache);
+        return;
+    }
+    if visible_count != cache.seen_count + 1 {
+        cache.disabled = true;
+        analyzer
+            .member_assignment_widening_cache
+            .insert(cache_key, cache);
+        return;
+    }
+
+    cache.seen_count = visible_count;
+    match cache.by_realm.get_mut(&realm) {
+        Some(state) => {
+            state.no_table_literal_widen_type = TypeOps::Union.apply(
+                analyzer.db,
+                &state.no_table_literal_widen_type,
+                &no_table_literal_widen_type,
+            );
+            state.table_literal_widen_type = TypeOps::Union.apply(
+                analyzer.db,
+                &state.table_literal_widen_type,
+                &table_literal_widen_type,
+            );
+            state.all_table_assignment_merge_types &= all_table_assignment_merge_types;
+        }
+        None => {
+            cache.by_realm.insert(
+                realm,
+                MemberAssignmentWideningState {
+                    no_table_literal_widen_type,
+                    table_literal_widen_type,
+                    all_table_assignment_merge_types,
+                },
+            );
+        }
+    }
+
+    analyzer
+        .member_assignment_widening_cache
+        .insert(cache_key, cache);
+}
+
+fn merge_cached_assignment_types<'a>(
+    analyzer: &LuaAnalyzer,
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    let mut result = None;
+    for typ in types {
+        result = Some(match result {
+            Some(current) => TypeOps::Union.apply(analyzer.db, &current, typ),
+            None => typ.clone(),
+        });
+    }
+    result
+}
+
+fn member_assignment_realm(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> GmodRealm {
+    if !analyzer.gmod_enabled {
+        return GmodRealm::Unknown;
+    }
+
+    analyzer
+        .db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&member_id.file_id, member_id.get_position())
+}
+
+fn member_assignment_realms_compatible(
+    analyzer: &LuaAnalyzer,
+    left: GmodRealm,
+    right: GmodRealm,
+) -> bool {
+    !analyzer.gmod_enabled || left.is_compatible_with(right)
 }
 
 fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_id: LuaMemberId) {

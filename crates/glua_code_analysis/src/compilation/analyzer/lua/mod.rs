@@ -27,7 +27,7 @@ use log::info;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Emmyrc, FileId, InferFailReason,
+    Emmyrc, FileId, GmodRealm, InferFailReason, LuaMemberKey, LuaMemberOwner,
     compilation::analyzer::{
         AnalysisPipeline,
         lua::call::{analyze_call, build_special_call_direct_matcher},
@@ -238,6 +238,28 @@ struct LuaAnalyzer<'a> {
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
+    member_assignment_widening_cache:
+        FxHashMap<MemberAssignmentWideningCacheKey, MemberAssignmentWideningCache>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct MemberAssignmentWideningCacheKey {
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+}
+
+#[derive(Debug, Default)]
+struct MemberAssignmentWideningCache {
+    seen_count: usize,
+    by_realm: FxHashMap<GmodRealm, MemberAssignmentWideningState>,
+    disabled: bool,
+}
+
+#[derive(Debug, Clone)]
+struct MemberAssignmentWideningState {
+    no_table_literal_widen_type: LuaType,
+    table_literal_widen_type: LuaType,
+    all_table_assignment_merge_types: bool,
 }
 
 impl LuaAnalyzer<'_> {
@@ -256,6 +278,7 @@ impl LuaAnalyzer<'_> {
             gmod_enabled,
             is_scripted_class_scope,
             special_call_direct_matcher,
+            member_assignment_widening_cache: FxHashMap::default(),
         }
     }
 

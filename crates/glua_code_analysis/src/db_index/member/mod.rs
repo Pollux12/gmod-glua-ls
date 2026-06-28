@@ -478,6 +478,18 @@ impl LuaMemberIndex {
         self.member_current_owner.get(id)
     }
 
+    pub fn visible_member_count_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> usize {
+        self.member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+            .map(|member_ids| member_ids.len())
+            .unwrap_or(0)
+    }
+
     pub fn get_members_for_owner_key(
         &self,
         owner: &LuaMemberOwner,
