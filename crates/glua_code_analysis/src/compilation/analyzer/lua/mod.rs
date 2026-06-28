@@ -20,7 +20,7 @@ use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
-    analyze_table_field,
+    analyze_table_field, flush_pending_dynamic_key_collection_widenings,
 };
 
 use log::info;
@@ -98,6 +98,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     workspace_profile.merge(profile);
                 }
                 analyze_chunk_return(&mut analyzer, root.clone());
+                flush_pending_dynamic_key_collection_widenings(&mut analyzer);
                 file_count += 1;
                 if let Some(file_start) = file_start {
                     let file_elapsed = file_start.elapsed();
@@ -141,19 +142,23 @@ impl LuaAnalyzeProfile {
     }
 
     fn log_slow_file(&self, path: &str) {
+        let summary = self.summary(8);
+        info!("lua analyze slow file node profile: {} [{}]", path, summary);
+    }
+
+    fn summary(&self, take: usize) -> String {
         let mut stats = self
             .node_stats
             .iter()
             .map(|(kind, (count, total))| (*kind, *count, *total))
             .collect::<Vec<_>>();
         stats.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
-        let summary = stats
+        stats
             .into_iter()
-            .take(8)
+            .take(take)
             .map(|(kind, count, total)| format!("{kind}: {count} in {total:?}"))
             .collect::<Vec<_>>()
-            .join(", ");
-        info!("lua analyze slow file node profile: {} [{}]", path, summary);
+            .join(", ")
     }
 
     fn merge(&mut self, other: &LuaAnalyzeProfile) {
@@ -165,18 +170,7 @@ impl LuaAnalyzeProfile {
     }
 
     fn log_workspace(&self) {
-        let mut stats = self
-            .node_stats
-            .iter()
-            .map(|(kind, (count, total))| (*kind, *count, *total))
-            .collect::<Vec<_>>();
-        stats.sort_by_key(|(_, _, total)| std::cmp::Reverse(*total));
-        let summary = stats
-            .into_iter()
-            .take(10)
-            .map(|(kind, count, total)| format!("{kind}: {count} in {total:?}"))
-            .collect::<Vec<_>>()
-            .join(", ");
+        let summary = self.summary(10);
         info!("lua analyze workspace node profile: [{}]", summary);
     }
 }
@@ -240,6 +234,9 @@ struct LuaAnalyzer<'a> {
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
     member_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberAssignmentWideningCache>,
+    member_collection_assignment_widening_cache:
+        FxHashMap<MemberAssignmentWideningCacheKey, MemberCollectionAssignmentWideningCache>,
+    pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -262,6 +259,19 @@ struct MemberAssignmentWideningState {
     all_table_assignment_merge_types: bool,
 }
 
+#[derive(Debug, Default)]
+struct MemberCollectionAssignmentWideningCache {
+    seen_count: usize,
+    by_realm: FxHashMap<GmodRealm, LuaType>,
+    disabled: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct DynamicKeyCollectionWideningKey {
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+}
+
 impl LuaAnalyzer<'_> {
     pub fn new<'a>(
         db: &'a mut DbIndex,
@@ -279,6 +289,8 @@ impl LuaAnalyzer<'_> {
             is_scripted_class_scope,
             special_call_direct_matcher,
             member_assignment_widening_cache: FxHashMap::default(),
+            member_collection_assignment_widening_cache: FxHashMap::default(),
+            pending_dynamic_key_collection_widenings: FxHashMap::default(),
         }
     }
 

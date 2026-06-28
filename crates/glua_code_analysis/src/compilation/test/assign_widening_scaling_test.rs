@@ -2,7 +2,11 @@
 mod test {
     use std::time::Instant;
 
-    use crate::VirtualWorkspace;
+    use crate::{Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace};
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
 
     /// Regression guard for issue #36: a field assigned a very large number of
     /// times under distinct (branched / guarded) writes used to drive
@@ -81,5 +85,83 @@ mod test {
         };
         // The decl tree exists and analysis completed without hanging/panicking.
         assert!(result_type.is_some(), "file failed to index");
+    }
+
+    fn index_distinct_self_field_assignments(count: usize) -> std::time::Duration {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        ws.update_emmyrc(emmyrc);
+
+        let mut body = String::from("function ENT:Initialize()\n");
+        for i in 0..count {
+            body.push_str(&format!("    self.field{i} = {i}\n"));
+        }
+        body.push_str("end\n");
+
+        let start = Instant::now();
+        ws.def_file("lua/entities/perf_entity/init.lua", &body);
+        start.elapsed()
+    }
+
+    #[test]
+    fn distinct_self_field_assignments_index_near_linearly() {
+        let _ = index_distinct_self_field_assignments(200);
+
+        let small = index_distinct_self_field_assignments(1000);
+        let large = index_distinct_self_field_assignments(4000);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        eprintln!(
+            "distinct self field assignment scaling: 1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x"
+        );
+        assert!(
+            ratio < 8.0,
+            "indexing scaled super-linearly with distinct self field assignments \
+             (1000 -> {small:?}, 4000 -> {large:?}, ratio {ratio:.1}x)"
+        );
+    }
+
+    fn index_dynamic_key_collection_assignments(count: usize) -> std::time::Duration {
+        let mut body = String::from(
+            r#"
+---@return string
+local function key_name()
+end
+
+local T = {}
+"#,
+        );
+        for i in 0..count {
+            body.push_str(&format!("T.field{i} = {{ {i} }}\n"));
+        }
+        for i in 0..count {
+            body.push_str(&format!("T[key_name()] = {{ {i} }}\n"));
+        }
+        body.push_str("return T\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    #[test]
+    fn dynamic_key_collection_assignments_do_not_scan_owner_members_quadratically() {
+        let _ = index_dynamic_key_collection_assignments(100);
+
+        let small = index_dynamic_key_collection_assignments(500);
+        let large = index_dynamic_key_collection_assignments(2000);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        eprintln!(
+            "dynamic key collection assignment scaling: 500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x"
+        );
+        assert!(
+            ratio < 9.0,
+            "indexing scaled super-linearly with dynamic-key collection assignments \
+             (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
+        );
     }
 }

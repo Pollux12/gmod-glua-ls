@@ -19,7 +19,10 @@ use glua_parser::{
     LuaTableField, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
 
-use super::{LuaAnalyzer, MemberAssignmentWideningCacheKey, MemberAssignmentWideningState};
+use super::{
+    DynamicKeyCollectionWideningKey, LuaAnalyzer, MemberAssignmentWideningCacheKey,
+    MemberAssignmentWideningState,
+};
 
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
     let name_list: Vec<_> = local_stat.get_local_name_list().collect();
@@ -469,6 +472,11 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
         return Some(());
     }
 
+    if let Some(member_owner) = direct_local_table_prefix_member_owner(analyzer, &prefix_expr) {
+        apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
+        return Some(());
+    }
+
     match analyzer.infer_expr(&prefix_expr.clone()) {
         Ok(prefix_type) => {
             if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
@@ -599,10 +607,6 @@ fn try_resolve_scoped_class_prefix_member_owner(
     };
 
     let name = name_expr.get_name_text()?;
-    let decl_tree = analyzer
-        .db
-        .get_decl_index()
-        .get_decl_tree(&analyzer.file_id)?;
     if name != "self" {
         if !name_expr_resolves_to_seeded_class_local(analyzer, name_expr) {
             return None;
@@ -611,8 +615,7 @@ fn try_resolve_scoped_class_prefix_member_owner(
         return scoped_class_global_member_owner(analyzer, &name).map(|owner| (owner, false));
     }
 
-    let self_decl = decl_tree.find_local_decl("self", name_expr.get_position())?;
-    if !self_decl.is_implicit_self() {
+    if !name_expr_resolves_to_implicit_self(analyzer, name_expr) {
         return None;
     }
 
@@ -646,6 +649,16 @@ fn name_expr_resolves_to_seeded_class_local(
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
         .is_some_and(|decl| decl.is_seeded_class_local())
+}
+
+fn name_expr_resolves_to_implicit_self(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> bool {
+    analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
+        .is_some_and(|decl| decl.is_implicit_self())
 }
 
 fn scoped_class_global_member_owner(analyzer: &LuaAnalyzer, name: &str) -> Option<LuaMemberOwner> {
@@ -1177,30 +1190,33 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
-    if let Some(widened_type) =
-        get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
-    {
-        expr_type = widened_type;
-    }
-
-    match get_cached_widened_member_assignment_type(
-        analyzer,
-        &type_owner,
-        &expr_type,
-        preserve_table_literals,
-    ) {
-        Some(Some(widened_type)) => {
+    let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
+    if !dynamic_expr_key_member {
+        if let Some(widened_type) =
+            get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
+        {
             expr_type = widened_type;
         }
-        Some(None) => {}
-        None => {
-            if let Some(widened_type) = get_widened_member_assignment_type(
-                analyzer,
-                &type_owner,
-                &expr_type,
-                preserve_table_literals,
-            ) {
+
+        match get_cached_widened_member_assignment_type(
+            analyzer,
+            &type_owner,
+            &expr_type,
+            preserve_table_literals,
+        ) {
+            Some(Some(widened_type)) => {
                 expr_type = widened_type;
+            }
+            Some(None) => {}
+            None => {
+                if let Some(widened_type) = get_widened_member_assignment_type(
+                    analyzer,
+                    &type_owner,
+                    &expr_type,
+                    preserve_table_literals,
+                ) {
+                    expr_type = widened_type;
+                }
             }
         }
     }
@@ -1226,7 +1242,8 @@ fn assign_merge_type_owner_and_expr_type(
                 .get_member_index_mut()
                 .mark_non_overwriting_assignment_member(*member_id);
             preserve_guarded_table_assignment_members(analyzer, *member_id);
-        } else if !is_member_assignment_in_conditional_branch(analyzer, *member_id)
+        } else if !dynamic_expr_key_member
+            && !is_member_assignment_in_conditional_branch(analyzer, *member_id)
             && analyzer
                 .db
                 .get_member_index()
@@ -1240,14 +1257,31 @@ fn assign_merge_type_owner_and_expr_type(
         }
     }
 
-    record_member_assignment_widening_cache(
-        analyzer,
-        &type_owner,
-        &expr_type,
-        preserve_table_literals,
-    );
+    if !dynamic_expr_key_member {
+        record_member_assignment_widening_cache(
+            analyzer,
+            &type_owner,
+            &expr_type,
+            preserve_table_literals,
+        );
+        record_member_collection_assignment_widening_cache(analyzer, &type_owner, &expr_type);
+    }
 
     Some(())
+}
+
+fn is_dynamic_expr_key_member_assignment(
+    analyzer: &LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+) -> bool {
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return false;
+    };
+    analyzer
+        .db
+        .get_member_index()
+        .get_member(member_id)
+        .is_some_and(|member| member.get_key().is_expr())
 }
 
 fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bool {
@@ -1507,10 +1541,26 @@ fn get_widened_member_assignment_collection_type(
         return None;
     };
     let incoming_array = normalize_infer_collection_type(analyzer.db, incoming_type)?;
-    let member_index = analyzer.db.get_member_index();
-    let owner = member_index.get_member_owner(member_id)?.clone();
-    let key = member_index.get_member(member_id)?.get_key().clone();
-    let related_members = member_index.get_members_for_owner_key(&owner, &key);
+    let (owner, key) = {
+        let member_index = analyzer.db.get_member_index();
+        (
+            member_index.get_member_owner(member_id)?.clone(),
+            member_index.get_member(member_id)?.get_key().clone(),
+        )
+    };
+    if let Some(widened_type) = get_cached_widened_member_collection_assignment_type(
+        analyzer,
+        &owner,
+        &key,
+        *member_id,
+        incoming_array.get_base(),
+    ) {
+        return Some(widened_type);
+    }
+    let related_members = analyzer
+        .db
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &key);
     let mut widened_base = incoming_array.get_base().clone();
     let mut saw_related_collection = false;
 
@@ -1551,6 +1601,112 @@ fn get_widened_member_assignment_collection_type(
     Some(LuaType::Array(
         LuaArrayType::from_base_type(widened_base).into(),
     ))
+}
+
+fn get_cached_widened_member_collection_assignment_type(
+    analyzer: &mut LuaAnalyzer,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    member_id: LuaMemberId,
+    incoming_base: &LuaType,
+) -> Option<LuaType> {
+    let incoming_base = crate::widen_literal_type_for_assignment(incoming_base);
+    let member_index = analyzer.db.get_member_index();
+    let visible_count = member_index.visible_member_count_for_owner_key(owner, key);
+    let cache_key = MemberAssignmentWideningCacheKey {
+        owner: owner.clone(),
+        key: key.clone(),
+    };
+
+    let Some(cache) = analyzer
+        .member_collection_assignment_widening_cache
+        .get(&cache_key)
+    else {
+        return (visible_count == 1).then_some(LuaType::Array(
+            LuaArrayType::from_base_type(incoming_base).into(),
+        ));
+    };
+    if cache.disabled || cache.seen_count + 1 != visible_count {
+        return None;
+    }
+
+    let current_realm = member_assignment_realm(analyzer, member_id);
+    let mut widened_base = incoming_base;
+    let mut saw_related_collection = false;
+    for (realm, base_type) in &cache.by_realm {
+        if !member_assignment_realms_compatible(analyzer, current_realm, *realm) {
+            continue;
+        }
+        saw_related_collection = true;
+        widened_base = TypeOps::Union.apply(analyzer.db, &widened_base, base_type);
+    }
+
+    saw_related_collection
+        .then(|| LuaType::Array(LuaArrayType::from_base_type(widened_base).into()))
+}
+
+fn record_member_collection_assignment_widening_cache(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    assigned_type: &LuaType,
+) {
+    let Some(assigned_array) = normalize_infer_collection_type(analyzer.db, assigned_type) else {
+        return;
+    };
+
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return;
+    };
+    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+        return;
+    }
+
+    let member_index = analyzer.db.get_member_index();
+    let Some(owner) = member_index.get_member_owner(member_id).cloned() else {
+        return;
+    };
+    let Some(key) = member_index
+        .get_member(member_id)
+        .map(|member| member.get_key().clone())
+    else {
+        return;
+    };
+    let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
+    let realm = member_assignment_realm(analyzer, *member_id);
+    let cache_key = MemberAssignmentWideningCacheKey { owner, key };
+
+    let mut cache = analyzer
+        .member_collection_assignment_widening_cache
+        .remove(&cache_key)
+        .unwrap_or_default();
+    if cache.disabled {
+        analyzer
+            .member_collection_assignment_widening_cache
+            .insert(cache_key, cache);
+        return;
+    }
+    if visible_count != cache.seen_count + 1 {
+        cache.disabled = true;
+        analyzer
+            .member_collection_assignment_widening_cache
+            .insert(cache_key, cache);
+        return;
+    }
+
+    let assigned_base = crate::widen_literal_type_for_assignment(assigned_array.get_base());
+    cache.seen_count = visible_count;
+    match cache.by_realm.get_mut(&realm) {
+        Some(base_type) => {
+            *base_type = TypeOps::Union.apply(analyzer.db, base_type, &assigned_base);
+        }
+        None => {
+            cache.by_realm.insert(realm, assigned_base);
+        }
+    }
+
+    analyzer
+        .member_collection_assignment_widening_cache
+        .insert(cache_key, cache);
 }
 
 fn guarded_table_assignment_member_ids_for_owner_key(
@@ -1849,19 +2005,144 @@ fn widen_existing_member_collection_type(
         return Some(());
     }
 
-    if let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone()) {
+    let deferred_collection_widening = incoming_is_collection
+        && try_defer_dynamic_key_collection_widening(analyzer, index_expr, value_type)
+            .unwrap_or(false);
+    if !deferred_collection_widening
+        && let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone())
+    {
         widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
     }
 
     if is_collection_append
         && let Some(prefix_expr) = index_expr.get_prefix_expr()
         && let Some(prefix_index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
-        && let Some(member_ids) = find_related_member_ids(analyzer, prefix_index_expr)
     {
-        widen_member_collections_with_element_type(analyzer, &member_ids, value_type);
+        let deferred_element_widening =
+            try_defer_dynamic_key_element_widening(analyzer, &prefix_index_expr, value_type)
+                .unwrap_or(false);
+        if !deferred_element_widening
+            && let Some(member_ids) = find_related_member_ids(analyzer, prefix_index_expr)
+        {
+            widen_member_collections_with_element_type(analyzer, &member_ids, value_type);
+        }
     }
 
     Some(())
+}
+
+fn try_defer_dynamic_key_collection_widening(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: &LuaIndexExpr,
+    value_type: &LuaType,
+) -> Option<bool> {
+    let incoming_array = normalize_infer_collection_type(analyzer.db, value_type)?;
+    let (owner, key) = dynamic_key_owner_and_member_key(analyzer, index_expr)?;
+    record_pending_dynamic_key_collection_widening(analyzer, owner, key, incoming_array.get_base());
+    Some(true)
+}
+
+fn try_defer_dynamic_key_element_widening(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: &LuaIndexExpr,
+    element_type: &LuaType,
+) -> Option<bool> {
+    let (owner, key) = dynamic_key_owner_and_member_key(analyzer, index_expr)?;
+    record_pending_dynamic_key_collection_widening(analyzer, owner, key, element_type);
+    Some(true)
+}
+
+fn dynamic_key_owner_and_member_key(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: &LuaIndexExpr,
+) -> Option<(LuaMemberOwner, LuaMemberKey)> {
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let owner = direct_local_table_prefix_member_owner(analyzer, &prefix_expr).or_else(|| {
+        let prefix_type = analyzer.infer_expr(&prefix_expr).ok()?;
+        get_member_owner_for_prefix_type(prefix_type)
+    })?;
+    let index_key = index_expr.get_index_key()?;
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let member_key =
+        LuaMemberKey::from_index_key_or_unknown(analyzer.db, cache, &index_key).ok()?;
+    member_key.is_expr().then_some((owner, member_key))
+}
+
+fn direct_local_table_prefix_member_owner(
+    analyzer: &LuaAnalyzer,
+    prefix_expr: &LuaExpr,
+) -> Option<LuaMemberOwner> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+    let decl_id = analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
+    if is_local_mutable(analyzer, decl_id) {
+        return None;
+    }
+
+    let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let root = analyzer
+        .db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let table_expr = LuaTableExpr::cast(node)?;
+    Some(LuaMemberOwner::Element(InFiled::new(
+        decl_id.file_id,
+        table_expr.get_range(),
+    )))
+}
+
+fn record_pending_dynamic_key_collection_widening(
+    analyzer: &mut LuaAnalyzer,
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+    additional_base: &LuaType,
+) {
+    let cache_key = DynamicKeyCollectionWideningKey { owner, key };
+    let additional_base = crate::widen_literal_type_for_assignment(additional_base);
+    let widened_base = match analyzer
+        .pending_dynamic_key_collection_widenings
+        .remove(&cache_key)
+    {
+        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &additional_base),
+        None => additional_base,
+    };
+    analyzer
+        .pending_dynamic_key_collection_widenings
+        .insert(cache_key, widened_base);
+}
+
+pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaAnalyzer) {
+    let pending = std::mem::take(&mut analyzer.pending_dynamic_key_collection_widenings);
+    for (cache_key, additional_base) in pending {
+        let Some(access_key_type) = member_key_as_expr_type(&cache_key.key) else {
+            continue;
+        };
+        let Some(members) = analyzer.db.get_member_index().get_members(&cache_key.owner) else {
+            continue;
+        };
+        let member_ids = members
+            .into_iter()
+            .filter(|member| {
+                member_key_matches_type(analyzer.db, access_key_type, member.get_key())
+            })
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        widen_member_collections_with_element_type(analyzer, &member_ids, &additional_base);
+    }
 }
 
 fn find_related_member_ids(

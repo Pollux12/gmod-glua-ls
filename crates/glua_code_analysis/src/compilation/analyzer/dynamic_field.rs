@@ -8,8 +8,8 @@ use glua_parser::{
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaMemberKey, LuaSignatureId, LuaType, VarRefId,
-    db_index::{DbIndex, DynamicFieldOwner},
+    InFiled, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
+    db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner},
     profile::Profile,
     semantic::{
         find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
@@ -202,6 +202,21 @@ fn collect_dynamic_fields_for_file(
             let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                 continue;
             };
+
+            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
+            else {
+                continue;
+            };
+
+            let field_names = get_field_names(db, cache, &index_expr);
+            let should_collect_wildcard = mode.collect_direct_assignments()
+                && is_dynamic_index_key(&index_expr)
+                && (field_names.is_empty()
+                    || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
+            if field_names.is_empty() && !should_collect_wildcard {
+                continue;
+            }
+
             let cache_key = PrefixCacheKey::from_expr(db, cache, &prefix_expr);
             let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                 match cached_type {
@@ -224,17 +239,6 @@ fn collect_dynamic_fields_for_file(
             } else {
                 prefix_type
             };
-
-            let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range())
-            else {
-                continue;
-            };
-
-            let field_names = get_field_names(db, cache, &index_expr);
-            let should_collect_wildcard = mode.collect_direct_assignments()
-                && is_dynamic_index_key(&index_expr)
-                && (field_names.is_empty()
-                    || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
             if should_collect_wildcard {
                 collect_wildcard_for_type(
                     &effective_type,
@@ -252,11 +256,13 @@ fn collect_dynamic_fields_for_file(
                 if mode.collect_declared_member_table_fields()
                     && let Some(value_expr) = value_expr
                 {
+                    let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
                     collect_assigned_table_fields_for_declared_member(
                         db,
                         cache,
                         &effective_type,
                         &field_name,
+                        member_id,
                         value_expr,
                         file_id,
                         &mut collected,
@@ -301,19 +307,25 @@ fn analyze_dynamic_fields(
         Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
-    let profile_enabled = log::log_enabled!(log::Level::Info);
+    let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+    let profile_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
+    let helper_start = profile_enabled.then(std::time::Instant::now);
     let field_setter_helpers = if mode.collect_direct_assignments() {
         let context_covers_workspace = context_covers_workspace(&*db, context, &tree_list);
         FieldSetterHelperCache::from_tree_list(&tree_list, context_covers_workspace)
     } else {
         FieldSetterHelperCache::default()
     };
+    if let (Some(profile), Some(helper_start)) = (profile.as_mut(), helper_start) {
+        profile.helper_cache_time += helper_start.elapsed();
+    }
 
     // Collection is read-only against an immutable `&DbIndex` and writes only to
     // per-file local buffers, so it runs concurrently across files. Results are
     // concatenated in deterministic file order and merged into the db below.
     let file_ids: Vec<crate::FileId> = tree_list.iter().map(|t| t.file_id).collect();
+    let collection_start = profile_enabled.then(std::time::Instant::now);
     let per_file = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
         let Some(root) = db
             .get_vfs()
@@ -324,9 +336,16 @@ fn analyze_dynamic_fields(
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
     });
+    if let (Some(profile), Some(collection_start)) = (profile.as_mut(), collection_start) {
+        profile.collection_time += collection_start.elapsed();
+    }
+    let merge_start = profile_enabled.then(std::time::Instant::now);
     for (file_collected, file_wildcards) in per_file {
         collected.extend(file_collected);
         collected_wildcards.extend(file_wildcards);
+    }
+    if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
+        profile.collection_merge_time += merge_start.elapsed();
     }
 
     let propagate_start = profile_enabled.then(std::time::Instant::now);
@@ -375,6 +394,9 @@ fn analyze_dynamic_fields(
     }
     if let Some(profile) = profile {
         profile.log(tree_list.len(), collected.len(), propagated.len());
+        if stderr_profile_enabled {
+            profile.print(tree_list.len(), collected.len(), propagated.len());
+        }
     }
 }
 
@@ -741,14 +763,17 @@ struct DynamicFieldProfile {
     owner_cache_hits: usize,
     owner_cache_misses: usize,
     owner_infer_time: Duration,
+    helper_cache_time: Duration,
+    collection_time: Duration,
+    collection_merge_time: Duration,
     propagation_time: Duration,
     insertion_time: Duration,
 }
 
 impl DynamicFieldProfile {
-    fn log(&self, file_count: usize, collected: usize, propagated: usize) {
-        log::info!(
-            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} propagation_time={:?} insertion_time={:?}",
+    fn summary(&self, file_count: usize, collected: usize, propagated: usize) -> String {
+        format!(
+            "dynamic field profile: files={} assignments={} vars={} index_candidates={} no_field_name_skips={} calls={} fields_collected={} collected_entries={} propagated={} owner_cache_hits={} owner_cache_misses={} owner_infer_time={:?} helper_cache_time={:?} collection_time={:?} collection_merge_time={:?} propagation_time={:?} insertion_time={:?}",
             file_count,
             self.assignments_scanned,
             self.vars_scanned,
@@ -761,9 +786,20 @@ impl DynamicFieldProfile {
             self.owner_cache_hits,
             self.owner_cache_misses,
             self.owner_infer_time,
+            self.helper_cache_time,
+            self.collection_time,
+            self.collection_merge_time,
             self.propagation_time,
             self.insertion_time,
-        );
+        )
+    }
+
+    fn log(&self, file_count: usize, collected: usize, propagated: usize) {
+        log::info!("{}", self.summary(file_count, collected, propagated));
+    }
+
+    fn print(&self, file_count: usize, collected: usize, propagated: usize) {
+        eprintln!("{}", self.summary(file_count, collected, propagated));
     }
 }
 
@@ -849,6 +885,7 @@ fn collect_assigned_table_fields_for_declared_member(
     cache: &mut crate::LuaInferCache,
     owner_type: &LuaType,
     field_name: &SmolStr,
+    member_id: LuaMemberId,
     value_expr: &LuaExpr,
     file_id: crate::FileId,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
@@ -857,17 +894,57 @@ fn collect_assigned_table_fields_for_declared_member(
         return;
     };
 
-    let Some(member_infos) =
-        find_members_with_key(db, owner_type, LuaMemberKey::Name(field_name.clone()), true)
-    else {
+    let Some(member_types) = find_declared_member_types_for_dynamic_field(
+        db,
+        owner_type,
+        LuaMemberKey::Name(field_name.clone()),
+        member_id,
+    ) else {
         return;
     };
 
-    for member_info in member_infos {
+    for member_type in member_types {
         for field in table_expr.get_fields() {
-            collect_nested_table_field(db, cache, &field, &member_info.typ, file_id, collected);
+            collect_nested_table_field(db, cache, &field, &member_type, file_id, collected);
         }
     }
+}
+
+fn find_declared_member_types_for_dynamic_field(
+    db: &DbIndex,
+    owner_type: &LuaType,
+    key: LuaMemberKey,
+    member_id: LuaMemberId,
+) -> Option<Vec<LuaType>> {
+    if let LuaType::TableConst(table_range) = owner_type {
+        if let Some(member_type) = db
+            .get_type_index()
+            .get_type_cache(&LuaTypeOwner::Member(member_id))
+            .map(|cache| cache.as_type().clone())
+        {
+            return Some(vec![member_type]);
+        }
+
+        let owner = LuaMemberOwner::Element(table_range.clone());
+        let member_types = db
+            .get_member_index()
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .filter_map(|member| {
+                db.get_type_index()
+                    .get_type_cache(&LuaTypeOwner::Member(member.get_id()))
+                    .map(|cache| cache.as_type().clone())
+            })
+            .collect::<Vec<_>>();
+        return (!member_types.is_empty()).then_some(member_types);
+    }
+
+    find_members_with_key(db, owner_type, key, true).map(|member_infos| {
+        member_infos
+            .into_iter()
+            .map(|member_info| member_info.typ)
+            .collect()
+    })
 }
 
 fn infer_setmetatable_target_type(

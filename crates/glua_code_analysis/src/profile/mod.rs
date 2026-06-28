@@ -25,7 +25,7 @@ impl<'a> Profile<'a> {
     }
 
     pub fn cond_new(name: &'a str, cond: bool) -> Option<Self> {
-        if cond && (log::log_enabled!(log::Level::Info) || phase_profile_enabled()) {
+        if (cond && log::log_enabled!(log::Level::Info)) || phase_profile_enabled() {
             Some(Self::new(name))
         } else {
             None

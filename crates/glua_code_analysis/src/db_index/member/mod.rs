@@ -74,8 +74,8 @@ impl LuaMemberIndex {
         if !owner.is_unknown() {
             self.member_current_owner.insert(id, owner.clone());
             self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
-            self.add_member_to_owner_key_index(owner.clone(), id);
-            self.add_member_to_owner_key_history_index(owner.clone(), id);
+            self.add_new_member_to_owner_key_index(owner.clone(), id);
+            self.add_new_member_to_owner_key_history_index(owner.clone(), id);
             self.add_member_to_owner(owner.clone(), id);
         }
         id
@@ -92,8 +92,10 @@ impl LuaMemberIndex {
         let member = self.get_member(&id)?;
         let key = member.get_key().clone();
         let feature = member.get_feature();
-        self.add_member_to_owner_key_index(owner.clone(), id);
-        self.add_member_to_owner_key_history_index(owner.clone(), id);
+        if self.member_current_owner.get(&id) != Some(&owner) {
+            self.add_member_to_owner_key_index(owner.clone(), id);
+            self.add_member_to_owner_key_history_index(owner.clone(), id);
+        }
         let member_map = self
             .owner_members
             .entry(owner.clone())
@@ -220,6 +222,18 @@ impl LuaMemberIndex {
         self.add_member_id_to_owner_key_map(owner, id, true);
     }
 
+    fn add_new_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
+        self.add_new_member_id_to_owner_key_map(owner, id, false);
+    }
+
+    fn add_new_member_to_owner_key_history_index(
+        &mut self,
+        owner: LuaMemberOwner,
+        id: LuaMemberId,
+    ) {
+        self.add_new_member_id_to_owner_key_map(owner, id, true);
+    }
+
     fn add_member_id_to_owner_key_map(
         &mut self,
         owner: LuaMemberOwner,
@@ -245,6 +259,33 @@ impl LuaMemberIndex {
                 member_ids.push(id);
             }
         }
+
+        if history {
+            self.invalidate_member_key_history_cache();
+        }
+    }
+
+    fn add_new_member_id_to_owner_key_map(
+        &mut self,
+        owner: LuaMemberOwner,
+        id: LuaMemberId,
+        history: bool,
+    ) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+
+        let target_index = if history {
+            &mut self.member_owner_key_history_index
+        } else {
+            &mut self.member_owner_key_index
+        };
+        target_index
+            .entry(owner)
+            .or_default()
+            .entry(key)
+            .or_default()
+            .push(id);
 
         if history {
             self.invalidate_member_key_history_cache();
