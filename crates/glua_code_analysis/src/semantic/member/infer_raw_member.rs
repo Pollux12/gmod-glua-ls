@@ -424,7 +424,7 @@ fn infer_table_generic_raw_member_type(
 
 fn infer_generic_raw_member_type(
     db: &DbIndex,
-    mut cache: Option<&mut LuaInferCache>,
+    cache: Option<&mut LuaInferCache>,
     generic_type: &LuaGenericType,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuardRef,
@@ -442,12 +442,6 @@ fn infer_generic_raw_member_type(
     }
 
     let base_ref_type = LuaType::Ref(base_ref_id.clone());
-    let result = infer_raw_member_type_guard(
-        db,
-        cache.as_deref_mut(),
-        &base_ref_type,
-        member_key,
-        infer_guard,
-    )?;
+    let result = infer_raw_member_type_guard(db, cache, &base_ref_type, member_key, infer_guard)?;
     Ok(instantiate_type_generic(db, &result, &substitutor))
 }

@@ -555,9 +555,7 @@ pub fn assignment_prefix_key_for_syntax(
     stat_syntax: &LuaSyntaxNode,
     syntax: &LuaSyntaxNode,
 ) -> Option<AssignmentPrefixKey> {
-    let Some((block_start, block_end)) = assignment_block_range(stat_syntax) else {
-        return None;
-    };
+    let (block_start, block_end) = assignment_block_range(stat_syntax)?;
 
     let access_text = normalized_syntax_text(syntax);
     if access_text.is_empty() {

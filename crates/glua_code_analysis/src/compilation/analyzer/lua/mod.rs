@@ -185,7 +185,7 @@ impl SlowLuaAnalyzeSummary {
         if self
             .worst_file
             .as_ref()
-            .map_or(true, |(_, worst_elapsed)| elapsed > *worst_elapsed)
+            .is_none_or(|(_, worst_elapsed)| elapsed > *worst_elapsed)
         {
             self.worst_file = Some((file_id, elapsed));
         }

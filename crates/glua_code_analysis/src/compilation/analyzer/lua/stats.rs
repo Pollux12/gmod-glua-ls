@@ -2374,9 +2374,8 @@ pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaA
             }
         }
 
-        for ((_, additional_base), member_ids) in pending_items
-            .into_iter()
-            .zip(member_ids_by_pending_key.into_iter())
+        for ((_, additional_base), member_ids) in
+            pending_items.into_iter().zip(member_ids_by_pending_key)
         {
             widen_member_collections_with_element_type(analyzer, &member_ids, &additional_base);
         }
