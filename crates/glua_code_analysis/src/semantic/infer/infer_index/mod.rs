@@ -31,6 +31,7 @@ use crate::{
             narrow::{infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin},
         },
         is_doc_tag_table_const,
+        member::cached_local_class_table_member_ids,
         member::find_members_with_key,
         member::get_buildin_type_map_type_id,
         member::infer_owner_raw_member_type_with_realm,
@@ -1535,6 +1536,19 @@ fn infer_custom_type_member(
         }
 
         return resolved;
+    }
+    let local_class_member_ids =
+        cached_local_class_table_member_ids(db, cache, &prefix_type_id, &key);
+    if !local_class_member_ids.is_empty() {
+        let member_item = match local_class_member_ids.as_slice() {
+            [member_id] => LuaMemberIndexItem::One(*member_id),
+            _ => LuaMemberIndexItem::Many(local_class_member_ids),
+        };
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
     }
 
     if let Some(dynamic_field) = resolve_dynamic_field_member(

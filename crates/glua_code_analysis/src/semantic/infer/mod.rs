@@ -43,7 +43,7 @@ use crate::{
     db_index::{DbIndex, LuaOperator, LuaOperatorMetaMethod, LuaSignatureId, LuaType},
 };
 
-use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type};
+use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type_with_cache};
 
 pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
@@ -410,7 +410,7 @@ pub fn infer_bind_value_type(
                 Ok(key) => key,
                 Err(_) => return None,
             };
-            match infer_raw_member_type(db, &table_type, &member_key) {
+            match infer_raw_member_type_with_cache(db, cache, &table_type, &member_key) {
                 Ok(typ) => Some(typ),
                 Err(InferFailReason::FieldNotFound) => None,
                 Err(_) => Some(LuaType::Unknown),

@@ -15,7 +15,7 @@ use crate::{
 
 use super::{
     FindMembersResult, LuaMemberInfo, get_buildin_type_map_type_id, intersect_member_types,
-    merge_open_table_types, resolve_dynamic_field_member_for_file,
+    local_class_table_member_ids, merge_open_table_types, resolve_dynamic_field_member_for_file,
 };
 
 #[derive(Debug, Clone)]
@@ -366,6 +366,44 @@ fn find_custom_type_members(
 
         if should_stop_collecting(members.len(), filter) {
             return Some(members);
+        }
+    }
+
+    if members.is_empty()
+        && let FindMemberFilter::ByKey {
+            member_key,
+            find_all,
+        } = filter
+    {
+        let local_member_ids = local_class_table_member_ids(db, type_decl_id, member_key);
+        if !local_member_ids.is_empty() {
+            let member_index = db.get_member_index();
+            for member_id in local_member_ids {
+                let raw_type = db
+                    .get_type_index()
+                    .get_type_cache(&member_id.into())
+                    .map(|t| t.as_type().clone())
+                    .unwrap_or(LuaType::Unknown);
+                let feature = member_index
+                    .get_member(&member_id)
+                    .map(|member| member.get_feature());
+
+                members.push(LuaMemberInfo {
+                    property_owner_id: Some(LuaSemanticDeclId::Member(member_id)),
+                    key: member_key.clone(),
+                    typ: ctx.instantiate_type(db, &raw_type),
+                    feature,
+                    overload_index: None,
+                });
+
+                if !find_all {
+                    return Some(members);
+                }
+            }
+
+            if should_stop_collecting(members.len(), filter) {
+                return Some(members);
+            }
         }
     }
 

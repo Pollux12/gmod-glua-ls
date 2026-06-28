@@ -6,8 +6,8 @@ mod infer_raw_member;
 use std::collections::HashSet;
 
 use crate::{
-    DbIndex, FileId, GmodRealm, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSemanticDeclId,
-    TypeOps,
+    DbIndex, FileId, GmodRealm, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::type_check::check_type_compact,
 };
@@ -25,10 +25,10 @@ use glua_parser::{
     LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaTableExpr, LuaTableField,
 };
 use glua_parser::{LuaAstNode, LuaIndexExpr};
-pub use infer_raw_member::infer_raw_member_type;
 pub(crate) use infer_raw_member::{
     infer_owner_raw_member_type_with_realm, resolve_member_item_with_realm,
 };
+pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cache};
 use rowan::{TextRange, TextSize};
 
 use super::{
@@ -129,6 +129,105 @@ pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaTy
     }
 
     result.unwrap_or(LuaType::Never)
+}
+
+pub(crate) fn local_class_table_member_ids(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> Vec<LuaMemberId> {
+    let Some(type_decl) = db.get_type_index().get_type_decl(type_id) else {
+        return Vec::new();
+    };
+    if !type_decl.is_class() {
+        return Vec::new();
+    }
+
+    let member_index = db.get_member_index();
+    let mut member_ids = Vec::new();
+    for location in type_decl.get_locations() {
+        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&location.file_id) else {
+            continue;
+        };
+        for decl in decl_tree.get_decls().values() {
+            if !decl_binds_type(db, decl, type_id) {
+                continue;
+            }
+            let Some(owner) = local_table_decl_member_owner(db, decl) else {
+                continue;
+            };
+            let Some(member_item) = member_index.get_member_item(&owner, member_key) else {
+                continue;
+            };
+            member_ids.extend(
+                member_item
+                    .get_member_ids()
+                    .into_iter()
+                    .filter(|member_id| {
+                        member_index
+                            .get_member(member_id)
+                            .is_some_and(|member| member.get_key() == member_key)
+                    }),
+            );
+        }
+    }
+
+    member_ids.sort_by_key(|member_id| {
+        let syntax_id = member_id.get_syntax_id();
+        (
+            member_id.file_id.id,
+            u32::from(member_id.get_position()),
+            u32::from(syntax_id.get_range().end()),
+            syntax_id.get_kind() as u16,
+        )
+    });
+    member_ids.dedup();
+    member_ids
+}
+
+pub(crate) fn cached_local_class_table_member_ids(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    type_id: &LuaTypeDeclId,
+    member_key: &LuaMemberKey,
+) -> Vec<LuaMemberId> {
+    let cache_key = (type_id.clone(), member_key.clone());
+    if let Some(member_ids) = cache.local_class_table_member_ids_cache.get(&cache_key) {
+        return member_ids.as_ref().clone();
+    }
+
+    let member_ids = local_class_table_member_ids(db, type_id, member_key);
+    cache
+        .local_class_table_member_ids_cache
+        .insert(cache_key, std::sync::Arc::new(member_ids.clone()));
+    member_ids
+}
+
+fn decl_binds_type(db: &DbIndex, decl: &LuaDecl, type_id: &LuaTypeDeclId) -> bool {
+    db.get_type_index()
+        .get_type_cache(&decl.get_id().into())
+        .is_some_and(|type_cache| match type_cache.as_type() {
+            LuaType::Ref(bound_id) | LuaType::Def(bound_id) => bound_id == type_id,
+            _ => false,
+        })
+}
+
+fn local_table_decl_member_owner(db: &DbIndex, decl: &LuaDecl) -> Option<LuaMemberOwner> {
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl.get_id().file_id)?
+        .get_red_root();
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let table_expr = LuaTableExpr::cast(node)?;
+    Some(LuaMemberOwner::Element(InFiled::new(
+        decl.get_id().file_id,
+        table_expr.get_range(),
+    )))
 }
 
 fn merge_open_table_components(mut components: Vec<LuaType>) -> Option<LuaType> {
@@ -564,9 +663,7 @@ fn unknown_index_key_matches_access(access_key_type: &LuaType) -> bool {
             true
         }
         LuaType::TypeGuard(inner) => unknown_index_key_matches_access(inner),
-        LuaType::Union(union) => union
-            .types()
-            .any(unknown_index_key_matches_access),
+        LuaType::Union(union) => union.types().any(unknown_index_key_matches_access),
         _ => false,
     }
 }

@@ -508,7 +508,12 @@ impl<'a> SemanticModel<'a> {
         prefix_type: &LuaType,
         member_key: &LuaMemberKey,
     ) -> Result<LuaType, InferFailReason> {
-        member::infer_raw_member_type(self.db, prefix_type, member_key)
+        member::infer_raw_member_type_with_cache(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            prefix_type,
+            member_key,
+        )
     }
 
     pub(crate) fn infer_index_member_type(

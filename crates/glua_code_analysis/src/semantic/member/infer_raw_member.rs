@@ -7,12 +7,16 @@ use crate::{
     DbIndex, FileId, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
     LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType,
     LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps, check_type_compact,
-    semantic::generic::{TypeSubstitutor, instantiate_type_generic},
+    semantic::{
+        LuaInferCache,
+        generic::{TypeSubstitutor, instantiate_type_generic},
+    },
 };
 
 use super::{
-    RawGetMemberTypeResult, get_buildin_type_map_type_id, member_key_as_type,
-    member_key_matches_type, merge_open_table_types,
+    RawGetMemberTypeResult, cached_local_class_table_member_ids, get_buildin_type_map_type_id,
+    local_class_table_member_ids, member_key_as_type, member_key_matches_type,
+    merge_open_table_types,
 };
 
 pub fn infer_raw_member_type(
@@ -20,11 +24,21 @@ pub fn infer_raw_member_type(
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
 ) -> RawGetMemberTypeResult {
-    infer_raw_member_type_guard(db, prefix_type, member_key, &InferGuard::new())
+    infer_raw_member_type_guard(db, None, prefix_type, member_key, &InferGuard::new())
+}
+
+pub fn infer_raw_member_type_with_cache(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    member_key: &LuaMemberKey,
+) -> RawGetMemberTypeResult {
+    infer_raw_member_type_guard(db, Some(cache), prefix_type, member_key, &InferGuard::new())
 }
 
 fn infer_raw_member_type_guard(
     db: &DbIndex,
+    mut cache: Option<&mut LuaInferCache>,
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuardRef,
@@ -60,12 +74,20 @@ fn infer_raw_member_type_guard(
             let owner = LuaMemberOwner::Type(decl_id);
             infer_owner_raw_member_type(db, owner, member_key)
         }
-        LuaType::Ref(type_id) => {
-            infer_custom_type_raw_member_type(db, type_id, member_key, infer_guard)
-        }
-        LuaType::Def(type_id) => {
-            infer_custom_type_raw_member_type(db, type_id, member_key, infer_guard)
-        }
+        LuaType::Ref(type_id) => infer_custom_type_raw_member_type(
+            db,
+            cache.as_deref_mut(),
+            type_id,
+            member_key,
+            infer_guard,
+        ),
+        LuaType::Def(type_id) => infer_custom_type_raw_member_type(
+            db,
+            cache.as_deref_mut(),
+            type_id,
+            member_key,
+            infer_guard,
+        ),
         LuaType::Tuple(tuple) => infer_tuple_raw_member_type(tuple, member_key),
         LuaType::Object(object) => infer_object_raw_member_type(db, object, member_key),
         LuaType::Array(array_type) => {
@@ -74,13 +96,23 @@ fn infer_raw_member_type_guard(
         LuaType::TableGeneric(table_generic) => {
             infer_table_generic_raw_member_type(db, table_generic, member_key)
         }
-        LuaType::Generic(generic_type) => {
-            infer_generic_raw_member_type(db, generic_type, member_key, infer_guard)
+        LuaType::Generic(generic_type) => infer_generic_raw_member_type(
+            db,
+            cache.as_deref_mut(),
+            generic_type,
+            member_key,
+            infer_guard,
+        ),
+        LuaType::MergedTable(merged_table) => infer_merged_table_raw_member_type(
+            db,
+            cache.as_deref_mut(),
+            merged_table,
+            member_key,
+            infer_guard,
+        ),
+        LuaType::TableOf(inner) => {
+            infer_raw_member_type_guard(db, cache, inner, member_key, infer_guard)
         }
-        LuaType::MergedTable(merged_table) => {
-            infer_merged_table_raw_member_type(db, merged_table, member_key, infer_guard)
-        }
-        LuaType::TableOf(inner) => infer_raw_member_type_guard(db, inner, member_key, infer_guard),
         // other do not support now
         _ => Err(InferFailReason::None),
     }
@@ -88,6 +120,7 @@ fn infer_raw_member_type_guard(
 
 fn infer_merged_table_raw_member_type(
     db: &DbIndex,
+    mut cache: Option<&mut LuaInferCache>,
     merged_table: &LuaMergedTableType,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuardRef,
@@ -96,7 +129,13 @@ fn infer_merged_table_raw_member_type(
     let mut last_resolve_reason = InferFailReason::FieldNotFound;
 
     for component in merged_table.get_types() {
-        match infer_raw_member_type_guard(db, component, member_key, &infer_guard.fork()) {
+        match infer_raw_member_type_guard(
+            db,
+            cache.as_deref_mut(),
+            component,
+            member_key,
+            &infer_guard.fork(),
+        ) {
             Ok(typ) if !typ.is_never() => member_types.push(typ),
             Ok(_) => {}
             Err(InferFailReason::FieldNotFound | InferFailReason::None) => {}
@@ -229,6 +268,7 @@ fn nullable_any_type() -> LuaType {
 
 fn infer_custom_type_raw_member_type(
     db: &DbIndex,
+    mut cache: Option<&mut LuaInferCache>,
     type_id: &LuaTypeDeclId,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuardRef,
@@ -240,7 +280,7 @@ fn infer_custom_type_raw_member_type(
         .ok_or(InferFailReason::None)?;
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(db, None) {
-            return infer_raw_member_type_guard(db, &origin_type, member_key, infer_guard);
+            return infer_raw_member_type_guard(db, cache, &origin_type, member_key, infer_guard);
         } else {
             return Err(InferFailReason::None);
         }
@@ -257,13 +297,29 @@ fn infer_custom_type_raw_member_type(
     {
         return member_item.resolve_type(db);
     }
+    let local_class_member_ids = cache.as_deref_mut().map_or_else(
+        || local_class_table_member_ids(db, type_id, member_key),
+        |cache| cached_local_class_table_member_ids(db, cache, type_id, member_key),
+    );
+    if !local_class_member_ids.is_empty() {
+        let member_item = match local_class_member_ids.as_slice() {
+            [member_id] => LuaMemberIndexItem::One(*member_id),
+            _ => LuaMemberIndexItem::Many(local_class_member_ids),
+        };
+        return member_item.resolve_type(db);
+    }
 
     if type_decl.is_class()
         && let Some(super_types) = type_index.get_super_types(type_id)
     {
         for super_type in super_types {
-            let result =
-                infer_raw_member_type_guard(db, &super_type, member_key, &infer_guard.fork());
+            let result = infer_raw_member_type_guard(
+                db,
+                cache.as_deref_mut(),
+                &super_type,
+                member_key,
+                &infer_guard.fork(),
+            );
 
             match result {
                 Ok(member_type) => {
@@ -368,6 +424,7 @@ fn infer_table_generic_raw_member_type(
 
 fn infer_generic_raw_member_type(
     db: &DbIndex,
+    mut cache: Option<&mut LuaInferCache>,
     generic_type: &LuaGenericType,
     member_key: &LuaMemberKey,
     infer_guard: &InferGuardRef,
@@ -381,10 +438,16 @@ fn infer_generic_raw_member_type(
         .ok_or(InferFailReason::None)?;
 
     if let Some(origin) = type_decl.get_alias_origin(db, Some(&substitutor)) {
-        return infer_raw_member_type(db, &origin, member_key);
+        return infer_raw_member_type_guard(db, cache, &origin, member_key, infer_guard);
     }
 
     let base_ref_type = LuaType::Ref(base_ref_id.clone());
-    let result = infer_raw_member_type_guard(db, &base_ref_type, member_key, infer_guard)?;
+    let result = infer_raw_member_type_guard(
+        db,
+        cache.as_deref_mut(),
+        &base_ref_type,
+        member_key,
+        infer_guard,
+    )?;
     Ok(instantiate_type_generic(db, &result, &substitutor))
 }
