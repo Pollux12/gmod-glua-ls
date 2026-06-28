@@ -2273,14 +2273,7 @@ fn direct_local_table_prefix_member_owner(
     analyzer: &mut LuaAnalyzer,
     prefix_expr: &LuaExpr,
 ) -> Option<LuaMemberOwner> {
-    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-        return None;
-    };
-    let decl_id = analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))?;
+    let decl_id = direct_local_prefix_decl_id(analyzer, prefix_expr)?;
     if let Some(cached_owner) = analyzer
         .direct_local_table_member_owner_cache
         .get(&decl_id)
@@ -2294,6 +2287,17 @@ fn direct_local_table_prefix_member_owner(
         .direct_local_table_member_owner_cache
         .insert(decl_id, owner.clone());
     owner
+}
+
+fn direct_local_prefix_decl_id(analyzer: &LuaAnalyzer, prefix_expr: &LuaExpr) -> Option<LuaDeclId> {
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+    analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
 }
 
 fn resolve_direct_local_table_prefix_member_owner(
