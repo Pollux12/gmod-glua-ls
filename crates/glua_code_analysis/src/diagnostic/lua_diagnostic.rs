@@ -114,39 +114,74 @@ impl LuaDiagnostic {
         let mut workspace_file_ids = module_index.get_main_workspace_file_ids();
         workspace_file_ids.sort_unstable();
 
-        let mut gm_method_realms = HashMap::new();
-        let mut callee_realms_by_workspace = HashMap::new();
-        let mut realm_call_candidates_by_workspace = HashMap::new();
-        for workspace_id in module_index.get_main_workspace_ids() {
-            let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
-            let mut callee_realm_data =
-                precompute_callee_realm_data_for_workspace(db, workspace_id, &workspace_file_ids);
-            callee_realm_data
-                .realm_call_candidates
-                .insert_gm_method_realms(realms.as_ref());
-            gm_method_realms.insert(workspace_id, realms);
-            callee_realms_by_workspace
-                .insert(workspace_id, Arc::new(callee_realm_data.callee_realms));
-            realm_call_candidates_by_workspace.insert(
-                workspace_id,
-                Arc::new(callee_realm_data.realm_call_candidates),
-            );
-        }
-
-        let missing_required_fields = precompute_missing_required_fields(db);
-        let subclass_fields = precompute_subclass_fields(db);
-        let await_candidates = precompute_await_candidates(db);
-        let param_type_candidates = precompute_param_type_candidates(db);
-        let nodiscard_candidates = precompute_nodiscard_candidates(db);
-
-        // Precompute decl annotation realms for all workspace files
-        let decl_annotation_realms = precompute_decl_annotation_realms(db, &workspace_file_ids);
-
-        // Precompute sorted send flows so each file doesn't re-sort them.
-        let sorted_send_flows = Arc::new(precompute_sorted_send_flows(
-            db.get_gmod_network_index(),
-            db.get_vfs(),
-        ));
+        // Every precomputation here scans the workspace-wide db independently and
+        // reads only immutable `&DbIndex` state, so run them all concurrently. On
+        // large workspaces this block was a ~0.3-0.4s serial prelude to the
+        // parallel per-file diagnostic pass; fanning it out keeps the one-time
+        // precompute off the critical path. The per-workspace realm loop keeps its
+        // own sequential ordering inside a single task (insertion order is
+        // significant for the "first definition wins" realm-candidate rule).
+        let workspace_file_ids_ref = &workspace_file_ids;
+        let (
+            workspace_realm_data,
+            missing_required_fields,
+            subclass_fields,
+            await_candidates,
+            param_type_candidates,
+            nodiscard_candidates,
+            decl_annotation_realms,
+            sorted_send_flows,
+        ) = std::thread::scope(|s| {
+            let workspace_realms = s.spawn(|| {
+                let mut gm_method_realms = HashMap::new();
+                let mut callee_realms_by_workspace = HashMap::new();
+                let mut realm_call_candidates_by_workspace = HashMap::new();
+                for workspace_id in module_index.get_main_workspace_ids() {
+                    let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
+                    let mut callee_realm_data = precompute_callee_realm_data_for_workspace(
+                        db,
+                        workspace_id,
+                        workspace_file_ids_ref,
+                    );
+                    callee_realm_data
+                        .realm_call_candidates
+                        .insert_gm_method_realms(realms.as_ref());
+                    gm_method_realms.insert(workspace_id, realms);
+                    callee_realms_by_workspace
+                        .insert(workspace_id, Arc::new(callee_realm_data.callee_realms));
+                    realm_call_candidates_by_workspace.insert(
+                        workspace_id,
+                        Arc::new(callee_realm_data.realm_call_candidates),
+                    );
+                }
+                (
+                    gm_method_realms,
+                    callee_realms_by_workspace,
+                    realm_call_candidates_by_workspace,
+                )
+            });
+            let missing = s.spawn(|| precompute_missing_required_fields(db));
+            let subclass = s.spawn(|| precompute_subclass_fields(db));
+            let await_c = s.spawn(|| precompute_await_candidates(db));
+            let param_type = s.spawn(|| precompute_param_type_candidates(db));
+            let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
+            let decl_realms =
+                s.spawn(|| precompute_decl_annotation_realms(db, workspace_file_ids_ref));
+            let send_flows =
+                s.spawn(|| precompute_sorted_send_flows(db.get_gmod_network_index(), db.get_vfs()));
+            (
+                workspace_realms.join().expect("workspace realm precompute panicked"),
+                missing.join().expect("precompute_missing_required_fields panicked"),
+                subclass.join().expect("precompute_subclass_fields panicked"),
+                await_c.join().expect("precompute_await_candidates panicked"),
+                param_type.join().expect("precompute_param_type_candidates panicked"),
+                nodiscard.join().expect("precompute_nodiscard_candidates panicked"),
+                decl_realms.join().expect("precompute_decl_annotation_realms panicked"),
+                Arc::new(send_flows.join().expect("precompute_sorted_send_flows panicked")),
+            )
+        });
+        let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =
+            workspace_realm_data;
 
         Arc::new(SharedDiagnosticData {
             workspace_file_ids: Arc::new(workspace_file_ids),
