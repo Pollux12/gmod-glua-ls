@@ -14,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
     update_code_style,
 };
 use tokio_util::sync::CancellationToken;
@@ -195,6 +195,58 @@ async fn main() {
         phase: "indexing (total)".into(),
         duration: indexing_duration,
     });
+
+    // Phase 4b: Incremental edit latency (simulates a keystroke re-index of a
+    // single already-indexed file — the interactive-editing hot path). Optional,
+    // enabled with BENCH_INCREMENTAL=1.
+    if std::env::var("BENCH_INCREMENTAL").is_ok() {
+        let main_ids = analysis
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        // Pick a handful of representative files spread across the workspace.
+        let sample: Vec<FileId> = {
+            let n = main_ids.len();
+            (0..5)
+                .filter_map(|i| main_ids.get(i * n / 5).copied())
+                .collect()
+        };
+        let mut total = std::time::Duration::ZERO;
+        let mut worst = std::time::Duration::ZERO;
+        let mut edited = 0usize;
+        for file_id in sample {
+            let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
+                continue;
+            };
+            let Some(text) = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .cloned()
+            else {
+                continue;
+            };
+            // Append a trivially-different comment to force a real re-index.
+            let edited_text = format!("{text}\n-- bench incremental edit\n");
+            let t = Instant::now();
+            analysis.update_file_by_uri(&uri, Some(edited_text));
+            let elapsed = t.elapsed();
+            total += elapsed;
+            worst = worst.max(elapsed);
+            edited += 1;
+            eprintln!("  [incremental] re-index {:?}: {:.3}s", file_id, elapsed.as_secs_f64());
+        }
+        if edited > 0 {
+            eprintln!(
+                "  [incremental] {} edits, avg {:.3}s, worst {:.3}s",
+                edited,
+                total.as_secs_f64() / edited as f64,
+                worst.as_secs_f64()
+            );
+        }
+    }
 
     // Phase 5: Diagnostics (parallel, matching real LS behavior)
     let t = Instant::now();
