@@ -2,6 +2,7 @@ mod accessorfunc_test;
 mod and_or_test;
 mod annotation_test;
 mod array_test;
+mod assign_widening_scaling_test;
 mod attribute_test;
 mod closure_generic;
 mod closure_param_infer_test;

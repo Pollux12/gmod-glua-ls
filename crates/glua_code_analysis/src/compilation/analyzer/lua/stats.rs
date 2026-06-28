@@ -21,6 +21,41 @@ use glua_parser::{
 
 use super::LuaAnalyzer;
 
+/// Upper bound on how many historical assignment members under a single
+/// `(owner, key)` the per-assignment widening / preservation scans will walk.
+///
+/// Each member assignment to the same field re-scans every prior member sharing
+/// that `(owner, key)` (to union their types, preserve guarded table literals,
+/// etc.). That is O(members) per assignment, i.e. O(N²) for a field assigned N
+/// times. Real code assigns a given field a small number of times; pathological
+/// inputs — generated code, huge dispatch/config tables, thousands of branched
+/// `if cond then obj.field = {...} end` writes — would otherwise drive
+/// `lua analyze` into multi-second-per-file behaviour and time the workspace out
+/// (issue #36). Above this bound the widening short-circuits: the bound is far
+/// larger than any hand-written field's assignment count, and reads still union
+/// the live members at query time, so observable types are unchanged for
+/// realistic code while degenerate files stay responsive.
+const MAX_RELATED_MEMBER_WIDENING_SCAN: usize = 64;
+
+/// O(1) check of whether the `(owner, key)` behind this type owner already has
+/// more historical assignment members than the widening scan should walk.
+fn owner_key_exceeds_widening_scan_budget(
+    analyzer: &LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+) -> bool {
+    let LuaTypeOwner::Member(member_id) = type_owner else {
+        return false;
+    };
+    let member_index = analyzer.db.get_member_index();
+    let Some(owner) = member_index.get_member_owner(member_id) else {
+        return false;
+    };
+    let Some(key) = member_index.get_member(member_id).map(|m| m.get_key()) else {
+        return false;
+    };
+    member_index.count_members_for_owner_key(owner, key) > MAX_RELATED_MEMBER_WIDENING_SCAN
+}
+
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
     let name_list: Vec<_> = local_stat.get_local_name_list().collect();
     let expr_list: Vec<_> = local_stat.get_value_exprs().collect();
@@ -1177,19 +1212,26 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
-    if let Some(widened_type) =
-        get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
-    {
-        expr_type = widened_type;
-    }
+    // Bound the O(related-members) widening/preservation work so a field assigned
+    // a pathological number of times cannot make this O(N²). See
+    // MAX_RELATED_MEMBER_WIDENING_SCAN.
+    let within_widening_budget = !owner_key_exceeds_widening_scan_budget(analyzer, &type_owner);
 
-    if let Some(widened_type) = get_widened_member_assignment_type(
-        analyzer,
-        &type_owner,
-        &expr_type,
-        preserve_table_literals,
-    ) {
-        expr_type = widened_type;
+    if within_widening_budget {
+        if let Some(widened_type) =
+            get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
+        {
+            expr_type = widened_type;
+        }
+
+        if let Some(widened_type) = get_widened_member_assignment_type(
+            analyzer,
+            &type_owner,
+            &expr_type,
+            preserve_table_literals,
+        ) {
+            expr_type = widened_type;
+        }
     }
 
     if is_global_decl_owner(analyzer, &type_owner) {
@@ -1202,7 +1244,8 @@ fn assign_merge_type_owner_and_expr_type(
         LuaTypeCache::InferType(expr_type),
     );
 
-    if let LuaTypeOwner::Member(member_id) = type_owner
+    if within_widening_budget
+        && let LuaTypeOwner::Member(member_id) = type_owner
         && is_assignment_file_define_member(analyzer.db, member_id)
     {
         let guarded_table_assignment =
@@ -1648,7 +1691,13 @@ fn widen_existing_member_collection_type(
         return Some(());
     }
 
-    if let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone()) {
+    // Bound the related-member fan-out: a field written as a collection a
+    // pathological number of times would otherwise make this O(N²). The bound is
+    // far above any realistic field's assignment count (see
+    // MAX_RELATED_MEMBER_WIDENING_SCAN).
+    if let Some(member_ids) = find_related_member_ids(analyzer, index_expr.clone())
+        && member_ids.len() <= MAX_RELATED_MEMBER_WIDENING_SCAN
+    {
         widen_member_collections_with_collection_type(analyzer, &member_ids, value_type);
     }
 
@@ -1656,6 +1705,7 @@ fn widen_existing_member_collection_type(
         && let Some(prefix_expr) = index_expr.get_prefix_expr()
         && let Some(prefix_index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone())
         && let Some(member_ids) = find_related_member_ids(analyzer, prefix_index_expr)
+        && member_ids.len() <= MAX_RELATED_MEMBER_WIDENING_SCAN
     {
         widen_member_collections_with_element_type(analyzer, &member_ids, value_type);
     }

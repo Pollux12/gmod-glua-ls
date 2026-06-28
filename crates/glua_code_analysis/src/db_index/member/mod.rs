@@ -478,6 +478,22 @@ impl LuaMemberIndex {
         self.member_current_owner.get(id)
     }
 
+    /// Number of historical assignment members recorded under `(owner, key)`.
+    /// O(1) — used to bound the otherwise O(N) per-assignment widening/preserve
+    /// scans so a field assigned a pathological number of times (generated code,
+    /// huge dispatch tables) cannot drive `lua analyze` into O(N²) behaviour.
+    pub fn count_members_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> usize {
+        self.member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+            .map(|member_ids| member_ids.len())
+            .unwrap_or(0)
+    }
+
     pub fn get_members_for_owner_key(
         &self,
         owner: &LuaMemberOwner,
