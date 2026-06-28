@@ -21,7 +21,10 @@ use crate::{
     },
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type, is_initialized_assignment_prefix};
+use super::{
+    AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
+    is_initialized_assignment_access, is_initialized_assignment_prefix,
+};
 
 pub struct CheckFieldChecker;
 
@@ -77,6 +80,12 @@ impl Checker for CheckFieldChecker {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let initialized_assignment_accesses =
+            if has_reusable_table_literal_assignment(&assignment_prefixes) {
+                collect_initialized_assignment_accesses(&root, &assignment_prefixes)
+            } else {
+                HashSet::new()
+            };
         let mut state = CheckFieldState::default();
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(CheckFieldProfile::default);
@@ -140,6 +149,12 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
+                    if initialized_assignment_accesses.contains(index_expr.syntax()) {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.prechecked_index_skips += 1;
+                        }
+                        continue;
+                    }
                     check_index_expr(
                         context,
                         semantic_model,
@@ -156,6 +171,54 @@ impl Checker for CheckFieldChecker {
             profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
         }
     }
+}
+
+fn has_reusable_table_literal_assignment(assignment_prefixes: &AssignmentPrefixEvents) -> bool {
+    let table_literal_keys = assignment_prefixes
+        .iter()
+        .filter(|(_, events)| events.iter().any(|event| event.is_table_literal))
+        .map(|((block_start, block_end, text), _)| (*block_start, *block_end, text.as_str()));
+
+    for (table_block_start, table_block_end, table_text) in table_literal_keys {
+        for (block_start, block_end, text) in assignment_prefixes.keys() {
+            if *block_start != table_block_start || *block_end != table_block_end {
+                continue;
+            }
+            let Some(rest) = text.strip_prefix(table_text) else {
+                continue;
+            };
+            if rest.starts_with('.') || rest.starts_with('[') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn collect_initialized_assignment_accesses(
+    root: &glua_parser::LuaChunk,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> HashSet<LuaSyntaxNode> {
+    let mut initialized_accesses = HashSet::new();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let (vars, _) = assign.get_var_and_expr_list();
+        for var in vars {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            for node in index_expr.syntax().descendants() {
+                let Some(descendant_index_expr) = LuaIndexExpr::cast(node) else {
+                    continue;
+                };
+                if is_initialized_assignment_access(&descendant_index_expr, assignment_prefixes) {
+                    initialized_accesses.insert(descendant_index_expr.syntax().clone());
+                }
+            }
+        }
+    }
+
+    initialized_accesses
 }
 
 #[derive(Default)]
@@ -403,9 +466,7 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
 fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> bool {
     let is_tableof = match prefix_typ {
         LuaType::TableOf(_) => true,
-        LuaType::Union(union) => union
-            .types()
-            .any(|t| matches!(t, LuaType::TableOf(_))),
+        LuaType::Union(union) => union.types().any(|t| matches!(t, LuaType::TableOf(_))),
         _ => false,
     };
     if !is_tableof {
@@ -1307,9 +1368,16 @@ fn allows_nil_safe_expr_undefined_field_suppression(
             // accessing a field on `T?` in an `and`/`or` expression is safe because
             // the surrounding boolean expression guards against the nil case.
             union_type.types().any(|t| !matches!(t, LuaType::Nil))
-                && union_type.types().filter(|t| !matches!(t, LuaType::Nil)).all(|t| {
-                    allows_nil_safe_expr_undefined_field_suppression(semantic_model, t, index_key)
-                })
+                && union_type
+                    .types()
+                    .filter(|t| !matches!(t, LuaType::Nil))
+                    .all(|t| {
+                        allows_nil_safe_expr_undefined_field_suppression(
+                            semantic_model,
+                            t,
+                            index_key,
+                        )
+                    })
         }
         _ => false,
     }

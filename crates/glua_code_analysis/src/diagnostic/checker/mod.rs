@@ -551,6 +551,43 @@ pub fn is_initialized_assignment_prefix(
     last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
 }
 
+pub fn assignment_prefix_key_for_syntax(
+    stat_syntax: &LuaSyntaxNode,
+    syntax: &LuaSyntaxNode,
+) -> Option<AssignmentPrefixKey> {
+    let Some((block_start, block_end)) = assignment_block_range(stat_syntax) else {
+        return None;
+    };
+
+    let access_text = normalized_syntax_text(syntax);
+    if access_text.is_empty() {
+        return None;
+    }
+
+    Some((block_start, block_end, access_text))
+}
+
+pub fn is_initialized_assignment_access(
+    index_expr: &LuaIndexExpr,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> bool {
+    let Some(stat) = index_expr.syntax().ancestors().find_map(LuaStat::cast) else {
+        return false;
+    };
+
+    let Some(key) = assignment_prefix_key_for_syntax(stat.syntax(), index_expr.syntax()) else {
+        return false;
+    };
+
+    let Some(events) = assignment_prefixes.get(&key) else {
+        return false;
+    };
+
+    let current_offset = stat.syntax().text_range().start();
+    let last_event_idx = events.partition_point(|event| event.offset < current_offset);
+    last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
+}
+
 fn assignment_block_range(node: &LuaSyntaxNode) -> Option<(TextSize, TextSize)> {
     let range = node.parent()?.text_range();
     Some((range.start(), range.end()))

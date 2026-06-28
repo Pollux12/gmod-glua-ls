@@ -1135,6 +1135,65 @@ mod test {
     }
 
     #[test]
+    fn test_repeated_initialized_index_prefixes_do_not_report_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");
+        for i in 0..40 {
+            body.push_str(&format!(
+                r#"
+                    WepHolster.defData["weapon_{i}"] = {{}}
+                    WepHolster.defData["weapon_{i}"].Model = "models/weapons/w_{i}.mdl"
+                    WepHolster.defData["weapon_{i}"].Bone = "ValveBiped.Bip01_Spine"
+"#
+            ));
+        }
+
+        let file_id = ws.def(&body);
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+
+        assert!(
+            diags.is_empty(),
+            "initialized table prefixes should not produce undefined-field diagnostics: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn test_repeated_initialized_index_prefixes_diagnose_quick_smoke() {
+        let mut ws = VirtualWorkspace::new();
+        let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");
+        for i in 0..250 {
+            body.push_str(&format!(
+                r#"
+                    WepHolster.defData["weapon_{i}"] = {{}}
+                    WepHolster.defData["weapon_{i}"].Model = "models/weapons/w_{i}.mdl"
+                    WepHolster.defData["weapon_{i}"].Bone = "ValveBiped.Bip01_Spine"
+"#
+            ));
+        }
+
+        let file_id = ws.def(&body);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let start = std::time::Instant::now();
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let elapsed = start.elapsed();
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected undefined-field diagnostics: {diagnostics:#?}"
+        );
+        assert!(
+            elapsed.as_millis() < 250,
+            "repeated initialized index-prefix diagnostics took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
     fn test_guarded_empty_table_bootstrap_keeps_typed_member_access_valid() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
