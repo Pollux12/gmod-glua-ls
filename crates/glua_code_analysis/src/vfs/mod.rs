@@ -157,7 +157,6 @@ impl Vfs {
         if text.is_none() && existing_file_id.is_none() {
             return None;
         }
-        self.content_revision += 1;
 
         let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
         log::debug!("file_id (preparsed): {:?}, uri: {}", fid, uri.as_str());
@@ -172,6 +171,8 @@ impl Vfs {
         {
             return None;
         }
+
+        self.content_revision += 1;
 
         match text {
             Some(content) => {
@@ -224,7 +225,6 @@ impl Vfs {
         if text.is_none() && existing_file_id.is_none() {
             return None;
         }
-        self.content_revision += 1;
 
         let fid = existing_file_id.unwrap_or_else(|| self.file_id(uri));
         log::debug!(
@@ -243,6 +243,8 @@ impl Vfs {
         {
             return None;
         }
+
+        self.content_revision += 1;
 
         let mut deferred_drop = DeferredVfsDrop::default();
 
@@ -415,4 +417,90 @@ struct FileContent {
     content: String,
     is_remote: bool,
     version: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glua_parser::{LineIndex, LuaParser};
+    use lsp_types::Uri;
+    use rowan::NodeCache;
+
+    use crate::Emmyrc;
+
+    use super::Vfs;
+
+    fn parse_lua(text: &str) -> (glua_parser::LuaSyntaxTree, LineIndex) {
+        let mut node_cache = NodeCache::default();
+        let emmyrc = Emmyrc::default();
+        let parse_config = emmyrc.get_parse_config(&mut node_cache);
+        (LuaParser::parse(text, parse_config), LineIndex::parse(text))
+    }
+
+    fn file_uri() -> Uri {
+        "file:///test.lua".parse().expect("valid test uri")
+    }
+
+    fn new_vfs() -> Vfs {
+        let mut vfs = Vfs::new();
+        vfs.update_config(Arc::new(Emmyrc::default()));
+        vfs
+    }
+
+    #[test]
+    fn stale_preparsed_update_does_not_bump_content_revision() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let (tree, line_index) = parse_lua("local a = 1");
+        vfs.set_file_content_preparsed(
+            &uri,
+            Some("local a = 1".to_string()),
+            tree,
+            line_index,
+            Some(2),
+        )
+        .expect("initial update should be accepted");
+        let revision = vfs.content_revision();
+
+        let (tree, line_index) = parse_lua("local a = 0");
+        let result = vfs.set_file_content_preparsed(
+            &uri,
+            Some("local a = 0".to_string()),
+            tree,
+            line_index,
+            Some(1),
+        );
+
+        assert!(result.is_none(), "stale update should be rejected");
+        assert_eq!(vfs.content_revision(), revision);
+    }
+
+    #[test]
+    fn stale_deferred_preparsed_update_does_not_bump_content_revision() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let (tree, line_index) = parse_lua("local a = 1");
+        vfs.set_file_content_preparsed_deferred(
+            &uri,
+            Some("local a = 1".to_string()),
+            tree,
+            line_index,
+            Some(2),
+        )
+        .expect("initial update should be accepted");
+        let revision = vfs.content_revision();
+
+        let (tree, line_index) = parse_lua("local a = 0");
+        let result = vfs.set_file_content_preparsed_deferred(
+            &uri,
+            Some("local a = 0".to_string()),
+            tree,
+            line_index,
+            Some(1),
+        );
+
+        assert!(result.is_none(), "stale update should be rejected");
+        assert_eq!(vfs.content_revision(), revision);
+    }
 }
