@@ -50,6 +50,28 @@ mod test {
         start.elapsed()
     }
 
+    fn infer_after_repeated_unrelated_inner_conditions(count: usize) -> std::time::Duration {
+        let mut body = String::from(
+            r#"
+---@type string?
+local target
+local unrelated = {}
+"#,
+        );
+        for i in 0..count {
+            body.push_str(&format!(
+                "if cond{i} then\n    if unrelated.flag{i} then\n        local sink{i} = {i}\n    end\nend\n"
+            ));
+        }
+        body.push_str("result = target\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        let _ = ws.expr_ty("result");
+        start.elapsed()
+    }
+
     #[test]
     #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
     fn repeated_field_assignment_indexing_stays_near_linear() {
@@ -107,6 +129,35 @@ mod test {
         assert!(
             elapsed.as_millis() < 250,
             "small guarded bootstrap smoke took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    fn repeated_unrelated_inner_conditions_still_infer_quick_smoke() {
+        let elapsed = infer_after_repeated_unrelated_inner_conditions(200);
+
+        assert!(
+            elapsed.as_millis() < 250,
+            "unrelated inner-condition flow smoke took too long: {elapsed:?}"
+        );
+    }
+
+    #[test]
+    #[ignore = "wall-clock performance smoke for unrelated inner-condition branch merges"]
+    fn unrelated_inner_condition_branch_merges_stay_near_linear() {
+        let _ = infer_after_repeated_unrelated_inner_conditions(100);
+
+        let small = infer_after_repeated_unrelated_inner_conditions(500);
+        let large = infer_after_repeated_unrelated_inner_conditions(2000);
+
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        eprintln!(
+            "unrelated inner-condition flow scaling: 500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x"
+        );
+        assert!(
+            ratio < 12.0,
+            "flow narrowing scaled super-linearly with unrelated inner conditions \
+             (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
         );
     }
 

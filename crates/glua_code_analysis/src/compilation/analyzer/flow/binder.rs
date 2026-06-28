@@ -7,7 +7,8 @@ use smol_str::SmolStr;
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DbIndex, FileId,
-    FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, LuaClosureId, LuaDeclId,
+    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
+    LuaClosureId, LuaDeclId,
 };
 
 /// Snapshot of the modification counters, used to detect what was created
@@ -18,6 +19,15 @@ pub struct ModificationSnapshot {
     pub index_assign_count: u32,
     pub cast_or_implfunc_count: u32,
     pub condition_count: u32,
+    pub narrowing_event_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum NarrowingEvent {
+    Name(ArcIntern<SmolStr>),
+    IndexPath(ArcIntern<SmolStr>),
+    OpaqueName,
+    OpaqueIndex,
 }
 
 #[derive(Debug)]
@@ -49,7 +59,8 @@ pub struct FlowBinder<'a> {
     cast_or_implfunc_count: u32,
     condition_count: u32,
     // File-wide narrowing capability (which names/paths can be narrowed).
-    narrowing_capability: crate::FileNarrowingCapability,
+    narrowing_capability: FileNarrowingCapability,
+    narrowing_events: Vec<NarrowingEvent>,
 }
 
 impl<'a> FlowBinder<'a> {
@@ -76,7 +87,8 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: 0,
             cast_or_implfunc_count: 0,
             condition_count: 0,
-            narrowing_capability: crate::FileNarrowingCapability::default(),
+            narrowing_capability: FileNarrowingCapability::default(),
+            narrowing_events: Vec::new(),
         };
 
         binder.start = binder.create_start();
@@ -241,6 +253,7 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: self.index_assign_count,
             cast_or_implfunc_count: self.cast_or_implfunc_count,
             condition_count: self.condition_count,
+            narrowing_event_count: self.narrowing_events.len(),
         }
     }
 
@@ -253,6 +266,34 @@ impl<'a> FlowBinder<'a> {
             self.cast_or_implfunc_count > snap.cast_or_implfunc_count,
             self.condition_count > snap.condition_count,
         )
+    }
+
+    pub fn narrowing_capability_since(
+        &self,
+        snap: ModificationSnapshot,
+    ) -> FileNarrowingCapability {
+        let mut capability = FileNarrowingCapability::default();
+        for event in self
+            .narrowing_events
+            .iter()
+            .skip(snap.narrowing_event_count)
+        {
+            match event {
+                NarrowingEvent::Name(name) => {
+                    capability.referenced_names.insert(name.clone());
+                }
+                NarrowingEvent::IndexPath(path) => {
+                    capability.referenced_index_paths.insert(path.clone());
+                }
+                NarrowingEvent::OpaqueName => {
+                    capability.has_opaque_name_target = true;
+                }
+                NarrowingEvent::OpaqueIndex => {
+                    capability.has_opaque_index_target = true;
+                }
+            }
+        }
+        capability
     }
 
     /// Record merge-skip metadata for a BranchLabel created by an if/elseif/else.
@@ -275,24 +316,30 @@ impl<'a> FlowBinder<'a> {
     /// Record a bare name that can be narrowed at some site (assignment target,
     /// cast, or condition expression).
     pub fn record_narrowable_name(&mut self, name: &str) {
+        let name = ArcIntern::from(SmolStr::new(name));
         self.narrowing_capability
             .referenced_names
-            .insert(internment::ArcIntern::from(smol_str::SmolStr::new(name)));
+            .insert(name.clone());
+        self.narrowing_events.push(NarrowingEvent::Name(name));
     }
 
     /// Record an index access path that can be narrowed.
     pub fn record_narrowable_index_path(&mut self, path: &str) {
+        let path = ArcIntern::from(SmolStr::new(path));
         self.narrowing_capability
             .referenced_index_paths
-            .insert(internment::ArcIntern::from(smol_str::SmolStr::new(path)));
+            .insert(path.clone());
+        self.narrowing_events.push(NarrowingEvent::IndexPath(path));
     }
 
     pub fn mark_opaque_name_target(&mut self) {
         self.narrowing_capability.has_opaque_name_target = true;
+        self.narrowing_events.push(NarrowingEvent::OpaqueName);
     }
 
     pub fn mark_opaque_index_target(&mut self) {
         self.narrowing_capability.has_opaque_index_target = true;
+        self.narrowing_events.push(NarrowingEvent::OpaqueIndex);
     }
 
     /// Walk an expression subtree and record every name / index access path it

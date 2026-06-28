@@ -148,7 +148,7 @@ fn get_type_at_flow_walk(
     visited_flow_ids: &mut Vec<FlowId>,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
-    let mut pending_branch_types = Vec::new();
+    let pending_branch_types = [];
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
@@ -201,18 +201,7 @@ fn get_type_at_flow_walk(
                 if matches!(flow_node.kind, FlowNodeKind::BranchLabel)
                     && let Some(info) = tree.get_branch_label_info(antecedent_flow_id)
                 {
-                    let can_skip = match var_ref_id {
-                        VarRefId::VarRef(_) | VarRefId::SelfRef(_) | VarRefId::GlobalName(_, _) => {
-                            !info.has_name_assigns
-                                && !info.has_casts_or_implfunc
-                                && !info.has_inner_conditions
-                        }
-                        VarRefId::IndexRef(_, _) => {
-                            !info.has_index_assigns
-                                && !info.has_casts_or_implfunc
-                                && !info.has_inner_conditions
-                        }
-                    };
+                    let can_skip = !branch_can_narrow_var_ref(db, info, var_ref_id);
 
                     if can_skip
                         && all_branch_antecedents_alive(tree, flow_node)
@@ -229,17 +218,6 @@ fn get_type_at_flow_walk(
                         antecedent_flow_id = info.common_predecessor;
                         continue;
                     }
-                }
-
-                if matches!(flow_node.kind, FlowNodeKind::BranchLabel)
-                    && let Some((common_predecessor, mut branch_types)) =
-                        try_defer_noop_branch_antecedent_merge(
-                            db, tree, cache, root, var_ref_id, flow_node,
-                        )?
-                {
-                    pending_branch_types.append(&mut branch_types);
-                    antecedent_flow_id = common_predecessor;
-                    continue;
                 }
 
                 return finish_flow_walk_result(
@@ -1240,192 +1218,41 @@ fn branch_has_relevant_special_call_effects(
     })
 }
 
-fn try_defer_noop_branch_antecedent_merge(
+fn branch_can_narrow_var_ref(
     db: &DbIndex,
-    tree: &FlowTree,
-    cache: &mut LuaInferCache,
-    root: &LuaChunk,
-    var_ref_id: &VarRefId,
-    flow_node: &FlowNode,
-) -> Result<Option<(FlowId, Vec<LuaType>)>, InferFailReason> {
-    let Some(info) = tree.get_branch_label_info(flow_node.id) else {
-        return Ok(None);
-    };
-    let Some(FlowAntecedent::Multiple(idx)) = &flow_node.antecedent else {
-        return Ok(None);
-    };
-    if !all_branch_antecedents_alive(tree, flow_node)
-        || branch_has_relevant_special_call_effects(
-            db,
-            tree,
-            cache,
-            root,
-            flow_node,
-            info.common_predecessor,
-            var_ref_id,
-        )
-    {
-        return Ok(None);
-    }
-
-    let Some(antecedents) = tree.get_multi_antecedents(*idx) else {
-        return Ok(None);
-    };
-    let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
-        db.get_gmod_infer_index()
-            .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
-    });
-
-    let mut skipped_common_predecessor_path = false;
-    let mut branch_types = Vec::with_capacity(antecedents.len());
-    for &flow_id in antecedents {
-        let Some(antecedent_node) = tree.get_flow_node(flow_id) else {
-            continue;
-        };
-        if matches!(
-            antecedent_node.kind,
-            FlowNodeKind::Unreachable | FlowNodeKind::Return | FlowNodeKind::Break
-        ) || call_flow_node_returns_never(db, cache, root, antecedent_node)
-        {
-            continue;
-        }
-
-        let antecedent_realm =
-            get_or_compute_flow_node_realm(db, cache, root, flow_id, antecedent_node);
-        if !realms_can_reach(target_realm, antecedent_realm) {
-            return Ok(None);
-        }
-
-        if !flow_path_can_change_var_ref(
-            db,
-            tree,
-            cache,
-            root,
-            flow_id,
-            info.common_predecessor,
-            var_ref_id,
-        ) {
-            skipped_common_predecessor_path = true;
-            continue;
-        }
-
-        let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
-            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id)
-        })?;
-        if branch_type.is_unknown() {
-            return Ok(Some((info.common_predecessor, vec![LuaType::Unknown])));
-        }
-        branch_types.push(branch_type);
-    }
-
-    if skipped_common_predecessor_path {
-        Ok(Some((info.common_predecessor, branch_types)))
-    } else {
-        Ok(None)
-    }
-}
-
-fn flow_path_can_change_var_ref(
-    db: &DbIndex,
-    tree: &FlowTree,
-    cache: &LuaInferCache,
-    root: &LuaChunk,
-    flow_id: FlowId,
-    stop_at: FlowId,
+    info: &crate::BranchLabelInfo,
     var_ref_id: &VarRefId,
 ) -> bool {
-    let mut stack = vec![flow_id];
-    let mut visited = HashSet::new();
-    while let Some(flow_id) = stack.pop() {
-        if flow_id == stop_at || !visited.insert(flow_id) {
-            continue;
-        }
-
-        let Some(flow_node) = tree.get_flow_node(flow_id) else {
-            continue;
-        };
-        if flow_node_can_change_var_ref(db, tree, cache, root, flow_id, flow_node, var_ref_id) {
-            return true;
-        }
-
-        match &flow_node.antecedent {
-            Some(FlowAntecedent::Single(prev)) => stack.push(*prev),
-            Some(FlowAntecedent::Multiple(idx)) => {
-                if let Some(prevs) = tree.get_multi_antecedents(*idx) {
-                    stack.extend(prevs.iter().copied());
-                }
-            }
-            None => {}
-        }
+    if info.has_casts_or_implfunc {
+        return true;
     }
 
-    false
-}
-
-fn flow_node_can_change_var_ref(
-    db: &DbIndex,
-    tree: &FlowTree,
-    cache: &LuaInferCache,
-    root: &LuaChunk,
-    flow_id: FlowId,
-    flow_node: &FlowNode,
-    var_ref_id: &VarRefId,
-) -> bool {
-    match &flow_node.kind {
-        FlowNodeKind::Assignment(_, assign_hint) => {
-            let can_match_assignment = matches!(
-                (assign_hint, var_ref_id),
-                (AssignVarHint::Mixed, _)
-                    | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
-                    | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
-                    | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
-                    | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
-            );
-            can_match_assignment && !assignment_flow_info_cannot_match(tree, flow_id, var_ref_id)
-        }
-        FlowNodeKind::Call(call_ptr) => {
-            let Some(call_expr) = call_ptr.to_node(root) else {
-                return false;
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => {
+            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+                return info.has_name_assigns;
             };
-            db.get_flow_index()
-                .get_special_call_effects(&cache.get_file_id(), call_expr.get_position())
-                .is_some_and(|effects| {
-                    effects.iter().any(|effect| {
-                        special_call_effect_matches_var_ref(&effect.target, var_ref_id)
-                    })
-                })
+            branch_name_can_be_narrowed(info, decl.get_name())
         }
-        FlowNodeKind::TrueCondition(condition_ptr)
-        | FlowNodeKind::FalseCondition(condition_ptr) => {
-            condition_ptr.to_node(root).is_some_and(|condition| {
-                condition_expr_can_reference_var_ref(db, cache, condition, var_ref_id)
-            })
+        VarRefId::SelfRef(_) => branch_name_can_be_narrowed(info, "self"),
+        VarRefId::GlobalName(name, _) => info.narrowing_capability.name_can_be_narrowed(name),
+        VarRefId::IndexRef(root, path) => {
+            info.narrowing_capability.index_path_can_be_narrowed(path)
+                || root
+                    .as_decl_id()
+                    .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                    .is_some_and(|decl| branch_name_can_be_narrowed(info, decl.get_name()))
         }
-        FlowNodeKind::ImplFunc(_) | FlowNodeKind::TagCast(_) => true,
-        FlowNodeKind::Start
-        | FlowNodeKind::Unreachable
-        | FlowNodeKind::BranchLabel
-        | FlowNodeKind::LoopLabel
-        | FlowNodeKind::NamedLabel(_)
-        | FlowNodeKind::DeclPosition(_)
-        | FlowNodeKind::ForIStat(_)
-        | FlowNodeKind::Break
-        | FlowNodeKind::Return => false,
     }
 }
 
-fn condition_expr_can_reference_var_ref(
-    db: &DbIndex,
-    cache: &LuaInferCache,
-    expr: LuaExpr,
-    var_ref_id: &VarRefId,
-) -> bool {
-    let mut probe_cache = cache.clone();
-    expr.syntax().descendants().any(|node| {
-        LuaExpr::cast(node).is_some_and(|expr| {
-            get_var_expr_var_ref_id(db, &mut probe_cache, expr).is_some_and(|id| id == *var_ref_id)
-        })
-    })
+fn branch_name_can_be_narrowed(info: &crate::BranchLabelInfo, name: &str) -> bool {
+    info.narrowing_capability.has_opaque_name_target
+        || info
+            .narrowing_capability
+            .referenced_names
+            .iter()
+            .any(|narrowable_name| narrowable_name.as_str() == name)
 }
 
 fn antecedent_has_relevant_special_call_effect(

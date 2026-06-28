@@ -70,6 +70,10 @@ pub struct BranchLabelInfo {
     /// patterns create inner conditions that can narrow variables beyond what
     /// the outer condition/merge would cancel out.
     pub has_inner_conditions: bool,
+    /// Branch-local names and index paths that can change/narrow a variable.
+    /// This lets the flow walk skip branch merges for variables unrelated to
+    /// assignments and inner conditions in the branch.
+    pub narrowing_capability: FileNarrowingCapability,
 }
 
 #[derive(Debug, Clone, Default)]

@@ -543,6 +543,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     // Record BranchLabel metadata so the flow walk can skip merges for
     // variables that were not modified inside any branch.
     let (has_name, has_index, has_casts, _) = binder.check_new_modifications(saved);
+    let narrowing_capability = binder.narrowing_capability_since(saved);
     binder.set_branch_label_info(
         post_if_label,
         BranchLabelInfo {
@@ -551,6 +552,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
             has_index_assigns: has_index,
             has_casts_or_implfunc: has_casts,
             has_inner_conditions: blocks_have_inner_conditions,
+            narrowing_capability,
         },
     );
 

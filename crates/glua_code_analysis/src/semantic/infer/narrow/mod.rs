@@ -90,7 +90,19 @@ fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &V
         // and only diverge from the origin type through an actual narrowing site
         // (assignment / cast / condition) on a matching access path. When no such
         // site exists in the file, the walk is provably a no-op.
-        VarRefId::IndexRef(_, path) => capability.index_path_can_be_narrowed(path),
+        VarRefId::IndexRef(root, path) => {
+            capability.index_path_can_be_narrowed(path)
+                || root
+                    .as_decl_id()
+                    .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                    .is_some_and(|decl| {
+                        capability.has_opaque_name_target
+                            || capability
+                                .referenced_names
+                                .iter()
+                                .any(|name| name.as_str() == decl.get_name())
+                    })
+        }
     }
 }
 
