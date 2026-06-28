@@ -1,8 +1,7 @@
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaCallExprStat,
-    LuaClosureExpr, LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr,
-    LuaIndexKey, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaSyntaxKind,
-    LuaSyntaxNode, LuaVarExpr, LuaWhileStat, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaCallExprStat,
+    LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat,
+    LuaLocalStat, LuaNameExpr, LuaSyntaxKind, LuaSyntaxNode, LuaVarExpr, UnaryOperator,
 };
 use rowan::TextRange;
 use rustc_hash::FxHashSet;
@@ -52,27 +51,29 @@ impl Checker for NeedCheckNilChecker {
             }
         }
 
-        for if_stat in root.descendants::<LuaIfStat>() {
-            if let Some(condition) = if_stat.get_condition_expr() {
-                check_condition_expr(context, semantic_model, condition);
-            }
-        }
-
-        for elseif_stat in root.descendants::<LuaElseIfClauseStat>() {
-            if let Some(condition) = elseif_stat.get_condition_expr() {
-                check_condition_expr(context, semantic_model, condition);
-            }
-        }
-
-        for while_stat in root.descendants::<LuaWhileStat>() {
-            if let Some(condition) = while_stat.get_condition_expr() {
-                check_condition_expr(context, semantic_model, condition);
-            }
-        }
-
-        for repeat_stat in root.descendants::<LuaRepeatStat>() {
-            if let Some(condition) = repeat_stat.get_condition_expr() {
-                check_condition_expr(context, semantic_model, condition);
+        for node in root.descendants::<LuaAst>() {
+            match node {
+                LuaAst::LuaIfStat(if_stat) => {
+                    if let Some(condition) = if_stat.get_condition_expr() {
+                        check_condition_expr(context, semantic_model, condition);
+                    }
+                }
+                LuaAst::LuaElseIfClauseStat(elseif_stat) => {
+                    if let Some(condition) = elseif_stat.get_condition_expr() {
+                        check_condition_expr(context, semantic_model, condition);
+                    }
+                }
+                LuaAst::LuaWhileStat(while_stat) => {
+                    if let Some(condition) = while_stat.get_condition_expr() {
+                        check_condition_expr(context, semantic_model, condition);
+                    }
+                }
+                LuaAst::LuaRepeatStat(repeat_stat) => {
+                    if let Some(condition) = repeat_stat.get_condition_expr() {
+                        check_condition_expr(context, semantic_model, condition);
+                    }
+                }
+                _ => {}
             }
         }
     }

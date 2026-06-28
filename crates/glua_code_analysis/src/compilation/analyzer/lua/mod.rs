@@ -67,8 +67,10 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
         let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
         let slow_log_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
+        let node_profile_enabled = stderr_profile_enabled;
         let total_start = slow_log_enabled.then(Instant::now);
-        let mut workspace_profile = slow_log_enabled.then(LuaAnalyzeProfile::default);
+        let mut workspace_profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
+        let mut slow_file_summary = slow_log_enabled.then(SlowLuaAnalyzeSummary::default);
         let mut file_count: usize = 0;
         for file_id in order {
             if let Some(root) = tree_map.get(&file_id) {
@@ -82,7 +84,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     is_scripted,
                     &special_call_direct_matcher,
                 );
-                let mut profile = slow_log_enabled.then(LuaAnalyzeProfile::default);
+                let mut profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
                 for node in root.descendants::<LuaAst>() {
                     if let Some(profile) = profile.as_mut() {
                         let kind = lua_ast_profile_kind(&node);
@@ -103,7 +105,19 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 file_count += 1;
                 if let Some(file_start) = file_start {
                     let file_elapsed = file_start.elapsed();
-                    if file_elapsed.as_millis() > 1 {
+                    if let Some(summary) = slow_file_summary.as_mut() {
+                        summary.record(file_id, file_elapsed);
+                    }
+
+                    // Detailed per-file logging is intentionally reserved for explicit profiling.
+                    // Info logging can be enabled in normal server sessions, and logging every
+                    // >1ms file turns large workspace analysis into a log-I/O hotspot.
+                    let should_log_file = if stderr_profile_enabled {
+                        file_elapsed.as_millis() > 1
+                    } else {
+                        file_elapsed >= Duration::from_millis(50)
+                    };
+                    if should_log_file {
                         let path = db
                             .get_vfs()
                             .get_uri(&file_id)
@@ -136,6 +150,9 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
             if let Some(workspace_profile) = workspace_profile.as_ref() {
                 workspace_profile.log_workspace();
             }
+            if let Some(slow_file_summary) = slow_file_summary.as_ref() {
+                slow_file_summary.log(db);
+            }
             if stderr_profile_enabled {
                 eprintln!(
                     "lua analyze total: {} files in {:?}",
@@ -149,6 +166,45 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                 }
             }
         }
+    }
+}
+
+#[derive(Default)]
+struct SlowLuaAnalyzeSummary {
+    files_over_1ms: usize,
+    worst_file: Option<(FileId, Duration)>,
+}
+
+impl SlowLuaAnalyzeSummary {
+    fn record(&mut self, file_id: FileId, elapsed: Duration) {
+        if elapsed.as_millis() <= 1 {
+            return;
+        }
+
+        self.files_over_1ms += 1;
+        if self
+            .worst_file
+            .as_ref()
+            .map_or(true, |(_, worst_elapsed)| elapsed > *worst_elapsed)
+        {
+            self.worst_file = Some((file_id, elapsed));
+        }
+    }
+
+    fn log(&self, db: &DbIndex) {
+        let Some((file_id, elapsed)) = self.worst_file else {
+            return;
+        };
+
+        let path = db
+            .get_vfs()
+            .get_uri(&file_id)
+            .map(|u| u.to_string())
+            .unwrap_or_else(|| format!("{:?}", file_id));
+        info!(
+            "lua analyze slow file summary: {} files over 1ms, worst {} cost {:?}",
+            self.files_over_1ms, path, elapsed
+        );
     }
 }
 
