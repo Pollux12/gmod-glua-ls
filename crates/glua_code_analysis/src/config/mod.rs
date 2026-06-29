@@ -123,5 +123,9 @@ impl Emmyrc {
             context.process_and_dedup_string(self.workspace.ignore_dir.iter());
 
         self.resource.paths = context.process_and_dedup_string(self.resource.paths.iter());
+
+        self.gmod
+            .scripted_class_scopes
+            .refresh_resolved_definitions();
     }
 }

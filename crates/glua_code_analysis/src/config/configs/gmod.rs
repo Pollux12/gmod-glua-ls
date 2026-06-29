@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::Hash;
 use std::path::Path;
+use std::sync::Arc;
 
 use schemars::JsonSchema;
 use serde::de::Deserializer;
@@ -95,7 +96,7 @@ pub struct EmmyrcGmod {
     pub auto_detect_gamemode_base: Option<bool>,
 }
 
-#[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
+#[derive(Serialize, Debug, JsonSchema, Clone)]
 #[serde(rename_all = "camelCase")]
 pub struct EmmyrcGmodScriptedClassScopes {
     #[serde(default = "scripted_scope_include_default")]
@@ -104,6 +105,29 @@ pub struct EmmyrcGmodScriptedClassScopes {
     #[serde(default, rename = "exclude", skip_serializing)]
     #[schemars(skip)]
     pub legacy_exclude: Vec<String>,
+    #[serde(skip, default)]
+    #[schemars(skip)]
+    resolved_definitions_cache: Arc<[ResolvedGmodScriptedClassDefinition]>,
+}
+
+impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassScopes {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        // Keep in sync with the serialized fields of `EmmyrcGmodScriptedClassScopes`.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct EmmyrcGmodScriptedClassScopesData {
+            #[serde(default = "scripted_scope_include_default")]
+            include: Vec<EmmyrcGmodScriptedClassScopeEntry>,
+            #[serde(default, rename = "exclude")]
+            legacy_exclude: Vec<String>,
+        }
+
+        let data = EmmyrcGmodScriptedClassScopesData::deserialize(deserializer)?;
+        Ok(Self::new(data.include, data.legacy_exclude))
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone)]
@@ -1227,16 +1251,33 @@ fn merge_scripted_class_definition_override(
 
 impl Default for EmmyrcGmodScriptedClassScopes {
     fn default() -> Self {
-        Self {
-            include: scripted_scope_include_default(),
-            legacy_exclude: Vec::new(),
-        }
+        Self::new(scripted_scope_include_default(), Vec::new())
     }
 }
 
 impl EmmyrcGmodScriptedClassScopes {
+    fn new(include: Vec<EmmyrcGmodScriptedClassScopeEntry>, legacy_exclude: Vec<String>) -> Self {
+        let resolved_definitions_cache =
+            merge_scripted_class_definitions(&include, &legacy_exclude).into();
+
+        Self {
+            include,
+            legacy_exclude,
+            resolved_definitions_cache,
+        }
+    }
+
+    pub fn refresh_resolved_definitions(&mut self) {
+        self.resolved_definitions_cache =
+            merge_scripted_class_definitions(&self.include, &self.legacy_exclude).into();
+    }
+
+    pub fn resolved_definitions_slice(&self) -> &[ResolvedGmodScriptedClassDefinition] {
+        &self.resolved_definitions_cache
+    }
+
     pub fn resolved_definitions(&self) -> Vec<ResolvedGmodScriptedClassDefinition> {
-        merge_scripted_class_definitions(&self.include, &self.legacy_exclude)
+        self.resolved_definitions_cache.to_vec()
     }
 
     pub fn include_patterns(&self) -> Vec<String> {
@@ -1250,9 +1291,9 @@ impl EmmyrcGmodScriptedClassScopes {
         }
 
         let mut patterns = self
-            .resolved_definitions()
-            .into_iter()
-            .flat_map(|definition| definition.include)
+            .resolved_definitions_slice()
+            .iter()
+            .flat_map(|definition| definition.include.iter().cloned())
             .collect::<Vec<_>>();
         for pattern in legacy_include {
             if !patterns.iter().any(|existing| existing == &pattern) {
@@ -1264,9 +1305,9 @@ impl EmmyrcGmodScriptedClassScopes {
     }
 
     pub fn exclude_patterns(&self) -> Vec<String> {
-        self.resolved_definitions()
-            .into_iter()
-            .flat_map(|definition| definition.exclude)
+        self.resolved_definitions_slice()
+            .iter()
+            .flat_map(|definition| definition.exclude.iter().cloned())
             .collect()
     }
 
@@ -1277,7 +1318,7 @@ impl EmmyrcGmodScriptedClassScopes {
     /// from blocking a file that legitimately belongs to another definition
     /// (e.g. STOOL's `weapons/gmod_tool/stools/**`).
     pub fn is_file_in_scope(&self, file_path: &Path) -> bool {
-        let definitions = self.resolved_definitions();
+        let definitions = self.resolved_definitions_slice();
         if definitions.is_empty() {
             return true;
         }
@@ -1307,7 +1348,7 @@ impl EmmyrcGmodScriptedClassScopes {
             return None;
         }
 
-        let definitions = self.resolved_definitions();
+        let definitions = self.resolved_definitions_slice();
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
         for definition in definitions {
             // Check THIS definition's include/exclude patterns — do not merge
@@ -1388,12 +1429,12 @@ impl EmmyrcGmodScriptedClassScopes {
     where
         T: Copy + Eq + Hash,
     {
-        let definitions = self.resolved_definitions();
+        let definitions = self.resolved_definitions_slice();
         if definitions.is_empty() {
             return (HashSet::new(), HashMap::new());
         }
 
-        let compiled_definitions = compile_scope_definitions(&definitions);
+        let compiled_definitions = compile_scope_definitions(definitions);
         let mut scope_files = HashSet::new();
         let mut matches = HashMap::new();
         for (file_id, file_path) in files {

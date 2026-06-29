@@ -699,6 +699,12 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn update_config(&mut self, config: Arc<Emmyrc>) {
+        let mut refreshed_config = (*config).clone();
+        refreshed_config
+            .gmod
+            .scripted_class_scopes
+            .refresh_resolved_definitions();
+        let config = Arc::new(refreshed_config);
         self.emmyrc = config.clone();
         self.compilation.update_config(config.clone());
         self.diagnostic.update_config(config);

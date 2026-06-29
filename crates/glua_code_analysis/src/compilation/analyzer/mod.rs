@@ -397,7 +397,7 @@ impl AnalyzeContext {
         }
 
         let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-        if scopes.resolved_definitions().is_empty() {
+        if scopes.resolved_definitions_slice().is_empty() {
             let file_ids = self
                 .tree_list
                 .iter()

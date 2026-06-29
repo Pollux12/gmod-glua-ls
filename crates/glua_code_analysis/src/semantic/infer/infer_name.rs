@@ -472,7 +472,7 @@ pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
         .get_emmyrc()
         .gmod
         .scripted_class_scopes
-        .resolved_definitions()
+        .resolved_definitions_slice()
         .iter()
         .any(|definition| definition.class_global == name)
     {
@@ -518,7 +518,7 @@ fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(Stri
 fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
     let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
     let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return scopes.resolved_definitions().is_empty();
+        return scopes.resolved_definitions_slice().is_empty();
     };
     scopes.is_file_in_scope(file_path)
 }
