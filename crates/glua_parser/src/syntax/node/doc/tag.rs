@@ -534,6 +534,7 @@ pub enum LuaDocTagDefaultValue {
     Boolean(bool),
     Number(String),
     String(String),
+    Expression(String),
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -586,11 +587,34 @@ impl LuaDocDefaultValue {
                     let string_token = LuaStringToken::cast(token.syntax().clone())?;
                     return Some(LuaDocTagDefaultValue::String(string_token.get_value()));
                 }
+                LuaTokenKind::TkName => {
+                    return Some(LuaDocTagDefaultValue::Expression(
+                        self.get_expression_text()?,
+                    ));
+                }
                 _ => {}
             }
         }
 
         None
+    }
+
+    fn get_expression_text(&self) -> Option<String> {
+        let mut seen_match = false;
+        let mut text = String::new();
+        for token in self.tokens::<LuaGeneralToken>() {
+            if !seen_match {
+                if token.get_token_kind() == LuaTokenKind::TkDocMatch {
+                    seen_match = true;
+                }
+                continue;
+            }
+
+            text.push_str(token.get_text());
+        }
+
+        let text = text.trim();
+        (!text.is_empty()).then(|| text.to_string())
     }
 }
 

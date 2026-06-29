@@ -772,6 +772,7 @@ pub(crate) fn format_doc_default_value(default_value: &LuaDocDefaultValue) -> St
         LuaDocDefaultValue::Boolean(value) => value.to_string(),
         LuaDocDefaultValue::Number(value) => value.clone(),
         LuaDocDefaultValue::String(value) => format!("{value:?}"),
+        LuaDocDefaultValue::Expression(value) => value.clone(),
     }
 }
 

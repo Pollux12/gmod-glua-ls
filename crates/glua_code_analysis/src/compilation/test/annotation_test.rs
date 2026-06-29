@@ -297,6 +297,79 @@ mod test {
     }
 
     #[test]
+    fn test_inline_default_expression_in_param_context() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param entity Entity=NULL
+        ---@param origin Vector=Vector( 0, 0, 0 )
+        ---@param angle Angle=Angle( 0, 0, 0 )
+        function Example:SetDefaults(entity, origin, angle)
+        end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let entity_idx = signature
+            .find_param_idx("entity")
+            .expect("missing entity param");
+        let entity_default = signature
+            .param_docs
+            .get(&entity_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            entity_default,
+            Some(LuaDocDefaultValue::Expression("NULL".to_string()))
+        );
+
+        let origin_idx = signature
+            .find_param_idx("origin")
+            .expect("missing origin param");
+        let origin_default = signature
+            .param_docs
+            .get(&origin_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            origin_default,
+            Some(LuaDocDefaultValue::Expression(
+                "Vector( 0, 0, 0 )".to_string()
+            ))
+        );
+
+        let angle_idx = signature
+            .find_param_idx("angle")
+            .expect("missing angle param");
+        let angle_default = signature
+            .param_docs
+            .get(&angle_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            angle_default,
+            Some(LuaDocDefaultValue::Expression(
+                "Angle( 0, 0, 0 )".to_string()
+            ))
+        );
+    }
+
+    #[test]
     fn test_inline_default_metadata_storage_for_local_function() {
         let mut ws = VirtualWorkspace::new();
 

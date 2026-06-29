@@ -639,6 +639,7 @@ pub enum LuaDocDefaultValue {
     Boolean(bool),
     Number(String),
     String(String),
+    Expression(String),
 }
 
 #[derive(Debug, Clone)]
