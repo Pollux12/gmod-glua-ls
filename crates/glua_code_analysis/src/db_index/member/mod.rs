@@ -1005,7 +1005,10 @@ mod tests {
         end: u32,
     ) -> LuaMemberId {
         LuaMemberId::new(
-            LuaSyntaxId::new(kind.into(), TextRange::new(TextSize::new(start), TextSize::new(end))),
+            LuaSyntaxId::new(
+                kind.into(),
+                TextRange::new(TextSize::new(start), TextSize::new(end)),
+            ),
             file_id,
         )
     }
@@ -1067,7 +1070,10 @@ mod tests {
         index.add_member(owner.clone(), make_member(first_member_id, "first"));
         index.add_member(owner.clone(), make_member(second_member_id, "second"));
 
-        assert_eq!(owner_member_ids(&index, &owner), vec![first_member_id, second_member_id]);
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![first_member_id, second_member_id]
+        );
 
         index.add_member(owner.clone(), make_member(earlier_member_id, "third"));
 
@@ -1161,7 +1167,10 @@ mod tests {
         index.add_member(owner.clone(), make_member(removed_member_id, "removed"));
         index.add_member(owner.clone(), make_member(retained_member_id, "retained"));
 
-        assert_eq!(owner_member_ids(&index, &owner), vec![removed_member_id, retained_member_id]);
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![removed_member_id, retained_member_id]
+        );
 
         index.remove(FileId::new(4));
 
@@ -1206,7 +1215,12 @@ mod tests {
 
         index.add_member(
             owner.clone(),
-            LuaMember::new(first_member_id, key.clone(), LuaMemberFeature::FileFieldDecl, None),
+            LuaMember::new(
+                first_member_id,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
         );
         assert_eq!(owner_member_ids(&index, &owner), vec![first_member_id]);
 
@@ -1215,7 +1229,10 @@ mod tests {
             LuaMember::new(second_member_id, key, LuaMemberFeature::FileFieldDecl, None),
         );
 
-        assert_eq!(owner_member_ids(&index, &owner), vec![second_member_id, first_member_id]);
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![second_member_id, first_member_id]
+        );
     }
 
     #[test]
@@ -1485,7 +1502,12 @@ mod tests {
         index.mark_non_overwriting_assignment_member(later_member_id);
         index.add_member(
             owner.clone(),
-            LuaMember::new(later_member_id, key.clone(), LuaMemberFeature::FileDefine, None),
+            LuaMember::new(
+                later_member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
         );
         assert_eq!(owner_member_ids(&index, &owner), vec![later_member_id]);
 
