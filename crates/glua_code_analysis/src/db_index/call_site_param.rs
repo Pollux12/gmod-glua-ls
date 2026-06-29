@@ -12,6 +12,12 @@ struct CallSiteParamContribution {
     param_type: LuaType,
 }
 
+fn sorted_file_ids<V>(map: &HashMap<FileId, V>) -> Vec<FileId> {
+    let mut file_ids = map.keys().copied().collect::<Vec<_>>();
+    file_ids.sort_unstable();
+    file_ids
+}
+
 #[derive(Debug, Default)]
 pub struct CallSiteParamIndex {
     /// file → source function access paths and their mutated parameter indexes declared by that file.
@@ -98,16 +104,24 @@ impl CallSiteParamIndex {
     fn rebuild_derived_state(&mut self) {
         self.inferred_params.clear();
 
-        for contribution in self.file_contributions.values().flatten() {
-            self.inferred_params
-                .entry(contribution.signature_id)
-                .or_default()
-                .entry(contribution.param_idx)
-                .and_modify(|current| {
-                    *current =
-                        LuaType::from_vec(vec![current.clone(), contribution.param_type.clone()])
-                })
-                .or_insert_with(|| contribution.param_type.clone());
+        for file_id in sorted_file_ids(&self.file_contributions) {
+            let Some(contributions) = self.file_contributions.get(&file_id) else {
+                continue;
+            };
+
+            for contribution in contributions {
+                self.inferred_params
+                    .entry(contribution.signature_id)
+                    .or_default()
+                    .entry(contribution.param_idx)
+                    .and_modify(|current| {
+                        *current = LuaType::from_vec(vec![
+                            current.clone(),
+                            contribution.param_type.clone(),
+                        ])
+                    })
+                    .or_insert_with(|| contribution.param_type.clone());
+            }
         }
     }
 
@@ -115,13 +129,7 @@ impl CallSiteParamIndex {
         self.source_signatures_by_path.clear();
         self.mutated_params.clear();
 
-        let mut file_ids = self
-            .file_source_signatures
-            .keys()
-            .copied()
-            .collect::<Vec<_>>();
-        file_ids.sort_by_key(|file_id| file_id.id);
-        for file_id in file_ids {
+        for file_id in sorted_file_ids(&self.file_source_signatures) {
             let Some(signatures) = self.file_source_signatures.get(&file_id) else {
                 continue;
             };
@@ -153,5 +161,57 @@ impl LuaIndex for CallSiteParamIndex {
         self.file_contributions.clear();
         self.inferred_params.clear();
         self.mutated_params.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn signature_id(file_id: FileId, position: u32) -> LuaSignatureId {
+        serde_json::from_str(&format!("\"{}|{}\"", file_id.id, position)).unwrap()
+    }
+
+    fn inferred_union_members(
+        index: &CallSiteParamIndex,
+        signature_id: &LuaSignatureId,
+    ) -> Vec<LuaType> {
+        match index.get_inferred_param(signature_id, 0) {
+            Some(LuaType::Union(union)) => union.as_ref().into_vec(),
+            Some(other) => vec![other.clone()],
+            None => panic!("expected inferred param for signature {signature_id:?}"),
+        }
+    }
+
+    #[test]
+    fn inferred_param_union_order_is_stable_across_file_insertion_order() {
+        let lower_file_id = FileId::new(1);
+        let higher_file_id = FileId::new(2);
+        let signature_id = signature_id(FileId::new(10), 0);
+
+        let lower_file_contribution = (signature_id, 0, LuaType::String);
+        let higher_file_contribution = (signature_id, 0, LuaType::Boolean);
+
+        let mut forward_index = CallSiteParamIndex::new();
+        forward_index.set_files_contributions(vec![
+            (higher_file_id, vec![higher_file_contribution.clone()]),
+            (lower_file_id, vec![lower_file_contribution.clone()]),
+        ]);
+
+        let mut reverse_index = CallSiteParamIndex::new();
+        reverse_index.set_files_contributions(vec![
+            (lower_file_id, vec![lower_file_contribution]),
+            (higher_file_id, vec![higher_file_contribution]),
+        ]);
+
+        let expected = vec![LuaType::String, LuaType::Boolean];
+        assert_eq!(
+            inferred_union_members(&forward_index, &signature_id),
+            expected
+        );
+        assert_eq!(
+            inferred_union_members(&reverse_index, &signature_id),
+            expected
+        );
     }
 }
