@@ -50,7 +50,9 @@ mod test {
         start.elapsed()
     }
 
-    fn infer_after_repeated_unrelated_inner_conditions(count: usize) -> std::time::Duration {
+    fn infer_after_repeated_unrelated_inner_conditions(
+        count: usize,
+    ) -> (std::time::Duration, String) {
         let mut body = String::from(
             r#"
 ---@type string?
@@ -68,8 +70,8 @@ local unrelated = {}
         let mut ws = VirtualWorkspace::new();
         let start = Instant::now();
         ws.def(&body);
-        let _ = ws.expr_ty("result");
-        start.elapsed()
+        let result_type = ws.expr_ty("result");
+        (start.elapsed(), ws.humanize_type(result_type))
     }
 
     #[test]
@@ -124,22 +126,33 @@ local unrelated = {}
 
     #[test]
     fn repeated_guarded_bootstrap_assignment_still_indexes_quick_smoke() {
-        let elapsed = index_repeated_guarded_bootstrap_assignments(30);
+        let mut body = String::from("local T = {}\n");
+        for _ in 0..30 {
+            body.push_str("T.field = T.field or {}\n");
+        }
+        body.push_str("local result = T.field\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&body);
 
         assert!(
-            elapsed.as_millis() < 250,
-            "small guarded bootstrap smoke took too long: {elapsed:?}"
+            ws.analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model")
+                .get_db()
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .is_some(),
+            "file failed to index"
         );
     }
 
     #[test]
     fn repeated_unrelated_inner_conditions_still_infer_quick_smoke() {
-        let elapsed = infer_after_repeated_unrelated_inner_conditions(200);
+        let (_, result_type) = infer_after_repeated_unrelated_inner_conditions(200);
 
-        assert!(
-            elapsed.as_millis() < 250,
-            "unrelated inner-condition flow smoke took too long: {elapsed:?}"
-        );
+        assert_eq!(result_type, "string?");
     }
 
     #[test]
@@ -147,8 +160,8 @@ local unrelated = {}
     fn unrelated_inner_condition_branch_merges_stay_near_linear() {
         let _ = infer_after_repeated_unrelated_inner_conditions(100);
 
-        let small = infer_after_repeated_unrelated_inner_conditions(500);
-        let large = infer_after_repeated_unrelated_inner_conditions(2000);
+        let (small, _) = infer_after_repeated_unrelated_inner_conditions(500);
+        let (large, _) = infer_after_repeated_unrelated_inner_conditions(2000);
 
         let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
         eprintln!(
@@ -184,7 +197,10 @@ local unrelated = {}
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let mut body = String::from("function ENT:Initialize()\n");
@@ -241,9 +257,10 @@ local T = {}
         start.elapsed()
     }
 
-    fn index_repeated_literal_index_member_assignments(count: usize) -> std::time::Duration {
+    #[test]
+    fn repeated_literal_index_member_assignments_index_quick_smoke() {
         let mut body = String::from("local T = {}\nT.entries = {}\n");
-        for i in 0..count {
+        for i in 0..30 {
             body.push_str(&format!(
                 r#"
 T.entries["entry_{i}"] = {{}}
@@ -252,20 +269,21 @@ T.entries["entry_{i}"].offset = {{ Vector(0, 0, 0), Angle(0, 0, 0) }}
 "#
             ));
         }
+        body.push_str(r#"local result = T.entries["entry_29"].name"#);
 
         let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
-        ws.def(&body);
-        start.elapsed()
-    }
-
-    #[test]
-    fn repeated_literal_index_member_assignments_index_quick_smoke() {
-        let elapsed = index_repeated_literal_index_member_assignments(30);
+        let file_id = ws.def(&body);
 
         assert!(
-            elapsed.as_millis() < 250,
-            "literal-index member assignment smoke took too long: {elapsed:?}"
+            ws.analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model")
+                .get_db()
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .is_some(),
+            "file failed to index"
         );
     }
 

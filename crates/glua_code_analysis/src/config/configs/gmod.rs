@@ -101,10 +101,10 @@ pub struct EmmyrcGmod {
 pub struct EmmyrcGmodScriptedClassScopes {
     #[serde(default = "scripted_scope_include_default")]
     #[schemars(extend("x-gluals-editor" = "scriptedClassTable"))]
-    pub include: Vec<EmmyrcGmodScriptedClassScopeEntry>,
+    include: Vec<EmmyrcGmodScriptedClassScopeEntry>,
     #[serde(default, rename = "exclude", skip_serializing)]
     #[schemars(skip)]
-    pub legacy_exclude: Vec<String>,
+    legacy_exclude: Vec<String>,
     #[serde(skip, default)]
     #[schemars(skip)]
     resolved_definitions_cache: Arc<[ResolvedGmodScriptedClassDefinition]>,
@@ -1272,6 +1272,24 @@ impl EmmyrcGmodScriptedClassScopes {
             merge_scripted_class_definitions(&self.include, &self.legacy_exclude).into();
     }
 
+    pub fn set_include(&mut self, include: Vec<EmmyrcGmodScriptedClassScopeEntry>) {
+        self.include = include;
+        self.refresh_resolved_definitions();
+    }
+
+    pub fn set_legacy_exclude(&mut self, legacy_exclude: Vec<String>) {
+        self.legacy_exclude = legacy_exclude;
+        self.refresh_resolved_definitions();
+    }
+
+    pub fn include(&self) -> &[EmmyrcGmodScriptedClassScopeEntry] {
+        &self.include
+    }
+
+    pub fn legacy_exclude(&self) -> &[String] {
+        &self.legacy_exclude
+    }
+
     pub fn resolved_definitions_slice(&self) -> &[ResolvedGmodScriptedClassDefinition] {
         &self.resolved_definitions_cache
     }
@@ -1757,7 +1775,7 @@ mod tests {
             eq(Some("gamemode_"))
         )?;
         verify_that!(
-            gmod.scripted_class_scopes.legacy_exclude.is_empty(),
+            gmod.scripted_class_scopes.legacy_exclude().is_empty(),
             eq(true)
         )?;
         verify_that!(gmod.hook_mappings.method_to_hook.is_empty(), eq(true))?;
@@ -1926,6 +1944,23 @@ mod tests {
         .or_fail()?;
 
         let definitions = scopes.resolved_definitions();
+        verify_that!(definitions.len(), eq(1usize))?;
+        verify_that!(definitions[0].id.as_str(), eq("plugins"))?;
+        verify_that!(
+            scopes.include_patterns().as_slice(),
+            eq(&["plugins/**".to_string()])
+        )
+    }
+
+    #[gtest]
+    fn test_scripted_class_scope_set_include_refreshes_queries() -> Result<()> {
+        let mut scopes = EmmyrcGmodScriptedClassScopes::default();
+        scopes.set_include(vec![EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(
+            "plugins/**".to_string(),
+        )]);
+
+        let definitions = scopes.resolved_definitions();
+
         verify_that!(definitions.len(), eq(1usize))?;
         verify_that!(definitions[0].id.as_str(), eq("plugins"))?;
         verify_that!(

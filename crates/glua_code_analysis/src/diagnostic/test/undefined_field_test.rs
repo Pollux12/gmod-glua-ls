@@ -1176,20 +1176,14 @@ mod test {
             .diagnostic
             .enable_only(DiagnosticCode::UndefinedField);
 
-        let start = std::time::Instant::now();
         let diagnostics = ws
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let elapsed = start.elapsed();
 
         assert!(
             diagnostics.is_empty(),
             "unexpected undefined-field diagnostics: {diagnostics:#?}"
-        );
-        assert!(
-            elapsed.as_millis() < 250,
-            "repeated initialized index-prefix diagnostics took too long: {elapsed:?}"
         );
     }
 

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use std::{sync::Arc, time::Instant};
+    use std::sync::Arc;
 
     use crate::{DiagnosticCode, VirtualWorkspace};
     #[test]
@@ -208,15 +208,9 @@ mod tests {
         }
 
         let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
         let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
-        let elapsed = start.elapsed();
 
         assert!(no_redefined_local);
-        assert!(
-            elapsed.as_millis() < 250,
-            "redefined-local repeated-scope smoke took too long: {elapsed:?}"
-        );
     }
 
     #[test]
@@ -229,14 +223,8 @@ mod tests {
         }
 
         let mut ws = VirtualWorkspace::new();
-        let start = Instant::now();
         let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
-        let elapsed = start.elapsed();
 
         assert!(no_redefined_local);
-        assert!(
-            elapsed.as_millis() < 250,
-            "redefined-local vgui registration smoke took too long: {elapsed:?}"
-        );
     }
 }

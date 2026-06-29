@@ -1007,7 +1007,10 @@ local EscapeStringMap: {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("plugins/**")]);
         emmyrc.gmod.hook_mappings.method_prefixes = vec!["PLUGIN".to_string()];
         ws.update_emmyrc(emmyrc);
 
@@ -1075,7 +1078,10 @@ local EscapeStringMap: {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
@@ -1115,7 +1121,10 @@ local EscapeStringMap: {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
@@ -2480,7 +2489,10 @@ local EscapeStringMap: {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
@@ -2536,7 +2548,10 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
@@ -2609,7 +2624,10 @@ local EscapeStringMap: {
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(&dedent(
@@ -3632,7 +3650,10 @@ local EscapeStringMap: {
         let mut ws = enable_gmod_workspace();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(
@@ -3703,7 +3724,10 @@ local EscapeStringMap: {
         let mut ws = enable_gmod_workspace();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         // Hover directly on the `GlideExitPos` token in the `= nil` branch.
@@ -3785,7 +3809,10 @@ local EscapeStringMap: {
         let mut ws = enable_gmod_workspace();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         let (content, position) = ProviderVirtualWorkspace::handle_file_content(

@@ -502,7 +502,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("plugins/**")]);
         ws.update_emmyrc(emmyrc);
 
         assert!(!has_diagnostic(
@@ -523,7 +526,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
         ws.update_emmyrc(emmyrc);
 
         assert!(!has_diagnostic(
@@ -544,7 +550,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("plugins/**")]);
         ws.update_emmyrc(emmyrc);
 
         assert!(has_diagnostic(
