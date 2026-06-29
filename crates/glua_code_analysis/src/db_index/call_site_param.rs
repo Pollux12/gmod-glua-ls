@@ -14,10 +14,12 @@ struct CallSiteParamContribution {
 
 #[derive(Debug, Default)]
 pub struct CallSiteParamIndex {
-    /// file → source function access paths declared by that file.
-    file_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId)>>,
+    /// file → source function access paths and their mutated parameter indexes declared by that file.
+    file_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId, Vec<usize>)>>,
     /// access path → current source function signature candidates.
     source_signatures_by_path: HashMap<String, Vec<LuaSignatureId>>,
+    /// Flat map for fast check: signature_id -> list of mutated parameter indices.
+    mutated_params: HashMap<LuaSignatureId, Vec<usize>>,
     /// file → observed call-site param evidence contributed by calls in that file.
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
     /// signature → param index → union of all observed types from current file contributions.
@@ -31,7 +33,7 @@ impl CallSiteParamIndex {
 
     pub fn set_files_source_signatures(
         &mut self,
-        updates: Vec<(FileId, Vec<(String, LuaSignatureId)>)>,
+        updates: Vec<(FileId, Vec<(String, LuaSignatureId, Vec<usize>)>)>,
     ) {
         for (file_id, signatures) in updates {
             self.file_source_signatures.insert(file_id, signatures);
@@ -53,6 +55,12 @@ impl CallSiteParamIndex {
             .find(|signature_id| {
                 signature_id.get_file_id() == file_id && signature_id.get_position() <= position
             })
+    }
+
+    pub fn is_param_mutated(&self, signature_id: &LuaSignatureId, param_idx: usize) -> bool {
+        self.mutated_params
+            .get(signature_id)
+            .is_some_and(|mutated| mutated.contains(&param_idx))
     }
 
     pub fn set_files_contributions(
@@ -105,6 +113,7 @@ impl CallSiteParamIndex {
 
     fn rebuild_source_signatures(&mut self) {
         self.source_signatures_by_path.clear();
+        self.mutated_params.clear();
 
         let mut file_ids = self
             .file_source_signatures
@@ -116,11 +125,14 @@ impl CallSiteParamIndex {
             let Some(signatures) = self.file_source_signatures.get(&file_id) else {
                 continue;
             };
-            for (path, signature_id) in signatures {
+            for (path, signature_id, mutated) in signatures {
                 self.source_signatures_by_path
                     .entry(path.clone())
                     .or_default()
                     .push(*signature_id);
+                if !mutated.is_empty() {
+                    self.mutated_params.insert(*signature_id, mutated.clone());
+                }
             }
         }
     }
@@ -140,5 +152,6 @@ impl LuaIndex for CallSiteParamIndex {
         self.source_signatures_by_path.clear();
         self.file_contributions.clear();
         self.inferred_params.clear();
+        self.mutated_params.clear();
     }
 }

@@ -70,7 +70,7 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
 fn source_signatures_in_file(
     file_id: FileId,
     root: &glua_parser::LuaSyntaxNode,
-) -> Vec<(String, LuaSignatureId)> {
+) -> Vec<(String, LuaSignatureId, Vec<usize>)> {
     let mut funcs = root
         .descendants()
         .filter_map(LuaFuncStat::cast)
@@ -83,12 +83,56 @@ fn source_signatures_in_file(
                 .get_func_name()
                 .and_then(|func_name| func_name.get_access_path())?;
             let closure = func_stat.get_closure()?;
+            let mutated = get_mutated_params(&closure);
             Some((
                 path.to_string(),
                 LuaSignatureId::from_closure(file_id, &closure),
+                mutated,
             ))
         })
         .collect()
+}
+
+fn get_mutated_params(closure: &LuaClosureExpr) -> Vec<usize> {
+    let Some(params_list) = closure.get_params_list() else {
+        return Vec::new();
+    };
+    let mut mutated = Vec::new();
+    let params = params_list
+        .get_params()
+        .enumerate()
+        .filter_map(|(idx, param)| {
+            param
+                .get_name_token()
+                .map(|token| (idx, token.get_name_text().to_string()))
+        })
+        .collect::<Vec<_>>();
+
+    if params.is_empty() {
+        return Vec::new();
+    }
+
+    let Some(block) = closure.get_block() else {
+        return Vec::new();
+    };
+
+    for assign in block.descendants::<LuaAssignStat>() {
+        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
+            continue;
+        }
+        let (vars, _) = assign.get_var_and_expr_list();
+        for var in vars {
+            for (idx, param_name) in &params {
+                if var_writes_param(&var, param_name) {
+                    if !mutated.contains(idx) {
+                        mutated.push(*idx);
+                    }
+                }
+            }
+        }
+    }
+
+    mutated
 }
 
 fn collect_call_site_param_types(
@@ -128,7 +172,10 @@ fn collect_call_site_param_types(
         if !has_gmod_param_name_hint(db, param_name) {
             continue;
         }
-        if source_param_is_mutated(db, signature_id, param_idx) {
+        if db
+            .get_call_site_param_index()
+            .is_param_mutated(&signature_id, param_idx)
+        {
             continue;
         }
         let Some(arg_type) = infer_supported_call_site_arg_type(db, cache, file_id, arg) else {
@@ -142,40 +189,6 @@ fn collect_call_site_param_types(
     }
 
     Some(())
-}
-
-fn source_param_is_mutated(db: &DbIndex, signature_id: LuaSignatureId, param_idx: usize) -> bool {
-    let Some(tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
-        return true;
-    };
-    let root = tree.get_red_root();
-    let Some(closure) = root
-        .descendants()
-        .filter_map(LuaClosureExpr::cast)
-        .find(|closure| closure.get_position() == signature_id.get_position())
-    else {
-        return true;
-    };
-    let Some(param_name) = closure
-        .get_params_list()
-        .and_then(|params| params.get_params().nth(param_idx))
-        .and_then(|param| param.get_name_token())
-        .map(|token| token.get_name_text().to_string())
-    else {
-        return true;
-    };
-    let Some(block) = closure.get_block() else {
-        return true;
-    };
-
-    block.descendants::<LuaAssignStat>().any(|assign| {
-        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
-            return false;
-        }
-
-        let (vars, _) = assign.get_var_and_expr_list();
-        vars.iter().any(|var| var_writes_param(var, &param_name))
-    })
 }
 
 fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {
