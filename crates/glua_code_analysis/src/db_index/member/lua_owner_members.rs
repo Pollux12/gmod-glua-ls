@@ -1,11 +1,16 @@
-use std::collections::HashMap;
+use std::{collections::HashMap, sync::OnceLock};
 
-use crate::{LuaMemberIndexItem, LuaMemberKey};
+use super::member_id_sort_key;
+use crate::{LuaMemberId, LuaMemberIndexItem, LuaMemberKey};
 
 #[allow(unused)]
 #[derive(Debug, Clone)]
 pub struct LuaOwnerMembers {
     members: HashMap<LuaMemberKey, LuaMemberIndexItem>,
+    // `members` is private and these four mutators are the complete id-set
+    // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
+    // `remove_member`.
+    sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
     resolve_state: OwnerMemberStatus,
 }
 
@@ -14,11 +19,13 @@ impl LuaOwnerMembers {
     pub fn new() -> Self {
         Self {
             members: HashMap::new(),
+            sorted_ids_cache: OnceLock::new(),
             resolve_state: OwnerMemberStatus::UnResolved,
         }
     }
 
     pub fn add_member(&mut self, key: LuaMemberKey, item: LuaMemberIndexItem) {
+        self.invalidate_sorted_member_ids();
         self.members.insert(key, item);
     }
 
@@ -35,6 +42,7 @@ impl LuaOwnerMembers {
     }
 
     pub fn get_member_mut(&mut self, key: &LuaMemberKey) -> Option<&mut LuaMemberIndexItem> {
+        self.invalidate_sorted_member_ids();
         self.members.get_mut(key)
     }
 
@@ -42,11 +50,27 @@ impl LuaOwnerMembers {
         self.members.values()
     }
 
+    pub fn sorted_member_ids(&self) -> &[LuaMemberId] {
+        self.sorted_ids_cache.get_or_init(|| {
+            let mut member_ids = Vec::new();
+            for item in self.members.values() {
+                match item {
+                    LuaMemberIndexItem::One(id) => member_ids.push(*id),
+                    LuaMemberIndexItem::Many(ids) => member_ids.extend(ids.iter().copied()),
+                }
+            }
+            member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+            member_ids
+        })
+    }
+
     pub fn iter_mut(&mut self) -> impl Iterator<Item = (&LuaMemberKey, &mut LuaMemberIndexItem)> {
+        self.invalidate_sorted_member_ids();
         self.members.iter_mut()
     }
 
     pub fn remove_member(&mut self, key: &LuaMemberKey) -> Option<LuaMemberIndexItem> {
+        self.invalidate_sorted_member_ids();
         self.members.remove(key)
     }
 
@@ -64,6 +88,10 @@ impl LuaOwnerMembers {
 
     pub fn is_resolved(&self) -> bool {
         matches!(self.resolve_state, OwnerMemberStatus::Resolved)
+    }
+
+    fn invalidate_sorted_member_ids(&mut self) {
+        self.sorted_ids_cache = OnceLock::new();
     }
 }
 
