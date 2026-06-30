@@ -256,4 +256,25 @@ mod test {
             ]))),
         );
     }
+
+    #[test]
+    fn test_pairs_nil_only_values_fall_back_to_unknown() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@type table<string, nil>
+            local t = {
+                a = nil,
+                b = nil,
+            }
+
+            for _, v in pairs(t) do
+                value_out = v
+            end
+        "#,
+        );
+
+        assert_eq!(ws.expr_ty("value_out"), LuaType::Unknown);
+    }
 }

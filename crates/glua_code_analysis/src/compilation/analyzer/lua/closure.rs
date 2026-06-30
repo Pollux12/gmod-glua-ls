@@ -839,12 +839,13 @@ fn table_const_has_no_known_members(db: &DbIndex, table: &crate::InFiled<TextRan
 }
 
 fn should_union_any_as_unknown(typ: &LuaType) -> bool {
+    // Broad Boolean joins the Any→Unknown path so real bool branches survive `any | boolean`.
+    // Boolean literals stay excluded so `any | false` preserves the original any fallback.
     !matches!(
         typ,
         LuaType::Any
             | LuaType::Unknown
             | LuaType::Nil
-            | LuaType::Boolean
             | LuaType::BooleanConst(_)
             | LuaType::DocBooleanConst(_)
     ) && !typ.is_nullable()

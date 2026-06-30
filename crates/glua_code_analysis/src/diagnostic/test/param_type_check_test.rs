@@ -223,6 +223,60 @@ mod test {
     }
 
     #[test]
+    fn test_correlated_overload_truthiness_prunes_doc_true_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value true
+            local function takesTrue(value) end
+
+            ---@overload fun(flag: true)
+            ---@param flag false
+            local function wrapper(flag)
+                if not flag then
+                    return
+                end
+
+                takesTrue(flag)
+            end
+
+            wrapper(true)
+            wrapper(false)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_truthiness_keeps_boolean_union_flowing() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value boolean
+            local function takesBoolean(value) end
+
+            ---@return any|boolean
+            local function getFlag() end
+
+            ---@overload fun(flag: boolean)
+            ---@param flag nil
+            local function wrapper(flag)
+                if not flag then
+                    return
+                end
+
+                takesBoolean(flag)
+            end
+
+            wrapper(getFlag())
+            "#
+        ));
+    }
+
+    #[test]
     fn test_issue_82() {
         let mut ws = VirtualWorkspace::new();
 

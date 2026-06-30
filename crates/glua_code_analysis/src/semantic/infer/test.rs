@@ -763,6 +763,37 @@ mod test {
     }
 
     #[test]
+    fn test_return_inference_preserves_boolean_branches_over_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return any
+            local function read()
+            end
+
+            local function pick(condition, fallback)
+                if fallback then
+                    return false
+                end
+
+                if condition then
+                    return true
+                end
+
+                return read()
+            end
+
+            local value = pick(a, b)
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("boolean"));
+    }
+
+    #[test]
     fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();

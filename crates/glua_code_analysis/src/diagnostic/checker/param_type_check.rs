@@ -943,6 +943,8 @@ fn correlated_overload_param_type_at_call(
 
     let call_start = call_expr.get_range().start();
     let block = call_expr.syntax().ancestors().find_map(LuaBlock::cast)?;
+    // Only scan the current execution block. Propagating outer guards into nested closures is
+    // unsound unless invocation timing and intervening reassignments are proven safe.
     for stat in block.get_stats() {
         let stat_range = stat.get_range();
         if stat_range.start() >= call_start || stat_range.contains_range(call_expr.get_range()) {
@@ -1431,7 +1433,9 @@ fn correlated_truthiness_possible(
 
 fn type_may_be_truthy(typ: &LuaType) -> bool {
     match typ {
-        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => false,
+        LuaType::Nil => false,
+        LuaType::Boolean => true,
+        LuaType::BooleanConst(value) | LuaType::DocBooleanConst(value) => *value,
         LuaType::Union(union) => union.types().any(type_may_be_truthy),
         _ => true,
     }
@@ -1439,8 +1443,9 @@ fn type_may_be_truthy(typ: &LuaType) -> bool {
 
 fn type_may_be_falsy(typ: &LuaType) -> bool {
     match typ {
-        LuaType::Nil | LuaType::BooleanConst(false) | LuaType::DocBooleanConst(false) => true,
-        LuaType::Boolean | LuaType::DocBooleanConst(_) => true,
+        LuaType::Nil => true,
+        LuaType::Boolean => true,
+        LuaType::BooleanConst(value) | LuaType::DocBooleanConst(value) => !value,
         LuaType::Union(union) => union.types().any(type_may_be_falsy),
         _ => false,
     }

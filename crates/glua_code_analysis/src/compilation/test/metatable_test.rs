@@ -311,6 +311,87 @@ mod test {
     }
 
     #[test]
+    fn test_mutual_anonymous_metatable_index_cycle_does_not_overflow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local mtA = {}
+            local mtB = {}
+            local a = setmetatable({}, mtA)
+            local b = setmetatable({}, mtB)
+
+            mtA.__index = b
+            mtB.__index = a
+
+            local value = a.missingField
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_field_code),
+            "expected UndefinedField diagnostic for missing member through mutual __index cycle, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_composite_anonymous_metatable_index_cycle_does_not_overflow() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            local mtA = {}
+            local mtB = {}
+            local a = setmetatable({}, mtA)
+            local b = setmetatable({}, mtB)
+
+            local function pick(flag)
+                if flag then
+                    return a
+                end
+
+                return b
+            end
+
+            local cycle = pick(MAYBE_FLAG)
+            mtA.__index = cycle
+            mtB.__index = cycle
+
+            local value = a.missingField
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_field_code),
+            "expected UndefinedField diagnostic for missing member through composite __index cycle, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn test_setmetatable_factory_fields_transfer_to_class_owner() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(

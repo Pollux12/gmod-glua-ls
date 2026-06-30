@@ -231,13 +231,8 @@ fn try_infer_pairs_iter_types_from_table_members(
 
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
-            [member] => remove_pairs_yield_nil(db, &member.typ),
-            _ => LuaType::from_vec(
-                member_infos
-                    .into_iter()
-                    .map(|member| remove_pairs_yield_nil(db, &member.typ))
-                    .collect::<Vec<_>>(),
-            ),
+            [member] => member.typ.clone(),
+            _ => LuaType::from_vec(member_infos.into_iter().map(|member| member.typ).collect()),
         };
         values.push(value_type);
     }
@@ -274,6 +269,11 @@ fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
         .map(|value| remove_pairs_yield_nil(db, &value))
         .filter(|value| !value.is_unknown() && !value.is_never())
         .collect::<Vec<_>>();
+    if values.is_empty() {
+        // All observed values were nil-only or otherwise uninformative; avoid collapsing to Nil.
+        return LuaType::Unknown;
+    }
+
     try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
 }
 

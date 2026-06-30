@@ -47,6 +47,8 @@ use crate::{
 
 use super::{InferFailReason, InferResult, infer_expr, infer_name::infer_global_type};
 
+type TableMemberLookupGuard = HashSet<InFiled<TextRange>>;
+
 pub fn infer_index_expr(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -315,12 +317,33 @@ pub fn infer_member_by_member_key(
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
 ) -> InferResult {
+    let mut table_member_lookup_guard = TableMemberLookupGuard::default();
+    infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        prefix_type,
+        index_expr,
+        infer_guard,
+        &mut table_member_lookup_guard,
+    )
+}
+
+fn infer_member_by_member_key_with_table_guard(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    index_expr: LuaIndexMemberExpr,
+    infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
+) -> InferResult {
     match &prefix_type {
         LuaType::Table => infer_plain_table_member(db, cache, index_expr),
         LuaType::Any => Ok(LuaType::Any),
         LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::Nil => Ok(LuaType::Never),
-        LuaType::TableConst(id) => infer_table_member(db, cache, id.clone(), index_expr),
+        LuaType::TableConst(id) => {
+            infer_table_member(db, cache, id.clone(), index_expr, table_member_lookup_guard)
+        }
         LuaType::String
         | LuaType::Io
         | LuaType::StringConst(_)
@@ -341,42 +364,100 @@ pub fn infer_member_by_member_key(
                 }
             }
             let decl_id = get_buildin_type_map_type_id(prefix_type).ok_or(InferFailReason::None)?;
-            infer_custom_type_member(db, cache, decl_id, index_expr, infer_guard)
+            infer_custom_type_member(
+                db,
+                cache,
+                decl_id,
+                index_expr,
+                infer_guard,
+                table_member_lookup_guard,
+            )
         }
-        LuaType::Ref(decl_id) => {
-            infer_custom_type_member(db, cache, decl_id.clone(), index_expr, infer_guard)
-        }
-        LuaType::Def(decl_id) => {
-            infer_custom_type_member(db, cache, decl_id.clone(), index_expr, infer_guard)
-        }
+        LuaType::Ref(decl_id) => infer_custom_type_member(
+            db,
+            cache,
+            decl_id.clone(),
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
+        LuaType::Def(decl_id) => infer_custom_type_member(
+            db,
+            cache,
+            decl_id.clone(),
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         // LuaType::Module(_) => todo!(),
         LuaType::Tuple(tuple_type) => infer_tuple_member(db, cache, tuple_type, index_expr),
         LuaType::Object(object_type) => infer_object_member(db, cache, object_type, index_expr),
-        LuaType::Union(union_type) => {
-            infer_union_member(db, cache, union_type, index_expr, infer_guard)
-        }
-        LuaType::MergedTable(merged_table) => {
-            infer_merged_table_member(db, cache, merged_table, index_expr, infer_guard)
-        }
+        LuaType::Union(union_type) => infer_union_member(
+            db,
+            cache,
+            union_type,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
+        LuaType::MergedTable(merged_table) => infer_merged_table_member(
+            db,
+            cache,
+            merged_table,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         LuaType::MultiLineUnion(multi_union) => {
             let union_type = multi_union.to_union();
             if let LuaType::Union(union_type) = union_type {
-                infer_union_member(db, cache, &union_type, index_expr, infer_guard)
+                infer_union_member(
+                    db,
+                    cache,
+                    &union_type,
+                    index_expr,
+                    infer_guard,
+                    table_member_lookup_guard,
+                )
             } else {
                 Err(InferFailReason::FieldNotFound)
             }
         }
-        LuaType::Intersection(intersection_type) => {
-            infer_intersection_member(db, cache, intersection_type, index_expr, infer_guard)
-        }
-        LuaType::Generic(generic_type) => {
-            infer_generic_member(db, cache, generic_type, index_expr, infer_guard)
-        }
+        LuaType::Intersection(intersection_type) => infer_intersection_member(
+            db,
+            cache,
+            intersection_type,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
+        LuaType::Generic(generic_type) => infer_generic_member(
+            db,
+            cache,
+            generic_type,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         LuaType::Global => infer_global_field_member(db, cache, index_expr),
-        LuaType::Instance(inst) => infer_instance_member(db, cache, inst, index_expr, infer_guard),
+        LuaType::Instance(inst) => infer_instance_member(
+            db,
+            cache,
+            inst,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         LuaType::Namespace(ns) => infer_namespace_member(db, cache, ns, index_expr),
         LuaType::Array(array_type) => infer_array_member(db, cache, array_type, index_expr),
-        LuaType::TplRef(tpl) => infer_tpl_ref_member(db, cache, tpl, index_expr, infer_guard),
+        LuaType::TplRef(tpl) => infer_tpl_ref_member(
+            db,
+            cache,
+            tpl,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         LuaType::ModuleRef(file_id) => {
             let module_info = db.get_module_index().get_module(*file_id);
             if let Some(module_info) = module_info {
@@ -385,12 +466,13 @@ pub fn infer_member_by_member_key(
                         return Err(InferFailReason::RecursiveInfer);
                     }
 
-                    return infer_member_by_member_key(
+                    return infer_member_by_member_key_with_table_guard(
                         db,
                         cache,
                         export_type,
                         index_expr,
                         infer_guard,
+                        table_member_lookup_guard,
                     );
                 } else {
                     return Err(InferFailReason::UnResolveModuleExport(*file_id));
@@ -399,9 +481,14 @@ pub fn infer_member_by_member_key(
 
             Err(InferFailReason::FieldNotFound)
         }
-        LuaType::TableOf(inner) => {
-            infer_member_by_member_key(db, cache, inner, index_expr, infer_guard)
-        }
+        LuaType::TableOf(inner) => infer_member_by_member_key_with_table_guard(
+            db,
+            cache,
+            inner,
+            index_expr,
+            infer_guard,
+            table_member_lookup_guard,
+        ),
         _ => Err(InferFailReason::FieldNotFound),
     }
 }
@@ -411,6 +498,29 @@ fn infer_table_member(
     cache: &mut LuaInferCache,
     inst: InFiled<TextRange>,
     index_expr: LuaIndexMemberExpr,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
+) -> InferResult {
+    if !table_member_lookup_guard.insert(inst.clone()) {
+        return Err(InferFailReason::FieldNotFound);
+    }
+
+    let result = infer_table_member_owner(
+        db,
+        cache,
+        inst.clone(),
+        index_expr,
+        table_member_lookup_guard,
+    );
+    table_member_lookup_guard.remove(&inst);
+    result
+}
+
+fn infer_table_member_owner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    inst: InFiled<TextRange>,
+    index_expr: LuaIndexMemberExpr,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let owner = LuaMemberOwner::Element(inst.clone());
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
@@ -582,9 +692,14 @@ fn infer_table_member(
                 return Ok(dynamic_member_type);
             }
 
-            if let Ok(metatable_type) =
-                infer_table_metatable_member(db, cache, &inst, index_expr.clone(), &index_key)
-            {
+            if let Ok(metatable_type) = infer_table_metatable_member(
+                db,
+                cache,
+                &inst,
+                index_expr.clone(),
+                &index_key,
+                table_member_lookup_guard,
+            ) {
                 return Ok(metatable_type);
             }
 
@@ -614,6 +729,7 @@ fn infer_table_metatable_member(
     table_range: &InFiled<TextRange>,
     index_expr: LuaIndexMemberExpr,
     index_key: &LuaIndexKey,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let metatable = db
         .get_metatable_index()
@@ -629,12 +745,13 @@ fn infer_table_metatable_member(
         cache.get_file_id(),
         Some(index_expr.get_position()),
     ) && !metatable_index_type_points_to_table(&index_type, table_range)
-        && let Ok(typ) = infer_member_by_member_key(
+        && let Ok(typ) = infer_member_by_member_key_with_table_guard(
             db,
             cache,
             &index_type,
             index_expr.clone(),
             &InferGuard::new(),
+            table_member_lookup_guard,
         )
     {
         return Ok(typ);
@@ -1467,6 +1584,7 @@ fn infer_custom_type_member(
     prefix_type_id: LuaTypeDeclId,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     infer_guard.check(&prefix_type_id)?;
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
@@ -1478,12 +1596,13 @@ fn infer_custom_type_member(
         .ok_or(InferFailReason::None)?;
     if type_decl.is_alias() {
         if let Some(origin_type) = type_decl.get_alias_origin(db, None) {
-            return infer_member_by_member_key(
+            return infer_member_by_member_key_with_table_guard(
                 db,
                 cache,
                 &origin_type,
                 index_expr.clone(),
                 infer_guard,
+                table_member_lookup_guard,
             );
         } else {
             return Err(InferFailReason::FieldNotFound);
@@ -1562,12 +1681,13 @@ fn infer_custom_type_member(
             && let Some(super_types) = type_index.get_super_types(&prefix_type_id)
         {
             for super_type in super_types {
-                let result = infer_member_by_member_key(
+                let result = infer_member_by_member_key_with_table_guard(
                     db,
                     cache,
                     &super_type,
                     index_expr.clone(),
                     infer_guard,
+                    table_member_lookup_guard,
                 );
 
                 match result {
@@ -1627,8 +1747,14 @@ fn infer_custom_type_member(
         && let Some(super_types) = type_index.get_super_types(&prefix_type_id)
     {
         for super_type in super_types {
-            let result =
-                infer_member_by_member_key(db, cache, &super_type, index_expr.clone(), infer_guard);
+            let result = infer_member_by_member_key_with_table_guard(
+                db,
+                cache,
+                &super_type,
+                index_expr.clone(),
+                infer_guard,
+                table_member_lookup_guard,
+            );
 
             match result {
                 Ok(member_type) => {
@@ -1919,6 +2045,7 @@ fn infer_union_member(
     union_type: &LuaUnionType,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let mut member_types = Vec::new();
     let mut meet_string = false;
@@ -1929,12 +2056,13 @@ fn infer_union_member(
             }
             meet_string = true;
         }
-        let result = infer_member_by_member_key(
+        let result = infer_member_by_member_key_with_table_guard(
             db,
             cache,
             sub_type,
             index_expr.clone(),
             &infer_guard.fork(),
+            table_member_lookup_guard,
         );
         if let Ok(typ) = result {
             if !typ.is_never() {
@@ -1958,17 +2086,19 @@ fn infer_merged_table_member(
     merged_table: &LuaMergedTableType,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let mut member_types = Vec::new();
     let mut last_resolve_reason = InferFailReason::FieldNotFound;
 
     for component in merged_table.get_types() {
-        match infer_member_by_member_key(
+        match infer_member_by_member_key_with_table_guard(
             db,
             cache,
             component,
             index_expr.clone(),
             &infer_guard.fork(),
+            table_member_lookup_guard,
         ) {
             Ok(typ) if !typ.is_never() => member_types.push(typ),
             Ok(_) => {}
@@ -1995,11 +2125,18 @@ fn infer_intersection_member(
     intersection_type: &LuaIntersectionType,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let mut result: Option<LuaType> = None;
     for member in intersection_type.get_types() {
-        match infer_member_by_member_key(db, cache, member, index_expr.clone(), &infer_guard.fork())
-        {
+        match infer_member_by_member_key_with_table_guard(
+            db,
+            cache,
+            member,
+            index_expr.clone(),
+            &infer_guard.fork(),
+            table_member_lookup_guard,
+        ) {
             Ok(ty) => {
                 result = Some(match result {
                     Some(prev) => intersect_member_types(db, prev, ty),
@@ -2025,6 +2162,7 @@ fn infer_generic_members_from_super_generics(
     substitutor: &TypeSubstitutor,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> Option<LuaType> {
     let type_index = db.get_type_index();
 
@@ -2037,12 +2175,13 @@ fn infer_generic_members_from_super_generics(
     if let Some(super_types) = type_index.get_super_types(&type_decl_id) {
         super_types.iter().find_map(|super_type| {
             let super_type = instantiate_type_generic(db, super_type, substitutor);
-            infer_member_by_member_key(
+            infer_member_by_member_key_with_table_guard(
                 db,
                 cache,
                 &super_type,
                 index_expr.clone(),
                 &infer_guard.fork(),
+                table_member_lookup_guard,
             )
             .ok()
         })
@@ -2057,6 +2196,7 @@ fn infer_generic_member(
     generic_type: &LuaGenericType,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let base_type = generic_type.get_base_type();
 
@@ -2069,12 +2209,13 @@ fn infer_generic_member(
             && type_decl.is_alias()
             && let Some(origin_type) = type_decl.get_alias_origin(db, Some(&substitutor))
         {
-            return infer_member_by_member_key(
+            return infer_member_by_member_key_with_table_guard(
                 db,
                 cache,
                 &origin_type,
                 index_expr,
                 &infer_guard.fork(),
+                table_member_lookup_guard,
             );
         }
 
@@ -2085,13 +2226,21 @@ fn infer_generic_member(
             &substitutor,
             index_expr.clone(),
             infer_guard,
+            table_member_lookup_guard,
         );
         if let Some(result) = result {
             return Ok(result);
         }
     }
 
-    let member_type = infer_member_by_member_key(db, cache, &base_type, index_expr, infer_guard)?;
+    let member_type = infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        &base_type,
+        index_expr,
+        infer_guard,
+        table_member_lookup_guard,
+    )?;
 
     Ok(instantiate_type_generic(db, &member_type, &substitutor))
 }
@@ -2102,14 +2251,27 @@ fn infer_instance_member(
     inst: &LuaInstanceType,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let range = inst.get_range();
 
     let origin_type = inst.get_base();
-    let base_result =
-        infer_member_by_member_key(db, cache, origin_type, index_expr.clone(), infer_guard);
+    let base_result = infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        origin_type,
+        index_expr.clone(),
+        infer_guard,
+        table_member_lookup_guard,
+    );
     match base_result {
-        Ok(typ) => match infer_table_member(db, cache, range.clone(), index_expr.clone()) {
+        Ok(typ) => match infer_table_member(
+            db,
+            cache,
+            range.clone(),
+            index_expr.clone(),
+            table_member_lookup_guard,
+        ) {
             Ok(table_type) => {
                 return Ok(match TypeOps::Intersect.apply(db, &typ, &table_type) {
                     LuaType::Never => typ,
@@ -2123,7 +2285,13 @@ fn infer_instance_member(
         Err(err) => return Err(err),
     }
 
-    infer_table_member(db, cache, range.clone(), index_expr.clone())
+    infer_table_member(
+        db,
+        cache,
+        range.clone(),
+        index_expr.clone(),
+        table_member_lookup_guard,
+    )
 }
 
 pub fn infer_member_by_operator(
@@ -2903,6 +3071,7 @@ fn infer_tpl_ref_member(
     generic: &GenericTpl,
     index_expr: LuaIndexMemberExpr,
     infer_guard: &InferGuardRef,
+    table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let extend_type = get_tpl_ref_extend_type(
         db,
@@ -2916,5 +3085,12 @@ fn infer_tpl_ref_member(
         0,
     )
     .ok_or(InferFailReason::None)?;
-    infer_member_by_member_key(db, cache, &extend_type, index_expr.clone(), infer_guard)
+    infer_member_by_member_key_with_table_guard(
+        db,
+        cache,
+        &extend_type,
+        index_expr.clone(),
+        infer_guard,
+        table_member_lookup_guard,
+    )
 }
