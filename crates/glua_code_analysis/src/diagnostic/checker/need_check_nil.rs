@@ -168,6 +168,8 @@ fn nullable_callable_is_from_non_nullable_receiver(
         return false;
     };
     let Ok(receiver_type) = semantic_model.infer_expr(receiver) else {
+        // Conservative by design: unresolved receivers are reported by the
+        // upstream receiver-safety path, not suppressed as safe nullable calls.
         return false;
     };
 
@@ -196,6 +198,8 @@ fn nullable_callable_is_from_guarded_receiver(
         return false;
     };
     let Ok(receiver_type) = semantic_model.infer_expr(receiver.clone()) else {
+        // Conservative by design: unresolved receivers are reported by the
+        // upstream receiver-safety path, not suppressed as safe nullable calls.
         return false;
     };
 

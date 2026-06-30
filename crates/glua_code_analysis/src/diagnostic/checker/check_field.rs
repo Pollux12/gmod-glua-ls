@@ -1300,8 +1300,8 @@ fn callee_type_has_member_guard_param(
                 .is_some()
         }
         LuaType::DocFunction(_) => {
-            // DocFunction types don't carry call-arg roles directly;
-            // try to resolve through the signature index.
+            // DocFunction types cannot carry member-guard call-arg roles in the
+            // current model. Real annotated member guards infer to Signature.
             false
         }
         LuaType::Union(union_type) => union_type
