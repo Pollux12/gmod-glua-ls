@@ -1158,6 +1158,47 @@ mod test {
     }
 
     #[test]
+    fn meta_global_path_members_extend_std_backed_global_tables() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.new_path("annotations");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "annotations/math.lua",
+            r#"
+            ---@meta
+
+            math.ease = {}
+            math = {}
+
+            ---@param input number
+            ---@param min number
+            ---@param max number
+            ---@return number
+            function math.Clamp(input, min, max) end
+
+            ---@param input number
+            ---@return number
+            function math.ease.InQuad(input) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_math.lua",
+            r#"
+            local clamped = math.Clamp(5, 0, 10)
+            local eased = math.ease.InQuad(clamped)
+            print(eased)
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+
+        assert!(
+            diags.is_empty(),
+            "meta global-path members should extend std-backed global table types: {diags:#?}"
+        );
+    }
+
+    #[test]
     fn test_repeated_initialized_index_prefixes_diagnose_quick_smoke() {
         let mut ws = VirtualWorkspace::new();
         let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");

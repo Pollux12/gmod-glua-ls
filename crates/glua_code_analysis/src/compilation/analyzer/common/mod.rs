@@ -1,5 +1,7 @@
 mod migrate_global_member;
-use migrate_global_member::migrate_global_members_when_type_resolve;
+pub(super) use migrate_global_member::{
+    migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
+};
 use rowan::TextRange;
 
 use crate::{

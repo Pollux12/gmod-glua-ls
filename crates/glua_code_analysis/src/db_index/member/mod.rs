@@ -219,6 +219,17 @@ impl LuaMemberIndex {
         Some(())
     }
 
+    pub fn add_member_alias_to_owner(
+        &mut self,
+        owner: LuaMemberOwner,
+        id: LuaMemberId,
+    ) -> Option<()> {
+        let file_id = self.get_member(&id)?.get_file_id();
+        self.add_member_to_owner(owner.clone(), id)?;
+        self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
+        Some(())
+    }
+
     fn should_preserve_assignment_file_define_member(
         &self,
         owner: &LuaMemberOwner,

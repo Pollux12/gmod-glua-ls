@@ -9,7 +9,10 @@ use crate::{
     profile::Profile,
 };
 
-use super::{AnalyzeContext, gmod::ensure_scoped_class_type_decl_for_file};
+use super::{
+    AnalyzeContext, common::migrate_global_path_members_when_owner_resolved,
+    gmod::ensure_scoped_class_type_decl_for_file,
+};
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
 use rowan::{TextRange, TextSize, WalkEvent};
 
@@ -246,6 +249,20 @@ impl<'a> DeclAnalyzer<'a> {
         self.decl.file_id()
     }
 
+    fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
+        let global_id = match (&owner, member.get_feature().is_meta_decl()) {
+            (LuaMemberOwner::GlobalPath(global_id), true) => Some(global_id.clone()),
+            _ => None,
+        };
+        let member_id = self.db.get_member_index_mut().add_member(owner, member);
+
+        if let Some(global_id) = global_id {
+            migrate_global_path_members_when_owner_resolved(self.db, &global_id);
+        }
+
+        member_id
+    }
+
     pub fn get_decl_tree(self) -> LuaDeclarationTree {
         self.decl
     }
@@ -313,7 +330,7 @@ impl<'a> DeclAnalyzer<'a> {
                 LuaMemberFeature::FileFieldDecl,
                 None,
             );
-            self.db.get_member_index_mut().add_member(owner, member);
+            self.add_member(owner, member);
             // Link the member's property to the same property as the decl so that
             // description/annotations stored on the decl (or its signature) are visible
             // when looking up the member (e.g. hover over a legacy-module member).
@@ -434,7 +451,7 @@ impl<'a> DeclAnalyzer<'a> {
                 LuaMemberFeature::FileFieldDecl,
                 Some(GlobalId::new(&child_path)),
             );
-            self.db.get_member_index_mut().add_member(owner, member);
+            self.add_member(owner, member);
             self.db.get_type_index_mut().bind_type(
                 member_id.into(),
                 LuaTypeCache::InferType(LuaType::Namespace(SmolStr::new(&child_path).into())),

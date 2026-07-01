@@ -151,7 +151,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 let (owner, global_id) = find_index_owner(analyzer, index_expr.clone());
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
 
-                analyzer.db.get_member_index_mut().add_member(owner, member);
+                analyzer.add_member(owner, member);
                 if let LuaMemberKey::Name(name) = &key {
                     analyze_maybe_global_index_expr(analyzer, index_expr, name, value_expr_id);
                 }
@@ -339,10 +339,7 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
 
             let (owner_id, global_id) = find_index_owner(analyzer, index_expr.clone());
             let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
-            let member_id = analyzer
-                .db
-                .get_member_index_mut()
-                .add_member(owner_id, member);
+            let member_id = analyzer.add_member(owner_id, member);
 
             if let LuaMemberKey::Name(name) = &key {
                 analyze_maybe_global_index_expr(analyzer, &index_expr, name, None);

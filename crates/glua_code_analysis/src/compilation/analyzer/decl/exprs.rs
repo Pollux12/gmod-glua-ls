@@ -290,10 +290,7 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
                     }
                     _ => LuaMember::new(member_id, key, decl_feature, None),
                 };
-                analyzer
-                    .db
-                    .get_member_index_mut()
-                    .add_member(owner_id.clone(), member);
+                analyzer.add_member(owner_id.clone(), member);
             }
         }
     }
