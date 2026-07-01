@@ -836,6 +836,23 @@ fn resolve_gmod_annotations_path(client_config: &ClientConfig, emmyrc: &Emmyrc) 
     None
 }
 
+fn gmod_annotations_explicitly_disabled(client_config: &ClientConfig, emmyrc: &Emmyrc) -> bool {
+    if matches!(emmyrc.gmod.auto_load_annotations, Some(false)) {
+        return true;
+    }
+
+    if emmyrc
+        .gmod
+        .annotations_path
+        .as_ref()
+        .is_some_and(|path| !path.is_empty())
+    {
+        return false;
+    }
+
+    client_config.gmod_annotations_path.as_deref() == Some("")
+}
+
 /// Inject GMod annotations path into workspace library if appropriate
 fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
     let Some(annotations_path) = resolve_gmod_annotations_path(client_config, emmyrc) else {
@@ -874,11 +891,12 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
 ///
 /// Returns `Ok(())` when:
 ///   - `gmod.enabled` is false, or
+///   - annotation loading was explicitly disabled, or
 ///   - a resolved annotations path exists, points to an existing directory,
 ///     and that directory contains at least one `.lua` annotation file.
 ///
 /// Returns `Err(reason)` with a user-facing reason string for any of:
-///   - no path resolved, including explicit annotation disable,
+///   - no path resolved,
 ///   - the resolved path does not exist,
 ///   - the resolved path is not a directory,
 ///   - the resolved directory contains no `.lua` files (present-but-empty).
@@ -890,13 +908,18 @@ pub fn validate_gmod_annotations_for_ls(
         return Ok(());
     }
 
+    if gmod_annotations_explicitly_disabled(client_config, emmyrc) {
+        return Ok(());
+    }
+
     let Some(annotations_path) = resolve_gmod_annotations_path(client_config, emmyrc) else {
         return Err(
             "GMod mode is enabled but no GMod annotations path was resolved. \
              Set `gmod.annotationsPath` in `.gluarc.json`, pass a path via the \
-             client/CLI (`--gmod-annotations-path`), or disable GMod mode with \
-             `gmod.enabled: false`. Running GMod mode without annotations is \
-             not supported by the language server."
+             client/CLI (`--gmod-annotations-path`), explicitly disable \
+             annotations with `--gmod-annotations-path none` or \
+             `gmod.autoLoadAnnotations: false`, or disable GMod mode with \
+             `gmod.enabled: false`."
                 .to_string(),
         );
     };
@@ -2399,25 +2422,25 @@ mod tests {
     }
 
     #[test]
-    fn validate_fails_when_auto_load_disabled() {
-        // autoLoadAnnotations:false means no path resolves. The LS does not
-        // support running GMod mode without annotations.
+    fn validate_succeeds_when_auto_load_disabled() {
+        // autoLoadAnnotations:false is an explicit workspace opt-out, not a
+        // missing-annotations configuration error.
         let emmyrc = emmyrc_with_annotations(Some("/irrelevant"), Some(false), None);
         let client = ClientConfig::default();
 
         let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
-        assert!(result.is_err());
+        assert!(result.is_ok());
     }
 
     #[test]
-    fn validate_fails_when_client_explicitly_disables_annotations() {
+    fn validate_succeeds_when_client_explicitly_disables_annotations() {
         let emmyrc = emmyrc_with_annotations(None, None, None);
         let client = client_config_with_annotations_path(Some(""));
 
         let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
         assert!(
-            result.is_err(),
-            "CLI/client explicit disable must fail LS validation"
+            result.is_ok(),
+            "CLI/client explicit disable must pass LS validation"
         );
     }
 

@@ -145,8 +145,9 @@ pub async fn initialized_handler(
     // launching the language server without API metadata, which would dark
     // out metadata-driven behavior (completions, hovers, diagnostics, realm
     // inference, etc.). `glua_check`, `VirtualWorkspace`, and analysis tests
-    // never enter this path and remain exempt. To run the server without
-    // GMod annotations, set `gmod.enabled: false`.
+    // never enter this path and remain exempt. Explicit annotation opt-outs
+    // (`--gmod-annotations-path none` / `gmod.autoLoadAnnotations: false`) are
+    // allowed; this only rejects accidental missing or unusable annotation sets.
     if let Err(reason) = validate_gmod_annotations_for_ls(&client_config, &emmyrc) {
         log::error!("GMod annotations validation failed: {reason}");
         // Surface the reason to the client before aborting. The initialize
