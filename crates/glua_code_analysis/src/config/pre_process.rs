@@ -58,7 +58,7 @@ impl PreProcessContext {
             .collect()
     }
 
-    fn pre_process_path(&self, path: &str) -> String {
+    pub(super) fn pre_process_path(&self, path: &str) -> String {
         let mut path = path.to_string();
         path = self.replace_env_var(&path);
         // ${workspaceFolder}  == {workspaceFolder}

@@ -791,7 +791,6 @@ fn merge_client_config(client_config: &ClientConfig, emmyrc: &mut Emmyrc) -> Opt
 /// (i.e. auto-load is not explicitly disabled and a non-empty path is
 /// available). Returns `None` when:
 ///   - `gmod.autoLoadAnnotations == Some(false)` (explicit opt-out), or
-///   - `gmod.annotationsPath` is `Some("")` (explicit empty = skip), or
 ///   - the client/CLI path is `Some("")` (explicit empty = skip), or
 ///   - no path was provided by config or client.
 ///
@@ -810,11 +809,13 @@ fn resolve_gmod_annotations_path(client_config: &ClientConfig, emmyrc: &Emmyrc) 
     if let Some(explicit_path) = &emmyrc.gmod.annotations_path {
         // User specified explicit path in .gluarc.json/.emmyrc - use that (highest priority)
         if explicit_path.is_empty() {
-            log::info!("GMod annotations_path is explicitly set to empty string - skipping");
-            return None;
+            log::info!(
+                "GMod annotations_path is empty in config; falling back to client configuration"
+            );
+        } else {
+            log::info!("Using GMod annotations from config: {}", explicit_path);
+            return Some(explicit_path.clone());
         }
-        log::info!("Using GMod annotations from config: {}", explicit_path);
-        return Some(explicit_path.clone());
     }
 
     if let Some(cli_path) = &client_config.gmod_annotations_path {
@@ -841,6 +842,10 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
         return;
     };
 
+    if matches!(emmyrc.gmod.annotations_path.as_deref(), None | Some("")) {
+        emmyrc.gmod.annotations_path = Some(annotations_path.clone());
+    }
+
     // Add to library paths
     use glua_code_analysis::EmmyLibraryItem;
     if emmyrc
@@ -865,9 +870,7 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
 ///
 /// This is **LS-only**: `glua_check` and lower-level `VirtualWorkspace`/analysis
 /// tests intentionally run without annotations and must not be affected. The
-/// check is only meaningful when `gmod.enabled` is true (the default). To run
-/// the server without GMod annotations, disable GMod mode via
-/// `gmod.enabled: false`.
+/// check is only meaningful when `gmod.enabled` is true (the default).
 ///
 /// Returns `Ok(())` when:
 ///   - `gmod.enabled` is false, or
@@ -875,8 +878,7 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
 ///     and that directory contains at least one `.lua` annotation file.
 ///
 /// Returns `Err(reason)` with a user-facing reason string for any of:
-///   - no path resolved (missing path / `autoLoadAnnotations: false` /
-///     empty client path / empty config path),
+///   - no path resolved, including explicit annotation disable,
 ///   - the resolved path does not exist,
 ///   - the resolved path is not a directory,
 ///   - the resolved directory contains no `.lua` files (present-but-empty).
@@ -893,7 +895,8 @@ pub fn validate_gmod_annotations_for_ls(
             "GMod mode is enabled but no GMod annotations path was resolved. \
              Set `gmod.annotationsPath` in `.gluarc.json`, pass a path via the \
              client/CLI (`--gmod-annotations-path`), or disable GMod mode with \
-             `gmod.enabled: false`."
+             `gmod.enabled: false`. Running GMod mode without annotations is \
+             not supported by the language server."
                 .to_string(),
         );
     };
@@ -2345,12 +2348,12 @@ mod tests {
     }
 
     #[test]
-    fn resolve_annotations_path_returns_none_for_empty_config_path() {
+    fn resolve_annotations_path_falls_back_to_client_for_empty_config_path() {
         let emmyrc = emmyrc_with_annotations(Some(""), None, None);
         let client = client_config_with_annotations_path(Some("/from/client"));
 
         let resolved = resolve_gmod_annotations_path(&client, &emmyrc);
-        assert!(resolved.is_none(), "empty config path must skip");
+        assert_eq!(resolved.as_deref(), Some("/from/client"));
     }
 
     #[test]
@@ -2397,14 +2400,55 @@ mod tests {
 
     #[test]
     fn validate_fails_when_auto_load_disabled() {
-        // autoLoadAnnotations:false means no path resolves -> validation fails
-        // (this is the "explicitly opted out of annotations while GMod enabled"
-        // case the plan calls out as a startup error).
+        // autoLoadAnnotations:false means no path resolves. The LS does not
+        // support running GMod mode without annotations.
         let emmyrc = emmyrc_with_annotations(Some("/irrelevant"), Some(false), None);
         let client = ClientConfig::default();
 
         let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
         assert!(result.is_err());
+    }
+
+    #[test]
+    fn validate_fails_when_client_explicitly_disables_annotations() {
+        let emmyrc = emmyrc_with_annotations(None, None, None);
+        let client = client_config_with_annotations_path(Some(""));
+
+        let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
+        assert!(
+            result.is_err(),
+            "CLI/client explicit disable must fail LS validation"
+        );
+    }
+
+    #[test]
+    fn validate_fails_when_empty_config_path_has_no_client_fallback() {
+        let emmyrc = emmyrc_with_annotations(Some(""), None, None);
+        let client = ClientConfig::default();
+
+        let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
+        assert!(
+            result.is_err(),
+            "empty config path is fallback-to-client, not explicit disable"
+        );
+    }
+
+    #[test]
+    fn validate_prefers_config_path_over_empty_client_path() {
+        let dir = create_temp_dir();
+        fs::write(dir.join("meta.lua"), "-- annotation").expect("write lua");
+
+        let emmyrc =
+            emmyrc_with_annotations(Some(dir.to_str().expect("path is utf-8")), None, None);
+        let client = client_config_with_annotations_path(Some(""));
+
+        let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
+        assert!(
+            result.is_ok(),
+            "non-empty config path should beat lower-precedence client disable"
+        );
+
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -2479,6 +2523,24 @@ mod tests {
     }
 
     #[test]
+    fn validate_falls_back_to_client_for_empty_config_path() {
+        let dir = create_temp_dir();
+        fs::write(dir.join("meta.lua"), "-- an annotation").expect("write lua");
+
+        let emmyrc = emmyrc_with_annotations(Some(""), None, None);
+        let client =
+            client_config_with_annotations_path(Some(dir.to_str().expect("path is utf-8")));
+
+        let result = validate_gmod_annotations_for_ls(&client, &emmyrc);
+        assert!(
+            result.is_ok(),
+            "client fallback should validate: {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn validate_succeeds_with_nested_lua_files() {
         // directory_contains_lua_file is recursive; nested .lua counts.
         let dir = create_temp_dir();
@@ -2510,6 +2572,60 @@ mod tests {
         assert!(result.is_ok(), "client-provided populated dir must pass");
 
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_uses_workspace_relative_config_annotations_path_after_load() {
+        let workspace = create_temp_dir();
+        let config_annotations_dir = workspace.join("my-custom-annotations");
+        fs::create_dir_all(&config_annotations_dir).expect("mkdir config annotations");
+        fs::write(
+            config_annotations_dir.join("meta.lua"),
+            "-- workspace annotations",
+        )
+        .expect("write config annotation");
+
+        let vscode_annotations_dir = create_temp_dir();
+        fs::write(
+            vscode_annotations_dir.join("meta.lua"),
+            "-- vscode annotations",
+        )
+        .expect("write vscode annotation");
+
+        fs::write(
+            workspace.join(".gluarc.json"),
+            r#"{ "gmod": { "annotationsPath": "./my-custom-annotations" } }"#,
+        )
+        .expect("write config");
+
+        let client = client_config_with_annotations_path(Some(
+            vscode_annotations_dir.to_str().expect("path is utf-8"),
+        ));
+
+        let loaded = load_emmy_config(vec![workspace.clone()], client.clone());
+
+        let resolved = resolve_gmod_annotations_path(&client, &loaded.emmyrc)
+            .expect("config annotations path should resolve");
+        let resolved_path = PathBuf::from(&resolved);
+        assert!(
+            resolved_path.is_absolute(),
+            "workspace-relative config path should be preprocessed before validation, got: {resolved}"
+        );
+        assert_eq!(
+            resolved_path.canonicalize().expect("resolved annotations"),
+            config_annotations_dir
+                .canonicalize()
+                .expect("config annotations")
+        );
+
+        let result = validate_gmod_annotations_for_ls(&client, &loaded.emmyrc);
+        assert!(
+            result.is_ok(),
+            "workspace-relative config annotations path should validate after load: {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(workspace);
+        let _ = fs::remove_dir_all(vscode_annotations_dir);
     }
 
     #[test]

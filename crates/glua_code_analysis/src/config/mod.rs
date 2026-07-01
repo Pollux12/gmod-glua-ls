@@ -116,6 +116,10 @@ impl Emmyrc {
 
         self.workspace.library = context.process_and_dedup_library(self.workspace.library.iter());
 
+        if let Some(annotations_path) = &mut self.gmod.annotations_path {
+            *annotations_path = context.pre_process_path(annotations_path);
+        }
+
         self.workspace.package_dirs =
             context.process_and_dedup_string(self.workspace.package_dirs.iter());
 
