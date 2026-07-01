@@ -27,7 +27,7 @@ use log::info;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Emmyrc, FileId, GmodRealm, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
+    Emmyrc, FileId, GmodStateMask, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
     compilation::analyzer::{
         AnalysisPipeline,
         lua::call::{analyze_call, build_special_call_direct_matcher},
@@ -330,7 +330,7 @@ struct MemberAssignmentWideningCacheKey {
 #[derive(Debug, Default)]
 struct MemberAssignmentWideningCache {
     seen_count: usize,
-    by_realm: FxHashMap<GmodRealm, MemberAssignmentWideningState>,
+    by_state_mask: FxHashMap<GmodStateMask, MemberAssignmentWideningState>,
     disabled: bool,
 }
 
@@ -347,7 +347,7 @@ struct MemberAssignmentWideningState {
 #[derive(Debug, Default)]
 struct MemberCollectionAssignmentWideningCache {
     seen_count: usize,
-    by_realm: FxHashMap<GmodRealm, LuaType>,
+    by_state_mask: FxHashMap<GmodStateMask, LuaType>,
     disabled: bool,
 }
 

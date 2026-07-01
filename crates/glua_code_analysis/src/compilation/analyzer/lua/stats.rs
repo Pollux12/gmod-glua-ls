@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    CacheEntry, FileId, GmodRealm, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
+    CacheEntry, FileId, GmodStateMask, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
     LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::{
         analyzer::{
@@ -1491,11 +1491,13 @@ fn get_cached_widened_member_assignment_type(
         return None;
     }
 
-    let current_realm = member_assignment_realm(analyzer, *member_id);
+    let current_state_mask = member_assignment_state_mask(analyzer, *member_id);
     let compatible_states = cache
-        .by_realm
+        .by_state_mask
         .iter()
-        .filter(|(realm, _)| member_assignment_realms_compatible(analyzer, current_realm, **realm))
+        .filter(|(state_mask, _)| {
+            member_assignment_state_masks_compatible(analyzer, current_state_mask, **state_mask)
+        })
         .map(|(_, state)| state.clone())
         .collect::<Vec<_>>();
     if compatible_states.is_empty() {
@@ -1577,7 +1579,7 @@ fn record_member_assignment_widening_cache(
         return;
     };
     let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
-    let realm = member_assignment_realm(analyzer, *member_id);
+    let state_mask = member_assignment_state_mask(analyzer, *member_id);
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
     let no_table_literal_widen_type = widen_related_assignment_type(assigned_type, false);
     let table_literal_widen_type = widen_related_assignment_type(assigned_type, true);
@@ -1610,7 +1612,7 @@ fn record_member_assignment_widening_cache(
     }
 
     cache.seen_count = visible_count;
-    match cache.by_realm.get_mut(&realm) {
+    match cache.by_state_mask.get_mut(&state_mask) {
         Some(state) => {
             state.no_table_literal_widen_type = TypeOps::Union.apply(
                 analyzer.db,
@@ -1637,8 +1639,8 @@ fn record_member_assignment_widening_cache(
             );
         }
         None => {
-            cache.by_realm.insert(
-                realm,
+            cache.by_state_mask.insert(
+                state_mask,
                 MemberAssignmentWideningState {
                     no_table_literal_widen_type,
                     table_literal_widen_type,
@@ -1710,21 +1712,21 @@ fn merge_cached_assignment_types<'a>(
     result
 }
 
-fn member_assignment_realm(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> GmodRealm {
+fn member_assignment_state_mask(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> GmodStateMask {
     if !analyzer.gmod_enabled {
-        return GmodRealm::Unknown;
+        return GmodStateMask::empty();
     }
 
     analyzer
         .db
         .get_gmod_infer_index()
-        .get_realm_at_offset(&member_id.file_id, member_id.get_position())
+        .get_state_mask_at_offset(&member_id.file_id, member_id.get_position())
 }
 
-fn member_assignment_realms_compatible(
+fn member_assignment_state_masks_compatible(
     analyzer: &LuaAnalyzer,
-    left: GmodRealm,
-    right: GmodRealm,
+    left: GmodStateMask,
+    right: GmodStateMask,
 ) -> bool {
     !analyzer.gmod_enabled || left.is_compatible_with(right)
 }
@@ -1800,14 +1802,16 @@ fn get_widened_member_assignment_collection_type(
             member_index.get_member(member_id)?.get_key().clone(),
         )
     };
-    if let Some(widened_type) = get_cached_widened_member_collection_assignment_type(
+    match get_cached_widened_member_collection_assignment_type(
         analyzer,
         &owner,
         &key,
         *member_id,
         incoming_array.get_base(),
     ) {
-        return Some(widened_type);
+        Some(Some(widened_type)) => return Some(widened_type),
+        Some(None) => return None,
+        None => {}
     }
     let related_members = analyzer
         .db
@@ -1861,7 +1865,7 @@ fn get_cached_widened_member_collection_assignment_type(
     key: &LuaMemberKey,
     member_id: LuaMemberId,
     incoming_base: &LuaType,
-) -> Option<LuaType> {
+) -> Option<Option<LuaType>> {
     let incoming_base = crate::widen_literal_type_for_assignment(incoming_base);
     let member_index = analyzer.db.get_member_index();
     let visible_count = member_index.visible_member_count_for_owner_key(owner, key);
@@ -1874,27 +1878,27 @@ fn get_cached_widened_member_collection_assignment_type(
         .member_collection_assignment_widening_cache
         .get(&cache_key)
     else {
-        return (visible_count == 1).then_some(LuaType::Array(
-            LuaArrayType::from_base_type(incoming_base).into(),
-        ));
+        return (visible_count == 1).then_some(None);
     };
     if cache.disabled || cache.seen_count + 1 != visible_count {
         return None;
     }
 
-    let current_realm = member_assignment_realm(analyzer, member_id);
+    let current_state_mask = member_assignment_state_mask(analyzer, member_id);
     let mut widened_base = incoming_base;
     let mut saw_related_collection = false;
-    for (realm, base_type) in &cache.by_realm {
-        if !member_assignment_realms_compatible(analyzer, current_realm, *realm) {
+    for (state_mask, base_type) in &cache.by_state_mask {
+        if !member_assignment_state_masks_compatible(analyzer, current_state_mask, *state_mask) {
             continue;
         }
         saw_related_collection = true;
         widened_base = TypeOps::Union.apply(analyzer.db, &widened_base, base_type);
     }
 
-    saw_related_collection
-        .then(|| LuaType::Array(LuaArrayType::from_base_type(widened_base).into()))
+    Some(
+        saw_related_collection
+            .then(|| LuaType::Array(LuaArrayType::from_base_type(widened_base).into())),
+    )
 }
 
 fn record_member_collection_assignment_widening_cache(
@@ -1924,7 +1928,7 @@ fn record_member_collection_assignment_widening_cache(
         return;
     };
     let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
-    let realm = member_assignment_realm(analyzer, *member_id);
+    let state_mask = member_assignment_state_mask(analyzer, *member_id);
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
 
     let mut cache = analyzer
@@ -1947,12 +1951,12 @@ fn record_member_collection_assignment_widening_cache(
 
     let assigned_base = crate::widen_literal_type_for_assignment(assigned_array.get_base());
     cache.seen_count = visible_count;
-    match cache.by_realm.get_mut(&realm) {
+    match cache.by_state_mask.get_mut(&state_mask) {
         Some(base_type) => {
             *base_type = TypeOps::Union.apply(analyzer.db, base_type, &assigned_base);
         }
         None => {
-            cache.by_realm.insert(realm, assigned_base);
+            cache.by_state_mask.insert(state_mask, assigned_base);
         }
     }
 
@@ -3307,10 +3311,14 @@ mod tests {
     }
 
     fn member_id_at(start: u32) -> LuaMemberId {
+        member_id_at_file(FileId::new(0), start)
+    }
+
+    fn member_id_at_file(file_id: FileId, start: u32) -> LuaMemberId {
         let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
         LuaMemberId::new(
             LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
-            FileId::new(0),
+            file_id,
         )
     }
 
@@ -3332,10 +3340,24 @@ mod tests {
     }
 
     fn with_analyzer<T>(db: &mut DbIndex, run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T) -> T {
+        with_analyzer_config(db, false, run)
+    }
+
+    fn with_analyzer_config<T>(
+        db: &mut DbIndex,
+        gmod_enabled: bool,
+        run: impl FnOnce(&mut LuaAnalyzer<'_>) -> T,
+    ) -> T {
         let mut context = crate::compilation::analyzer::AnalyzeContext::new();
         let matcher = super::super::call::SpecialCallDirectMatcher::default();
-        let mut analyzer =
-            LuaAnalyzer::new(db, FileId::new(0), &mut context, false, false, &matcher);
+        let mut analyzer = LuaAnalyzer::new(
+            db,
+            FileId::new(0),
+            &mut context,
+            gmod_enabled,
+            false,
+            &matcher,
+        );
         run(&mut analyzer)
     }
 
@@ -3644,7 +3666,8 @@ mod tests {
                 second_member,
                 &LuaType::String,
             )
-            .expect("sequential collection cache should be usable");
+            .expect("sequential collection cache should be usable")
+            .expect("second same-key collection assignment should widen with cached prior type");
 
             assert_eq!(
                 widened,
@@ -3656,6 +3679,109 @@ mod tests {
                     ))
                     .into()
                 )
+            );
+        });
+    }
+
+    #[test]
+    fn member_collection_assignment_widening_cache_preserves_first_collection_assignment() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("items");
+        let member_id = member_id_at(1);
+        let array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            member_id,
+            key.clone(),
+            array.clone(),
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            let cached = get_cached_widened_member_collection_assignment_type(
+                analyzer,
+                &owner,
+                &key,
+                member_id,
+                &LuaType::Integer,
+            );
+
+            assert_eq!(
+                cached,
+                Some(None),
+                "first visible collection assignment should use the cache path without widening"
+            );
+        });
+    }
+
+    #[test]
+    fn member_collection_assignment_widening_cache_respects_load_state_masks() {
+        let mut db = DbIndex::new();
+        db.get_gmod_infer_index_mut()
+            .set_all_realm_file_metadata(std::collections::HashMap::from([
+                (
+                    FileId::new(0),
+                    crate::GmodRealmFileMetadata {
+                        load_state_mask: GmodStateMask::CLIENT,
+                        ..Default::default()
+                    },
+                ),
+                (
+                    FileId::new(1),
+                    crate::GmodRealmFileMetadata {
+                        load_state_mask: GmodStateMask::SERVER,
+                        ..Default::default()
+                    },
+                ),
+            ]));
+
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("items");
+        let first_member = member_id_at_file(FileId::new(0), 1);
+        let second_member = member_id_at_file(FileId::new(1), 3);
+        let first_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::Integer).into());
+        let second_array = LuaType::Array(LuaArrayType::from_base_type(LuaType::String).into());
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            first_array.clone(),
+        );
+
+        with_analyzer_config(&mut db, true, |analyzer| {
+            record_member_collection_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &first_array,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner.clone(),
+                second_member,
+                key.clone(),
+                second_array,
+            );
+
+            let cached = get_cached_widened_member_collection_assignment_type(
+                analyzer,
+                &owner,
+                &key,
+                second_member,
+                &LuaType::String,
+            );
+
+            assert_eq!(
+                cached,
+                Some(None),
+                "client-only and server-only collection assignments must not be widened together"
             );
         });
     }
