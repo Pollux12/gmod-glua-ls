@@ -1736,14 +1736,7 @@ fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwn
 }
 
 fn normalize_infer_collection_type(db: &DbIndex, typ: &LuaType) -> Option<()> {
-    match typ {
-        LuaType::Array(_) => Some(()),
-        LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(()),
-        // Shaped sequential literals are inferred as TableConst; treat them as
-        // inferred collections too so flow narrowing over their elements works.
-        LuaType::TableConst(range) => crate::table_const_array_base(db, range).map(|_| ()),
-        _ => None,
-    }
+    infer_collection_base_type(db, typ).map(|_| ())
 }
 
 fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
@@ -1751,8 +1744,39 @@ fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
         LuaType::Array(array) => Some(array.get_base().clone()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(tuple.cast_down_array_base(db)),
         LuaType::TableConst(range) => crate::table_const_array_base(db, range),
+        LuaType::TypeGuard(inner) => infer_collection_base_type(db, inner),
+        LuaType::Union(union) => infer_collection_base_types(db, union.types()),
+        LuaType::Intersection(intersection) => {
+            infer_collection_base_types(db, intersection.get_types().iter())
+        }
+        LuaType::MergedTable(merged_table) => {
+            infer_collection_base_types(db, merged_table.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            infer_collection_base_types(db, union.get_unions().iter().map(|(typ, _)| typ))
+        }
         _ => None,
     }
+}
+
+fn infer_collection_base_types<'a>(
+    db: &DbIndex,
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    let mut base_type = None;
+    for typ in types {
+        if typ.is_never() {
+            continue;
+        }
+
+        let collection_base = infer_collection_base_type(db, typ)?;
+        base_type = Some(match base_type {
+            Some(current) => TypeOps::Union.apply(db, &current, &collection_base),
+            None => collection_base,
+        });
+    }
+
+    base_type
 }
 
 fn expr_access_path(expr: &LuaExpr) -> Option<String> {

@@ -2754,8 +2754,39 @@ fn normalize_infer_collection_type(db: &crate::DbIndex, typ: &LuaType) -> Option
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => {
             Some(LuaArrayType::from_base_type(tuple.cast_down_array_base(db)))
         }
+        LuaType::TypeGuard(inner) => normalize_infer_collection_type(db, inner),
+        LuaType::Union(union) => normalize_infer_collection_types(db, union.types()),
+        LuaType::Intersection(intersection) => {
+            normalize_infer_collection_types(db, intersection.get_types().iter())
+        }
+        LuaType::MergedTable(merged_table) => {
+            normalize_infer_collection_types(db, merged_table.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            normalize_infer_collection_types(db, union.get_unions().iter().map(|(typ, _)| typ))
+        }
         _ => None,
     }
+}
+
+fn normalize_infer_collection_types<'a>(
+    db: &crate::DbIndex,
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaArrayType> {
+    let mut base_type = None;
+    for typ in types {
+        if typ.is_never() {
+            continue;
+        }
+
+        let collection = normalize_infer_collection_type(db, typ)?;
+        base_type = Some(match base_type {
+            Some(current) => TypeOps::Union.apply(db, &current, collection.get_base()),
+            None => collection.get_base().clone(),
+        });
+    }
+
+    base_type.map(LuaArrayType::from_base_type)
 }
 
 fn is_assignment_file_define_member(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {

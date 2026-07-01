@@ -666,19 +666,76 @@ fn is_inferred_collection_member_type(db: &DbIndex, typ: &LuaType) -> bool {
         LuaType::Array(_) => true,
         LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         LuaType::TableConst(range) => crate::table_const_array_base(db, range).is_some(),
+        LuaType::TypeGuard(inner) => is_inferred_collection_member_type(db, inner),
+        LuaType::Union(union) => {
+            union.types().next().is_some()
+                && union
+                    .types()
+                    .all(|typ| typ.is_never() || is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::Intersection(intersection) => {
+            let types = intersection.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::MergedTable(merged_table) => {
+            let types = merged_table.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|(typ, _)| typ.is_never() || is_inferred_collection_member_type(db, typ))
+        }
         _ => false,
     }
 }
 
 fn is_lenient_inferred_member_type(db: &DbIndex, typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_)
-    ) || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
+    match typ {
+        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_) => true,
+        LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         // Shaped sequential literals infer as TableConst and are mutable dynamic
         // tables, so later modification must not be flagged. Object/keyed
         // TableConst literals are excluded so their fields stay strictly checked.
-        || matches!(typ, LuaType::TableConst(range) if crate::table_const_array_base(db, range).is_some())
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range).is_some(),
+        LuaType::TypeGuard(inner) => is_lenient_inferred_member_type(db, inner),
+        LuaType::Union(union) => {
+            union.types().next().is_some()
+                && union
+                    .types()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::Intersection(intersection) => {
+            let types = intersection.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::MergedTable(merged_table) => {
+            let types = merged_table.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|(typ, _)| is_lenient_inferred_member_type(db, typ))
+        }
+        _ => false,
+    }
 }
 
 fn check_local_stat(

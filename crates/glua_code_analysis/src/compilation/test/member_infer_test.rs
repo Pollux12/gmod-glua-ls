@@ -1126,6 +1126,41 @@ mod test {
     }
 
     #[gtest]
+    fn test_member_collection_reset_and_append_includes_appended_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@class Seat
+        local Seat = {}
+
+        ---@class Vehicle
+        local Vehicle = {}
+
+        ---@param seat Seat
+        function Vehicle:test(seat)
+            local selfTbl = self
+
+            self.wheelTraceFilter = { self, "player", "npc_*" }
+            selfTbl.wheelTraceFilter = { self, "player" }
+            selfTbl.wheelTraceFilter[#selfTbl.wheelTraceFilter + 1] = seat
+
+            local appended = selfTbl.wheelTraceFilter[3]
+        end
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "appended");
+        let display = ws.humanize_type(ty.clone());
+        assert_that!(
+            !ty.is_nil() && !ty.is_unknown() && display.contains("Seat"),
+            eq(true),
+            "expected appended collection element to include Seat, got {}",
+            display
+        );
+    }
+
+    #[gtest]
     fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
         let mut ws = VirtualWorkspace::new();
 

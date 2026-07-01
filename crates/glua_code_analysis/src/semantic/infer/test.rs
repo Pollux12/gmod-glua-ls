@@ -961,6 +961,40 @@ mod test {
     }
 
     #[test]
+    fn test_literal_string_key_assignment_preserves_named_field_types() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@type Player
+            local player = {}
+
+            local rec = {}
+            rec["owner"] = player
+            rec["label"] = "main"
+            rec.test = 2
+
+            local owner = rec.owner
+            local label = rec.label
+            local test = rec["test"]
+        "#,
+        );
+
+        let owner_ty = infer_last_index_expr_type_in_file(&ws, file_id, "owner");
+        let label_ty = infer_last_index_expr_type_in_file(&ws, file_id, "label");
+        let test_ty = infer_last_index_expr_type_in_file(&ws, file_id, "test");
+
+        assert_eq!(owner_ty, ws.ty("Player"));
+        assert_eq!(
+            label_ty,
+            LuaType::StringConst(smol_str::SmolStr::new("main").into())
+        );
+        assert_eq!(test_ty, LuaType::IntegerConst(2));
+    }
+
+    #[test]
     fn test_custom_type_dynamic_index_key_is_guarded_before_recursing() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def(
