@@ -9,8 +9,8 @@ use rowan::TextSize;
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
     GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
-    LuaUnionType, TypeOps, infer_expr,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
+    LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
     semantic::cache::FlowOrigin,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -307,6 +307,7 @@ fn get_type_at_flow_walk(
                         | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
                         | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
                         | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+                        | (AssignVarHint::NameOnly, VarRefId::IndexRef(_, _))
                         | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
                 );
 
@@ -1333,7 +1334,14 @@ fn get_type_at_assign_stat(
         };
 
         if maybe_ref_id != *var_ref_id {
-            // let typ = get_var_ref_type(db, cache, var_ref_id)?;
+            if var_ref_id.start_with(&maybe_ref_id)
+                && let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)?
+                && let Some(member_type) =
+                    assigned_prefix_member_type(db, cache, var_ref_id, &maybe_ref_id, &expr_type)?
+            {
+                return Ok(ResultTypeOrContinue::Result(member_type));
+            }
+
             continue;
         }
 
@@ -1400,6 +1408,8 @@ fn get_type_at_assign_stat(
                 expr_type,
                 LuaType::StringConst(_) | LuaType::DocStringConst(_)
             );
+        let rhs_is_class_instance =
+            explicit_var_type.is_none() && is_class_instance_type(db, &expr_type);
         let rhs_replaces_special_call_effect = explicit_var_type.is_none()
             && antecedent_has_relevant_special_call_effect_before_node(
                 db, tree, cache, root, flow_node, var_ref_id,
@@ -1407,6 +1417,7 @@ fn get_type_at_assign_stat(
 
         let narrowed = if rhs_is_fresh_table_literal
             || rhs_is_string_literal
+            || rhs_is_class_instance
             || rhs_replaces_special_call_effect
         {
             Some(expr_type.clone())
@@ -1453,6 +1464,96 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn assigned_prefix_member_type(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    query_ref_id: &VarRefId,
+    assigned_ref_id: &VarRefId,
+    assigned_type: &LuaType,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let VarRefId::IndexRef(_, path) = query_ref_id else {
+        return Ok(None);
+    };
+
+    if path.contains('.') {
+        return Ok(None);
+    }
+
+    let key = LuaMemberKey::Name(path.to_string().into());
+    let Some(type_id) = assigned_member_type_id(assigned_type) else {
+        return Ok(None);
+    };
+
+    resolve_assigned_type_member(db, cache, &type_id, &key, assigned_ref_id.get_position())
+        .map(Some)
+}
+
+fn assigned_member_type_id(assigned_type: &LuaType) -> Option<LuaTypeDeclId> {
+    match assigned_type {
+        LuaType::Instance(instance) => assigned_member_type_id(instance.get_base()),
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
+        _ => None,
+    }
+}
+
+fn is_class_instance_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let Some(type_id) = assigned_member_type_id(typ) else {
+        return false;
+    };
+
+    db.get_type_index()
+        .get_type_decl(&type_id)
+        .is_some_and(|decl| decl.is_class())
+}
+
+fn resolve_assigned_type_member(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    type_id: &LuaTypeDeclId,
+    key: &LuaMemberKey,
+    access_position: TextSize,
+) -> InferResult {
+    let type_index = db.get_type_index();
+    let type_decl = type_index
+        .get_type_decl(type_id)
+        .ok_or(InferFailReason::None)?;
+
+    let owner = LuaMemberOwner::Type(type_id.clone());
+    if let Some(member_item) = db.get_member_index().get_member_item(&owner, key) {
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
+    }
+
+    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_id.get_name()));
+    if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, key) {
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
+    }
+
+    if type_decl.is_class()
+        && let Some(super_types) = type_index.get_super_types(type_id)
+    {
+        for super_type in super_types {
+            let Some(super_type_id) = assigned_member_type_id(&super_type) else {
+                continue;
+            };
+            match resolve_assigned_type_member(db, cache, &super_type_id, key, access_position) {
+                Ok(member_type) => return Ok(member_type),
+                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Err(InferFailReason::FieldNotFound)
 }
 
 fn antecedent_has_relevant_special_call_effect_before_node(
@@ -1574,6 +1675,9 @@ fn assignment_flow_info_cannot_match(
     let Some(info) = tree.get_assignment_flow_info(flow_id) else {
         return false;
     };
+    if info.is_empty() {
+        return false;
+    }
     if info.has_unknown_index_target {
         return false;
     }

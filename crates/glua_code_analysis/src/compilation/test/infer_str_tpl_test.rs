@@ -2224,4 +2224,74 @@ mod test {
         let expected = ws.ty("DCategoryList");
         assert_eq!(base, expected);
     }
+
+    #[gtest]
+    fn test_vgui_create_literal_reassignment_replaces_local_panel_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/vgui_reassigned_color_mixer.lua",
+            r#"
+                ---@class Panel
+                ---@class DForm: Panel
+                local DForm = {}
+
+                ---@return DNumSlider
+                function DForm:NumSlider(label, convar, min, max, decimals) end
+
+                ---@return DCheckBoxLabel
+                function DForm:CheckBox(label, convar) end
+
+                ---@class DCheckBoxLabel: Panel
+                ---@class DNumSlider: Panel
+                ---@class DColorMixer: Panel
+                ---@type DColorMixer
+                DColorMixer = nil
+
+                function DColorMixer:SetLabel(label) end
+                function DColorMixer:SetAlphaBar(enabled) end
+                function DColorMixer:SetPalette(enabled) end
+                function DColorMixer:SetColor(color) end
+                function DColorMixer:SetConVarR(name) end
+                function DColorMixer:SetConVarG(name) end
+                function DColorMixer:SetConVarB(name) end
+
+                local direct = vgui.Create("DColorMixer")
+                direct:SetLabel("Direct color")
+
+                local dgui = vgui.Create("DForm")
+                local cb = dgui:NumSlider("Start popup", "ttt_startpopup_duration", 0, 60, 0)
+                cb = dgui:CheckBox("Lower sights", "ttt_ironsights_lowered")
+                cb = dgui:CheckBox("Fast switch", "ttt_weaponswitcher_fast")
+                cb = vgui.Create("DColorMixer")
+                cb:SetLabel("Crosshair color")
+                cb:SetAlphaBar(false)
+                cb:SetPalette(false)
+                cb:SetColor({})
+                cb:SetConVarR("ttt_crosshair_color_r")
+                cb:SetConVarG("ttt_crosshair_color_g")
+                cb:SetConVarB("ttt_crosshair_color_b")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field_code),
+            "DColorMixer reassignment should replace the older local panel type, got {diagnostics:?}"
+        );
+    }
 }
