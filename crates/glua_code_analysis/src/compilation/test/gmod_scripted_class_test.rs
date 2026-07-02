@@ -2112,6 +2112,124 @@ mod test {
     }
 
     #[gtest]
+    fn test_scripted_entity_self_baseclass_calls_are_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/tot_smokenade/cl_init.lua",
+            r#"
+            ---@class Entity
+            ---@class base_anim : Entity
+            local base_anim = {}
+
+            function base_anim:Draw(flags) end
+            function base_anim:DrawTranslucent(flags) end
+
+            ENT.Base = "base_anim"
+
+            function ENT:Draw(flags)
+                self.BaseClass.Draw(self, flags)
+            end
+
+            function ENT:DrawTranslucent(flags)
+                self.BaseClass.DrawTranslucent(self, flags)
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let false_positive_codes = [DiagnosticCode::UndefinedField, DiagnosticCode::NeedCheckNil]
+            .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| !false_positive_codes.contains(&diag.code)),
+            "unexpected self.BaseClass diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_self_baseclass_members_resolve_in_gm_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "garrysmod/gamemodes/base/gamemode/cl_init.lua",
+                r#"
+                ---@class GM
+                function GM:Initialize() end
+                function GM:HUDShouldDraw(name) return true end
+                function GM:UpdateAnimation(ply, vel, maxseqgroundspeed) end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/cl_init.lua",
+                r#"
+                DEFINE_BASECLASS("gamemode_base")
+
+                function GM:Initialize()
+                    self.BaseClass:Initialize()
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                r#"
+                function GM:HUDShouldDraw(name)
+                    return self.BaseClass.HUDShouldDraw(self, name)
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/player_ext_shd.lua",
+                r#"
+                function GM:UpdateAnimation(ply, vel, maxseqgroundspeed)
+                    return self.BaseClass.UpdateAnimation(self, ply, vel, maxseqgroundspeed)
+                end
+                "#,
+            ),
+        ]);
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        for file_id in file_ids.into_iter().skip(1) {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let undefined_fields: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diag| diag.code == undefined_field_code)
+                .collect();
+            assert!(
+                undefined_fields.is_empty(),
+                "unexpected gamemode BaseClass undefined-field diagnostics: {undefined_fields:?}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_doc_param_resolves_scoped_entity_type_without_type_not_found() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

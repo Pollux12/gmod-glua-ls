@@ -2705,10 +2705,12 @@ fn synthesize_scripted_class_members(
         if let Some(ref scope_match) = scope_match {
             let class_decl_id =
                 get_scripted_class_type_decl_id(&scope_match.global_name, &scope_match.class_name);
-            if let Some((effective_base_name, is_derive)) = resolve_effective_inheritance_base(
-                &metadata,
-                scope_match.class_name_prefix.as_deref(),
-            ) {
+            if let Some((effective_base_name, is_derive, source_syntax_id)) =
+                resolve_effective_inheritance_base(
+                    &metadata,
+                    scope_match.class_name_prefix.as_deref(),
+                )
+            {
                 synthesize_inheritance_base(
                     db,
                     file_id,
@@ -2716,6 +2718,7 @@ fn synthesize_scripted_class_members(
                     &effective_base_name,
                     is_derive,
                     scope_match.class_name_prefix.as_deref(),
+                    source_syntax_id,
                 );
             }
             if let Some(effective_call) =
@@ -3182,6 +3185,7 @@ fn synthesize_scripted_ent_registration(
                 super_type,
             );
         }
+        synthesize_baseclass_member(db, file_id, &class_decl_id, &base_name, call.syntax_id);
     }
 
     // Inject extra super-types based on `ENT.Type`. The `Type` field selects
@@ -3400,6 +3404,13 @@ fn synthesize_scoped_base_assignments_with(
                     continue;
                 };
                 add_scoped_super_type_if_missing(db, &class_decl_id, file_id, &base_name);
+                synthesize_baseclass_member(
+                    db,
+                    file_id,
+                    &class_decl_id,
+                    &base_name,
+                    value_expr.get_syntax_id(),
+                );
             } else if let Some(ref type_path) = expected_type_path
                 && access_path.eq_ignore_ascii_case(type_path)
             {
@@ -3875,6 +3886,7 @@ fn synthesize_inheritance_base(
     base_name: &str,
     is_derive: bool,
     class_name_prefix: Option<&str>,
+    source_syntax_id: LuaSyntaxId,
 ) {
     if base_name.is_empty() {
         return;
@@ -3898,6 +3910,13 @@ fn synthesize_inheritance_base(
     let super_type = LuaType::Ref(LuaTypeDeclId::global(&effective_base_name));
     db.get_type_index_mut()
         .add_super_type_if_missing(class_decl_id.clone(), file_id, super_type);
+    synthesize_baseclass_member(
+        db,
+        file_id,
+        class_decl_id,
+        &effective_base_name,
+        source_syntax_id,
+    );
 }
 
 fn materialize_scoped_gamemode_base(
@@ -3948,7 +3967,7 @@ fn valid_inheritance_literal(call: &GmodScriptedClassCallMetadata) -> bool {
 fn resolve_effective_inheritance_base(
     metadata: &GmodScriptedClassFileMetadata,
     class_name_prefix: Option<&str>,
-) -> Option<(String, bool)> {
+) -> Option<(String, bool, LuaSyntaxId)> {
     let call = resolve_effective_inheritance_call(metadata)?;
     let base_name = match call.literal_args.get(call.inheritance_name_arg_idx()) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.as_str(),
@@ -3968,10 +3987,11 @@ fn resolve_effective_inheritance_base(
                 format!("{prefix}{base_name}")
             },
             true,
+            call.syntax_id,
         ));
     }
 
-    Some((base_name.to_string(), false))
+    Some((base_name.to_string(), false, call.syntax_id))
 }
 
 /// Synthesize a parent-name alias member on a derived scripted class.
@@ -5426,6 +5446,30 @@ fn synthesize_panel_baseclass_member(
             }
         })
         .unwrap_or(call.syntax_id);
+    synthesize_baseclass_member(db, file_id, class_decl_id, base_name, syntax_id);
+}
+
+fn synthesize_baseclass_member(
+    db: &mut DbIndex,
+    file_id: FileId,
+    class_decl_id: &LuaTypeDeclId,
+    base_name: &str,
+    syntax_id: LuaSyntaxId,
+) {
+    if base_name.is_empty() {
+        return;
+    }
+
+    let owner = LuaMemberOwner::Type(class_decl_id.clone());
+    let member_key = LuaMemberKey::Name("BaseClass".into());
+    if db
+        .get_member_index()
+        .get_member_item(&owner, &member_key)
+        .is_some()
+    {
+        return;
+    }
+
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);
