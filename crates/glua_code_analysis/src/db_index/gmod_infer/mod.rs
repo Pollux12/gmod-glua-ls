@@ -136,6 +136,23 @@ pub struct GmodSystemAggregate {
     net_registration_count: HashMap<String, usize>,
     concommand_registration_count: HashMap<String, usize>,
     convar_registration_count: HashMap<String, usize>,
+    duplicate_registrations:
+        HashMap<(GmodSystemRegistrationKind, String), Vec<GmodSystemRegistration>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GmodSystemRegistrationKind {
+    NetMessage,
+    Concommand,
+    Convar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodSystemRegistration {
+    pub kind: GmodSystemRegistrationKind,
+    pub name: String,
+    pub file_id: FileId,
+    pub name_range: TextRange,
 }
 
 impl GmodSystemAggregate {
@@ -159,6 +176,35 @@ impl GmodSystemAggregate {
             .get(name)
             .copied()
             .unwrap_or(0)
+    }
+
+    fn add_registration(
+        &mut self,
+        kind: GmodSystemRegistrationKind,
+        name: &str,
+        file_id: FileId,
+        name_range: TextRange,
+    ) {
+        self.duplicate_registrations
+            .entry((kind, name.to_string()))
+            .or_default()
+            .push(GmodSystemRegistration {
+                kind,
+                name: name.to_string(),
+                file_id,
+                name_range,
+            });
+    }
+
+    pub fn registrations(
+        &self,
+        kind: GmodSystemRegistrationKind,
+        name: &str,
+    ) -> &[GmodSystemRegistration] {
+        self.duplicate_registrations
+            .get(&(kind, name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 }
 
@@ -256,7 +302,7 @@ impl GmodInferIndex {
     fn build_system_aggregate(&self) -> GmodSystemAggregate {
         let mut aggregate = GmodSystemAggregate::default();
 
-        for metadata in self.system_file_metadata.values() {
+        for (file_id, metadata) in &self.system_file_metadata {
             for site in &metadata.net_add_string_calls {
                 if let Some(name) = normalize_system_name(site.name.as_deref()) {
                     aggregate.known_net_messages.insert(name.to_string());
@@ -264,6 +310,14 @@ impl GmodInferIndex {
                         .net_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::NetMessage,
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
 
@@ -273,6 +327,14 @@ impl GmodInferIndex {
                         .concommand_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::Concommand,
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
 
@@ -282,6 +344,14 @@ impl GmodInferIndex {
                         .convar_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::Convar,
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
         }
@@ -399,6 +469,27 @@ impl GmodInferIndex {
     pub fn get_system_aggregate(&self) -> &GmodSystemAggregate {
         self.system_aggregate_cache
             .get_or_init(|| self.build_system_aggregate())
+    }
+
+    pub fn has_compatible_duplicate_registration(
+        &self,
+        kind: GmodSystemRegistrationKind,
+        name: &str,
+        file_id: &FileId,
+        name_range: TextRange,
+    ) -> bool {
+        self.get_system_aggregate()
+            .registrations(kind, name)
+            .iter()
+            .any(|registration| {
+                (registration.file_id != *file_id || registration.name_range != name_range)
+                    && self.are_offsets_compatible(
+                        file_id,
+                        name_range.start(),
+                        &registration.file_id,
+                        registration.name_range.start(),
+                    )
+            })
     }
 
     pub fn get_realm_file_metadata(&self, file_id: &FileId) -> Option<&GmodRealmFileMetadata> {

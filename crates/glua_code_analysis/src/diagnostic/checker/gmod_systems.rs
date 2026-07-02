@@ -1,4 +1,4 @@
-use crate::{DiagnosticCode, SemanticModel};
+use crate::{DiagnosticCode, SemanticModel, db_index::GmodSystemRegistrationKind};
 
 use super::{Checker, DiagnosticContext};
 
@@ -51,12 +51,17 @@ impl Checker for GmodSystemsChecker {
             let Some(name) = normalize_name(site.name.as_deref()) else {
                 continue;
             };
-            if aggregate.net_registration_count(name) <= 1 {
-                continue;
-            }
             let Some(name_range) = site.name_range else {
                 continue;
             };
+            if !infer_index.has_compatible_duplicate_registration(
+                GmodSystemRegistrationKind::NetMessage,
+                name,
+                &file_id,
+                name_range,
+            ) {
+                continue;
+            }
 
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
@@ -78,12 +83,17 @@ impl Checker for GmodSystemsChecker {
             let Some(name) = normalize_name(site.command_name.as_deref()) else {
                 continue;
             };
-            if aggregate.concommand_registration_count(name) <= 1 {
-                continue;
-            }
             let Some(name_range) = site.name_range else {
                 continue;
             };
+            if !infer_index.has_compatible_duplicate_registration(
+                GmodSystemRegistrationKind::Concommand,
+                name,
+                &file_id,
+                name_range,
+            ) {
+                continue;
+            }
 
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
@@ -105,12 +115,17 @@ impl Checker for GmodSystemsChecker {
             let Some(name) = normalize_name(site.convar_name.as_deref()) else {
                 continue;
             };
-            if aggregate.convar_registration_count(name) <= 1 {
-                continue;
-            }
             let Some(name_range) = site.name_range else {
                 continue;
             };
+            if !infer_index.has_compatible_duplicate_registration(
+                GmodSystemRegistrationKind::Convar,
+                name,
+                &file_id,
+                name_range,
+            ) {
+                continue;
+            }
 
             context.add_diagnostic(
                 DiagnosticCode::GmodDuplicateSystemRegistration,
