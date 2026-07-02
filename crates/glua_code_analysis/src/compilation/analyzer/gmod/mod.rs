@@ -1651,68 +1651,192 @@ fn collect_net_ops_recursive(
     local_fns: &mut LocalFnCache,
     db: &DbIndex,
 ) {
-    for call_expr in subtree.descendants().filter_map(LuaCallExpr::cast) {
-        if is_call_expr_in_nested_closure(enclosing_block, &call_expr) {
-            continue;
-        }
+    // Keep the public helper name used by read/write collection call sites,
+    // while the implementation below documents the call-argument evaluation
+    // ordering needed for nested reads such as `net.ReadData(net.ReadUInt(16))`.
+    collect_net_ops_eval_order(
+        root,
+        enclosing_block,
+        subtree,
+        out,
+        visited,
+        force_dynamic,
+        direction,
+        helper_registry,
+        flow_prefix,
+        local_fns,
+        db,
+    );
+}
 
-        if let Some(method_name) = get_exact_net_method_name(&call_expr) {
-            if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
-                && direction.matches(op_kind)
-            {
-                let dynamic = force_dynamic
-                    || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
-                let bits = extract_bit_width_arg(&call_expr, op_kind);
-                let value_text = extract_write_value_text(&call_expr, op_kind);
-                let local_path = extract_flow_path(enclosing_block, &call_expr);
-                let mut flow_path = Vec::with_capacity(flow_prefix.len() + local_path.len());
-                flow_path.extend_from_slice(flow_prefix);
-                flow_path.extend(local_path);
-                out.push(NetOpEntry {
-                    kind: op_kind,
-                    range: call_expr.get_range(),
-                    dynamic,
-                    bits,
-                    value_text,
-                    flow_path,
-                });
-            }
-            continue;
-        }
-
-        let Some((helper_key, helper_block, helper_root)) =
-            resolve_call_to_function_block(root, &call_expr, helper_registry, local_fns, db)
-        else {
-            continue;
-        };
-
-        if !visited.insert(helper_key.clone()) {
-            continue;
-        }
-
-        let helper_force_dynamic =
-            force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, &call_expr);
-        // Carry the call-site's flow context into the helper so reads/writes
-        // performed inside the helper appear under the correct outer
-        // `for`/`if`/`while` frames in hover.
-        let local_path = extract_flow_path(enclosing_block, &call_expr);
-        let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
-        nested_prefix.extend_from_slice(flow_prefix);
-        nested_prefix.extend(local_path);
-        collect_net_ops_recursive(
-            &helper_root,
-            &helper_block,
-            helper_block.syntax(),
+fn collect_net_ops_eval_order(
+    root: &LuaChunk,
+    enclosing_block: &LuaBlock,
+    subtree: &LuaSyntaxNode,
+    out: &mut Vec<NetOpEntry>,
+    visited: &mut HashSet<String>,
+    force_dynamic: bool,
+    direction: NetOpDirection,
+    helper_registry: &HelperRegistry,
+    flow_prefix: &[NetFlowFrame],
+    local_fns: &mut LocalFnCache,
+    db: &DbIndex,
+) {
+    if let Some(call_expr) = LuaCallExpr::cast(subtree.clone()) {
+        collect_net_ops_from_call_expr(
+            root,
+            enclosing_block,
+            &call_expr,
             out,
             visited,
-            helper_force_dynamic,
+            force_dynamic,
             direction,
             helper_registry,
-            &nested_prefix,
+            flow_prefix,
             local_fns,
             db,
         );
-        visited.remove(&helper_key);
+        return;
+    }
+
+    for child in subtree.children() {
+        collect_net_ops_eval_order(
+            root,
+            enclosing_block,
+            &child,
+            out,
+            visited,
+            force_dynamic,
+            direction,
+            helper_registry,
+            flow_prefix,
+            local_fns,
+            db,
+        );
+    }
+}
+
+fn collect_net_ops_from_call_expr(
+    root: &LuaChunk,
+    enclosing_block: &LuaBlock,
+    call_expr: &LuaCallExpr,
+    out: &mut Vec<NetOpEntry>,
+    visited: &mut HashSet<String>,
+    force_dynamic: bool,
+    direction: NetOpDirection,
+    helper_registry: &HelperRegistry,
+    flow_prefix: &[NetFlowFrame],
+    local_fns: &mut LocalFnCache,
+    db: &DbIndex,
+) {
+    if is_call_expr_in_nested_closure(enclosing_block, call_expr) {
+        return;
+    }
+
+    collect_net_ops_from_call_args(
+        root,
+        enclosing_block,
+        call_expr,
+        out,
+        visited,
+        force_dynamic,
+        direction,
+        helper_registry,
+        flow_prefix,
+        local_fns,
+        db,
+    );
+
+    if let Some(method_name) = get_exact_net_method_name(call_expr) {
+        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
+            && direction.matches(op_kind)
+        {
+            let dynamic =
+                force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, call_expr);
+            let bits = extract_bit_width_arg(call_expr, op_kind);
+            let value_text = extract_write_value_text(call_expr, op_kind);
+            let local_path = extract_flow_path(enclosing_block, call_expr);
+            let mut flow_path = Vec::with_capacity(flow_prefix.len() + local_path.len());
+            flow_path.extend_from_slice(flow_prefix);
+            flow_path.extend(local_path);
+            out.push(NetOpEntry {
+                kind: op_kind,
+                range: call_expr.get_range(),
+                dynamic,
+                bits,
+                value_text,
+                flow_path,
+            });
+        }
+        return;
+    }
+
+    let Some((helper_key, helper_block, helper_root)) =
+        resolve_call_to_function_block(root, call_expr, helper_registry, local_fns, db)
+    else {
+        return;
+    };
+
+    if !visited.insert(helper_key.clone()) {
+        return;
+    }
+
+    let helper_force_dynamic =
+        force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, call_expr);
+    // Carry the call-site's flow context into the helper so reads/writes
+    // performed inside the helper appear under the correct outer
+    // `for`/`if`/`while` frames in hover.
+    let local_path = extract_flow_path(enclosing_block, call_expr);
+    let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
+    nested_prefix.extend_from_slice(flow_prefix);
+    nested_prefix.extend(local_path);
+    collect_net_ops_recursive(
+        &helper_root,
+        &helper_block,
+        helper_block.syntax(),
+        out,
+        visited,
+        helper_force_dynamic,
+        direction,
+        helper_registry,
+        &nested_prefix,
+        local_fns,
+        db,
+    );
+    visited.remove(&helper_key);
+}
+
+fn collect_net_ops_from_call_args(
+    root: &LuaChunk,
+    enclosing_block: &LuaBlock,
+    call_expr: &LuaCallExpr,
+    out: &mut Vec<NetOpEntry>,
+    visited: &mut HashSet<String>,
+    force_dynamic: bool,
+    direction: NetOpDirection,
+    helper_registry: &HelperRegistry,
+    flow_prefix: &[NetFlowFrame],
+    local_fns: &mut LocalFnCache,
+    db: &DbIndex,
+) {
+    let Some(args) = call_expr.get_args_list() else {
+        return;
+    };
+
+    for arg in args.get_args() {
+        collect_net_ops_eval_order(
+            root,
+            enclosing_block,
+            arg.syntax(),
+            out,
+            visited,
+            force_dynamic,
+            direction,
+            helper_registry,
+            flow_prefix,
+            local_fns,
+            db,
+        );
     }
 }
 

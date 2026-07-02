@@ -40,6 +40,43 @@ mod tests {
     }
 
     #[gtest]
+    fn test_ignores_server_registered_message_started_from_shared_file() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/gamemode/sync.lua",
+            r#"
+            util.AddNetworkString("TTT_ClearEntityProperty")
+            SYNC = {}
+
+            function SYNC:ClearEntityProperty(ent, propertyName, targets)
+                if ent[propertyName] == nil then return end
+
+                ent[propertyName] = nil
+
+                net.Start("TTT_ClearEntityProperty")
+                net.WriteEntity(ent)
+                net.WriteString(propertyName)
+                if targets then
+                    net.Send(targets)
+                else
+                    net.Broadcast()
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::GmodUnknownNetMessage.get_name().to_string(),
+        ));
+        assert!(!diagnostics.iter().any(|diagnostic| diagnostic.code == code));
+    }
+
+    #[gtest]
     fn test_duplicate_system_registration_enabled_by_default() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
