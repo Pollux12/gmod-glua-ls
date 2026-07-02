@@ -1,7 +1,8 @@
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaCallExprStat,
-    LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat,
-    LuaLocalStat, LuaNameExpr, LuaSyntaxKind, LuaSyntaxNode, LuaVarExpr, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
+    LuaCallExprStat, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaIndexKey,
+    LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode, LuaVarExpr,
+    UnaryOperator,
 };
 use rowan::TextRange;
 use rustc_hash::FxHashSet;
@@ -319,6 +320,7 @@ fn report_unsafe_receiver(
         } else {
             is_expr_guarded_by_prior_nil_early_return(semantic_model, receiver)
                 || is_expr_guarded_by_correlated_multi_return(semantic_model, receiver)
+                || is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, receiver)
                 || is_expr_guarded_by_current_assigned_value_type_guard_condition(
                     semantic_model,
                     receiver,
@@ -730,6 +732,8 @@ fn check_index_expr(
             )
         } else {
             is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix)
+                || is_expr_guarded_by_correlated_multi_return(semantic_model, &prefix)
+                || is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &prefix)
         };
         if guarded {
             return Some(());
@@ -1546,6 +1550,147 @@ fn local_call_initializer_slot(
     let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
     let call_expr = LuaCallExpr::cast(node)?;
     Some((call_expr, initializer.get_ret_idx()))
+}
+
+fn is_expr_proven_by_falsy_param_nil_free_return_slot(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let Some((call_expr, return_slot)) = local_call_initializer_slot(semantic_model, expr) else {
+        return false;
+    };
+    if local_initialized_by_call_was_reassigned_before_use(&call_expr, expr) {
+        return false;
+    }
+    let Some(signature_id) = call_signature_id(semantic_model, &call_expr) else {
+        return false;
+    };
+    let Some(signature) = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(&signature_id)
+    else {
+        return false;
+    };
+    let facts = signature
+        .falsy_param_nil_free_return_slots()
+        .iter()
+        .filter(|fact| {
+            fact.return_slot == return_slot
+                || local_stat_slot_for_expr(semantic_model, &call_expr, expr)
+                    .is_some_and(|slot| fact.return_slot == slot)
+        });
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    facts.into_iter().any(|fact| {
+        mapped_call_arg_for_param(&call_expr, signature.is_colon_define, &args, fact.param_idx)
+            .map(|arg| {
+                semantic_model
+                    .infer_expr(arg)
+                    .is_ok_and(|typ| typ.is_always_falsy())
+            })
+            .unwrap_or(true)
+    })
+}
+
+fn local_stat_slot_for_expr(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> Option<usize> {
+    let local_stat = call_expr.get_parent::<LuaLocalStat>()?;
+    let LuaSemanticDeclId::LuaDecl(expr_decl_id) =
+        semantic_model.find_decl(expr.syntax().clone().into(), SemanticDeclLevel::default())?
+    else {
+        return None;
+    };
+
+    local_stat
+        .get_local_name_list()
+        .enumerate()
+        .find_map(|(idx, local_name)| {
+            let decl_id = LuaDeclId::new(semantic_model.get_file_id(), local_name.get_position());
+            (decl_id == expr_decl_id).then_some(idx)
+        })
+}
+
+fn local_initialized_by_call_was_reassigned_before_use(
+    call_expr: &LuaCallExpr,
+    expr: &LuaExpr,
+) -> bool {
+    let Some(name) = name_expr_text(expr) else {
+        return true;
+    };
+    let Some(local_stat) = call_expr.get_parent::<LuaLocalStat>() else {
+        return true;
+    };
+    let Some(block) = local_stat.get_parent::<LuaBlock>() else {
+        return true;
+    };
+    let after = local_stat.get_range().start();
+    let before = expr.get_range().start();
+    block.get_stats().any(|stat| {
+        let start = stat.get_range().start();
+        start > after
+            && start < before
+            && stat_may_write_name_excluding_nested_closures(&stat, &name)
+    })
+}
+
+fn name_expr_text(expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name) => name.get_name_text().map(|name| name.to_string()),
+        LuaExpr::ParenExpr(paren) => paren.get_expr().and_then(|expr| name_expr_text(&expr)),
+        _ => None,
+    }
+}
+
+fn stat_may_write_name_excluding_nested_closures(stat: &LuaStat, name: &str) -> bool {
+    let stat_range = stat.get_range();
+    stat.descendants::<LuaAssignStat>().any(|assign| {
+        !node_is_inside_nested_closure(&assign, stat_range)
+            && assign.get_var_and_expr_list().0.into_iter().any(|var| {
+                var.syntax()
+                    .text()
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<String>()
+                    == name
+            })
+    }) || stat.descendants::<LuaLocalStat>().any(|local_stat| {
+        !node_is_inside_nested_closure(&local_stat, stat_range)
+            && local_stat
+                .get_local_name_list()
+                .filter_map(|local| local.get_name_token())
+                .any(|token| token.get_name_text() == name)
+    })
+}
+
+fn node_is_inside_nested_closure<N: LuaAstNode>(node: &N, outer_range: TextRange) -> bool {
+    node.syntax()
+        .ancestors()
+        .filter_map(LuaClosureExpr::cast)
+        .any(|closure| {
+            let range = closure.get_range();
+            range.start() >= outer_range.start() && range.end() <= outer_range.end()
+        })
+}
+
+fn mapped_call_arg_for_param(
+    call_expr: &LuaCallExpr,
+    is_colon_define: bool,
+    args: &[LuaExpr],
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    match (is_colon_define, call_expr.is_colon_call()) {
+        (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
+        (false, true) if param_idx == 0 => call_expr.get_prefix_expr(),
+        (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
+        _ => args.get(param_idx).cloned(),
+    }
 }
 
 fn expr_has_prior_correlated_return_guard(
@@ -3218,6 +3363,7 @@ fn check_binary_expr(
         if left_type.is_nullable()
             && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &left)
             && !is_expr_guarded_by_correlated_multi_return(semantic_model, &left)
+            && !is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &left)
         {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,
@@ -3231,6 +3377,7 @@ fn check_binary_expr(
         if right_type.is_nullable()
             && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &right)
             && !is_expr_guarded_by_correlated_multi_return(semantic_model, &right)
+            && !is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &right)
         {
             context.add_diagnostic(
                 DiagnosticCode::NeedCheckNil,

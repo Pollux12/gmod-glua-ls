@@ -1,6 +1,6 @@
 use std::sync::Arc;
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaNameExpr, LuaSyntaxKind};
+use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaNameExpr, LuaSyntaxKind};
 use rowan::TextRange;
 
 use super::{
@@ -275,6 +275,8 @@ fn should_prefer_signature_for_call(
                     || !signature.overloads.is_empty()
                     || !signature.out_params.is_empty()
                     || !signature.nil_return_guard_params().is_empty()
+                    || !signature.falsy_param_nil_free_return_slots().is_empty()
+                    || !signature.falsy_param_return_aliases().is_empty()
             }
             _ => false,
         })
@@ -414,6 +416,16 @@ fn infer_doc_function(
         }
     }
 
+    if let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
+        && let Some(signature) = db.get_signature_index().get(&signature_id)
+        && (!signature.falsy_param_nil_free_return_slots().is_empty()
+            || !signature.falsy_param_return_aliases().is_empty())
+    {
+        return Ok(specialize_falsy_param_returns_for_call(
+            db, cache, signature, func, &call_expr,
+        ));
+    }
+
     Ok(func.clone().into())
 }
 
@@ -467,7 +479,14 @@ fn infer_signature_doc_function(
 
         let fake_doc_function =
             apply_signature_return_kinds_to_function(signature, &fake_doc_function);
-        Ok(specialize_nil_guarded_return_for_call(
+        let fake_doc_function = specialize_nil_guarded_return_for_call(
+            db,
+            cache,
+            signature,
+            fake_doc_function.as_ref(),
+            &call_expr,
+        );
+        Ok(specialize_falsy_param_returns_for_call(
             db,
             cache,
             signature,
@@ -489,14 +508,21 @@ fn infer_signature_doc_function(
             &fake_doc_function,
         ));
 
-        resolve_signature(
+        let resolved = resolve_signature(
             db,
             cache,
             new_overloads,
             call_expr.clone(),
             is_generic,
             args_count,
-        )
+        )?;
+        Ok(specialize_falsy_param_returns_for_call(
+            db,
+            cache,
+            signature,
+            resolved.as_ref(),
+            &call_expr,
+        ))
     }
 }
 
@@ -536,6 +562,152 @@ fn specialize_nil_guarded_return_for_call(
         )
         .with_optional_params(func_ty.get_optional_params().to_vec()),
     )
+}
+
+fn specialize_falsy_param_returns_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Arc<LuaFunctionType> {
+    if (signature.falsy_param_nil_free_return_slots().is_empty()
+        && signature.falsy_param_return_aliases().is_empty())
+        || !func_ty.get_ret().is_nullable()
+    {
+        return Arc::new(func_ty.clone());
+    }
+
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let mut return_type = func_ty.get_ret().clone();
+    let mut changed = false;
+
+    for fact in signature.falsy_param_nil_free_return_slots() {
+        let arg = call_arg_for_param(call_expr, func_ty, &args, fact.param_idx);
+        if arg_is_omitted_or_always_falsy(db, cache, arg.as_ref()) {
+            let old_return_type = return_type.clone();
+            let new_return_type = remove_nil_from_return_slot(return_type, fact.return_slot);
+            changed |= new_return_type != old_return_type;
+            return_type = new_return_type;
+        }
+    }
+
+    for fact in signature.falsy_param_return_aliases() {
+        let falsy_arg = call_arg_for_param(call_expr, func_ty, &args, fact.falsy_param_idx);
+        if !arg_is_omitted_or_always_falsy(db, cache, falsy_arg.as_ref()) {
+            continue;
+        }
+        let Some(alias_arg) = call_arg_for_param(call_expr, func_ty, &args, fact.aliased_param_idx)
+        else {
+            continue;
+        };
+        if alias_arg_is_not_nil_free_syntax(&alias_arg) {
+            continue;
+        }
+        let Ok(alias_type) = infer_expr(db, cache, alias_arg) else {
+            continue;
+        };
+        if alias_type.is_unknown() || alias_type.is_nullable() {
+            continue;
+        }
+        let old_return_type = return_type.clone();
+        let new_return_type = replace_return_slot_with_type(
+            return_type,
+            fact.return_slot,
+            remove_nil_from_type(alias_type),
+        );
+        changed |= new_return_type != old_return_type;
+        return_type = new_return_type;
+    }
+
+    if !changed {
+        return Arc::new(func_ty.clone());
+    }
+
+    Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            return_type,
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    )
+}
+
+fn alias_arg_is_not_nil_free_syntax(arg: &LuaExpr) -> bool {
+    matches!(
+        arg,
+        LuaExpr::BinaryExpr(binary)
+            if binary.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr)
+    )
+}
+
+fn replace_return_slot_with_type(t: LuaType, slot: usize, replacement: LuaType) -> LuaType {
+    match t {
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Multi(types) => {
+                let mut types = types.clone();
+                if let Some(slot_type) = types.get_mut(slot) {
+                    *slot_type = replacement;
+                }
+                LuaType::Variadic(VariadicType::Multi(types).into())
+            }
+            VariadicType::Base(_) if slot == 0 => {
+                LuaType::Variadic(VariadicType::Base(replacement).into())
+            }
+            _ => LuaType::Variadic(variadic),
+        },
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .types()
+                .map(|typ| replace_return_slot_with_type(typ.clone(), slot, replacement.clone()))
+                .collect(),
+        ),
+        _ if slot == 0 => replacement,
+        other => other,
+    }
+}
+
+fn arg_is_omitted_or_always_falsy(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg: Option<&LuaExpr>,
+) -> bool {
+    let Some(arg) = arg else {
+        return true;
+    };
+    infer_expr(db, cache, arg.clone()).is_ok_and(|typ| typ.is_always_falsy())
+}
+
+fn remove_nil_from_return_slot(t: LuaType, slot: usize) -> LuaType {
+    match t {
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Multi(types) => {
+                let mut types = types.clone();
+                if let Some(slot_type) = types.get_mut(slot) {
+                    *slot_type = remove_nil_from_type(slot_type.clone());
+                }
+                LuaType::Variadic(VariadicType::Multi(types).into())
+            }
+            VariadicType::Base(base) if slot == 0 => {
+                LuaType::Variadic(VariadicType::Base(remove_nil_from_type(base.clone())).into())
+            }
+            _ => LuaType::Variadic(variadic),
+        },
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .types()
+                .map(|typ| remove_nil_from_return_slot(typ.clone(), slot))
+                .collect(),
+        ),
+        other if slot == 0 => remove_nil_from_type(other),
+        other => other,
+    }
 }
 
 fn call_arg_for_param(

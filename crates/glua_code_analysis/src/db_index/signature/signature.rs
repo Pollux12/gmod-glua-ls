@@ -34,12 +34,27 @@ pub struct LuaSignature {
     require_guard_param: Option<usize>,
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
+    falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
+    falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaReturnCorrelation {
     pub discriminant_slot: usize,
     pub implied_non_nil_slots: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaFalsyParamNilFreeReturnSlot {
+    pub param_idx: usize,
+    pub return_slot: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaFalsyParamReturnAlias {
+    pub falsy_param_idx: usize,
+    pub aliased_param_idx: usize,
+    pub return_slot: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -80,6 +95,8 @@ impl LuaSignature {
             require_guard_param: None,
             nil_return_guard_params: Vec::new(),
             return_correlations: Vec::new(),
+            falsy_param_nil_free_return_slots: Vec::new(),
+            falsy_param_return_aliases: Vec::new(),
         }
     }
 
@@ -114,6 +131,40 @@ impl LuaSignature {
 
     pub fn nil_return_guard_params(&self) -> &[usize] {
         &self.nil_return_guard_params
+    }
+
+    pub fn add_falsy_param_nil_free_return_slot(&mut self, param_idx: usize, return_slot: usize) {
+        let fact = LuaFalsyParamNilFreeReturnSlot {
+            param_idx,
+            return_slot,
+        };
+        if !self.falsy_param_nil_free_return_slots.contains(&fact) {
+            self.falsy_param_nil_free_return_slots.push(fact);
+        }
+    }
+
+    pub fn falsy_param_nil_free_return_slots(&self) -> &[LuaFalsyParamNilFreeReturnSlot] {
+        &self.falsy_param_nil_free_return_slots
+    }
+
+    pub fn add_falsy_param_return_alias(
+        &mut self,
+        falsy_param_idx: usize,
+        aliased_param_idx: usize,
+        return_slot: usize,
+    ) {
+        let fact = LuaFalsyParamReturnAlias {
+            falsy_param_idx,
+            aliased_param_idx,
+            return_slot,
+        };
+        if !self.falsy_param_return_aliases.contains(&fact) {
+            self.falsy_param_return_aliases.push(fact);
+        }
+    }
+
+    pub fn falsy_param_return_aliases(&self) -> &[LuaFalsyParamReturnAlias] {
+        &self.falsy_param_return_aliases
     }
 
     pub fn is_generic(&self) -> bool {

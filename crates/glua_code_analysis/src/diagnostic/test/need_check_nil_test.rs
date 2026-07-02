@@ -2934,6 +2934,390 @@ mod test {
     }
 
     #[gtest]
+    fn test_helper_or_known_non_nil_value_return_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            local maybe = maybe_color()
+            local color = fallback(maybe)
+            local n = color.r + 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_helper_or_known_non_nil_tuple_return_slot_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            local function info()
+                local maybe = maybe_color()
+                local color = fallback(maybe)
+                return "name", color
+            end
+
+            local _, color = info()
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_helper_or_known_non_nil_arg_return_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function modify(color, mode)
+                if not mode then return color end
+                return { r = 0 }
+            end
+
+            local color = modify(maybe_color() or COLOR_WHITE)
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_helper_tuple_optional_falsy_branch_preserves_non_nil_slot() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            local function info(simple)
+                local color = fallback(maybe_color())
+                if simple then
+                    color = maybe_color()
+                end
+                return "name", color
+            end
+
+            local _, color = info()
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_helper_or_nullable_fallback_return_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local maybeFallback = maybe_color()
+
+            local function fallback(c)
+                return c or maybeFallback
+            end
+
+            local color = fallback(maybe_color())
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_helper_or_result_overwritten_with_nil_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function fallback(c)
+                local color = c or COLOR_WHITE
+                color = nil
+                return color
+            end
+
+            local color = fallback(maybe_color())
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_helper_tuple_alternate_nil_return_slot_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            local function maybe_color() end
+
+            local function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            local function info(use_nil)
+                if use_nil then
+                    return "name", nil
+                end
+                return "name", fallback(maybe_color())
+            end
+
+            local _, color = info(false)
+            color.r = 1
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_helper_nullable_signature_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+
+        ws.def_file(
+            "lua/helpers/color_fallback.lua",
+            r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@param c Color?
+            ---@return Color?
+            function fallback(c)
+                return c or COLOR_WHITE
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/use_color.lua",
+            r#"
+            ---@return Color?
+            local function maybe_color() end
+
+            local color = fallback(maybe_color())
+            color.r = 1
+            "#,
+        );
+
+        let diagnostics: Vec<_> = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert_that!(diagnostics, len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_helper_tuple_alternate_nil_return_slot_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+
+        ws.def_file(
+            "lua/helpers/color_info.lua",
+            r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            function maybe_color() end
+
+            function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            function info(use_nil)
+                if use_nil then
+                    return "name", nil
+                end
+                return "name", fallback(maybe_color())
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/use_color.lua",
+            r#"
+            local _, color = info()
+            color.r = 1
+            "#,
+        );
+
+        let diagnostics: Vec<_> = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert_that!(diagnostics, len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_single_return_nullable_tuple_slot_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+
+        ws.def_file(
+            "lua/helpers/color_info.lua",
+            r#"
+            ---@class Color
+            ---@field r integer
+
+            ---@type Color
+            COLOR_WHITE = { r = 255 }
+
+            ---@return Color?
+            function maybe_color() end
+
+            function fallback(c)
+                return c or COLOR_WHITE
+            end
+
+            function maybe_info(use_nil)
+                if use_nil then
+                    return "name", nil
+                end
+                return "name", fallback(maybe_color())
+            end
+
+            function info()
+                return maybe_info()
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/use_color.lua",
+            r#"
+            local _, color = info()
+            color.r = 1
+            "#,
+        );
+
+        let diagnostics: Vec<_> = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect();
+
+        assert_that!(diagnostics, len(eq(1)));
+    }
+
+    #[gtest]
     fn test_reverse_len_for_loop_index_with_zero_bound_still_reports_nil_access() {
         let mut ws = VirtualWorkspace::new();
         let code = r#"
@@ -8833,8 +9217,9 @@ mod test {
                 return 1, value
             end
 
-            ---@type integer?
-            local maybe
+            ---@return integer?
+            local function maybe_value() end
+            local maybe = maybe_value()
             local seqStartPos, seqEndPos = decode(maybe)
             if not seqStartPos then
                 return
@@ -9005,6 +9390,612 @@ mod test {
             not(is_empty()),
             "unpack precision must preserve explicit nil elements"
         );
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_omitted_skips_nullable_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper()
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_explicit_false_skips_nullable_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_non_nil_helper_initializer_skips_nullable_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function fallback_color()
+                return 1
+            end
+            local function helper(include)
+                local color = fallback_color()
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper()
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_nested_param_return_helper_initializer_skips_nullable_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function maybe_color()
+            end
+
+            local function modify(color, mode)
+                if not mode then return color end
+                return nil
+            end
+
+            local function fallback_color(mode)
+                return modify(maybe_color() or 1, mode)
+            end
+
+            local function helper(include)
+                local color = fallback_color()
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper()
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_and_expression_with_or_identifier_stays_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@return { r: integer }?
+            local function maybe_color() end
+
+            local function modify(color, mode)
+                if not mode then return color end
+                return 1
+            end
+
+            local function fallback(mode)
+                local color = maybe_color()
+                return modify(color and { r = 1 }, mode)
+            end
+
+            local function helper(include)
+                local color = fallback(include)
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+
+            local _, color = helper(false)
+            local n = color.r + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_non_nil_actual() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then return color end
+                return 1
+            end
+            local color = modify(1)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_nullable_actual_stays_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then return color end
+                return 1
+            end
+            ---@return integer?
+            local function maybe_value() end
+            local maybe = maybe_value()
+            local color = modify(maybe)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_unknown_mode_nullable_actual_stays_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then return color end
+                return 1
+            end
+            ---@return integer?
+            local function maybe_value() end
+            local maybe = maybe_value()
+            ---@type boolean
+            local mode = math.random() > 0.5
+            local color = modify(maybe, mode)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_explicit_true_not_used() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then return color end
+                return nil
+            end
+            local color = modify(1, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_else_not_specialized() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then
+                    return color
+                else
+                    return nil
+                end
+            end
+            local color = modify(1)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_param_reassigned_before_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                color = nil
+                if not mode then return color end
+                return 1
+            end
+            local color = modify(1)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_conditional_param_reassignment_before_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode, cond)
+                if cond then
+                    color = nil
+                end
+                if not mode then return color end
+                return 1
+            end
+            local color = modify(1, nil, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_conditional_call_before_guard() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode, cond)
+                local function clear()
+                    color = nil
+                end
+                if cond then clear() end
+                if not mode then return color end
+                return nil
+            end
+            local color = modify(1, nil, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_pre_guard_early_return() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode, cond)
+                if cond then
+                    return nil
+                end
+                if not mode then return color end
+                return 1
+            end
+            local color = modify(1, nil, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_return_alias_branch_must_return_direct_param() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function modify(color, mode)
+                if not mode then return color or 1 end
+                return nil
+            end
+            local color = modify(1)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_explicit_true_keeps_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_unknown_boolean_keeps_nullable() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            ---@type boolean
+            local include
+            local _, color = helper(include)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_reassigned_before_if_not_specialized() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                include = false
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_conditionally_reassigned_before_if_not_specialized() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include, cond)
+                if cond then
+                    include = true
+                end
+                local color = 1
+                if include then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(false, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_else_not_specialized() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = 2
+                else
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_returned_local_overwritten_with_nil_after_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = 2
+                end
+                color = nil
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_returned_local_conditionally_overwritten_with_nil_after_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include, cond)
+                local color = 1
+                if include then
+                    color = 2
+                end
+                if cond then
+                    color = nil
+                end
+                return true, color
+            end
+            local _, color = helper(false, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_caller_reassignment_after_call_invalidates_proof() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then color = nil end
+                return true, color
+            end
+            local _, color = helper(false)
+            color = nil
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_caller_conditional_reassignment_after_call_invalidates_proof() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then color = nil end
+                return true, color
+            end
+            local _, color = helper(false)
+            if cond then color = nil end
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_intervening_call_after_local_proof_invalidates_return_slot() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                local function clear()
+                    color = nil
+                end
+                if include then color = nil end
+                clear()
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_conditional_intervening_call_after_local_proof_invalidates_return_slot()
+     {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include, cond)
+                local color = 1
+                local function clear()
+                    color = nil
+                end
+                if include then color = nil end
+                if cond then clear() end
+                return true, color
+            end
+            local _, color = helper(false, true)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_helper_falsy_param_alternate_return_path_has_nil_slot_two() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local function helper(include)
+                local color = 1
+                if include then
+                    color = 2
+                end
+                if math.random() > 0.5 then
+                    return true, nil
+                end
+                return true, color
+            end
+            local _, color = helper(false)
+            local n = color + 1
+            "#,
+        );
+        assert_that!(diagnostics, not(is_empty()));
     }
 
     fn def_canconstrain_valid_guard_annotation(ws: &mut VirtualWorkspace) {

@@ -1,10 +1,10 @@
 use std::ops::Deref;
 
 use glua_parser::{
-    BinaryOperator, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList, LuaCallExpr,
-    LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey,
-    LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaVarExpr, PathTrait,
-    UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList,
+    LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat,
+    LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaVarExpr,
+    PathTrait, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -28,8 +28,520 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_lambda_params(analyzer, &signature_id, &closure);
     analyze_require_guard_param(analyzer, &signature_id, &closure);
     analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
+    analyze_falsy_param_nil_free_return_slots(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
+}
+
+fn analyze_falsy_param_nil_free_return_slots(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+
+    for stat in block.get_stats() {
+        let LuaStat::IfStat(if_stat) = stat else {
+            continue;
+        };
+        if let Some((falsy_param_idx, aliased_param_idx, return_slot)) =
+            falsy_param_return_alias(&params, &block, &if_stat)
+        {
+            analyzer
+                .db
+                .get_signature_index_mut()
+                .get_or_create(*signature_id)
+                .add_falsy_param_return_alias(falsy_param_idx, aliased_param_idx, return_slot);
+        }
+        let Some(condition) = if_stat.get_condition_expr() else {
+            continue;
+        };
+        let Some(param_name) = expr_name_text(&condition) else {
+            continue;
+        };
+        let Some(param_idx) = params.iter().position(|param| param == &param_name) else {
+            continue;
+        };
+        if let Some(return_slot) =
+            falsy_param_nil_free_return_slot(analyzer, closure, &block, &if_stat, &param_name)
+        {
+            analyzer
+                .db
+                .get_signature_index_mut()
+                .get_or_create(*signature_id)
+                .add_falsy_param_nil_free_return_slot(param_idx, return_slot);
+        }
+    }
+
+    for (param_idx, param_name) in params.iter().enumerate() {
+        if return_call_is_nil_free_when_param_falsy(
+            analyzer, &params, &block, param_idx, param_name,
+        ) {
+            analyzer
+                .db
+                .get_signature_index_mut()
+                .get_or_create(*signature_id)
+                .add_falsy_param_nil_free_return_slot(param_idx, 0);
+        }
+    }
+
+    Some(())
+}
+
+fn return_call_is_nil_free_when_param_falsy(
+    analyzer: &mut LuaAnalyzer,
+    params: &[String],
+    block: &LuaBlock,
+    param_idx: usize,
+    param_name: &str,
+) -> bool {
+    let mut stats = block.get_stats();
+    let Some(LuaStat::ReturnStat(return_stat)) = stats.next() else {
+        return false;
+    };
+    if stats.next().is_some() {
+        return false;
+    }
+    let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+    let [LuaExpr::CallExpr(call_expr)] = exprs.as_slice() else {
+        return false;
+    };
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let typ_dbg = infer_expr(
+        analyzer.db,
+        analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id),
+        prefix,
+    );
+    let Ok(LuaType::Signature(signature_id)) = typ_dbg else {
+        return false;
+    };
+    let Some(signature) = analyzer.db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+    let is_colon_define = signature.is_colon_define;
+    let alias_facts = signature.falsy_param_return_aliases().to_vec();
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    alias_facts.iter().any(|fact| {
+        fact.return_slot == 0
+            && call_arg_for_param_signature(call_expr, is_colon_define, &args, fact.falsy_param_idx)
+                .and_then(|arg| expr_name_text(&arg))
+                .is_some_and(|arg_name| {
+                    arg_name == param_name && params.get(param_idx) == Some(&arg_name)
+                })
+            && call_arg_for_param_signature(
+                call_expr,
+                is_colon_define,
+                &args,
+                fact.aliased_param_idx,
+            )
+            .is_some_and(|arg| expr_is_proven_non_nil(analyzer, &arg))
+    })
+}
+
+fn call_arg_for_param_signature(
+    call_expr: &LuaCallExpr,
+    is_colon_define: bool,
+    args: &[LuaExpr],
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    match (is_colon_define, call_expr.is_colon_call()) {
+        (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
+        (false, true) if param_idx == 0 => call_expr.get_prefix_expr(),
+        (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
+        _ => args.get(param_idx).cloned(),
+    }
+}
+
+fn falsy_param_return_alias(
+    params: &[String],
+    block: &LuaBlock,
+    if_stat: &LuaIfStat,
+) -> Option<(usize, usize, usize)> {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return None;
+    }
+    let condition = if_stat.get_condition_expr()?;
+    let LuaExpr::UnaryExpr(unary_expr) = condition else {
+        return None;
+    };
+    if unary_expr.get_op_token()?.get_op() != UnaryOperator::OpNot {
+        return None;
+    }
+    let falsy_param_name = expr_name_text(&unary_expr.get_expr()?)?;
+    let falsy_param_idx = params.iter().position(|param| param == &falsy_param_name)?;
+
+    let branch_block = if_stat.get_block()?;
+    let mut branch_stats = branch_block.get_stats();
+    let Some(LuaStat::ReturnStat(return_stat)) = branch_stats.next() else {
+        return None;
+    };
+    if branch_stats.next().is_some() {
+        return None;
+    }
+    let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+    if exprs.len() != 1 {
+        return None;
+    }
+    let aliased_param_name = expr_name_text(&exprs[0])?;
+    let aliased_param_idx = params
+        .iter()
+        .position(|param| param == &aliased_param_name)?;
+
+    if !pre_guard_statements_are_harmless_for_alias(
+        block,
+        if_stat.get_range().start(),
+        &falsy_param_name,
+        &aliased_param_name,
+    ) {
+        return None;
+    }
+
+    Some((falsy_param_idx, aliased_param_idx, 0))
+}
+
+fn pre_guard_statements_are_harmless_for_alias(
+    block: &LuaBlock,
+    before: TextSize,
+    falsy_param_name: &str,
+    aliased_param_name: &str,
+) -> bool {
+    block.get_stats().all(|stat| {
+        stat.get_range().start() >= before
+            || pre_guard_statement_is_harmless_for_alias(
+                &stat,
+                falsy_param_name,
+                aliased_param_name,
+            )
+    })
+}
+
+fn pre_guard_statement_is_harmless_for_alias(
+    stat: &LuaStat,
+    falsy_param_name: &str,
+    aliased_param_name: &str,
+) -> bool {
+    if stat_may_write_name(stat, falsy_param_name)
+        || stat_may_write_name(stat, aliased_param_name)
+        || stat_may_define_closure(stat)
+        || stat_contains_immediately_executed_call(stat)
+    {
+        return false;
+    }
+
+    matches!(
+        stat,
+        LuaStat::LocalStat(_) | LuaStat::AssignStat(_) | LuaStat::EmptyStat(_)
+    )
+}
+
+fn stat_may_define_closure(stat: &LuaStat) -> bool {
+    matches!(stat, LuaStat::LocalFuncStat(_) | LuaStat::FuncStat(_))
+        || stat.descendants::<LuaClosureExpr>().next().is_some()
+}
+
+fn stat_contains_immediately_executed_call(stat: &LuaStat) -> bool {
+    if match stat {
+        LuaStat::AssignStat(assign) => assign
+            .get_var_and_expr_list()
+            .1
+            .iter()
+            .any(expr_contains_immediately_executed_call),
+        LuaStat::LocalStat(local_stat) => local_stat
+            .get_value_exprs()
+            .any(|expr| expr_contains_immediately_executed_call(&expr)),
+        LuaStat::CallExprStat(_) => true,
+        _ => false,
+    } {
+        return true;
+    }
+
+    let stat_range = stat.get_range();
+    stat.descendants::<LuaCallExpr>()
+        .any(|call| !node_is_inside_nested_closure(&call, stat_range))
+}
+
+fn falsy_param_nil_free_return_slot(
+    analyzer: &mut LuaAnalyzer,
+    closure: &LuaClosureExpr,
+    block: &LuaBlock,
+    if_stat: &LuaIfStat,
+    param_name: &str,
+) -> Option<usize> {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return None;
+    }
+    if param_is_assigned_before(block, param_name, if_stat.get_range().start()) {
+        return None;
+    }
+
+    let return_stats = block
+        .descendants::<LuaReturnStat>()
+        .filter(|return_stat| {
+            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .collect::<Vec<_>>();
+    let reachable_returns = return_stats
+        .iter()
+        .filter(|return_stat| !return_is_inside_stat(return_stat, if_stat))
+        .collect::<Vec<_>>();
+    if reachable_returns.is_empty() {
+        return None;
+    }
+
+    let mut proven_slot = None;
+    for return_stat in reachable_returns {
+        if param_is_assigned_between(
+            block,
+            param_name,
+            if_stat.get_range().start(),
+            return_stat.get_range().start(),
+        ) {
+            return None;
+        }
+        let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+        let slot = proven_slot.unwrap_or(1);
+        let LuaExpr::NameExpr(_) = exprs.get(slot)? else {
+            return None;
+        };
+        let local_name = expr_name_text(&exprs[slot])?;
+        if !local_is_proven_non_nil_on_falsy_path(
+            analyzer,
+            block,
+            if_stat,
+            return_stat,
+            &local_name,
+        ) {
+            return None;
+        }
+        proven_slot = Some(slot);
+    }
+
+    proven_slot
+}
+
+fn return_is_inside_stat(return_stat: &LuaReturnStat, stat: &LuaIfStat) -> bool {
+    let return_range = return_stat.get_range();
+    let stat_range = stat.get_range();
+    return_range.start() >= stat_range.start() && return_range.end() <= stat_range.end()
+}
+
+fn param_is_assigned_before(block: &LuaBlock, param_name: &str, before: TextSize) -> bool {
+    block
+        .get_stats()
+        .any(|stat| stat.get_range().start() < before && stat_may_write_name(&stat, param_name))
+}
+
+fn param_is_assigned_between(
+    block: &LuaBlock,
+    param_name: &str,
+    after: TextSize,
+    before: TextSize,
+) -> bool {
+    block.get_stats().any(|stat| {
+        let start = stat.get_range().start();
+        start > after && start < before && stat_may_write_name(&stat, param_name)
+    })
+}
+
+fn local_is_proven_non_nil_on_falsy_path(
+    analyzer: &mut LuaAnalyzer,
+    block: &LuaBlock,
+    if_stat: &LuaIfStat,
+    return_stat: &LuaReturnStat,
+    local_name: &str,
+) -> bool {
+    let mut proven = false;
+    for stat in block.get_stats() {
+        if stat.get_range().start() >= return_stat.get_range().start() {
+            break;
+        }
+        if stat.get_range().start() >= if_stat.get_range().start()
+            && stat.get_range().end() <= if_stat.get_range().end()
+        {
+            continue;
+        }
+        if proven
+            && (stat_contains_immediately_executed_call(&stat) || stat_may_define_closure(&stat))
+        {
+            return false;
+        }
+        if stat_may_write_name(&stat, local_name) && !stat_writes_name(&stat, local_name) {
+            return false;
+        }
+        if stat_writes_name(&stat, local_name) {
+            proven = stat_assigns_name_non_nil(analyzer, &stat, local_name);
+        }
+    }
+    proven
+}
+
+fn stat_writes_name(stat: &LuaStat, name: &str) -> bool {
+    match stat {
+        LuaStat::AssignStat(assign) => assign
+            .get_var_and_expr_list()
+            .0
+            .into_iter()
+            .any(|var| var_source_text(&var) == name),
+        LuaStat::LocalStat(local_stat) => local_stat
+            .get_local_name_list()
+            .filter_map(|local| local.get_name_token())
+            .any(|token| token.get_name_text() == name),
+        _ => false,
+    }
+}
+
+fn stat_may_write_name(stat: &LuaStat, name: &str) -> bool {
+    if stat_writes_name(stat, name) {
+        return true;
+    }
+
+    let stat_range = stat.get_range();
+    stat.descendants::<LuaAssignStat>().any(|assign| {
+        !node_is_inside_nested_closure(&assign, stat_range)
+            && assign
+                .get_var_and_expr_list()
+                .0
+                .into_iter()
+                .any(|var| var_source_text(&var) == name)
+    }) || stat.descendants::<LuaLocalStat>().any(|local_stat| {
+        !node_is_inside_nested_closure(&local_stat, stat_range)
+            && local_stat
+                .get_local_name_list()
+                .filter_map(|local| local.get_name_token())
+                .any(|token| token.get_name_text() == name)
+    })
+}
+
+fn node_is_inside_nested_closure<N: LuaAstNode>(node: &N, outer_range: TextRange) -> bool {
+    node.syntax()
+        .ancestors()
+        .filter_map(LuaClosureExpr::cast)
+        .any(|closure| {
+            let range = closure.get_range();
+            range.start() >= outer_range.start() && range.end() <= outer_range.end()
+        })
+}
+
+fn stat_assigns_name_non_nil(analyzer: &mut LuaAnalyzer, stat: &LuaStat, name: &str) -> bool {
+    match stat {
+        LuaStat::AssignStat(assign) => {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            vars.into_iter()
+                .position(|var| var_source_text(&var) == name)
+                .is_some_and(|idx| {
+                    exprs
+                        .get(idx)
+                        .is_some_and(|expr| expr_is_proven_non_nil(analyzer, expr))
+                })
+        }
+        LuaStat::LocalStat(local_stat) => local_stat
+            .get_local_name_list()
+            .position(|local| {
+                local
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == name)
+            })
+            .is_some_and(|idx| {
+                local_stat
+                    .get_value_exprs()
+                    .nth(idx)
+                    .is_some_and(|expr| expr_is_proven_non_nil(analyzer, &expr))
+            }),
+        _ => false,
+    }
+}
+
+fn expr_is_proven_non_nil(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) -> bool {
+    if let LuaExpr::CallExpr(call_expr) = expr
+        && call_expr_is_known_nil_free_for_falsy_args(analyzer, call_expr)
+    {
+        return true;
+    }
+    if let LuaExpr::BinaryExpr(binary_expr) = expr
+        && binary_expr.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpOr)
+        && let Some((_, right)) = binary_expr.get_exprs()
+        && expr_is_proven_non_nil(analyzer, &right)
+    {
+        return true;
+    }
+    if matches!(expr, LuaExpr::BinaryExpr(_)) {
+        return false;
+    }
+    if matches!(expr, LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_)) {
+        return expr_is_syntactically_non_nil(expr);
+    }
+    infer_expr(
+        analyzer.db,
+        analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id),
+        expr.clone(),
+    )
+    .is_ok_and(|typ| !typ.is_nullable())
+}
+
+fn call_expr_is_known_nil_free_for_falsy_args(
+    analyzer: &mut LuaAnalyzer,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(LuaType::Signature(signature_id)) = infer_expr(
+        analyzer.db,
+        analyzer
+            .context
+            .infer_manager
+            .get_infer_cache(analyzer.file_id),
+        prefix,
+    ) else {
+        return false;
+    };
+    let Some(signature) = analyzer.db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+    let is_colon_define = signature.is_colon_define;
+    let facts = signature.falsy_param_nil_free_return_slots().to_vec();
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    facts.iter().any(|fact| {
+        fact.return_slot == 0
+            && call_arg_for_param_signature(call_expr, is_colon_define, &args, fact.param_idx)
+                .map(|arg| {
+                    infer_expr(
+                        analyzer.db,
+                        analyzer
+                            .context
+                            .infer_manager
+                            .get_infer_cache(analyzer.file_id),
+                        arg,
+                    )
+                    .is_ok_and(|typ| typ.is_always_falsy())
+                })
+                .unwrap_or(true)
+    })
 }
 
 fn analyze_nil_return_guard_params(
@@ -1411,12 +1923,12 @@ fn return_shapes_imply_non_nil_slot(
 
         saw_truthy_discriminant = true;
         let implied = shape.get(implied_slot).unwrap_or(&LuaType::Nil);
-        if implied.is_optional() {
+        if implied.is_optional() && shapes.len() != 1 {
             return false;
         }
     }
 
-    saw_truthy_discriminant && saw_falsy_discriminant
+    saw_truthy_discriminant && (saw_falsy_discriminant || shapes.len() == 1)
 }
 
 fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
