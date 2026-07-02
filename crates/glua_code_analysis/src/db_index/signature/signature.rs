@@ -32,6 +32,7 @@ pub struct LuaSignature {
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
     require_guard_param: Option<usize>,
+    nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
 }
 
@@ -77,6 +78,7 @@ impl LuaSignature {
             nodiscard: None,
             is_vararg: false,
             require_guard_param: None,
+            nil_return_guard_params: Vec::new(),
             return_correlations: Vec::new(),
         }
     }
@@ -102,6 +104,16 @@ impl LuaSignature {
 
     pub fn set_require_guard_param(&mut self, param_idx: usize) {
         self.require_guard_param = Some(param_idx);
+    }
+
+    pub fn add_nil_return_guard_param(&mut self, param_idx: usize) {
+        if !self.nil_return_guard_params.contains(&param_idx) {
+            self.nil_return_guard_params.push(param_idx);
+        }
+    }
+
+    pub fn nil_return_guard_params(&self) -> &[usize] {
+        &self.nil_return_guard_params
     }
 
     pub fn is_generic(&self) -> bool {

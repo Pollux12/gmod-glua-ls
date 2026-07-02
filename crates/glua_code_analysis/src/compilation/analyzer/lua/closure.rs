@@ -1,9 +1,10 @@
 use std::ops::Deref;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaBlock, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaComment,
-    LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat, LuaLiteralToken, LuaLocalStat, LuaReturnStat,
-    LuaStat, LuaSyntaxKind, LuaVarExpr,
+    BinaryOperator, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList, LuaCallExpr,
+    LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexKey,
+    LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaVarExpr, PathTrait,
+    UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -26,8 +27,707 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_colon_define(analyzer, &signature_id, &closure);
     analyze_lambda_params(analyzer, &signature_id, &closure);
     analyze_require_guard_param(analyzer, &signature_id, &closure);
+    analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
+}
+
+fn analyze_nil_return_guard_params(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+    let mut guard_param_indices = Vec::new();
+    let mut guard_return_ranges = Vec::new();
+    for stat in block.get_stats() {
+        let LuaStat::IfStat(if_stat) = stat else {
+            continue;
+        };
+        let Some(param_name) = nil_return_guard_param_name(&if_stat) else {
+            continue;
+        };
+        let Some(param_idx) = params.iter().position(|param| param == &param_name) else {
+            continue;
+        };
+
+        guard_param_indices.push(param_idx);
+        if let Some(return_stat) = nil_return_guard_return_stat(&if_stat) {
+            guard_return_ranges.push(return_stat.get_range());
+        }
+    }
+
+    if guard_param_indices.is_empty()
+        || !non_guard_returns_are_proven_non_nil(analyzer, closure, &block, &guard_return_ranges)
+    {
+        return Some(());
+    }
+
+    for param_idx in guard_param_indices {
+        analyzer
+            .db
+            .get_signature_index_mut()
+            .get_or_create(*signature_id)
+            .add_nil_return_guard_param(param_idx);
+    }
+
+    Some(())
+}
+
+fn nil_return_guard_param_name(if_stat: &LuaIfStat) -> Option<String> {
+    if nil_return_guard_return_stat(if_stat).is_none() {
+        return None;
+    }
+
+    let LuaExpr::UnaryExpr(unary_expr) = if_stat.get_condition_expr()? else {
+        return None;
+    };
+    if unary_expr.get_op_token()?.get_op() != UnaryOperator::OpNot {
+        return None;
+    }
+    expr_name_text(&unary_expr.get_expr()?)
+}
+
+fn nil_return_guard_return_stat(if_stat: &LuaIfStat) -> Option<LuaReturnStat> {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return None;
+    }
+
+    let block = if_stat.get_block()?;
+    let mut stats = block.get_stats();
+    let Some(LuaStat::ReturnStat(return_stat)) = stats.next() else {
+        return None;
+    };
+
+    if stats.next().is_none() && return_stat.get_expr_list().next().is_none() {
+        Some(return_stat)
+    } else {
+        None
+    }
+}
+
+fn non_guard_returns_are_proven_non_nil(
+    analyzer: &mut LuaAnalyzer,
+    closure: &LuaClosureExpr,
+    block: &LuaBlock,
+    guard_return_ranges: &[TextRange],
+) -> bool {
+    let mut saw_non_guard_return = false;
+    let return_stats = block.descendants::<LuaReturnStat>().collect::<Vec<_>>();
+    for return_stat in return_stats {
+        if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
+            continue;
+        }
+        if guard_return_ranges.contains(&return_stat.get_range()) {
+            continue;
+        }
+
+        saw_non_guard_return = true;
+        let Some(first_expr) = return_stat.get_expr_list().next() else {
+            return false;
+        };
+        if matches!(
+            first_expr.clone(),
+            LuaExpr::LiteralExpr(ref literal_expr)
+                if matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+        ) {
+            return false;
+        }
+        if matches!(first_expr, LuaExpr::IndexExpr(_))
+            && expr_contains_immediately_executed_call(&first_expr)
+        {
+            return false;
+        }
+
+        if return_index_expr_proven_non_nil_by_prior_branch(
+            closure,
+            block,
+            &return_stat,
+            &first_expr,
+        ) {
+            continue;
+        }
+        if return_index_expr_has_matching_initializer_branch(
+            closure,
+            block,
+            &return_stat,
+            &first_expr,
+        ) {
+            return false;
+        }
+
+        let Ok(ret_type) = infer_expr(
+            analyzer.db,
+            analyzer
+                .context
+                .infer_manager
+                .get_infer_cache(analyzer.file_id),
+            first_expr.clone(),
+        ) else {
+            return false;
+        };
+        if ret_type.is_nullable() {
+            return false;
+        }
+    }
+
+    saw_non_guard_return
+}
+
+fn return_index_expr_proven_non_nil_by_prior_branch(
+    closure: &LuaClosureExpr,
+    block: &LuaBlock,
+    return_stat: &LuaReturnStat,
+    return_expr: &LuaExpr,
+) -> bool {
+    if !matches!(return_expr, LuaExpr::IndexExpr(_)) {
+        return false;
+    }
+    if expr_contains_immediately_executed_call(return_expr) {
+        return false;
+    }
+
+    let return_text = expr_source_text(return_expr);
+    for stat in block.get_stats() {
+        if stat.get_range().start() >= return_stat.get_range().start() {
+            break;
+        }
+
+        let LuaStat::IfStat(if_stat) = stat else {
+            continue;
+        };
+        if !if_block_directly_assigns_non_nil_expr(&if_stat, &return_text) {
+            continue;
+        }
+
+        let Some(condition_expr) = if_stat.get_condition_expr() else {
+            continue;
+        };
+        if negated_condition_proves_index_exists(closure, &condition_expr, &return_text) {
+            if intervening_statement_mutates_index(
+                block,
+                if_stat.get_range().end(),
+                return_stat.get_range().start(),
+                return_expr,
+                &return_text,
+            ) {
+                continue;
+            }
+
+            return true;
+        }
+    }
+
+    false
+}
+
+fn return_index_expr_has_matching_initializer_branch(
+    closure: &LuaClosureExpr,
+    block: &LuaBlock,
+    return_stat: &LuaReturnStat,
+    return_expr: &LuaExpr,
+) -> bool {
+    if !matches!(return_expr, LuaExpr::IndexExpr(_)) {
+        return false;
+    }
+
+    let return_text = expr_source_text(return_expr);
+    for stat in block.get_stats() {
+        if stat.get_range().start() >= return_stat.get_range().start() {
+            break;
+        }
+
+        let LuaStat::IfStat(if_stat) = stat else {
+            continue;
+        };
+        if !if_block_directly_assigns_expr(&if_stat, &return_text) {
+            continue;
+        }
+
+        let Some(condition_expr) = if_stat.get_condition_expr() else {
+            continue;
+        };
+        if negated_condition_proves_index_exists(closure, &condition_expr, &return_text) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn intervening_statement_mutates_index(
+    block: &LuaBlock,
+    after: TextSize,
+    before: TextSize,
+    index_expr: &LuaExpr,
+    index_expr_text: &str,
+) -> bool {
+    let dependency_names = index_expr_dependency_names(index_expr);
+    for stat in block.get_stats() {
+        let range = stat.get_range();
+        if range.start() <= after || range.start() >= before {
+            continue;
+        }
+
+        match stat {
+            LuaStat::AssignStat(assign) => {
+                let (_, exprs) = assign.get_var_and_expr_list();
+                if exprs.iter().any(expr_contains_immediately_executed_call) {
+                    return true;
+                }
+
+                let (vars, _) = assign.get_var_and_expr_list();
+                if vars.into_iter().any(|var| {
+                    written_expr_invalidates_index(
+                        &var_source_text(&var),
+                        index_expr_text,
+                        &dependency_names,
+                    )
+                }) {
+                    return true;
+                }
+            }
+            LuaStat::LocalStat(local_stat) => {
+                if local_stat
+                    .get_value_exprs()
+                    .any(|expr| expr_contains_immediately_executed_call(&expr))
+                {
+                    return true;
+                }
+
+                if local_stat
+                    .get_local_name_list()
+                    .into_iter()
+                    .filter_map(|name| name.get_name_token())
+                    .map(|name| name.get_name_text().to_string())
+                    .any(|name| dependency_names.iter().any(|dep| dep == &name))
+                {
+                    return true;
+                }
+            }
+            LuaStat::IfStat(if_stat) => {
+                if !if_stat_is_harmless_between_guard_and_return(
+                    &if_stat,
+                    index_expr_text,
+                    &dependency_names,
+                ) {
+                    return true;
+                }
+            }
+            LuaStat::EmptyStat(_) => {}
+            _ => return true,
+        }
+    }
+
+    false
+}
+
+fn if_stat_is_harmless_between_guard_and_return(
+    if_stat: &LuaIfStat,
+    index_expr_text: &str,
+    dependency_names: &[String],
+) -> bool {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return false;
+    }
+    if if_stat
+        .get_condition_expr()
+        .is_none_or(|condition| expr_contains_immediately_executed_call(&condition))
+    {
+        return false;
+    }
+    let Some(block) = if_stat.get_block() else {
+        return false;
+    };
+
+    block.get_stats().all(|stat| {
+        direct_stat_is_harmless_between_guard_and_return(&stat, index_expr_text, dependency_names)
+    })
+}
+
+fn direct_stat_is_harmless_between_guard_and_return(
+    stat: &LuaStat,
+    index_expr_text: &str,
+    dependency_names: &[String],
+) -> bool {
+    match stat {
+        LuaStat::AssignStat(assign) => {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            !exprs.iter().any(expr_contains_immediately_executed_call)
+                && !vars.into_iter().any(|var| {
+                    written_expr_invalidates_index(
+                        &var_source_text(&var),
+                        index_expr_text,
+                        dependency_names,
+                    )
+                })
+        }
+        LuaStat::LocalStat(local_stat) => {
+            !local_stat
+                .get_value_exprs()
+                .any(|expr| expr_contains_immediately_executed_call(&expr))
+                && !local_stat
+                    .get_local_name_list()
+                    .into_iter()
+                    .filter_map(|name| name.get_name_token())
+                    .map(|name| name.get_name_text().to_string())
+                    .any(|name| dependency_names.iter().any(|dep| dep == &name))
+        }
+        LuaStat::CallExprStat(call_stat) => call_stat
+            .get_call_expr()
+            .is_some_and(|call_expr| call_is_harmless_setmetatable(&call_expr, index_expr_text)),
+        LuaStat::EmptyStat(_) => true,
+        _ => false,
+    }
+}
+
+fn call_is_harmless_setmetatable(call_expr: &LuaCallExpr, index_expr_text: &str) -> bool {
+    if call_expr
+        .get_prefix_expr()
+        .is_none_or(|prefix| expr_source_text(&prefix) != "setmetatable")
+    {
+        return false;
+    }
+    let Some(args) = call_expr.get_args_list() else {
+        return false;
+    };
+    let args = args.get_args().collect::<Vec<_>>();
+    args.first()
+        .is_some_and(|arg| expr_source_text(arg) == index_expr_text)
+        && args
+            .iter()
+            .skip(1)
+            .all(|arg| !expr_contains_immediately_executed_call(arg))
+}
+
+fn expr_contains_immediately_executed_call(expr: &LuaExpr) -> bool {
+    let expr_range = expr.get_range();
+    matches!(expr, LuaExpr::CallExpr(_))
+        || expr
+            .descendants::<LuaCallExpr>()
+            .any(|call_expr| !call_is_inside_nested_closure_expr(&call_expr, expr_range))
+}
+
+fn call_is_inside_nested_closure_expr(call_expr: &LuaCallExpr, expr_range: TextRange) -> bool {
+    call_expr.ancestors::<LuaClosureExpr>().any(|closure| {
+        let closure_range = closure.get_range();
+        closure_range.start() >= expr_range.start() && closure_range.end() <= expr_range.end()
+    })
+}
+
+fn written_expr_invalidates_index(
+    written_text: &str,
+    index_expr_text: &str,
+    dependency_names: &[String],
+) -> bool {
+    written_text == index_expr_text
+        || index_expr_text
+            .strip_prefix(written_text)
+            .is_some_and(|suffix| suffix.starts_with('.') || suffix.starts_with('['))
+        || dependency_names.iter().any(|name| name == written_text)
+}
+
+fn index_expr_dependency_names(expr: &LuaExpr) -> Vec<String> {
+    let mut names = Vec::new();
+    collect_index_expr_dependency_names(expr, &mut names);
+    names
+}
+
+fn collect_index_expr_dependency_names(expr: &LuaExpr, names: &mut Vec<String>) {
+    match expr {
+        LuaExpr::NameExpr(_) => names.push(expr_source_text(expr)),
+        LuaExpr::IndexExpr(index_expr) => {
+            if let Some(prefix_expr) = index_expr.get_prefix_expr() {
+                collect_index_expr_dependency_names(&prefix_expr, names);
+            }
+            if let Some(LuaIndexKey::Expr(key_expr)) = index_expr.get_index_key() {
+                collect_index_expr_dependency_names(&key_expr, names);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn if_block_directly_assigns_non_nil_expr(if_stat: &LuaIfStat, expr_text: &str) -> bool {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return false;
+    }
+
+    let Some(block) = if_stat.get_block() else {
+        return false;
+    };
+    let mut stats = block.get_stats();
+    let Some(LuaStat::AssignStat(assign)) = stats.next() else {
+        return false;
+    };
+    if stats.next().is_some() {
+        return false;
+    }
+
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    if vars.len() != 1 || exprs.len() != 1 {
+        return false;
+    }
+
+    var_source_text(&vars[0]) == expr_text && expr_is_syntactically_non_nil(&exprs[0])
+}
+
+fn if_block_directly_assigns_expr(if_stat: &LuaIfStat, expr_text: &str) -> bool {
+    if if_stat.get_else_if_clause_list().next().is_some() || if_stat.get_else_clause().is_some() {
+        return false;
+    }
+
+    let Some(block) = if_stat.get_block() else {
+        return false;
+    };
+    let mut stats = block.get_stats();
+    let Some(LuaStat::AssignStat(assign)) = stats.next() else {
+        return false;
+    };
+    if stats.next().is_some() {
+        return false;
+    }
+
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    vars.len() == 1 && exprs.len() == 1 && var_source_text(&vars[0]) == expr_text
+}
+
+fn negated_condition_proves_index_exists(
+    closure: &LuaClosureExpr,
+    condition_expr: &LuaExpr,
+    index_expr_text: &str,
+) -> bool {
+    let LuaExpr::UnaryExpr(unary_expr) = condition_expr else {
+        return false;
+    };
+    if unary_expr
+        .get_op_token()
+        .is_none_or(|op| op.get_op() != UnaryOperator::OpNot)
+    {
+        return false;
+    }
+
+    match unary_expr.get_expr() {
+        Some(expr) if expr_source_text(&expr) == index_expr_text => true,
+        Some(LuaExpr::CallExpr(call_expr)) => {
+            predicate_call_proves_index_exists(closure, &call_expr, index_expr_text)
+        }
+        _ => false,
+    }
+}
+
+fn predicate_call_proves_index_exists(
+    closure: &LuaClosureExpr,
+    call_expr: &LuaCallExpr,
+    index_expr_text: &str,
+) -> bool {
+    if call_expr.is_colon_call() {
+        return false;
+    }
+
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let predicate_path = expr_source_text(&prefix_expr);
+
+    let Some(root) = closure.syntax().ancestors().last() else {
+        return false;
+    };
+
+    let matching_predicates = root
+        .descendants()
+        .filter_map(LuaFuncStat::cast)
+        .filter(|func_stat| func_stat.ancestors::<LuaClosureExpr>().next().is_none())
+        .filter(|func_stat| !func_stat_is_colon_defined(func_stat))
+        .filter(|func_stat| {
+            func_stat
+                .get_func_name()
+                .and_then(|name| name.get_access_path().map(|path| path.to_string()))
+                .as_deref()
+                == Some(predicate_path.as_str())
+        })
+        .filter_map(|func_stat| func_stat.get_closure())
+        .collect::<Vec<_>>();
+
+    if matching_predicates.len() != 1 {
+        return false;
+    }
+
+    predicate_returns_index_non_nil(&matching_predicates[0], call_expr, index_expr_text)
+}
+
+fn func_stat_is_colon_defined(func_stat: &LuaFuncStat) -> bool {
+    matches!(
+        func_stat.get_func_name(),
+        Some(LuaVarExpr::IndexExpr(index_expr))
+            if index_expr.get_index_token().is_some_and(|token| token.is_colon())
+    )
+}
+
+fn predicate_returns_index_non_nil(
+    closure: &LuaClosureExpr,
+    call_expr: &LuaCallExpr,
+    index_expr_text: &str,
+) -> bool {
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+    let substitutions = predicate_param_substitutions(closure, call_expr);
+
+    let mut saw_proving_return = false;
+    for return_stat in block.descendants::<LuaReturnStat>().filter(|return_stat| {
+        return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+    }) {
+        let Some(return_expr) = return_stat.get_expr_list().next() else {
+            continue;
+        };
+        if expr_is_falsy_literal(&return_expr) {
+            continue;
+        }
+        if !predicate_return_expr_proves_index(return_expr, &substitutions, index_expr_text) {
+            return false;
+        }
+        saw_proving_return = true;
+    }
+
+    saw_proving_return
+}
+
+fn predicate_return_expr_proves_index(
+    return_expr: LuaExpr,
+    substitutions: &[(String, String)],
+    index_expr_text: &str,
+) -> bool {
+    let return_text = expr_source_text_with_param_subs(&return_expr, substitutions);
+    if return_text == index_expr_text {
+        return true;
+    }
+
+    let LuaExpr::BinaryExpr(binary_expr) = return_expr else {
+        return false;
+    };
+    if binary_expr
+        .get_op_token()
+        .is_none_or(|op| op.get_op() != BinaryOperator::OpNe)
+    {
+        return false;
+    }
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return false;
+    };
+
+    let left_text = expr_source_text_with_param_subs(&left, substitutions);
+    let right_text = expr_source_text_with_param_subs(&right, substitutions);
+
+    (left_text == index_expr_text && expr_is_nil(&right))
+        || (expr_is_nil(&left) && right_text == index_expr_text)
+}
+
+fn predicate_param_substitutions(
+    closure: &LuaClosureExpr,
+    call_expr: &LuaCallExpr,
+) -> Vec<(String, String)> {
+    let Some(params) = closure.get_params_list() else {
+        return Vec::new();
+    };
+    let Some(args) = call_expr.get_args_list() else {
+        return Vec::new();
+    };
+
+    params
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        })
+        .zip(args.get_args().map(|arg| expr_source_text(&arg)))
+        .collect()
+}
+
+fn expr_is_nil(expr: &LuaExpr) -> bool {
+    matches!(
+        expr,
+        LuaExpr::LiteralExpr(literal_expr)
+            if matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+    )
+}
+
+fn expr_is_syntactically_non_nil(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::TableExpr(_) => !expr_contains_immediately_executed_call(expr),
+        LuaExpr::LiteralExpr(literal_expr) => match literal_expr.get_literal() {
+            Some(LuaLiteralToken::String(_)) | Some(LuaLiteralToken::Number(_)) => true,
+            Some(LuaLiteralToken::Bool(token)) => token.is_true(),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn expr_is_falsy_literal(expr: &LuaExpr) -> bool {
+    matches!(
+        expr,
+        LuaExpr::LiteralExpr(literal_expr)
+            if matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Nil(_)))
+                || matches!(literal_expr.get_literal(), Some(LuaLiteralToken::Bool(ref token)) if !token.is_true())
+    )
+}
+
+fn expr_source_text(expr: &LuaExpr) -> String {
+    expr.syntax()
+        .text()
+        .to_string()
+        .split_whitespace()
+        .collect()
+}
+
+fn expr_source_text_with_param_subs(expr: &LuaExpr, substitutions: &[(String, String)]) -> String {
+    match expr {
+        LuaExpr::NameExpr(_) => {
+            let name = expr_source_text(expr);
+            substitutions
+                .iter()
+                .find_map(|(param, arg)| (param == &name).then(|| arg.clone()))
+                .unwrap_or(name)
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+                return expr_source_text(expr);
+            };
+            let prefix_text = expr_source_text_with_param_subs(&prefix_expr, substitutions);
+            match index_expr.get_index_key() {
+                Some(LuaIndexKey::Name(name)) => {
+                    format!("{prefix_text}.{}", name.get_name_text())
+                }
+                Some(LuaIndexKey::String(string)) => {
+                    format!("{prefix_text}[{}]", string.syntax().text())
+                }
+                Some(LuaIndexKey::Integer(integer)) => {
+                    format!("{prefix_text}[{}]", integer.syntax().text())
+                }
+                Some(LuaIndexKey::Expr(key_expr)) => format!(
+                    "{prefix_text}[{}]",
+                    expr_source_text_with_param_subs(&key_expr, substitutions)
+                ),
+                Some(LuaIndexKey::Idx(_)) | None => expr_source_text(expr),
+            }
+        }
+        _ => expr_source_text(expr),
+    }
+}
+
+fn var_source_text(var: &LuaVarExpr) -> String {
+    var.syntax().text().to_string().split_whitespace().collect()
 }
 
 fn analyze_colon_define(

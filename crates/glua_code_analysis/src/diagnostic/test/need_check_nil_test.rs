@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaSignatureId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaClosureExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -3991,6 +3992,1136 @@ mod test {
             local menu = MaybeMenu()
             UseMenu(DermaMenu())
             UseMenu(menu)
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_non_nil_literal_arg_skips_unreachable_nil_return_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "translated"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_non_nil_literal_arg_with_member_exists_predicate_return_is_non_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.IsLanguage(raw_lang_name) then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "translated"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_cross_file_lang_create_language_return_is_non_nil_for_literal_arg() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let library_root = ws
+            .virtual_url_generator
+            .new_path("__test_library_lang_create_language");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("cl_lang.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            LANG = {
+                Strings = {}
+            }
+
+            function LANG.IsLanguage(lang_name)
+                lang_name = lang_name and string.lower(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name, lang_code)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if lang_code then
+                    lang_code = string.lower(lang_code)
+                end
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {
+                        language_name = raw_lang_name
+                    }
+                end
+
+                return LANG.Strings[lang_name]
+            end
+        "#
+                .to_string(),
+            ),
+        );
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local L = LANG.CreateLanguage("English", "en")
+            L.phrase = "translated"
+        "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_unproven_nil_return_guard_param_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class PairResult
+            ---@field value string
+
+            local function MakePair(first, second)
+                if not first then return end
+                if not second then return end
+                return {}
+            end
+
+            ---@return string?
+            local function MaybeName() end
+
+            local result = MakePair("known", MaybeName())
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guarded_dot_defined_colon_call_maps_self_to_prefix() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local T = {}
+
+            function T.make(self, key)
+                if not self then return end
+                if not key then return end
+                return {}
+            end
+
+            local result = T:make("known")
+            result.value = "safe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_guarded_dot_defined_colon_call_missing_later_arg_stays_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local T = {}
+
+            function T.make(self, key)
+                if not self then return end
+                if not key then return end
+                return {}
+            end
+
+            local result = T:make()
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guarded_colon_defined_colon_call_does_not_shift_args() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local T = {}
+
+            function T:make(key)
+                if not key then return end
+                return {}
+            end
+
+            ---@return string?
+            local function MaybeName() end
+
+            local result = T:make(MaybeName())
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guarded_colon_defined_dot_call_maps_args_after_self() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local T = {}
+
+            function T:make(key)
+                if not key then return end
+                return {}
+            end
+
+            ---@return string?
+            local function MaybeName() end
+
+            local result = T.make(T, MaybeName())
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_nil_return_guard_preserves_false_return_branch() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            local function MaybeValue(key)
+                if not key then return end
+                return false
+            end
+
+            local value = MaybeValue("known")
+            if value then
+                value:missing()
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_member_exists_predicate_with_unproven_truthy_return_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            ---@return boolean
+            local function ShouldBypass() end
+
+            function LANG.IsLanguage(lang_name)
+                if ShouldBypass() then
+                    return true
+                end
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.IsLanguage(raw_lang_name) then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_member_exists_predicate_duplicate_definition_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return true
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.IsLanguage(raw_lang_name) then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_nested_assignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    local function later()
+                        LANG.Strings[raw_lang_name] = {}
+                    end
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_conditional_assignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            ---@return boolean
+            local function ShouldAssign() end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    if ShouldAssign() then
+                        LANG.Strings[raw_lang_name] = {}
+                    end
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_nil_assignment_rhs_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    LANG.Strings[raw_lang_name] = nil
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_root_mutating_multi_assignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    LANG.Strings[raw_lang_name], LANG.Strings = {}, nil
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_intervening_index_reassignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                LANG.Strings[raw_lang_name] = nil
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_intervening_key_reassignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.Strings[lang_name] then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                lang_name = "other"
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_initializer_else_assignment_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[raw_lang_name] then
+                    LANG.Strings[raw_lang_name] = {}
+                else
+                    LANG.Strings[raw_lang_name] = nil
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_intervening_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                ClearLanguages()
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_intervening_if_condition_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+                return true
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                if ClearLanguages() then end
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_intervening_if_nested_condition_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            local flag = true
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+                return true
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                if flag and ClearLanguages() then end
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_setmetatable_arg_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+                return {}
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                if lang_name == "english" then
+                    setmetatable(LANG.Strings[lang_name], ClearLanguages())
+                end
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_setmetatable_table_arg_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+                return function() end
+            end
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {}
+                end
+
+                if lang_name == "english" then
+                    setmetatable(LANG.Strings[lang_name], {
+                        __index = ClearLanguages()
+                    })
+                end
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_guard_block_return_index_call_does_not_record_nil_return_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            local LANG = {
+                Strings = {}
+            }
+
+            local flip = false
+            local function DynamicName()
+                flip = not flip
+                if flip then
+                    return "english"
+                end
+                return "other"
+            end
+
+            ---@return LanguageTable?
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG.Strings[DynamicName()] then
+                    LANG.Strings[DynamicName()] = {}
+                end
+
+                return LANG.Strings[DynamicName()]
+            end
+        "#;
+
+        let file_id = ws.def(code);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .find(|closure| {
+                closure
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .contains("DynamicName()")
+            })
+            .expect("expected CreateLanguage closure");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        assert_that!(signature.nil_return_guard_params(), is_empty());
+    }
+
+    #[gtest]
+    fn test_guard_block_table_rhs_call_does_not_record_nil_return_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        let code = r#"
+            local LANG = {
+                Strings = {}
+            }
+
+            local function ClearLanguages()
+                LANG.Strings = {}
+                return "side effect"
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.Strings[lang_name] then
+                    LANG.Strings[lang_name] = { ClearLanguages() }
+                end
+
+                return LANG.Strings[lang_name]
+            end
+        "#;
+
+        let file_id = ws.def(code);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .find(|closure| {
+                closure
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .contains("ClearLanguages()")
+            })
+            .expect("expected CreateLanguage closure");
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        assert_that!(signature.nil_return_guard_params(), is_empty());
+    }
+
+    #[gtest]
+    fn test_guard_block_ttt_setmetatable_literal_preserves_non_nil_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {},
+                DefaultLanguage = "english"
+            }
+
+            local cached_default
+
+            function LANG.IsLanguage(lang_name)
+                return LANG.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+                local lang_name = string.lower(raw_lang_name)
+
+                if not LANG.IsLanguage(lang_name) then
+                    LANG.Strings[lang_name] = {
+                        language_name = raw_lang_name
+                    }
+                end
+
+                if lang_name == LANG.DefaultLanguage then
+                    cached_default = LANG.Strings[lang_name]
+                    setmetatable(LANG.Strings[lang_name], {
+                        __index = function(tbl, name)
+                            return "missing", false
+                        end
+                    })
+                end
+
+                return LANG.Strings[lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "safe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_member_exists_predicate_does_not_substring_replace_params() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG.IsLanguage(name)
+                return LANG.Strings[name_extra]
+            end
+
+            function LANG.CreateLanguage(raw_name_extra)
+                if not raw_name_extra then return end
+
+                if not LANG.IsLanguage(raw_name_extra) then
+                    LANG.Strings[raw_name_extra] = {}
+                end
+
+                return LANG.Strings[raw_name_extra]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_member_exists_predicate_colon_call_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class LanguageTable
+            ---@field phrase string
+
+            local LANG = {
+                Strings = {}
+            }
+
+            function LANG:IsLanguage(lang_name)
+                return self.Strings[lang_name]
+            end
+
+            function LANG.CreateLanguage(raw_lang_name)
+                if not raw_lang_name then return end
+
+                if not LANG:IsLanguage(raw_lang_name) then
+                    LANG.Strings[raw_lang_name] = {}
+                end
+
+                return LANG.Strings[raw_lang_name]
+            end
+
+            local L = LANG.CreateLanguage("English")
+            L.phrase = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_unrelated_nil_return_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            ---@return boolean
+            local function ShouldSkip() end
+
+            local function MakeResult(key)
+                if not key then return end
+                if ShouldSkip() then return nil end
+                return {}
+            end
+
+            local result = MakeResult("known")
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_nullable_expression_return_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            ---@return ResultTable?
+            local function MaybeResult() end
+
+            local function MakeResult(key)
+                if not key then return end
+                return MaybeResult()
+            end
+
+            local result = MakeResult("known")
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_first_result_nil_multi_return_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local function MakeResult(key)
+                if not key then return end
+                return nil, "error"
+            end
+
+            local result = MakeResult("known")
+            result.value = "unsafe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_nil_return_guard_with_else_preserves_nullable_return() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            local function MakeResult(key)
+                if not key then
+                    return
+                else
+                    return nil
+                end
+
+                return {}
+            end
+
+            local result = MakeResult("known")
+            result.value = "unsafe"
         "#;
 
         let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);

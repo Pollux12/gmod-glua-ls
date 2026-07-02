@@ -274,6 +274,7 @@ fn should_prefer_signature_for_call(
                     || richer_return
                     || !signature.overloads.is_empty()
                     || !signature.out_params.is_empty()
+                    || !signature.nil_return_guard_params().is_empty()
             }
             _ => false,
         })
@@ -326,8 +327,26 @@ fn get_signature_id_from_semantic_decl_value_expr(
         return Some(signature_id);
     }
     let file_id = match semantic_decl {
-        crate::LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.file_id,
-        crate::LuaSemanticDeclId::Member(member_id) => member_id.file_id,
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+            decl_id.file_id
+        }
+        crate::LuaSemanticDeclId::Member(member_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+            member_id.file_id
+        }
         crate::LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
         crate::LuaSemanticDeclId::TypeDecl(_) => return None,
     };
@@ -442,12 +461,18 @@ fn infer_signature_doc_function(
         )
         .with_optional_params(signature.get_param_optional_flags());
         if is_generic {
-            fake_doc_function = instantiate_func_generic(db, cache, &fake_doc_function, call_expr)?;
+            fake_doc_function =
+                instantiate_func_generic(db, cache, &fake_doc_function, call_expr.clone())?;
         }
 
-        Ok(apply_signature_return_kinds_to_function(
+        let fake_doc_function =
+            apply_signature_return_kinds_to_function(signature, &fake_doc_function);
+        Ok(specialize_nil_guarded_return_for_call(
+            db,
+            cache,
             signature,
-            &fake_doc_function,
+            fake_doc_function.as_ref(),
+            &call_expr,
         ))
     } else {
         let mut new_overloads = signature.overloads.clone();
@@ -472,6 +497,81 @@ fn infer_signature_doc_function(
             is_generic,
             args_count,
         )
+    }
+}
+
+fn specialize_nil_guarded_return_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Arc<LuaFunctionType> {
+    if signature.nil_return_guard_params().is_empty() || !func_ty.get_ret().is_nullable() {
+        return Arc::new(func_ty.clone());
+    }
+
+    let Some(args) = call_expr.get_args_list() else {
+        return Arc::new(func_ty.clone());
+    };
+    let args = args.get_args().collect::<Vec<_>>();
+
+    let guard_satisfied = signature.nil_return_guard_params().iter().all(|param_idx| {
+        call_arg_for_param(call_expr, func_ty, &args, *param_idx)
+            .and_then(|arg| infer_expr(db, cache, arg.clone()).ok())
+            .is_some_and(|arg_type| arg_type.is_always_truthy())
+    });
+
+    if !guard_satisfied {
+        return Arc::new(func_ty.clone());
+    }
+
+    Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            remove_nil_from_type(func_ty.get_ret().clone()),
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    )
+}
+
+fn call_arg_for_param(
+    call_expr: &LuaCallExpr,
+    func_ty: &LuaFunctionType,
+    args: &[LuaExpr],
+    param_idx: usize,
+) -> Option<LuaExpr> {
+    match (func_ty.is_colon_define(), call_expr.is_colon_call()) {
+        (true, false) => args.get(param_idx.checked_add(1)?).cloned(),
+        (false, true) if param_idx == 0 => call_expr.get_prefix_expr(),
+        (false, true) => args.get(param_idx.checked_sub(1)?).cloned(),
+        _ => args.get(param_idx).cloned(),
+    }
+}
+
+fn remove_nil_from_type(t: LuaType) -> LuaType {
+    match t {
+        LuaType::Nil => LuaType::Unknown,
+        LuaType::Union(u) => LuaType::from_vec(
+            u.types()
+                .filter(|it| !matches!(it, LuaType::Nil))
+                .cloned()
+                .collect(),
+        ),
+        LuaType::Instance(instance_type) => {
+            let new_base = remove_nil_from_type(instance_type.get_base().clone());
+            if new_base.is_unknown() {
+                LuaType::Unknown
+            } else {
+                LuaType::Instance(
+                    LuaInstanceType::new(new_base, instance_type.get_range().clone()).into(),
+                )
+            }
+        }
+        _ => t,
     }
 }
 
