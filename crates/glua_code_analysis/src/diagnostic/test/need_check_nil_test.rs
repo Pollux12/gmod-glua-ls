@@ -889,11 +889,11 @@ mod test {
     #[gtest]
     fn test_unchecked_nil_access_for_opaque_table_chained_index() {
         let mut ws = VirtualWorkspace::new();
-        let code = r#"
+        let code = r##"
             ---@type table
             local tbl = {}
             print(tbl.someKey.test)
-        "#;
+        "##;
 
         assert_that!(
             ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
@@ -2385,6 +2385,546 @@ mod test {
 
                 self.Buttons[KP_OUT_OF_RANGE]:SetText("")
             end
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_constant_index_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_out_of_range_constant_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_SERIALKILLER = 5
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor() end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local killerColor = ROLE_COLORS[ROLE_SERIALKILLER]
+            killerColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_inaccessible_shadow_constant_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 99
+            local ROLE_MAX = 2
+
+            do
+                local ROLE_TRAITOR = 1
+            end
+
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_root_reassignment_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_TRAITOR = 1
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = 0, 2 do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            ROLE_COLORS = {}
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_direct_key_reassignment_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_TRAITOR = 1
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = 0, 2 do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            ROLE_TRAITOR = 99
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_same_assignment_root_replacement_stays_need_check_nil()
+    {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_TRAITOR = 1
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = 0, 2 do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            ROLE_COLORS[ROLE_TRAITOR], ROLE_COLORS = { r = 0 }, {}
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_same_assignment_key_replacement_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_TRAITOR = 1
+            local ROLE_COLORS = {}
+
+            local function FillRoleColors(list)
+                for r = 0, 2 do
+                    list[r] = { r = 0 }
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            ROLE_COLORS[ROLE_TRAITOR], ROLE_TRAITOR = { r = 0 }, 99
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_read_before_call_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor() end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+
+            FillRoleColors(ROLE_COLORS)
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_nullable_rhs_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color?
+            local function MaybeColor() end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MaybeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_call_rhs_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor()
+                ROLE_COLORS[ROLE_TRAITOR] = nil
+                return { r = 0 }
+            end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_constant_index_does_not_use_string_key_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r##"
+            ---@class Color
+            ---@field r integer
+
+            local ONE = 1
+            local t = {}
+            t["1"] = { r = 0 }
+
+            local c = t[ONE]
+            c.r = 255
+        "##;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_constant_index_does_not_use_hash_prefixed_string_key_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r##"
+            ---@class Color
+            ---@field r integer
+
+            local ONE = 1
+            local t = {}
+            t["#1"] = { r = 0 }
+
+            local c = t[ONE]
+            c.r = 255
+        "##;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_intervening_mutation_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor() end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            ROLE_COLORS[ROLE_TRAITOR] = nil
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_unknown_call_between_population_and_read_stays_need_check_nil()
+     {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor() end
+
+            local function MaybeMutatesColors() end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+            MaybeMutatesColors()
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_inaccessible_same_name_helper_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor() end
+
+            do
+                local function FillRoleColors(list)
+                    for r = ROLE_NONE, ROLE_MAX do
+                        list[r] = MakeColor()
+                    end
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
         "#;
 
         assert_that!(

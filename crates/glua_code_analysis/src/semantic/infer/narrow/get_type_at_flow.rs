@@ -1,10 +1,11 @@
 use std::{collections::HashSet, ops::Deref};
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
+    LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaStat,
+    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use crate::{
     AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
@@ -309,7 +310,8 @@ fn get_type_at_flow_walk(
                         | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
                         | (AssignVarHint::NameOnly, VarRefId::IndexRef(_, _))
                         | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
-                );
+                ) || (matches!(assign_hint, AssignVarHint::IndexOnly)
+                    && numeric_table_index_query(db, cache, root, var_ref_id).is_some());
 
                 if !can_match_assignment {
                     if let Some(merged_type) =
@@ -326,7 +328,9 @@ fn get_type_at_flow_walk(
                     continue;
                 }
 
-                if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id) {
+                if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id)
+                    && numeric_table_index_query(db, cache, root, var_ref_id).is_none()
+                {
                     if let Some(merged_type) =
                         try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
                     {
@@ -407,6 +411,30 @@ fn get_type_at_flow_walk(
                             Ok(effect_type),
                         );
                     }
+                }
+
+                if let Some(populated_type) = try_get_numeric_range_table_arg_population_type(
+                    db,
+                    cache,
+                    root,
+                    var_ref_id,
+                    call_expr.clone(),
+                )? {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(populated_type),
+                    );
+                }
+
+                if numeric_table_index_query(db, cache, root, var_ref_id).is_some() {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        get_var_ref_type(db, cache, var_ref_id),
+                    );
                 }
 
                 if let Some(merged_type) =
@@ -1333,6 +1361,52 @@ fn get_type_at_assign_stat(
             continue;
         };
 
+        if numeric_table_index_query_key_name(var_ref_id)
+            .map(str::to_string)
+            .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
+            .is_some_and(|key_name| var_ref_is_name(db, &maybe_ref_id, &key_name))
+        {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
+        }
+
+        if let Some((query_root, _query_index)) =
+            numeric_table_index_query(db, cache, root, var_ref_id)
+            && var_ref_matches_root(&maybe_ref_id, &query_root)
+        {
+            return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                db, cache, var_ref_id,
+            )?));
+        }
+
+        if let Some((query_root, query_index)) =
+            numeric_table_index_query(db, cache, root, var_ref_id)
+            && let LuaVarExpr::IndexExpr(index_expr) = &var
+            && let VarRefId::IndexRef(assign_root, _) = &maybe_ref_id
+            && *assign_root == query_root
+            && index_expr_numeric_key_value(db, cache, index_expr) == Some(query_index)
+        {
+            if assignment_vars_write_root(db, cache, &vars, &query_root) {
+                return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                    db, cache, var_ref_id,
+                )?));
+            }
+            if numeric_table_index_query_key_name(var_ref_id)
+                .map(str::to_string)
+                .or_else(|| {
+                    numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id)
+                })
+                .is_some_and(|key_name| {
+                    assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
+                })
+            {
+                return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
+            }
+            let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)? else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+            return Ok(ResultTypeOrContinue::Result(expr_type));
+        }
+
         if maybe_ref_id != *var_ref_id {
             if var_ref_id.start_with(&maybe_ref_id)
                 && let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)?
@@ -1343,6 +1417,16 @@ fn get_type_at_assign_stat(
             }
 
             continue;
+        }
+
+        if numeric_table_index_query_key_name(var_ref_id)
+            .map(str::to_string)
+            .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
+            .is_some_and(|key_name| {
+                assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
+            })
+        {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
         }
 
         // Check if there's an explicit type annotation (not just inferred type)
@@ -1464,6 +1548,418 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn try_get_numeric_range_table_arg_population_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: LuaCallExpr,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some((query_root, access_index)) = numeric_table_index_query(db, cache, root, var_ref_id)
+    else {
+        return Ok(None);
+    };
+
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some((arg_index, _)) = args.iter().enumerate().find(|(_, arg)| {
+        matches!(
+            get_var_expr_var_ref_id(db, cache, (*arg).clone()),
+            Some(VarRefId::VarRef(decl_id)) if query_root.as_decl_id() == Some(decl_id)
+        )
+    }) else {
+        return Ok(None);
+    };
+
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, root, &call_expr)
+    else {
+        return Ok(None);
+    };
+    let Some(param_name) = closure
+        .get_params_list()
+        .and_then(|params| params.get_params().nth(arg_index))
+        .and_then(|param| param.get_name_token())
+        .map(|name| name.get_name_text().to_string())
+    else {
+        return Ok(None);
+    };
+
+    let Some(block) = closure.get_block() else {
+        return Ok(None);
+    };
+    let stats = block.get_stats().collect::<Vec<_>>();
+    let [LuaStat::ForStat(for_stat)] = stats.as_slice() else {
+        return Ok(None);
+    };
+    if !numeric_for_bounds_cover_index(db, cache, for_stat, access_index) {
+        return Ok(None);
+    }
+
+    let Some(for_var_name) = for_stat
+        .get_var_name()
+        .map(|name| name.get_name_text().to_string())
+    else {
+        return Ok(None);
+    };
+    let Some(for_block) = for_stat.get_block() else {
+        return Ok(None);
+    };
+    let for_stats = for_block.get_stats().collect::<Vec<_>>();
+    let [LuaStat::AssignStat(assign_stat)] = for_stats.as_slice() else {
+        return Ok(None);
+    };
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let ([LuaVarExpr::IndexExpr(index_expr)], [rhs_expr]) = (vars.as_slice(), exprs.as_slice())
+    else {
+        return Ok(None);
+    };
+    if !index_expr_writes_param_at_for_var(index_expr, &param_name, &for_var_name) {
+        return Ok(None);
+    }
+    if expr_contains_immediately_executed_call(rhs_expr) {
+        return Ok(None);
+    }
+
+    let rhs_type = infer_expr(db, cache, rhs_expr.clone())?;
+    if rhs_type.is_nullable() || rhs_type.is_nil() {
+        return Ok(None);
+    }
+
+    Ok(Some(rhs_type))
+}
+
+fn numeric_table_index_query(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+) -> Option<(
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+)> {
+    if let VarRefId::IndexRef(query_root, query_path) = var_ref_id
+        && let Some(index_name) = dynamic_bracket_index_name(query_path.deref())
+        && let Some(index) =
+            unambiguous_integer_const_name_value(db, cache, index_name, var_ref_id.get_position())
+    {
+        return Some((query_root.clone(), index));
+    }
+
+    if let VarRefId::IndexRef(query_decl_root, _) = var_ref_id
+        && let Some(decl_id) = query_decl_root.as_decl_id()
+        && let Some(query) =
+            numeric_table_index_query_from_decl_initializer(db, cache, root, decl_id)
+    {
+        return Some(query);
+    }
+
+    let decl_id = var_ref_id.get_decl_id_ref()?;
+    numeric_table_index_query_from_decl_initializer(db, cache, root, decl_id)
+}
+
+fn numeric_table_index_query_from_decl_initializer(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    decl_id: LuaDeclId,
+) -> Option<(
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+)> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let expr = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaExpr::cast)?;
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return None;
+    };
+    let access_index = index_expr_numeric_key_value(db, cache, &index_expr)?;
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let query_root = index_expr_root_id(db, cache, prefix_expr)?;
+    Some((query_root, access_index))
+}
+
+fn index_expr_root_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    mut prefix_expr: LuaExpr,
+) -> Option<crate::semantic::infer::narrow::var_ref_id::VarRefRootId> {
+    while let LuaExpr::IndexExpr(index_expr) = prefix_expr {
+        prefix_expr = index_expr.get_prefix_expr()?;
+    }
+
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+    match get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr))? {
+        VarRefId::SelfRef(self_ref_id) => {
+            Some(crate::semantic::infer::narrow::var_ref_id::VarRefRootId::SelfRef(self_ref_id))
+        }
+        VarRefId::VarRef(decl_id) => {
+            Some(crate::semantic::infer::narrow::var_ref_id::VarRefRootId::Decl(decl_id))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_same_file_named_function_closure(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaClosureExpr> {
+    let LuaExpr::NameExpr(name_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
+        && let Some(token) = decl.get_syntax_id().to_token_from_root(root.syntax())
+        && let Some(parent) = token.parent()
+    {
+        for ancestor in parent.ancestors() {
+            if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
+                return func_stat.get_closure();
+            }
+            if let Some(local_func_stat) = LuaLocalFuncStat::cast(ancestor) {
+                return local_func_stat.get_closure();
+            }
+        }
+    }
+
+    let name_text = name_expr.get_name_text()?;
+    let call_block = call_expr.ancestors::<LuaBlock>().next()?;
+    let mut matched = call_block
+        .get_stats()
+        .take_while(|stat| stat.get_position() < call_expr.get_position())
+        .filter_map(|stat| match stat {
+            LuaStat::LocalFuncStat(local_func) => Some(local_func),
+            _ => None,
+        })
+        .filter(|stat| {
+            stat.get_local_name()
+                .and_then(|name| name.get_name_token())
+                .is_some_and(|token| token.get_name_text() == name_text)
+        })
+        .filter_map(|stat| stat.get_closure());
+    let closure = matched.next()?;
+    if matched.next().is_some() {
+        return None;
+    }
+    Some(closure)
+}
+
+fn index_expr_writes_param_at_for_var(
+    index_expr: &LuaIndexExpr,
+    param_name: &str,
+    for_var_name: &str,
+) -> bool {
+    let Some(prefix) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let LuaExpr::NameExpr(prefix_name) = prefix else {
+        return false;
+    };
+    if prefix_name.get_name_text().as_deref() != Some(param_name) {
+        return false;
+    }
+
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return false;
+    };
+    key_name.get_name_text().as_deref() == Some(for_var_name)
+}
+
+fn numeric_for_bounds_cover_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    for_stat: &glua_parser::LuaForStat,
+    access_index: i64,
+) -> bool {
+    let iter_exprs = for_stat.get_iter_expr().collect::<Vec<_>>();
+    let [start_expr, end_expr] = iter_exprs.as_slice() else {
+        return false;
+    };
+    let Some(start) = integer_const_expr_value(db, cache, start_expr) else {
+        return false;
+    };
+    let Some(end) = integer_const_expr_value(db, cache, end_expr) else {
+        return false;
+    };
+    access_index >= start && access_index <= end
+}
+
+fn integer_const_expr_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<i64> {
+    match infer_expr(db, cache, expr.clone()).ok()? {
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn numeric_table_index_query_key_name(var_ref_id: &VarRefId) -> Option<&str> {
+    let VarRefId::IndexRef(_, query_path) = var_ref_id else {
+        return None;
+    };
+    dynamic_bracket_index_name(query_path.deref())
+}
+
+fn numeric_table_index_query_key_name_from_initializer<'a>(
+    db: &DbIndex,
+    root: &'a LuaChunk,
+    var_ref_id: &VarRefId,
+) -> Option<String> {
+    let decl_id = match var_ref_id {
+        VarRefId::IndexRef(query_root, _) => query_root.as_decl_id(),
+        _ => var_ref_id.get_decl_id_ref(),
+    }?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let expr = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaExpr::cast)?;
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return None;
+    };
+    let LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) = index_expr.get_index_key()? else {
+        return None;
+    };
+    name_expr.get_name_text()
+}
+
+fn dynamic_bracket_index_name(path: &str) -> Option<&str> {
+    path.rsplit('.')
+        .next()?
+        .strip_prefix('[')?
+        .strip_suffix(']')
+}
+
+fn unambiguous_integer_const_name_value(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name: &str,
+    before: TextSize,
+) -> Option<i64> {
+    let file_id = cache.get_file_id();
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+    let mut value = None;
+    for decl in decl_tree
+        .get_decls()
+        .values()
+        .filter(|decl| decl.get_name() == name && decl.get_position() <= before)
+    {
+        let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) else {
+            return None;
+        };
+        let decl_value = match type_cache.as_type() {
+            LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => *value,
+            _ => return None,
+        };
+        match value {
+            Some(existing) if existing != decl_value => return None,
+            Some(_) => {}
+            None => value = Some(decl_value),
+        }
+    }
+    value
+}
+
+fn var_ref_matches_root(
+    var_ref_id: &VarRefId,
+    root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+) -> bool {
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => root.as_decl_id() == Some(*decl_id),
+        VarRefId::SelfRef(self_ref_id) => root.receiver_eq(&self_ref_id.receiver),
+        _ => false,
+    }
+}
+
+fn var_ref_is_name(db: &DbIndex, var_ref_id: &VarRefId, name: &str) -> bool {
+    let Some(decl_id) = var_ref_id.get_decl_id_ref() else {
+        return false;
+    };
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.get_name() == name)
+}
+
+fn assignment_vars_write_root(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    vars: &[LuaVarExpr],
+    root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+) -> bool {
+    vars.iter().any(|var| {
+        get_var_expr_var_ref_id(db, cache, var.to_expr())
+            .is_some_and(|var_ref_id| var_ref_matches_root(&var_ref_id, root))
+    })
+}
+
+fn assignment_vars_write_dynamic_key_name(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    vars: &[LuaVarExpr],
+    key_name: &str,
+) -> bool {
+    vars.iter().any(|var| {
+        if let LuaVarExpr::NameExpr(name_expr) = var
+            && name_expr.get_name_text().as_deref() == Some(key_name)
+        {
+            return true;
+        }
+
+        get_var_expr_var_ref_id(db, cache, var.to_expr())
+            .is_some_and(|var_ref_id| var_ref_is_name(db, &var_ref_id, key_name))
+    })
+}
+
+fn expr_contains_immediately_executed_call(expr: &LuaExpr) -> bool {
+    let expr_range = expr.get_range();
+    matches!(expr, LuaExpr::CallExpr(_))
+        || expr
+            .descendants::<LuaCallExpr>()
+            .any(|call_expr| !call_is_inside_nested_closure_expr(&call_expr, expr_range))
+}
+
+fn call_is_inside_nested_closure_expr(call_expr: &LuaCallExpr, expr_range: TextRange) -> bool {
+    call_expr.ancestors::<LuaClosureExpr>().any(|closure| {
+        let closure_range = closure.get_range();
+        closure_range.start() >= expr_range.start() && closure_range.end() <= expr_range.end()
+    })
+}
+
+fn index_expr_numeric_key_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<i64> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Expr(key_expr) => integer_const_expr_value(db, cache, &key_expr),
+        LuaIndexKey::Integer(number) => match number.get_number_value() {
+            NumberResult::Int(value) => Some(value),
+            _ => None,
+        },
+        LuaIndexKey::Idx(value) => Some(value as i64),
+        _ => None,
+    }
 }
 
 fn assigned_prefix_member_type(
