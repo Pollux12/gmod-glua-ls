@@ -13,6 +13,8 @@ use crate::{
     LuaIntersectionType, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignature, LuaSignatureId,
     LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, ReturnTypeKind, VariadicType,
 };
+use crate::{GMOD_DOMAIN_CONVAR, GMOD_ROLE_REFERENCE};
+use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
 use crate::{
     InferGuardRef,
     semantic::{
@@ -426,7 +428,218 @@ fn infer_doc_function(
         ));
     }
 
+    if let Some(registered_convar_type) =
+        get_registered_convar_type_at_call(db, cache, &call_expr, func)
+    {
+        return Ok(Arc::new(
+            LuaFunctionType::new(
+                func.get_async_state(),
+                func.is_colon_define(),
+                func.is_variadic(),
+                func.get_params().to_vec(),
+                registered_convar_type,
+            )
+            .with_optional_params(func.get_optional_params().to_vec()),
+        ));
+    }
+
     Ok(func.clone().into())
+}
+
+fn get_registered_convar_type_at_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    func: &LuaFunctionType,
+) -> Option<LuaType> {
+    if !is_getconvar_reference_call(db, cache, call_expr) {
+        return None;
+    }
+    get_registered_convar_type_for_verified_call(db, cache, call_expr, func)
+}
+
+fn get_registered_convar_type_at_signature_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    call_expr: &LuaCallExpr,
+    func: &LuaFunctionType,
+) -> Option<LuaType> {
+    if !is_getconvar_reference_signature_call(db, signature_id, signature, call_expr) {
+        return None;
+    }
+    get_registered_convar_type_for_verified_call(db, cache, call_expr, func)
+}
+
+fn get_registered_convar_type_for_verified_call(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    call_expr: &LuaCallExpr,
+    func: &LuaFunctionType,
+) -> Option<LuaType> {
+    if !db.get_emmyrc().gmod.enabled || !func.get_ret().is_nullable() {
+        return None;
+    }
+    let convar_name = crate::ast_util::literal_string_arg_value(call_expr, 0)?;
+    let convar_name = convar_name.trim();
+    if convar_name.is_empty() {
+        return None;
+    }
+
+    let call_file_id = cache.get_file_id();
+    let call_offset = call_expr.get_range().start();
+    let call_state = db
+        .get_gmod_infer_index()
+        .get_state_mask_at_offset(&call_file_id, call_offset);
+
+    db.get_gmod_infer_index()
+        .get_system_aggregate()
+        .convar_registrations(convar_name)
+        .iter()
+        .any(|registration| {
+            convar_registration_is_load_available(db, call_file_id, call_offset, registration)
+                && convar_registration_state_is_compatible(
+                    db,
+                    call_state,
+                    registration.file_id,
+                    registration.name_range.start(),
+                    registration.convar_kind,
+                )
+        })
+        .then(|| remove_nil_from_type(func.get_ret().clone()))
+}
+
+fn is_getconvar_reference_signature_call(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if prefix_expr.syntax().text().to_string() != "GetConVar" {
+        return false;
+    }
+    if signature
+        .call_arg_roles_for_param(0)
+        .iter()
+        .any(|role| role.domain == GMOD_DOMAIN_CONVAR && role.role == GMOD_ROLE_REFERENCE)
+    {
+        return true;
+    }
+    db.get_vfs()
+        .get_file_path(&signature_id.get_file_id())
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+fn is_getconvar_reference_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if prefix_expr.syntax().text().to_string() != "GetConVar" {
+        return false;
+    }
+    let Some(signature_id) = get_prefix_expr_signature_id(db, cache, call_expr) else {
+        return false;
+    };
+    if let Some(signature) = db.get_signature_index().get(&signature_id)
+        && signature
+            .call_arg_roles_for_param(0)
+            .iter()
+            .any(|role| role.domain == GMOD_DOMAIN_CONVAR && role.role == GMOD_ROLE_REFERENCE)
+    {
+        return true;
+    }
+    db.get_vfs()
+        .get_file_path(&signature_id.get_file_id())
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+fn convar_registration_is_load_available(
+    db: &DbIndex,
+    call_file_id: crate::FileId,
+    call_offset: rowan::TextSize,
+    registration: &crate::GmodSystemRegistration,
+) -> bool {
+    if db
+        .get_gmod_load_index()
+        .get_file_info(&registration.file_id)
+        .is_some_and(|load_info| load_info.shadowed_by.is_some())
+    {
+        return false;
+    }
+
+    if registration.file_id == call_file_id {
+        return registration.name_range.start() < call_offset;
+    }
+
+    let mut pending = vec![call_file_id];
+    let mut visited = rustc_hash::FxHashSet::default();
+    while let Some(file_id) = pending.pop() {
+        if !visited.insert(file_id) {
+            continue;
+        }
+        let Some(load_info) = db.get_gmod_load_index().get_file_info(&file_id) else {
+            continue;
+        };
+        for edge in &load_info.incoming_edges {
+            if edge.source_file_id == registration.file_id && load_edge_executes_target(edge.kind) {
+                if edge
+                    .range
+                    .is_some_and(|range| registration.name_range.start() < range.start())
+                {
+                    return true;
+                }
+            }
+            if load_edge_executes_target(edge.kind) {
+                pending.push(edge.source_file_id);
+            }
+        }
+    }
+    false
+}
+
+fn convar_registration_state_is_compatible(
+    db: &DbIndex,
+    call_state: GmodStateMask,
+    registration_file_id: crate::FileId,
+    registration_offset: rowan::TextSize,
+    convar_kind: Option<GmodConVarKind>,
+) -> bool {
+    let registration_state = db
+        .get_gmod_infer_index()
+        .get_state_mask_at_offset(&registration_file_id, registration_offset);
+    if !crate::GmodInferIndex::are_state_masks_compatible(call_state, registration_state) {
+        return false;
+    }
+    match convar_kind {
+        Some(GmodConVarKind::Client) => {
+            !call_state.intersects(GmodStateMask::SERVER)
+                && call_state.is_compatible_with(GmodStateMask::CLIENT.union(GmodStateMask::MENU))
+        }
+        _ => registration_state.is_compatible_with(call_state),
+    }
+}
+
+fn load_edge_executes_target(kind: GmodLoadEdgeKind) -> bool {
+    matches!(
+        kind,
+        GmodLoadEdgeKind::Include
+            | GmodLoadEdgeKind::IncludeCS
+            | GmodLoadEdgeKind::Require
+            | GmodLoadEdgeKind::WrapperInclude
+            | GmodLoadEdgeKind::DynamicInclude
+    )
 }
 
 fn infer_generic_doc_function_union(
@@ -486,9 +699,17 @@ fn infer_signature_doc_function(
             fake_doc_function.as_ref(),
             &call_expr,
         );
-        Ok(specialize_falsy_param_returns_for_call(
+        let fake_doc_function = specialize_falsy_param_returns_for_call(
             db,
             cache,
+            signature,
+            fake_doc_function.as_ref(),
+            &call_expr,
+        );
+        Ok(specialize_registered_convar_return_for_call(
+            db,
+            cache,
+            signature_id,
             signature,
             fake_doc_function.as_ref(),
             &call_expr,
@@ -516,14 +737,52 @@ fn infer_signature_doc_function(
             is_generic,
             args_count,
         )?;
-        Ok(specialize_falsy_param_returns_for_call(
+        let resolved = specialize_falsy_param_returns_for_call(
             db,
             cache,
             signature,
             resolved.as_ref(),
             &call_expr,
+        );
+        Ok(specialize_registered_convar_return_for_call(
+            db,
+            cache,
+            signature_id,
+            signature,
+            resolved.as_ref(),
+            &call_expr,
         ))
     }
+}
+
+fn specialize_registered_convar_return_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    signature: &LuaSignature,
+    func: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Arc<LuaFunctionType> {
+    if let Some(registered_convar_type) = get_registered_convar_type_at_signature_call(
+        db,
+        cache,
+        signature_id,
+        signature,
+        call_expr,
+        func,
+    ) {
+        return Arc::new(
+            LuaFunctionType::new(
+                func.get_async_state(),
+                func.is_colon_define(),
+                func.is_variadic(),
+                func.get_params().to_vec(),
+                registered_convar_type,
+            )
+            .with_optional_params(func.get_optional_params().to_vec()),
+        );
+    }
+    Arc::new(func.clone())
 }
 
 fn specialize_nil_guarded_return_for_call(

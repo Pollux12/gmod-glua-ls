@@ -565,6 +565,183 @@ mod test {
     }
 
     #[test]
+    fn test_registration_after_include_still_needs_getconvar_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/init.lua",
+            r#"
+            include("reader.lua")
+            CreateConVar("after_include", "1")
+            "#,
+        );
+        let reader_file = ws.def_file(
+            "gamemodes/sandbox/gamemode/reader.lua",
+            r#"
+            GetConVar("after_include"):GetBool()
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_file, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_shadowed_library_convar_registration_does_not_suppress_getconvar_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/gamemodes/sandbox/gamemode/init.lua",
+            r#"
+            CreateConVar("shadowed_library_only", "1")
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/init.lua",
+            r#"
+            include("reader.lua")
+            "#,
+        );
+        let reader_file = ws.def_file(
+            "gamemodes/sandbox/gamemode/reader.lua",
+            r#"
+            GetConVar("shadowed_library_only"):GetBool()
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader_file, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::NeedCheckNil.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_same_file_prior_convar_registration_suppresses_getconvar_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            CreateConVar("same_file_enabled", "1")
+            GetConVar("same_file_enabled"):GetBool()
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_same_file_prior_convar_registration_suppresses_local_alias_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            CreateConVar("same_file_alias", "1")
+            local c = GetConVar("same_file_alias")
+            c:GetBool()
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[test]
+    fn test_later_convar_registration_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            GetConVar("registered_later"):GetBool()
+            CreateConVar("registered_later", "1")
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
+    fn test_dynamic_getconvar_name_still_needs_nil_check_with_registration() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        def_convar_role_fixture(&mut ws);
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            CreateConVar("dynamic_registered", "1")
+            local name = "dynamic_registered"
+            GetConVar(name):GetBool()
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    #[test]
     fn test_unregistered_cached_getconvar_still_needs_nil_check() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         def_convar_role_fixture(&mut ws);

@@ -150,6 +150,7 @@ pub enum GmodSystemRegistrationKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodSystemRegistration {
     pub kind: GmodSystemRegistrationKind,
+    pub convar_kind: Option<GmodConVarKind>,
     pub name: String,
     pub file_id: FileId,
     pub name_range: TextRange,
@@ -178,9 +179,14 @@ impl GmodSystemAggregate {
             .unwrap_or(0)
     }
 
+    pub fn convar_registrations(&self, name: &str) -> &[GmodSystemRegistration] {
+        self.registrations(GmodSystemRegistrationKind::Convar, name)
+    }
+
     fn add_registration(
         &mut self,
         kind: GmodSystemRegistrationKind,
+        convar_kind: Option<GmodConVarKind>,
         name: &str,
         file_id: FileId,
         name_range: TextRange,
@@ -190,6 +196,7 @@ impl GmodSystemAggregate {
             .or_default()
             .push(GmodSystemRegistration {
                 kind,
+                convar_kind,
                 name: name.to_string(),
                 file_id,
                 name_range,
@@ -313,6 +320,7 @@ impl GmodInferIndex {
                     if let Some(name_range) = site.name_range {
                         aggregate.add_registration(
                             GmodSystemRegistrationKind::NetMessage,
+                            None,
                             name,
                             *file_id,
                             name_range,
@@ -330,6 +338,7 @@ impl GmodInferIndex {
                     if let Some(name_range) = site.name_range {
                         aggregate.add_registration(
                             GmodSystemRegistrationKind::Concommand,
+                            None,
                             name,
                             *file_id,
                             name_range,
@@ -347,6 +356,7 @@ impl GmodInferIndex {
                     if let Some(name_range) = site.name_range {
                         aggregate.add_registration(
                             GmodSystemRegistrationKind::Convar,
+                            Some(site.kind),
                             name,
                             *file_id,
                             name_range,
