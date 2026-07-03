@@ -10,8 +10,9 @@ use glua_parser::{
     LuaChunk, LuaClosureExpr, LuaComment, LuaCommentOwner, LuaDocDescriptionOwner, LuaDocTag,
     LuaDocTagFileparam, LuaDocTagRealm, LuaElseClauseStat, LuaElseIfClauseStat, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIfStat, LuaIndexKey, LuaLiteralToken,
-    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaRepeatStat, LuaStat, LuaSyntaxId,
-    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, LuaWhileStat, NumberResult, PathTrait,
+    LuaLocalFuncStat, LuaLocalName, LuaLocalStat, LuaNameExpr, LuaParamName, LuaRepeatStat,
+    LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, LuaWhileStat,
+    NumberResult, PathTrait,
 };
 
 use crate::{
@@ -567,7 +568,12 @@ fn collect_numeric_range_table_populations_for_file(
                     continue;
                 };
                 if let Some(population) = numeric_range_population_from_helper_call(
-                    db, &mut cache, file_id, closure, &call_expr,
+                    db,
+                    &mut cache,
+                    file_id,
+                    closure,
+                    &call_expr,
+                    &local_helpers,
                 ) {
                     populations.push(population);
                 } else if let Some(outer_populations) = numeric_range_populations_from_outer_call(
@@ -635,6 +641,13 @@ fn numeric_range_populations_from_outer_call(
             LuaStat::CallExprStat(call_stat) => {
                 let call_expr = call_stat.get_call_expr()?;
                 let helper_name = call_expr_name(&call_expr)?;
+                if call_name_shadowed_in_closure_before_call(
+                    outer_closure,
+                    &helper_name,
+                    &call_expr,
+                ) {
+                    return None;
+                }
                 let fill_closure = helpers.get(&helper_name)?;
                 let population = numeric_range_population_from_helper_call(
                     db,
@@ -642,6 +655,7 @@ fn numeric_range_populations_from_outer_call(
                     file_id,
                     fill_closure,
                     &call_expr,
+                    helpers,
                 )?;
                 populated_tables.insert(population.table_global.clone());
                 populations.push(population);
@@ -769,12 +783,82 @@ fn call_expr_name(call_expr: &LuaCallExpr) -> Option<String> {
     name_expr.get_name_text()
 }
 
+fn call_name_shadowed_in_closure_before_call(
+    closure: &LuaClosureExpr,
+    call_name: &str,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    if closure.get_params_list().is_some_and(|params| {
+        params
+            .get_params()
+            .any(|param| param_name_eq(&param, call_name))
+    }) {
+        return true;
+    }
+
+    let Some(block) = closure.get_block() else {
+        return true;
+    };
+    let call_start = call_expr.syntax().text_range().start();
+
+    for local_stat in block.syntax().descendants().filter_map(LuaLocalStat::cast) {
+        if is_node_in_nested_closure(local_stat.syntax(), block.syntax())
+            || !node_ends_before(local_stat.syntax(), call_start)
+        {
+            continue;
+        }
+        if local_stat
+            .get_local_name_list()
+            .any(|local_name| local_name_name_eq(&local_name, call_name))
+        {
+            return true;
+        }
+    }
+
+    for local_func in block
+        .syntax()
+        .descendants()
+        .filter_map(LuaLocalFuncStat::cast)
+    {
+        if is_node_in_nested_closure(local_func.syntax(), block.syntax())
+            || !node_ends_before(local_func.syntax(), call_start)
+        {
+            continue;
+        }
+        if local_func
+            .get_local_name()
+            .is_some_and(|local_name| local_name_name_eq(&local_name, call_name))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn node_ends_before(node: &LuaSyntaxNode, position: TextSize) -> bool {
+    node.text_range().end() <= position
+}
+
+fn param_name_eq(param: &LuaParamName, name: &str) -> bool {
+    param
+        .get_name_token()
+        .is_some_and(|name_token| name_token.get_name_text() == name)
+}
+
+fn local_name_name_eq(local_name: &LuaLocalName, name: &str) -> bool {
+    local_name
+        .get_name_token()
+        .is_some_and(|name_token| name_token.get_name_text() == name)
+}
+
 fn numeric_range_population_from_helper_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
     closure: &LuaClosureExpr,
     call_expr: &LuaCallExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
 ) -> Option<TableNumericRangePopulation> {
     let args = call_expr
         .get_args_list()
@@ -808,9 +892,6 @@ fn numeric_range_population_from_helper_call(
     else {
         return None;
     };
-    if expr_contains_immediately_executed_call(rhs_expr) {
-        return None;
-    }
     let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
         return None;
     };
@@ -833,6 +914,9 @@ fn numeric_range_population_from_helper_call(
         return None;
     }
     let table_global = table_name_expr.get_name_text()?.to_string();
+    if !numeric_range_rhs_is_safe(db, file_id, closure, rhs_expr, helpers, &table_global) {
+        return None;
+    }
     let rhs_type = infer_expr(db, cache, rhs_expr.clone()).ok()?;
     if rhs_type.is_nullable() || rhs_type.is_nil() {
         return None;
@@ -859,8 +943,121 @@ fn integer_const_expr_value(
     }
 }
 
-fn expr_contains_immediately_executed_call(expr: &LuaExpr) -> bool {
-    expr.descendants::<LuaCallExpr>().next().is_some()
+fn numeric_range_rhs_is_safe(
+    db: &DbIndex,
+    file_id: FileId,
+    fill_closure: &LuaClosureExpr,
+    rhs_expr: &LuaExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+    table_global: &str,
+) -> bool {
+    let calls = rhs_expr.descendants::<LuaCallExpr>().collect::<Vec<_>>();
+    if calls.is_empty() {
+        return true;
+    }
+
+    calls.into_iter().all(|call_expr| {
+        let Some(helper_name) = call_expr_name(&call_expr) else {
+            return false;
+        };
+        if call_name_shadowed_in_closure_before_call(fill_closure, &helper_name, &call_expr) {
+            return false;
+        }
+        let Some(helper_closure) = helpers.get(&helper_name) else {
+            return false;
+        };
+
+        rhs_helper_body_is_safe(db, file_id, helper_closure, helpers, table_global)
+    })
+}
+
+fn rhs_helper_body_is_safe(
+    db: &DbIndex,
+    file_id: FileId,
+    helper_closure: &LuaClosureExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+    table_global: &str,
+) -> bool {
+    let Some(block) = helper_closure.get_block() else {
+        return false;
+    };
+
+    for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if !is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
+            return false;
+        }
+    }
+
+    let mut protected_names = helpers.keys().map(String::as_str).collect::<HashSet<_>>();
+    protected_names.insert(table_global);
+
+    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        if is_node_in_nested_closure(assign_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars
+            .iter()
+            .any(|var| matches!(var, LuaVarExpr::IndexExpr(_)))
+        {
+            return false;
+        }
+        if vars.into_iter().any(|var| {
+            var_writes_protected_numeric_range_identity(db, file_id, &var, &protected_names)
+        }) {
+            return false;
+        }
+    }
+
+    for local_stat in block.syntax().descendants().filter_map(LuaLocalStat::cast) {
+        if is_node_in_nested_closure(local_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        if local_shadows_protected_numeric_range_identity(&local_stat, &protected_names) {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn local_shadows_protected_numeric_range_identity(
+    local_stat: &LuaLocalStat,
+    protected_names: &HashSet<&str>,
+) -> bool {
+    local_stat.get_local_name_list().any(|local_name| {
+        local_name
+            .get_name_token()
+            .is_some_and(|name| protected_names.contains(name.get_name_text()))
+    })
+}
+
+fn var_writes_protected_numeric_range_identity(
+    db: &DbIndex,
+    file_id: FileId,
+    var: &LuaVarExpr,
+    protected_names: &HashSet<&str>,
+) -> bool {
+    match var {
+        LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text().is_some_and(|name| {
+            protected_names.contains(name.as_str())
+                || !name_expr_resolves_to_local(db, file_id, name_expr)
+        }),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr().is_some_and(|prefix| {
+            expr_reads_protected_numeric_range_identity(&prefix, protected_names)
+        }),
+    }
+}
+
+fn expr_reads_protected_numeric_range_identity(
+    expr: &LuaExpr,
+    protected_names: &HashSet<&str>,
+) -> bool {
+    expr.descendants::<LuaNameExpr>().any(|name_expr| {
+        name_expr
+            .get_name_text()
+            .is_some_and(|name| protected_names.contains(name.as_str()))
+    })
 }
 
 fn collect_annotated_scripted_class_calls(db: &mut DbIndex, context: &AnalyzeContext) {
