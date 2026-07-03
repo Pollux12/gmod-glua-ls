@@ -8,10 +8,10 @@ use glua_parser::{
 use rowan::{TextRange, TextSize};
 
 use crate::{
-    AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
+    AssignVarHint, CacheEntry, DbIndex, FileId, FlowAntecedent, FlowId, FlowNode, FlowNodeKind,
+    FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+    LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
     semantic::cache::FlowOrigin,
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -1630,6 +1630,271 @@ fn try_get_numeric_range_table_arg_population_type(
     }
 
     Ok(Some(rhs_type))
+}
+
+pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let (table_global, access_index) = numeric_global_table_index_query(db, cache, index_expr)?;
+    let reader_file_id = cache.get_file_id();
+    let access_position = index_expr.get_position();
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&reader_file_id, access_position);
+    for population in db
+        .get_numeric_range_population_index()
+        .get_for_global(&table_global)
+    {
+        if population.file_id == reader_file_id {
+            continue;
+        }
+        if access_index < population.start || access_index > population.end {
+            continue;
+        }
+        let Some((pop_pos, reader_pos, roots)) =
+            population_load_positions(db, population.file_id, reader_file_id, query_realm)
+        else {
+            continue;
+        };
+        if pop_pos >= reader_pos {
+            continue;
+        }
+        if load_ordered_file_between_has_global_table_uncertainty(
+            db,
+            &roots,
+            pop_pos,
+            reader_pos,
+            &table_global,
+        ) {
+            continue;
+        }
+        if file_has_global_table_uncertainty_after(
+            db,
+            population.file_id,
+            &table_global,
+            population.call_range.end(),
+        ) {
+            continue;
+        }
+        if read_inside_nested_closure(index_expr)
+            && current_file_has_any_top_level_global_table_uncertainty(index_expr, &table_global)
+        {
+            continue;
+        }
+        if current_scope_has_prior_global_table_uncertainty(index_expr, &table_global) {
+            continue;
+        }
+        return Some(population.value_type.clone());
+    }
+    None
+}
+
+fn numeric_global_table_index_query(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<(String, i64)> {
+    let access_index = index_expr_numeric_key_value(db, cache, index_expr)?;
+    let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if !name_expr_is_global_root(db, cache, &table_name) {
+        return None;
+    }
+    Some((table_name.get_name_text()?, access_index))
+}
+
+fn population_load_positions(
+    db: &DbIndex,
+    population_file_id: FileId,
+    reader_file_id: FileId,
+    query_realm: GmodRealm,
+) -> Option<(
+    usize,
+    usize,
+    Vec<(FileId, crate::GmodLoadRootKind, crate::GmodLoadOrderKey)>,
+)> {
+    let state = crate::GmodStateMask::from_realm(query_realm).as_caller_compatibility_mask();
+    let roots = db.get_gmod_load_index().engine_roots_in_load_order(state);
+    let pop_pos = roots
+        .iter()
+        .position(|(file_id, _, _)| *file_id == population_file_id);
+    let reader_pos = roots
+        .iter()
+        .position(|(file_id, _, _)| *file_id == reader_file_id);
+    Some((pop_pos?, reader_pos?, roots))
+}
+
+fn load_ordered_file_between_has_global_table_uncertainty(
+    db: &DbIndex,
+    roots: &[(FileId, crate::GmodLoadRootKind, crate::GmodLoadOrderKey)],
+    pop_pos: usize,
+    reader_pos: usize,
+    table_global: &str,
+) -> bool {
+    for (file_id, _, _) in &roots[pop_pos + 1..reader_pos] {
+        let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
+            return true;
+        };
+        let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
+            return true;
+        };
+        if file_has_top_level_global_table_uncertainty(&chunk, table_global) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_has_top_level_global_table_uncertainty(root: &LuaChunk, table_global: &str) -> bool {
+    let Some(block) = root.get_block() else {
+        return true;
+    };
+    for stat in block.get_stats() {
+        if top_level_stat_may_mutate_global_table(&stat, table_global) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_has_global_table_uncertainty_after(
+    db: &DbIndex,
+    file_id: FileId,
+    table_global: &str,
+    after: TextSize,
+) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return true;
+    };
+    let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
+        return true;
+    };
+    let Some(block) = chunk.get_block() else {
+        return true;
+    };
+    for stat in block.get_stats().filter(|stat| stat.get_position() > after) {
+        if top_level_stat_may_mutate_global_table(&stat, table_global) {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_inside_nested_closure(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .syntax()
+        .ancestors()
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
+}
+
+fn current_file_has_any_top_level_global_table_uncertainty(
+    index_expr: &LuaIndexExpr,
+    table_global: &str,
+) -> bool {
+    let Some(root) = LuaChunk::cast(index_expr.get_root()) else {
+        return true;
+    };
+    file_has_top_level_global_table_uncertainty(&root, table_global)
+}
+
+fn current_scope_has_prior_global_table_uncertainty(
+    index_expr: &LuaIndexExpr,
+    table_global: &str,
+) -> bool {
+    let mut before = index_expr.get_position();
+    if enclosing_control_flow_has_prior_call(index_expr, before) {
+        return true;
+    }
+    for block in index_expr.syntax().ancestors().filter_map(LuaBlock::cast) {
+        for stat in block
+            .get_stats()
+            .take_while(|stat| stat.get_position() < before)
+        {
+            if top_level_stat_may_mutate_global_table(&stat, table_global) {
+                return true;
+            }
+        }
+        before = block.get_position();
+    }
+    false
+}
+
+fn enclosing_control_flow_has_prior_call(index_expr: &LuaIndexExpr, before: TextSize) -> bool {
+    for stat in index_expr.syntax().ancestors().filter_map(LuaStat::cast) {
+        if !matches!(
+            stat,
+            LuaStat::IfStat(_)
+                | LuaStat::WhileStat(_)
+                | LuaStat::RepeatStat(_)
+                | LuaStat::ForStat(_)
+                | LuaStat::ForRangeStat(_)
+        ) {
+            continue;
+        }
+        for call_expr in stat.descendants::<LuaCallExpr>() {
+            if call_expr.get_position() < before
+                && !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax())
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn top_level_stat_may_mutate_global_table(stat: &LuaStat, table_global: &str) -> bool {
+    for call_expr in stat.descendants::<LuaCallExpr>() {
+        if !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax()) {
+            return true;
+        }
+    }
+    for assign_stat in stat.descendants::<LuaAssignStat>() {
+        if node_is_inside_nested_closure(assign_stat.syntax(), stat.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars
+            .iter()
+            .any(|var| var_expr_may_mutate_global_table(var, table_global))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn node_is_inside_nested_closure(
+    node: &glua_parser::LuaSyntaxNode,
+    boundary: &glua_parser::LuaSyntaxNode,
+) -> bool {
+    node.ancestors()
+        .take_while(|ancestor| ancestor != boundary)
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
+}
+
+fn var_expr_may_mutate_global_table(var: &LuaVarExpr, table_global: &str) -> bool {
+    match var {
+        LuaVarExpr::NameExpr(name_expr) => {
+            name_expr.get_name_text().as_deref() == Some(table_global)
+        }
+        LuaVarExpr::IndexExpr(index_expr) => {
+            index_expr_global_root_name(index_expr).as_deref() == Some(table_global)
+        }
+    }
+}
+
+fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    let mut prefix = index_expr.get_prefix_expr()?;
+    while let LuaExpr::IndexExpr(parent_index) = prefix {
+        prefix = parent_index.get_prefix_expr()?;
+    }
+    let LuaExpr::NameExpr(name_expr) = prefix else {
+        return None;
+    };
+    name_expr.get_name_text()
 }
 
 fn numeric_table_index_query(

@@ -13,6 +13,7 @@ mod gmod_network;
 mod member;
 mod metatable;
 mod module;
+mod numeric_range_population;
 mod operators;
 mod property;
 mod reference;
@@ -40,6 +41,7 @@ pub use gmod_network::*;
 pub use member::*;
 pub use metatable::{LuaMetatableIndex, SetmetatableFactoryBinding};
 pub use module::*;
+pub use numeric_range_population::*;
 pub use operators::*;
 pub use property::*;
 pub use reference::*;
@@ -71,6 +73,7 @@ pub struct DbIndex {
     dynamic_field_index: DynamicFieldIndex,
     vfs: Vfs,
     file_dependencies_index: LuaDependencyIndex,
+    numeric_range_population_index: NumericRangePopulationIndex,
     metatable_index: LuaMetatableIndex,
     global_index: LuaGlobalIndex,
     json_schema_index: JsonSchemaIndex,
@@ -125,6 +128,7 @@ impl DbIndex {
             dynamic_field_index: DynamicFieldIndex::new(),
             vfs: Vfs::new(),
             file_dependencies_index: LuaDependencyIndex::new(),
+            numeric_range_population_index: NumericRangePopulationIndex::new(),
             metatable_index: LuaMetatableIndex::new(),
             global_index: LuaGlobalIndex::new(),
             json_schema_index: JsonSchemaIndex::new(),
@@ -341,6 +345,14 @@ impl DbIndex {
         &mut self.file_dependencies_index
     }
 
+    pub fn get_numeric_range_population_index(&self) -> &NumericRangePopulationIndex {
+        &self.numeric_range_population_index
+    }
+
+    pub fn get_numeric_range_population_index_mut(&mut self) -> &mut NumericRangePopulationIndex {
+        &mut self.numeric_range_population_index
+    }
+
     pub fn get_global_index(&self) -> &LuaGlobalIndex {
         &self.global_index
     }
@@ -401,6 +413,7 @@ impl LuaIndex for DbIndex {
         self.gmod_network_index.remove(file_id);
         self.dynamic_field_index.remove(file_id);
         self.file_dependencies_index.remove(file_id);
+        self.numeric_range_population_index.remove(file_id);
         self.metatable_index.remove(file_id);
         self.global_index.remove(file_id);
         self.json_schema_index.remove(file_id);
@@ -426,6 +439,7 @@ impl LuaIndex for DbIndex {
         self.gmod_network_index.clear();
         self.dynamic_field_index.clear();
         self.file_dependencies_index.clear();
+        self.numeric_range_population_index.clear();
         self.metatable_index.clear();
         self.global_index.clear();
         self.json_schema_index.clear();

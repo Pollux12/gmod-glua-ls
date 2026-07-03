@@ -28,7 +28,10 @@ use crate::{
             VarRefId, VarRefRootId,
             infer_index::infer_array::infer_array_member,
             infer_name::get_name_expr_var_ref_id,
-            narrow::{infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin},
+            narrow::{
+                get_type_at_flow::try_get_cross_file_numeric_range_population_type_for_index,
+                infer_expr_narrow_type, infer_expr_narrow_type_with_flow_origin,
+            },
         },
         is_doc_tag_table_const,
         member::cached_local_class_table_member_ids,
@@ -55,6 +58,13 @@ pub fn infer_index_expr(
     index_expr: LuaIndexExpr,
     pass_flow: bool,
 ) -> InferResult {
+    if pass_flow
+        && let Some(populated_type) =
+            try_get_cross_file_numeric_range_population_type_for_index(db, cache, &index_expr)
+    {
+        return Ok(populated_type);
+    }
+
     let prefix_expr = index_expr.get_prefix_expr().ok_or(InferFailReason::None)?;
     let mut prefix_is_unresolved_param = false;
     let prefix_type = match infer_expr(db, cache, prefix_expr.clone()) {
