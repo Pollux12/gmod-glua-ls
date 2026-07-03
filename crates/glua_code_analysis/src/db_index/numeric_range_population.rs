@@ -51,6 +51,10 @@ impl NumericRangePopulationIndex {
             .unwrap_or(&[])
     }
 
+    pub fn has_global(&self, table_global: &str) -> bool {
+        self.by_global.contains_key(table_global)
+    }
+
     pub fn remove(&mut self, file_id: FileId) {
         if let Some(populations) = self.by_file.remove(&file_id) {
             for population in populations {

@@ -1712,18 +1712,25 @@ fn numeric_global_table_index_query(
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> Option<(String, i64, Option<String>)> {
+    let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let table_global = table_name.get_name_text()?;
+    if !db
+        .get_numeric_range_population_index()
+        .has_global(&table_global)
+    {
+        return None;
+    }
+    if !name_expr_is_global_root(db, cache, &table_name) {
+        return None;
+    }
     let access_index = index_expr_numeric_key_value(db, cache, index_expr)?;
     let key_name = match index_expr.get_index_key()? {
         LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) => name_expr.get_name_text(),
         _ => None,
     };
-    let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
-        return None;
-    };
-    if !name_expr_is_global_root(db, cache, &table_name) {
-        return None;
-    }
-    Some((table_name.get_name_text()?, access_index, key_name))
+    Some((table_global, access_index, key_name))
 }
 
 fn population_load_positions(
