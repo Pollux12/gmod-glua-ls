@@ -1667,29 +1667,32 @@ pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
         if pop_pos >= reader_pos {
             continue;
         }
+        let mut mutation_roots = Vec::with_capacity(1 + population.alias_roots.len());
+        mutation_roots.push(population.table_global.as_str());
+        mutation_roots.extend(population.alias_roots.iter().map(String::as_str));
         if load_ordered_file_between_has_global_table_uncertainty(
             db,
             &roots,
             pop_pos,
             reader_pos,
-            &table_global,
+            &mutation_roots,
         ) {
             continue;
         }
         if file_has_global_table_uncertainty_after(
             db,
             population.file_id,
-            &table_global,
+            &mutation_roots,
             population.call_range.end(),
         ) {
             continue;
         }
         if read_inside_nested_closure(index_expr)
-            && current_file_has_any_top_level_global_table_uncertainty(index_expr, &table_global)
+            && current_file_has_any_top_level_global_table_uncertainty(index_expr, &mutation_roots)
         {
             continue;
         }
-        if current_scope_has_prior_global_table_uncertainty(index_expr, &table_global) {
+        if current_scope_has_prior_global_table_uncertainty(index_expr, &mutation_roots) {
             continue;
         }
         return Some(population.value_type.clone());
@@ -1742,7 +1745,7 @@ fn load_ordered_file_between_has_global_table_uncertainty(
     roots: &[(FileId, crate::GmodLoadRootKind, crate::GmodLoadOrderKey)],
     pop_pos: usize,
     reader_pos: usize,
-    table_global: &str,
+    mutation_roots: &[&str],
 ) -> bool {
     for (file_id, _, _) in &roots[pop_pos + 1..reader_pos] {
         let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
@@ -1751,19 +1754,19 @@ fn load_ordered_file_between_has_global_table_uncertainty(
         let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
             return true;
         };
-        if file_has_top_level_global_table_uncertainty(&chunk, table_global) {
+        if file_has_top_level_global_table_uncertainty(&chunk, mutation_roots) {
             return true;
         }
     }
     false
 }
 
-fn file_has_top_level_global_table_uncertainty(root: &LuaChunk, table_global: &str) -> bool {
+fn file_has_top_level_global_table_uncertainty(root: &LuaChunk, mutation_roots: &[&str]) -> bool {
     let Some(block) = root.get_block() else {
         return true;
     };
     for stat in block.get_stats() {
-        if top_level_stat_may_mutate_global_table(&stat, table_global) {
+        if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
             return true;
         }
     }
@@ -1773,7 +1776,7 @@ fn file_has_top_level_global_table_uncertainty(root: &LuaChunk, table_global: &s
 fn file_has_global_table_uncertainty_after(
     db: &DbIndex,
     file_id: FileId,
-    table_global: &str,
+    mutation_roots: &[&str],
     after: TextSize,
 ) -> bool {
     let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
@@ -1786,7 +1789,7 @@ fn file_has_global_table_uncertainty_after(
         return true;
     };
     for stat in block.get_stats().filter(|stat| stat.get_position() > after) {
-        if top_level_stat_may_mutate_global_table(&stat, table_global) {
+        if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
             return true;
         }
     }
@@ -1802,17 +1805,17 @@ fn read_inside_nested_closure(index_expr: &LuaIndexExpr) -> bool {
 
 fn current_file_has_any_top_level_global_table_uncertainty(
     index_expr: &LuaIndexExpr,
-    table_global: &str,
+    mutation_roots: &[&str],
 ) -> bool {
     let Some(root) = LuaChunk::cast(index_expr.get_root()) else {
         return true;
     };
-    file_has_top_level_global_table_uncertainty(&root, table_global)
+    file_has_top_level_global_table_uncertainty(&root, mutation_roots)
 }
 
 fn current_scope_has_prior_global_table_uncertainty(
     index_expr: &LuaIndexExpr,
-    table_global: &str,
+    mutation_roots: &[&str],
 ) -> bool {
     let mut before = index_expr.get_position();
     if enclosing_control_flow_has_prior_call(index_expr, before) {
@@ -1823,7 +1826,7 @@ fn current_scope_has_prior_global_table_uncertainty(
             .get_stats()
             .take_while(|stat| stat.get_position() < before)
         {
-            if top_level_stat_may_mutate_global_table(&stat, table_global) {
+            if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
                 return true;
             }
         }
@@ -1855,7 +1858,7 @@ fn enclosing_control_flow_has_prior_call(index_expr: &LuaIndexExpr, before: Text
     false
 }
 
-fn top_level_stat_may_mutate_global_table(stat: &LuaStat, table_global: &str) -> bool {
+fn top_level_stat_may_mutate_global_table(stat: &LuaStat, mutation_roots: &[&str]) -> bool {
     for call_expr in stat.descendants::<LuaCallExpr>() {
         if !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax()) {
             return true;
@@ -1868,7 +1871,7 @@ fn top_level_stat_may_mutate_global_table(stat: &LuaStat, table_global: &str) ->
         let (vars, _) = assign_stat.get_var_and_expr_list();
         if vars
             .iter()
-            .any(|var| var_expr_may_mutate_global_table(var, table_global))
+            .any(|var| var_expr_may_mutate_global_table(var, mutation_roots))
         {
             return true;
         }
@@ -1885,14 +1888,13 @@ fn node_is_inside_nested_closure(
         .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
 }
 
-fn var_expr_may_mutate_global_table(var: &LuaVarExpr, table_global: &str) -> bool {
+fn var_expr_may_mutate_global_table(var: &LuaVarExpr, mutation_roots: &[&str]) -> bool {
     match var {
-        LuaVarExpr::NameExpr(name_expr) => {
-            name_expr.get_name_text().as_deref() == Some(table_global)
-        }
-        LuaVarExpr::IndexExpr(index_expr) => {
-            index_expr_global_root_name(index_expr).as_deref() == Some(table_global)
-        }
+        LuaVarExpr::NameExpr(name_expr) => name_expr
+            .get_name_text()
+            .is_some_and(|name| mutation_roots.iter().any(|root| *root == name)),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr_global_root_name(index_expr)
+            .is_some_and(|name| mutation_roots.iter().any(|root| *root == name)),
     }
 }
 

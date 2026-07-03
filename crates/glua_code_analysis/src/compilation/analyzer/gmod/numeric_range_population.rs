@@ -150,6 +150,23 @@ fn numeric_range_populations_from_outer_call(
                     }
                 }
             }
+            LuaStat::AssignStat(assign_stat)
+                if !assign_writes_tracked_helper(&assign_stat, helpers)
+                    && attach_exact_alias_assignment(
+                        db,
+                        file_id,
+                        &assign_stat,
+                        &mut populations,
+                    ) => {}
+            LuaStat::AssignStat(assign_stat)
+                if !assign_writes_tracked_helper(&assign_stat, helpers)
+                    && drop_mutated_population_facts(&assign_stat, &mut populations) =>
+            {
+                populated_tables = populations
+                    .iter()
+                    .map(|population| population.table_global.clone())
+                    .collect();
+            }
             LuaStat::LocalStat(local_stat)
                 if !local_shadows_tracked_helper(&local_stat, helpers)
                     && is_harmless_local_alias_or_assignment(&local_stat) => {}
@@ -161,6 +178,80 @@ fn numeric_range_populations_from_outer_call(
         None
     } else {
         Some(populations)
+    }
+}
+
+fn attach_exact_alias_assignment(
+    db: &DbIndex,
+    file_id: FileId,
+    assign_stat: &LuaAssignStat,
+    populations: &mut [TableNumericRangePopulation],
+) -> bool {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let ([LuaVarExpr::NameExpr(alias_name)], [LuaExpr::NameExpr(source_name)]) =
+        (vars.as_slice(), exprs.as_slice())
+    else {
+        return false;
+    };
+    let Some(alias_root) = alias_name.get_name_text() else {
+        return false;
+    };
+    let Some(source_root) = source_name.get_name_text() else {
+        return false;
+    };
+    if name_expr_resolves_to_local(db, file_id, alias_name)
+        || name_expr_resolves_to_local(db, file_id, source_name)
+    {
+        return false;
+    }
+    for population in populations {
+        if population.table_global == source_root {
+            population.alias_roots.push(alias_root.clone());
+            population.alias_roots.sort();
+            population.alias_roots.dedup();
+            return true;
+        }
+    }
+    false
+}
+
+fn drop_mutated_population_facts(
+    assign_stat: &LuaAssignStat,
+    populations: &mut Vec<TableNumericRangePopulation>,
+) -> bool {
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    let original_len = populations.len();
+    populations.retain(|population| {
+        let mut mutation_roots = Vec::with_capacity(1 + population.alias_roots.len());
+        mutation_roots.push(population.table_global.as_str());
+        mutation_roots.extend(population.alias_roots.iter().map(String::as_str));
+        !vars
+            .iter()
+            .any(|var| var_may_mutate_any_global_root(var, &mutation_roots))
+    });
+    populations.len() != original_len
+}
+
+fn var_may_mutate_any_global_root(var: &LuaVarExpr, roots: &[&str]) -> bool {
+    match var {
+        LuaVarExpr::NameExpr(name_expr) => name_expr
+            .get_name_text()
+            .is_some_and(|name| roots.iter().any(|root| *root == name)),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr
+            .get_prefix_expr()
+            .and_then(|prefix| root_name_from_expr(&prefix))
+            .is_some_and(|name| roots.iter().any(|root| *root == name)),
+    }
+}
+
+fn root_name_from_expr(expr: &LuaExpr) -> Option<String> {
+    let mut prefix = expr.clone();
+    while let LuaExpr::IndexExpr(index_expr) = prefix {
+        prefix = index_expr.get_prefix_expr()?;
+    }
+    match prefix {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        _ => None,
     }
 }
 
@@ -454,6 +545,7 @@ fn numeric_range_population_from_helper_call(
         end,
         value_type: rhs_type,
         write_roots,
+        alias_roots: Vec::new(),
         file_id,
         call_range: call_expr.get_range(),
     })
