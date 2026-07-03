@@ -22,7 +22,7 @@ use crate::{
     GmodVguiPanelCallRoles, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
     LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
     LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, SemanticDeclGuard, SemanticDeclLevel,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -34,9 +34,13 @@ use crate::{
         LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
         NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation,
     },
-    db_index::{rebuild_effective_valid_guard_signatures, signature_is_side_effect_free},
+    db_index::{
+        GMOD_ATTR_SIDE_EFFECT_FREE, rebuild_effective_valid_guard_signatures,
+        signature_is_side_effect_free,
+    },
     infer_expr,
     profile::Profile,
+    semantic::{get_member_value_expr, infer_expr_semantic_decl},
 };
 use rowan::{TextRange, TextSize};
 
@@ -581,6 +585,7 @@ fn collect_numeric_range_table_populations_for_file(
                     &mut cache,
                     file_id,
                     closure,
+                    &call_expr,
                     &local_helpers,
                 ) {
                     populations.extend(outer_populations);
@@ -630,6 +635,7 @@ fn numeric_range_populations_from_outer_call(
     cache: &mut LuaInferCache,
     file_id: FileId,
     outer_closure: &LuaClosureExpr,
+    outer_call_expr: &LuaCallExpr,
     helpers: &HashMap<String, LuaClosureExpr>,
 ) -> Option<Vec<TableNumericRangePopulation>> {
     let block = outer_closure.get_block()?;
@@ -656,7 +662,9 @@ fn numeric_range_populations_from_outer_call(
                     fill_closure,
                     &call_expr,
                     helpers,
-                )?;
+                );
+                let mut population = population?;
+                population.call_range = outer_call_expr.get_range();
                 populated_tables.insert(population.table_global.clone());
                 populations.push(population);
             }
@@ -925,11 +933,19 @@ fn numeric_range_population_from_helper_call(
     ) {
         return None;
     }
-    let rhs_type = infer_expr(db, cache, rhs_expr.clone()).ok()?;
+    let mut rhs_type = infer_expr(db, cache, rhs_expr.clone()).ok().or_else(|| {
+        infer_tracked_safe_helper_call_return_type(db, cache, file_id, rhs_expr, helpers)
+    })?;
+    if rhs_type.is_nullable() || rhs_type.is_nil() {
+        if let Some(helper_return_type) =
+            infer_tracked_safe_helper_call_return_type(db, cache, file_id, rhs_expr, helpers)
+        {
+            rhs_type = helper_return_type;
+        }
+    }
     if rhs_type.is_nullable() || rhs_type.is_nil() {
         return None;
     }
-
     Some(TableNumericRangePopulation {
         table_global,
         start,
@@ -938,6 +954,145 @@ fn numeric_range_population_from_helper_call(
         file_id,
         call_range: call_expr.get_range(),
     })
+}
+
+fn infer_tracked_safe_helper_call_return_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    rhs_expr: &LuaExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+) -> Option<LuaType> {
+    // Only recover a non-null RHS type for tracked helpers whose bodies have already
+    // passed the numeric-range population safety checks. This is intentionally not a
+    // general local return-flow inference path.
+    let LuaExpr::CallExpr(call_expr) = rhs_expr else {
+        return None;
+    };
+    let helper_name = call_expr_name(call_expr)?;
+    let LuaExpr::NameExpr(name_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if !name_expr_resolves_to_local(db, file_id, &name_expr) {
+        return None;
+    }
+
+    let helper_closure = helpers.get(&helper_name)?;
+    let block = helper_closure.get_block()?;
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let params = helper_closure
+        .get_params_list()
+        .map(|params| params.get_params().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let param_names = params
+        .iter()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|token| token.get_name_text().to_string())
+        })
+        .collect::<HashSet<_>>();
+    if helper_body_mutates_or_shadows_params(block.syntax(), &param_names) {
+        return None;
+    }
+    let mut return_types = Vec::new();
+    for return_stat in block
+        .syntax()
+        .descendants()
+        .filter_map(glua_parser::LuaReturnStat::cast)
+    {
+        if is_node_in_nested_closure(return_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let return_exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+        let [return_expr] = return_exprs.as_slice() else {
+            return None;
+        };
+        let return_type =
+            infer_safe_helper_return_expr_type(db, cache, return_expr, &params, &args)?;
+        if return_type.is_nullable() || return_type.is_nil() {
+            return None;
+        }
+        return_types.push(return_type);
+    }
+
+    if return_types.is_empty() {
+        None
+    } else {
+        Some(LuaType::from_vec(return_types))
+    }
+}
+
+fn helper_body_mutates_or_shadows_params(
+    block: &LuaSyntaxNode,
+    param_names: &HashSet<String>,
+) -> bool {
+    if param_names.is_empty() {
+        return false;
+    }
+
+    for assign_stat in block.descendants().filter_map(LuaAssignStat::cast) {
+        if is_node_in_nested_closure(assign_stat.syntax(), block) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars.into_iter().any(|var| {
+            matches!(var, LuaVarExpr::NameExpr(name_expr) if name_expr
+                .get_name_text()
+                .is_some_and(|name| param_names.contains(&name)))
+        }) {
+            return true;
+        }
+    }
+
+    for local_stat in block.descendants().filter_map(LuaLocalStat::cast) {
+        if is_node_in_nested_closure(local_stat.syntax(), block) {
+            continue;
+        }
+        if local_stat.get_local_name_list().any(|local_name| {
+            local_name
+                .get_name_token()
+                .is_some_and(|token| param_names.contains(token.get_name_text()))
+        }) {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn infer_safe_helper_return_expr_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    return_expr: &LuaExpr,
+    params: &[LuaParamName],
+    args: &[LuaExpr],
+) -> Option<LuaType> {
+    if let LuaExpr::NameExpr(name_expr) = return_expr {
+        let name = name_expr.get_name_text()?;
+        if let Some(arg_index) = params.iter().position(|param| {
+            param
+                .get_name_token()
+                .is_some_and(|token| token.get_name_text() == name)
+        }) {
+            return infer_expr(db, cache, args.get(arg_index)?.clone()).ok();
+        }
+    }
+
+    if let LuaExpr::CallExpr(call_expr) = return_expr
+        && let Some(signature_id) =
+            side_effect_free_call_metadata_signature_id(db, cache, call_expr)
+    {
+        return db
+            .get_signature_index()
+            .get(&signature_id)
+            .map(|signature| signature.get_return_type());
+    }
+
+    infer_expr(db, cache, return_expr.clone()).ok()
 }
 
 fn integer_const_expr_value(
@@ -965,22 +1120,71 @@ fn numeric_range_rhs_is_safe(
         return true;
     }
 
+    let mut active_helpers = HashSet::new();
     calls.into_iter().all(|call_expr| {
-        if !side_effect_free_call_is_safe(db, cache, &call_expr, &mut HashSet::new()) {
-            return false;
-        }
+        numeric_range_call_is_safe(
+            db,
+            cache,
+            file_id,
+            fill_closure,
+            &call_expr,
+            helpers,
+            table_global,
+            &mut active_helpers,
+        )
+    })
+}
 
-        let Some(helper_name) = call_expr_name(&call_expr) else {
-            return true;
-        };
-        if call_name_shadowed_in_closure_before_call(fill_closure, &helper_name, &call_expr) {
-            return false;
+fn numeric_range_call_is_safe(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
+    call_expr: &LuaCallExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+    table_global: &str,
+    active_helpers: &mut HashSet<String>,
+) -> bool {
+    if let Some(helper_name) = call_expr_name(call_expr)
+        && call_expr.get_prefix_expr().is_some_and(|prefix| {
+            matches!(
+                prefix,
+                LuaExpr::NameExpr(ref name_expr)
+                    if name_expr_resolves_to_local(db, file_id, name_expr)
+            )
+        })
+    {
+        if let Some(helper_closure) = helpers.get(&helper_name) {
+            return !call_name_shadowed_in_closure_before_call(
+                containing_closure,
+                &helper_name,
+                call_expr,
+            ) && call_args_are_side_effect_free(db, cache, call_expr)
+                && rhs_helper_body_is_safe(
+                    db,
+                    cache,
+                    file_id,
+                    &helper_name,
+                    helper_closure,
+                    helpers,
+                    table_global,
+                    active_helpers,
+                );
         }
-        let Some(helper_closure) = helpers.get(&helper_name) else {
-            return true;
-        };
+    }
 
-        rhs_helper_body_is_safe(db, cache, file_id, helper_closure, helpers, table_global)
+    side_effect_free_call_is_safe(db, cache, call_expr, &mut HashSet::new())
+}
+
+fn call_args_are_side_effect_free(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    call_expr.get_args_list().is_none_or(|args| {
+        let mut active_calls = HashSet::new();
+        args.get_args()
+            .all(|arg| expr_calls_are_side_effect_free(db, cache, &arg, &mut active_calls))
     })
 }
 
@@ -988,18 +1192,36 @@ fn rhs_helper_body_is_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    helper_name: &str,
     helper_closure: &LuaClosureExpr,
     helpers: &HashMap<String, LuaClosureExpr>,
     table_global: &str,
+    active_helpers: &mut HashSet<String>,
 ) -> bool {
+    if !active_helpers.insert(helper_name.to_string()) {
+        return false;
+    }
+
     let Some(block) = helper_closure.get_block() else {
+        active_helpers.remove(helper_name);
         return false;
     };
 
     for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
-        if !is_node_in_nested_closure(call_expr.syntax(), block.syntax())
-            && !side_effect_free_call_is_safe(db, cache, &call_expr, &mut HashSet::new())
-        {
+        if is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
+            continue;
+        }
+        if !numeric_range_call_is_safe(
+            db,
+            cache,
+            file_id,
+            helper_closure,
+            &call_expr,
+            helpers,
+            table_global,
+            active_helpers,
+        ) {
+            active_helpers.remove(helper_name);
             return false;
         }
     }
@@ -1016,11 +1238,13 @@ fn rhs_helper_body_is_safe(
             .iter()
             .any(|var| matches!(var, LuaVarExpr::IndexExpr(_)))
         {
+            active_helpers.remove(helper_name);
             return false;
         }
         if vars.into_iter().any(|var| {
             var_writes_protected_numeric_range_identity(db, file_id, &var, &protected_names)
         }) {
+            active_helpers.remove(helper_name);
             return false;
         }
     }
@@ -1030,10 +1254,12 @@ fn rhs_helper_body_is_safe(
             continue;
         }
         if local_shadows_protected_numeric_range_identity(&local_stat, &protected_names) {
+            active_helpers.remove(helper_name);
             return false;
         }
     }
 
+    active_helpers.remove(helper_name);
     true
 }
 
@@ -1048,8 +1274,7 @@ fn side_effect_free_call_is_safe(
         return false;
     }
 
-    let is_safe = side_effect_free_call_signature_id(db, cache, call_expr)
-        .is_some_and(|signature_id| signature_is_side_effect_free(db, signature_id))
+    let is_safe = side_effect_free_call_metadata_signature_id(db, cache, call_expr).is_some()
         && call_expr.get_args_list().is_none_or(|args| {
             args.get_args()
                 .all(|arg| expr_calls_are_side_effect_free(db, cache, &arg, active_calls))
@@ -1071,14 +1296,131 @@ fn expr_calls_are_side_effect_free(
     })
 }
 
-fn side_effect_free_call_signature_id(
+fn side_effect_free_call_metadata_signature_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaSignatureId> {
-    match infer_expr(db, cache, call_expr.get_prefix_expr()?).ok()? {
-        LuaType::Signature(signature_id) => Some(signature_id),
-        _ => None,
+    let (signature_id, semantic_decl) =
+        side_effect_free_call_signature_and_decl(db, cache, call_expr)?;
+    if signature_is_side_effect_free(db, signature_id)
+        || semantic_decl_has_side_effect_free_attribute(db, semantic_decl)
+    {
+        Some(signature_id)
+    } else {
+        None
+    }
+}
+
+fn side_effect_free_call_signature_and_decl(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<(LuaSignatureId, crate::LuaSemanticDeclId)> {
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    if let LuaExpr::NameExpr(name_expr) = &prefix_expr
+        && let Some(signature_id) = get_local_name_signature_id(db, cache, name_expr)
+    {
+        return Some((
+            signature_id,
+            crate::LuaSemanticDeclId::Signature(signature_id),
+        ));
+    }
+
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        prefix_expr,
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::default(),
+    )?;
+    Some((
+        get_signature_id_from_semantic_decl_value_expr(db, semantic_decl.clone())?,
+        semantic_decl,
+    ))
+}
+
+fn semantic_decl_has_side_effect_free_attribute(
+    db: &DbIndex,
+    semantic_decl: crate::LuaSemanticDeclId,
+) -> bool {
+    db.get_property_index()
+        .get_property(&semantic_decl)
+        .is_some_and(|property| {
+            property
+                .find_attribute_use(GMOD_ATTR_SIDE_EFFECT_FREE)
+                .is_some()
+        })
+}
+
+fn get_local_name_signature_id(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaSignatureId> {
+    let decl_id = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let value_syntax_id = decl.get_value_syntax_id()?;
+    let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+    let closure = LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)?;
+    let LuaExpr::ClosureExpr(closure) = closure else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(decl.get_file_id(), &closure))
+}
+
+fn get_signature_id_from_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: crate::LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+    let file_id = match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+            decl_id.file_id
+        }
+        crate::LuaSemanticDeclId::Member(member_id) => {
+            if let Some(LuaType::Signature(signature_id)) = db
+                .get_type_index()
+                .get_type_cache(&member_id.into())
+                .map(|type_cache| type_cache.as_type())
+            {
+                return Some(*signature_id);
+            }
+            member_id.file_id
+        }
+        crate::LuaSemanticDeclId::Signature(signature_id) => return Some(signature_id),
+        crate::LuaSemanticDeclId::TypeDecl(_) => return None,
+    };
+    let LuaExpr::ClosureExpr(closure) = get_semantic_decl_value_expr(db, semantic_decl)? else {
+        return None;
+    };
+    Some(LuaSignatureId::from_closure(file_id, &closure))
+}
+
+fn get_semantic_decl_value_expr(
+    db: &DbIndex,
+    semantic_decl: crate::LuaSemanticDeclId,
+) -> Option<LuaExpr> {
+    match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(&decl_id)?;
+            let value_syntax_id = decl.get_value_syntax_id()?;
+            let root = db.get_vfs().get_syntax_tree(&decl.get_file_id())?;
+            LuaExpr::cast(value_syntax_id.to_node_from_root(&root.get_red_root())?)
+        }
+        crate::LuaSemanticDeclId::Member(member_id) => get_member_value_expr(db, member_id),
+        crate::LuaSemanticDeclId::Signature(_) | crate::LuaSemanticDeclId::TypeDecl(_) => None,
     }
 }
 

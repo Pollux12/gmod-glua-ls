@@ -5,7 +5,7 @@ use glua_parser::{
 use smol_str::SmolStr;
 
 use crate::{
-    LuaAttributeUse, LuaSemanticDeclId, LuaType,
+    GMOD_ATTR_SIDE_EFFECT_FREE, LuaAttributeUse, LuaSemanticDeclId, LuaType,
     compilation::analyzer::doc::{
         DocAnalyzer,
         infer_type::infer_type,
@@ -29,10 +29,18 @@ pub fn analyze_tag_attribute_use(
 
     if let Some(owner) = owner {
         match (owner, &owner_id) {
-            (LuaAst::LuaDocTagParam(_), LuaSemanticDeclId::Signature(_)) => {
-                return Some(());
-            }
-            (LuaAst::LuaDocTagReturn(_), LuaSemanticDeclId::Signature(_)) => {
+            (LuaAst::LuaDocTagParam(_), LuaSemanticDeclId::Signature(_))
+            | (LuaAst::LuaDocTagReturn(_), LuaSemanticDeclId::Signature(_)) => {
+                let attribute_uses = infer_attribute_uses(analyzer, tag_use)?;
+                for attribute_use in attribute_uses {
+                    if attribute_use.id.get_name() == GMOD_ATTR_SIDE_EFFECT_FREE {
+                        analyzer.db.get_property_index_mut().add_attribute_use(
+                            analyzer.file_id,
+                            owner_id.clone(),
+                            attribute_use,
+                        );
+                    }
+                }
                 return Some(());
             }
             _ => {}
