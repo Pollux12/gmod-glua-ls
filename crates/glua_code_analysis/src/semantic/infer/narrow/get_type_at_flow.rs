@@ -13,6 +13,7 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
     semantic::cache::FlowOrigin,
+    semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
         infer_name::infer_global_type,
@@ -1688,11 +1689,17 @@ pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
             continue;
         }
         if read_inside_nested_closure(index_expr)
-            && current_file_has_any_top_level_global_table_uncertainty(index_expr, &mutation_roots)
+            && current_file_has_any_top_level_global_table_uncertainty(
+                db,
+                cache,
+                index_expr,
+                &mutation_roots,
+            )
         {
             continue;
         }
-        if current_scope_has_prior_global_table_uncertainty(index_expr, &mutation_roots) {
+        if current_scope_has_prior_global_table_uncertainty(db, cache, index_expr, &mutation_roots)
+        {
             continue;
         }
         return Some(population.value_type.clone());
@@ -1754,19 +1761,25 @@ fn load_ordered_file_between_has_global_table_uncertainty(
         let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
             return true;
         };
-        if file_has_top_level_global_table_uncertainty(&chunk, mutation_roots) {
+        let mut cache = LuaInferCache::new(*file_id, Default::default());
+        if file_has_top_level_global_table_uncertainty(db, &mut cache, &chunk, mutation_roots) {
             return true;
         }
     }
     false
 }
 
-fn file_has_top_level_global_table_uncertainty(root: &LuaChunk, mutation_roots: &[&str]) -> bool {
+fn file_has_top_level_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    mutation_roots: &[&str],
+) -> bool {
     let Some(block) = root.get_block() else {
         return true;
     };
     for stat in block.get_stats() {
-        if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
+        if top_level_stat_may_mutate_global_table(db, cache, &stat, mutation_roots) {
             return true;
         }
     }
@@ -1789,7 +1802,8 @@ fn file_has_global_table_uncertainty_after(
         return true;
     };
     for stat in block.get_stats().filter(|stat| stat.get_position() > after) {
-        if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        if top_level_stat_may_mutate_global_table(db, &mut cache, &stat, mutation_roots) {
             return true;
         }
     }
@@ -1804,21 +1818,25 @@ fn read_inside_nested_closure(index_expr: &LuaIndexExpr) -> bool {
 }
 
 fn current_file_has_any_top_level_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
     mutation_roots: &[&str],
 ) -> bool {
     let Some(root) = LuaChunk::cast(index_expr.get_root()) else {
         return true;
     };
-    file_has_top_level_global_table_uncertainty(&root, mutation_roots)
+    file_has_top_level_global_table_uncertainty(db, cache, &root, mutation_roots)
 }
 
 fn current_scope_has_prior_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
     mutation_roots: &[&str],
 ) -> bool {
     let mut before = index_expr.get_position();
-    if enclosing_control_flow_has_prior_call(index_expr, before) {
+    if enclosing_control_flow_has_prior_call(db, cache, index_expr, before, mutation_roots) {
         return true;
     }
     for block in index_expr.syntax().ancestors().filter_map(LuaBlock::cast) {
@@ -1826,7 +1844,7 @@ fn current_scope_has_prior_global_table_uncertainty(
             .get_stats()
             .take_while(|stat| stat.get_position() < before)
         {
-            if top_level_stat_may_mutate_global_table(&stat, mutation_roots) {
+            if top_level_stat_may_mutate_global_table(db, cache, &stat, mutation_roots) {
                 return true;
             }
         }
@@ -1835,7 +1853,13 @@ fn current_scope_has_prior_global_table_uncertainty(
     false
 }
 
-fn enclosing_control_flow_has_prior_call(index_expr: &LuaIndexExpr, before: TextSize) -> bool {
+fn enclosing_control_flow_has_prior_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    before: TextSize,
+    mutation_roots: &[&str],
+) -> bool {
     for stat in index_expr.syntax().ancestors().filter_map(LuaStat::cast) {
         if !matches!(
             stat,
@@ -1850,6 +1874,7 @@ fn enclosing_control_flow_has_prior_call(index_expr: &LuaIndexExpr, before: Text
         for call_expr in stat.descendants::<LuaCallExpr>() {
             if call_expr.get_position() < before
                 && !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax())
+                && call_effect_overlaps_mutation_roots(db, cache, &call_expr, mutation_roots)
             {
                 return true;
             }
@@ -1858,9 +1883,17 @@ fn enclosing_control_flow_has_prior_call(index_expr: &LuaIndexExpr, before: Text
     false
 }
 
-fn top_level_stat_may_mutate_global_table(stat: &LuaStat, mutation_roots: &[&str]) -> bool {
+fn top_level_stat_may_mutate_global_table(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    stat: &LuaStat,
+    mutation_roots: &[&str],
+) -> bool {
     for call_expr in stat.descendants::<LuaCallExpr>() {
-        if !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax()) {
+        if node_is_inside_nested_closure(call_expr.syntax(), stat.syntax()) {
+            continue;
+        }
+        if call_effect_overlaps_mutation_roots(db, cache, &call_expr, mutation_roots) {
             return true;
         }
     }
@@ -1877,6 +1910,37 @@ fn top_level_stat_may_mutate_global_table(stat: &LuaStat, mutation_roots: &[&str
         }
     }
     false
+}
+
+fn call_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    mutation_roots: &[&str],
+) -> bool {
+    let call_overlaps = match gmod_call_write_effect(db, cache, call_expr) {
+        GmodCallWriteEffect::None => false,
+        GmodCallWriteEffect::Globals(roots) => roots.iter().any(|root| {
+            mutation_roots
+                .iter()
+                .any(|mutation_root| root == mutation_root)
+        }),
+        GmodCallWriteEffect::Unknown => true,
+    };
+    call_overlaps
+        || call_expr.get_args_list().is_some_and(|args| {
+            args.get_args().any(|arg| {
+                arg.descendants::<LuaCallExpr>().any(|nested_call| {
+                    !node_is_inside_nested_closure(nested_call.syntax(), arg.syntax())
+                        && call_effect_overlaps_mutation_roots(
+                            db,
+                            cache,
+                            &nested_call,
+                            mutation_roots,
+                        )
+                })
+            })
+        })
 }
 
 fn node_is_inside_nested_closure(

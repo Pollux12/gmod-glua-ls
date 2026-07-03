@@ -22,8 +22,9 @@ use crate::{
     GmodVguiPanelCallRoles, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
     LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
     LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, SemanticDeclGuard, SemanticDeclLevel,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
+    db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
         GmodConcommandSiteMetadata, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
@@ -34,14 +35,8 @@ use crate::{
         LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
         NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation,
     },
-    db_index::{
-        GMOD_ATTR_SIDE_EFFECT_FREE, GMOD_ATTR_WRITES_GLOBAL, attribute_use_write_global_root,
-        rebuild_effective_valid_guard_signatures, signature_is_side_effect_free,
-        signature_writes_global_roots,
-    },
     infer_expr,
     profile::Profile,
-    semantic::{get_member_value_expr, infer_expr_semantic_decl},
 };
 use rowan::{TextRange, TextSize};
 

@@ -4546,6 +4546,131 @@ mod test {
     }
 
     #[gtest]
+    fn test_cross_file_numeric_range_population_disjoint_writes_global_call_preserves_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[writes_global("OtherCache")]
+            function TouchOther() end
+            TouchOther()
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(0)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_matching_writes_global_call_rejects_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[writes_global("ROLE_COLORS")]
+            function TouchColors() end
+            TouchColors()
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_alias_root_writes_global_call_rejects_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} ROLE_COLORS_ALIAS=ROLE_COLORS local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS_ALIAS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[writes_global("ROLE_COLORS_ALIAS")]
+            function TouchAlias() end
+            TouchAlias()
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_include_call_rejects_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"include("x.lua") local c=ROLE_COLORS[ROLE_TRAITOR] c.r=1"#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_local_shadow_effect_function_rejects_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[side_effect_free]
+            function SafeGlobal() end
+            local SafeGlobal=function() end
+            SafeGlobal()
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_nested_closure_call_does_not_reject_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file("lua/autorun/shared/c_reader.lua", r#"local later=function() UnknownMutator() end local c=ROLE_COLORS[ROLE_TRAITOR] c.r=1"#);
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(0)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_malformed_writes_global_call_rejects_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[writes_global]
+            function BadEffect() end
+            BadEffect()
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+    }
+
+    #[gtest]
+    fn test_cross_file_numeric_range_population_side_effect_free_call_with_safe_arg_preserves_fact()
+    {
+        let mut ws = gmod_ws();
+        ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
+        let reader = ws.def_file(
+            "lua/autorun/shared/c_reader.lua",
+            r#"
+            ---@[side_effect_free]
+            function SafeArg() end
+            ---@[side_effect_free]
+            function SafeOuter(x) end
+            SafeOuter(SafeArg())
+            local c=ROLE_COLORS[ROLE_TRAITOR]
+            c.r=1
+            "#,
+        );
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(0)));
+    }
+
+    #[gtest]
     fn test_cross_file_numeric_range_population_helper_reassignment_before_population_call_stays_need_check_nil()
      {
         let mut ws = gmod_ws();

@@ -1,6 +1,7 @@
 mod cache;
 mod decl;
 mod generic;
+pub(crate) mod gmod_call_effect;
 mod guard;
 mod infer;
 mod member;
