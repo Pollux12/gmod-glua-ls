@@ -547,6 +547,13 @@ fn collect_numeric_range_table_populations_for_file(
                     local_helpers.insert(name_token.get_name_text().to_string(), closure);
                 }
             }
+            LuaStat::FuncStat(func_stat) => {
+                if let (Some(name), Some(closure)) =
+                    (simple_func_stat_name(&func_stat), func_stat.get_closure())
+                {
+                    local_helpers.insert(name, closure);
+                }
+            }
             LuaStat::CallExprStat(call_stat) => {
                 let Some(call_expr) = call_stat.get_call_expr() else {
                     continue;
@@ -563,6 +570,14 @@ fn collect_numeric_range_table_populations_for_file(
                     db, &mut cache, file_id, closure, &call_expr,
                 ) {
                     populations.push(population);
+                } else if let Some(outer_populations) = numeric_range_populations_from_outer_call(
+                    db,
+                    &mut cache,
+                    file_id,
+                    closure,
+                    &local_helpers,
+                ) {
+                    populations.extend(outer_populations);
                 } else {
                     local_helpers.clear();
                 }
@@ -595,6 +610,112 @@ fn collect_numeric_range_table_populations_for_file(
     }
 
     populations
+}
+
+fn simple_func_stat_name(func_stat: &LuaFuncStat) -> Option<String> {
+    let LuaVarExpr::NameExpr(name_expr) = func_stat.get_func_name()? else {
+        return None;
+    };
+    name_expr.get_name_text()
+}
+
+fn numeric_range_populations_from_outer_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    outer_closure: &LuaClosureExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+) -> Option<Vec<TableNumericRangePopulation>> {
+    let block = outer_closure.get_block()?;
+    let mut populations = Vec::new();
+    let mut populated_tables: HashSet<String> = HashSet::new();
+
+    for stat in block.get_stats() {
+        match stat {
+            LuaStat::CallExprStat(call_stat) => {
+                let call_expr = call_stat.get_call_expr()?;
+                let helper_name = call_expr_name(&call_expr)?;
+                let fill_closure = helpers.get(&helper_name)?;
+                let population = numeric_range_population_from_helper_call(
+                    db,
+                    cache,
+                    file_id,
+                    fill_closure,
+                    &call_expr,
+                )?;
+                populated_tables.insert(population.table_global.clone());
+                populations.push(population);
+            }
+            LuaStat::AssignStat(assign_stat)
+                if !assign_writes_tracked_helper(&assign_stat, helpers)
+                    && is_harmless_table_reset(&assign_stat) =>
+            {
+                for table_name in reset_table_names(&assign_stat) {
+                    if populated_tables.contains(&table_name) {
+                        return None;
+                    }
+                }
+            }
+            LuaStat::LocalStat(local_stat)
+                if !local_shadows_tracked_helper(&local_stat, helpers)
+                    && is_harmless_local_alias_or_assignment(&local_stat) => {}
+            _ => return None,
+        }
+    }
+
+    if populations.is_empty() {
+        None
+    } else {
+        Some(populations)
+    }
+}
+
+fn assign_writes_tracked_helper(
+    assign_stat: &LuaAssignStat,
+    helpers: &HashMap<String, LuaClosureExpr>,
+) -> bool {
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter().any(|var| {
+        matches!(var, LuaVarExpr::NameExpr(name_expr) if name_expr
+            .get_name_text()
+            .is_some_and(|name| helpers.contains_key(&name)))
+    })
+}
+
+fn local_shadows_tracked_helper(
+    local_stat: &LuaLocalStat,
+    helpers: &HashMap<String, LuaClosureExpr>,
+) -> bool {
+    local_stat.get_local_name_list().any(|local_name| {
+        local_name
+            .get_name_token()
+            .is_some_and(|name| helpers.contains_key(name.get_name_text()))
+    })
+}
+
+fn is_harmless_table_reset(assign_stat: &LuaAssignStat) -> bool {
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    vars.len() == exprs.len()
+        && vars.iter().zip(exprs.iter()).all(|(var, expr)| {
+            matches!(var, LuaVarExpr::NameExpr(_)) && matches!(expr, LuaExpr::TableExpr(_))
+        })
+}
+
+fn reset_table_names(assign_stat: &LuaAssignStat) -> Vec<String> {
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter()
+        .filter_map(|var| match var {
+            LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            _ => None,
+        })
+        .collect()
+}
+
+fn is_harmless_local_alias_or_assignment(local_stat: &LuaLocalStat) -> bool {
+    let exprs = local_stat.get_value_exprs().collect::<Vec<_>>();
+    exprs
+        .iter()
+        .all(|expr| matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::TableExpr(_)))
 }
 
 fn helper_invalidated_by_descendant_write(
