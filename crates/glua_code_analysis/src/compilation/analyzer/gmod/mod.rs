@@ -24,7 +24,6 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
     LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
-    db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
         GmodConcommandSiteMetadata, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
@@ -35,6 +34,7 @@ use crate::{
         LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
         NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation,
     },
+    db_index::{rebuild_effective_valid_guard_signatures, signature_is_side_effect_free},
     infer_expr,
     profile::Profile,
 };
@@ -914,7 +914,15 @@ fn numeric_range_population_from_helper_call(
         return None;
     }
     let table_global = table_name_expr.get_name_text()?.to_string();
-    if !numeric_range_rhs_is_safe(db, file_id, closure, rhs_expr, helpers, &table_global) {
+    if !numeric_range_rhs_is_safe(
+        db,
+        cache,
+        file_id,
+        closure,
+        rhs_expr,
+        helpers,
+        &table_global,
+    ) {
         return None;
     }
     let rhs_type = infer_expr(db, cache, rhs_expr.clone()).ok()?;
@@ -945,6 +953,7 @@ fn integer_const_expr_value(
 
 fn numeric_range_rhs_is_safe(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     file_id: FileId,
     fill_closure: &LuaClosureExpr,
     rhs_expr: &LuaExpr,
@@ -957,22 +966,27 @@ fn numeric_range_rhs_is_safe(
     }
 
     calls.into_iter().all(|call_expr| {
-        let Some(helper_name) = call_expr_name(&call_expr) else {
+        if !side_effect_free_call_is_safe(db, cache, &call_expr, &mut HashSet::new()) {
             return false;
+        }
+
+        let Some(helper_name) = call_expr_name(&call_expr) else {
+            return true;
         };
         if call_name_shadowed_in_closure_before_call(fill_closure, &helper_name, &call_expr) {
             return false;
         }
         let Some(helper_closure) = helpers.get(&helper_name) else {
-            return false;
+            return true;
         };
 
-        rhs_helper_body_is_safe(db, file_id, helper_closure, helpers, table_global)
+        rhs_helper_body_is_safe(db, cache, file_id, helper_closure, helpers, table_global)
     })
 }
 
 fn rhs_helper_body_is_safe(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     file_id: FileId,
     helper_closure: &LuaClosureExpr,
     helpers: &HashMap<String, LuaClosureExpr>,
@@ -983,7 +997,9 @@ fn rhs_helper_body_is_safe(
     };
 
     for call_expr in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
-        if !is_node_in_nested_closure(call_expr.syntax(), block.syntax()) {
+        if !is_node_in_nested_closure(call_expr.syntax(), block.syntax())
+            && !side_effect_free_call_is_safe(db, cache, &call_expr, &mut HashSet::new())
+        {
             return false;
         }
     }
@@ -1019,6 +1035,51 @@ fn rhs_helper_body_is_safe(
     }
 
     true
+}
+
+fn side_effect_free_call_is_safe(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    active_calls: &mut HashSet<TextRange>,
+) -> bool {
+    let call_range = call_expr.syntax().text_range();
+    if !active_calls.insert(call_range) {
+        return false;
+    }
+
+    let is_safe = side_effect_free_call_signature_id(db, cache, call_expr)
+        .is_some_and(|signature_id| signature_is_side_effect_free(db, signature_id))
+        && call_expr.get_args_list().is_none_or(|args| {
+            args.get_args()
+                .all(|arg| expr_calls_are_side_effect_free(db, cache, &arg, active_calls))
+        });
+
+    active_calls.remove(&call_range);
+    is_safe
+}
+
+fn expr_calls_are_side_effect_free(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+    active_calls: &mut HashSet<TextRange>,
+) -> bool {
+    expr.descendants::<LuaCallExpr>().all(|nested_call| {
+        is_node_in_nested_closure(nested_call.syntax(), expr.syntax())
+            || side_effect_free_call_is_safe(db, cache, &nested_call, active_calls)
+    })
+}
+
+fn side_effect_free_call_signature_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaSignatureId> {
+    match infer_expr(db, cache, call_expr.get_prefix_expr()?).ok()? {
+        LuaType::Signature(signature_id) => Some(signature_id),
+        _ => None,
+    }
 }
 
 fn local_shadows_protected_numeric_range_identity(
