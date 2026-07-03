@@ -33,7 +33,7 @@ use crate::{
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
         GmodSystemFileMetadata, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
         LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
-        NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation,
+        NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation, WorkspaceKind,
     },
     infer_expr,
     profile::Profile,
@@ -8241,8 +8241,94 @@ fn rebuild_gmod_load_index(
         }
     }
 
+    mark_main_workspace_load_shadows(db, &mut file_infos, &file_ids);
+
     db.get_gmod_load_index_mut()
         .set_all_file_infos(file_infos, unresolved_edges);
+}
+
+fn mark_main_workspace_load_shadows(
+    db: &DbIndex,
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    file_ids: &[FileId],
+) {
+    let module_index = db.get_module_index();
+    let mut files_by_load_identity: HashMap<String, Vec<FileId>> = HashMap::new();
+
+    for file_id in file_ids {
+        let Some(info) = file_infos.get(file_id) else {
+            continue;
+        };
+        if info.status != GmodLoadStatus::EngineLoaded || info.roots.is_empty() {
+            continue;
+        }
+        let Some(workspace_id) = module_index.get_workspace_id(*file_id) else {
+            continue;
+        };
+        let workspace_kind = module_index.get_workspace_kind(workspace_id);
+        if !matches!(workspace_kind, WorkspaceKind::Main | WorkspaceKind::Library) {
+            continue;
+        }
+        let Some(load_identity) = gmod_relative_path(db, *file_id) else {
+            continue;
+        };
+        files_by_load_identity
+            .entry(load_identity)
+            .or_default()
+            .push(*file_id);
+    }
+
+    for files in files_by_load_identity.values() {
+        let main_files = files
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                module_index
+                    .get_workspace_id(*file_id)
+                    .is_some_and(|workspace_id| {
+                        module_index.get_workspace_kind(workspace_id) == WorkspaceKind::Main
+                    })
+            })
+            .collect::<Vec<_>>();
+
+        if main_files.len() != 1 {
+            continue;
+        }
+        let winning_file_id = main_files[0];
+        let Some(winning_info) = file_infos.get(&winning_file_id) else {
+            continue;
+        };
+        let winning_roots = winning_info.roots.clone();
+
+        for file_id in files {
+            if *file_id == winning_file_id {
+                continue;
+            }
+            let Some(workspace_id) = module_index.get_workspace_id(*file_id) else {
+                continue;
+            };
+            if module_index.get_workspace_kind(workspace_id) != WorkspaceKind::Library {
+                continue;
+            }
+            let Some(info) = file_infos.get(file_id) else {
+                continue;
+            };
+            if !has_matching_load_root(&winning_roots, &info.roots) {
+                continue;
+            }
+            if let Some(info) = file_infos.get_mut(file_id) {
+                info.mark_shadowed_by(winning_file_id);
+            }
+        }
+    }
+}
+
+fn has_matching_load_root(left: &[GmodLoadRoot], right: &[GmodLoadRoot]) -> bool {
+    left.iter().any(|left_root| {
+        right.iter().any(|right_root| {
+            left_root.kind == right_root.kind && left_root.states.intersects(right_root.states)
+        })
+    })
 }
 
 struct DynamicLoadPattern {

@@ -6,7 +6,7 @@ use std::{
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 
-use super::{GmodLoadStatus, GmodStateMask, LuaIndex};
+use super::{GmodLoadIndex, GmodLoadStatus, GmodStateMask, LuaIndex};
 use crate::FileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -473,6 +473,7 @@ impl GmodInferIndex {
 
     pub fn has_compatible_duplicate_registration(
         &self,
+        load_index: &GmodLoadIndex,
         kind: GmodSystemRegistrationKind,
         name: &str,
         file_id: &FileId,
@@ -483,6 +484,10 @@ impl GmodInferIndex {
             .iter()
             .any(|registration| {
                 (registration.file_id != *file_id || registration.name_range != name_range)
+                    && !load_index.files_are_mutually_exclusive_by_load_shadowing(
+                        *file_id,
+                        registration.file_id,
+                    )
                     && self.are_offsets_compatible(
                         file_id,
                         name_range.start(),

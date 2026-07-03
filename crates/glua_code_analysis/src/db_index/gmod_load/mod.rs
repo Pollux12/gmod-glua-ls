@@ -206,6 +206,7 @@ pub struct GmodFileLoadInfo {
     pub roots: Vec<GmodLoadRoot>,
     pub incoming_edges: Vec<GmodLoadEdge>,
     pub client_send_available: bool,
+    pub shadowed_by: Option<FileId>,
 }
 
 impl GmodFileLoadInfo {
@@ -218,6 +219,7 @@ impl GmodFileLoadInfo {
             roots: Vec::new(),
             incoming_edges: Vec::new(),
             client_send_available: false,
+            shadowed_by: None,
         }
     }
 
@@ -251,6 +253,10 @@ impl GmodFileLoadInfo {
         }
         self.incoming_edges.push(edge);
     }
+
+    pub fn mark_shadowed_by(&mut self, winning_file_id: FileId) {
+        self.shadowed_by = Some(winning_file_id);
+    }
 }
 
 #[derive(Debug, Default)]
@@ -277,6 +283,21 @@ impl GmodLoadIndex {
 
     pub fn unresolved_edges(&self) -> &[GmodLoadEdge] {
         &self.unresolved_edges
+    }
+
+    pub fn files_are_mutually_exclusive_by_load_shadowing(
+        &self,
+        left: FileId,
+        right: FileId,
+    ) -> bool {
+        let Some(left_info) = self.file_infos.get(&left) else {
+            return false;
+        };
+        let Some(right_info) = self.file_infos.get(&right) else {
+            return false;
+        };
+
+        left_info.shadowed_by == Some(right) || right_info.shadowed_by == Some(left)
     }
 
     pub fn engine_roots_in_load_order(
@@ -430,6 +451,9 @@ impl LuaIndex for GmodLoadIndex {
             info.incoming_edges.retain(|edge| {
                 edge.source_file_id != file_id && edge.target_file_id != Some(file_id)
             });
+            if info.shadowed_by == Some(file_id) {
+                info.shadowed_by = None;
+            }
         }
     }
 

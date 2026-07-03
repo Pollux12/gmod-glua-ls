@@ -278,6 +278,160 @@ mod tests {
     }
 
     #[gtest]
+    fn test_suppresses_duplicate_network_string_from_shadowed_library_gamemode_file() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_RoundState")
+            "#,
+        );
+        let main_file = ws.def_file(
+            "gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_RoundState")
+            "#,
+        );
+
+        assert!(!has_duplicate_diagnostic(&ws, main_file));
+    }
+
+    #[gtest]
+    fn test_suppresses_duplicate_scripted_entity_systems_from_shadowed_library_file() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/entities/entities/ttt_shadow/init.lua",
+            r#"
+            concommand.Add("ttt_shadow_cmd", function() end)
+            CreateConVar("ttt_shadow_cvar", "1")
+            "#,
+        );
+        let main_file = ws.def_file(
+            "entities/entities/ttt_shadow/init.lua",
+            r#"
+            concommand.Add("ttt_shadow_cmd", function() end)
+            CreateConVar("ttt_shadow_cvar", "1")
+            "#,
+        );
+
+        assert!(!has_duplicate_diagnostic(&ws, main_file));
+    }
+
+    #[gtest]
+    fn test_reports_library_and_main_duplicate_when_virtual_paths_differ() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_PathDiff")
+            "#,
+        );
+        let main_file = ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_PathDiff")
+            "#,
+        );
+
+        assert!(has_duplicate_diagnostic(&ws, main_file));
+    }
+
+    #[gtest]
+    fn test_reports_duplicate_for_same_virtual_path_with_both_files_in_main_workspace() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "addon_a/gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_MainMain")
+            "#,
+        );
+        let second_file = ws.def_file(
+            "addon_b/gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_MainMain")
+            "#,
+        );
+
+        assert!(has_duplicate_diagnostic(&ws, second_file));
+    }
+
+    #[gtest]
+    fn test_reports_duplicate_for_same_virtual_path_when_precedence_is_unknown() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/lua/custom/same_virtual_path.lua",
+            r#"
+            util.AddNetworkString("TTT_UnknownPrecedence")
+            "#,
+        );
+        let second_file = ws.def_file(
+            "lua/custom/same_virtual_path.lua",
+            r#"
+            util.AddNetworkString("TTT_UnknownPrecedence")
+            "#,
+        );
+
+        assert!(has_duplicate_diagnostic(&ws, second_file));
+    }
+
+    #[gtest]
+    fn test_reports_duplicate_when_library_file_is_not_shadowed_by_main() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_NotShadowed")
+            "#,
+        );
+        let main_file = ws.def_file(
+            "gamemodes/darkrp/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_NotShadowed")
+            "#,
+        );
+
+        assert!(has_duplicate_diagnostic(&ws, main_file));
+    }
+
+    #[gtest]
+    fn test_suppresses_shadowed_library_duplicate_with_case_normalized_virtual_path() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/GAMEMODES/TerrorTown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_CasePath")
+            "#,
+        );
+        let main_file = ws.def_file(
+            "gamemodes/terrortown/gamemode/init.lua",
+            r#"
+            util.AddNetworkString("TTT_CasePath")
+            "#,
+        );
+
+        assert!(!has_duplicate_diagnostic(&ws, main_file));
+    }
+
+    #[gtest]
     fn test_duplicate_system_registration_keeps_kinds_separate() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
