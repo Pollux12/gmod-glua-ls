@@ -35,8 +35,9 @@ use crate::{
         NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation,
     },
     db_index::{
-        GMOD_ATTR_SIDE_EFFECT_FREE, rebuild_effective_valid_guard_signatures,
-        signature_is_side_effect_free,
+        GMOD_ATTR_SIDE_EFFECT_FREE, GMOD_ATTR_WRITES_GLOBAL, attribute_use_write_global_root,
+        rebuild_effective_valid_guard_signatures, signature_is_side_effect_free,
+        signature_writes_global_roots,
     },
     infer_expr,
     profile::Profile,

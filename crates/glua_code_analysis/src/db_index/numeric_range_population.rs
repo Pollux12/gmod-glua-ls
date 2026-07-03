@@ -10,6 +10,7 @@ pub struct TableNumericRangePopulation {
     pub start: i64,
     pub end: i64,
     pub value_type: LuaType,
+    pub write_roots: Vec<String>,
     pub file_id: FileId,
     pub call_range: TextRange,
 }

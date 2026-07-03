@@ -21,7 +21,7 @@
 
 use crate::{
     DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, db_index::declaration::LuaDeclExtra,
+    LuaSignatureId, LuaType, db_index::declaration::LuaDeclExtra,
 };
 
 use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_type};
@@ -129,6 +129,15 @@ pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
 /// identities. This marker is explicit metadata only; callers must not infer it
 /// from source bodies.
 pub const GMOD_ATTR_SIDE_EFFECT_FREE: &str = "side_effect_free";
+
+/// Signature-level standalone attribute name for calls whose write effects are
+/// bounded to the listed global/root identities.
+///
+/// Example: `---@[writes_global("ConVarCache")]` on `GetConVar` means the call
+/// may mutate `_G.ConVarCache`, but should be rejected by consumers whose proof
+/// depends on that root. This is not purity; unknown writes outside the listed
+/// roots are not permitted by the metadata contract.
+pub const GMOD_ATTR_WRITES_GLOBAL: &str = "writes_global";
 
 /// Reserved for future net-payload markers: a signature carrying or consuming a
 /// typed net payload. Modeled as a signature-level standalone attribute.
@@ -313,6 +322,46 @@ pub fn signature_is_valid_guard_in_realm(
 
 pub fn signature_is_side_effect_free(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
     find_signature_attribute_use(db, signature_id, GMOD_ATTR_SIDE_EFFECT_FREE).is_some()
+}
+
+pub fn signature_writes_global_roots(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<Vec<String>> {
+    let mut roots = Vec::new();
+    let uses = signature_attribute_uses(db, signature_id)?;
+    for attribute_use in uses {
+        if attribute_use.id.get_name() != GMOD_ATTR_WRITES_GLOBAL {
+            continue;
+        }
+        let Some(root) = attribute_use_write_global_root(attribute_use) else {
+            return None;
+        };
+        roots.push(root);
+    }
+    if roots.is_empty() { None } else { Some(roots) }
+}
+
+pub fn attribute_use_write_global_root(attribute_use: &crate::LuaAttributeUse) -> Option<String> {
+    for param_name in ["global", "name", "root", ""] {
+        if let Some(root) = attribute_string_param(attribute_use, param_name) {
+            return Some(root);
+        }
+    }
+    if attribute_use.args.len() == 1
+        && let Some(LuaType::DocStringConst(root) | LuaType::StringConst(root)) =
+            attribute_use.args[0].1.as_ref()
+    {
+        return Some(root.to_string());
+    }
+    None
+}
+
+fn attribute_string_param(attribute_use: &crate::LuaAttributeUse, name: &str) -> Option<String> {
+    match attribute_use.get_param_by_name(name)? {
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {

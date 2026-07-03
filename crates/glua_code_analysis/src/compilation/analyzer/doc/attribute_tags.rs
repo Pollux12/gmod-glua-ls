@@ -5,7 +5,8 @@ use glua_parser::{
 use smol_str::SmolStr;
 
 use crate::{
-    GMOD_ATTR_SIDE_EFFECT_FREE, LuaAttributeUse, LuaSemanticDeclId, LuaType,
+    GMOD_ATTR_SIDE_EFFECT_FREE, GMOD_ATTR_WRITES_GLOBAL, LuaAttributeUse, LuaSemanticDeclId,
+    LuaType,
     compilation::analyzer::doc::{
         DocAnalyzer,
         infer_type::infer_type,
@@ -33,7 +34,10 @@ pub fn analyze_tag_attribute_use(
             | (LuaAst::LuaDocTagReturn(_), LuaSemanticDeclId::Signature(_)) => {
                 let attribute_uses = infer_attribute_uses(analyzer, tag_use)?;
                 for attribute_use in attribute_uses {
-                    if attribute_use.id.get_name() == GMOD_ATTR_SIDE_EFFECT_FREE {
+                    if matches!(
+                        attribute_use.id.get_name(),
+                        GMOD_ATTR_SIDE_EFFECT_FREE | GMOD_ATTR_WRITES_GLOBAL
+                    ) {
                         analyzer.db.get_property_index_mut().add_attribute_use(
                             analyzer.file_id,
                             owner_id.clone(),

@@ -1637,7 +1637,8 @@ pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
 ) -> Option<LuaType> {
-    let (table_global, access_index) = numeric_global_table_index_query(db, cache, index_expr)?;
+    let (table_global, access_index, key_name) =
+        numeric_global_table_index_query(db, cache, index_expr)?;
     let reader_file_id = cache.get_file_id();
     let access_position = index_expr.get_position();
     let query_realm = db
@@ -1651,6 +1652,11 @@ pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
             continue;
         }
         if access_index < population.start || access_index > population.end {
+            continue;
+        }
+        if let Some(key_name) = key_name.as_deref()
+            && population.write_roots.iter().any(|root| root == key_name)
+        {
             continue;
         }
         let Some((pop_pos, reader_pos, roots)) =
@@ -1695,15 +1701,19 @@ fn numeric_global_table_index_query(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
-) -> Option<(String, i64)> {
+) -> Option<(String, i64, Option<String>)> {
     let access_index = index_expr_numeric_key_value(db, cache, index_expr)?;
+    let key_name = match index_expr.get_index_key()? {
+        LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) => name_expr.get_name_text(),
+        _ => None,
+    };
     let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
         return None;
     };
     if !name_expr_is_global_root(db, cache, &table_name) {
         return None;
     }
-    Some((table_name.get_name_text()?, access_index))
+    Some((table_name.get_name_text()?, access_index, key_name))
 }
 
 fn population_load_positions(
