@@ -311,7 +311,9 @@ pub fn signature_is_valid_guard_in_realm(
     signature_id: LuaSignatureId,
     call_realm: GmodRealm,
 ) -> bool {
-    if signature_has_valid_guard_attribute(db, signature_id) {
+    if signature_has_valid_guard_attribute(db, signature_id)
+        && signature_realm_mask(db, signature_id).is_compatible_with(call_realm.state_mask())
+    {
         return true;
     }
 
