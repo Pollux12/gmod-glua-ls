@@ -10,7 +10,7 @@ use crate::{
     DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
     GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
     LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel,
-    SemanticModel, find_best_call_arg_role_from_type, find_signature_attribute_use,
+    SemanticModel, find_best_direct_call_arg_role_from_type, find_signature_attribute_use,
     get_var_expr_var_ref_id,
     semantic::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
@@ -2756,7 +2756,7 @@ fn static_string_call_arg_role(
         };
         for domain in GMOD_CALL_ARG_DOMAINS {
             if let Some(role) =
-                find_best_call_arg_role_from_type(db, &callee_type, arg_idx, domain, roles)
+                find_best_direct_call_arg_role_from_type(db, &callee_type, arg_idx, domain, roles)
             {
                 return Some((role.domain.to_string(), key));
             }

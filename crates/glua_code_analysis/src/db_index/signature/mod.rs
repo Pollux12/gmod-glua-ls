@@ -16,6 +16,7 @@ pub use gmod_domains::{
     GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
     attribute_use_write_global_root, collect_call_arg_roles_for_param,
     find_best_call_arg_role_for_param, find_best_call_arg_role_from_type,
+    find_best_direct_call_arg_role_for_param, find_best_direct_call_arg_role_from_type,
     find_signature_attribute_use, rebuild_effective_valid_guard_signatures,
     signature_attribute_uses, signature_is_side_effect_free, signature_is_valid_guard_in_realm,
     signature_is_valid_guard_or_base_runtime_isvalid_in_realm, signature_owner_for,

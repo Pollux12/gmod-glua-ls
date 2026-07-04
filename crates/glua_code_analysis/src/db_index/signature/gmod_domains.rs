@@ -189,8 +189,32 @@ pub fn find_best_call_arg_role_for_param(
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_for_param_by(signature, param_idx, domain, roles, |_| true)
+}
+
+pub fn find_best_direct_call_arg_role_for_param(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_for_param_by(signature, param_idx, domain, roles, |role| {
+        role.is_direct_arg()
+    })
+}
+
+fn find_best_call_arg_role_for_param_by(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+    mut predicate: impl FnMut(&LuaCallArgRole) -> bool,
+) -> Option<LuaCallArgRole> {
     let mut best: Option<LuaCallArgRole> = None;
     let mut consider = |role: &LuaCallArgRole| {
+        if !predicate(role) {
+            return;
+        }
         if role.domain != domain {
             return;
         }
@@ -222,8 +246,34 @@ pub fn find_best_call_arg_role_from_type(
     domain: &str,
     roles: &[&str],
 ) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_from_type_by(db, typ, arg_idx, domain, roles, |_| true)
+}
+
+pub fn find_best_direct_call_arg_role_from_type(
+    db: &DbIndex,
+    typ: &crate::LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_from_type_by(db, typ, arg_idx, domain, roles, |role| {
+        role.is_direct_arg()
+    })
+}
+
+fn find_best_call_arg_role_from_type_by(
+    db: &DbIndex,
+    typ: &crate::LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+    mut predicate: impl FnMut(&LuaCallArgRole) -> bool,
+) -> Option<LuaCallArgRole> {
     let mut best: Option<LuaCallArgRole> = None;
     visit_call_arg_roles_from_type(db, typ, arg_idx, &mut |role| {
+        if !predicate(role) {
+            return;
+        }
         if role.domain != domain {
             return;
         }

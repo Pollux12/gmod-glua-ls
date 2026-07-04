@@ -1288,7 +1288,7 @@ fn callee_type_has_member_guard_param(
     typ: &LuaType,
     arg_idx: usize,
 ) -> bool {
-    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_call_arg_role_for_param};
+    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_direct_call_arg_role_for_param};
 
     let db = semantic_model.get_db();
     match typ {
@@ -1296,8 +1296,13 @@ fn callee_type_has_member_guard_param(
             let Some(signature) = db.get_signature_index().get(signature_id) else {
                 return false;
             };
-            find_best_call_arg_role_for_param(signature, arg_idx, GMOD_DOMAIN_MEMBER_GUARD, &[])
-                .is_some()
+            find_best_direct_call_arg_role_for_param(
+                signature,
+                arg_idx,
+                GMOD_DOMAIN_MEMBER_GUARD,
+                &[],
+            )
+            .is_some()
         }
         LuaType::DocFunction(_) => {
             // DocFunction types cannot carry member-guard call-arg roles in the

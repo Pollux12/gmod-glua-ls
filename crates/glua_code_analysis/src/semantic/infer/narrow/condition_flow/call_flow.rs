@@ -296,7 +296,7 @@ fn is_member_guard_callee(
     cache: &mut LuaInferCache,
     name_expr: &glua_parser::LuaNameExpr,
 ) -> bool {
-    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_call_arg_role_for_param};
+    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_direct_call_arg_role_for_param};
 
     if name_expr_has_local_binding(db, cache, name_expr) {
         return false;
@@ -326,7 +326,7 @@ fn is_member_guard_callee(
         return false;
     };
 
-    find_best_call_arg_role_for_param(signature, 0, GMOD_DOMAIN_MEMBER_GUARD, &[]).is_some()
+    find_best_direct_call_arg_role_for_param(signature, 0, GMOD_DOMAIN_MEMBER_GUARD, &[]).is_some()
 }
 
 /// Metadata-driven member-guard narrowing. When `call_expr` is a call to a

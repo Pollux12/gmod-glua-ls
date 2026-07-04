@@ -522,11 +522,11 @@ fn is_getconvar_reference_signature_call(
     if prefix_expr.syntax().text().to_string() != "GetConVar" {
         return false;
     }
-    if signature
-        .call_arg_roles_for_param(0)
-        .iter()
-        .any(|role| role.domain == GMOD_DOMAIN_CONVAR && role.role == GMOD_ROLE_REFERENCE)
-    {
+    if signature.call_arg_roles_for_param(0).iter().any(|role| {
+        role.is_direct_arg()
+            && role.domain == GMOD_DOMAIN_CONVAR
+            && role.role == GMOD_ROLE_REFERENCE
+    }) {
         return true;
     }
     db.get_vfs()
@@ -551,10 +551,11 @@ fn is_getconvar_reference_call(
         return false;
     };
     if let Some(signature) = db.get_signature_index().get(&signature_id)
-        && signature
-            .call_arg_roles_for_param(0)
-            .iter()
-            .any(|role| role.domain == GMOD_DOMAIN_CONVAR && role.role == GMOD_ROLE_REFERENCE)
+        && signature.call_arg_roles_for_param(0).iter().any(|role| {
+            role.is_direct_arg()
+                && role.domain == GMOD_DOMAIN_CONVAR
+                && role.role == GMOD_ROLE_REFERENCE
+        })
     {
         return true;
     }

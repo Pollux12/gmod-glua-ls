@@ -1375,6 +1375,34 @@ mod tests {
     }
 
     #[gtest]
+    fn test_goto_vgui_panel_definition_ignores_call_arg_field_direct_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local pnl = vgui.CreateFromTable("MyPa<??>nel")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_goto_vgui_panel_definition_from_annotated_arg() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

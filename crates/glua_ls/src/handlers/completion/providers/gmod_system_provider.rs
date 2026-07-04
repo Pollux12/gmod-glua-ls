@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glua_code_analysis::{
     FileId, GmodHookSiteMetadata, GmodRealm, LuaType, NetSendFlow, NetSendKind, SemanticModel,
-    find_call_arg_role_from_type,
+    find_best_direct_call_arg_role_from_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag,
@@ -777,15 +777,18 @@ fn staged_string_call_kind_from_type(
     db: &glua_code_analysis::DbIndex,
     typ: &LuaType,
 ) -> Option<StagedStringCallKind> {
-    if find_call_arg_role_from_type(db, typ, 0, "gmod.net_message", &["receive"]).is_some() {
+    if find_best_direct_call_arg_role_from_type(db, typ, 0, "gmod.net_message", &["receive"])
+        .is_some()
+    {
         return Some(StagedStringCallKind::NetReceive);
     }
 
-    let hook_role = find_call_arg_role_from_type(db, typ, 0, "gmod.hook", &["add", "emit"])?;
+    let hook_role =
+        find_best_direct_call_arg_role_from_type(db, typ, 0, "gmod.hook", &["add", "emit"])?;
     match hook_role.role.as_str() {
         "add" => Some(StagedStringCallKind::HookAdd),
         "emit" => Some(StagedStringCallKind::HookEmit {
-            include_gamemode_arg: find_call_arg_role_from_type(
+            include_gamemode_arg: find_best_direct_call_arg_role_from_type(
                 db,
                 typ,
                 1,
@@ -830,7 +833,7 @@ fn call_has_hook_gamemode_table_role(
         1,
         call_expr.is_colon_call(),
     );
-    find_call_arg_role_from_type(
+    find_best_direct_call_arg_role_from_type(
         semantic_model.get_db(),
         &callable_type,
         param_idx,

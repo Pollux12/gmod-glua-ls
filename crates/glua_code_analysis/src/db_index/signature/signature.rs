@@ -66,6 +66,12 @@ pub struct LuaCallArgRole {
     pub priority: Option<i64>,
 }
 
+impl LuaCallArgRole {
+    pub fn is_direct_arg(&self) -> bool {
+        self.field_path.is_empty()
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LuaNoDiscard {
     NoDiscard,

@@ -4904,6 +4904,36 @@ mod test {
         ));
     }
 
+    /// `call_arg_field` scopes metadata to a field inside the argument table;
+    /// it must not suppress diagnostics for the direct argument expression.
+    #[test]
+    fn test_call_arg_field_member_guard_does_not_suppress_direct_argument() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
+
+            ---@[call_arg_field("gmod.member_guard", "function", "callback")]
+            ---@param config table
+            ---@return boolean
+            function hasCallback(config) end
+
+            ---@class MyVehicle3
+            MyVehicle3 = {}
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle3
+                local vehicle
+                local result = hasCallback(vehicle.GetFreeSeat)
+            "#
+        ));
+    }
+
     /// An unannotated `isfunction` spelling (without `gmod.member_guard` metadata)
     /// should NOT suppress undefined-field when the member access is not in
     /// a conditional context.

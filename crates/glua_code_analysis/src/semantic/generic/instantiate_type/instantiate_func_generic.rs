@@ -9,7 +9,7 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::db_index::GmodClassCallLiteral;
-use crate::db_index::find_call_arg_role_from_type;
+use crate::db_index::find_best_direct_call_arg_role_from_type;
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDocDefaultValue, LuaFunctionType,
     LuaGenericType, LuaSemanticDeclId, LuaSignatureId, TypeVisitTrait,
@@ -198,7 +198,7 @@ fn resolve_str_default_from_arg_inner(
 ///
 /// First tries semantic-declaration resolution (which yields a `Signature` id
 /// carrying the `call_arg` metadata), then falls back to inferring the
-/// expression type and using `find_call_arg_role_from_type`.
+/// expression type and using direct call-arg role metadata.
 fn check_vgui_panel_ref_role(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -224,7 +224,10 @@ fn check_vgui_panel_ref_role(
                 for candidate_idx in &candidate_param_indices {
                     let mut found = false;
                     let mut visitor = |role: &crate::LuaCallArgRole| {
-                        if role.domain == "gmod.vgui_panel" && role.role == "reference" {
+                        if role.is_direct_arg()
+                            && role.domain == "gmod.vgui_panel"
+                            && role.role == "reference"
+                        {
                             found = true;
                         }
                     };
@@ -242,7 +245,7 @@ fn check_vgui_panel_ref_role(
         return false;
     };
     candidate_param_indices.into_iter().any(|candidate_idx| {
-        find_call_arg_role_from_type(
+        find_best_direct_call_arg_role_from_type(
             db,
             &callable_type,
             candidate_idx,
