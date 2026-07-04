@@ -140,6 +140,7 @@ fn numeric_range_populations_from_outer_call(
                 );
                 let mut population = population?;
                 population.call_range = outer_call_expr.get_range();
+                drop_population_facts_for_table(&population.table_global, &mut populations);
                 populated_tables.insert(population.table_global.clone());
                 populations.push(population);
             }
@@ -216,6 +217,13 @@ fn attach_exact_alias_assignment(
         }
     }
     false
+}
+
+fn drop_population_facts_for_table(
+    table_global: &str,
+    populations: &mut Vec<TableNumericRangePopulation>,
+) {
+    populations.retain(|population| population.table_global != table_global);
 }
 
 fn drop_mutated_population_facts(

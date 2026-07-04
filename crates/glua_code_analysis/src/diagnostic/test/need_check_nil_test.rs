@@ -3246,6 +3246,64 @@ mod test {
     }
 
     #[gtest]
+    fn test_outer_numeric_range_population_later_same_table_fill_invalidates_earlier_fact() {
+        let mut ws = gmod_ws();
+        ws.def_file(
+            "lua/autorun/shared/a_colors.lua",
+            r#"
+            ROLE_MIN = 1
+            ROLE_MAX = 3
+            ROLE_TRAITOR = 2
+            ROLE_COLORS = {}
+
+            local function fill_with_nested(list)
+                for i = ROLE_MIN, ROLE_MAX do
+                    list[i] = { nested = { value = 1 } }
+                end
+            end
+
+            local function fill_without_nested(list)
+                for i = ROLE_MIN, ROLE_MAX do
+                    list[i] = {}
+                end
+            end
+
+            function update()
+                ROLE_COLORS = {}
+                fill_with_nested(ROLE_COLORS)
+                fill_without_nested(ROLE_COLORS)
+            end
+
+            update()
+        "#,
+        );
+        let reader = ws.def_file(
+            "lua/autorun/shared/b_reader.lua",
+            r#"
+            ROLE_COLORS[ROLE_TRAITOR].nested.value = 1
+        "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(reader, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
     fn test_outer_numeric_range_population_preserves_original_after_exact_alias_assignment() {
         let mut ws = gmod_ws();
         ws.def_file(
@@ -8697,6 +8755,29 @@ mod test {
         let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
 
         assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_nil_return_guard_still_specializes_when_signature_has_overload() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let code = r#"
+            ---@class ResultTable
+            ---@field value string
+
+            ---@overload fun(): nil
+            local function MakeResult(key)
+                if not key then return end
+                return {}
+            end
+
+            local result = MakeResult("known")
+            result.value = "safe"
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code);
+
+        assert_that!(diagnostics, is_empty());
     }
 
     #[gtest]

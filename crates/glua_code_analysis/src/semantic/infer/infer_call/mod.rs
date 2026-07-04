@@ -737,6 +737,13 @@ fn infer_signature_doc_function(
             is_generic,
             args_count,
         )?;
+        let resolved = specialize_nil_guarded_return_for_call(
+            db,
+            cache,
+            signature,
+            resolved.as_ref(),
+            &call_expr,
+        );
         let resolved = specialize_falsy_param_returns_for_call(
             db,
             cache,
