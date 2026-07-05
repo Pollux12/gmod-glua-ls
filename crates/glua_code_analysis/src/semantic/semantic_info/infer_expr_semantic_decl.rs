@@ -7,8 +7,9 @@ use crate::{
     DbIndex, GlobalId, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
     LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaMergedTableType,
     LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType,
+    compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
-        infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
+        infer::find_self_decl_or_member_id,
         member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
         semantic_info::resolve_global_decl_id,
     },
@@ -87,7 +88,9 @@ fn infer_name_expr_semantic_decl(
         return infer_self_semantic_decl(db, cache, name_expr);
     }
 
-    if let Some(type_decl_id) = resolve_scoped_scripted_global_type_decl_id(db, cache, &name) {
+    if let Some(type_decl_id) =
+        name_expr_resolves_to_scoped_authoring_table(db, cache.get_file_id(), &name_expr)
+    {
         return Some(LuaSemanticDeclId::TypeDecl(type_decl_id));
     }
 

@@ -4,6 +4,7 @@ use crate::{
     DbIndex, DiagnosticCode, GmodClassCallArgSource, GmodClassCallLiteral,
     GmodScriptedClassCallMetadata, LuaDecl, LuaDeclId, LuaDeclarationTree, LuaScope, LuaScopeKind,
     ScopeOrDeclId, SemanticModel,
+    compilation::analyzer::gmod::scoped_authoring_local_overrides_runtime_table,
 };
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaSyntaxKind, PathTrait};
 use rowan::{TextRange, TextSize};
@@ -86,8 +87,10 @@ fn check_scope_for_redefined_locals(
                 if gmod_enabled && name == "self" {
                     continue;
                 }
-                if decl.is_seeded_class_local() {
-                    continue;
+                if gmod_enabled
+                    && scoped_authoring_local_overrides_runtime_table(db, *file_id, &name, *decl_id)
+                {
+                    diagnostics.insert(*decl_id);
                 }
                 if visible_locals.contains_key(&name) {
                     let old_decl = visible_locals

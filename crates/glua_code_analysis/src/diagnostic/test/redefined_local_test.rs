@@ -185,6 +185,57 @@ mod tests {
     }
 
     #[test]
+    fn test_scoped_gamemode_local_table_override_reports_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/test/gamemode/init.lua",
+            r#"
+                local GM = {}
+                function GM:PlayerSpawn(ply) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_scoped_gamemode_local_alias_does_not_report_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/test/gamemode/init.lua",
+            r#"
+                local GM = GM
+                function GM:PlayerSpawn(ply) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_scoped_plugin_local_table_authoring_does_not_report_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "plugins/example/sh_plugin.lua",
+            r#"
+                local PLUGIN = {}
+                function PLUGIN:Initialize() end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_unregistered_panel_reuse_still_reports_redefined_local() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(

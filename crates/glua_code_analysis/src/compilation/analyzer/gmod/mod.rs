@@ -2204,9 +2204,8 @@ fn collect_scripted_scope_type_bindings_with(
                 continue;
             }
 
-            let is_scoped_local = decl.is_local()
-                && (decl.is_seeded_class_local()
-                    || scoped_class_authored_as_local(&scope_match.global_name));
+            let is_scoped_local =
+                decl.is_local() && scoped_class_authored_as_local(&scope_match.global_name);
             if is_scoped_local || decl.is_global() {
                 decls.push((decl.get_id(), decl.get_range()));
             }
@@ -2316,6 +2315,82 @@ pub(crate) fn get_scripted_class_type_decl_id(
     } else {
         LuaTypeDeclId::global(class_name)
     }
+}
+
+pub(crate) fn resolve_scoped_authoring_type(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &str,
+) -> Option<LuaTypeDeclId> {
+    if !db.get_emmyrc().gmod.enabled {
+        return None;
+    }
+
+    let info = db.get_gmod_infer_index().get_scoped_class_info(&file_id)?;
+    (info.global_name == name)
+        .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
+}
+
+pub(crate) fn name_expr_resolves_to_scoped_authoring_table(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaTypeDeclId> {
+    let name = name_expr.get_name_text()?;
+    let class_decl_id = resolve_scoped_authoring_type(db, file_id, &name)?;
+
+    let local_decl = db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .filter(|decl_id| db.get_decl_index().get_decl(decl_id).is_some());
+
+    let Some(decl_id) = local_decl else {
+        return Some(class_decl_id);
+    };
+
+    scoped_authoring_decl_has_type(db, decl_id, &class_decl_id).then_some(class_decl_id)
+}
+
+pub(crate) fn scoped_authoring_local_overrides_runtime_table(
+    db: &DbIndex,
+    file_id: FileId,
+    name: &str,
+    decl_id: LuaDeclId,
+) -> bool {
+    if scoped_class_authored_as_local(name) {
+        return false;
+    }
+
+    let Some(class_decl_id) = resolve_scoped_authoring_type(db, file_id, name) else {
+        return false;
+    };
+
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    if !decl.is_local() {
+        return false;
+    }
+
+    !scoped_authoring_decl_has_type(db, decl_id, &class_decl_id)
+}
+
+fn scoped_authoring_decl_has_type(
+    db: &DbIndex,
+    decl_id: LuaDeclId,
+    class_decl_id: &LuaTypeDeclId,
+) -> bool {
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return false;
+    };
+    if !decl.is_local() {
+        return false;
+    }
+
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|type_cache| type_cache.as_type() == &LuaType::Def(class_decl_id.clone()))
 }
 
 fn scoped_class_uses_global_namespace(global_name: &str) -> bool {

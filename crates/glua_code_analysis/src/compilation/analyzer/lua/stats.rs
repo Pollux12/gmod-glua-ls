@@ -3,12 +3,10 @@ use std::collections::HashSet;
 use crate::{
     CacheEntry, FileId, GmodStateMask, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
     LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
-    compilation::{
-        analyzer::{
-            common::{add_member, bind_type},
-            unresolve::{UnResolveDecl, UnResolveMember},
-        },
-        get_scripted_class_type_decl_id,
+    compilation::analyzer::{
+        common::{add_member, bind_type},
+        gmod::name_expr_resolves_to_scoped_authoring_table,
+        unresolve::{UnResolveDecl, UnResolveMember},
     },
     db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::{member_key_matches_type, merge_open_table_types, remove_false_or_nil},
@@ -614,11 +612,9 @@ fn try_resolve_scoped_class_prefix_member_owner(
 
     let name = name_expr.get_name_text()?;
     if name != "self" {
-        if !name_expr_resolves_to_seeded_class_local(analyzer, name_expr) {
-            return None;
-        }
-
-        return scoped_class_global_member_owner(analyzer, &name).map(|owner| (owner, false));
+        let class_decl_id =
+            name_expr_resolves_to_scoped_authoring_table(analyzer.db, analyzer.file_id, name_expr)?;
+        return Some((LuaMemberOwner::Type(class_decl_id), false));
     }
 
     if !name_expr_resolves_to_implicit_self(analyzer, name_expr) {
@@ -636,25 +632,12 @@ fn try_resolve_scoped_class_prefix_member_owner(
     let LuaExpr::NameExpr(class_name_expr) = func_name.get_prefix_expr()? else {
         return None;
     };
-    let class_global = class_name_expr.get_name_text()?;
-    if !name_expr_resolves_to_seeded_class_local(analyzer, &class_name_expr) {
-        return None;
-    }
-
-    scoped_class_global_member_owner(analyzer, &class_global).map(|owner| (owner, false))
-}
-
-fn name_expr_resolves_to_seeded_class_local(
-    analyzer: &LuaAnalyzer,
-    name_expr: &LuaNameExpr,
-) -> bool {
-    analyzer
-        .db
-        .get_reference_index()
-        .get_local_reference(&analyzer.file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
-        .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
-        .is_some_and(|decl| decl.is_seeded_class_local())
+    let class_decl_id = name_expr_resolves_to_scoped_authoring_table(
+        analyzer.db,
+        analyzer.file_id,
+        &class_name_expr,
+    )?;
+    Some((LuaMemberOwner::Type(class_decl_id), false))
 }
 
 fn name_expr_resolves_to_implicit_self(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> bool {
@@ -665,23 +648,6 @@ fn name_expr_resolves_to_implicit_self(analyzer: &LuaAnalyzer, name_expr: &LuaNa
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .and_then(|decl_id| analyzer.db.get_decl_index().get_decl(&decl_id))
         .is_some_and(|decl| decl.is_implicit_self())
-}
-
-fn scoped_class_global_member_owner(analyzer: &LuaAnalyzer, name: &str) -> Option<LuaMemberOwner> {
-    if !analyzer.db.get_emmyrc().gmod.enabled {
-        return None;
-    }
-
-    let info = analyzer
-        .db
-        .get_gmod_infer_index()
-        .get_scoped_class_info(&analyzer.file_id)?;
-    (info.global_name == name).then(|| {
-        LuaMemberOwner::Type(get_scripted_class_type_decl_id(
-            &info.global_name,
-            &info.class_name,
-        ))
-    })
 }
 
 fn apply_index_expr_member_owner(

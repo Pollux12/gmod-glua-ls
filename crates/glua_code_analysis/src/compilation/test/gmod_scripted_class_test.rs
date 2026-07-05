@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaLocalName, LuaNameExpr};
+    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaLocalName, LuaNameExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
+        VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -9493,6 +9494,234 @@ mod test {
             .expect("expected scoped-class info for nested entity file");
         assert_eq!(info.class_name, "my_ent");
         assert_eq!(info.global_name, "ENT");
+    }
+
+    #[gtest]
+    fn issue_38_first_token_in_scoped_class_file_keeps_its_own_semantic_decl() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"AddCSLuaFile("shared.lua")"#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let add_cs_lua_file_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "AddCSLuaFile")
+            })
+            .expect("expected AddCSLuaFile name expression");
+        let add_cs_lua_file_token = add_cs_lua_file_expr
+            .get_name_token()
+            .expect("expected AddCSLuaFile token");
+        let semantic_info = semantic_model
+            .get_semantic_info(add_cs_lua_file_token.syntax().clone().into())
+            .expect("expected AddCSLuaFile semantic info");
+
+        let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_info
+            .semantic_decl
+            .expect("expected AddCSLuaFile semantic decl")
+        else {
+            panic!("expected AddCSLuaFile to resolve to a Lua declaration");
+        };
+        let decl = semantic_model
+            .get_db()
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .expect("expected AddCSLuaFile declaration");
+        assert_eq!(decl.get_name(), "AddCSLuaFile");
+
+        let local_ref = semantic_model
+            .get_db()
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .expect("expected file references");
+        let mapped_decl = local_ref.get_decl_id(&add_cs_lua_file_token.get_range());
+        if let Some(mapped_decl) = mapped_decl
+            && let Some(mapped_decl) = semantic_model
+                .get_db()
+                .get_decl_index()
+                .get_decl(&mapped_decl)
+        {
+            assert_ne!(
+                mapped_decl.get_name(),
+                "GM",
+                "AddCSLuaFile token must not be mapped to the scoped GM authoring symbol"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_byte_zero_gm_member_binds_to_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_some(),
+            "GM.TestValue should be owned by the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_byte_zero_method_self_uses_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"function GM:Initialize()
+    self.TestValue = 1
+end"#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "self")
+            })
+            .expect("expected self name expression");
+        let self_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(self_expr))
+            .expect("expected self type");
+        assert_eq!(
+            self_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "method self should resolve to the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_local_gm_shadow_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"local GM = 0
+GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_none(),
+            "a real local GM shadow must not bind members to the scoped gamemode class"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let shadowed_gm_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "GM")
+            })
+            .last()
+            .expect("expected shadowed GM reference");
+        let shadowed_gm_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(shadowed_gm_expr))
+            .expect("expected shadowed GM type");
+        assert_ne!(
+            shadowed_gm_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "a real local GM shadow must not infer as the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_local_gm_alias_preserves_scoped_class_binding() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"local GM = GM
+GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_some(),
+            "a local GM alias to the scoped table should still bind scoped gamemode members"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let aliased_gm_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "GM")
+            })
+            .last()
+            .expect("expected aliased GM reference");
+        let aliased_gm_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(aliased_gm_expr))
+            .expect("expected aliased GM type");
+        assert_eq!(
+            aliased_gm_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "local GM = GM should preserve the scoped gamemode class type"
+        );
     }
 
     #[gtest]

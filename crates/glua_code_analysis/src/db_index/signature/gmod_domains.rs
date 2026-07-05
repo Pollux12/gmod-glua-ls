@@ -386,9 +386,7 @@ pub fn signature_writes_global_roots(
         if attribute_use.id.get_name() != GMOD_ATTR_WRITES_GLOBAL {
             continue;
         }
-        let Some(root) = attribute_use_write_global_root(attribute_use) else {
-            return None;
-        };
+        let root = attribute_use_write_global_root(attribute_use)?;
         roots.push(root);
     }
     if roots.is_empty() { None } else { Some(roots) }

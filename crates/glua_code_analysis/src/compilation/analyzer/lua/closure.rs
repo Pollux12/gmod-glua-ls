@@ -596,9 +596,7 @@ fn analyze_nil_return_guard_params(
 }
 
 fn nil_return_guard_param_name(if_stat: &LuaIfStat) -> Option<String> {
-    if nil_return_guard_return_stat(if_stat).is_none() {
-        return None;
-    }
+    nil_return_guard_return_stat(if_stat)?;
 
     let LuaExpr::UnaryExpr(unary_expr) = if_stat.get_condition_expr()? else {
         return None;
@@ -818,7 +816,6 @@ fn intervening_statement_mutates_index(
 
                 if local_stat
                     .get_local_name_list()
-                    .into_iter()
                     .filter_map(|name| name.get_name_token())
                     .map(|name| name.get_name_text().to_string())
                     .any(|name| dependency_names.iter().any(|dep| dep == &name))
@@ -889,7 +886,6 @@ fn direct_stat_is_harmless_between_guard_and_return(
                 .any(|expr| expr_contains_immediately_executed_call(&expr))
                 && !local_stat
                     .get_local_name_list()
-                    .into_iter()
                     .filter_map(|name| name.get_name_token())
                     .map(|name| name.get_name_text().to_string())
                     .any(|name| dependency_names.iter().any(|dep| dep == &name))

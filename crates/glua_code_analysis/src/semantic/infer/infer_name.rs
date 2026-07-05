@@ -13,7 +13,9 @@ use crate::{
     CacheEntry, FileId, GmodStateMask, LuaDecl, LuaDeclExtra, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     SemanticDeclLevel, TypeOps,
-    compilation::{analyzer::infer_for_range_iter_expr_func, get_scripted_class_type_decl_id},
+    compilation::analyzer::{
+        gmod::name_expr_resolves_to_scoped_authoring_table, infer_for_range_iter_expr_func,
+    },
     db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature, LuaSignatureId},
     infer_node_semantic_decl,
     semantic::{
@@ -60,8 +62,10 @@ pub fn infer_name_expr(
             return Ok(define_baseclass_type);
         }
 
-        if let Some(scoped_type) = infer_scoped_scripted_global_type(db, cache, name) {
-            return Ok(scoped_type);
+        if let Some(class_decl_id) =
+            name_expr_resolves_to_scoped_authoring_table(db, file_id, &name_expr)
+        {
+            return Ok(LuaType::Def(class_decl_id));
         }
 
         match get_name_expr_var_ref_id(db, cache, &name_expr) {
@@ -442,87 +446,6 @@ fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Opt
     Some(LuaType::Ref(LuaTypeDeclId::global(base_name)))
 }
 
-fn infer_scoped_scripted_global_type(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name: &str,
-) -> Option<LuaType> {
-    let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, name)?;
-    Some(LuaType::Def(class_decl_id))
-}
-
-pub(crate) fn resolve_scoped_scripted_global_type_decl_id(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name: &str,
-) -> Option<LuaTypeDeclId> {
-    if !db.get_emmyrc().gmod.enabled {
-        return None;
-    }
-
-    if let Some(info) = db
-        .get_gmod_infer_index()
-        .get_scoped_class_info(&cache.get_file_id())
-    {
-        return (info.global_name == name)
-            .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name));
-    }
-
-    if !db
-        .get_emmyrc()
-        .gmod
-        .scripted_class_scopes
-        .resolved_definitions_slice()
-        .iter()
-        .any(|definition| definition.class_global == name)
-    {
-        return None;
-    }
-
-    let (global_name, class_name) = detect_scoped_global_from_path_cached(db, cache)?;
-    if global_name != name {
-        return None;
-    }
-
-    Some(get_scripted_class_type_decl_id(&global_name, &class_name))
-}
-
-fn detect_scoped_global_from_path_cached(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-) -> Option<(String, String)> {
-    if let Some(cached) = cache.scoped_scripted_global_cache.as_ref() {
-        return cached.clone();
-    }
-
-    let detected = detect_scoped_global_from_path(db, cache.get_file_id());
-    cache.scoped_scripted_global_cache = Some(detected.clone());
-    detected
-}
-
-fn detect_scoped_global_from_path(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
-    if !is_in_scripted_class_scope(db, file_id) {
-        return None;
-    }
-
-    let file_path = db.get_vfs().get_file_path(&file_id)?;
-    let scope_match = db
-        .get_emmyrc()
-        .gmod
-        .scripted_class_scopes
-        .detect_class_for_path(file_path)?;
-
-    Some((scope_match.definition.class_global, scope_match.class_name))
-}
-
-fn is_in_scripted_class_scope(db: &DbIndex, file_id: FileId) -> bool {
-    let scopes = &db.get_emmyrc().gmod.scripted_class_scopes;
-    let Some(file_path) = db.get_vfs().get_file_path(&file_id) else {
-        return scopes.resolved_definitions_slice().is_empty();
-    };
-    scopes.is_file_in_scope(file_path)
-}
-
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
     let self_ref_id = match get_name_expr_var_ref_id(db, cache, &name_expr) {
         Some(VarRefId::SelfRef(self_ref_id)) => self_ref_id,
@@ -536,7 +459,7 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
     // normal flow-narrowing pipeline on top of this base, so guards like
     // `if self == self.parent then ... end` still narrow correctly.
     //
-    // The base is only seeded when concrete (Def/Ref/TableConst/Instance/...),
+    // The base is only used when concrete (Def/Ref/TableConst/Instance/...),
     // so generic `SelfInfer`/declared-parameter `self` still falls through to
     // the canonical `get_var_ref_type` resolution.
     let base_seed = infer_implicit_method_self_type(db, cache, &name_expr);
@@ -556,8 +479,8 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
 /// distinct tables/classes per region.
 ///
 /// Resolution order:
-/// 1. Path-scoped seeded class locals (ENT/SWEP/GM) resolve by their scoped
-///    class name (one class per file) — preserved as-is.
+/// 1. Scoped authoring tables (ENT/SWEP/GM) resolve by their scoped class
+///    metadata (one class per file).
 /// 2. Otherwise infer the enclosing colon-method prefix expression *at its
 ///    position* (region-aware via flow + GMod table-literal class binding) and
 ///    use it when it yields a concrete receiver type.
@@ -596,9 +519,9 @@ fn infer_implicit_method_self_type_inner(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
-    // 1. Path-scoped seeded class locals (ENT/SWEP/GM): name/path-driven, one
-    //    class per file. Keep this first to preserve scoped-class behavior.
-    if let Some(scoped_type) = infer_scoped_seeded_class_self_type(db, cache, name_expr) {
+    // 1. Scoped authoring tables (ENT/SWEP/GM): metadata-driven, one class
+    //    per file. Keep this first to preserve scoped-class behavior.
+    if let Some(scoped_type) = infer_scoped_authoring_self_type(db, cache, name_expr) {
         return Some(scoped_type);
     }
 
@@ -609,9 +532,9 @@ fn infer_implicit_method_self_type_inner(
     is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
 }
 
-/// Resolves `self` for synthetically-seeded scoped class locals (ENT/SWEP/GM),
-/// which map a file to a single class by name/path.
-fn infer_scoped_seeded_class_self_type(
+/// Resolves `self` for virtual scoped authoring tables (ENT/SWEP/GM),
+/// which map a file to a single class through scoped-class metadata.
+fn infer_scoped_authoring_self_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
@@ -628,33 +551,8 @@ fn infer_scoped_seeded_class_self_type(
     let LuaExpr::NameExpr(prefix_name_expr) = index_expr.get_prefix_expr()? else {
         return None;
     };
-    let prefix_name = prefix_name_expr.get_name_text()?;
-    let file_id = cache.get_file_id();
-    let prefix_decl = db
-        .get_reference_index()
-        .get_local_reference(&file_id)
-        .and_then(|file_ref| file_ref.get_decl_id(&prefix_name_expr.get_range()))
-        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))?;
-    // Accept the synthetic seed (ENT/SWEP/GM convention) or an explicit
-    // authoring local for scopes that conventionally use `local` (PLUGIN,
-    // PLAYER), where the prefix references the user's `local PLAYER = {}`
-    // rather than the seeded decl. For global-convention scopes (ENT/SWEP/...)
-    // an explicit shadowing local must NOT bind as the scoped class.
-    if !prefix_decl.is_seeded_class_local()
-        && !db
-            .get_gmod_infer_index()
-            .get_scoped_class_info(&file_id)
-            .is_some_and(|info| {
-                info.global_name == prefix_name.as_str()
-                    && crate::compilation::analyzer::gmod::scoped_class_authored_as_local(
-                        &info.global_name,
-                    )
-            })
-    {
-        return None;
-    }
-
-    let class_decl_id = resolve_scoped_scripted_global_type_decl_id(db, cache, &prefix_name)?;
+    let class_decl_id =
+        name_expr_resolves_to_scoped_authoring_table(db, cache.get_file_id(), &prefix_name_expr)?;
     Some(LuaType::Def(class_decl_id))
 }
 
@@ -2309,6 +2207,14 @@ fn find_self_receiver_id(
             let decl = tree.find_local_decl(&name, prefix_name.get_position());
             if let Some(decl) = decl {
                 return Some(LuaDeclOrMemberId::Decl(decl.get_id()));
+            }
+
+            if name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name).is_some() {
+                let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+                return db
+                    .get_member_index()
+                    .get_member(&member_id)
+                    .map(|_| LuaDeclOrMemberId::Member(member_id));
             }
 
             let id = resolve_global_decl_id(db, cache, &name, Some(&prefix_name))?;

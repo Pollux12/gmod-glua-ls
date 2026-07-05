@@ -519,7 +519,7 @@ fn is_getconvar_reference_signature_call(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if prefix_expr.syntax().text().to_string() != "GetConVar" {
+    if prefix_expr.syntax().text() != "GetConVar" {
         return false;
     }
     if signature.call_arg_roles_for_param(0).iter().any(|role| {
@@ -544,7 +544,7 @@ fn is_getconvar_reference_call(
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return false;
     };
-    if prefix_expr.syntax().text().to_string() != "GetConVar" {
+    if prefix_expr.syntax().text() != "GetConVar" {
         return false;
     }
     let Some(signature_id) = get_prefix_expr_signature_id(db, cache, call_expr) else {

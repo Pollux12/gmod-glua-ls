@@ -2165,9 +2165,9 @@ fn numeric_table_index_query_key_name(var_ref_id: &VarRefId) -> Option<&str> {
     dynamic_bracket_index_name(query_path.deref())
 }
 
-fn numeric_table_index_query_key_name_from_initializer<'a>(
+fn numeric_table_index_query_key_name_from_initializer(
     db: &DbIndex,
-    root: &'a LuaChunk,
+    root: &LuaChunk,
     var_ref_id: &VarRefId,
 ) -> Option<String> {
     let decl_id = match var_ref_id {
@@ -2213,9 +2213,7 @@ fn unambiguous_integer_const_name_value(
         .values()
         .filter(|decl| decl.get_name() == name && decl.get_position() <= before)
     {
-        let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) else {
-            return None;
-        };
+        let type_cache = db.get_type_index().get_type_cache(&decl.get_id().into())?;
         let decl_value = match type_cache.as_type() {
             LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => *value,
             _ => return None,
