@@ -659,4 +659,48 @@ mod test {
 
         assert_eq!(func.get_ret(), &ws.ty("boolean"));
     }
+
+    #[test]
+    fn test_union_arg_prefers_base_signature_over_non_matching_overload() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class NPC : Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@param player Player
+            ---@return boolean
+            ---@overload fun(players: Player[]): string
+            local function pick(player)
+            end
+
+            ---@type Entity|NPC|NULL|Player
+            local owner
+
+            pick(owner)
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let call_expr = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected call");
+        let func = semantic_model
+            .infer_call_expr_func(call_expr, None)
+            .expect("expected callable");
+
+        assert_eq!(func.get_ret(), &ws.ty("boolean"));
+    }
 }
