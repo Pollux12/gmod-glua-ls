@@ -121,15 +121,6 @@ pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
 /// static type when one exists.
 pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
 
-/// Signature-level standalone attribute name for calls that are safe to treat as
-/// side-effect-free during conservative analyzer rewrites.
-///
-/// Example: `---@[side_effect_free]` on a global helper means the call does not
-/// mutate globals, captured state, arguments, or analysis-relevant table/key
-/// identities. This marker is explicit metadata only; callers must not infer it
-/// from source bodies.
-pub const GMOD_ATTR_SIDE_EFFECT_FREE: &str = "side_effect_free";
-
 /// Signature-level standalone attribute name for calls whose write effects are
 /// bounded to the listed global/root identities.
 ///
@@ -370,10 +361,6 @@ pub fn signature_is_valid_guard_in_realm(
     db.get_signature_index()
         .effective_valid_guard_signature_mask(&signature_id)
         .is_some_and(|guard_mask| guard_mask.is_compatible_with(call_realm.state_mask()))
-}
-
-pub fn signature_is_side_effect_free(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
-    find_signature_attribute_use(db, signature_id, GMOD_ATTR_SIDE_EFFECT_FREE).is_some()
 }
 
 pub fn signature_writes_global_roots(

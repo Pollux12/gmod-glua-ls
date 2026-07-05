@@ -1,16 +1,15 @@
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaExpr, LuaNameExpr};
 
 use crate::{
-    DbIndex, GMOD_ATTR_SIDE_EFFECT_FREE, GMOD_ATTR_WRITES_GLOBAL, LuaInferCache, LuaSignatureId,
-    LuaType, SemanticDeclGuard, SemanticDeclLevel, attribute_use_write_global_root,
-    db_index::{signature_is_side_effect_free, signature_writes_global_roots},
+    DbIndex, GMOD_ATTR_WRITES_GLOBAL, LuaInferCache, LuaSignatureId, LuaType, SemanticDeclGuard,
+    SemanticDeclLevel, attribute_use_write_global_root,
+    db_index::signature_writes_global_roots,
     semantic::{get_member_value_expr, infer_expr_semantic_decl},
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum GmodCallWriteEffect {
     Unknown,
-    None,
     Globals(Vec<String>),
 }
 
@@ -23,12 +22,6 @@ pub(crate) fn gmod_call_write_effect(
     else {
         return GmodCallWriteEffect::Unknown;
     };
-    if signature_is_side_effect_free(db, signature_id)
-        || semantic_decl_has_side_effect_free_attribute(db, semantic_decl.clone())
-    {
-        return GmodCallWriteEffect::None;
-    }
-
     let mut roots = Vec::new();
     if let Some(signature_roots) = signature_writes_global_roots(db, signature_id) {
         roots.extend(signature_roots);
@@ -42,21 +35,6 @@ pub(crate) fn gmod_call_write_effect(
         roots.sort();
         roots.dedup();
         GmodCallWriteEffect::Globals(roots)
-    }
-}
-
-pub(crate) fn side_effect_free_call_metadata_signature_id(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    call_expr: &LuaCallExpr,
-) -> Option<LuaSignatureId> {
-    let (signature_id, semantic_decl) = call_effect_signature_and_decl(db, cache, call_expr)?;
-    if signature_is_side_effect_free(db, signature_id)
-        || semantic_decl_has_side_effect_free_attribute(db, semantic_decl)
-    {
-        Some(signature_id)
-    } else {
-        None
     }
 }
 
@@ -86,19 +64,6 @@ fn call_effect_signature_and_decl(
         get_signature_id_from_semantic_decl_value_expr(db, semantic_decl.clone())?,
         semantic_decl,
     ))
-}
-
-fn semantic_decl_has_side_effect_free_attribute(
-    db: &DbIndex,
-    semantic_decl: crate::LuaSemanticDeclId,
-) -> bool {
-    db.get_property_index()
-        .get_property(&semantic_decl)
-        .is_some_and(|property| {
-            property
-                .find_attribute_use(GMOD_ATTR_SIDE_EFFECT_FREE)
-                .is_some()
-        })
 }
 
 fn semantic_decl_writes_global_roots(

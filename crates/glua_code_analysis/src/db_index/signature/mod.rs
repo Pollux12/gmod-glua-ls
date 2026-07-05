@@ -7,18 +7,18 @@ use std::collections::{HashMap, HashSet};
 
 pub use async_state::AsyncState;
 pub use gmod_domains::{
-    GMOD_ATTR_SELF_CALL_VALID, GMOD_ATTR_SELF_GUARD, GMOD_ATTR_SIDE_EFFECT_FREE,
-    GMOD_ATTR_VALID_GUARD, GMOD_ATTR_WRITES_GLOBAL, GMOD_CALL_ARG_DOMAINS, GMOD_DOMAIN_CLASS_BASE,
-    GMOD_DOMAIN_COLOR, GMOD_DOMAIN_CONCOMMAND, GMOD_DOMAIN_CONVAR, GMOD_DOMAIN_DERMA_SKIN,
-    GMOD_DOMAIN_FILE_FIND, GMOD_DOMAIN_GAMEMODE, GMOD_DOMAIN_HOOK, GMOD_DOMAIN_LOAD,
-    GMOD_DOMAIN_MEMBER_GUARD, GMOD_DOMAIN_NET_MESSAGE, GMOD_DOMAIN_NET_PAYLOAD,
-    GMOD_DOMAIN_NETWORK_VAR, GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_TIMER, GMOD_DOMAIN_VALID_GUARD,
-    GMOD_DOMAIN_VGUI_PANEL, GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
+    GMOD_ATTR_SELF_CALL_VALID, GMOD_ATTR_SELF_GUARD, GMOD_ATTR_VALID_GUARD,
+    GMOD_ATTR_WRITES_GLOBAL, GMOD_CALL_ARG_DOMAINS, GMOD_DOMAIN_CLASS_BASE, GMOD_DOMAIN_COLOR,
+    GMOD_DOMAIN_CONCOMMAND, GMOD_DOMAIN_CONVAR, GMOD_DOMAIN_DERMA_SKIN, GMOD_DOMAIN_FILE_FIND,
+    GMOD_DOMAIN_GAMEMODE, GMOD_DOMAIN_HOOK, GMOD_DOMAIN_LOAD, GMOD_DOMAIN_MEMBER_GUARD,
+    GMOD_DOMAIN_NET_MESSAGE, GMOD_DOMAIN_NET_PAYLOAD, GMOD_DOMAIN_NETWORK_VAR,
+    GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_TIMER, GMOD_DOMAIN_VALID_GUARD, GMOD_DOMAIN_VGUI_PANEL,
+    GMOD_ROLE_EXISTS, GMOD_ROLE_REFERENCE, GMOD_SIGNATURE_METADATA_DOMAINS,
     attribute_use_write_global_root, collect_call_arg_roles_for_param,
     find_best_call_arg_role_for_param, find_best_call_arg_role_from_type,
     find_best_direct_call_arg_role_for_param, find_best_direct_call_arg_role_from_type,
     find_signature_attribute_use, rebuild_effective_valid_guard_signatures,
-    signature_attribute_uses, signature_is_side_effect_free, signature_is_valid_guard_in_realm,
+    signature_attribute_uses, signature_is_valid_guard_in_realm,
     signature_is_valid_guard_or_base_runtime_isvalid_in_realm, signature_owner_for,
     signature_writes_global_roots,
 };

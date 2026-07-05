@@ -2926,7 +2926,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_numeric_for_populated_table_arg_call_rhs_stays_need_check_nil() {
+    fn test_numeric_for_populated_table_arg_rhs_call_mutates_table_slot_stays_need_check_nil() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2945,6 +2945,125 @@ mod test {
             ---@return Color
             local function MakeColor()
                 ROLE_COLORS[ROLE_TRAITOR] = nil
+                return { r = 0 }
+            end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            len(eq(1))
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_body_inferred_call_rhs_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor()
+                return { r = 0 }
+            end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = MakeColor()
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_empty_body_call_rhs_has_no_nil_access_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            function Color(r, g, b) end
+
+            local function FillRoleColors(list)
+                for r = ROLE_NONE, ROLE_MAX do
+                    list[r] = Color(255, 255, 255)
+                end
+            end
+
+            FillRoleColors(ROLE_COLORS)
+
+            local traitorColor = ROLE_COLORS[ROLE_TRAITOR]
+            traitorColor.r = 255
+        "#;
+
+        assert_that!(
+            diagnostics_for_code(&mut ws, DiagnosticCode::NeedCheckNil, code),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_numeric_for_populated_table_arg_rhs_call_mutates_key_stays_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Color
+            ---@field r integer
+
+            local ROLE_NONE = 0
+            local ROLE_TRAITOR = 1
+            local ROLE_MAX = 2
+            local ROLE_COLORS = {}
+
+            ---@return Color
+            local function MakeColor()
+                ROLE_TRAITOR = 99
                 return { r = 0 }
             end
 
@@ -3501,13 +3620,11 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color, mode)
                 return { r = color.r, mode = mode }
             end
 
             ---@return string
-            ---@[side_effect_free]
             local function GetMode()
                 return "default"
             end
@@ -3558,7 +3675,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3600,7 +3716,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3676,7 +3791,6 @@ mod test {
             local cached_mode = nil
 
             ---@return string
-            ---@[side_effect_free]
             local function ReadMode()
                 return "default"
             end
@@ -3689,7 +3803,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color, mode)
                 return { r = color.r, mode = mode }
             end
@@ -3744,7 +3857,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3795,7 +3907,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3838,7 +3949,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return string
-            ---@[side_effect_free]
             local function ReadMode()
                 return "default"
             end
@@ -3849,7 +3959,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3901,7 +4010,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -3958,7 +4066,6 @@ mod test {
             end
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -4000,7 +4107,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -4038,7 +4144,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -4076,7 +4181,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -4114,7 +4218,6 @@ mod test {
             FALLBACK = { r = 0 }
 
             ---@return table
-            ---@[side_effect_free]
             local function MakeColor(color)
                 return color
             end
@@ -4849,7 +4952,6 @@ mod test {
         let reader = ws.def_file(
             "lua/autorun/shared/c_reader.lua",
             r#"
-            ---@[side_effect_free]
             function SafeGlobal() end
             local SafeGlobal=function() end
             SafeGlobal()
@@ -4886,23 +4988,20 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_call_with_safe_arg_preserves_fact()
-    {
+    fn test_cross_file_numeric_range_population_unknown_call_with_arg_rejects_fact() {
         let mut ws = gmod_ws();
         ws.def_file("lua/autorun/shared/a_colors.lua", r#"ROLE_MIN=1 ROLE_MAX=3 ROLE_TRAITOR=2 ROLE_COLORS={} local function fill(list) for i=ROLE_MIN,ROLE_MAX do list[i]={r=1} end end fill(ROLE_COLORS)"#);
         let reader = ws.def_file(
             "lua/autorun/shared/c_reader.lua",
             r#"
-            ---@[side_effect_free]
             function SafeArg() end
-            ---@[side_effect_free]
             function SafeOuter(x) end
             SafeOuter(SafeArg())
             local c=ROLE_COLORS[ROLE_TRAITOR]
             c.r=1
             "#,
         );
-        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(0)));
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
     }
 
     #[gtest]
@@ -5363,7 +5462,6 @@ mod test {
             COLOR_WHITE = { r = 255 }
 
             ---@return table
-            ---@[side_effect_free]
             function ModifyColor(color, mode)
                 if mode then
                     return { r = 0 }
@@ -5405,7 +5503,6 @@ mod test {
             COLOR_WHITE = { r = 255 }
 
             ---@return table
-            ---@[side_effect_free]
             function fallback(color)
                 return color
             end
@@ -5431,7 +5528,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_nested_call_has_no_nil_access() {
+    fn test_cross_file_numeric_range_population_nested_call_has_no_nil_access() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -5443,7 +5540,6 @@ mod test {
             COLOR_WHITE = Color(1, 2, 3)
 
             ---@return table
-            ---@[side_effect_free]
             function MakeBaseColor()
                 return { r = 1 }
             end
@@ -5463,7 +5559,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_nested_arg_has_no_nil_access() {
+    fn test_cross_file_numeric_range_population_nested_arg_has_no_nil_access() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -5474,13 +5570,11 @@ mod test {
             ROLE_COLORS = {}
 
             ---@return table
-            ---@[side_effect_free]
             function MakeBaseColor()
                 return { r = 1 }
             end
 
             ---@return table
-            ---@[side_effect_free]
             function TintColor(color)
                 return color
             end
@@ -5745,13 +5839,11 @@ mod test {
             ROLE_COLORS = {}
 
             ---@return table
-            ---@[side_effect_free]
             function Color(r, g, b)
                 return { r = r, g = g, b = b }
             end
 
             ---@return table
-            ---@[side_effect_free]
             function ColorAlpha(color, alpha)
                 return { r = color.r, g = color.g, b = color.b, a = alpha }
             end
@@ -5776,7 +5868,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_outer_helper_with_local_rhs_helper_has_no_nil_access()
+    fn test_cross_file_numeric_range_population_outer_helper_with_unbodied_library_call_stays_need_check_nil()
      {
         let mut ws = gmod_ws();
         ws.def_files(vec![
@@ -5786,7 +5878,6 @@ mod test {
             ---@class Color
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param r number
             ---@param g number
             ---@param b number
@@ -5794,7 +5885,6 @@ mod test {
             function _G.Color(r, g, b, a) end
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param h number
             ---@param s number
             ---@param l number
@@ -5837,11 +5927,11 @@ mod test {
             "local c = ROLE_COLORS[ROLE_TRAITOR]\nc.r = 1",
         );
 
-        assert_that!(need_check_nil_for_file(&mut ws, reader), is_empty());
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_library_workspace_side_effect_free_has_no_nil_access()
+    fn test_cross_file_numeric_range_population_library_workspace_unbodied_call_stays_need_check_nil()
      {
         let mut ws = gmod_ws();
         let library_root = ws
@@ -5857,7 +5947,6 @@ mod test {
             ---@class Color
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param r number
             ---@param g number
             ---@param b number
@@ -5865,7 +5954,6 @@ mod test {
             function _G.Color(r, g, b, a) end
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param h number
             ---@param s number
             ---@param l number
@@ -5910,12 +5998,11 @@ mod test {
             "local c = ROLE_COLORS[ROLE_TRAITOR]\nc.r = 1",
         );
 
-        assert_that!(need_check_nil_for_file(&mut ws, reader), is_empty());
+        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_local_shadowed_library_side_effect_free_stays_need_check_nil()
-     {
+    fn test_cross_file_numeric_range_population_local_shadowed_library_stays_need_check_nil() {
         let mut ws = gmod_ws();
         ws.def_files(vec![
             (
@@ -5924,7 +6011,6 @@ mod test {
             ---@class Color
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param r number
             ---@param g number
             ---@param b number
@@ -5932,7 +6018,6 @@ mod test {
             function _G.Color(r, g, b, a) end
 
             ---@return Color
-            ---@[side_effect_free]
             ---@param h number
             ---@param s number
             ---@param l number
@@ -5988,7 +6073,6 @@ mod test {
             ROLE_COLORS = {}
 
             ---@return table
-            ---@[side_effect_free]
             function Color(r, g, b)
                 return { r = r, g = g, b = b }
             end
@@ -6024,7 +6108,6 @@ mod test {
             ROLE_COLORS = {}
 
             ---@return table
-            ---@[side_effect_free]
             function Color(r, g, b)
                 return { r = r, g = g, b = b }
             end
@@ -6170,7 +6253,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_unannotated_nested_call_stays_need_check_nil() {
+    fn test_cross_file_numeric_range_population_body_inferred_nested_call_has_no_nil_access() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -6194,12 +6277,11 @@ mod test {
             "local c = ROLE_COLORS[ROLE_TRAITOR]\nc.r = 1",
         );
 
-        assert_that!(need_check_nil_for_file(&mut ws, reader), len(eq(1)));
+        assert_that!(need_check_nil_for_file(&mut ws, reader), is_empty());
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_name_shadow_stays_need_check_nil()
-    {
+    fn test_cross_file_numeric_range_population_name_shadow_stays_need_check_nil() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -6209,7 +6291,6 @@ mod test {
             ROLE_TRAITOR = 2
             ROLE_COLORS = {}
             ---@return table
-            ---@[side_effect_free]
             function MakeBaseColor()
                 return { r = 1 }
             end
@@ -6231,8 +6312,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_nullable_return_stays_need_check_nil()
-     {
+    fn test_cross_file_numeric_range_population_nullable_return_stays_need_check_nil() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -6242,7 +6322,6 @@ mod test {
             ROLE_TRAITOR = 2
             ROLE_COLORS = {}
             ---@return table?
-            ---@[side_effect_free]
             function MaybeColor() end
             local function fill(list)
                 for i = ROLE_MIN, ROLE_MAX do list[i] = MaybeColor() end
@@ -6259,8 +6338,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_cross_file_numeric_range_population_side_effect_free_unknown_arg_call_stays_need_check_nil()
-     {
+    fn test_cross_file_numeric_range_population_unknown_arg_call_stays_need_check_nil() {
         let mut ws = gmod_ws();
         ws.def_file(
             "lua/autorun/shared/sh_colors.lua",
@@ -6270,7 +6348,6 @@ mod test {
             ROLE_TRAITOR = 2
             ROLE_COLORS = {}
             ---@return table
-            ---@[side_effect_free]
             function TintColor(color)
                 return color
             end

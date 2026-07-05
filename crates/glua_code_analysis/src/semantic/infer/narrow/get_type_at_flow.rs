@@ -1562,6 +1562,9 @@ fn try_get_numeric_range_table_arg_population_type(
     else {
         return Ok(None);
     };
+    let key_name = numeric_table_index_query_key_name(var_ref_id)
+        .map(str::to_string)
+        .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id));
 
     let args = call_expr
         .get_args_list()
@@ -1621,7 +1624,15 @@ fn try_get_numeric_range_table_arg_population_type(
     if !index_expr_writes_param_at_for_var(index_expr, &param_name, &for_var_name) {
         return Ok(None);
     }
-    if expr_contains_immediately_executed_call(rhs_expr) {
+    if expr_calls_may_write_numeric_population_identity(
+        db,
+        cache,
+        root,
+        rhs_expr,
+        &query_root,
+        key_name.as_deref(),
+        &mut HashSet::new(),
+    ) {
         return Ok(None);
     }
 
@@ -1631,6 +1642,120 @@ fn try_get_numeric_range_table_arg_population_type(
     }
 
     Ok(Some(rhs_type))
+}
+
+fn expr_calls_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    expr: &LuaExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let expr_range = expr.get_range();
+    if let LuaExpr::CallExpr(call_expr) = expr
+        && same_file_call_may_write_numeric_population_identity(
+            db,
+            cache,
+            root,
+            call_expr,
+            query_root,
+            key_name,
+            active_closures,
+        )
+    {
+        return true;
+    }
+    expr.descendants::<LuaCallExpr>().any(|call_expr| {
+        call_is_inside_nested_closure_expr(&call_expr, expr_range)
+            || same_file_call_may_write_numeric_population_identity(
+                db,
+                cache,
+                root,
+                &call_expr,
+                query_root,
+                key_name,
+                active_closures,
+            )
+    })
+}
+
+fn same_file_call_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    call_expr: &LuaCallExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, root, call_expr) else {
+        return false;
+    };
+    let closure_range = closure.get_range();
+    if !active_closures.insert(closure_range) {
+        return true;
+    }
+
+    let may_write = closure_may_write_numeric_population_identity(
+        db,
+        cache,
+        root,
+        &closure,
+        query_root,
+        key_name,
+        active_closures,
+    );
+    active_closures.remove(&closure_range);
+    may_write
+}
+
+fn closure_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    closure: &LuaClosureExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+
+    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if assignment_vars_write_root(db, cache, &vars, query_root)
+            || key_name.is_some_and(|key_name| {
+                assignment_vars_write_dynamic_key_name(db, cache, &vars, key_name)
+            })
+        {
+            return true;
+        }
+    }
+
+    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
+            continue;
+        }
+        if same_file_call_may_write_numeric_population_identity(
+            db,
+            cache,
+            root,
+            &nested_call,
+            query_root,
+            key_name,
+            active_closures,
+        ) {
+            return true;
+        }
+    }
+
+    false
 }
 
 pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
@@ -1926,17 +2051,27 @@ fn call_effect_overlaps_mutation_roots(
     mutation_roots: &[&str],
 ) -> bool {
     let call_overlaps = match gmod_call_write_effect(db, cache, call_expr) {
-        GmodCallWriteEffect::None => false,
         GmodCallWriteEffect::Globals(roots) => roots.iter().any(|root| {
             mutation_roots
                 .iter()
                 .any(|mutation_root| root == mutation_root)
         }),
-        GmodCallWriteEffect::Unknown => true,
+        GmodCallWriteEffect::Unknown => same_file_call_effect_overlaps_mutation_roots(
+            db,
+            cache,
+            call_expr,
+            mutation_roots,
+            &mut HashSet::new(),
+        ),
     };
     call_overlaps
         || call_expr.get_args_list().is_some_and(|args| {
             args.get_args().any(|arg| {
+                if let LuaExpr::CallExpr(ref nested_call) = arg
+                    && call_effect_overlaps_mutation_roots(db, cache, &nested_call, mutation_roots)
+                {
+                    return true;
+                }
                 arg.descendants::<LuaCallExpr>().any(|nested_call| {
                     !node_is_inside_nested_closure(nested_call.syntax(), arg.syntax())
                         && call_effect_overlaps_mutation_roots(
@@ -1948,6 +2083,102 @@ fn call_effect_overlaps_mutation_roots(
                 })
             })
         })
+}
+
+fn same_file_call_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    mutation_roots: &[&str],
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(root) = LuaChunk::cast(call_expr.get_root()) else {
+        return true;
+    };
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, &root, call_expr)
+    else {
+        return true;
+    };
+    let closure_range = closure.get_range();
+    if !active_closures.insert(closure_range) {
+        return true;
+    }
+
+    let overlaps = closure_effect_overlaps_mutation_roots(
+        db,
+        cache,
+        &root,
+        &closure,
+        mutation_roots,
+        active_closures,
+    );
+    active_closures.remove(&closure_range);
+    overlaps
+}
+
+fn closure_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    closure: &LuaClosureExpr,
+    mutation_roots: &[&str],
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(block) = closure.get_block() else {
+        return true;
+    };
+
+    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars
+            .iter()
+            .any(|var| var_expr_may_mutate_global_table(var, mutation_roots))
+        {
+            return true;
+        }
+    }
+
+    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
+            continue;
+        }
+        let call_overlaps = match gmod_call_write_effect(db, cache, &nested_call) {
+            GmodCallWriteEffect::Globals(roots) => roots.iter().any(|root| {
+                mutation_roots
+                    .iter()
+                    .any(|mutation_root| root == mutation_root)
+            }),
+            GmodCallWriteEffect::Unknown => {
+                let Some(closure) =
+                    resolve_same_file_named_function_closure(db, cache, root, &nested_call)
+                else {
+                    return true;
+                };
+                let closure_range = closure.get_range();
+                if !active_closures.insert(closure_range) {
+                    return true;
+                }
+                let overlaps = closure_effect_overlaps_mutation_roots(
+                    db,
+                    cache,
+                    root,
+                    &closure,
+                    mutation_roots,
+                    active_closures,
+                );
+                active_closures.remove(&closure_range);
+                overlaps
+            }
+        };
+        if call_overlaps {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn node_is_inside_nested_closure(
@@ -2086,25 +2317,44 @@ fn resolve_same_file_named_function_closure(
     }
 
     let name_text = name_expr.get_name_text()?;
-    let call_block = call_expr.ancestors::<LuaBlock>().next()?;
-    let mut matched = call_block
-        .get_stats()
-        .take_while(|stat| stat.get_position() < call_expr.get_position())
-        .filter_map(|stat| match stat {
-            LuaStat::LocalFuncStat(local_func) => Some(local_func),
-            _ => None,
-        })
-        .filter(|stat| {
-            stat.get_local_name()
-                .and_then(|name| name.get_name_token())
-                .is_some_and(|token| token.get_name_text() == name_text)
-        })
-        .filter_map(|stat| stat.get_closure());
-    let closure = matched.next()?;
-    if matched.next().is_some() {
-        return None;
+    for block in call_expr.ancestors::<LuaBlock>() {
+        let mut matched = block
+            .get_stats()
+            .take_while(|stat| stat.get_position() < call_expr.get_position())
+            .filter_map(|stat| match stat {
+                LuaStat::LocalFuncStat(local_func) => local_func
+                    .get_local_name()
+                    .and_then(|name| name.get_name_token())
+                    .is_some_and(|token| token.get_name_text() == name_text)
+                    .then(|| local_func.get_closure())
+                    .flatten(),
+                LuaStat::FuncStat(func_stat) => {
+                    simple_func_stat_name_matches(&func_stat, &name_text)
+                        .then(|| func_stat.get_closure())
+                        .flatten()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut matched = matched.drain(..);
+        let Some(closure) = matched.next() else {
+            continue;
+        };
+        if matched.next().is_some() {
+            return None;
+        }
+        return Some(closure);
     }
-    Some(closure)
+    None
+}
+
+fn simple_func_stat_name_matches(func_stat: &LuaFuncStat, name: &str) -> bool {
+    let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name() else {
+        return false;
+    };
+    name_expr
+        .get_name_text()
+        .is_some_and(|name_text| name_text == name)
 }
 
 fn index_expr_writes_param_at_for_var(
@@ -2234,6 +2484,7 @@ fn var_ref_matches_root(
     match var_ref_id {
         VarRefId::VarRef(decl_id) => root.as_decl_id() == Some(*decl_id),
         VarRefId::SelfRef(self_ref_id) => root.receiver_eq(&self_ref_id.receiver),
+        VarRefId::IndexRef(index_root, _) => index_root == root,
         _ => false,
     }
 }
@@ -2275,14 +2526,6 @@ fn assignment_vars_write_dynamic_key_name(
         get_var_expr_var_ref_id(db, cache, var.to_expr())
             .is_some_and(|var_ref_id| var_ref_is_name(db, &var_ref_id, key_name))
     })
-}
-
-fn expr_contains_immediately_executed_call(expr: &LuaExpr) -> bool {
-    let expr_range = expr.get_range();
-    matches!(expr, LuaExpr::CallExpr(_))
-        || expr
-            .descendants::<LuaCallExpr>()
-            .any(|call_expr| !call_is_inside_nested_closure_expr(&call_expr, expr_range))
 }
 
 fn call_is_inside_nested_closure_expr(call_expr: &LuaCallExpr, expr_range: TextRange) -> bool {

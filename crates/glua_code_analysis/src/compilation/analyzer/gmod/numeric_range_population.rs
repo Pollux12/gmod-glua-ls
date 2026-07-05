@@ -1,7 +1,5 @@
 use super::*;
-use crate::semantic::gmod_call_effect::{
-    GmodCallWriteEffect, gmod_call_write_effect, side_effect_free_call_metadata_signature_id,
-};
+use crate::semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect};
 
 pub(super) fn collect_numeric_range_table_populations_for_file(
     db: &DbIndex,
@@ -516,6 +514,7 @@ fn numeric_range_population_from_helper_call(
             db,
             cache,
             file_id,
+            closure,
             &for_stats,
             &param_name,
             &for_var_name,
@@ -672,6 +671,20 @@ fn pre_loop_expr_is_harmless(
     protected_names: &HashSet<String>,
     active_helpers: &mut HashSet<String>,
 ) -> bool {
+    if let LuaExpr::CallExpr(call_expr) = expr
+        && !pre_loop_call_is_harmless(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            call_expr,
+            helpers,
+            protected_names,
+            active_helpers,
+        )
+    {
+        return false;
+    }
     expr.descendants::<LuaCallExpr>().all(|call_expr| {
         is_node_in_nested_closure(call_expr.syntax(), expr.syntax())
             || pre_loop_call_is_harmless(
@@ -822,6 +835,7 @@ fn branchy_loop_writes_target_on_continue_paths(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     stats: &[LuaStat],
     param_name: &str,
     loop_var_name: &str,
@@ -833,6 +847,7 @@ fn branchy_loop_writes_target_on_continue_paths(
             db,
             cache,
             file_id,
+            containing_closure,
             stat,
             param_name,
             loop_var_name,
@@ -847,6 +862,7 @@ fn branchy_stat_writes_target_before_continue(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     stat: &LuaStat,
     param_name: &str,
     loop_var_name: &str,
@@ -859,6 +875,7 @@ fn branchy_stat_writes_target_before_continue(
             db,
             cache,
             file_id,
+            containing_closure,
             assign_stat,
             param_name,
             loop_var_name,
@@ -870,6 +887,7 @@ fn branchy_stat_writes_target_before_continue(
             db,
             cache,
             file_id,
+            containing_closure,
             if_stat,
             param_name,
             loop_var_name,
@@ -877,9 +895,15 @@ fn branchy_stat_writes_target_before_continue(
             protected_names,
             target_written,
         ),
-        LuaStat::LocalStat(local_stat) => {
-            branchy_local_stat_is_safe(db, cache, local_stat, protected_names)
-        }
+        LuaStat::LocalStat(local_stat) => branchy_local_stat_is_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            local_stat,
+            helpers,
+            protected_names,
+        ),
         LuaStat::EmptyStat(_) => true,
         LuaStat::CallExprStat(_) => false,
         _ => false,
@@ -889,7 +913,10 @@ fn branchy_stat_writes_target_before_continue(
 fn branchy_local_stat_is_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     local_stat: &glua_parser::LuaLocalStat,
+    helpers: &HashMap<String, LuaClosureExpr>,
     protected_names: &HashSet<String>,
 ) -> bool {
     for local_name in local_stat.get_local_name_list() {
@@ -902,8 +929,16 @@ fn branchy_local_stat_is_safe(
     }
 
     local_stat.get_value_exprs().all(|expr| {
-        let mut active_calls = HashSet::new();
-        expr_calls_have_allowed_write_effects(db, cache, &expr, protected_names, &mut active_calls)
+        pre_loop_expr_is_harmless(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            &expr,
+            helpers,
+            protected_names,
+            &mut HashSet::new(),
+        )
     })
 }
 
@@ -911,6 +946,7 @@ fn branchy_assignment_is_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     assign_stat: &LuaAssignStat,
     param_name: &str,
     loop_var_name: &str,
@@ -921,6 +957,7 @@ fn branchy_assignment_is_safe(
         db,
         cache,
         file_id,
+        containing_closure,
         assign_stat,
         param_name,
         loop_var_name,
@@ -945,8 +982,16 @@ fn branchy_assignment_is_safe(
         }
     }
     exprs.iter().all(|expr| {
-        let mut active_calls = HashSet::new();
-        expr_calls_have_allowed_write_effects(db, cache, expr, protected_names, &mut active_calls)
+        pre_loop_expr_is_harmless(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            expr,
+            helpers,
+            protected_names,
+            &mut HashSet::new(),
+        )
     })
 }
 
@@ -954,6 +999,7 @@ fn if_stat_continue_paths_are_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     if_stat: &LuaIfStat,
     param_name: &str,
     loop_var_name: &str,
@@ -961,13 +1007,22 @@ fn if_stat_continue_paths_are_safe(
     protected_names: &HashSet<String>,
     target_written: bool,
 ) -> bool {
-    if !condition_calls_are_safe(db, cache, if_stat.get_condition_expr(), protected_names) {
+    if !condition_calls_are_safe(
+        db,
+        cache,
+        file_id,
+        containing_closure,
+        if_stat.get_condition_expr(),
+        helpers,
+        protected_names,
+    ) {
         return false;
     }
     if !block_continue_paths_are_safe(
         db,
         cache,
         file_id,
+        containing_closure,
         if_stat.get_block(),
         param_name,
         loop_var_name,
@@ -978,19 +1033,26 @@ fn if_stat_continue_paths_are_safe(
         return false;
     }
     for else_if in if_stat.get_else_if_clause_list() {
-        if !condition_calls_are_safe(db, cache, else_if.get_condition_expr(), protected_names)
-            || !block_continue_paths_are_safe(
-                db,
-                cache,
-                file_id,
-                else_if.get_block(),
-                param_name,
-                loop_var_name,
-                helpers,
-                protected_names,
-                target_written,
-            )
-        {
+        if !condition_calls_are_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            else_if.get_condition_expr(),
+            helpers,
+            protected_names,
+        ) || !block_continue_paths_are_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            else_if.get_block(),
+            param_name,
+            loop_var_name,
+            helpers,
+            protected_names,
+            target_written,
+        ) {
             return false;
         }
     }
@@ -999,6 +1061,7 @@ fn if_stat_continue_paths_are_safe(
             db,
             cache,
             file_id,
+            containing_closure,
             else_clause.get_block(),
             param_name,
             loop_var_name,
@@ -1014,17 +1077,22 @@ fn if_stat_continue_paths_are_safe(
 fn condition_calls_are_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     condition: Option<LuaExpr>,
+    helpers: &HashMap<String, LuaClosureExpr>,
     protected_names: &HashSet<String>,
 ) -> bool {
     condition.is_none_or(|condition| {
-        let mut active_calls = HashSet::new();
-        expr_calls_have_allowed_write_effects(
+        pre_loop_expr_is_harmless(
             db,
             cache,
+            file_id,
+            containing_closure,
             &condition,
+            helpers,
             protected_names,
-            &mut active_calls,
+            &mut HashSet::new(),
         )
     })
 }
@@ -1033,6 +1101,7 @@ fn block_continue_paths_are_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     block: Option<LuaBlock>,
     param_name: &str,
     loop_var_name: &str,
@@ -1048,6 +1117,7 @@ fn block_continue_paths_are_safe(
             db,
             cache,
             file_id,
+            containing_closure,
             &stat,
             param_name,
             loop_var_name,
@@ -1062,6 +1132,7 @@ fn block_continue_paths_are_safe(
                 db,
                 cache,
                 file_id,
+                containing_closure,
                 assign_stat,
                 param_name,
                 loop_var_name,
@@ -1079,6 +1150,7 @@ fn assignment_writes_target_with_non_nil_rhs(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     assign_stat: &LuaAssignStat,
     param_name: &str,
     loop_var_name: &str,
@@ -1093,18 +1165,35 @@ fn assignment_writes_target_with_non_nil_rhs(
     if !index_expr_matches_target(index_expr, param_name, loop_var_name) {
         return false;
     }
-    early_continue_rhs_calls_are_safe(db, cache, rhs_expr, protected_names)
-        && inferred_rhs_is_non_nil(db, cache, file_id, rhs_expr, helpers)
+    early_continue_rhs_calls_are_safe(
+        db,
+        cache,
+        file_id,
+        containing_closure,
+        rhs_expr,
+        helpers,
+        protected_names,
+    ) && inferred_rhs_is_non_nil(db, cache, file_id, rhs_expr, helpers)
 }
 
 fn early_continue_rhs_calls_are_safe(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
     rhs_expr: &LuaExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
     protected_names: &HashSet<String>,
 ) -> bool {
-    let mut active_calls = HashSet::new();
-    expr_calls_have_allowed_write_effects(db, cache, rhs_expr, protected_names, &mut active_calls)
+    numeric_range_rhs_is_safe(
+        db,
+        cache,
+        file_id,
+        containing_closure,
+        rhs_expr,
+        helpers,
+        protected_names,
+    )
 }
 
 fn index_expr_matches_target(
@@ -1270,16 +1359,6 @@ fn infer_safe_helper_return_expr_type(
         }
     }
 
-    if let LuaExpr::CallExpr(call_expr) = return_expr
-        && let Some(signature_id) =
-            side_effect_free_call_metadata_signature_id(db, cache, call_expr)
-    {
-        return db
-            .get_signature_index()
-            .get(&signature_id)
-            .map(|signature| signature.get_return_type());
-    }
-
     infer_expr(db, cache, return_expr.clone()).ok()
 }
 
@@ -1303,7 +1382,11 @@ fn numeric_range_rhs_is_safe(
     helpers: &HashMap<String, LuaClosureExpr>,
     protected_names: &HashSet<String>,
 ) -> bool {
-    let calls = rhs_expr.descendants::<LuaCallExpr>().collect::<Vec<_>>();
+    let mut calls = Vec::new();
+    if let LuaExpr::CallExpr(call_expr) = rhs_expr {
+        calls.push(call_expr.clone());
+    }
+    calls.extend(rhs_expr.descendants::<LuaCallExpr>());
     if calls.is_empty() {
         return true;
     }
@@ -1334,57 +1417,127 @@ fn numeric_range_call_is_safe(
     active_helpers: &mut HashSet<String>,
 ) -> bool {
     if let Some(helper_name) = call_expr_name(call_expr)
-        && call_expr.get_prefix_expr().is_some_and(|prefix| {
-            matches!(
-                prefix,
-                LuaExpr::NameExpr(ref name_expr)
-                    if name_expr_resolves_to_local(db, file_id, name_expr)
-            )
-        })
+        && let Some(helper_closure) = helpers.get(&helper_name)
     {
-        if let Some(helper_closure) = helpers.get(&helper_name) {
-            return !call_name_shadowed_in_closure_before_call(
-                containing_closure,
-                &helper_name,
-                call_expr,
-            ) && call_args_have_allowed_write_effects(
-                db,
-                cache,
-                call_expr,
-                protected_names,
-            ) && rhs_helper_body_is_safe(
-                db,
-                cache,
-                file_id,
-                &helper_name,
-                helper_closure,
-                helpers,
-                protected_names,
-                active_helpers,
-            );
-        }
+        return !call_name_shadowed_in_closure_before_call(
+            containing_closure,
+            &helper_name,
+            call_expr,
+        ) && !call_write_effect_overlaps_protected_names(
+            db,
+            cache,
+            call_expr,
+            protected_names,
+        ) && call_args_are_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            call_expr,
+            helpers,
+            protected_names,
+            active_helpers,
+        ) && rhs_helper_body_is_safe(
+            db,
+            cache,
+            file_id,
+            &helper_name,
+            helper_closure,
+            helpers,
+            protected_names,
+            active_helpers,
+        );
     }
 
     call_write_effect_is_allowed(db, cache, call_expr, protected_names, &mut HashSet::new())
+        && call_args_are_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            call_expr,
+            helpers,
+            protected_names,
+            active_helpers,
+        )
 }
 
-fn call_args_have_allowed_write_effects(
+fn call_write_effect_overlaps_protected_names(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
     protected_names: &HashSet<String>,
 ) -> bool {
+    match gmod_call_write_effect(db, cache, call_expr) {
+        GmodCallWriteEffect::Globals(roots) => roots
+            .iter()
+            .any(|root| protected_names.contains(root.as_str())),
+        GmodCallWriteEffect::Unknown => false,
+    }
+}
+
+fn call_args_are_safe(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
+    call_expr: &LuaCallExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+    protected_names: &HashSet<String>,
+    active_helpers: &mut HashSet<String>,
+) -> bool {
     call_expr.get_args_list().is_none_or(|args| {
-        let mut active_calls = HashSet::new();
         args.get_args().all(|arg| {
-            expr_calls_have_allowed_write_effects(
+            expr_calls_are_safe(
                 db,
                 cache,
+                file_id,
+                containing_closure,
                 &arg,
+                helpers,
                 protected_names,
-                &mut active_calls,
+                active_helpers,
             )
         })
+    })
+}
+
+fn expr_calls_are_safe(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    containing_closure: &LuaClosureExpr,
+    expr: &LuaExpr,
+    helpers: &HashMap<String, LuaClosureExpr>,
+    protected_names: &HashSet<String>,
+    active_helpers: &mut HashSet<String>,
+) -> bool {
+    if let LuaExpr::CallExpr(nested_call) = expr
+        && !numeric_range_call_is_safe(
+            db,
+            cache,
+            file_id,
+            containing_closure,
+            nested_call,
+            helpers,
+            protected_names,
+            active_helpers,
+        )
+    {
+        return false;
+    }
+    expr.descendants::<LuaCallExpr>().all(|nested_call| {
+        is_node_in_nested_closure(nested_call.syntax(), expr.syntax())
+            || numeric_range_call_is_safe(
+                db,
+                cache,
+                file_id,
+                containing_closure,
+                &nested_call,
+                helpers,
+                protected_names,
+                active_helpers,
+            )
     })
 }
 
@@ -1478,7 +1631,6 @@ fn call_write_effect_is_allowed(
     }
 
     let is_safe = match gmod_call_write_effect(db, cache, call_expr) {
-        GmodCallWriteEffect::None => true,
         GmodCallWriteEffect::Globals(roots) => roots
             .iter()
             .all(|root| !protected_names.contains(root.as_str())),
@@ -1500,6 +1652,11 @@ fn expr_calls_have_allowed_write_effects(
     protected_names: &HashSet<String>,
     active_calls: &mut HashSet<TextRange>,
 ) -> bool {
+    if let LuaExpr::CallExpr(nested_call) = expr
+        && !call_write_effect_is_allowed(db, cache, nested_call, protected_names, active_calls)
+    {
+        return false;
+    }
     expr.descendants::<LuaCallExpr>().all(|nested_call| {
         is_node_in_nested_closure(nested_call.syntax(), expr.syntax())
             || call_write_effect_is_allowed(db, cache, &nested_call, protected_names, active_calls)
