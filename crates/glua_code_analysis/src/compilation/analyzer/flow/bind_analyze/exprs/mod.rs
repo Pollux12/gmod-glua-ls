@@ -2,7 +2,7 @@ mod bind_binary_expr;
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexExpr, LuaNameExpr,
-    LuaTableExpr, LuaUnaryExpr,
+    LuaTableExpr, LuaUnaryExpr, UnaryOperator,
 };
 
 use crate::{
@@ -117,6 +117,21 @@ pub fn bind_unary_expr(
     current: FlowId,
 ) -> Option<()> {
     let inner_expr = unary_expr.get_expr()?;
+
+    if unary_expr
+        .get_op_token()
+        .is_some_and(|op| matches!(op.get_op(), UnaryOperator::OpNot))
+    {
+        let old_true_target = binder.true_target;
+        let old_false_target = binder.false_target;
+        binder.true_target = old_false_target;
+        binder.false_target = old_true_target;
+        bind_expr(binder, inner_expr, current);
+        binder.true_target = old_true_target;
+        binder.false_target = old_false_target;
+        return Some(());
+    }
+
     bind_expr(binder, inner_expr, current);
     Some(())
 }

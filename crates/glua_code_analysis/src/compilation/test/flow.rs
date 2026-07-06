@@ -3530,6 +3530,49 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_isvalid_conjunction_early_return_narrows_each_operand() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel?
+            local function maybeLabel() end
+
+            local dclock = maybeLabel()
+            local dwires = maybeLabel()
+
+            local function update(val)
+                if not (IsValid(dclock) and IsValid(dwires)) then return end
+
+                dclock:Update(val)
+                dwires:Update(val)
+                _G.afterGuard = dwires
+            end
+            "#,
+        );
+
+        let dwires_after_guard = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 0);
+        let desc = ws.humanize_type(dwires_after_guard.clone());
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+        assert_that!(desc.as_str(), not(contains_substring("NULL")));
+        let expected = ws.ty("DLabel");
+        assert_that!(ws.check_type(&dwires_after_guard, &expected), eq(true));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UncheckedNilAccess),
+            eq(false)
+        );
+    }
+
+    #[gtest]
     fn test_isstring_guard_narrows() {
         // isstring(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
