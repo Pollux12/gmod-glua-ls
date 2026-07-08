@@ -14,7 +14,7 @@ use super::checker::precompute_missing_required_fields;
 use super::checker::precompute_nodiscard_candidates;
 use super::checker::precompute_param_type_candidates;
 use super::checker::precompute_sorted_send_flows;
-use super::checker::precompute_subclass_fields;
+use super::checker::precompute_subtype_fields;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
@@ -125,7 +125,7 @@ impl LuaDiagnostic {
         let (
             workspace_realm_data,
             missing_required_fields,
-            subclass_fields,
+            subtype_fields,
             await_candidates,
             param_type_candidates,
             nodiscard_candidates,
@@ -161,7 +161,7 @@ impl LuaDiagnostic {
                 )
             });
             let missing = s.spawn(|| precompute_missing_required_fields(db));
-            let subclass = s.spawn(|| precompute_subclass_fields(db));
+            let subtype_fields = s.spawn(|| precompute_subtype_fields(db));
             let await_c = s.spawn(|| precompute_await_candidates(db));
             let param_type = s.spawn(|| precompute_param_type_candidates(db));
             let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
@@ -176,9 +176,9 @@ impl LuaDiagnostic {
                 missing
                     .join()
                     .expect("precompute_missing_required_fields panicked"),
-                subclass
+                subtype_fields
                     .join()
-                    .expect("precompute_subclass_fields panicked"),
+                    .expect("precompute_subtype_fields panicked"),
                 await_c
                     .join()
                     .expect("precompute_await_candidates panicked"),
@@ -200,6 +200,7 @@ impl LuaDiagnostic {
         });
         let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =
             workspace_realm_data;
+        let (direct_subtype_fields, transitive_subtype_fields) = subtype_fields;
 
         Arc::new(SharedDiagnosticData {
             workspace_file_ids: Arc::new(workspace_file_ids),
@@ -207,7 +208,8 @@ impl LuaDiagnostic {
             callee_realms_by_workspace,
             realm_call_candidates_by_workspace,
             missing_required_fields: Arc::new(missing_required_fields),
-            subclass_fields: Arc::new(subclass_fields),
+            direct_subtype_fields: Arc::new(direct_subtype_fields),
+            transitive_subtype_fields: Arc::new(transitive_subtype_fields),
             await_candidates: Arc::new(await_candidates),
             param_type_candidates: Arc::new(param_type_candidates),
             nodiscard_candidates: Arc::new(nodiscard_candidates),

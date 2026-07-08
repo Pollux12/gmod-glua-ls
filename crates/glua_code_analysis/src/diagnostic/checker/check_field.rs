@@ -28,12 +28,19 @@ use super::{
 
 pub struct CheckFieldChecker;
 
-pub fn precompute_subclass_fields(db: &DbIndex) -> HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>> {
+pub fn precompute_subtype_fields(
+    db: &DbIndex,
+) -> (
+    HashMap<LuaTypeDeclId, HashMap<SmolStr, Arc<Vec<SmolStr>>>>,
+    HashMap<LuaTypeDeclId, HashSet<SmolStr>>,
+) {
     if !db.get_emmyrc().gmod.enabled {
-        return HashMap::new();
+        return (HashMap::new(), HashMap::new());
     }
 
-    let mut subclass_fields: HashMap<LuaTypeDeclId, HashSet<SmolStr>> = HashMap::new();
+    let mut direct_subtype_fields: HashMap<LuaTypeDeclId, HashMap<SmolStr, HashSet<SmolStr>>> =
+        HashMap::new();
+    let mut transitive_subtype_fields: HashMap<LuaTypeDeclId, HashSet<SmolStr>> = HashMap::new();
     let type_index = db.get_type_index();
     let member_index = db.get_member_index();
 
@@ -59,22 +66,51 @@ pub fn precompute_subclass_fields(db: &DbIndex) -> HashMap<LuaTypeDeclId, Arc<Ha
         type_id.collect_super_types(db, &mut super_types);
         for super_type in super_types {
             if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                subclass_fields
+                transitive_subtype_fields
                     .entry(super_id)
                     .or_default()
                     .extend(member_names.iter().cloned());
             }
         }
+
+        if let Some(super_types) = type_index.get_super_types_iter(&type_id) {
+            for super_type in super_types {
+                if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
+                    let fields = direct_subtype_fields.entry(super_id.clone()).or_default();
+                    for member_name in &member_names {
+                        fields
+                            .entry(member_name.clone())
+                            .or_default()
+                            .insert(SmolStr::new(type_decl.get_name()));
+                    }
+                }
+            }
+        }
     }
 
-    subclass_fields
+    let direct_subtype_fields = direct_subtype_fields
         .into_iter()
-        .map(|(type_id, fields)| (type_id, Arc::new(fields)))
-        .collect()
+        .map(|(type_id, fields)| {
+            let fields = fields
+                .into_iter()
+                .map(|(field_name, child_names)| {
+                    let mut child_names = child_names.into_iter().collect::<Vec<_>>();
+                    child_names.sort();
+                    (field_name, Arc::new(child_names))
+                })
+                .collect();
+            (type_id, fields)
+        })
+        .collect();
+    (direct_subtype_fields, transitive_subtype_fields)
 }
 
 impl Checker for CheckFieldChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
+    const CODES: &[DiagnosticCode] = &[
+        DiagnosticCode::InjectField,
+        DiagnosticCode::UndefinedField,
+        DiagnosticCode::GmodMemberOnSubtypeOnly,
+    ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
@@ -237,7 +273,7 @@ struct CheckFieldProfile {
     invalid_prefix_skips: usize,
     valid_member_hits: usize,
     dynamic_field_skips: usize,
-    subclass_field_skips: usize,
+    subtype_advisories_emitted: usize,
     diagnostics_emitted: usize,
     prefix_infer_time: Duration,
     valid_member_time: Duration,
@@ -246,7 +282,7 @@ struct CheckFieldProfile {
 impl CheckFieldProfile {
     fn log(&self, file_id: crate::FileId, member_cache_entries: usize) {
         log::info!(
-            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subclass_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
+            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subtype_advisories={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
             file_id,
             self.nodes_scanned,
             self.assignment_nodes,
@@ -257,7 +293,7 @@ impl CheckFieldProfile {
             self.invalid_prefix_skips,
             self.valid_member_hits,
             self.dynamic_field_skips,
-            self.subclass_field_skips,
+            self.subtype_advisories_emitted,
             self.diagnostics_emitted,
             self.prefix_infer_time,
             self.valid_member_time,
@@ -361,15 +397,6 @@ fn check_index_expr(
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && field_exists_on_subclass(context, db, &prefix_typ, &field_name)
-    {
-        if let Some(profile) = profile.as_mut() {
-            profile.subclass_field_skips += 1;
-        }
-        return Some(());
-    }
-
     // Bracket access with non-literal expression keys (e.g., `tbl[entity]`) is a dynamic
     // table access pattern that cannot be statically validated. Suppress undefined-field
     // unless the prefix is an enum or a typed table (where key validation is meaningful).
@@ -413,6 +440,33 @@ fn check_index_expr(
             );
         }
         DiagnosticCode::UndefinedField => {
+            // This advisory is emitted from the undefined-field pass: disabling
+            // `undefined-field` also disables subtype-only member diagnostics.
+            let candidates = if context.is_checker_enable_by_code(&DiagnosticCode::UndefinedField) {
+                direct_subtype_field_candidates(context, db, &prefix_typ, &field_name)
+            } else {
+                Vec::new()
+            };
+            if !candidates.is_empty() {
+                if let Some(profile) = profile.as_mut() {
+                    profile.subtype_advisories_emitted += 1;
+                    profile.diagnostics_emitted += 1;
+                }
+                context.add_diagnostic(
+                    DiagnosticCode::GmodMemberOnSubtypeOnly,
+                    index_key.get_range()?,
+                    subtype_only_member_message(db, &prefix_typ, &field_name, &candidates),
+                    None,
+                );
+                return Some(());
+            }
+            // Tier rule: direct subtype members produce the advisory above, while
+            // deeper/transitive subtype hits stay silent for baseline parity and
+            // open-world inheritance trees such as VGUI panels. Only a full subtype
+            // closure miss falls through to ordinary `UndefinedField`.
+            if transitive_subtype_has_field(context, db, &prefix_typ, &field_name) {
+                return Some(());
+            }
             if let Some(profile) = profile.as_mut() {
                 profile.diagnostics_emitted += 1;
             }
@@ -2180,10 +2234,62 @@ fn owner_has_named_dynamic_fields(
         .is_some_and(|fields| !fields.is_empty())
 }
 
-/// Check if a field exists on any subclass of the given prefix type.
-/// In GMod, entities are commonly passed around as their base type (e.g. Entity)
-/// even though they are actually a specific subclass (e.g. Vehicle, Player).
-fn field_exists_on_subclass(
+fn direct_subtype_field_candidates(
+    context: &DiagnosticContext,
+    db: &DbIndex,
+    prefix_typ: &LuaType,
+    field_name: &SmolStr,
+) -> Vec<SmolStr> {
+    if !db.get_emmyrc().gmod.enabled {
+        return Vec::new();
+    }
+
+    let type_id = match prefix_typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id,
+        LuaType::TableOf(inner) => {
+            return direct_subtype_field_candidates(context, db, inner, field_name);
+        }
+        LuaType::Union(union) => {
+            let mut candidates = union
+                .types()
+                .filter(|t| !t.is_nil())
+                .flat_map(|t| direct_subtype_field_candidates(context, db, t, field_name))
+                .collect::<Vec<_>>();
+            candidates.sort();
+            candidates.dedup();
+            return candidates;
+        }
+        _ => return Vec::new(),
+    };
+
+    if let Some(shared_data) = context.get_shared_data_arc() {
+        return shared_data
+            .direct_subtype_fields
+            .get(type_id)
+            .and_then(|fields| fields.get(field_name))
+            .map(|candidates| candidates.as_ref().clone())
+            .unwrap_or_default();
+    }
+
+    let sub_types = db.get_type_index().get_sub_types(type_id);
+    let key = LuaMemberKey::Name(field_name.clone());
+    let mut candidates = Vec::new();
+    for sub_decl in sub_types {
+        let owner = LuaMemberOwner::Type(sub_decl.get_id());
+        if db
+            .get_member_index()
+            .get_member_item(&owner, &key)
+            .is_some()
+        {
+            candidates.push(SmolStr::new(sub_decl.get_name()));
+        }
+    }
+    candidates.sort();
+    candidates.dedup();
+    candidates
+}
+
+fn transitive_subtype_has_field(
     context: &DiagnosticContext,
     db: &DbIndex,
     prefix_typ: &LuaType,
@@ -2195,33 +2301,61 @@ fn field_exists_on_subclass(
 
     let type_id = match prefix_typ {
         LuaType::Ref(id) | LuaType::Def(id) => id,
-        LuaType::TableOf(inner) => return field_exists_on_subclass(context, db, inner, field_name),
+        LuaType::TableOf(inner) => {
+            return transitive_subtype_has_field(context, db, inner, field_name);
+        }
         LuaType::Union(union) => {
             return union
                 .types()
-                .any(|t| field_exists_on_subclass(context, db, t, field_name));
+                .filter(|t| !t.is_nil())
+                .any(|t| transitive_subtype_has_field(context, db, t, field_name));
         }
         _ => return false,
     };
 
     if let Some(shared_data) = context.get_shared_data_arc() {
         return shared_data
-            .subclass_fields
+            .transitive_subtype_fields
             .get(type_id)
             .is_some_and(|fields| fields.contains(field_name));
     }
 
     let sub_types = db.get_type_index().get_all_sub_types(type_id);
     let key = LuaMemberKey::Name(field_name.clone());
-    for sub_decl in sub_types {
+    sub_types.into_iter().any(|sub_decl| {
         let owner = LuaMemberOwner::Type(sub_decl.get_id());
-        if db
-            .get_member_index()
+        db.get_member_index()
             .get_member_item(&owner, &key)
             .is_some()
-        {
-            return true;
-        }
+    })
+}
+
+fn subtype_only_member_message(
+    db: &DbIndex,
+    base_typ: &LuaType,
+    field_name: &SmolStr,
+    candidates: &[SmolStr],
+) -> String {
+    let base = humanize_lint_type(db, base_typ);
+    let shown = candidates
+        .iter()
+        .take(3)
+        .map(|name| format!("`{name}`"))
+        .collect::<Vec<_>>();
+    let more = candidates.len().saturating_sub(shown.len());
+    let candidate_text = if more == 0 {
+        shown.join(", ")
+    } else {
+        format!("{}, and {more} more", shown.join(", "))
+    };
+
+    if candidates.len() == 1 {
+        format!(
+            "Field `{field_name}` is defined on subtype {candidate_text} but not on `{base}`. Narrow or cast the value before access."
+        )
+    } else {
+        format!(
+            "Field `{field_name}` is defined on subtypes {candidate_text} but not on `{base}`. Narrow or cast the value before access."
+        )
     }
-    false
 }

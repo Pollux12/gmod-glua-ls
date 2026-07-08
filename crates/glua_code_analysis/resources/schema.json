@@ -349,6 +349,11 @@
           "type": "string"
         },
         {
+          "const": "gmod-member-on-subtype-only",
+          "description": "gmod-member-on-subtype-only",
+          "type": "string"
+        },
+        {
           "const": "undefined-global-argument",
           "description": "Deprecated alias for `undefined-global-assignment`. Accepted for backward compatibility.",
           "type": "string"

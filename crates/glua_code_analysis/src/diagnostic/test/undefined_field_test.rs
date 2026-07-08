@@ -157,6 +157,25 @@ mod test {
             .collect()
     }
 
+    fn default_diagnostics_for_code_with_shared(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let diagnostics = ws
+            .analysis
+            .diagnose_file_with_shared(file_id, CancellationToken::new(), shared)
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
     fn enable_gmod(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -311,12 +330,17 @@ mod test {
             "same local keeps actual infer_expr distinct from labeled contextual SemanticInfo overlays"
         );
 
-        let undefined_fields =
-            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
-        assert!(
-            undefined_fields.is_empty(),
-            "current recursive subclass suppression hides Entity:GetShootPos() undefined-field: {undefined_fields:?}"
+        let subtype_only = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
         );
+        assert_eq!(subtype_only.len(), 2, "{subtype_only:?}");
+        assert!(subtype_only.iter().any(|diagnostic| {
+            diagnostic
+                .message
+                .contains("Field `GetShootPos` is defined on subtype `Player` but not on `Entity`")
+        }));
     }
 
     #[test]
@@ -345,10 +369,13 @@ mod test {
 
         let undefined_fields =
             diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
-        assert!(
-            undefined_fields.is_empty(),
-            "current behavior suppresses undefined-field when the member exists only on a recursive descendant: {undefined_fields:?}"
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
+        let subtype_only = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
         );
+        assert!(subtype_only.is_empty(), "{subtype_only:?}");
     }
 
     #[test]
@@ -3406,10 +3433,10 @@ mod test {
     }
 
     #[test]
-    fn test_field_on_subclass_suppressed() {
+    fn test_field_on_direct_subclass_reports_subtype_only_diagnostic() {
         let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
             r#"
                 ---@class SubclassTest.BaseEntity
                 local BaseEntity = {}
@@ -3422,12 +3449,166 @@ mod test {
                 local ent = nil
                 ent:GetDriver()
             "#,
+        );
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(diagnostics[0].message.contains(
+            "Field `GetDriver` is defined on subtype `Vehicle` but not on `SubclassTest.BaseEntity`"
         ));
     }
 
     #[test]
-    fn test_field_on_deep_subclass_suppressed() {
+    fn test_subtype_only_diagnostic_merges_union_and_table_of_candidates_with_cap() {
         let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+                ---@class MergeCap.BaseA
+                local BaseA = {}
+
+                ---@class MergeCap.BaseB
+                local BaseB = {}
+
+                ---@class MergeCap.Alpha : MergeCap.BaseA
+                local Alpha = {}
+                function Alpha:SharedOnly() end
+
+                ---@class MergeCap.Bravo : MergeCap.BaseA
+                local Bravo = {}
+                function Bravo:SharedOnly() end
+
+                ---@class MergeCap.Charlie : MergeCap.BaseB
+                local Charlie = {}
+                function Charlie:SharedOnly() end
+
+                ---@class MergeCap.Delta : MergeCap.BaseB
+                local Delta = {}
+                function Delta:SharedOnly() end
+
+                ---@class MergeCap.AlphaDuplicate : MergeCap.BaseB
+                local AlphaDuplicate = {}
+                function AlphaDuplicate:SharedOnly() end
+
+                ---@type MergeCap.BaseA|tableof<MergeCap.BaseB>
+                local ent = nil
+                ent:SharedOnly()
+            "#,
+        );
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                DiagnosticCode::GmodMemberOnSubtypeOnly
+                    .get_name()
+                    .to_string()
+            ))
+        );
+        assert!(
+            diagnostic.message.contains("Field `SharedOnly`"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("defined on subtypes"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("`Alpha`"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("`AlphaDuplicate`"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("`Bravo`"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            diagnostic.message.contains("and 2 more"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("`Charlie`"),
+            "{}",
+            diagnostic.message
+        );
+        assert!(
+            !diagnostic.message.contains("`Delta`"),
+            "{}",
+            diagnostic.message
+        );
+    }
+
+    #[test]
+    fn test_subtype_only_diagnostic_is_silent_when_undefined_field_disabled() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.diagnostics.disable = vec![DiagnosticCode::UndefinedField];
+        ws.analysis.update_config(Arc::new(emmyrc));
+
+        let file_id = ws.def(
+            r#"
+                ---@class DisabledSubtypeOnly.BaseEntity
+                local BaseEntity = {}
+
+                ---@class DisabledSubtypeOnly.Vehicle : DisabledSubtypeOnly.BaseEntity
+                local Vehicle = {}
+                function Vehicle:GetDriver() end
+
+                ---@type DisabledSubtypeOnly.BaseEntity
+                local ent = nil
+                ent:GetDriver()
+            "#,
+        );
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+
+        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+    }
+
+    #[test]
+    fn test_field_on_deep_subclass_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+            r#"
+                ---@class DeepSubTest.Entity
+                local Entity = {}
+
+                ---@class DeepSubTest.Vehicle : DeepSubTest.Entity
+                local Vehicle = {}
+
+                ---@class DeepSubTest.Airboat : DeepSubTest.Vehicle
+                local Airboat = {}
+                function Airboat:GetSpecialField() end
+
+                ---@type DeepSubTest.Entity
+                local ent = nil
+                ent:GetSpecialField()
+            "#,
+        ));
         assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
@@ -3446,6 +3627,43 @@ mod test {
                 ent:GetSpecialField()
             "#,
         ));
+    }
+
+    #[test]
+    fn test_panel_member_on_deep_custom_panel_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+                ---@class Panel
+                local Panel = {}
+
+                ---@class DPanel : Panel
+                local DPanel = {}
+
+                ---@class MyCustomPanel : DPanel
+                local MyCustomPanel = {}
+                function MyCustomPanel:OnlyOnCustomPanel() end
+
+                ---@type Panel
+                local pnl = nil
+                pnl:OnlyOnCustomPanel()
+            "#,
+        );
+
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedField,
+        );
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
+
+        let subtype_only = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert!(subtype_only.is_empty(), "{subtype_only:?}");
     }
 
     #[test]

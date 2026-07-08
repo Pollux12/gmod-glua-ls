@@ -68,7 +68,7 @@ use super::{
 };
 
 pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
-pub use check_field::precompute_subclass_fields;
+pub use check_field::precompute_subtype_fields;
 pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
@@ -83,7 +83,9 @@ pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
 
 pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
-pub type PrecomputedSubclassFields = HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>>;
+pub type PrecomputedDirectSubtypeFields =
+    HashMap<LuaTypeDeclId, HashMap<SmolStr, Arc<Vec<SmolStr>>>>;
+pub type PrecomputedTransitiveSubtypeFields = HashMap<LuaTypeDeclId, HashSet<SmolStr>>;
 pub type AssignmentPrefixKey = (TextSize, TextSize, String);
 pub type AssignmentPrefixEvents = HashMap<AssignmentPrefixKey, Vec<AssignmentPrefixEvent>>;
 
@@ -263,8 +265,10 @@ pub struct SharedDiagnosticData {
         HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
-    /// Named members declared on subclasses, keyed by every base type they can satisfy.
-    pub subclass_fields: Arc<PrecomputedSubclassFields>,
+    /// Direct subtype member candidates, keyed by base type then field name.
+    pub direct_subtype_fields: Arc<PrecomputedDirectSubtypeFields>,
+    /// Transitive subtype member names, keyed by base type. Used only for baseline-parity silence.
+    pub transitive_subtype_fields: Arc<PrecomputedTransitiveSubtypeFields>,
     /// Whether any indexed signature/type cache can produce an async callable.
     pub await_candidates: Arc<PrecomputedAwaitCandidates>,
     /// Static callee names whose callable metadata has parameter types worth checking.

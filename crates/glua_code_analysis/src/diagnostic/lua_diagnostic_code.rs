@@ -150,6 +150,8 @@ pub enum DiagnosticCode {
     GmodDuplicateSystemRegistration,
     /// gmod-null-check
     GmodNullCheck,
+    /// gmod-member-on-subtype-only
+    GmodMemberOnSubtypeOnly,
     #[serde(other)]
     None,
 }
@@ -194,6 +196,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::GmodNetReadWriteBitsMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::GmodDuplicateSystemRegistration => DiagnosticSeverity::HINT,
         DiagnosticCode::GmodNullCheck => DiagnosticSeverity::WARNING,
+        DiagnosticCode::GmodMemberOnSubtypeOnly => DiagnosticSeverity::WARNING,
         DiagnosticCode::RedundantParameter => DiagnosticSeverity::INFORMATION,
         _ => DiagnosticSeverity::WARNING,
     }
@@ -231,6 +234,7 @@ pub fn is_code_default_enable(code: &DiagnosticCode, level: LuaLanguageLevel) ->
         DiagnosticCode::GmodNetReadWriteBitsMismatch => true,
         DiagnosticCode::GmodInvalidHookName => true,
         DiagnosticCode::GmodNullCheck => true,
+        DiagnosticCode::GmodMemberOnSubtypeOnly => true,
 
         // neovim-code-style
         DiagnosticCode::NonLiteralExpressionsInAssert => false,
@@ -322,6 +326,10 @@ mod tests {
             is_code_default_enable(&DiagnosticCode::GmodNullCheck, level),
             eq(true)
         );
+        assert_that!(
+            is_code_default_enable(&DiagnosticCode::GmodMemberOnSubtypeOnly, level),
+            eq(true)
+        );
     }
 
     #[gtest]
@@ -336,6 +344,10 @@ mod tests {
         );
         assert_that!(
             get_default_severity(DiagnosticCode::GmodNullCheck),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::GmodMemberOnSubtypeOnly),
             eq(DiagnosticSeverity::WARNING)
         );
         assert_that!(
