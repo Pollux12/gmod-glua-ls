@@ -2,6 +2,7 @@ pub(in crate::compilation::analyzer) mod call;
 mod closure;
 mod for_range_stat;
 mod func_body;
+mod member_write_policy;
 mod metatable;
 mod module;
 mod stats;
@@ -15,6 +16,7 @@ use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::infer_for_range_iter_expr_func;
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
+use member_write_policy::MemberAssignmentWideningState;
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
@@ -344,16 +346,6 @@ impl<S> Default for MemberWideningCache<S> {
             disabled: false,
         }
     }
-}
-
-#[derive(Debug, Clone)]
-struct MemberAssignmentWideningState {
-    no_table_literal_widen_type: LuaType,
-    table_literal_widen_type: LuaType,
-    doc_type: Option<LuaType>,
-    all_table_assignment_merge_types: bool,
-    class_bootstrap_type: Option<LuaType>,
-    class_bootstrap_compatible: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

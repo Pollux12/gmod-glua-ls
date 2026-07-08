@@ -20,7 +20,12 @@ use rustc_hash::FxHashMap;
 
 use super::{
     DynamicKeyCollectionWideningKey, LuaAnalyzer, MemberAssignmentWideningCacheKey,
-    MemberAssignmentWideningState, MemberWideningCache,
+    MemberWideningCache,
+    member_write_policy::{
+        MemberAssignmentWideningDecision, MemberAssignmentWideningState,
+        decide_member_assignment_widening, merge_member_assignment_widening_state,
+        union_member_assignment_widening, widen_related_assignment_type,
+    },
 };
 
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
@@ -1612,59 +1617,16 @@ fn get_cached_widened_member_assignment_type(
         return Some(None);
     }
 
-    if let Some(doc_type) = merge_cached_assignment_types(
-        analyzer,
-        compatible_states
-            .iter()
-            .filter_map(|state| state.doc_type.as_ref()),
-    ) {
-        return Some(Some(doc_type));
-    }
-
-    if !matches!(
-        incoming_type,
-        LuaType::Union(_) | LuaType::Intersection(_) | LuaType::MultiLineUnion(_)
-    ) && let Some(class_type) = prefer_class_assignment_type(incoming_type)
-    {
-        if !is_class_bootstrap_compatible_type(incoming_type, &class_type) {
-            return None;
-        }
-
-        let class_bootstrap_compatible = compatible_states.iter().all(|state| {
-            state.class_bootstrap_compatible
-                && state
-                    .class_bootstrap_type
-                    .as_ref()
-                    .is_none_or(|cached_class| is_same_class_type(cached_class, &class_type))
-        });
-        if class_bootstrap_compatible {
-            return Some(Some(class_type));
-        }
-
-        return None;
-    }
-
-    let should_widen_table_literals = is_table_assignment_merge_type(incoming_type)
-        && compatible_states
-            .iter()
-            .all(|state| state.all_table_assignment_merge_types);
-    let previous_type = merge_cached_assignment_types(
-        analyzer,
-        compatible_states.iter().map(|state| {
-            if should_widen_table_literals {
-                &state.table_literal_widen_type
-            } else {
-                &state.no_table_literal_widen_type
-            }
-        }),
-    )?;
-    let incoming_type = widen_related_assignment_type(incoming_type, should_widen_table_literals);
-
-    Some(Some(TypeOps::Union.apply(
+    match decide_member_assignment_widening(
         analyzer.db,
-        &previous_type,
-        &incoming_type,
-    )))
+        incoming_type,
+        true,
+        compatible_states.iter(),
+    ) {
+        MemberAssignmentWideningDecision::Widened(widened_type) => Some(Some(widened_type)),
+        MemberAssignmentWideningDecision::ClassBootstrapRejected => None,
+        MemberAssignmentWideningDecision::NoPreviousAssignments => Some(None),
+    }
 }
 
 fn record_member_assignment_widening_cache(
@@ -1693,26 +1655,13 @@ fn record_member_assignment_widening_cache(
     let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
     let state_mask = member_assignment_state_mask(analyzer, *member_id);
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
-    let no_table_literal_widen_type = widen_related_assignment_type(assigned_type, false);
-    let table_literal_widen_type = widen_related_assignment_type(assigned_type, true);
     let doc_type = analyzer
         .db
         .get_type_index()
         .get_type_cache(&(*member_id).into())
         .filter(|cache| cache.is_doc())
         .map(|cache| cache.as_type().clone());
-    let all_table_assignment_merge_types = is_table_assignment_merge_type(assigned_type);
-    let (class_bootstrap_type, class_bootstrap_compatible) =
-        class_bootstrap_cache_state(assigned_type);
-
-    let new_state = MemberAssignmentWideningState {
-        no_table_literal_widen_type,
-        table_literal_widen_type,
-        doc_type,
-        all_table_assignment_merge_types,
-        class_bootstrap_type,
-        class_bootstrap_compatible,
-    };
+    let new_state = MemberAssignmentWideningState::from_assigned_type(assigned_type, doc_type);
     let db = &*analyzer.db;
     record_widening_cache(
         &mut analyzer.member_assignment_widening_cache,
@@ -1721,85 +1670,9 @@ fn record_member_assignment_widening_cache(
         state_mask,
         new_state,
         |state, new_state| {
-            state.no_table_literal_widen_type = TypeOps::Union.apply(
-                db,
-                &state.no_table_literal_widen_type,
-                &new_state.no_table_literal_widen_type,
-            );
-            state.table_literal_widen_type = TypeOps::Union.apply(
-                db,
-                &state.table_literal_widen_type,
-                &new_state.table_literal_widen_type,
-            );
-            if let Some(doc_type) = new_state.doc_type {
-                state.doc_type = Some(match state.doc_type.take() {
-                    Some(current) => TypeOps::Union.apply(db, &current, &doc_type),
-                    None => doc_type,
-                });
-            }
-            state.all_table_assignment_merge_types &= new_state.all_table_assignment_merge_types;
-            merge_class_bootstrap_cache_state(
-                state,
-                assigned_type,
-                new_state.class_bootstrap_type,
-                new_state.class_bootstrap_compatible,
-            );
+            merge_member_assignment_widening_state(db, state, new_state, assigned_type);
         },
     );
-}
-
-fn class_bootstrap_cache_state(typ: &LuaType) -> (Option<LuaType>, bool) {
-    if let Some(class_type) = prefer_class_assignment_type(typ) {
-        let compatible = is_class_bootstrap_compatible_type(typ, &class_type);
-        return (Some(class_type), compatible);
-    }
-
-    (None, is_class_neutral_bootstrap_type(typ))
-}
-
-fn merge_class_bootstrap_cache_state(
-    state: &mut MemberAssignmentWideningState,
-    assigned_type: &LuaType,
-    assigned_class_type: Option<LuaType>,
-    assigned_class_compatible: bool,
-) {
-    if !state.class_bootstrap_compatible {
-        return;
-    }
-
-    match (&state.class_bootstrap_type, assigned_class_type) {
-        (_, Some(class_type)) => {
-            state.class_bootstrap_compatible = assigned_class_compatible
-                && state
-                    .class_bootstrap_type
-                    .as_ref()
-                    .is_none_or(|current_class| is_same_class_type(current_class, &class_type));
-            if state.class_bootstrap_compatible && state.class_bootstrap_type.is_none() {
-                state.class_bootstrap_type = Some(class_type);
-            }
-        }
-        (Some(class_type), None) => {
-            state.class_bootstrap_compatible =
-                is_class_bootstrap_compatible_type(assigned_type, class_type);
-        }
-        (None, None) => {
-            state.class_bootstrap_compatible = is_class_neutral_bootstrap_type(assigned_type);
-        }
-    }
-}
-
-fn merge_cached_assignment_types<'a>(
-    analyzer: &LuaAnalyzer,
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaType> {
-    let mut result = None;
-    for typ in types {
-        result = Some(match result {
-            Some(current) => TypeOps::Union.apply(analyzer.db, &current, typ),
-            None => typ.clone(),
-        });
-    }
-    result
 }
 
 fn member_assignment_state_mask(analyzer: &LuaAnalyzer, member_id: LuaMemberId) -> GmodStateMask {
@@ -2086,67 +1959,7 @@ fn get_widened_member_assignment_type(
         return None;
     }
 
-    if let Some(class_type) = prefer_class_assignment_type(incoming_type) {
-        let mut saw_previous_assignment = false;
-        let mut class_bootstrap_compatible = true;
-
-        for related_member in &related_members {
-            let related_member_id = related_member.get_id();
-            if related_member_id == *member_id {
-                continue;
-            }
-            if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
-                continue;
-            }
-            saw_previous_assignment = true;
-
-            if !is_assignment_file_define_member(analyzer.db, related_member_id) {
-                class_bootstrap_compatible = false;
-                break;
-            }
-
-            let Some(existing_cache) = analyzer
-                .db
-                .get_type_index()
-                .get_type_cache(&related_member_id.into())
-                .cloned()
-            else {
-                continue;
-            };
-
-            if existing_cache.is_doc() {
-                class_bootstrap_compatible = false;
-                break;
-            }
-
-            if !is_class_bootstrap_compatible_type(existing_cache.as_type(), &class_type) {
-                class_bootstrap_compatible = false;
-                break;
-            }
-        }
-
-        if saw_previous_assignment && class_bootstrap_compatible {
-            return Some(class_type);
-        }
-    }
-
-    let should_widen_table_literals = !preserve_table_literals
-        && is_table_assignment_merge_type(incoming_type)
-        && related_members
-            .iter()
-            .filter(|related_member| related_member.get_id() != *member_id)
-            .all(|related_member| {
-                analyzer
-                    .db
-                    .get_type_index()
-                    .get_type_cache(&related_member.get_id().into())
-                    .is_some_and(|cache| {
-                        cache.is_doc() || is_table_assignment_merge_type(cache.as_type())
-                    })
-            });
-    let mut doc_type: Option<LuaType> = None;
-    let mut widened_type =
-        widen_related_assignment_type(incoming_type, should_widen_table_literals);
+    let mut previous_states = Vec::new();
     let mut saw_previous_assignment = false;
 
     for related_member in related_members {
@@ -2172,164 +1985,40 @@ fn get_widened_member_assignment_type(
             continue;
         };
 
-        if existing_cache.is_doc() {
-            let existing_type = existing_cache.as_type().clone();
-            doc_type = Some(match doc_type {
-                Some(current) => TypeOps::Union.apply(analyzer.db, &current, &existing_type),
-                None => existing_type,
-            });
-            continue;
-        }
-
-        let existing_type =
-            widen_related_assignment_type(existing_cache.as_type(), should_widen_table_literals);
-        widened_type = TypeOps::Union.apply(analyzer.db, &widened_type, &existing_type);
+        previous_states.push(MemberAssignmentWideningState::from_type_cache(
+            &existing_cache,
+        ));
     }
 
     if !saw_previous_assignment {
         return None;
     }
 
-    if let Some(doc_type) = doc_type {
-        return Some(doc_type);
-    }
+    let widened_type = match decide_member_assignment_widening(
+        analyzer.db,
+        incoming_type,
+        !preserve_table_literals,
+        previous_states.iter(),
+    ) {
+        MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
+        MemberAssignmentWideningDecision::ClassBootstrapRejected => {
+            union_member_assignment_widening(
+                analyzer.db,
+                incoming_type,
+                !preserve_table_literals,
+                previous_states.iter(),
+            )
+        }
+        MemberAssignmentWideningDecision::NoPreviousAssignments => {
+            widen_related_assignment_type(incoming_type, false)
+        }
+    };
 
     Some(if preserve_table_literals {
         crate::prune_redundant_guarded_table_bootstrap_type(analyzer.db, widened_type)
     } else {
         widened_type
     })
-}
-
-fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
-    if widen_table_literals {
-        return widen_table_literals_for_assignment(typ);
-    }
-
-    crate::widen_literal_type_for_assignment(typ)
-}
-
-fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
-    match typ {
-        LuaType::TableConst(_) => LuaType::Table,
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .into_iter()
-                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
-                .collect(),
-        ),
-        _ => crate::widen_literal_type_for_assignment(typ),
-    }
-}
-
-fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::Table
-            | LuaType::TableConst(_)
-            | LuaType::Object(_)
-            | LuaType::MergedTable(_)
-            | LuaType::TableOf(_)
-    )
-}
-
-fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
-    match typ {
-        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
-        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
-        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
-        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
-        LuaType::Intersection(intersection) => {
-            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
-        }
-        LuaType::MultiLineUnion(union) => {
-            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
-        }
-        _ => None,
-    }
-}
-
-fn prefer_class_assignment_type_from_iter<'a>(
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaType> {
-    for typ in types {
-        if let Some(class_type) = prefer_class_assignment_type(typ) {
-            return Some(class_type);
-        }
-    }
-
-    None
-}
-
-fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
-    if is_same_class_type(typ, class_type) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
-        LuaType::Instance(instance) => {
-            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
-                || is_table_bootstrap_type(typ)
-        }
-        LuaType::Union(union) => union
-            .types()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        _ => is_table_bootstrap_type(typ),
-    }
-}
-
-fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
-    if is_table_bootstrap_type(typ) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
-        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(is_class_neutral_bootstrap_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
-        _ => false,
-    }
-}
-
-fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
-    match (
-        class_decl_id_from_type(left),
-        class_decl_id_from_type(right),
-    ) {
-        (Some(left_id), Some(right_id)) => left_id == right_id,
-        _ => false,
-    }
-}
-
-fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
-    match typ {
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
-        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
-        _ => None,
-    }
-}
-
-fn is_table_bootstrap_type(typ: &LuaType) -> bool {
-    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
 }
 
 fn is_member_realm_compatible(
@@ -3718,6 +3407,240 @@ mod tests {
                 "different class bootstraps must fall back to the full compatibility scan"
             );
         });
+    }
+
+    #[test]
+    fn member_assignment_widening_fallback_preserves_doc_authority() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+        let doc_type = LuaType::Def(LuaTypeDeclId::global("DocType"));
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+        let third_member = member_id_at(5);
+
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            LuaType::Integer,
+        );
+        db.get_type_index_mut().force_bind_type(
+            LuaTypeOwner::Member(first_member),
+            LuaTypeCache::DocType(doc_type.clone()),
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &LuaType::Integer,
+                false,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner.clone(),
+                second_member,
+                key.clone(),
+                LuaType::String,
+            );
+            add_typed_file_define_member(analyzer.db, owner, third_member, key, LuaType::Boolean);
+
+            assert_eq!(
+                get_cached_widened_member_assignment_type(
+                    analyzer,
+                    &LuaTypeOwner::Member(third_member),
+                    &LuaType::Boolean,
+                    false,
+                ),
+                None,
+                "visible-count mismatch should force the fallback scan"
+            );
+
+            let widened = get_widened_member_assignment_type(
+                analyzer,
+                &LuaTypeOwner::Member(third_member),
+                &LuaType::Boolean,
+                false,
+            )
+            .expect("fallback scan should find prior same-key assignments");
+
+            assert_eq!(widened, doc_type);
+        });
+    }
+
+    #[test]
+    fn member_assignment_widening_fallback_rejects_different_class_bootstrap() {
+        let mut db = DbIndex::new();
+        let owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        let key = LuaMemberKey::from("field");
+        let first_class = LuaType::Def(LuaTypeDeclId::global("FirstClass"));
+        let second_class = LuaType::Def(LuaTypeDeclId::global("SecondClass"));
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+        let third_member = member_id_at(5);
+
+        add_typed_file_define_member(
+            &mut db,
+            owner.clone(),
+            first_member,
+            key.clone(),
+            first_class.clone(),
+        );
+
+        with_analyzer(&mut db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &first_class,
+                false,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner.clone(),
+                second_member,
+                key.clone(),
+                second_class.clone(),
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                owner,
+                third_member,
+                key,
+                second_class.clone(),
+            );
+
+            assert_eq!(
+                get_cached_widened_member_assignment_type(
+                    analyzer,
+                    &LuaTypeOwner::Member(third_member),
+                    &second_class,
+                    false,
+                ),
+                None,
+                "visible-count mismatch should force the fallback scan"
+            );
+
+            let widened = get_widened_member_assignment_type(
+                analyzer,
+                &LuaTypeOwner::Member(third_member),
+                &second_class,
+                false,
+            )
+            .expect("fallback scan should widen incompatible class assignments");
+            let expected = TypeOps::Union.apply(analyzer.db, &first_class, &second_class);
+
+            assert_eq!(widened, expected);
+            assert_ne!(widened, second_class);
+        });
+    }
+
+    #[test]
+    fn member_assignment_widening_cache_and_fallback_match_plain_scalars() {
+        let key = LuaMemberKey::from("field");
+        let first_member = member_id_at(1);
+        let second_member = member_id_at(3);
+        let third_member = member_id_at(5);
+
+        let mut cached_db = DbIndex::new();
+        let cached_owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        add_typed_file_define_member(
+            &mut cached_db,
+            cached_owner.clone(),
+            first_member,
+            key.clone(),
+            LuaType::Integer,
+        );
+        let cached_widened = with_analyzer(&mut cached_db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &LuaType::Integer,
+                false,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                cached_owner,
+                second_member,
+                key.clone(),
+                LuaType::String,
+            );
+
+            get_cached_widened_member_assignment_type(
+                analyzer,
+                &LuaTypeOwner::Member(second_member),
+                &LuaType::String,
+                false,
+            )
+            .expect("sequential same-key assignment should use cache")
+            .expect("cached scalar assignment should widen")
+        });
+
+        let mut fallback_db = DbIndex::new();
+        let fallback_owner = LuaMemberOwner::Element(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(10), TextSize::new(11)),
+        ));
+        add_typed_file_define_member(
+            &mut fallback_db,
+            fallback_owner.clone(),
+            first_member,
+            key.clone(),
+            LuaType::Integer,
+        );
+        let fallback_widened = with_analyzer(&mut fallback_db, |analyzer| {
+            record_member_assignment_widening_cache(
+                analyzer,
+                &LuaTypeOwner::Member(first_member),
+                &LuaType::Integer,
+                false,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                fallback_owner.clone(),
+                second_member,
+                key.clone(),
+                LuaType::String,
+            );
+            add_typed_file_define_member(
+                analyzer.db,
+                fallback_owner,
+                third_member,
+                key,
+                LuaType::String,
+            );
+
+            assert_eq!(
+                get_cached_widened_member_assignment_type(
+                    analyzer,
+                    &LuaTypeOwner::Member(third_member),
+                    &LuaType::String,
+                    false,
+                ),
+                None,
+                "visible-count mismatch should force the fallback scan"
+            );
+
+            get_widened_member_assignment_type(
+                analyzer,
+                &LuaTypeOwner::Member(third_member),
+                &LuaType::String,
+                false,
+            )
+            .expect("fallback scalar assignment should widen")
+        });
+
+        assert_eq!(cached_widened, fallback_widened);
     }
 
     #[test]

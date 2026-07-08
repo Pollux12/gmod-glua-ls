@@ -1439,7 +1439,7 @@ mod test {
     }
 
     #[gtest]
-    fn proof_current_defib_member_write_policy_initial_nil_loses_body_player_union() {
+    fn phase_c0_member_or_write_initial_nil_preserves_body_player_union() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
 
@@ -1456,7 +1456,7 @@ mod test {
     }
 
     #[gtest]
-    fn proof_current_defib_member_write_policy_rhs_order_changes_lost_constituent() {
+    fn phase_c0_member_or_write_rhs_order_preserves_body_player_union() {
         let mut body_first_ws = VirtualWorkspace::new();
         body_first_ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
 
@@ -1475,6 +1475,24 @@ mod test {
             player_first_ws.humanize_type(player_first_ty),
             "(Player|Ragdoll)?"
         );
+    }
+
+    #[gtest]
+    fn phase_f2a_member_write_policy_cached_and_inferred_paths_match_nilable_union() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        let cached_rendered = ws.humanize_type(cached_ty);
+        assert_eq!(cached_rendered, "(Player|Ragdoll)?");
+
+        let inferred_ty = inferred_index_expr_type(&mut ws, file_id, "self.Target");
+        let inferred_rendered = ws.humanize_type(inferred_ty);
+        assert_eq!(inferred_rendered, "(Player|Ragdoll)?");
+        assert_eq!(cached_rendered, inferred_rendered);
+
+        let read_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(read_ty), "(Player|Ragdoll)?");
     }
 
     #[gtest]
