@@ -251,7 +251,7 @@ mod test {
     }
 
     #[test]
-    fn proof_current_fangs_type_source_divergence_for_spos() {
+    fn fangs_member_on_subtype_preserves_actual_unknown_for_spos() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -344,7 +344,7 @@ mod test {
     }
 
     #[test]
-    fn proof_current_undefined_field_suppression_searches_recursive_descendants() {
+    fn recursive_descendant_member_suppresses_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -379,7 +379,7 @@ mod test {
     }
 
     #[test]
-    fn proof_current_semantic_info_has_type_origin_field() {
+    fn semantic_info_exposes_actual_type_origin() {
         fn assert_semantic_info_shape(info: crate::semantic::SemanticInfo) {
             let crate::semantic::SemanticInfo {
                 typ,

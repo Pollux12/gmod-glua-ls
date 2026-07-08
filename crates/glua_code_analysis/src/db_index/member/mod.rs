@@ -597,7 +597,6 @@ impl LuaMemberIndex {
         )
     }
 
-    #[allow(unused)]
     pub fn get_member_item_by_member_id(
         &self,
         member_id: LuaMemberId,

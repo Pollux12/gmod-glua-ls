@@ -61,7 +61,6 @@ impl LuaMemberIndexItem {
         resolve_member_semantic_id_with_realm_at_offset(db, self, caller_file_id, caller_position)
     }
 
-    #[allow(unused)]
     pub fn resolve_type_owner_member_id(&self, db: &DbIndex) -> Option<LuaMemberId> {
         resolve_type_owner_member_id(db, self)
     }

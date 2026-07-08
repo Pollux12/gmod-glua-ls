@@ -11,7 +11,12 @@ use crate::{
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeCacheWriteMode {
+    /// Preserve an existing cache and only write when the owner is currently
+    /// uncached. This is the default for doc/discovery surfaces that should not
+    /// overwrite an earlier authority decision.
     InsertOnly,
+    /// Replace the cache unconditionally. This is reserved for policy decisions
+    /// that have already computed the final widened or synthesized type.
     ForceOverwrite,
 }
 
@@ -33,6 +38,13 @@ pub fn write_type_cache(
     }
 }
 
+/// Binds an inferred/declared type and preserves the legacy declaration merge
+/// behavior.
+///
+/// This is intentionally broader than `write_type_cache`: when a cache already
+/// exists it may merge table members into a resolved definition, or replace only
+/// the narrow uninformative inferred cases documented by
+/// `should_replace_uninformative_inferred_cache`.
 pub fn bind_type(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
@@ -76,6 +88,12 @@ pub fn bind_type(
     Some(())
 }
 
+/// Binds a type produced by the unresolve/resolution pass.
+///
+/// Resolved caches share the same uninformative inferred-type replacement test
+/// as member inference, but do not inherit member-only or signature-specific
+/// inferred write policy. If no resolved replacement applies, this falls back to
+/// `bind_type` for the normal declaration merge behavior.
 pub fn bind_resolved_type(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
@@ -97,14 +115,7 @@ fn should_replace_uninformative_resolved_cache(
     current_cache: &LuaTypeCache,
     new_cache: &LuaTypeCache,
 ) -> bool {
-    let LuaTypeCache::InferType(current_type) = current_cache else {
-        return false;
-    };
-    let LuaTypeCache::InferType(new_type) = new_cache else {
-        return false;
-    };
-
-    is_uninformative_inferred_type(current_type) && is_informative_inferred_type(new_type)
+    should_replace_uninformative_infer_type_cache(current_cache, new_cache)
 }
 
 fn should_replace_uninformative_inferred_cache(
@@ -120,6 +131,13 @@ fn should_replace_uninformative_inferred_cache(
         return false;
     }
 
+    should_replace_uninformative_infer_type_cache(current_cache, new_cache)
+}
+
+fn should_replace_uninformative_infer_type_cache(
+    current_cache: &LuaTypeCache,
+    new_cache: &LuaTypeCache,
+) -> bool {
     let LuaTypeCache::InferType(current_type) = current_cache else {
         return false;
     };
@@ -265,8 +283,8 @@ fn preferred_owner_from_types<'a>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{FileId, LuaDecl, LuaDeclExtra};
-    use glua_parser::LuaSyntaxKind;
+    use crate::{FileId, LuaDecl, LuaDeclExtra, LuaMemberId, LuaSignatureId, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaSyntaxId, LuaSyntaxKind};
 
     fn owner() -> LuaTypeOwner {
         let decl = LuaDecl::new(
@@ -279,6 +297,31 @@ mod tests {
             None,
         );
         LuaTypeOwner::Decl(decl.get_id())
+    }
+
+    fn member_owner() -> LuaTypeOwner {
+        let range = TextRange::new(0.into(), 1.into());
+        LuaTypeOwner::Member(LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range),
+            FileId::new(1),
+        ))
+    }
+
+    fn signature_type() -> LuaType {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local function f() end");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+
+        LuaType::Signature(LuaSignatureId::from_closure(file_id, &closure))
     }
 
     #[test]
@@ -312,6 +355,99 @@ mod tests {
         assert!(matches!(
             db.get_type_index().get_type_cache(&owner),
             Some(LuaTypeCache::InferType(LuaType::Integer))
+        ));
+    }
+
+    #[test]
+    fn bind_resolved_type_replaces_uninformative_resolved_cache() {
+        let mut db = DbIndex::new();
+        let owner = owner();
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Unknown),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        bind_resolved_type(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+        );
+
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::String))
+        ));
+    }
+
+    #[test]
+    fn bind_type_replaces_uninformative_member_cache() {
+        let mut db = DbIndex::new();
+        let owner = member_owner();
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Nil),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        bind_type(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Integer),
+        );
+
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::Integer))
+        ));
+    }
+
+    #[test]
+    fn bind_type_keeps_uninformative_decl_cache_for_non_signature_inference() {
+        let mut db = DbIndex::new();
+        let owner = owner();
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Unknown),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        bind_type(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Integer),
+        );
+
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::Unknown))
+        ));
+    }
+
+    #[test]
+    fn bind_type_replaces_uninformative_decl_cache_for_signature_inference() {
+        let mut db = DbIndex::new();
+        let owner = owner();
+        let signature_type = signature_type();
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Unknown),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        bind_type(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(signature_type),
+        );
+
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::Signature(_)))
         ));
     }
 }

@@ -1575,7 +1575,7 @@ mod test {
     }
 
     #[gtest]
-    fn phase_f0_documents_current_multifile_member_write_order_preserves_union() {
+    fn multifile_member_write_order_preserves_union() {
         let base_source = r#"
         ---@class Entity
         ---@class Player: Entity
@@ -1626,7 +1626,7 @@ mod test {
     }
 
     #[gtest]
-    fn phase_f0_documents_current_member_write_truth_survives_touch_reindex() {
+    fn member_write_union_survives_touch_reindex() {
         let mut ws = VirtualWorkspace::new();
         let path = "lua/weapons/test/shared.lua";
         let source = defib_like_write_policy_source("self.Target = body or ply");
