@@ -2,6 +2,7 @@ mod cache;
 mod collection;
 mod scalar;
 
+pub(in crate::compilation::analyzer::lua) use crate::widen_related_assignment_type;
 pub(in crate::compilation::analyzer::lua) use cache::{
     DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey, MemberWideningCache,
     WideningCacheLookup, lookup_widening_cache, member_assignment_state_mask,
@@ -22,5 +23,5 @@ pub(in crate::compilation::analyzer::lua) use collection::{
 pub(in crate::compilation::analyzer::lua) use scalar::{
     MemberAssignmentWideningDecision, MemberAssignmentWideningState,
     decide_member_assignment_widening, merge_member_assignment_widening_state,
-    union_member_assignment_widening, widen_related_assignment_type,
+    union_member_assignment_widening,
 };

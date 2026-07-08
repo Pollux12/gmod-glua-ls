@@ -198,6 +198,144 @@ pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     }
 }
 
+pub(crate) fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    if widen_table_literals {
+        return widen_table_literals_for_assignment(typ);
+    }
+
+    widen_literal_type_for_assignment(typ)
+}
+
+fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) => LuaType::Table,
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
+                .collect(),
+        ),
+        _ => widen_literal_type_for_assignment(typ),
+    }
+}
+
+pub(crate) fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
+        _ => widen_literal_type_for_assignment(typ),
+    }
+}
+
+pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
+    )
+}
+
+pub(crate) fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
+    match typ {
+        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
+        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
+        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
+        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
+        LuaType::Intersection(intersection) => {
+            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
+        }
+        _ => None,
+    }
+}
+
+fn prefer_class_assignment_type_from_iter<'a>(
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    for typ in types {
+        if let Some(class_type) = prefer_class_assignment_type(typ) {
+            return Some(class_type);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
+    if is_same_class_type(typ, class_type) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
+        LuaType::Instance(instance) => {
+            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
+                || is_table_bootstrap_type(typ)
+        }
+        LuaType::Union(union) => union
+            .types()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        _ => is_table_bootstrap_type(typ),
+    }
+}
+
+pub(crate) fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
+    if is_table_bootstrap_type(typ) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
+        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_class_neutral_bootstrap_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
+    match (
+        class_decl_id_from_type(left),
+        class_decl_id_from_type(right),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => false,
+    }
+}
+
+pub(crate) fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
+        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_table_bootstrap_type(typ: &LuaType) -> bool {
+    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
+}
+
 pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: LuaType) -> LuaType {
     let LuaType::Union(union) = typ else {
         return typ;

@@ -1,4 +1,8 @@
-use crate::{DbIndex, LuaTypeCache, TypeOps, db_index::LuaType};
+use crate::{
+    DbIndex, LuaTypeCache, TypeOps, db_index::LuaType, is_class_bootstrap_compatible_type,
+    is_class_neutral_bootstrap_type, is_same_class_type, is_table_assignment_merge_type,
+    prefer_class_assignment_type, widen_related_assignment_type,
+};
 
 #[derive(Debug, Clone)]
 pub(in crate::compilation::analyzer::lua) struct MemberAssignmentWideningState {
@@ -224,136 +228,36 @@ fn merge_assignment_types<'a>(
     result
 }
 
-pub(in crate::compilation::analyzer::lua) fn widen_related_assignment_type(
-    typ: &LuaType,
-    widen_table_literals: bool,
-) -> LuaType {
-    if widen_table_literals {
-        return widen_table_literals_for_assignment(typ);
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use crate::{FileId, InFiled, db_index::LuaType};
+
+    use super::*;
+
+    fn table_const(start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        ))
     }
 
-    crate::widen_literal_type_for_assignment(typ)
-}
+    #[test]
+    fn assignment_table_literal_widening_recurses_into_union_members() {
+        let typ = LuaType::from_vec(vec![table_const(1, 2), LuaType::String]);
 
-fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
-    match typ {
-        LuaType::TableConst(_) => LuaType::Table,
-        LuaType::Union(union) => LuaType::from_vec(
-            union
-                .into_vec()
-                .into_iter()
-                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
-                .collect(),
-        ),
-        _ => crate::widen_literal_type_for_assignment(typ),
+        let widened = widen_related_assignment_type(&typ, true);
+
+        let LuaType::Union(union) = widened else {
+            panic!("expected widened union");
+        };
+        assert!(union.types().any(|typ| matches!(typ, LuaType::Table)));
+        assert!(union.types().any(|typ| matches!(typ, LuaType::String)));
+        assert!(
+            !union
+                .types()
+                .any(|typ| matches!(typ, LuaType::TableConst(_)))
+        );
     }
-}
-
-fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::Table
-            | LuaType::TableConst(_)
-            | LuaType::Object(_)
-            | LuaType::MergedTable(_)
-            | LuaType::TableOf(_)
-    )
-}
-
-fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
-    match typ {
-        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
-        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
-        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
-        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
-        LuaType::Intersection(intersection) => {
-            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
-        }
-        LuaType::MultiLineUnion(union) => {
-            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
-        }
-        _ => None,
-    }
-}
-
-fn prefer_class_assignment_type_from_iter<'a>(
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaType> {
-    for typ in types {
-        if let Some(class_type) = prefer_class_assignment_type(typ) {
-            return Some(class_type);
-        }
-    }
-
-    None
-}
-
-fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
-    if is_same_class_type(typ, class_type) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
-        LuaType::Instance(instance) => {
-            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
-                || is_table_bootstrap_type(typ)
-        }
-        LuaType::Union(union) => union
-            .types()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        _ => is_table_bootstrap_type(typ),
-    }
-}
-
-fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
-    if is_table_bootstrap_type(typ) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
-        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(is_class_neutral_bootstrap_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
-        _ => false,
-    }
-}
-
-fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
-    match (
-        class_decl_id_from_type(left),
-        class_decl_id_from_type(right),
-    ) {
-        (Some(left_id), Some(right_id)) => left_id == right_id,
-        _ => false,
-    }
-}
-
-fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
-    match typ {
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
-        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
-        _ => None,
-    }
-}
-
-fn is_table_bootstrap_type(typ: &LuaType) -> bool {
-    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
 }

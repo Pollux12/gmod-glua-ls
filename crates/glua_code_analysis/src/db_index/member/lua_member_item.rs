@@ -5,7 +5,7 @@ use std::{
 
 use crate::{
     DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
-    db_index::gmod_infer::GmodRealm,
+    db_index::gmod_infer::GmodRealm, is_table_assignment_merge_type, widen_file_define_member_type,
 };
 use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, PathTrait};
 use rowan::TextSize;
@@ -1026,24 +1026,6 @@ fn realm_match_rank(caller_realm: GmodRealm, member_realm: GmodRealm) -> u8 {
     }
 }
 
-fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
-    match typ {
-        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
-        _ => crate::widen_literal_type_for_assignment(typ),
-    }
-}
-
-fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::Table
-            | LuaType::TableConst(_)
-            | LuaType::Object(_)
-            | LuaType::MergedTable(_)
-            | LuaType::TableOf(_)
-    )
-}
-
 fn member_item_from_ids(member_ids: Vec<LuaMemberId>) -> LuaMemberIndexItem {
     match member_ids.len() {
         0 => LuaMemberIndexItem::Many(vec![]),
@@ -1253,8 +1235,8 @@ mod tests {
     use std::sync::Arc;
 
     use crate::{
-        DbIndex, Emmyrc, FileId, GmodRealm, GmodRealmFileMetadata, GmodRealmRange,
-        LuaSemanticDeclId, LuaTypeDeclId, WorkspaceId,
+        DbIndex, Emmyrc, FileId, GmodRealm, GmodRealmFileMetadata, GmodRealmRange, InFiled,
+        LuaSemanticDeclId, LuaType, LuaTypeDeclId, WorkspaceId,
         db_index::{
             LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, WorkspaceKind,
         },
@@ -1274,6 +1256,41 @@ mod tests {
     fn make_member_id_with_kind(file_id: FileId, start: u32, kind: LuaSyntaxKind) -> LuaMemberId {
         let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
         LuaMemberId::new(LuaSyntaxId::new(kind.into(), range), file_id)
+    }
+
+    fn table_const(start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(InFiled::new(
+            FileId::new(0),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        ))
+    }
+
+    #[test]
+    fn file_define_member_widening_preserves_nested_table_consts_inside_unions() {
+        let typ = LuaType::from_vec(vec![table_const(1, 2), LuaType::String]);
+
+        let widened = super::widen_file_define_member_type(&typ, true);
+
+        let LuaType::Union(union) = widened else {
+            panic!("expected file-define widened union");
+        };
+        assert!(
+            union
+                .types()
+                .any(|typ| matches!(typ, LuaType::TableConst(_)))
+        );
+        assert!(union.types().any(|typ| matches!(typ, LuaType::String)));
+        assert!(!union.types().any(|typ| matches!(typ, LuaType::Table)));
+    }
+
+    #[test]
+    fn table_assignment_merge_type_includes_open_table_shapes_only() {
+        assert!(super::is_table_assignment_merge_type(&LuaType::Table));
+        assert!(super::is_table_assignment_merge_type(&table_const(1, 2)));
+        assert!(super::is_table_assignment_merge_type(&LuaType::TableOf(
+            Box::new(LuaType::String)
+        )));
+        assert!(!super::is_table_assignment_merge_type(&LuaType::String));
     }
 
     fn set_file_realms(db: &mut DbIndex, file_realms: &[(FileId, GmodRealm)]) {
