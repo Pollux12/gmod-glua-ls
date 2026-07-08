@@ -10,7 +10,10 @@ use crate::{
 };
 
 use super::{
-    AnalyzeContext, common::migrate_global_path_members_when_owner_resolved,
+    AnalyzeContext,
+    common::{
+        TypeCacheWriteMode, migrate_global_path_members_when_owner_resolved, write_type_cache,
+    },
     gmod::ensure_scoped_class_type_decl_for_file,
 };
 use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
@@ -421,9 +424,11 @@ impl<'a> DeclAnalyzer<'a> {
                 Some(GlobalId::new(&child_path)),
             );
             self.add_member(owner, member);
-            self.db.get_type_index_mut().bind_type(
+            write_type_cache(
+                self.db,
                 member_id.into(),
                 LuaTypeCache::InferType(LuaType::Namespace(SmolStr::new(&child_path).into())),
+                TypeCacheWriteMode::InsertOnly,
             );
         }
     }

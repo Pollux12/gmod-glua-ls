@@ -18,7 +18,7 @@ use crate::{
     LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, SemanticDeclLevel,
     SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
-        common::{add_member, bind_resolved_type},
+        common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
         lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
         unresolve::UnResolveSpecialCall,
     },
@@ -237,8 +237,12 @@ pub fn try_resolve_table_field(
         None,
     );
     db.get_member_index_mut().add_member(owner_id, member);
-    db.get_type_index_mut()
-        .bind_type(member_id.into(), LuaTypeCache::InferType(decl_type.clone()));
+    write_type_cache(
+        db,
+        member_id.into(),
+        LuaTypeCache::InferType(decl_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
+    );
 
     merge_table_field_to_def(db, cache, table_expr, member_id);
     Ok(())
@@ -365,8 +369,12 @@ pub fn try_resolve_iter_var(
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
-        db.get_type_index_mut()
-            .bind_type(decl_id.into(), LuaTypeCache::InferType(ret_type));
+        write_type_cache(
+            db,
+            decl_id.into(),
+            LuaTypeCache::InferType(ret_type),
+            TypeCacheWriteMode::InsertOnly,
+        );
     }
     Ok(())
 }
@@ -383,12 +391,20 @@ pub fn try_resolve_module_ref(
     let export_type = module.export_type.clone().ok_or(InferFailReason::None)?;
     match &module_ref.owner_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
-            db.get_type_index_mut()
-                .bind_type((*decl_id).into(), LuaTypeCache::InferType(export_type));
+            write_type_cache(
+                db,
+                (*decl_id).into(),
+                LuaTypeCache::InferType(export_type),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         LuaSemanticDeclId::Member(member_id) => {
-            db.get_type_index_mut()
-                .bind_type((*member_id).into(), LuaTypeCache::InferType(export_type));
+            write_type_cache(
+                db,
+                (*member_id).into(),
+                LuaTypeCache::InferType(export_type),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         _ => {}
     };

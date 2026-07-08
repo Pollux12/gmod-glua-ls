@@ -4,8 +4,12 @@ use std::collections::{HashMap, HashSet};
 use crate::{
     DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaObjectType,
     LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor,
-    VariadicType, compilation::analyzer::unresolve::UnResolveIterVar, get_member_map, infer_expr,
-    instantiate_doc_function, tpl_pattern_match_args,
+    VariadicType,
+    compilation::analyzer::{
+        common::{TypeCacheWriteMode, write_type_cache},
+        unresolve::UnResolveIterVar,
+    },
+    get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
 };
 
 use super::LuaAnalyzer;
@@ -32,20 +36,24 @@ pub fn analyze_for_range_stat(
                     .cloned()
                     .unwrap_or(LuaType::Unknown);
                 let ret_type = TypeOps::Remove.apply(analyzer.db, &ret_type, &LuaType::Nil);
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(ret_type));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::InferType(ret_type),
+                    TypeCacheWriteMode::InsertOnly,
+                );
             }
         }
         Err(InferFailReason::None) => {
             for var_name in var_name_list {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Unknown));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::InferType(LuaType::Unknown),
+                    TypeCacheWriteMode::InsertOnly,
+                );
             }
         }
         Err(reason) => {

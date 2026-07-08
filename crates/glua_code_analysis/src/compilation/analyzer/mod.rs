@@ -21,6 +21,7 @@ use std::{
 use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaFunctionType,
     LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
+    compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
@@ -189,9 +190,11 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
             );
             db.get_member_index_mut()
                 .add_member(owner.clone(), getter_member);
-            db.get_type_index_mut().bind_type(
+            write_type_cache(
+                db,
                 getter_member_id.into(),
                 LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+                TypeCacheWriteMode::InsertOnly,
             );
 
             let setter_name = format!("Set{}", call.accessor_name);
@@ -210,9 +213,11 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
                 None,
             );
             db.get_member_index_mut().add_member(owner, setter_member);
-            db.get_type_index_mut().bind_type(
+            write_type_cache(
+                db,
                 setter_member_id.into(),
                 LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+                TypeCacheWriteMode::InsertOnly,
             );
         }
     }

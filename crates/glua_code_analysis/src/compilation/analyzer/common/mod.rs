@@ -9,6 +9,30 @@ use crate::{
     db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId},
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TypeCacheWriteMode {
+    InsertOnly,
+    ForceOverwrite,
+}
+
+/// Writes a type cache using the requested low-level write mode.
+///
+/// Call sites fall into doc-annotation, assignment-inferred, and
+/// resolved-synthesized families. Authority-based precedence was evaluated and
+/// rejected in Phase C2 for lack of evidence; see
+/// `.slim/deepwork/indexing-type-source-refactor.md`.
+pub fn write_type_cache(
+    db: &mut DbIndex,
+    owner: LuaTypeOwner,
+    cache: LuaTypeCache,
+    mode: TypeCacheWriteMode,
+) {
+    match mode {
+        TypeCacheWriteMode::InsertOnly => db.get_type_index_mut().bind_type(owner, cache),
+        TypeCacheWriteMode::ForceOverwrite => db.get_type_index_mut().force_bind_type(owner, cache),
+    }
+}
+
 pub fn bind_type(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
@@ -236,4 +260,58 @@ fn preferred_owner_from_types<'a>(
     }
 
     fallback_owner
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{FileId, LuaDecl, LuaDeclExtra};
+    use glua_parser::LuaSyntaxKind;
+
+    fn owner() -> LuaTypeOwner {
+        let decl = LuaDecl::new(
+            "cache_owner",
+            FileId::new(1),
+            TextRange::new(0.into(), 11.into()),
+            LuaDeclExtra::Global {
+                kind: LuaSyntaxKind::NameExpr.into(),
+            },
+            None,
+        );
+        LuaTypeOwner::Decl(decl.get_id())
+    }
+
+    #[test]
+    fn write_type_cache_respects_insert_only_and_force_overwrite_modes() {
+        let mut db = DbIndex::new();
+        let owner = owner();
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Integer),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::String))
+        ));
+
+        write_type_cache(
+            &mut db,
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Integer),
+            TypeCacheWriteMode::ForceOverwrite,
+        );
+        assert!(matches!(
+            db.get_type_index().get_type_cache(&owner),
+            Some(LuaTypeCache::InferType(LuaType::Integer))
+        ));
+    }
 }

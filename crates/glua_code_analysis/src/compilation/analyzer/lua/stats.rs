@@ -4,7 +4,7 @@ use crate::{
     CacheEntry, FileId, GmodStateMask, InFiled, InferFailReason, LuaArrayType, LuaMemberKey,
     LuaSemanticDeclId, LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
-        common::{add_member, bind_type},
+        common::{TypeCacheWriteMode, add_member, bind_type, write_type_cache},
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
     },
@@ -42,10 +42,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             if is_local_mutable(analyzer, decl_id) {
                 continue;
             }
-            analyzer
-                .db
-                .get_type_index_mut()
-                .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
+            write_type_cache(
+                analyzer.db,
+                decl_id.into(),
+                LuaTypeCache::InferType(LuaType::Nil),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
 
         return Some(());
@@ -175,10 +177,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .context
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                 } else {
-                    analyzer
-                        .db
-                        .get_type_index_mut()
-                        .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
+                    write_type_cache(
+                        analyzer.db,
+                        decl_id.into(),
+                        LuaTypeCache::InferType(LuaType::Nil),
+                        TypeCacheWriteMode::InsertOnly,
+                    );
                 }
             }
             Err(reason) => {
@@ -221,9 +225,11 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             } else {
                                 // Out of variadic values; per Lua semantics
                                 // the missing values are `nil`.
-                                analyzer.db.get_type_index_mut().bind_type(
+                                write_type_cache(
+                                    analyzer.db,
                                     decl_id.into(),
                                     LuaTypeCache::InferType(LuaType::Nil),
+                                    TypeCacheWriteMode::InsertOnly,
                                 );
                             }
                         }
@@ -267,10 +273,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 let name = name_list.get(i)?;
                 let position = name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Nil));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::InferType(LuaType::Nil),
+                    TypeCacheWriteMode::InsertOnly,
+                );
             }
         }
     }
@@ -2748,11 +2756,13 @@ fn widen_member_collections_with_collection_type(
             existing_array.get_base(),
             incoming_array.get_base(),
         );
-        analyzer.db.get_type_index_mut().force_bind_type(
+        write_type_cache(
+            analyzer.db,
             (*member_id).into(),
             LuaTypeCache::InferType(LuaType::Array(
                 LuaArrayType::from_base_type(widened_base).into(),
             )),
+            TypeCacheWriteMode::ForceOverwrite,
         );
     }
 
@@ -2782,11 +2792,13 @@ fn widen_member_collections_with_element_type(
 
         let widened_base =
             TypeOps::Union.apply(analyzer.db, existing_array.get_base(), element_type);
-        analyzer.db.get_type_index_mut().force_bind_type(
+        write_type_cache(
+            analyzer.db,
             (*member_id).into(),
             LuaTypeCache::InferType(LuaType::Array(
                 LuaArrayType::from_base_type(widened_base).into(),
             )),
+            TypeCacheWriteMode::ForceOverwrite,
         );
     }
 
@@ -2946,10 +2958,12 @@ pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> 
         LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let type_owner = get_var_owner(analyzer, func_name.clone());
     set_index_expr_owner(analyzer, func_name.clone());
-    analyzer
-        .db
-        .get_type_index_mut()
-        .bind_type(type_owner, LuaTypeCache::InferType(signature_type.clone()));
+    write_type_cache(
+        analyzer.db,
+        type_owner,
+        LuaTypeCache::InferType(signature_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
+    );
 
     Some(())
 }
@@ -2964,9 +2978,11 @@ pub fn analyze_local_func_stat(
         LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let position = func_name.get_position();
     let decl_id = LuaDeclId::new(analyzer.file_id, position);
-    analyzer.db.get_type_index_mut().bind_type(
+    write_type_cache(
+        analyzer.db,
         decl_id.into(),
         LuaTypeCache::InferType(signature_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
     );
 
     Some(())

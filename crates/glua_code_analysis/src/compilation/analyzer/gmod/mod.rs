@@ -23,7 +23,10 @@ use crate::{
     LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
     LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
     LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
-    compilation::analyzer::{AnalysisPipeline, AnalyzeContext, common::add_member},
+    compilation::analyzer::{
+        AnalysisPipeline, AnalyzeContext,
+        common::{TypeCacheWriteMode, add_member, write_type_cache},
+    },
     db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
@@ -2230,9 +2233,11 @@ fn collect_scripted_scope_type_bindings_with(
             .get_type_cache(&decl_id.into())
             .map(|type_cache| type_cache.as_type().clone());
 
-        db.get_type_index_mut().force_bind_type(
+        write_type_cache(
+            db,
             decl_id.into(),
             LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
+            TypeCacheWriteMode::ForceOverwrite,
         );
 
         if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
@@ -3236,17 +3241,23 @@ fn synthesize_scripted_ent_registration(
         .get_type_cache(&table_syntax_owner)
         .is_some_and(|cache| cache.is_doc());
     if !preserve_doc {
-        db.get_type_index_mut().force_bind_type(
+        write_type_cache(
+            db,
             table_syntax_owner,
             LuaTypeCache::InferType(class_type.clone()),
+            TypeCacheWriteMode::ForceOverwrite,
         );
     }
 
     if let Some(decl_id) = decl_id
         && !decl_has_reassignment(db, file_id, decl_id)
     {
-        db.get_type_index_mut()
-            .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
+        write_type_cache(
+            db,
+            decl_id.into(),
+            LuaTypeCache::InferType(class_type.clone()),
+            TypeCacheWriteMode::ForceOverwrite,
+        );
     }
 
     let source_owner = LuaMemberOwner::Element(table_range.clone());
@@ -3945,9 +3956,11 @@ fn synthesize_from_wrapper_call(
         None,
     );
     db.get_member_index_mut().add_member(owner.clone(), member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+        TypeCacheWriteMode::InsertOnly,
     );
 
     // Setter
@@ -3968,9 +3981,11 @@ fn synthesize_from_wrapper_call(
         None,
     );
     db.get_member_index_mut().add_member(owner.clone(), member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
@@ -4161,9 +4176,11 @@ fn synthesize_define_baseclass_parent_alias(
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
@@ -4227,8 +4244,12 @@ fn synthesize_accessor_func(
                 None,
             );
             db.get_member_index_mut().add_member(owner.clone(), member);
-            db.get_type_index_mut()
-                .bind_type(member_id.into(), LuaTypeCache::DocType(value_type.clone()));
+            write_type_cache(
+                db,
+                member_id.into(),
+                LuaTypeCache::DocType(value_type.clone()),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
     }
 
@@ -4245,9 +4266,11 @@ fn synthesize_accessor_func(
             None,
         );
         db.get_member_index_mut().add_member(owner.clone(), member);
-        db.get_type_index_mut().bind_type(
+        write_type_cache(
+            db,
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+            TypeCacheWriteMode::InsertOnly,
         );
     }
 
@@ -4269,9 +4292,11 @@ fn synthesize_accessor_func(
         None,
     );
     db.get_member_index_mut().add_member(owner.clone(), member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
@@ -4332,9 +4357,11 @@ fn synthesize_network_var(
             None,
         );
         db.get_member_index_mut().add_member(owner.clone(), member);
-        db.get_type_index_mut().bind_type(
+        write_type_cache(
+            db,
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+            TypeCacheWriteMode::InsertOnly,
         );
     }
 
@@ -4356,9 +4383,11 @@ fn synthesize_network_var(
         None,
     );
     db.get_member_index_mut().add_member(owner.clone(), member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
@@ -4432,9 +4461,11 @@ fn synthesize_network_var_element(
             None,
         );
         db.get_member_index_mut().add_member(owner.clone(), member);
-        db.get_type_index_mut().bind_type(
+        write_type_cache(
+            db,
             member_id.into(),
             LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(getter_func))),
+            TypeCacheWriteMode::InsertOnly,
         );
     }
 
@@ -4456,9 +4487,11 @@ fn synthesize_network_var_element(
         None,
     );
     db.get_member_index_mut().add_member(owner.clone(), member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::DocFunction(Arc::new(setter_func))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
@@ -4656,8 +4689,12 @@ fn synthesize_vgui_register_file_target(
     let target_panel_decl_ids = ensure_register_file_panel_decls(db, target_file_id)?;
     let panel_decl_id = *target_panel_decl_ids.first()?;
     for decl_id in target_panel_decl_ids {
-        db.get_type_index_mut()
-            .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
+        write_type_cache(
+            db,
+            decl_id.into(),
+            LuaTypeCache::InferType(class_type.clone()),
+            TypeCacheWriteMode::ForceOverwrite,
+        );
     }
 
     let panel_owner = LuaMemberOwner::GlobalPath(GlobalId::new("PANEL"));
@@ -4830,9 +4867,11 @@ fn register_global_panel(
         .add_global_decl(panel_name, decl_id);
 
     // Bind the panel class type to the global declaration
-    db.get_type_index_mut().force_bind_type(
+    write_type_cache(
+        db,
         decl_id.into(),
         LuaTypeCache::InferType(LuaType::Def(class_decl_id)),
+        TypeCacheWriteMode::ForceOverwrite,
     );
 }
 
@@ -5169,9 +5208,11 @@ fn synthesize_panel_class_with_id(
                 .get_type_cache(&table_syntax_owner)
                 .is_some_and(|cache| cache.is_doc());
             if !preserve_doc {
-                db.get_type_index_mut().force_bind_type(
+                write_type_cache(
+                    db,
                     table_syntax_owner,
                     LuaTypeCache::InferType(class_type.clone()),
+                    TypeCacheWriteMode::ForceOverwrite,
                 );
             }
         }
@@ -5182,8 +5223,12 @@ fn synthesize_panel_class_with_id(
             // pass sees the synthesized class before it caches member values.
             // Reassigned locals remain table-literal-only to avoid collapsing
             // distinct registration regions onto one class.
-            db.get_type_index_mut()
-                .force_bind_type(decl_id.into(), LuaTypeCache::InferType(class_type.clone()));
+            write_type_cache(
+                db,
+                decl_id.into(),
+                LuaTypeCache::InferType(class_type.clone()),
+                TypeCacheWriteMode::ForceOverwrite,
+            );
         }
 
         // Transfer the members defined in this registration's table region to
@@ -5317,9 +5362,11 @@ fn bind_inline_vgui_panel_table(
         .get_type_cache(&table_syntax_owner)
         .is_some_and(|cache| cache.is_doc());
     if !preserve_doc {
-        db.get_type_index_mut().force_bind_type(
+        write_type_cache(
+            db,
             table_syntax_owner,
             LuaTypeCache::InferType(class_type.clone()),
+            TypeCacheWriteMode::ForceOverwrite,
         );
     }
 
@@ -5568,9 +5615,11 @@ fn synthesize_baseclass_member(
     let member_id = LuaMemberId::new(syntax_id, file_id);
     let member = LuaMember::new(member_id, member_key, LuaMemberFeature::FileFieldDecl, None);
     db.get_member_index_mut().add_member(owner, member);
-    db.get_type_index_mut().bind_type(
+    write_type_cache(
+        db,
         member_id.into(),
         LuaTypeCache::DocType(LuaType::Ref(LuaTypeDeclId::global(base_name))),
+        TypeCacheWriteMode::InsertOnly,
     );
 }
 
