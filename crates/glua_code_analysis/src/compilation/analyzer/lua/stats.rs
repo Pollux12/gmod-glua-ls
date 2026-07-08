@@ -893,6 +893,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             }
         }
 
+        let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
+
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
         assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
         update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
@@ -1405,6 +1407,79 @@ fn assign_merge_type_owner_and_expr_type(
     Some(())
 }
 
+fn member_assignment_or_source_type(
+    analyzer: &mut LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+    fallback_type: LuaType,
+) -> LuaType {
+    if !matches!(type_owner, LuaTypeOwner::Member(_)) {
+        return fallback_type;
+    }
+
+    let Some(arms) = top_level_or_expr_arms(expr) else {
+        return fallback_type;
+    };
+
+    let Some((last_arm, non_final_arms)) = arms.split_last() else {
+        return fallback_type;
+    };
+
+    let mut source_type = None;
+    for arm in non_final_arms {
+        let Ok(arm_type) = analyzer.infer_expr(arm) else {
+            return fallback_type;
+        };
+        if arm_type.is_unknown() || arm_type.is_any() {
+            return fallback_type;
+        }
+        let arm_type = remove_false_or_nil(arm_type);
+        source_type = Some(match source_type {
+            Some(current) => TypeOps::Union.apply(analyzer.db, &current, &arm_type),
+            None => arm_type,
+        });
+    }
+
+    let Ok(last_type) = analyzer.infer_expr(last_arm) else {
+        return fallback_type;
+    };
+    if last_type.is_unknown() || last_type.is_any() {
+        return fallback_type;
+    }
+
+    match source_type {
+        Some(current) => TypeOps::Union.apply(analyzer.db, &current, &last_type),
+        None => fallback_type,
+    }
+}
+
+fn top_level_or_expr_arms(expr: &LuaExpr) -> Option<Vec<LuaExpr>> {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return None;
+    };
+    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
+        return None;
+    }
+
+    let mut arms = Vec::new();
+    collect_or_expr_arms(expr, &mut arms)?;
+    (arms.len() >= 2).then_some(arms)
+}
+
+fn collect_or_expr_arms(expr: &LuaExpr, arms: &mut Vec<LuaExpr>) -> Option<()> {
+    if let LuaExpr::BinaryExpr(binary_expr) = expr
+        && binary_expr.get_op_token()?.get_op() == BinaryOperator::OpOr
+    {
+        let (left, right) = binary_expr.get_exprs()?;
+        collect_or_expr_arms(&left, arms)?;
+        collect_or_expr_arms(&right, arms)?;
+        return Some(());
+    }
+
+    arms.push(expr.clone());
+    Some(())
+}
+
 fn is_dynamic_expr_key_member_assignment(
     analyzer: &LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -1479,7 +1554,11 @@ fn get_cached_widened_member_assignment_type(
         return Some(Some(doc_type));
     }
 
-    if let Some(class_type) = prefer_class_assignment_type(incoming_type) {
+    if !matches!(
+        incoming_type,
+        LuaType::Union(_) | LuaType::Intersection(_) | LuaType::MultiLineUnion(_)
+    ) && let Some(class_type) = prefer_class_assignment_type(incoming_type)
+    {
         if !is_class_bootstrap_compatible_type(incoming_type, &class_type) {
             return None;
         }

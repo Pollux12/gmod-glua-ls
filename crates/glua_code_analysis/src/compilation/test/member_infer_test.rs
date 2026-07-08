@@ -9,7 +9,7 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaMemberId, LuaMemberOwner, LuaType, LuaUnionType,
+        DiagnosticCode, Emmyrc, LuaMemberId, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType,
         VirtualWorkspace,
     };
 
@@ -387,6 +387,43 @@ mod test {
             .get_type_cache(&owner)
             .map(|cache| cache.as_type().clone())
             .expect("expected cached type for index expr")
+    }
+
+    fn inferred_binary_expr_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaBinaryExpr(binary_expr) if binary_expr.syntax().text() == expr_text => {
+                    semantic_model
+                        .infer_expr(LuaExpr::BinaryExpr(binary_expr))
+                        .ok()
+                }
+                _ => None,
+            })
+            .expect("expected inferred type for binary expr")
+    }
+
+    fn class_union_type(names: &[&str]) -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_vec(
+                names
+                    .iter()
+                    .map(|name| LuaType::Def(LuaTypeDeclId::global(name)))
+                    .collect(),
+            )
+            .into(),
+        )
     }
 
     fn first_index_expr_member_owner(
@@ -1406,16 +1443,16 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
 
-        // Proof-only: the declared assignment set is nil | Ragdoll | Player, but
-        // the current member write policy keeps only the left side of the `or`
-        // assignment plus nil. This documents the pre-refactor lossy behavior.
+        // The declared assignment set is nil | Ragdoll | Player. Member writes
+        // must use the full top-level `or` source union instead of losing the
+        // fallback arm before member widening/cache writes.
         let ty = ws.expr_ty("A");
-        assert_eq!(ws.humanize_type(ty), "Ragdoll?");
+        assert_eq!(ws.humanize_type(ty), "(Player|Ragdoll)?");
 
-        // Direct assignment-target cache probing shows the write cache itself
-        // has already lost both the initial/later nil and the Player fallback.
+        // Direct assignment-target cache probing shows the incoming member write
+        // type includes both arms before the read-side nil widening is applied.
         let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
-        assert_eq!(ws.humanize_type(cached_ty), "Ragdoll");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
     }
 
     #[gtest]
@@ -1426,12 +1463,158 @@ mod test {
         let mut player_first_ws = VirtualWorkspace::new();
         player_first_ws.def(&defib_like_write_policy_source("self.Target = ply or body"));
 
-        // Proof-only: swapping only the RHS `or` order changes the indexed/read
-        // member base type instead of converging to the same Player | Ragdoll | nil union.
+        // Swapping only the RHS `or` order must converge to the same indexed/read
+        // Player | Ragdoll | nil union.
         let body_first_ty = body_first_ws.expr_ty("A");
         let player_first_ty = player_first_ws.expr_ty("A");
-        assert_eq!(body_first_ws.humanize_type(body_first_ty), "Ragdoll?");
-        assert_eq!(player_first_ws.humanize_type(player_first_ty), "Player?");
+        assert_eq!(
+            body_first_ws.humanize_type(body_first_ty),
+            "(Player|Ragdoll)?"
+        );
+        assert_eq!(
+            player_first_ws.humanize_type(player_first_ty),
+            "(Player|Ragdoll)?"
+        );
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_chained_rhs_uses_all_arms() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@class A: Entity
+        ---@class B: Entity
+        ---@class C: Entity
+        ---@param a A
+        ---@param b B
+        ---@param c C
+        function SWEP:SetTarget(a, b, c)
+            self.Target = a or b or c
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        assert!(ws.check_type(&ty, &class_union_type(&["A", "B", "C"])));
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_nilable_left_preserves_single_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@param maybe_body Ragdoll?
+        ---@param ply Player
+        function SWEP:SetTarget(maybe_body, ply)
+            self.Target = maybe_body or ply
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        let rendered = ws.humanize_type(ty);
+        assert!(rendered.contains("Player"), "got {rendered}");
+        assert!(rendered.contains("Ragdoll"), "got {rendered}");
+        assert!(!rendered.contains('?'), "got {rendered}");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_table_fallback_does_not_keep_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class Holder
+        local Holder = {}
+
+        ---@class Payload
+
+        ---@param x Payload?
+        function Holder:Set(x)
+            self.X = x or {}
+        end
+
+        ---@type Holder
+        local obj
+        A = obj.X
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let rendered = ws.humanize_type(ty);
+        assert!(rendered.contains("Payload"), "got {rendered}");
+        assert!(rendered.contains("table"), "got {rendered}");
+        assert!(!rendered.contains('?'), "got {rendered}");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_does_not_change_expression_level_or_type() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let binary_ty = inferred_binary_expr_type(&mut ws, file_id, "body or ply");
+        assert_eq!(ws.humanize_type(binary_ty), "Ragdoll");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_any_arm_falls_back_to_expression_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@param anything any
+        ---@param ply Player
+        function SWEP:SetTarget(anything, ply)
+            self.Target = anything or ply
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "any");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_respects_realm_split_state_masks() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/weapons/test/shared.lua",
+            r#"
+            ---@class ServerA
+            ---@class ServerB
+            ---@class ClientA
+            ---@class ClientB
+
+            SWEP = {}
+
+            if SERVER then
+                ---@param a ServerA
+                ---@param b ServerB
+                function SWEP:SetServer(a, b)
+                    self.Target = a or b
+                end
+
+                ServerRead = SWEP.Target
+            end
+
+            if CLIENT then
+                ---@param a ClientA
+                ---@param b ClientB
+                function SWEP:SetClient(a, b)
+                    self.Target = a or b
+                end
+
+                ClientRead = SWEP.Target
+            end
+            "#,
+        );
+
+        let server_ty = ws.expr_ty("ServerRead");
+        let client_ty = ws.expr_ty("ClientRead");
+        assert_eq!(ws.humanize_type(server_ty), "(ServerA|ServerB)");
+        assert_eq!(ws.humanize_type(client_ty), "(ClientA|ClientB)");
     }
 
     #[gtest]
