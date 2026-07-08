@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use glua_code_analysis::{
     DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaInferCache, LuaMemberId,
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
+    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticInfoOrigin, SemanticModel,
     explicit_param_string_default_reaches_flow, get_member_value_expr,
     inferred_string_default_reaches_flow,
 };
@@ -39,19 +39,27 @@ pub fn build_semantic_info_hover(
     range: TextRange,
     render_level: Option<RenderLevel>,
 ) -> Option<Hover> {
-    let typ = semantic_info.clone().typ;
+    let typ = semantic_info.typ.clone();
     if semantic_info.semantic_decl.is_none() {
-        return build_hover_without_property(db, semantic_model, document, token, typ);
+        return build_hover_without_property(
+            db,
+            semantic_model,
+            document,
+            token,
+            typ,
+            semantic_info.origin,
+        );
     }
     let hover_builder = build_hover_content(
         compilation,
         semantic_model,
         db,
-        Some(typ),
+        Some(typ.clone()),
         semantic_info.semantic_decl.unwrap(),
         false,
         Some(token.clone()),
         render_level,
+        matches!(semantic_info.origin, SemanticInfoOrigin::ContextualExpected),
     );
     if let Some(hover_builder) = hover_builder {
         hover_builder.build_hover_result(document.to_lsp_range(range))
@@ -80,11 +88,19 @@ pub fn build_assignment_target_hover(
             false,
             Some(token.clone()),
             render_level,
+            false,
         )?;
         return hover_builder.build_hover_result(document.to_lsp_range(range));
     }
 
-    build_hover_without_property(db, semantic_model, document, token, typ)
+    build_hover_without_property(
+        db,
+        semantic_model,
+        document,
+        token,
+        typ,
+        SemanticInfoOrigin::Actual,
+    )
 }
 
 fn build_hover_without_property(
@@ -93,6 +109,7 @@ fn build_hover_without_property(
     document: &LuaDocument,
     token: LuaSyntaxToken,
     typ: LuaType,
+    origin: SemanticInfoOrigin,
 ) -> Option<Hover> {
     if let Some(hover) =
         build_dynamic_field_hover_without_property(db, semantic_model, &token, &typ)
@@ -108,7 +125,10 @@ fn build_hover_without_property(
 
     let render_level = RenderLevel::Detailed;
 
-    let hover = humanize_type(db, &typ, render_level);
+    let hover = match origin {
+        SemanticInfoOrigin::Actual => humanize_type(db, &typ, render_level),
+        SemanticInfoOrigin::ContextualExpected => contextual_inferred_hover(db, &typ, render_level),
+    };
     Some(Hover {
         contents: HoverContents::Markup(MarkupContent {
             kind: lsp_types::MarkupKind::Markdown,
@@ -116,6 +136,15 @@ fn build_hover_without_property(
         }),
         range: document.to_lsp_range(token.text_range()),
     })
+}
+
+fn inferred_hover_type_text(type_text: String) -> String {
+    format!("(infer) {type_text}")
+}
+
+fn contextual_inferred_hover(db: &DbIndex, typ: &LuaType, render_level: RenderLevel) -> String {
+    let type_text = humanize_type(db, typ, render_level);
+    format!("```lua\n{}\n```", inferred_hover_type_text(type_text))
 }
 
 fn build_dynamic_field_hover_without_property(
@@ -167,8 +196,9 @@ fn build_dynamic_field_hover_without_property(
     };
 
     Some(format!(
-        "```lua\n(infer) {}: {}\n```",
-        display_field_name, type_humanize_text
+        "```lua\n{}: {}\n```",
+        inferred_hover_type_text(display_field_name),
+        type_humanize_text
     ))
 }
 
@@ -218,6 +248,7 @@ pub fn build_hover_content_for_completion<'a>(
         true,
         None,
         None,
+        false,
     )
 }
 
@@ -230,6 +261,7 @@ fn build_hover_content<'a>(
     is_completion: bool,
     token: Option<LuaSyntaxToken>,
     render_level: Option<RenderLevel>,
+    label_inferred_type: bool,
 ) -> Option<HoverBuilder<'a>> {
     let mut builder = match render_level {
         Some(level) => HoverBuilder::new_with_level(
@@ -241,6 +273,7 @@ fn build_hover_content<'a>(
         ),
         None => HoverBuilder::new(compilation, semantic_model, token, is_completion),
     };
+    builder.set_label_inferred_type(label_inferred_type);
     match property_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
             let typ = typ?;
@@ -272,7 +305,7 @@ fn build_decl_hover(
             .get_types(builder.semantic_model);
 
     // 处理类型签名
-    if is_function(&typ) {
+    if is_function(&typ) && !builder.label_inferred_type() {
         adjust_semantic_decls(
             builder,
             &mut semantic_decls,
@@ -298,6 +331,7 @@ fn build_decl_hover(
     } else {
         if typ.is_const() {
             let const_value = hover_const_type(db, &typ, builder.detail_render_level);
+            let const_value = builder.format_inferred_hover_type_text(const_value);
             let prefix = if decl.is_local() {
                 "local "
             } else {
@@ -309,6 +343,7 @@ fn build_decl_hover(
                 get_hover_type(builder, builder.semantic_model).unwrap_or(typ.clone());
             let type_humanize_text =
                 hover_humanize_type(builder, &decl_hover_type, Some(builder.detail_render_level));
+            let type_humanize_text = builder.format_inferred_hover_type_text(type_humanize_text);
             let prefix = if decl.is_local() {
                 "local "
             } else {
@@ -574,6 +609,7 @@ fn build_member_hover(
     } else {
         if typ.is_const() {
             let const_value = hover_const_type(db, &typ, builder.detail_render_level);
+            let const_value = builder.format_inferred_hover_type_text(const_value);
             builder.set_type_description(format!("(field) {}: {}", member_name, const_value));
             builder.set_location_path(Some(member));
         } else {
@@ -623,6 +659,7 @@ fn build_member_hover(
                 RenderLevel::Simple
             };
             let type_humanize_text = hover_humanize_type(builder, &member_hover_type, Some(level));
+            let type_humanize_text = builder.format_inferred_hover_type_text(type_humanize_text);
             builder
                 .set_type_description(format!("(field) {}: {}", member_name, type_humanize_text));
             builder.set_location_path(Some(member));
@@ -678,12 +715,8 @@ fn add_decl_color_preview(
     } else {
         "(global) "
     };
-    builder.set_type_description(format!(
-        "{}{}: {}",
-        prefix,
-        decl.get_name(),
-        color.gmod_display
-    ));
+    let display_type = builder.format_inferred_hover_type_text(color.gmod_display.clone());
+    builder.set_type_description(format!("{}{}: {}", prefix, decl.get_name(), display_type));
     builder.add_annotation_description(color_swatch_markdown(
         color.red,
         color.green,
@@ -714,7 +747,8 @@ fn add_member_color_preview(
         LuaMemberKey::Name(name) => humanize_member_key_name(name.as_str()),
         _ => return None,
     };
-    builder.set_type_description(format!("(field) {}: {}", member_name, color.gmod_display));
+    let display_type = builder.format_inferred_hover_type_text(color.gmod_display.clone());
+    builder.set_type_description(format!("(field) {}: {}", member_name, display_type));
     builder.add_annotation_description(color_swatch_markdown(
         color.red,
         color.green,

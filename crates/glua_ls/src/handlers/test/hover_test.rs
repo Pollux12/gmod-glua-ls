@@ -1751,6 +1751,66 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_contextual_infer_overlay_is_labeled_and_keeps_decl_hover() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_hover(
+            r#"
+                ---@class HoverExpected.Vector
+
+                ---@class HoverExpected.Entity
+
+
+                ---@class HoverExpected.HullTrace
+                ---@field start HoverExpected.Vector
+
+
+                util = {}
+
+                ---@param trace HoverExpected.HullTrace
+                function util.TraceHull(trace) end
+
+                ---@type HoverExpected.Entity
+                local owner
+                local spos = owner:GetShootPos()
+                util.TraceHull({ start = sp<??>os })
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal spos: (infer) HoverExpected.Vector\n```".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_contextual_infer_function_type_label_stays_before_whole_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_hover(
+            r#"
+                ---@class HoverExpectedFn.Player
+
+                ---@class HoverExpectedFn.Entity
+
+
+                ---@param callback fun(ply: HoverExpectedFn.Player): boolean
+                local function accepts_callback(callback) end
+
+                ---@type HoverExpectedFn.Entity
+                local owner
+                local callback = owner:GetCallback()
+                accepts_callback(callba<??>ck)
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal callback: (infer) fun(ply: HoverExpectedFn.Player) -> boolean\n```".to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_dynamic_field_for_metatable_instance() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

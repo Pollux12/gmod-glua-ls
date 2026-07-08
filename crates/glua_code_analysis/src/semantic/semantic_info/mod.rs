@@ -24,6 +24,13 @@ use super::{
 pub struct SemanticInfo {
     pub typ: LuaType,
     pub semantic_decl: Option<LuaSemanticDeclId>,
+    pub origin: SemanticInfoOrigin,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticInfoOrigin {
+    Actual,
+    ContextualExpected,
 }
 
 pub fn infer_token_semantic_info(
@@ -52,6 +59,7 @@ pub fn infer_token_semantic_info(
             Some(SemanticInfo {
                 typ,
                 semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+                origin: SemanticInfoOrigin::Actual,
             })
         }
         LuaSyntaxKind::ParamName => {
@@ -65,6 +73,7 @@ pub fn infer_token_semantic_info(
                     Some(SemanticInfo {
                         typ,
                         semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+                        origin: SemanticInfoOrigin::Actual,
                     })
                 }
                 _ => None,
@@ -82,18 +91,20 @@ pub fn infer_node_semantic_info(
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaExpr::cast(expr_node)?;
-            let mut typ = match infer_expr(db, cache, expr.clone()) {
-                Ok(typ) => typ,
-                Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
-                    infer_bind_value_type(db, cache, expr.clone()).unwrap_or(LuaType::Nil)
-                }
-                Err(_) => LuaType::Unknown,
+            let (typ, origin) = match infer_expr(db, cache, expr.clone()) {
+                Ok(typ) if !typ.is_unknown() => (typ, SemanticInfoOrigin::Actual),
+                actual_result => infer_bind_value_type(db, cache, expr.clone())
+                    .map(|typ| (typ, SemanticInfoOrigin::ContextualExpected))
+                    .unwrap_or_else(|| match actual_result {
+                        Ok(typ) => (typ, SemanticInfoOrigin::Actual),
+                        Err(InferFailReason::FieldNotFound)
+                            if matches!(expr, LuaExpr::IndexExpr(_)) =>
+                        {
+                            (LuaType::Nil, SemanticInfoOrigin::Actual)
+                        }
+                        Err(_) => (LuaType::Unknown, SemanticInfoOrigin::Actual),
+                    }),
             };
-            if typ.is_unknown()
-                && let Some(bind_typ) = infer_bind_value_type(db, cache, expr.clone())
-            {
-                typ = bind_typ;
-            }
             let property_owner = infer_expr_semantic_decl(
                 db,
                 cache,
@@ -104,6 +115,7 @@ pub fn infer_node_semantic_info(
             Some(SemanticInfo {
                 typ,
                 semantic_decl: property_owner,
+                origin,
             })
         }
         table_field_node if LuaTableField::can_cast(table_field_node.kind().into()) => {
@@ -116,6 +128,7 @@ pub fn infer_node_semantic_info(
             Some(SemanticInfo {
                 typ: type_cache.as_type().clone(),
                 semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
+                origin: SemanticInfoOrigin::Actual,
             })
         }
         name_type if LuaDocNameType::can_cast(name_type.kind().into()) => {
@@ -127,6 +140,7 @@ pub fn infer_node_semantic_info(
             Some(SemanticInfo {
                 typ: LuaType::Ref(type_decl.get_id()),
                 semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+                origin: SemanticInfoOrigin::Actual,
             })
         }
         tags if LuaDocTag::can_cast(tags.kind().into()) => {
@@ -150,6 +164,7 @@ pub fn infer_node_semantic_info(
                     Some(SemanticInfo {
                         typ: type_cache.as_type().clone(),
                         semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
+                        origin: SemanticInfoOrigin::Actual,
                     })
                 }
                 _ => None,
@@ -166,6 +181,7 @@ fn type_def_tag_info(name: &str, db: &DbIndex, cache: &mut LuaInferCache) -> Opt
     Some(SemanticInfo {
         typ: LuaType::Ref(type_decl.get_id()),
         semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+        origin: SemanticInfoOrigin::Actual,
     })
 }
 

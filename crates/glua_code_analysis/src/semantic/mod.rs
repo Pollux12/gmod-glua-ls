@@ -45,10 +45,10 @@ pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
-pub use semantic_info::SemanticInfo;
 pub(crate) use semantic_info::{
     SemanticDeclGuard, infer_expr_semantic_decl, infer_node_semantic_decl, resolve_global_decl_id,
 };
+pub use semantic_info::{SemanticInfo, SemanticInfoOrigin};
 use semantic_info::{
     infer_node_semantic_info, infer_token_semantic_decl, infer_token_semantic_info,
 };

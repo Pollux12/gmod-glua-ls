@@ -32,6 +32,7 @@ pub struct HoverBuilder<'a> {
     tag_content: Option<Vec<(String, String)>>,
     realm: Option<GmodRealm>,
     realm_is_explicit: bool,
+    label_inferred_type: bool,
 
     trigger_token: Option<LuaSyntaxToken>,
     pub semantic_model: &'a SemanticModel<'a>,
@@ -84,8 +85,25 @@ impl<'a> HoverBuilder<'a> {
             tag_content: None,
             realm: None,
             realm_is_explicit: false,
+            label_inferred_type: false,
             detail_render_level,
             substitutor,
+        }
+    }
+
+    pub fn set_label_inferred_type(&mut self, label: bool) {
+        self.label_inferred_type = label;
+    }
+
+    pub fn label_inferred_type(&self) -> bool {
+        self.label_inferred_type
+    }
+
+    pub fn format_inferred_hover_type_text(&self, type_text: String) -> String {
+        if self.label_inferred_type {
+            format!("(infer) {type_text}")
+        } else {
+            type_text
         }
     }
 

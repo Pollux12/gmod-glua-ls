@@ -1,6 +1,6 @@
 use glua_code_analysis::{
     DbIndex, DocSyntax, Emmyrc, FileId, LuaMemberId, LuaMemberKey, LuaType, LuaTypeDeclId,
-    SemanticInfo, WorkspaceId, get_member_map,
+    SemanticInfo, SemanticInfoOrigin, WorkspaceId, get_member_map,
 };
 use glua_parser::{
     LuaAst, LuaAstNode, LuaComment, LuaDocDescription, LuaDocTag, LuaLocalName, LuaSyntaxToken,
@@ -91,6 +91,7 @@ pub fn resolve_ref(
         let scopes = vec![SemanticInfo {
             typ: LuaType::Ref(scope.clone()),
             semantic_decl: Some(scope.into()),
+            origin: SemanticInfoOrigin::Actual,
         }];
         if let Some(found_refs) = find_members(db, scopes, path) {
             result.extend(found_refs);
@@ -131,6 +132,7 @@ pub fn resolve_ref(
             let scopes = vec![SemanticInfo {
                 typ: LuaType::Ref(found.get_id()),
                 semantic_decl: Some(found.get_id().into()),
+                origin: SemanticInfoOrigin::Actual,
             }];
             if let Some(found_refs) = find_members(db, scopes, &path[i..]) {
                 seen_types.extend(found_refs.iter().filter_map(|item| match &item.typ {
@@ -144,6 +146,7 @@ pub fn resolve_ref(
             let scopes = vec![SemanticInfo {
                 typ: found.export_type.clone().unwrap_or(LuaType::Nil),
                 semantic_decl: found.semantic_id.clone(),
+                origin: SemanticInfoOrigin::Actual,
             }];
             if let Some(found_refs) = find_members(db, scopes, &path[i..]) {
                 result.extend(
@@ -160,6 +163,7 @@ pub fn resolve_ref(
         let scopes = vec![SemanticInfo {
             typ: module.export_type.clone().unwrap_or(LuaType::Nil),
             semantic_decl: module.semantic_id.clone(),
+            origin: SemanticInfoOrigin::Actual,
         }];
         if let Some(found_refs) = find_members(db, scopes, path) {
             result.extend(
@@ -184,6 +188,7 @@ pub fn resolve_ref(
                         .as_type()
                         .clone(),
                     semantic_decl: Some(global.into()),
+                    origin: SemanticInfoOrigin::Actual,
                 })
             })
             .collect();
@@ -268,6 +273,7 @@ fn find_members(
                 new_scopes.extend(found_members.iter().map(|member| SemanticInfo {
                     typ: member.typ.clone(),
                     semantic_decl: member.property_owner_id.clone(),
+                    origin: SemanticInfoOrigin::Actual,
                 }))
             }
         }

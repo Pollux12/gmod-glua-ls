@@ -358,6 +358,37 @@ mod test {
             .expect("expected inferred type for index expr")
     }
 
+    fn cached_index_expr_type(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    Some(index_expr)
+                }
+                _ => None,
+            })
+            .expect("expected index expr");
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        let owner: crate::LuaTypeOwner = member_id.into();
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&owner)
+            .map(|cache| cache.as_type().clone())
+            .expect("expected cached type for index expr")
+    }
+
     fn first_index_expr_member_owner(
         ws: &VirtualWorkspace,
         file_id: crate::FileId,
@@ -1331,6 +1362,76 @@ mod test {
 
         let ty = ws.expr_ty("A");
         assert_eq!(ws.humanize_type(ty), "integer");
+    }
+
+    fn defib_like_target_source(order: &str) -> String {
+        format!(
+            r#"
+        ---@class Entity
+        ---@class Player: Entity
+        ---@class Ragdoll: Entity
+
+        ---@class SWEP
+        local SWEP = {{}}
+
+        {order}
+
+        ---@type SWEP
+        local obj
+        A = obj.Target
+        "#
+        )
+    }
+
+    fn defib_like_write_policy_source(setup: &str) -> String {
+        defib_like_target_source(&format!(
+            r#"
+        SWEP.Target = nil
+
+        ---@param body Ragdoll
+        ---@param ply Player
+        function SWEP:SetTarget(body, ply)
+            {setup}
+        end
+
+        function SWEP:ClearTarget()
+            self.Target = nil
+        end
+        "#
+        ))
+    }
+
+    #[gtest]
+    fn proof_current_defib_member_write_policy_initial_nil_loses_body_player_union() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        // Proof-only: the declared assignment set is nil | Ragdoll | Player, but
+        // the current member write policy keeps only the left side of the `or`
+        // assignment plus nil. This documents the pre-refactor lossy behavior.
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "Ragdoll?");
+
+        // Direct assignment-target cache probing shows the write cache itself
+        // has already lost both the initial/later nil and the Player fallback.
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        assert_eq!(ws.humanize_type(cached_ty), "Ragdoll");
+    }
+
+    #[gtest]
+    fn proof_current_defib_member_write_policy_rhs_order_changes_lost_constituent() {
+        let mut body_first_ws = VirtualWorkspace::new();
+        body_first_ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let mut player_first_ws = VirtualWorkspace::new();
+        player_first_ws.def(&defib_like_write_policy_source("self.Target = ply or body"));
+
+        // Proof-only: swapping only the RHS `or` order changes the indexed/read
+        // member base type instead of converging to the same Player | Ragdoll | nil union.
+        let body_first_ty = body_first_ws.expr_ty("A");
+        let player_first_ty = player_first_ws.expr_ty("A");
+        assert_eq!(body_first_ws.humanize_type(body_first_ty), "Ragdoll?");
+        assert_eq!(player_first_ws.humanize_type(player_first_ty), "Player?");
     }
 
     #[gtest]

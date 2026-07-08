@@ -3,10 +3,10 @@ mod test {
     use std::{ops::Deref, sync::Arc};
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, VirtualWorkspace,
-        humanize_type,
+        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, SemanticInfoOrigin,
+        VirtualWorkspace, humanize_type,
     };
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName, LuaNameExpr};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -137,6 +137,67 @@ mod test {
             .collect()
     }
 
+    fn diagnostics_for_code_with_shared(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let diagnostics = ws
+            .analysis
+            .diagnose_file_with_shared(file_id, CancellationToken::new(), shared)
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
+    fn enable_gmod(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(Arc::new(emmyrc));
+    }
+
+    fn name_expr_types(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> Vec<(String, String, SemanticInfoOrigin)> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| name_expr.get_name_text().as_deref() == Some(name))
+            .map(|name_expr| {
+                let infer_type = semantic_model
+                    .infer_expr(LuaExpr::NameExpr(name_expr.clone()))
+                    .unwrap_or(LuaType::Unknown);
+                let semantic_info = name_expr
+                    .get_name_token()
+                    .and_then(|token| {
+                        semantic_model.get_semantic_info(token.syntax().clone().into())
+                    })
+                    .expect("expected semantic info for name expression");
+
+                (
+                    ws.humanize_type(infer_type),
+                    ws.humanize_type(semantic_info.typ),
+                    semantic_info.origin,
+                )
+            })
+            .collect()
+    }
+
     fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
         match typ {
             LuaType::Table => true,
@@ -168,6 +229,160 @@ mod test {
                 .sum(),
             _ => 0,
         }
+    }
+
+    #[test]
+    fn proof_current_fangs_type_source_divergence_for_spos() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/fangs.lua",
+            r#"
+            ---@meta
+
+            ---@class Vector
+            ---@operator add(Vector): Vector
+            ---@operator mul(number): Vector
+
+            ---@return Vector
+            function Vector() end
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@field GetShootPos fun(self: Player): Vector
+            ---@field GetAimVector fun(self: Player): Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+            ---@field filter any
+            ---@field mins Vector
+            ---@field maxs Vector
+
+            util = {}
+
+            ---@param trace HullTrace
+            function util.TraceHull(trace) end
+
+            ---@param ... any
+            function print(...) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/fangs_shape.lua",
+            r#"
+            ---@type Entity
+            local owner
+            local spos = owner:GetShootPos()
+            print(spos)
+            local sdest = spos + (owner:GetAimVector() * 70)
+            local tr = util.TraceHull({ start = spos, endpos = sdest, filter = owner, mins = Vector(), maxs = Vector() })
+            "#,
+        );
+
+        let local_spos_type = local_name_type(&mut ws, file_id, "spos");
+        assert_eq!(
+            ws.humanize_type(local_spos_type),
+            "unknown",
+            "indexed/local semantic info for spos currently stays unknown after FieldNotFound"
+        );
+
+        let spos_types = name_expr_types(&ws, file_id, "spos");
+        assert_eq!(
+            spos_types,
+            vec![
+                (
+                    "unknown".to_string(),
+                    "any".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
+                ),
+                (
+                    "unknown".to_string(),
+                    "unknown".to_string(),
+                    SemanticInfoOrigin::Actual,
+                ),
+                (
+                    "unknown".to_string(),
+                    "Vector".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
+                ),
+            ],
+            "same local keeps actual infer_expr distinct from labeled contextual SemanticInfo overlays"
+        );
+
+        let undefined_fields =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            undefined_fields.is_empty(),
+            "current recursive subclass suppression hides Entity:GetShootPos() undefined-field: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn proof_current_undefined_field_suppression_searches_recursive_descendants() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/recursive_descendant.lua",
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class CustomPlayer : Player
+            ---@field OnlyOnCustom fun(self: CustomPlayer)
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/recursive_descendant.lua",
+            r#"
+            ---@type Entity
+            local ent
+            ent:OnlyOnCustom()
+            "#,
+        );
+
+        let undefined_fields =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert!(
+            undefined_fields.is_empty(),
+            "current behavior suppresses undefined-field when the member exists only on a recursive descendant: {undefined_fields:?}"
+        );
+    }
+
+    #[test]
+    fn proof_current_semantic_info_has_type_origin_field() {
+        fn assert_semantic_info_shape(info: crate::semantic::SemanticInfo) {
+            let crate::semantic::SemanticInfo {
+                typ,
+                semantic_decl,
+                origin,
+            } = info;
+            assert_eq!(origin, SemanticInfoOrigin::Actual);
+            let _ = (typ, semantic_decl);
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local value = 1");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .next()
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+
+        assert_semantic_info_shape(info);
     }
 
     #[test]
