@@ -42,6 +42,17 @@ enum MemberOrOwner {
     Owner(LuaMemberOwner),
 }
 
+#[derive(Debug)]
+enum MemberInsertAction {
+    Noop,
+    Store(LuaMemberIndexItem),
+    StoreRemovingVisibleOldIds {
+        item: LuaMemberIndexItem,
+        old_ids: Vec<LuaMemberId>,
+    },
+    PushPreservedAssignment,
+}
+
 impl Default for LuaMemberIndex {
     fn default() -> Self {
         Self::new()
@@ -91,132 +102,148 @@ impl LuaMemberIndex {
     pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
         let member = self.get_member(&id)?;
         let key = member.get_key().clone();
-        let feature = member.get_feature();
+        let is_decl = member.get_feature().is_decl();
         if self.member_current_owner.get(&id) != Some(&owner) {
             self.add_member_to_owner_key_index(owner.clone(), id);
             self.add_member_to_owner_key_history_index(owner.clone(), id);
         }
-        let member_map = self
-            .owner_members
+
+        self.owner_members
             .entry(owner.clone())
             .or_insert_with(LuaOwnerMembers::new);
-        if feature.is_decl() {
-            if let Some(item) = member_map.get_member_mut(&key) {
-                match item {
-                    LuaMemberIndexItem::One(old_id) => {
-                        if old_id != &id {
-                            let ids = vec![*old_id, id];
-                            *item = LuaMemberIndexItem::Many(ids);
-                        }
-                    }
-                    LuaMemberIndexItem::Many(ids) => {
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                    }
-                }
-            } else {
-                member_map.add_member(key.clone(), LuaMemberIndexItem::One(id));
-            }
-        } else {
-            if !self
-                .owner_members
-                .get(&owner)
-                .is_some_and(|owner_members| owner_members.contains_member(&key))
-            {
-                self.owner_members
-                    .entry(owner.clone())
-                    .or_insert_with(LuaOwnerMembers::new)
-                    .add_member(key, LuaMemberIndexItem::One(id));
-                return Some(());
-            }
 
-            if self.should_preserve_assignment_file_define_member(&owner, &key, id) {
-                self.push_preserved_assignment_member(owner, key, id);
-                return Some(());
-            }
-
-            let item = self.owner_members.get(&owner)?.get_member(&key)?.clone();
-            let (new_items, removed_member_ids) = if self.is_item_only_meta(&item) {
-                let new_items = match item {
-                    LuaMemberIndexItem::One(old_id) => {
-                        if old_id == id {
-                            return Some(());
-                        }
-                        LuaMemberIndexItem::Many(vec![id, old_id])
-                    }
-                    LuaMemberIndexItem::Many(mut ids) => {
-                        if ids.contains(&id) {
-                            return Some(());
-                        }
-
-                        ids.push(id);
-                        LuaMemberIndexItem::Many(ids)
-                    }
-                };
-                (new_items, Vec::new())
-            } else if self.is_item_only_file_define(&item) {
-                let old_member_ids = member_ids_from_item(&item);
-                let all_assignment_file_defines = self.is_assignment_file_define_member(id)
-                    && old_member_ids
-                        .iter()
-                        .all(|old_id| self.is_assignment_file_define_member(*old_id));
-
-                if all_assignment_file_defines {
-                    let should_preserve_members =
-                        self.non_overwriting_assignment_members.contains(&id)
-                            && old_member_ids.iter().all(|old_id| {
-                                self.non_overwriting_assignment_members.contains(old_id)
-                            });
-                    if should_preserve_members {
-                        let mut ids = old_member_ids;
-                        if !ids.contains(&id) {
-                            ids.push(id);
-                        }
-                        let item = match ids.as_slice() {
-                            [id] => LuaMemberIndexItem::One(*id),
-                            _ => LuaMemberIndexItem::Many(ids),
-                        };
-                        self.owner_members
-                            .entry(owner.clone())
-                            .or_insert_with(LuaOwnerMembers::new)
-                            .add_member(key.clone(), item);
-                        return Some(());
-                    }
-                    match item {
-                        LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
-                        LuaMemberIndexItem::Many(ids) if ids.contains(&id) => return Some(()),
-                        _ => (LuaMemberIndexItem::One(id), Vec::new()),
-                    }
-                } else {
-                    match item {
-                        LuaMemberIndexItem::One(old_id) if old_id == id => return Some(()),
-                        _ => (
-                            LuaMemberIndexItem::One(id),
-                            old_member_ids
-                                .into_iter()
-                                .filter(|old_id| {
-                                    *old_id != id && !self.is_assignment_file_define_member(*old_id)
-                                })
-                                .collect(),
-                        ),
-                    }
-                }
-            } else {
-                return Some(());
-            };
-
-            for old_member_id in removed_member_ids {
-                self.remove_member_from_visible_owner_key_index(&owner, old_member_id);
-            }
-
-            self.owner_members
-                .entry(owner.clone())
-                .or_insert_with(LuaOwnerMembers::new)
-                .add_member(key.clone(), new_items);
-        }
+        let current_item = self
+            .owner_members
+            .get(&owner)
+            .and_then(|owner_members| owner_members.get_member(&key));
+        let action = self.classify_member_insert(&owner, &key, id, is_decl, current_item);
+        self.apply_member_insert_action(owner, key, id, action);
 
         Some(())
+    }
+
+    fn classify_member_insert(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+        id: LuaMemberId,
+        is_decl: bool,
+        current_item: Option<&LuaMemberIndexItem>,
+    ) -> MemberInsertAction {
+        let Some(item) = current_item else {
+            return MemberInsertAction::Store(LuaMemberIndexItem::One(id));
+        };
+
+        if is_decl {
+            return match item {
+                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
+                LuaMemberIndexItem::One(old_id) => {
+                    MemberInsertAction::Store(LuaMemberIndexItem::Many(vec![*old_id, id]))
+                }
+                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
+                LuaMemberIndexItem::Many(ids) => {
+                    let mut ids = ids.clone();
+                    ids.push(id);
+                    MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
+                }
+            };
+        }
+
+        if self.should_preserve_assignment_file_define_member(owner, key, id) {
+            return MemberInsertAction::PushPreservedAssignment;
+        }
+
+        if self.is_item_only_meta(item) {
+            return match item {
+                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
+                LuaMemberIndexItem::One(old_id) => {
+                    MemberInsertAction::Store(LuaMemberIndexItem::Many(vec![id, *old_id]))
+                }
+                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
+                LuaMemberIndexItem::Many(ids) => {
+                    let mut ids = ids.clone();
+                    ids.push(id);
+                    MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
+                }
+            };
+        }
+
+        if !self.is_item_only_file_define(item) {
+            return MemberInsertAction::Noop;
+        }
+
+        let old_member_ids = member_ids_from_item(item);
+        let all_assignment_file_defines = self.is_assignment_file_define_member(id)
+            && old_member_ids
+                .iter()
+                .all(|old_id| self.is_assignment_file_define_member(*old_id));
+
+        if all_assignment_file_defines {
+            let should_preserve_members = self.non_overwriting_assignment_members.contains(&id)
+                && old_member_ids
+                    .iter()
+                    .all(|old_id| self.non_overwriting_assignment_members.contains(old_id));
+            if should_preserve_members {
+                let mut ids = old_member_ids;
+                if !ids.contains(&id) {
+                    ids.push(id);
+                }
+                let item = match ids.as_slice() {
+                    [id] => LuaMemberIndexItem::One(*id),
+                    _ => LuaMemberIndexItem::Many(ids),
+                };
+                return MemberInsertAction::Store(item);
+            }
+
+            return match item {
+                LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
+                LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
+                _ => MemberInsertAction::Store(LuaMemberIndexItem::One(id)),
+            };
+        }
+
+        match item {
+            LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
+            _ => MemberInsertAction::StoreRemovingVisibleOldIds {
+                item: LuaMemberIndexItem::One(id),
+                old_ids: old_member_ids
+                    .into_iter()
+                    .filter(|old_id| {
+                        *old_id != id && !self.is_assignment_file_define_member(*old_id)
+                    })
+                    .collect(),
+            },
+        }
+    }
+
+    fn apply_member_insert_action(
+        &mut self,
+        owner: LuaMemberOwner,
+        key: LuaMemberKey,
+        id: LuaMemberId,
+        action: MemberInsertAction,
+    ) {
+        match action {
+            MemberInsertAction::Noop => {}
+            MemberInsertAction::Store(item) => {
+                self.owner_members
+                    .entry(owner)
+                    .or_insert_with(LuaOwnerMembers::new)
+                    .add_member(key, item);
+            }
+            MemberInsertAction::StoreRemovingVisibleOldIds { item, old_ids } => {
+                for old_id in old_ids {
+                    self.remove_member_from_visible_owner_key_index(&owner, old_id);
+                }
+                self.owner_members
+                    .entry(owner)
+                    .or_insert_with(LuaOwnerMembers::new)
+                    .add_member(key, item);
+            }
+            MemberInsertAction::PushPreservedAssignment => {
+                self.push_preserved_assignment_member(owner, key, id);
+            }
+        }
     }
 
     pub fn add_member_alias_to_owner(
@@ -985,12 +1012,15 @@ mod tests {
     use crate::{FileId, LuaTypeDeclId};
 
     fn make_member(member_id: LuaMemberId, key: &str) -> LuaMember {
-        LuaMember::new(
-            member_id,
-            LuaMemberKey::Name(key.into()),
-            LuaMemberFeature::FileFieldDecl,
-            None,
-        )
+        make_member_with_feature(member_id, key, LuaMemberFeature::FileFieldDecl)
+    }
+
+    fn make_member_with_feature(
+        member_id: LuaMemberId,
+        key: &str,
+        feature: LuaMemberFeature,
+    ) -> LuaMember {
+        LuaMember::new(member_id, LuaMemberKey::Name(key.into()), feature, None)
     }
 
     fn make_member_id(file_id: FileId, start: u32) -> LuaMemberId {
@@ -1450,6 +1480,150 @@ mod tests {
         );
 
         assert!(index.has_visible_member_for_owner_key_other_than(&owner, &key, second_member_id));
+    }
+
+    #[test]
+    fn meta_only_member_item_preserves_meta_when_assignment_is_added() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let meta_member_id = make_member_id(FileId::new(4), 1);
+        let assignment_member_id = make_index_member_id(FileId::new(4), 3);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(meta_member_id, "field", LuaMemberFeature::MetaFieldDecl),
+        );
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(assignment_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                assignment_member_id,
+                meta_member_id,
+            ]))
+        );
+    }
+
+    #[test]
+    fn retain_only_member_for_owner_key_keeps_mixed_visible_members() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let declaration_member_id = make_member_id(FileId::new(4), 1);
+        let assignment_member_id = make_index_member_id(FileId::new(4), 3);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(
+                declaration_member_id,
+                "field",
+                LuaMemberFeature::FileFieldDecl,
+            ),
+        );
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(assignment_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        index
+            .retain_only_member_for_owner_key(assignment_member_id)
+            .expect("retain should no-op for mixed visible members");
+
+        let visible_member_ids = index
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            visible_member_ids,
+            vec![declaration_member_id, assignment_member_id]
+        );
+    }
+
+    #[test]
+    fn preserve_members_for_owner_key_filters_dedups_and_updates_visible_item() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherOwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = make_index_member_id(FileId::new(4), 1);
+        let second_member_id = make_index_member_id(FileId::new(4), 3);
+        let other_owner_member_id = make_index_member_id(FileId::new(5), 1);
+        let other_key_member_id = make_index_member_id(FileId::new(4), 5);
+
+        let mut index = LuaMemberIndex::new();
+        for member_id in [first_member_id, second_member_id] {
+            index.add_member(
+                owner.clone(),
+                make_member_with_feature(member_id, "field", LuaMemberFeature::FileDefine),
+            );
+        }
+        index.add_member(
+            other_owner,
+            make_member_with_feature(other_owner_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(other_key_member_id, "other", LuaMemberFeature::FileDefine),
+        );
+
+        index
+            .preserve_members_for_owner_key(
+                first_member_id,
+                vec![
+                    second_member_id,
+                    other_owner_member_id,
+                    first_member_id,
+                    second_member_id,
+                    other_key_member_id,
+                ],
+            )
+            .expect("preserve should succeed");
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                second_member_id,
+                first_member_id,
+            ]))
+        );
+        let visible_member_ids = index
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        assert_eq!(visible_member_ids, vec![second_member_id, first_member_id]);
+    }
+
+    #[test]
+    fn preserved_assignment_duplicate_insertions_keep_existing_item_order() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let first_member_id = make_index_member_id(FileId::new(4), 1);
+        let second_member_id = make_index_member_id(FileId::new(4), 3);
+
+        let mut index = LuaMemberIndex::new();
+        for member_id in [first_member_id, second_member_id] {
+            index.mark_non_overwriting_assignment_member(member_id);
+            index.add_member(
+                owner.clone(),
+                make_member_with_feature(member_id, "field", LuaMemberFeature::FileDefine),
+            );
+        }
+
+        index.push_preserved_assignment_member(owner.clone(), key.clone(), second_member_id);
+        index.push_preserved_assignment_member(owner.clone(), key.clone(), first_member_id);
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                first_member_id,
+                second_member_id,
+            ]))
+        );
     }
 
     #[test]
