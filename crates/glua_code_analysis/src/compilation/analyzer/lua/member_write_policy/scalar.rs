@@ -1,23 +1,26 @@
 use crate::{DbIndex, LuaTypeCache, TypeOps, db_index::LuaType};
 
 #[derive(Debug, Clone)]
-pub(super) struct MemberAssignmentWideningState {
-    pub(super) no_table_literal_widen_type: LuaType,
-    pub(super) table_literal_widen_type: LuaType,
-    pub(super) doc_type: Option<LuaType>,
-    pub(super) all_table_assignment_merge_types: bool,
+pub(in crate::compilation::analyzer::lua) struct MemberAssignmentWideningState {
+    pub(in crate::compilation::analyzer::lua) no_table_literal_widen_type: LuaType,
+    pub(in crate::compilation::analyzer::lua) table_literal_widen_type: LuaType,
+    pub(in crate::compilation::analyzer::lua) doc_type: Option<LuaType>,
+    pub(in crate::compilation::analyzer::lua) all_table_assignment_merge_types: bool,
     class_bootstrap_type: Option<LuaType>,
     class_bootstrap_compatible: bool,
 }
 
-pub(super) enum MemberAssignmentWideningDecision {
+pub(in crate::compilation::analyzer::lua) enum MemberAssignmentWideningDecision {
     Widened(LuaType),
     ClassBootstrapRejected,
     NoPreviousAssignments,
 }
 
 impl MemberAssignmentWideningState {
-    pub(super) fn from_assigned_type(assigned_type: &LuaType, doc_type: Option<LuaType>) -> Self {
+    pub(in crate::compilation::analyzer::lua) fn from_assigned_type(
+        assigned_type: &LuaType,
+        doc_type: Option<LuaType>,
+    ) -> Self {
         let (class_bootstrap_type, class_bootstrap_compatible) =
             class_bootstrap_cache_state(assigned_type);
 
@@ -31,7 +34,7 @@ impl MemberAssignmentWideningState {
         }
     }
 
-    pub(super) fn from_type_cache(cache: &LuaTypeCache) -> Self {
+    pub(in crate::compilation::analyzer::lua) fn from_type_cache(cache: &LuaTypeCache) -> Self {
         Self::from_assigned_type(
             cache.as_type(),
             cache.is_doc().then(|| cache.as_type().clone()),
@@ -39,7 +42,7 @@ impl MemberAssignmentWideningState {
     }
 }
 
-pub(super) fn merge_member_assignment_widening_state(
+pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_state(
     db: &DbIndex,
     state: &mut MemberAssignmentWideningState,
     new_state: MemberAssignmentWideningState,
@@ -70,7 +73,7 @@ pub(super) fn merge_member_assignment_widening_state(
     );
 }
 
-pub(super) fn decide_member_assignment_widening<'a>(
+pub(in crate::compilation::analyzer::lua) fn decide_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
     allow_table_literal_widening: bool,
@@ -138,7 +141,7 @@ pub(super) fn decide_member_assignment_widening<'a>(
     ))
 }
 
-pub(super) fn union_member_assignment_widening<'a>(
+pub(in crate::compilation::analyzer::lua) fn union_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
     allow_table_literal_widening: bool,
@@ -221,7 +224,10 @@ fn merge_assignment_types<'a>(
     result
 }
 
-pub(super) fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+pub(in crate::compilation::analyzer::lua) fn widen_related_assignment_type(
+    typ: &LuaType,
+    widen_table_literals: bool,
+) -> LuaType {
     if widen_table_literals {
         return widen_table_literals_for_assignment(typ);
     }

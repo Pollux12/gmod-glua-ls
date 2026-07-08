@@ -174,6 +174,24 @@ mod test {
     }
 
     #[test]
+    fn test_inferred_collection_dynamic_key_write_does_not_inject_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::InjectField,
+            r#"
+                local seen = {}
+
+                ---@param key integer
+                ---@param value string
+                local function remember(key, value)
+                    seen[key] = value
+                    seen[#seen + 1] = "fallback"
+                end
+        "#
+        ));
+    }
+
+    #[test]
     fn test_tuple() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(

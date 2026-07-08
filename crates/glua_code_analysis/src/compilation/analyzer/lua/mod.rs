@@ -16,7 +16,10 @@ use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::infer_for_range_iter_expr_func;
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
-use member_write_policy::MemberAssignmentWideningState;
+use member_write_policy::{
+    DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey,
+    MemberAssignmentWideningState, MemberWideningCache,
+};
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
@@ -29,7 +32,7 @@ use log::info;
 use std::time::{Duration, Instant};
 
 use crate::{
-    Emmyrc, FileId, GmodStateMask, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
+    Emmyrc, FileId, InferFailReason, LuaDeclId, LuaMemberOwner,
     compilation::analyzer::{
         AnalysisPipeline,
         lua::call::{analyze_call, build_special_call_direct_matcher},
@@ -323,35 +326,6 @@ struct LuaAnalyzer<'a> {
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
     literal_index_member_owner_cache: FxHashMap<String, LuaMemberOwner>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct MemberAssignmentWideningCacheKey {
-    owner: LuaMemberOwner,
-    key: LuaMemberKey,
-}
-
-#[derive(Debug)]
-struct MemberWideningCache<S> {
-    seen_count: usize,
-    by_state_mask: FxHashMap<GmodStateMask, S>,
-    disabled: bool,
-}
-
-impl<S> Default for MemberWideningCache<S> {
-    fn default() -> Self {
-        Self {
-            seen_count: 0,
-            by_state_mask: FxHashMap::default(),
-            disabled: false,
-        }
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct DynamicKeyCollectionWideningKey {
-    owner: LuaMemberOwner,
-    key: LuaMemberKey,
 }
 
 impl LuaAnalyzer<'_> {

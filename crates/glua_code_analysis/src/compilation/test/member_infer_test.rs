@@ -1194,6 +1194,40 @@ mod test {
     }
 
     #[gtest]
+    fn test_member_collection_variable_key_append_preserves_element_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        local holder = {}
+        holder.items = {}
+
+        local nextIndex = #holder.items + 1
+        holder.items[nextIndex] = "created"
+
+        local appended = holder.items[nextIndex]
+        local numericRead = holder.items[1]
+        "#,
+        );
+
+        let appended_ty = local_name_type(&mut ws, file_id, "appended");
+        assert_that!(
+            ws.check_type(&appended_ty, &LuaType::String),
+            eq(true),
+            "expected variable-key append read to preserve string element type, got {}",
+            ws.humanize_type(appended_ty)
+        );
+
+        let numeric_read_ty = local_name_type(&mut ws, file_id, "numericRead");
+        assert_that!(
+            ws.check_type(&numeric_read_ty, &LuaType::String),
+            eq(true),
+            "expected numeric collection read after variable-key append to preserve string element type, got {}",
+            ws.humanize_type(numeric_read_ty)
+        );
+    }
+
+    #[gtest]
     fn test_member_collection_reset_and_append_includes_appended_type() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1225,6 +1259,51 @@ mod test {
             eq(true),
             "expected appended collection element to include Seat, got {}",
             display
+        );
+    }
+
+    #[gtest]
+    fn test_member_nullable_collection_append_preserves_existing_and_appended_elements() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@class Player
+        local Player = {}
+
+        ---@class Weapon
+        local Weapon = {}
+
+        ---@param ply Player
+        ---@param weapon Weapon
+        local function rememberLoadout(ply, weapon)
+            ply.loadout = ply.loadout or { "fallback" }
+            ply.loadout[#ply.loadout + 1] = weapon
+
+            local first = ply.loadout[1]
+            local appended = ply.loadout[2]
+        end
+        "#,
+        );
+
+        let first_ty = local_name_type(&mut ws, file_id, "first");
+        let first_display = ws.humanize_type(first_ty.clone());
+        assert_that!(
+            first_display.contains("fallback") && first_display.contains("Weapon"),
+            eq(true),
+            "expected nullable collection element union to preserve existing and appended elements, got {}",
+            first_display
+        );
+
+        let appended_ty = local_name_type(&mut ws, file_id, "appended");
+        let appended_display = ws.humanize_type(appended_ty.clone());
+        assert_that!(
+            !appended_ty.is_nil()
+                && !appended_ty.is_unknown()
+                && appended_display.contains("Weapon"),
+            eq(true),
+            "expected nullable collection append to include Weapon element, got {}",
+            appended_display
         );
     }
 
