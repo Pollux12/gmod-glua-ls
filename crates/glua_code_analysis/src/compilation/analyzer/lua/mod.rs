@@ -311,10 +311,12 @@ struct LuaAnalyzer<'a> {
     gmod_enabled: bool,
     is_scripted_class_scope: bool,
     special_call_direct_matcher: &'a call::SpecialCallDirectMatcher,
-    member_assignment_widening_cache:
-        FxHashMap<MemberAssignmentWideningCacheKey, MemberAssignmentWideningCache>,
+    member_assignment_widening_cache: FxHashMap<
+        MemberAssignmentWideningCacheKey,
+        MemberWideningCache<MemberAssignmentWideningState>,
+    >,
     member_collection_assignment_widening_cache:
-        FxHashMap<MemberAssignmentWideningCacheKey, MemberCollectionAssignmentWideningCache>,
+        FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
@@ -327,11 +329,21 @@ struct MemberAssignmentWideningCacheKey {
     key: LuaMemberKey,
 }
 
-#[derive(Debug, Default)]
-struct MemberAssignmentWideningCache {
+#[derive(Debug)]
+struct MemberWideningCache<S> {
     seen_count: usize,
-    by_state_mask: FxHashMap<GmodStateMask, MemberAssignmentWideningState>,
+    by_state_mask: FxHashMap<GmodStateMask, S>,
     disabled: bool,
+}
+
+impl<S> Default for MemberWideningCache<S> {
+    fn default() -> Self {
+        Self {
+            seen_count: 0,
+            by_state_mask: FxHashMap::default(),
+            disabled: false,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -342,13 +354,6 @@ struct MemberAssignmentWideningState {
     all_table_assignment_merge_types: bool,
     class_bootstrap_type: Option<LuaType>,
     class_bootstrap_compatible: bool,
-}
-
-#[derive(Debug, Default)]
-struct MemberCollectionAssignmentWideningCache {
-    seen_count: usize,
-    by_state_mask: FxHashMap<GmodStateMask, LuaType>,
-    disabled: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

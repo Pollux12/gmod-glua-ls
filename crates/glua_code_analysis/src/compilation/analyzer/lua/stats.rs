@@ -20,7 +20,7 @@ use rustc_hash::FxHashMap;
 
 use super::{
     DynamicKeyCollectionWideningKey, LuaAnalyzer, MemberAssignmentWideningCacheKey,
-    MemberAssignmentWideningState,
+    MemberAssignmentWideningState, MemberWideningCache,
 };
 
 pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) -> Option<()> {
@@ -1514,6 +1514,62 @@ fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bo
         .is_some_and(|decl| decl.is_global())
 }
 
+enum WideningCacheLookup<'a, S> {
+    FirstSighting,
+    Fallback,
+    Hit(&'a MemberWideningCache<S>),
+}
+
+fn lookup_widening_cache<'a, S>(
+    cache_map: &'a FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<S>>,
+    cache_key: &MemberAssignmentWideningCacheKey,
+    visible_count: usize,
+) -> WideningCacheLookup<'a, S> {
+    let Some(cache) = cache_map.get(cache_key) else {
+        return if visible_count == 1 {
+            WideningCacheLookup::FirstSighting
+        } else {
+            WideningCacheLookup::Fallback
+        };
+    };
+
+    if cache.disabled || cache.seen_count + 1 != visible_count {
+        return WideningCacheLookup::Fallback;
+    }
+
+    WideningCacheLookup::Hit(cache)
+}
+
+fn record_widening_cache<S>(
+    cache_map: &mut FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<S>>,
+    cache_key: MemberAssignmentWideningCacheKey,
+    visible_count: usize,
+    state_mask: GmodStateMask,
+    new_state: S,
+    merge: impl FnOnce(&mut S, S),
+) {
+    let mut cache = cache_map.remove(&cache_key).unwrap_or_default();
+    if cache.disabled {
+        cache_map.insert(cache_key, cache);
+        return;
+    }
+    if cache.seen_count + 1 != visible_count {
+        cache.disabled = true;
+        cache_map.insert(cache_key, cache);
+        return;
+    }
+
+    cache.seen_count = visible_count;
+    match cache.by_state_mask.get_mut(&state_mask) {
+        Some(state) => merge(state, new_state),
+        None => {
+            cache.by_state_mask.insert(state_mask, new_state);
+        }
+    }
+
+    cache_map.insert(cache_key, cache);
+}
+
 fn get_cached_widened_member_assignment_type(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -1533,12 +1589,15 @@ fn get_cached_widened_member_assignment_type(
     let visible_count = member_index.visible_member_count_for_owner_key(&owner, &key);
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
 
-    let Some(cache) = analyzer.member_assignment_widening_cache.get(&cache_key) else {
-        return (visible_count == 1).then_some(None);
+    let cache = match lookup_widening_cache(
+        &analyzer.member_assignment_widening_cache,
+        &cache_key,
+        visible_count,
+    ) {
+        WideningCacheLookup::FirstSighting => return Some(None),
+        WideningCacheLookup::Fallback => return None,
+        WideningCacheLookup::Hit(cache) => cache,
     };
-    if cache.disabled || cache.seen_count + 1 != visible_count {
-        return None;
-    }
 
     let current_state_mask = member_assignment_state_mask(analyzer, *member_id);
     let compatible_states = cache
@@ -1646,69 +1705,47 @@ fn record_member_assignment_widening_cache(
     let (class_bootstrap_type, class_bootstrap_compatible) =
         class_bootstrap_cache_state(assigned_type);
 
-    let mut cache = analyzer
-        .member_assignment_widening_cache
-        .remove(&cache_key)
-        .unwrap_or_default();
-    if cache.disabled {
-        analyzer
-            .member_assignment_widening_cache
-            .insert(cache_key, cache);
-        return;
-    }
-    if visible_count != cache.seen_count + 1 {
-        cache.disabled = true;
-        analyzer
-            .member_assignment_widening_cache
-            .insert(cache_key, cache);
-        return;
-    }
-
-    cache.seen_count = visible_count;
-    match cache.by_state_mask.get_mut(&state_mask) {
-        Some(state) => {
+    let new_state = MemberAssignmentWideningState {
+        no_table_literal_widen_type,
+        table_literal_widen_type,
+        doc_type,
+        all_table_assignment_merge_types,
+        class_bootstrap_type,
+        class_bootstrap_compatible,
+    };
+    let db = &*analyzer.db;
+    record_widening_cache(
+        &mut analyzer.member_assignment_widening_cache,
+        cache_key,
+        visible_count,
+        state_mask,
+        new_state,
+        |state, new_state| {
             state.no_table_literal_widen_type = TypeOps::Union.apply(
-                analyzer.db,
+                db,
                 &state.no_table_literal_widen_type,
-                &no_table_literal_widen_type,
+                &new_state.no_table_literal_widen_type,
             );
             state.table_literal_widen_type = TypeOps::Union.apply(
-                analyzer.db,
+                db,
                 &state.table_literal_widen_type,
-                &table_literal_widen_type,
+                &new_state.table_literal_widen_type,
             );
-            if let Some(doc_type) = doc_type {
+            if let Some(doc_type) = new_state.doc_type {
                 state.doc_type = Some(match state.doc_type.take() {
-                    Some(current) => TypeOps::Union.apply(analyzer.db, &current, &doc_type),
+                    Some(current) => TypeOps::Union.apply(db, &current, &doc_type),
                     None => doc_type,
                 });
             }
-            state.all_table_assignment_merge_types &= all_table_assignment_merge_types;
+            state.all_table_assignment_merge_types &= new_state.all_table_assignment_merge_types;
             merge_class_bootstrap_cache_state(
                 state,
                 assigned_type,
-                class_bootstrap_type,
-                class_bootstrap_compatible,
+                new_state.class_bootstrap_type,
+                new_state.class_bootstrap_compatible,
             );
-        }
-        None => {
-            cache.by_state_mask.insert(
-                state_mask,
-                MemberAssignmentWideningState {
-                    no_table_literal_widen_type,
-                    table_literal_widen_type,
-                    doc_type,
-                    all_table_assignment_merge_types,
-                    class_bootstrap_type,
-                    class_bootstrap_compatible,
-                },
-            );
-        }
-    }
-
-    analyzer
-        .member_assignment_widening_cache
-        .insert(cache_key, cache);
+        },
+    );
 }
 
 fn class_bootstrap_cache_state(typ: &LuaType) -> (Option<LuaType>, bool) {
@@ -1927,15 +1964,15 @@ fn get_cached_widened_member_collection_assignment_type(
         key: key.clone(),
     };
 
-    let Some(cache) = analyzer
-        .member_collection_assignment_widening_cache
-        .get(&cache_key)
-    else {
-        return (visible_count == 1).then_some(None);
+    let cache = match lookup_widening_cache(
+        &analyzer.member_collection_assignment_widening_cache,
+        &cache_key,
+        visible_count,
+    ) {
+        WideningCacheLookup::FirstSighting => return Some(None),
+        WideningCacheLookup::Fallback => return None,
+        WideningCacheLookup::Hit(cache) => cache,
     };
-    if cache.disabled || cache.seen_count + 1 != visible_count {
-        return None;
-    }
 
     let current_state_mask = member_assignment_state_mask(analyzer, member_id);
     let mut widened_base = incoming_base;
@@ -1984,38 +2021,18 @@ fn record_member_collection_assignment_widening_cache(
     let state_mask = member_assignment_state_mask(analyzer, *member_id);
     let cache_key = MemberAssignmentWideningCacheKey { owner, key };
 
-    let mut cache = analyzer
-        .member_collection_assignment_widening_cache
-        .remove(&cache_key)
-        .unwrap_or_default();
-    if cache.disabled {
-        analyzer
-            .member_collection_assignment_widening_cache
-            .insert(cache_key, cache);
-        return;
-    }
-    if visible_count != cache.seen_count + 1 {
-        cache.disabled = true;
-        analyzer
-            .member_collection_assignment_widening_cache
-            .insert(cache_key, cache);
-        return;
-    }
-
     let assigned_base = crate::widen_literal_type_for_assignment(assigned_array.get_base());
-    cache.seen_count = visible_count;
-    match cache.by_state_mask.get_mut(&state_mask) {
-        Some(base_type) => {
-            *base_type = TypeOps::Union.apply(analyzer.db, base_type, &assigned_base);
-        }
-        None => {
-            cache.by_state_mask.insert(state_mask, assigned_base);
-        }
-    }
-
-    analyzer
-        .member_collection_assignment_widening_cache
-        .insert(cache_key, cache);
+    let db = &*analyzer.db;
+    record_widening_cache(
+        &mut analyzer.member_collection_assignment_widening_cache,
+        cache_key,
+        visible_count,
+        state_mask,
+        assigned_base,
+        |base_type, assigned_base| {
+            *base_type = TypeOps::Union.apply(db, base_type, &assigned_base);
+        },
+    );
 }
 
 fn guarded_table_assignment_member_ids_for_owner_key(

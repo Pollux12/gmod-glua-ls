@@ -1478,6 +1478,79 @@ mod test {
     }
 
     #[gtest]
+    fn phase_f0_documents_current_multifile_member_write_order_preserves_union() {
+        let base_source = r#"
+        ---@class Entity
+        ---@class Player: Entity
+        ---@class Ragdoll: Entity
+
+        ---@class SWEP
+        SWEP = {}
+        "#;
+        let set_body_source = r#"
+        ---@param body Ragdoll
+        function SWEP:SetBody(body)
+            self.Target = body
+        end
+        "#;
+        let set_player_source = r#"
+        ---@param ply Player
+        function SWEP:SetPlayer(ply)
+            self.Target = ply
+        end
+        "#;
+        let consumer_source = r#"
+        ---@type SWEP
+        local obj
+        A = obj.Target
+        "#;
+
+        let mut body_then_player_ws = VirtualWorkspace::new();
+        body_then_player_ws.def_file("lua/weapons/test/shared.lua", base_source);
+        body_then_player_ws.def_file("lua/weapons/test/body.lua", set_body_source);
+        body_then_player_ws.def_file("lua/weapons/test/player.lua", set_player_source);
+        body_then_player_ws.def_file("lua/weapons/test/consumer.lua", consumer_source);
+        let body_then_player_ty = body_then_player_ws.expr_ty("A");
+        assert_eq!(
+            body_then_player_ws.humanize_type(body_then_player_ty),
+            "(Player|Ragdoll)"
+        );
+
+        let mut player_then_body_ws = VirtualWorkspace::new();
+        player_then_body_ws.def_file("lua/weapons/test/shared.lua", base_source);
+        player_then_body_ws.def_file("lua/weapons/test/player.lua", set_player_source);
+        player_then_body_ws.def_file("lua/weapons/test/body.lua", set_body_source);
+        player_then_body_ws.def_file("lua/weapons/test/consumer.lua", consumer_source);
+        let player_then_body_ty = player_then_body_ws.expr_ty("A");
+        assert_eq!(
+            player_then_body_ws.humanize_type(player_then_body_ty),
+            "(Player|Ragdoll)"
+        );
+    }
+
+    #[gtest]
+    fn phase_f0_documents_current_member_write_truth_survives_touch_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/weapons/test/shared.lua";
+        let source = defib_like_write_policy_source("self.Target = body or ply");
+        let file_id = ws.def_file(path, &source);
+
+        let baseline_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(baseline_ty), "(Player|Ragdoll)?");
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let post_touch_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(post_touch_ty), "(Player|Ragdoll)?");
+
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+    }
+
+    #[gtest]
     fn phase_c0_member_or_write_chained_rhs_uses_all_arms() {
         let mut ws = VirtualWorkspace::new();
         ws.def(&defib_like_target_source(
@@ -1604,6 +1677,59 @@ mod test {
                 ---@param b ClientB
                 function SWEP:SetClient(a, b)
                     self.Target = a or b
+                end
+
+                ClientRead = SWEP.Target
+            end
+            "#,
+        );
+
+        let server_ty = ws.expr_ty("ServerRead");
+        let client_ty = ws.expr_ty("ClientRead");
+        assert_eq!(ws.humanize_type(server_ty), "(ServerA|ServerB)");
+        assert_eq!(ws.humanize_type(client_ty), "(ClientA|ClientB)");
+    }
+
+    #[gtest]
+    fn assignment_widening_cache_respects_realm_split_state_masks() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/weapons/test/shared.lua",
+            r#"
+            ---@class ServerA
+            ---@class ServerB
+            ---@class ClientA
+            ---@class ClientB
+
+            SWEP = {}
+
+            if SERVER then
+                ---@param value ServerA
+                function SWEP:SetServerA(value)
+                    self.Target = value
+                end
+
+                ---@param value ServerB
+                function SWEP:SetServerB(value)
+                    self.Target = value
+                end
+
+                ServerRead = SWEP.Target
+            end
+
+            if CLIENT then
+                ---@param value ClientA
+                function SWEP:SetClientA(value)
+                    self.Target = value
+                end
+
+                ---@param value ClientB
+                function SWEP:SetClientB(value)
+                    self.Target = value
                 end
 
                 ClientRead = SWEP.Target
