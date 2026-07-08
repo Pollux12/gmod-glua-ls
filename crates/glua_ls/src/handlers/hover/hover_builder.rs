@@ -14,6 +14,12 @@ use crate::handlers::hover::humanize_types::{
 use super::build_hover::{add_signature_param_description, add_signature_ret_description};
 use super::realm_badge::{badge_header_markdown, badge_markdown};
 
+const INFER_HOVER_PREFIX: &str = "(infer) ";
+
+pub(super) fn inferred_hover_type_text(type_text: String) -> String {
+    format!("{INFER_HOVER_PREFIX}{type_text}")
+}
+
 #[derive(Debug)]
 pub struct HoverBuilder<'a> {
     /// Type description, does not include overload
@@ -101,7 +107,7 @@ impl<'a> HoverBuilder<'a> {
 
     pub fn format_inferred_hover_type_text(&self, type_text: String) -> String {
         if self.label_inferred_type {
-            format!("(infer) {type_text}")
+            inferred_hover_type_text(type_text)
         } else {
             type_text
         }

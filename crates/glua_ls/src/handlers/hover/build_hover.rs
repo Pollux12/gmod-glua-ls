@@ -25,7 +25,7 @@ use crate::handlers::hover::humanize_types::hover_humanize_type;
 use super::{
     color_swatch::color_swatch_markdown,
     find_origin::{find_decl_origin_owners, find_member_origin_owners},
-    hover_builder::HoverBuilder,
+    hover_builder::{HoverBuilder, inferred_hover_type_text},
     humanize_types::hover_const_type,
 };
 
@@ -136,10 +136,6 @@ fn build_hover_without_property(
         }),
         range: document.to_lsp_range(token.text_range()),
     })
-}
-
-fn inferred_hover_type_text(type_text: String) -> String {
-    format!("(infer) {type_text}")
 }
 
 fn contextual_inferred_hover(db: &DbIndex, typ: &LuaType, render_level: RenderLevel) -> String {

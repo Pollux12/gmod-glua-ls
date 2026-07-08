@@ -1,6 +1,6 @@
 use glua_code_analysis::{
     DbIndex, DocSyntax, Emmyrc, FileId, LuaMemberId, LuaMemberKey, LuaType, LuaTypeDeclId,
-    SemanticInfo, SemanticInfoOrigin, WorkspaceId, get_member_map,
+    SemanticInfo, WorkspaceId, get_member_map,
 };
 use glua_parser::{
     LuaAst, LuaAstNode, LuaComment, LuaDocDescription, LuaDocTag, LuaLocalName, LuaSyntaxToken,
@@ -88,11 +88,10 @@ pub fn resolve_ref(
     // Try resolving in comment's owner. I.e. documentation for a class
     // can refer to class members without prefixing them by class name.
     if let Some(scope) = find_comment_scope(db, file_id, desc) {
-        let scopes = vec![SemanticInfo {
-            typ: LuaType::Ref(scope.clone()),
-            semantic_decl: Some(scope.into()),
-            origin: SemanticInfoOrigin::Actual,
-        }];
+        let scopes = vec![SemanticInfo::actual(
+            LuaType::Ref(scope.clone()),
+            Some(scope.into()),
+        )];
         if let Some(found_refs) = find_members(db, scopes, path) {
             result.extend(found_refs);
         }
@@ -129,11 +128,10 @@ pub fn resolve_ref(
             .join(".");
 
         if let Some(found) = db.get_type_index().find_type_decl(file_id, &name) {
-            let scopes = vec![SemanticInfo {
-                typ: LuaType::Ref(found.get_id()),
-                semantic_decl: Some(found.get_id().into()),
-                origin: SemanticInfoOrigin::Actual,
-            }];
+            let scopes = vec![SemanticInfo::actual(
+                LuaType::Ref(found.get_id()),
+                Some(found.get_id().into()),
+            )];
             if let Some(found_refs) = find_members(db, scopes, &path[i..]) {
                 seen_types.extend(found_refs.iter().filter_map(|item| match &item.typ {
                     LuaType::Ref(id) => Some(LuaType::Def(id.clone())),
@@ -143,11 +141,10 @@ pub fn resolve_ref(
             }
         }
         if let Some(found) = db.get_module_index().find_module(&name) {
-            let scopes = vec![SemanticInfo {
-                typ: found.export_type.clone().unwrap_or(LuaType::Nil),
-                semantic_decl: found.semantic_id.clone(),
-                origin: SemanticInfoOrigin::Actual,
-            }];
+            let scopes = vec![SemanticInfo::actual(
+                found.export_type.clone().unwrap_or(LuaType::Nil),
+                found.semantic_id.clone(),
+            )];
             if let Some(found_refs) = find_members(db, scopes, &path[i..]) {
                 result.extend(
                     found_refs
@@ -160,11 +157,10 @@ pub fn resolve_ref(
 
     // Find in current module.
     if let Some(module) = db.get_module_index().get_module(file_id) {
-        let scopes = vec![SemanticInfo {
-            typ: module.export_type.clone().unwrap_or(LuaType::Nil),
-            semantic_decl: module.semantic_id.clone(),
-            origin: SemanticInfoOrigin::Actual,
-        }];
+        let scopes = vec![SemanticInfo::actual(
+            module.export_type.clone().unwrap_or(LuaType::Nil),
+            module.semantic_id.clone(),
+        )];
         if let Some(found_refs) = find_members(db, scopes, path) {
             result.extend(
                 found_refs
@@ -181,15 +177,13 @@ pub fn resolve_ref(
         let scopes = globals
             .iter()
             .filter_map(|&global| {
-                Some(SemanticInfo {
-                    typ: db
-                        .get_type_index()
+                Some(SemanticInfo::actual(
+                    db.get_type_index()
                         .get_type_cache(&global.into())?
                         .as_type()
                         .clone(),
-                    semantic_decl: Some(global.into()),
-                    origin: SemanticInfoOrigin::Actual,
-                })
+                    Some(global.into()),
+                ))
             })
             .collect();
         if let Some(found_refs) = find_members(db, scopes, &path[1..]) {
@@ -270,10 +264,8 @@ fn find_members(
                 .as_ref()
                 .and_then(|members| members.get(&member_key))
             {
-                new_scopes.extend(found_members.iter().map(|member| SemanticInfo {
-                    typ: member.typ.clone(),
-                    semantic_decl: member.property_owner_id.clone(),
-                    origin: SemanticInfoOrigin::Actual,
+                new_scopes.extend(found_members.iter().map(|member| {
+                    SemanticInfo::actual(member.typ.clone(), member.property_owner_id.clone())
                 }))
             }
         }

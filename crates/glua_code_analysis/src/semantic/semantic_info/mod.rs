@@ -27,6 +27,17 @@ pub struct SemanticInfo {
     pub origin: SemanticInfoOrigin,
 }
 
+impl SemanticInfo {
+    pub fn actual(typ: LuaType, semantic_decl: Option<LuaSemanticDeclId>) -> Self {
+        let origin = SemanticInfoOrigin::Actual;
+        Self {
+            typ,
+            semantic_decl,
+            origin,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SemanticInfoOrigin {
     Actual,
@@ -56,11 +67,10 @@ pub fn infer_token_semantic_info(
                 token.text_range().start(),
             )
             .unwrap_or(typ);
-            Some(SemanticInfo {
+            Some(SemanticInfo::actual(
                 typ,
-                semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
-                origin: SemanticInfoOrigin::Actual,
-            })
+                Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+            ))
         }
         LuaSyntaxKind::ParamName => {
             let file_id = cache.get_file_id();
@@ -70,11 +80,10 @@ pub fn infer_token_semantic_info(
                 LuaDeclExtra::Param { .. } => {
                     let typ = infer_param_with_cache(db, cache, decl).ok()?;
 
-                    Some(SemanticInfo {
+                    Some(SemanticInfo::actual(
                         typ,
-                        semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
-                        origin: SemanticInfoOrigin::Actual,
-                    })
+                        Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+                    ))
                 }
                 _ => None,
             }
@@ -125,11 +134,10 @@ pub fn infer_node_semantic_info(
                 .get_type_index()
                 .get_type_cache(&member_id.into())
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
-            Some(SemanticInfo {
-                typ: type_cache.as_type().clone(),
-                semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
-                origin: SemanticInfoOrigin::Actual,
-            })
+            Some(SemanticInfo::actual(
+                type_cache.as_type().clone(),
+                Some(LuaSemanticDeclId::Member(member_id)),
+            ))
         }
         name_type if LuaDocNameType::can_cast(name_type.kind().into()) => {
             let name_type = LuaDocNameType::cast(name_type)?;
@@ -137,11 +145,10 @@ pub fn infer_node_semantic_info(
             let type_decl = db
                 .get_type_index()
                 .find_type_decl(cache.get_file_id(), &name)?;
-            Some(SemanticInfo {
-                typ: LuaType::Ref(type_decl.get_id()),
-                semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
-                origin: SemanticInfoOrigin::Actual,
-            })
+            Some(SemanticInfo::actual(
+                LuaType::Ref(type_decl.get_id()),
+                LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+            ))
         }
         tags if LuaDocTag::can_cast(tags.kind().into()) => {
             let tag = LuaDocTag::cast(tags)?;
@@ -161,11 +168,10 @@ pub fn infer_node_semantic_info(
                         .get_type_index()
                         .get_type_cache(&member_id.into())
                         .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
-                    Some(SemanticInfo {
-                        typ: type_cache.as_type().clone(),
-                        semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
-                        origin: SemanticInfoOrigin::Actual,
-                    })
+                    Some(SemanticInfo::actual(
+                        type_cache.as_type().clone(),
+                        Some(LuaSemanticDeclId::Member(member_id)),
+                    ))
                 }
                 _ => None,
             }
@@ -178,11 +184,10 @@ fn type_def_tag_info(name: &str, db: &DbIndex, cache: &mut LuaInferCache) -> Opt
     let type_decl = db
         .get_type_index()
         .find_type_decl(cache.get_file_id(), name)?;
-    Some(SemanticInfo {
-        typ: LuaType::Ref(type_decl.get_id()),
-        semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
-        origin: SemanticInfoOrigin::Actual,
-    })
+    Some(SemanticInfo::actual(
+        LuaType::Ref(type_decl.get_id()),
+        LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+    ))
 }
 
 pub fn infer_token_semantic_decl(
