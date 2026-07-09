@@ -3626,6 +3626,218 @@ mod test {
     }
 
     #[test]
+    fn test_direct_subtype_member_in_incompatible_realm_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeDirect.Base
+                local Base = {}
+
+                ---@class RealmSubtypeDirect.ClientChild : RealmSubtypeDirect.Base
+                local ClientChild = {}
+
+                ---@realm client
+                function ClientChild:ClientOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeDirect.Base
+                local ent = nil
+                ent:ClientOnly()
+            "#,
+        );
+
+        let subtype_only = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert!(subtype_only.is_empty(), "{subtype_only:?}");
+
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedField,
+        );
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+    }
+
+    #[test]
+    fn test_transitive_subtype_member_in_incompatible_realm_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_transitive_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeTransitive.Base
+                local Base = {}
+
+                ---@class RealmSubtypeTransitive.Middle : RealmSubtypeTransitive.Base
+                local Middle = {}
+
+                ---@class RealmSubtypeTransitive.ClientLeaf : RealmSubtypeTransitive.Middle
+                local ClientLeaf = {}
+
+                ---@realm client
+                function ClientLeaf:ClientOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_transitive_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeTransitive.Base
+                local ent = nil
+                ent:ClientOnly()
+            "#,
+        );
+
+        let subtype_only = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert!(subtype_only.is_empty(), "{subtype_only:?}");
+
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedField,
+        );
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+    }
+
+    #[test]
+    fn test_direct_subtype_member_in_compatible_realm_reports_subtype_only_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_compatible_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeCompatible.Base
+                local Base = {}
+
+                ---@class RealmSubtypeCompatible.ClientChild : RealmSubtypeCompatible.Base
+                local ClientChild = {}
+
+                ---@realm client
+                function ClientChild:ClientOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_compatible_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeCompatible.Base
+                local ent = nil
+                ent:ClientOnly()
+            "#,
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("`ClientChild`"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
+    fn test_direct_subtype_candidates_are_sorted_after_realm_filtering() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_sorted_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeSorted.Base
+                local Base = {}
+
+                ---@class RealmSubtypeSorted.Charlie : RealmSubtypeSorted.Base
+                local Charlie = {}
+                ---@realm client
+                function Charlie:VisibleOnly() end
+
+                ---@class RealmSubtypeSorted.Bravo : RealmSubtypeSorted.Base
+                local Bravo = {}
+                ---@realm server
+                function Bravo:VisibleOnly() end
+
+                ---@class RealmSubtypeSorted.Alpha : RealmSubtypeSorted.Base
+                local Alpha = {}
+                ---@realm client
+                function Alpha:VisibleOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_sorted_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeSorted.Base
+                local ent = nil
+                ent:VisibleOnly()
+            "#,
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let message = &diagnostics[0].message;
+        let alpha = message.find("`Alpha`").expect(message);
+        let charlie = message.find("`Charlie`").expect(message);
+        assert!(alpha < charlie, "{message}");
+        assert!(!message.contains("`Bravo`"), "{message}");
+    }
+
+    #[test]
+    fn test_menu_caller_sees_client_subtype_member() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_menu_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeMenu.Base
+                local Base = {}
+
+                ---@class RealmSubtypeMenu.ClientChild : RealmSubtypeMenu.Base
+                local ClientChild = {}
+
+                ---@realm client
+                function ClientChild:ClientOrMenuOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/menu/menu_subtype_realms.lua",
+            r#"
+                ---@realm menu
+                ---@type RealmSubtypeMenu.Base
+                local ent = nil
+                ent:ClientOrMenuOnly()
+            "#,
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert!(
+            diagnostics[0].message.contains("`ClientChild`"),
+            "{}",
+            diagnostics[0].message
+        );
+    }
+
+    #[test]
     fn test_field_on_deep_subclass_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);

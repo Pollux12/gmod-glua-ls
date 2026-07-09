@@ -13,8 +13,8 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel,
-    check_type_compact, enum_variable_is_param, get_keyof_members,
+    LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
+    enum_variable_is_param, get_keyof_members,
     semantic::{
         infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
         resolve_decl_backed_global_path_member_type,
@@ -24,86 +24,10 @@ use crate::{
 use super::{
     AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
     is_initialized_assignment_access, is_initialized_assignment_prefix,
+    subtype_member::{PrecomputedSubtypeMembers, precompute_subtype_members, query_subtype_member},
 };
 
 pub struct CheckFieldChecker;
-
-pub fn precompute_subtype_fields(
-    db: &DbIndex,
-) -> (
-    HashMap<LuaTypeDeclId, HashMap<SmolStr, Arc<Vec<SmolStr>>>>,
-    HashMap<LuaTypeDeclId, HashSet<SmolStr>>,
-) {
-    if !db.get_emmyrc().gmod.enabled {
-        return (HashMap::new(), HashMap::new());
-    }
-
-    let mut direct_subtype_fields: HashMap<LuaTypeDeclId, HashMap<SmolStr, HashSet<SmolStr>>> =
-        HashMap::new();
-    let mut transitive_subtype_fields: HashMap<LuaTypeDeclId, HashSet<SmolStr>> = HashMap::new();
-    let type_index = db.get_type_index();
-    let member_index = db.get_member_index();
-
-    for type_decl in type_index.get_all_types() {
-        let type_id = type_decl.get_id();
-        let owner = LuaMemberOwner::Type(type_id.clone());
-        let Some(members) = member_index.get_members(&owner) else {
-            continue;
-        };
-
-        let member_names = members
-            .iter()
-            .filter_map(|member| match member.get_key() {
-                LuaMemberKey::Name(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if member_names.is_empty() {
-            continue;
-        }
-
-        let mut super_types = Vec::new();
-        type_id.collect_super_types(db, &mut super_types);
-        for super_type in super_types {
-            if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                transitive_subtype_fields
-                    .entry(super_id)
-                    .or_default()
-                    .extend(member_names.iter().cloned());
-            }
-        }
-
-        if let Some(super_types) = type_index.get_super_types_iter(&type_id) {
-            for super_type in super_types {
-                if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                    let fields = direct_subtype_fields.entry(super_id.clone()).or_default();
-                    for member_name in &member_names {
-                        fields
-                            .entry(member_name.clone())
-                            .or_default()
-                            .insert(SmolStr::new(type_decl.get_name()));
-                    }
-                }
-            }
-        }
-    }
-
-    let direct_subtype_fields = direct_subtype_fields
-        .into_iter()
-        .map(|(type_id, fields)| {
-            let fields = fields
-                .into_iter()
-                .map(|(field_name, child_names)| {
-                    let mut child_names = child_names.into_iter().collect::<Vec<_>>();
-                    child_names.sort();
-                    (field_name, Arc::new(child_names))
-                })
-                .collect();
-            (type_id, fields)
-        })
-        .collect();
-    (direct_subtype_fields, transitive_subtype_fields)
-}
 
 impl Checker for CheckFieldChecker {
     const CODES: &[DiagnosticCode] = &[
@@ -116,6 +40,10 @@ impl Checker for CheckFieldChecker {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let subtype_members = context
+            .get_shared_data_arc()
+            .map(|shared_data| shared_data.subtype_members.clone())
+            .unwrap_or_else(|| Arc::new(precompute_subtype_members(semantic_model.get_db())));
         let initialized_assignment_accesses =
             if has_reusable_table_literal_assignment(&assignment_prefixes) {
                 collect_initialized_assignment_accesses(&root, &assignment_prefixes)
@@ -153,6 +81,7 @@ impl Checker for CheckFieldChecker {
                                 semantic_model,
                                 index_expr,
                                 DiagnosticCode::InjectField,
+                                &subtype_members,
                                 &mut state,
                                 profile.as_mut(),
                             );
@@ -170,6 +99,7 @@ impl Checker for CheckFieldChecker {
                             semantic_model,
                             &index_expr,
                             DiagnosticCode::InjectField,
+                            &subtype_members,
                             &mut state,
                             profile.as_mut(),
                         );
@@ -196,6 +126,7 @@ impl Checker for CheckFieldChecker {
                         semantic_model,
                         &index_expr,
                         DiagnosticCode::UndefinedField,
+                        &subtype_members,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -307,6 +238,7 @@ fn check_index_expr(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
+    subtype_members: &PrecomputedSubtypeMembers,
     state: &mut CheckFieldState,
     mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
@@ -442,12 +374,21 @@ fn check_index_expr(
         DiagnosticCode::UndefinedField => {
             // This advisory is emitted from the undefined-field pass: disabling
             // `undefined-field` also disables subtype-only member diagnostics.
-            let candidates = if context.is_checker_enable_by_code(&DiagnosticCode::UndefinedField) {
-                direct_subtype_field_candidates(context, db, &prefix_typ, &field_name)
-            } else {
-                Vec::new()
-            };
-            if !candidates.is_empty() {
+            let subtype_member =
+                if context.is_checker_enable_by_code(&DiagnosticCode::UndefinedField) {
+                    let key = LuaMemberKey::Name(field_name.clone());
+                    query_subtype_member(
+                        db,
+                        subtype_members,
+                        &prefix_typ,
+                        &key,
+                        context.get_file_id(),
+                        index_expr.get_position(),
+                    )
+                } else {
+                    Default::default()
+                };
+            if !subtype_member.direct_candidates.is_empty() {
                 if let Some(profile) = profile.as_mut() {
                     profile.subtype_advisories_emitted += 1;
                     profile.diagnostics_emitted += 1;
@@ -455,7 +396,12 @@ fn check_index_expr(
                 context.add_diagnostic(
                     DiagnosticCode::GmodMemberOnSubtypeOnly,
                     index_key.get_range()?,
-                    subtype_only_member_message(db, &prefix_typ, &field_name, &candidates),
+                    subtype_only_member_message(
+                        db,
+                        &prefix_typ,
+                        &field_name,
+                        &subtype_member.direct_candidates,
+                    ),
                     None,
                 );
                 return Some(());
@@ -464,7 +410,7 @@ fn check_index_expr(
             // deeper/transitive subtype hits stay silent for baseline parity and
             // open-world inheritance trees such as VGUI panels. Only a full subtype
             // closure miss falls through to ordinary `UndefinedField`.
-            if transitive_subtype_has_field(context, db, &prefix_typ, &field_name) {
+            if subtype_member.has_transitive_hit {
                 return Some(());
             }
             if let Some(profile) = profile.as_mut() {
@@ -1067,7 +1013,7 @@ fn check_enum_self_reference(
         && let Some(decl) = semantic_model.get_db().get_type_index().get_type_decl(id)
         && decl.is_enum()
         && key_types.iter().any(|typ| match typ {
-            LuaType::Ref(key_id) | LuaType::Def(key_id) => *id == *key_id,
+            LuaType::Ref(key_id) | LuaType::Def(key_id) => id == key_id,
             _ => false,
         })
     {
@@ -2230,102 +2176,6 @@ fn owner_has_named_dynamic_fields(
     index
         .get_fields(owner)
         .is_some_and(|fields| !fields.is_empty())
-}
-
-fn direct_subtype_field_candidates(
-    context: &DiagnosticContext,
-    db: &DbIndex,
-    prefix_typ: &LuaType,
-    field_name: &SmolStr,
-) -> Vec<SmolStr> {
-    if !db.get_emmyrc().gmod.enabled {
-        return Vec::new();
-    }
-
-    let type_id = match prefix_typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id,
-        LuaType::TableOf(inner) => {
-            return direct_subtype_field_candidates(context, db, inner, field_name);
-        }
-        LuaType::Union(union) => {
-            let mut candidates = union
-                .types()
-                .filter(|t| !t.is_nil())
-                .flat_map(|t| direct_subtype_field_candidates(context, db, t, field_name))
-                .collect::<Vec<_>>();
-            candidates.sort();
-            candidates.dedup();
-            return candidates;
-        }
-        _ => return Vec::new(),
-    };
-
-    if let Some(shared_data) = context.get_shared_data_arc() {
-        return shared_data
-            .direct_subtype_fields
-            .get(type_id)
-            .and_then(|fields| fields.get(field_name))
-            .map(|candidates| candidates.as_ref().clone())
-            .unwrap_or_default();
-    }
-
-    let sub_types = db.get_type_index().get_sub_types(type_id);
-    let key = LuaMemberKey::Name(field_name.clone());
-    let mut candidates = Vec::new();
-    for sub_decl in sub_types {
-        let owner = LuaMemberOwner::Type(sub_decl.get_id());
-        if db
-            .get_member_index()
-            .get_member_item(&owner, &key)
-            .is_some()
-        {
-            candidates.push(SmolStr::new(sub_decl.get_name()));
-        }
-    }
-    candidates.sort();
-    candidates.dedup();
-    candidates
-}
-
-fn transitive_subtype_has_field(
-    context: &DiagnosticContext,
-    db: &DbIndex,
-    prefix_typ: &LuaType,
-    field_name: &SmolStr,
-) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
-        return false;
-    }
-
-    let type_id = match prefix_typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id,
-        LuaType::TableOf(inner) => {
-            return transitive_subtype_has_field(context, db, inner, field_name);
-        }
-        LuaType::Union(union) => {
-            return union
-                .types()
-                .filter(|t| !t.is_nil())
-                .any(|t| transitive_subtype_has_field(context, db, t, field_name));
-        }
-        _ => return false,
-    };
-
-    if let Some(shared_data) = context.get_shared_data_arc() {
-        return shared_data
-            .transitive_subtype_fields
-            .get(type_id)
-            .is_some_and(|fields| fields.contains(field_name));
-    }
-
-    let sub_types = db.get_type_index().get_all_sub_types(type_id);
-    let key = LuaMemberKey::Name(field_name.clone());
-    sub_types.into_iter().any(|sub_decl| {
-        let owner = LuaMemberOwner::Type(sub_decl.get_id());
-        db.get_member_index()
-            .get_member_item(&owner, &key)
-            .is_some()
-    })
 }
 
 fn subtype_only_member_message(
