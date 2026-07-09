@@ -23,7 +23,7 @@ mod signature;
 mod traits;
 mod r#type;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
 use crate::{Emmyrc, FileId, Vfs};
 pub use accessor_func::*;
@@ -195,6 +195,78 @@ impl DbIndex {
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
         &mut self.types_index
+    }
+
+    pub fn get_inference_fact(&self, node: &LuaInferenceNodeId) -> Option<LuaTypeFact> {
+        match node {
+            LuaInferenceNodeId::TypeOwner(owner) => self.types_index.get_type_fact(owner),
+            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id)) => self
+                .types_index
+                .get_type_fact(&LuaTypeOwner::Decl(*decl_id)),
+            LuaInferenceNodeId::Definition(definition) => {
+                self.types_index.get_definition_fact(definition).cloned()
+            }
+            LuaInferenceNodeId::SignatureParam { .. } => None,
+        }
+    }
+
+    pub fn publish_inference_facts(
+        &mut self,
+        mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
+    ) -> HashSet<FileId> {
+        updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
+
+        let mut conflicting_nodes = HashSet::new();
+        for pair in updates.windows(2) {
+            let [(left_node, left_fact), (right_node, right_fact)] = pair else {
+                unreachable!();
+            };
+            if left_node == right_node && left_fact != right_fact {
+                conflicting_nodes.insert(left_node.clone());
+            }
+        }
+
+        let mut changed_files = HashSet::new();
+        let mut previous_node = None;
+        for (node, fact) in updates {
+            if conflicting_nodes.contains(&node) || previous_node.as_ref() == Some(&node) {
+                continue;
+            }
+            previous_node = Some(node.clone());
+            if self.get_inference_fact(&node).as_ref() == Some(&fact) {
+                continue;
+            }
+
+            match node {
+                LuaInferenceNodeId::TypeOwner(owner) => {
+                    let file_id = self.types_index.force_bind_type_fact_unchecked(
+                        owner,
+                        LuaTypeCache::InferType(fact.typ().clone()),
+                        LuaTypeFactMetadata::from_fact(&fact),
+                    );
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id)) => {
+                    let file_id = self.types_index.force_bind_type_fact_unchecked(
+                        LuaTypeOwner::Decl(decl_id),
+                        LuaTypeCache::InferType(fact.typ().clone()),
+                        LuaTypeFactMetadata::from_fact(&fact),
+                    );
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::Definition(definition) => {
+                    let file_id = self
+                        .types_index
+                        .bind_definition_fact_unchecked(definition, fact);
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::SignatureParam { .. } => {}
+            }
+        }
+
+        self.types_index
+            .rebuild_inference_derived_state(&changed_files);
+        changed_files
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
