@@ -1776,7 +1776,7 @@ local EscapeStringMap: {
                 util.TraceHull({ start = sp<??>os })
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal spos: (infer) HoverExpected.Vector\n```".to_string(),
+                value: "```lua\n(infer) local spos: HoverExpected.Vector\n```".to_string(),
             },
         ));
 
@@ -1803,7 +1803,7 @@ local EscapeStringMap: {
                 accepts_callback(callba<??>ck)
             "#,
             VirtualHoverResult {
-                value: "```lua\nlocal callback: (infer) fun(ply: HoverExpectedFn.Player) -> boolean\n```".to_string(),
+                value: "```lua\n(infer) local callback: fun(ply: HoverExpectedFn.Player) -> boolean\n```".to_string(),
             },
         ));
 

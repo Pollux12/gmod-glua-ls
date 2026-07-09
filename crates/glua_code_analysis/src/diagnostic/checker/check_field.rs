@@ -13,8 +13,8 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticInfoOrigin,
-    SemanticModel, check_type_compact, enum_variable_is_param, get_keyof_members,
+    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel,
+    check_type_compact, enum_variable_is_param, get_keyof_members,
     semantic::{
         infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
         resolve_decl_backed_global_path_member_type,
@@ -871,9 +871,7 @@ fn is_valid_member_inner(
                     // should be reported. This is more targeted than checking for any
                     // non-Unknown type, which would suppress legitimate undefined-field
                     // diagnostics from condition narrowing.
-                    if matches!(info.origin, SemanticInfoOrigin::Actual)
-                        && matches!(info.typ, LuaType::Signature(_))
-                    {
+                    if matches!(info.actual_typ(), Some(LuaType::Signature(_))) {
                         need = false;
                     }
                 }

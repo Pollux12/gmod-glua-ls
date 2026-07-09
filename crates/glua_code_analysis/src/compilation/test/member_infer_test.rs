@@ -71,7 +71,7 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
     }
 
@@ -326,7 +326,7 @@ mod test {
                 LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -1951,7 +1951,10 @@ mod test {
                 let semantic_info = semantic_model
                     .get_semantic_info(index_expr.syntax().clone().into())
                     .expect("expected semantic info for assignment field");
-                assignment_types.push((index_expr.syntax().text().to_string(), semantic_info.typ));
+                assignment_types.push((
+                    index_expr.syntax().text().to_string(),
+                    semantic_info.display_typ().clone(),
+                ));
             }
         }
 
@@ -2026,7 +2029,7 @@ mod test {
                 {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -2040,7 +2043,7 @@ mod test {
                 LuaAst::LuaNameExpr(name_expr) if name_expr.syntax().text() == "FuelModule" => {
                     semantic_model
                         .get_semantic_info(name_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -2076,7 +2079,7 @@ mod test {
                 {
                     client_semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })

@@ -2361,7 +2361,7 @@ mod test {
                 let token = param_name.get_name_token()?;
                 semantic_model
                     .get_semantic_info(token.syntax().clone().into())
-                    .map(|info| info.typ)
+                    .map(|info| info.display_typ().clone())
             })
             .collect()
     }

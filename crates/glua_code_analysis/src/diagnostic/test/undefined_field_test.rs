@@ -69,8 +69,14 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
+    }
+
+    fn semantic_info_type_and_origin(
+        info: crate::semantic::SemanticInfo,
+    ) -> (LuaType, SemanticInfoOrigin) {
+        (info.display_typ().clone(), info.origin)
     }
 
     fn index_expr_type(
@@ -210,7 +216,7 @@ mod test {
 
                 (
                     ws.humanize_type(infer_type),
-                    ws.humanize_type(semantic_info.typ),
+                    ws.humanize_type(semantic_info.display_typ().clone()),
                     semantic_info.origin,
                 )
             })
@@ -380,16 +386,6 @@ mod test {
 
     #[test]
     fn semantic_info_exposes_actual_type_origin() {
-        fn assert_semantic_info_shape(info: crate::semantic::SemanticInfo) {
-            let crate::semantic::SemanticInfo {
-                typ,
-                semantic_decl,
-                origin,
-            } = info;
-            assert_eq!(origin, SemanticInfoOrigin::Actual);
-            let _ = (typ, semantic_decl);
-        }
-
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def("local value = 1");
         let semantic_model = ws
@@ -408,8 +404,50 @@ mod test {
         let info = semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info");
+        let (actual_type, origin) = semantic_info_type_and_origin(info);
 
-        assert_semantic_info_shape(info);
+        assert_eq!(origin, SemanticInfoOrigin::Actual);
+        assert_eq!(actual_type, LuaType::IntegerConst(1));
+        assert_eq!(ws.humanize_type(actual_type), "1");
+    }
+
+    #[test]
+    fn absent_field_read_without_context_semantic_info_is_actual_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class D1aAbsentFieldTable
+            local value = {}
+            local missing = value.absent
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == "value.absent")
+            .expect("expected absent field index expression");
+        let info = semantic_model
+            .get_semantic_info(index_expr.syntax().clone().into())
+            .expect("expected semantic info for absent field read");
+        let (actual_type, origin) = semantic_info_type_and_origin(info);
+
+        assert_eq!(origin, SemanticInfoOrigin::Actual);
+        assert_eq!(actual_type, LuaType::Nil);
+        assert_eq!(ws.humanize_type(actual_type), "nil");
+
+        let undefined_fields =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert!(
+            undefined_fields[0]
+                .message
+                .contains("Undefined field `absent`")
+        );
     }
 
     #[test]

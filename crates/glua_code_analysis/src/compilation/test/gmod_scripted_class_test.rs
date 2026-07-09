@@ -40,7 +40,7 @@ mod test {
                 LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -129,7 +129,7 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
     }
 
@@ -603,7 +603,7 @@ mod test {
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info for local PLUGIN name");
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("vehicles"))
         );
     }
@@ -684,7 +684,7 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("vehicles_money"))
         );
     }
@@ -873,7 +873,7 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_inventory"))
         );
     }
@@ -921,7 +921,7 @@ mod test {
             .expect("expected semantic info for self");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_inventory"))
         );
     }
@@ -1215,7 +1215,7 @@ mod test {
             .expect("expected semantic info for BaseClass");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("base_glide")),
             "expected BaseClass to resolve to base_glide"
         );
@@ -1286,7 +1286,7 @@ mod test {
             .expect("expected semantic info for BaseClass");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("base_panel")),
             "expected BaseClass to resolve to base_panel"
         );
@@ -1832,7 +1832,7 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_money"))
         );
     }
@@ -2836,7 +2836,7 @@ mod test {
 
                 let semantic_info =
                     semantic_model.get_semantic_info(token.syntax().clone().into())?;
-                Some((token.get_position(), semantic_info.typ))
+                Some((token.get_position(), semantic_info.display_typ().clone()))
             })
             .collect::<Vec<_>>();
         panel_local_types.sort_by_key(|(position, _)| *position);
@@ -3302,7 +3302,7 @@ mod test {
                     return None;
                 }
                 let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
-                match &info.typ {
+                match info.display_typ() {
                     LuaType::Def(id) => {
                         Some((name_expr.get_position(), id.get_simple_name().to_string()))
                     }
@@ -4035,7 +4035,7 @@ mod test {
                     return None;
                 }
                 let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
-                match &info.typ {
+                match info.display_typ() {
                     LuaType::Def(id) => {
                         Some((name_expr.get_position(), id.get_simple_name().to_string()))
                     }
@@ -4112,7 +4112,7 @@ mod test {
             .expect("expected semantic info for local PANEL");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("ReFrame")),
             "local PANEL should resolve to first region class ReFrame"
         );
@@ -5042,7 +5042,7 @@ mod test {
             .expect("expected semantic info for self");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("multi_file_ent"))
         );
     }
@@ -9355,7 +9355,7 @@ mod test {
             .get_semantic_info(swep_token.syntax().clone().into())
             .expect("expected semantic info for SWEP");
         assert_eq!(
-            swep_semantic.typ,
+            swep_semantic.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("weapon_mad_deagle")),
             "expected SWEP to resolve to the scoped weapon class"
         );
@@ -10268,7 +10268,7 @@ GM.TestValue = 1"#,
             .get_semantic_info(baseclass_token.syntax().clone().into())
             .expect("expected BaseClass semantic info");
         assert_eq!(
-            baseclass_info.typ,
+            baseclass_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("gamemode_other"))
         );
 

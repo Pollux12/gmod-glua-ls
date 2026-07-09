@@ -176,7 +176,7 @@ fn get_call_signature_param_location(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
     let mut document = None;
-    let closure = if let LuaType::Signature(signature_id) = &semantic_info.typ {
+    let closure = if let LuaType::Signature(signature_id) = semantic_info.display_typ() {
         let sig_file_id = signature_id.get_file_id();
         let sig_position = signature_id.get_position();
         document = semantic_model.get_document_by_file_id(sig_file_id);
@@ -235,7 +235,7 @@ fn build_call_expr_await_hint(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
 
-    match semantic_info.typ {
+    match semantic_info.display_typ().clone() {
         LuaType::DocFunction(f) => {
             if f.get_async_state() == AsyncState::Async {
                 let range = call_expr.get_range();
@@ -424,7 +424,8 @@ fn build_local_name_hint(
         .get_semantic_info(NodeOrToken::Token(
             local_name.get_name_token()?.syntax().clone(),
         ))?
-        .typ;
+        .display_typ()
+        .clone();
 
     let vgui_panel_name = if enable_vgui_inlay_hint {
         get_vgui_panel_name(semantic_model, &typ)
@@ -509,7 +510,8 @@ fn build_assign_stat_hint(
             continue;
         };
 
-        let Some((panel_name, base_name)) = get_vgui_panel_name(semantic_model, &semantic_info.typ)
+        let Some((panel_name, base_name)) =
+            get_vgui_panel_name(semantic_model, semantic_info.display_typ())
         else {
             continue;
         };
@@ -707,7 +709,7 @@ fn build_call_expr_meta_call_hint(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
 
-    match &semantic_info.typ {
+    match semantic_info.display_typ() {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let decl = semantic_model.get_db().get_type_index().get_type_decl(id)?;
             if !decl.is_class() {
@@ -725,7 +727,7 @@ fn build_call_expr_meta_call_hint(
                 result,
                 &call_operator_ids,
                 call_expr,
-                semantic_info.typ,
+                semantic_info.display_typ().clone(),
             )?;
         }
         _ => {}

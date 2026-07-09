@@ -133,10 +133,14 @@ pub fn resolve_ref(
                 Some(found.get_id().into()),
             )];
             if let Some(found_refs) = find_members(db, scopes, &path[i..]) {
-                seen_types.extend(found_refs.iter().filter_map(|item| match &item.typ {
-                    LuaType::Ref(id) => Some(LuaType::Def(id.clone())),
-                    _ => None,
-                }));
+                seen_types.extend(
+                    found_refs
+                        .iter()
+                        .filter_map(|item| match item.display_typ() {
+                            LuaType::Ref(id) => Some(LuaType::Def(id.clone())),
+                            _ => None,
+                        }),
+                );
                 result.extend(found_refs);
             }
         }
@@ -149,7 +153,7 @@ pub fn resolve_ref(
                 result.extend(
                     found_refs
                         .into_iter()
-                        .filter(|item| !seen_types.contains(&item.typ)),
+                        .filter(|item| !seen_types.contains(item.display_typ())),
                 );
             }
         }
@@ -165,7 +169,7 @@ pub fn resolve_ref(
             result.extend(
                 found_refs
                     .into_iter()
-                    .filter(|item| !seen_types.contains(&item.typ)),
+                    .filter(|item| !seen_types.contains(item.display_typ())),
             );
         }
     }
@@ -259,7 +263,9 @@ fn find_members(
         let mut new_scopes = Vec::new();
 
         for scope in scopes {
-            let members = get_member_map(db, &scope.typ);
+            // Desc lookup scopes are produced by `SemanticInfo::actual` above or from resolved
+            // references, so their display type is the concrete lookup type for member walking.
+            let members = get_member_map(db, scope.display_typ());
             if let Some(found_members) = members
                 .as_ref()
                 .and_then(|members| members.get(&member_key))

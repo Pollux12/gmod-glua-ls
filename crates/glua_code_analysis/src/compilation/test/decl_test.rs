@@ -90,7 +90,10 @@ mod test {
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info for function name");
 
-        assert_that!(info.typ, matches_pattern!(LuaType::Signature(_)));
+        assert_that!(
+            info.display_typ().clone(),
+            matches_pattern!(LuaType::Signature(_))
+        );
 
         let call_name = ws
             .analysis
@@ -117,7 +120,10 @@ mod test {
             .get_semantic_info(call_token.syntax().clone().into())
             .expect("expected semantic info for call name");
 
-        assert_that!(call_info.typ, matches_pattern!(LuaType::Signature(_)));
+        assert_that!(
+            call_info.display_typ().clone(),
+            matches_pattern!(LuaType::Signature(_))
+        );
 
         let decl_id = ws
             .analysis

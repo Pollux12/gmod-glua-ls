@@ -22,19 +22,34 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticInfo {
-    pub typ: LuaType,
+    display_typ: LuaType,
     pub semantic_decl: Option<LuaSemanticDeclId>,
     pub origin: SemanticInfoOrigin,
 }
 
 impl SemanticInfo {
     pub fn actual(typ: LuaType, semantic_decl: Option<LuaSemanticDeclId>) -> Self {
-        let origin = SemanticInfoOrigin::Actual;
         Self {
-            typ,
+            display_typ: typ,
             semantic_decl,
-            origin,
+            origin: SemanticInfoOrigin::Actual,
         }
+    }
+
+    pub fn contextual_expected(typ: LuaType, semantic_decl: Option<LuaSemanticDeclId>) -> Self {
+        Self {
+            display_typ: typ,
+            semantic_decl,
+            origin: SemanticInfoOrigin::ContextualExpected,
+        }
+    }
+
+    pub fn display_typ(&self) -> &LuaType {
+        &self.display_typ
+    }
+
+    pub fn actual_typ(&self) -> Option<&LuaType> {
+        matches!(self.origin, SemanticInfoOrigin::Actual).then_some(&self.display_typ)
     }
 }
 
@@ -100,32 +115,19 @@ pub fn infer_node_semantic_info(
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaExpr::cast(expr_node)?;
-            let (typ, origin) = match infer_expr(db, cache, expr.clone()) {
-                Ok(typ) if !typ.is_unknown() => (typ, SemanticInfoOrigin::Actual),
-                actual_result => infer_bind_value_type(db, cache, expr.clone())
-                    .map(|typ| (typ, SemanticInfoOrigin::ContextualExpected))
-                    .unwrap_or_else(|| match actual_result {
-                        Ok(typ) => (typ, SemanticInfoOrigin::Actual),
-                        Err(InferFailReason::FieldNotFound)
-                            if matches!(expr, LuaExpr::IndexExpr(_)) =>
-                        {
-                            (LuaType::Nil, SemanticInfoOrigin::Actual)
-                        }
-                        Err(_) => (LuaType::Unknown, SemanticInfoOrigin::Actual),
-                    }),
-            };
             let property_owner = infer_expr_semantic_decl(
                 db,
                 cache,
-                expr,
+                expr.clone(),
                 SemanticDeclGuard::default(),
                 SemanticDeclLevel::NoTrace,
             );
-            Some(SemanticInfo {
-                typ,
-                semantic_decl: property_owner,
-                origin,
-            })
+            Some(infer_expr_display_semantic_info(
+                db,
+                cache,
+                expr,
+                property_owner,
+            ))
         }
         table_field_node if LuaTableField::can_cast(table_field_node.kind().into()) => {
             let table_field = LuaTableField::cast(table_field_node)?;
@@ -177,6 +179,27 @@ pub fn infer_node_semantic_info(
             }
         }
         _ => None,
+    }
+}
+
+fn infer_expr_display_semantic_info(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    semantic_decl: Option<LuaSemanticDeclId>,
+) -> SemanticInfo {
+    match infer_expr(db, cache, expr.clone()) {
+        Ok(typ) if !typ.is_unknown() => SemanticInfo::actual(typ, semantic_decl),
+        actual_result => infer_bind_value_type(db, cache, expr.clone())
+            .map(|typ| SemanticInfo::contextual_expected(typ, semantic_decl.clone()))
+            .unwrap_or_else(|| match actual_result {
+                Ok(typ) => SemanticInfo::actual(typ, semantic_decl),
+                Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
+                    // Lua absent table field reads evaluate to nil when no contextual expected type applies.
+                    SemanticInfo::actual(LuaType::Nil, semantic_decl)
+                }
+                Err(_) => SemanticInfo::actual(LuaType::Unknown, semantic_decl),
+            }),
     }
 }
 

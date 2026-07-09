@@ -33,7 +33,7 @@ mod test {
                 && let Some(info) =
                     semantic_model.get_semantic_info(index_expr.syntax().clone().into())
             {
-                return info.typ;
+                return info.display_typ().clone();
             } else if text == expr_text {
                 seen_occurrence += 1;
             }

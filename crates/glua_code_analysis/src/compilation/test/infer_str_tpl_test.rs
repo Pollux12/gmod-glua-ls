@@ -38,7 +38,8 @@ mod test {
         semantic_model
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     fn nth_local_name_type_from_end(
@@ -69,7 +70,8 @@ mod test {
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info for local name")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     fn nth_local_name_cached_type_from_end(

@@ -70,7 +70,8 @@ mod test {
         semantic_model
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     fn nth_name_expr_semantic_decl_from_end(

@@ -111,7 +111,8 @@ fn trigger_token_signature_id(
 ) -> Option<LuaSignatureId> {
     match semantic_model
         .get_semantic_info(trigger_token.clone().into())?
-        .typ
+        .display_typ()
+        .clone()
     {
         LuaType::Signature(signature_id) => Some(signature_id),
         _ => None,

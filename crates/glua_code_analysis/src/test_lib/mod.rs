@@ -468,7 +468,7 @@ impl VirtualWorkspace {
         let info = semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("Semantic info must exist");
-        info.typ
+        info.display_typ().clone()
     }
 
     pub fn expr_ty(&mut self, expr: &str) -> LuaType {
@@ -484,7 +484,7 @@ impl VirtualWorkspace {
         let info = semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("Semantic info must exist");
-        info.typ
+        info.display_typ().clone()
     }
 
     pub fn check_type(&self, source: &LuaType, compact_type: &LuaType) -> bool {
