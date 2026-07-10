@@ -8259,6 +8259,42 @@ mod test {
     }
 
     #[gtest]
+    fn test_unguarded_child_call_result_reassignment_still_needs_nil_check() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field IsValid fun(self: Entity): boolean
+
+            ---@class base_glide: Entity
+            ---@field GetFreeSeat fun(self: base_glide): Entity?
+
+            "#,
+        );
+
+        assert_that!(
+            ws.check_code_for(
+                DiagnosticCode::NeedCheckNil,
+                r#"
+                ---@param vehicle Entity
+                ---@return Entity?
+                local function fallback_seat()
+                end
+
+                local function test(vehicle)
+                    local seat = vehicle:GetFreeSeat()
+                    seat = fallback_seat()
+                    seat:IsValid()
+                end
+                "#,
+            ),
+            eq(false),
+            "reassignment must discard unguarded-child provenance before nil checking"
+        );
+    }
+
+    #[gtest]
     fn test_missing_receiver_field_method_call_reports_unchecked_nil_access() {
         // Repro: unresolved receiver field in method call should still produce
         // an unchecked nil access diagnostic on the receiver expression.

@@ -230,9 +230,11 @@ pub(crate) fn infer_expr_semantic_info(
         return SemanticInfo::canonical(fact, semantic_decl);
     }
 
-    match infer_expr(db, cache, expr.clone()) {
+    let actual_result = infer_expr(db, cache, expr.clone());
+    match actual_result {
         Ok(typ) if !typ.is_unknown() => actual_expr_semantic_info(db, typ, semantic_decl),
         actual_result => infer_bind_value_type(db, cache, expr.clone())
+            .filter(|typ| !typ.is_nil())
             .map(|typ| {
                 let node = semantic_decl
                     .as_ref()

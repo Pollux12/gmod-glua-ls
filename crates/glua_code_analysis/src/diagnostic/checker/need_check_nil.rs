@@ -8,10 +8,10 @@ use rowan::TextRange;
 
 use crate::{
     DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
-    GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaMemberKey, LuaMemberOwner,
-    LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType, SemanticDeclLevel,
-    SemanticModel, find_best_direct_call_arg_role_from_type, find_signature_attribute_use,
-    get_var_expr_var_ref_id,
+    GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaInferenceProvenanceKind, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType,
+    SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_from_type,
+    find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
         InferConditionFlow, cast_type, contains_gmod_null_type, get_member_value_expr,
         remove_false_or_nil,
@@ -296,6 +296,10 @@ fn report_unsafe_receiver(
         Err(_) => return false,
     };
     if receiver_type.is_nullable() {
+        if is_result_of_unguarded_child_call(semantic_model, receiver) {
+            return false;
+        }
+
         // If the type contains GMod NULL, use TypeGuard-only matching.
         // NULL is truthy, so `not expr` does not prove validity.
         let has_gmod_null = contains_gmod_null_type(semantic_model.get_db(), &receiver_type);
@@ -1424,6 +1428,27 @@ fn local_call_initializer_slot(
     let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
     let call_expr = LuaCallExpr::cast(node)?;
     Some((call_expr, initializer.get_ret_idx()))
+}
+
+fn is_result_of_unguarded_child_call(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some((call_expr, _)) = local_call_initializer_slot(semantic_model, expr) else {
+        return false;
+    };
+    if local_initialized_by_call_was_reassigned_before_use(&call_expr, expr) {
+        return false;
+    }
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(receiver) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+
+    semantic_model
+        .infer_expr_fact(receiver)
+        .provenance()
+        .iter()
+        .any(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
 }
 
 fn is_expr_proven_by_falsy_param_nil_free_return_slot(
