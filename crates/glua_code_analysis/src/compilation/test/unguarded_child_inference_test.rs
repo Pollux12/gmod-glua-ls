@@ -287,6 +287,32 @@ mod test {
     }
 
     #[test]
+    fn later_concrete_assignment_overrides_declaration_child_fact_for_semantic_info() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@return Base
+            local function make_base() end
+            ---@type Base
+            local value
+            value:ChildOnly()
+            value = make_base()
+            print(value)
+            "#,
+        );
+
+        let info = last_name_info(&ws, file_id, "value");
+        assert_eq!(
+            (ws.humanize_type(info.display_typ().clone()), info.origin),
+            ("Base".to_string(), SemanticInfoOrigin::Actual)
+        );
+    }
+
+    #[test]
     fn explicit_field_guard_suppresses_unguarded_child_provenance() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);

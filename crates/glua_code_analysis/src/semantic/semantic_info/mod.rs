@@ -220,19 +220,20 @@ pub(crate) fn infer_expr_semantic_info(
     expr: LuaExpr,
     semantic_decl: Option<LuaSemanticDeclId>,
 ) -> SemanticInfo {
-    if let Some(fact) = semantic_decl
+    let contextual_fact = semantic_decl
         .as_ref()
         .and_then(semantic_decl_inference_node)
         .and_then(|node| db.get_inference_fact(&node))
-        && fact.confidence() < LuaInferenceConfidence::Certain
-        && !fact.typ().is_unknown()
-    {
-        return SemanticInfo::canonical(fact, semantic_decl);
-    }
+        .filter(|fact| {
+            fact.confidence() < LuaInferenceConfidence::Certain && !fact.typ().is_unknown()
+        });
 
     let actual_result = infer_expr(db, cache, expr.clone());
     match actual_result {
-        Ok(typ) if !typ.is_unknown() => actual_expr_semantic_info(db, typ, semantic_decl),
+        Ok(typ) if !typ.is_unknown() => contextual_fact
+            .filter(|fact| fact.typ() == &typ)
+            .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
+            .unwrap_or_else(|| actual_expr_semantic_info(db, typ, semantic_decl)),
         actual_result => infer_bind_value_type(db, cache, expr.clone())
             .filter(|typ| !typ.is_nil())
             .map(|typ| {
