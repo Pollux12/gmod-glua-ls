@@ -82,6 +82,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) ->
 
         local_inference::stabilize_unknown_locals(db, &mut context);
 
+        let child_inference_changed =
+            local_inference::stabilize_unguarded_children(db, &mut context);
+        stabilization_candidates.extend(child_inference_changed);
+
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
             context.infer_manager.clear();
