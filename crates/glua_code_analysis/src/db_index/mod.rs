@@ -25,7 +25,7 @@ mod r#type;
 
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-use crate::{Emmyrc, FileId, Vfs};
+use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::CallSiteParamIndex;
 pub use declaration::*;
@@ -162,8 +162,15 @@ impl DbIndex {
         self.helper_registry_cache.0 = Some((revision, value));
     }
 
-    pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
-        for file_id in file_ids {
+    pub fn remove_index(&mut self, mut file_ids: Vec<FileId>) {
+        file_ids.sort_by_key(|file_id| file_id.id);
+        file_ids.dedup();
+        if file_ids.is_empty() {
+            return;
+        }
+
+        let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
+        for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
                 log::debug!(
                     "remove_index: file_id={:?} path={}",
@@ -173,8 +180,8 @@ impl DbIndex {
             } else {
                 log::debug!("remove_index: file_id={:?} (no path)", file_id);
             }
-            self.remove(file_id);
         }
+        self.remove_files(&file_ids);
     }
 
     pub fn get_metatable_index_mut(&mut self) -> &mut LuaMetatableIndex {
@@ -495,6 +502,39 @@ impl LuaIndex for DbIndex {
         self.metatable_index.remove(file_id);
         self.global_index.remove(file_id);
         self.json_schema_index.remove(file_id);
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        if let [file_id] = file_ids {
+            self.remove(*file_id);
+            return;
+        }
+
+        self.decl_index.remove_files(file_ids);
+        self.references_index.remove_files(file_ids);
+        self.types_index.remove_files(file_ids);
+        self.modules_index.remove_files(file_ids);
+        self.members_index.remove_files(file_ids);
+        self.property_index.remove_files(file_ids);
+        self.signature_index.remove_files(file_ids);
+        self.diagnostic_index.remove_files(file_ids);
+        self.operator_index.remove_files(file_ids);
+        self.flow_index.remove_files(file_ids);
+        self.accessor_func_index.remove_files(file_ids);
+        self.accessor_func_call_index.remove_files(file_ids);
+        self.call_site_param_index.remove_files(file_ids);
+        self.gmod_class_index.remove_files(file_ids);
+        self.gmod_infer_index.remove_files(file_ids);
+        self.gmod_load_index.remove_files(file_ids);
+        self.gmod_network_index.remove_files(file_ids);
+        self.dynamic_field_index.remove_files(file_ids);
+        self.file_dependencies_index.remove_files(file_ids);
+        for &file_id in file_ids {
+            self.numeric_range_population_index.remove(file_id);
+        }
+        self.metatable_index.remove_files(file_ids);
+        self.global_index.remove_files(file_ids);
+        self.json_schema_index.remove_files(file_ids);
     }
 
     fn clear(&mut self) {

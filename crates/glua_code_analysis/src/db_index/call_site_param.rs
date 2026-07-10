@@ -214,8 +214,14 @@ impl CallSiteParamIndex {
 
 impl LuaIndex for CallSiteParamIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.file_source_signatures.remove(&file_id);
-        self.file_contributions.remove(&file_id);
+        self.remove_files(std::slice::from_ref(&file_id));
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
+            self.file_source_signatures.remove(&file_id);
+            self.file_contributions.remove(&file_id);
+        }
 
         self.rebuild_derived_state();
         self.rebuild_source_signatures();
@@ -279,6 +285,70 @@ mod tests {
         assert_eq!(
             inferred_union_members(&reverse_index, &signature_id),
             expected
+        );
+    }
+
+    #[test]
+    fn batch_removal_matches_rebuilding_with_surviving_file_inputs() {
+        let removed_first = FileId::new(1);
+        let surviving = FileId::new(2);
+        let removed_last = FileId::new(3);
+        let removed_first_signature = signature_id(removed_first, 10);
+        let surviving_signature = signature_id(surviving, 20);
+        let removed_last_signature = signature_id(removed_last, 30);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_source_signatures(vec![
+            (
+                removed_first,
+                vec![(
+                    "removed-first".to_string(),
+                    removed_first_signature,
+                    vec![0],
+                )],
+            ),
+            (
+                surviving,
+                vec![("surviving".to_string(), surviving_signature, vec![1])],
+            ),
+            (
+                removed_last,
+                vec![("removed-last".to_string(), removed_last_signature, vec![2])],
+            ),
+        ]);
+        index.set_files_contributions(vec![
+            (
+                removed_first,
+                vec![(surviving_signature, 0, LuaType::String)],
+            ),
+            (surviving, vec![(surviving_signature, 0, LuaType::Boolean)]),
+            (
+                removed_last,
+                vec![(surviving_signature, 0, LuaType::Integer)],
+            ),
+        ]);
+
+        index.remove_files(&[removed_last, removed_first]);
+
+        let mut expected = CallSiteParamIndex::new();
+        expected.set_files_source_signatures(vec![(
+            surviving,
+            vec![("surviving".to_string(), surviving_signature, vec![1])],
+        )]);
+        expected.set_files_contributions(vec![(
+            surviving,
+            vec![(surviving_signature, 0, LuaType::Boolean)],
+        )]);
+
+        assert_eq!(
+            index.source_signatures_by_path,
+            expected.source_signatures_by_path
+        );
+        assert_eq!(index.mutated_params, expected.mutated_params);
+        assert_eq!(index.inferred_params, expected.inferred_params);
+        assert_eq!(
+            index.inference_events_by_file,
+            expected.inference_events_by_file
         );
     }
 }

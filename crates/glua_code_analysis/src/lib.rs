@@ -883,8 +883,9 @@ mod tests {
     use std::path::PathBuf;
 
     use lsp_types::Uri;
+    use tokio_util::sync::CancellationToken;
 
-    use crate::EmmyLuaAnalysis;
+    use crate::{EmmyLuaAnalysis, FileId};
 
     fn test_workspace_and_uri() -> (PathBuf, Uri) {
         let workspace = std::env::temp_dir().join("gmod_glua_ls_analysis_test_workspace");
@@ -999,5 +1000,131 @@ mod tests {
             b1_id, b2_id,
             "b.lua file id should be input-order independent"
         );
+    }
+
+    #[test]
+    fn multi_file_batch_reindex_matches_clean_build_diagnostics() {
+        let incremental_workspace =
+            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_incremental_workspace");
+        let clean_workspace =
+            std::env::temp_dir().join("gmod_glua_ls_batch_reindex_clean_workspace");
+        let uris = |workspace: &PathBuf| {
+            ["producer.lua", "consumer.lua", "helper.lua"].map(|name| {
+                Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
+            })
+        };
+        let incremental_uris = uris(&incremental_workspace);
+        let clean_uris = uris(&clean_workspace);
+
+        let initial_producer = r#"
+            Registry = Registry or {}
+            Registry.item = { name = "old" }
+            Registry.legacy = { value = 1 }
+        "#;
+        let initial_consumer = r#"
+            local name = Registry.item.name
+            local legacy = Registry.legacy.value
+            consume(name, legacy)
+        "#;
+        let changed_producer = r#"
+            Registry = Registry or {}
+            Registry.item = { title = "new" }
+        "#;
+        let changed_consumer = r#"
+            local title = Registry.item.title
+            local removed = Registry.legacy.value
+            consume(title, removed)
+        "#;
+        let initial_helper = "function consume(name, value) end";
+        let changed_helper = "function consume(title, removed, required) end";
+
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(incremental_workspace);
+        analysis.update_files_by_uri(vec![
+            (
+                incremental_uris[1].clone(),
+                Some(initial_consumer.to_string()),
+            ),
+            (
+                incremental_uris[0].clone(),
+                Some(initial_producer.to_string()),
+            ),
+            (
+                incremental_uris[2].clone(),
+                Some(initial_helper.to_string()),
+            ),
+        ]);
+
+        let mut file_ids = incremental_uris
+            .iter()
+            .map(|uri| analysis.get_file_id(&uri).expect("file should be indexed"))
+            .collect::<Vec<FileId>>();
+        file_ids.sort_unstable();
+
+        analysis.update_file_text_only(&incremental_uris[0], changed_producer.to_string());
+        analysis.update_file_text_only(&incremental_uris[1], changed_consumer.to_string());
+        analysis.update_file_text_only(&incremental_uris[2], changed_helper.to_string());
+        analysis.reindex_files(vec![file_ids[2], file_ids[0], file_ids[1], file_ids[2]]);
+
+        let mut clean_analysis = EmmyLuaAnalysis::new();
+        clean_analysis.add_main_workspace(clean_workspace);
+        clean_analysis.update_files_by_uri(vec![
+            (clean_uris[2].clone(), Some(changed_helper.to_string())),
+            (clean_uris[0].clone(), Some(changed_producer.to_string())),
+            (clean_uris[1].clone(), Some(changed_consumer.to_string())),
+        ]);
+
+        let snapshot = |analysis: &EmmyLuaAnalysis, file_uris: &[Uri]| {
+            let shared = analysis.precompute_diagnostic_shared_data();
+            file_uris
+                .iter()
+                .map(|uri| {
+                    let file_id = analysis.get_file_id(uri).expect("file should be indexed");
+                    analysis
+                        .diagnose_file_with_shared(
+                            file_id,
+                            CancellationToken::new(),
+                            shared.clone(),
+                        )
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        let clean_diagnostics = snapshot(&clean_analysis, &clean_uris);
+        assert!(
+            clean_diagnostics
+                .iter()
+                .any(|diagnostics| !diagnostics.is_empty()),
+            "fixture should exercise observable diagnostics"
+        );
+
+        assert_eq!(snapshot(&analysis, &incremental_uris), clean_diagnostics);
+        for (incremental_uri, clean_uri) in incremental_uris.iter().zip(&clean_uris) {
+            let incremental_file_id = analysis
+                .get_file_id(incremental_uri)
+                .expect("incremental file should be indexed");
+            let clean_file_id = clean_analysis
+                .get_file_id(clean_uri)
+                .expect("clean file should be indexed");
+            assert!(
+                analysis
+                    .compilation
+                    .get_db()
+                    .get_module_index()
+                    .get_module(incremental_file_id)
+                    .is_some(),
+                "batch reindex should restore module ownership for {incremental_file_id:?}"
+            );
+            assert!(
+                clean_analysis
+                    .compilation
+                    .get_db()
+                    .get_module_index()
+                    .get_module(clean_file_id)
+                    .is_some(),
+                "clean build should index module ownership for {clean_file_id:?}"
+            );
+        }
     }
 }

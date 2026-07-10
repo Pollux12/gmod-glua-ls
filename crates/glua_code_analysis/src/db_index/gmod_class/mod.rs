@@ -463,7 +463,7 @@ impl GmodClassMetadataIndex {
         }
     }
 
-    fn recompute_vgui_panels(&mut self) {
+    fn recompute_derived_caches(&mut self) {
         let mut vgui_panels = HashMap::new();
         let mut derma_skins = HashMap::new();
 
@@ -615,13 +615,20 @@ impl GmodClassMetadataIndex {
 
 impl LuaIndex for GmodClassMetadataIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.file_metadata.remove(&file_id);
-        self.recompute_vgui_panels();
+        self.remove_files(std::slice::from_ref(&file_id));
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
+            self.file_metadata.remove(&file_id);
+        }
+        self.recompute_derived_caches();
     }
 
     fn clear(&mut self) {
         self.file_metadata.clear();
-        self.recompute_vgui_panels();
+        self.vgui_panels.clear();
+        self.derma_skins.clear();
     }
 }
 
@@ -630,6 +637,7 @@ mod tests {
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use rowan::{TextRange, TextSize};
 
+    use super::LuaIndex;
     use super::{
         GmodClassCallArg, GmodClassCallLiteral, GmodClassMetadataIndex, GmodScriptedClassCallKind,
         GmodScriptedClassCallMetadata,
@@ -747,5 +755,57 @@ mod tests {
             index.get_vgui_panel_base("NewPanel"),
             Some(Some("EditablePanel".to_string()))
         );
+    }
+
+    #[test]
+    fn batch_removal_matches_rebuilding_with_surviving_file_metadata() {
+        let removed_first = FileId::new(1);
+        let surviving = FileId::new(2);
+        let removed_last = FileId::new(3);
+
+        let mut index = GmodClassMetadataIndex::new();
+        index.add_call(
+            removed_first,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("RemovedFirst", "DFrame", 10),
+        );
+        index.add_call(
+            surviving,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Surviving", "EditablePanel", 20),
+        );
+        index.add_call(
+            removed_last,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("RemovedLast", "DPanel", 30),
+        );
+        index.add_call(
+            removed_first,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("RemovedSkin", "", 40),
+        );
+        index.add_call(
+            surviving,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("SurvivingSkin", "", 50),
+        );
+
+        index.remove_files(&[removed_last, removed_first]);
+
+        let mut expected = GmodClassMetadataIndex::new();
+        expected.add_call(
+            surviving,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Surviving", "EditablePanel", 20),
+        );
+        expected.add_call(
+            surviving,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("SurvivingSkin", "", 50),
+        );
+
+        assert_eq!(index.file_metadata, expected.file_metadata);
+        assert_eq!(index.vgui_panels, expected.vgui_panels);
+        assert_eq!(index.derma_skins, expected.derma_skins);
     }
 }

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use rowan::TextRange;
 
@@ -457,6 +457,32 @@ impl LuaIndex for GmodLoadIndex {
         }
     }
 
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        self.file_infos
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.unresolved_edges.retain(|edge| {
+            !removed_file_ids.contains(&edge.source_file_id)
+                && !edge
+                    .target_file_id
+                    .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
+        });
+        for info in self.file_infos.values_mut() {
+            info.incoming_edges.retain(|edge| {
+                !removed_file_ids.contains(&edge.source_file_id)
+                    && !edge
+                        .target_file_id
+                        .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
+            });
+            if info
+                .shadowed_by
+                .is_some_and(|file_id| removed_file_ids.contains(&file_id))
+            {
+                info.shadowed_by = None;
+            }
+        }
+    }
+
     fn clear(&mut self) {
         self.file_infos.clear();
         self.unresolved_edges.clear();
@@ -470,5 +496,45 @@ fn status_rank(status: GmodLoadStatus) -> u8 {
         GmodLoadStatus::MaybeDynamic => 2,
         GmodLoadStatus::ReachableByLoadEdge => 3,
         GmodLoadStatus::EngineLoaded => 4,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
+    use crate::{FileId, db_index::LuaIndex};
+
+    #[test]
+    fn batch_removal_keeps_only_surviving_load_edges() {
+        let removed = FileId::new(1);
+        let other_removed = FileId::new(2);
+        let surviving = FileId::new(3);
+        let external = FileId::new(4);
+        let edge = |source_file_id, target_file_id| GmodLoadEdge {
+            source_file_id,
+            target_file_id,
+            kind: GmodLoadEdgeKind::Include,
+            states: GmodStateMask::SHARED,
+            path: None,
+            original_expr: None,
+            range: None,
+        };
+        let mut index = GmodLoadIndex::new();
+        let mut info = GmodFileLoadInfo::fallback_shared();
+        info.incoming_edges.push(edge(external, Some(surviving)));
+        info.incoming_edges.push(edge(removed, Some(surviving)));
+        info.shadowed_by = Some(removed);
+        index.file_infos.insert(surviving, info);
+        index.unresolved_edges.extend([
+            edge(surviving, Some(external)),
+            edge(surviving, Some(removed)),
+        ]);
+
+        index.remove_files(&[other_removed, removed, other_removed]);
+
+        let info = index.get_file_info(&surviving).unwrap();
+        assert_eq!(info.incoming_edges, vec![edge(external, Some(surviving))]);
+        assert_eq!(info.shadowed_by, None);
+        assert_eq!(index.unresolved_edges(), &[edge(surviving, Some(external))]);
     }
 }

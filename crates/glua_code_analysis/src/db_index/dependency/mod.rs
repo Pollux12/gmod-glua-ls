@@ -140,9 +140,84 @@ impl LuaIndex for LuaDependencyIndex {
         }
     }
 
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        self.dependencies.retain(|file_id, dependencies| {
+            !removed_file_ids.contains(file_id) && {
+                dependencies.retain(|dependency_id| !removed_file_ids.contains(dependency_id));
+                !dependencies.is_empty()
+            }
+        });
+        self.dependency_kinds.retain(|file_id, dependency_kinds| {
+            !removed_file_ids.contains(file_id) && {
+                dependency_kinds
+                    .retain(|dependency_id, _| !removed_file_ids.contains(dependency_id));
+                !dependency_kinds.is_empty()
+            }
+        });
+        self.dependency_sites.retain(|file_id, sites| {
+            if removed_file_ids.contains(file_id) {
+                return false;
+            }
+
+            for site in sites {
+                if site
+                    .target_file_id
+                    .is_some_and(|target_file_id| removed_file_ids.contains(&target_file_id))
+                {
+                    site.target_file_id = None;
+                }
+            }
+            true
+        });
+    }
+
     fn clear(&mut self) {
         self.dependencies.clear();
         self.dependency_kinds.clear();
         self.dependency_sites.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::{TextRange, TextSize};
+
+    use super::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
+    use crate::{FileId, db_index::LuaIndex};
+
+    #[test]
+    fn batch_removal_preserves_surviving_dependency_edges() {
+        let removed = FileId::new(1);
+        let other_removed = FileId::new(2);
+        let surviving = FileId::new(3);
+        let external = FileId::new(4);
+        let mut index = LuaDependencyIndex::new();
+        index.add_required_file(surviving, removed);
+        index.add_required_file(surviving, external);
+        index.add_required_file(removed, external);
+        index.add_dependency_site(LuaDependencySite {
+            source_file_id: surviving,
+            target_file_id: Some(removed),
+            kind: LuaDependencyKind::Include,
+            path: None,
+            original_expr: "include(\"removed\")".to_string(),
+            range: TextRange::new(TextSize::new(0), TextSize::new(1)),
+        });
+
+        index.remove_files(&[other_removed, removed, other_removed]);
+
+        assert_eq!(index.get_required_files(&surviving).unwrap().len(), 1);
+        assert!(
+            index
+                .get_required_files(&surviving)
+                .unwrap()
+                .contains(&external)
+        );
+        assert!(index.get_required_files(&removed).is_none());
+        assert_eq!(
+            index.get_dependency_sites(&surviving).unwrap()[0].target_file_id,
+            None
+        );
     }
 }
