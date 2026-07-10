@@ -89,7 +89,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
         }
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
-            analyzer.context.request_stabilization(analyzer.file_id);
             let unresolve = UnResolveDecl {
                 file_id: analyzer.file_id,
                 decl_id,
@@ -144,7 +143,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 if should_defer_nil_gmod_index_alias(analyzer, &expr, &expr_type)
                     || should_defer_weak_gmod_dynamic_index_alias(analyzer, &expr, &expr_type)
                 {
-                    analyzer.context.request_stabilization(analyzer.file_id);
                     clear_index_expr_type_cache(analyzer, &expr);
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
@@ -206,12 +204,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 }
             }
             Err(reason) => {
-                if matches!(reason, InferFailReason::FieldNotFound)
-                    && should_defer_gmod_self_index(analyzer, &expr)
-                {
-                    analyzer.context.request_stabilization(analyzer.file_id);
-                }
-
                 let unresolve = UnResolveDecl {
                     file_id: analyzer.file_id,
                     decl_id,
@@ -383,21 +375,6 @@ fn is_weak_dynamic_index_alias_type(expr_type: &LuaType) -> bool {
     }
 }
 
-fn should_defer_gmod_self_index(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
-    if !analyzer.gmod_enabled || !analyzer.db.get_emmyrc().gmod.infer_dynamic_fields {
-        return false;
-    }
-
-    let LuaExpr::IndexExpr(index_expr) = expr else {
-        return false;
-    };
-    if analyzer.is_scripted_class_scope {
-        nested_index_root_is_self(index_expr)
-    } else {
-        index_expr_prefix_is_self(index_expr)
-    }
-}
-
 fn index_expr_prefix_is_self(index_expr: &LuaIndexExpr) -> bool {
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return false;
@@ -407,26 +384,6 @@ fn index_expr_prefix_is_self(index_expr: &LuaIndexExpr) -> bool {
         prefix_expr,
         LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
     )
-}
-
-fn nested_index_root_is_self(index_expr: &LuaIndexExpr) -> bool {
-    let Some(mut prefix_expr) = index_expr.get_prefix_expr() else {
-        return false;
-    };
-    let mut saw_nested_index = false;
-    while let LuaExpr::IndexExpr(prefix_index) = prefix_expr {
-        saw_nested_index = true;
-        let Some(next_prefix) = prefix_index.get_prefix_expr() else {
-            return false;
-        };
-        prefix_expr = next_prefix;
-    }
-
-    saw_nested_index
-        && matches!(
-            prefix_expr,
-            LuaExpr::NameExpr(name_expr) if name_expr.get_name_text().as_deref() == Some("self")
-        )
 }
 
 fn clear_index_expr_type_cache(analyzer: &mut LuaAnalyzer, expr: &LuaExpr) {
@@ -900,11 +857,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 LuaType::Nil
             }
             Err(reason) => {
-                if matches!(reason, InferFailReason::FieldNotFound)
-                    && should_defer_gmod_self_index(analyzer, expr)
-                {
-                    analyzer.context.request_stabilization(analyzer.file_id);
-                }
                 add_unresolve_for_assignment(analyzer, type_owner, &var, expr.clone(), reason);
                 continue;
             }

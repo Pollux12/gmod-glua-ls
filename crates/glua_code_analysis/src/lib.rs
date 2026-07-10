@@ -208,8 +208,8 @@ impl EmmyLuaAnalysis {
             .filter(|id| !is_removed || *id != file_id)
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
-            let stabilization_candidates = self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids, &stabilization_candidates);
+            self.compilation.update_index(update_file_ids.clone());
+            self.stabilize_cross_file_type_caches(&update_file_ids);
         }
 
         Some(file_id)
@@ -372,8 +372,8 @@ impl EmmyLuaAnalysis {
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
         let file_ids = self.expand_reindex_file_ids(file_ids);
         self.compilation.remove_index(file_ids.clone());
-        let stabilization_candidates = self.compilation.update_index(file_ids.clone());
-        self.stabilize_cross_file_type_caches(&file_ids, &stabilization_candidates);
+        self.compilation.update_index(file_ids.clone());
+        self.stabilize_cross_file_type_caches(&file_ids);
     }
 
     fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
@@ -404,30 +404,19 @@ impl EmmyLuaAnalysis {
         expanded
     }
 
-    fn stabilize_cross_file_type_caches(
-        &mut self,
-        file_ids: &[FileId],
-        stabilization_candidates: &[FileId],
-    ) {
+    fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
         if file_ids.is_empty() {
             return;
         }
 
         let changed = file_ids.iter().copied().collect::<HashSet<_>>();
-        let same_batch_stabilization_candidates = stabilization_candidates
-            .iter()
-            .copied()
-            .collect::<HashSet<_>>();
         let all_dependents = self
             .compilation
             .get_db()
             .get_type_index()
             .files_with_cross_file_type_caches_referencing_files(&changed);
-        let mut dependents = all_dependents
+        let dependents = select_cross_file_stabilization_dependents(all_dependents, &changed)
             .into_iter()
-            .filter(|file_id| {
-                !changed.contains(file_id) || same_batch_stabilization_candidates.contains(file_id)
-            })
             .filter(|file_id| {
                 self.compilation
                     .get_db()
@@ -436,8 +425,6 @@ impl EmmyLuaAnalysis {
                     .is_some()
             })
             .collect::<Vec<_>>();
-        dependents.sort_unstable();
-        dependents.dedup();
         if dependents.is_empty() {
             return;
         }
@@ -606,8 +593,8 @@ impl EmmyLuaAnalysis {
         }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
-        let stabilization_candidates = self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files, &stabilization_candidates);
+        self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files);
         updated_files
     }
 
@@ -673,8 +660,8 @@ impl EmmyLuaAnalysis {
         }));
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
-        let stabilization_candidates = self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files, &stabilization_candidates);
+        self.compilation.update_index(updated_files.clone());
+        self.stabilize_cross_file_type_caches(&updated_files);
         updated_files
     }
 
@@ -760,6 +747,22 @@ impl EmmyLuaAnalysis {
         &self,
     ) -> std::sync::Arc<diagnostic::SharedDiagnosticData> {
         self.diagnostic.precompute_shared_data(&self.compilation)
+    }
+
+    /// Return main-workspace files in an order that keeps parallel diagnostic
+    /// workers busy. Source size is a cheap proxy for diagnostic cost, so
+    /// processing larger files first avoids leaving one expensive file on the
+    /// critical path after the other workers have gone idle.
+    pub fn get_main_workspace_file_ids_for_diagnostics(&self) -> Vec<FileId> {
+        let db = self.compilation.get_db();
+        let vfs = db.get_vfs();
+        let mut file_ids = db.get_module_index().get_main_workspace_file_ids();
+        file_ids.sort_unstable_by(|left, right| {
+            let left_len = vfs.get_file_content(left).map_or(0, String::len);
+            let right_len = vfs.get_file_content(right).map_or(0, String::len);
+            right_len.cmp(&left_len).then_with(|| left.cmp(right))
+        });
+        file_ids
     }
 
     pub fn reindex(&mut self) {
@@ -872,6 +875,19 @@ impl EmmyLuaAnalysis {
     }
 }
 
+fn select_cross_file_stabilization_dependents(
+    all_dependents: impl IntoIterator<Item = FileId>,
+    changed: &HashSet<FileId>,
+) -> Vec<FileId> {
+    let mut dependents = all_dependents
+        .into_iter()
+        .filter(|file_id| !changed.contains(file_id))
+        .collect::<Vec<_>>();
+    dependents.sort_unstable();
+    dependents.dedup();
+    dependents
+}
+
 impl Default for EmmyLuaAnalysis {
     fn default() -> Self {
         Self::new()
@@ -880,12 +896,74 @@ impl Default for EmmyLuaAnalysis {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashSet;
     use std::path::PathBuf;
 
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{EmmyLuaAnalysis, FileId};
+    use crate::{EmmyLuaAnalysis, FileId, select_cross_file_stabilization_dependents};
+
+    #[test]
+    fn stabilization_dependents_exclude_files_already_analyzed_in_batch() {
+        let changed_a = FileId { id: 1 };
+        let changed_b = FileId { id: 2 };
+        let unchanged_dependent = FileId { id: 3 };
+        let changed = HashSet::from([changed_a, changed_b]);
+
+        assert_eq!(
+            select_cross_file_stabilization_dependents(
+                [
+                    changed_b,
+                    unchanged_dependent,
+                    changed_a,
+                    unchanged_dependent
+                ],
+                &changed,
+            ),
+            vec![unchanged_dependent]
+        );
+    }
+
+    #[test]
+    fn diagnostic_file_ids_are_prioritized_by_source_size_then_file_id() {
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_diagnostic_priority_workspace");
+        let make_uri = |name: &str| {
+            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
+        };
+        let small_a = make_uri("small_a.lua");
+        let large = make_uri("large.lua");
+        let small_b = make_uri("small_b.lua");
+
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(workspace);
+        analysis.update_files_by_uri(vec![
+            (small_b.clone(), Some("return 1".to_string())),
+            (
+                large.clone(),
+                Some("local value = { one = 1, two = 2, three = 3 }\nreturn value".to_string()),
+            ),
+            (small_a.clone(), Some("return 2".to_string())),
+        ]);
+
+        let large_id = analysis
+            .get_file_id(&large)
+            .expect("large file should exist");
+        let mut small_ids = [
+            analysis
+                .get_file_id(&small_a)
+                .expect("small_a file should exist"),
+            analysis
+                .get_file_id(&small_b)
+                .expect("small_b file should exist"),
+        ];
+        small_ids.sort_unstable();
+
+        assert_eq!(
+            analysis.get_main_workspace_file_ids_for_diagnostics(),
+            vec![large_id, small_ids[0], small_ids[1]]
+        );
+    }
 
     fn test_workspace_and_uri() -> (PathBuf, Uri) {
         let workspace = std::env::temp_dir().join("gmod_glua_ls_analysis_test_workspace");

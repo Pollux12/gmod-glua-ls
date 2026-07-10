@@ -55,7 +55,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             );
         }
 
-        infer_manager.clear();
+        infer_manager.clear_for_unresolve(db);
 
         // Use FxHashMap for O(1) reason grouping (matching upstream)
         let had_unresolves = !context.unresolves.is_empty();

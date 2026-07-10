@@ -1,7 +1,9 @@
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use crate::{DiagnosticCode, Emmyrc, SemanticInfoOrigin, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaLocalName, LuaNameExpr};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -151,6 +153,85 @@ mod test {
         assert_eq!(
             ws.humanize_type(last_name_type(&ws, file_id, "pos")),
             "Vector"
+        );
+    }
+
+    #[test]
+    fn unguarded_child_fact_rebinds_an_earlier_cross_file_local_type_cache_in_the_same_batch() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_files(vec![
+            (
+                "definitions.lua",
+                r#"
+                ---@class Vector
+                ---@class Entity
+                ---@class Player: Entity
+                ---@field GetShootPos fun(self: Player): Vector
+
+                SharedTable = {}
+                "#,
+            ),
+            (
+                "consumer.lua",
+                r#"
+                local cross_file_anchor = SharedTable
+
+                ---@type Entity
+                local owner
+                local method = owner.GetShootPos
+                local position = owner:GetShootPos()
+                "#,
+            ),
+        ]);
+
+        let definitions_file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri("definitions.lua"))
+            .expect("expected definitions file id");
+        let consumer_file_id = ws
+            .analysis
+            .get_file_id(&ws.virtual_url_generator.new_uri("consumer.lua"))
+            .expect("expected consumer file id");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_file_id)
+            .expect("expected consumer semantic model");
+        let method_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "method")
+            })
+            .expect("expected local method name");
+        let method_decl_id =
+            crate::LuaDeclId::new(consumer_file_id, method_name.get_range().start());
+
+        let db = ws.analysis.compilation.get_db();
+        let cross_file_dependents = db
+            .get_type_index()
+            .files_with_cross_file_type_caches_referencing_files(&HashSet::from([
+                definitions_file_id,
+            ]));
+        assert!(
+            cross_file_dependents.contains(&consumer_file_id),
+            "consumer must depend on a cross-file type cache for this stabilization regression"
+        );
+
+        let method_type = db
+            .get_type_index()
+            .get_type_cache(&method_decl_id.into())
+            .expect("expected persistent type cache for local method")
+            .as_type();
+        assert!(
+            method_type.is_function(),
+            "late unguarded-child inference must rebind the earlier local method cache, got {method_type:?}"
         );
     }
 

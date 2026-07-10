@@ -30,13 +30,12 @@ use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 use infer_cache_manager::InferCacheManager;
 use unresolve::UnResolve;
 
-pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) -> HashSet<FileId> {
+pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
     if need_analyzed_files.is_empty() {
-        return HashSet::new();
+        return;
     }
 
     let contexts = module_analyze(db, need_analyzed_files);
-    let mut stabilization_candidates = HashSet::new();
 
     for (workspace_id, mut context) in contexts {
         context.workspace_id = Some(workspace_id);
@@ -80,24 +79,29 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) ->
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
 
-        local_inference::stabilize_unknown_locals(db, &mut context);
-
+        let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
         let child_inference_changed =
             local_inference::stabilize_unguarded_children(db, &mut context);
-        stabilization_candidates.extend(child_inference_changed);
+        let late_inference_changed = local_inference_changed || child_inference_changed;
 
-        if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
+        let infer_dynamic_fields =
+            db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
+        if infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
             resolve_uninformative_local_decl_caches(db, &mut context);
+        } else if late_inference_changed {
+            // Late inference facts can unlock deferred locals even when the
+            // optional dynamic-field pass is disabled. Retry that retained work
+            // in-place instead of reindexing the entire file batch.
+            context.infer_manager.clear();
+            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+            setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
+            resolve_uninformative_local_decl_caches(db, &mut context);
         }
-
-        stabilization_candidates.extend(context.stabilization_candidates.iter().copied());
     }
-
-    stabilization_candidates
 }
 
 fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -334,7 +338,6 @@ pub struct AnalyzeContext {
     unresolves: Vec<(UnResolve, InferFailReason)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
-    stabilization_candidates: HashSet<FileId>,
     infer_manager: InferCacheManager,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -349,7 +352,6 @@ impl AnalyzeContext {
             unresolves: Vec::new(),
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
-            stabilization_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             workspace_id: None,
         }
@@ -376,10 +378,6 @@ impl AnalyzeContext {
 
     pub fn request_uninformative_local_decl_reinfer(&mut self, decl_id: LuaDeclId) {
         self.uninformative_local_decl_candidates.insert(decl_id);
-    }
-
-    pub fn request_stabilization(&mut self, file_id: FileId) {
-        self.stabilization_candidates.insert(file_id);
     }
 
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {

@@ -2308,9 +2308,13 @@ pub(crate) fn infer_enclosing_self_type(
 #[cfg(test)]
 mod test {
     use super::{
-        direct_table_field_from_member_id, find_param_type_from_contextual_member, infer_name_expr,
+        direct_table_field_from_member_id, find_param_type_from_contextual_member,
+        get_name_expr_var_ref_id, infer_name_expr,
     };
-    use crate::{Emmyrc, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, VirtualWorkspace};
+    use crate::{
+        Emmyrc, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, VarRefId,
+        VirtualWorkspace,
+    };
     use glua_parser::{
         LuaAstNode, LuaAstToken, LuaClosureExpr, LuaIndexKey, LuaLocalName, LuaNameExpr,
         LuaParamName, LuaTableExpr, LuaTableField,
@@ -2431,6 +2435,84 @@ mod test {
         );
 
         Ok(())
+    }
+
+    #[test]
+    fn clear_for_unresolve_drops_global_var_ref_selected_from_mutable_types() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("a.lua", "Choice = 1");
+        ws.def_file("b.lua", "Choice = function() end");
+        let consumer_id = ws.def_file("consumer.lua", "local selected = Choice");
+
+        let choice_expr = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_id)
+            .expect("consumer semantic model should exist")
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("Choice"))
+            .expect("consumer Choice expression should exist");
+        let decl_ids = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_global_index()
+            .get_global_decl_ids("Choice")
+            .expect("Choice declarations should exist")
+            .clone();
+        assert_eq!(decl_ids.len(), 2);
+        let first = decl_ids[0];
+        let second = decl_ids[1];
+
+        let db = ws.analysis.compilation.get_db_mut();
+        db.get_type_index_mut()
+            .force_bind_type(first.into(), LuaTypeCache::InferType(LuaType::Integer));
+        db.get_type_index_mut()
+            .force_bind_type(second.into(), LuaTypeCache::InferType(LuaType::Function));
+        let mut cache = LuaInferCache::new(consumer_id, Default::default());
+        assert_eq!(
+            get_name_expr_var_ref_id(db, &mut cache, &choice_expr),
+            Some(VarRefId::VarRef(second))
+        );
+
+        db.get_type_index_mut()
+            .force_bind_type(first.into(), LuaTypeCache::InferType(LuaType::Function));
+        cache.clear_for_unresolve(db);
+
+        assert_eq!(
+            get_name_expr_var_ref_id(db, &mut cache, &choice_expr),
+            Some(VarRefId::VarRef(first))
+        );
+    }
+
+    #[test]
+    fn clear_for_unresolve_preserves_local_var_ref_identity() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local source = 1\nlocal selected = source");
+        let source_reference = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model should exist")
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("source"))
+            .expect("source reference should exist");
+        let syntax_id = source_reference.get_syntax_id();
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        let local_ref = get_name_expr_var_ref_id(db, &mut cache, &source_reference)
+            .expect("source should resolve to a local reference");
+        assert!(matches!(local_ref, VarRefId::VarRef(_)));
+
+        cache.clear_for_unresolve(db);
+
+        assert_eq!(
+            cache.expr_var_ref_id_cache.get(&syntax_id),
+            Some(&local_ref)
+        );
     }
 
     #[gtest]

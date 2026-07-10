@@ -1,7 +1,7 @@
 use rustc_hash::FxHashMap;
 
 use crate::{
-    FileId, LuaAnalysisPhase,
+    DbIndex, FileId, LuaAnalysisPhase,
     semantic::{LuaInferCache, PendingStrTplTypeDecl},
 };
 
@@ -41,6 +41,12 @@ impl InferCacheManager {
     pub fn clear(&mut self) {
         for (_, infer_cache) in self.infer_map.iter_mut() {
             infer_cache.clear();
+        }
+    }
+
+    pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
+        for infer_cache in self.infer_map.values_mut() {
+            infer_cache.clear_for_unresolve(db);
         }
     }
 

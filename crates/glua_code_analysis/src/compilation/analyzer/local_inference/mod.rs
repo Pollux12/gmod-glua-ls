@@ -22,7 +22,10 @@ use crate::{
 
 use self::evidence::ContextualTypeEvidence;
 
-pub(super) fn stabilize_unknown_locals(db: &mut crate::DbIndex, context: &mut AnalyzeContext) {
+pub(super) fn stabilize_unknown_locals(
+    db: &mut crate::DbIndex,
+    context: &mut AnalyzeContext,
+) -> bool {
     let _profile =
         crate::profile::Profile::cond_new("local inference stabilize", context.tree_list.len() > 1);
     let mut candidates = context
@@ -128,6 +131,7 @@ pub(super) fn stabilize_unknown_locals(db: &mut crate::DbIndex, context: &mut An
         solved.stats.unresolved
     );
     let changed = db.publish_inference_facts(solved.facts);
+    let changed_any = !changed.is_empty();
     if std::env::var_os("GLUALS_PROFILE").is_some() {
         eprintln!(
             "[profile] local_inference candidates={} evidence={} sccs={} resolved={} unresolved={} changed_files={}",
@@ -139,9 +143,10 @@ pub(super) fn stabilize_unknown_locals(db: &mut crate::DbIndex, context: &mut An
             changed.len()
         );
     }
-    if !changed.is_empty() {
+    if changed_any {
         context.infer_manager.clear();
     }
+    changed_any
 }
 
 fn contextual_type_support(
@@ -178,6 +183,9 @@ fn contextual_type_support(
 /// stabilization: it only starts from a concrete parent reference type.
 #[derive(Default)]
 struct UnguardedChildProfile {
+    subtype_index: std::time::Duration,
+    reference_scan: std::time::Duration,
+    publish: std::time::Duration,
     references_scanned: usize,
     assignment_targets_skipped: usize,
     conditions_skipped: usize,
@@ -188,14 +196,14 @@ struct UnguardedChildProfile {
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
-) -> std::collections::HashSet<crate::FileId> {
+) -> bool {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
     let mut profile = std::env::var_os("GLUALS_PROFILE")
         .is_some()
         .then(UnguardedChildProfile::default);
     if !db.get_emmyrc().gmod.enabled {
-        return Default::default();
+        return false;
     }
 
     let mut scores =
@@ -203,8 +211,13 @@ pub(super) fn stabilize_unguarded_children(
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
+    let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
     let direct_subtype_members = precompute_direct_subtype_members(db);
+    if let (Some(profile), Some(start)) = (&mut profile, subtype_index_start) {
+        profile.subtype_index = start.elapsed();
+    }
 
+    let reference_scan_start = profile.as_ref().map(|_| std::time::Instant::now());
     let file_ids = context
         .tree_list
         .iter()
@@ -369,6 +382,9 @@ pub(super) fn stabilize_unguarded_children(
             }
         }
     }
+    if let (Some(profile), Some(start)) = (&mut profile, reference_scan_start) {
+        profile.reference_scan = start.elapsed();
+    }
 
     let mut updates = Vec::new();
     for (definition, candidates) in scores {
@@ -431,13 +447,21 @@ pub(super) fn stabilize_unguarded_children(
     }
 
     let updates_len = updates.len();
+    let publish_start = profile.as_ref().map(|_| std::time::Instant::now());
     let changed = db.publish_inference_facts(updates);
-    if !changed.is_empty() {
+    if let (Some(profile), Some(start)) = (&mut profile, publish_start) {
+        profile.publish = start.elapsed();
+    }
+    let changed_any = !changed.is_empty();
+    if changed_any {
         context.infer_manager.clear();
     }
     if let Some(profile) = profile {
         eprintln!(
-            "[profile] unguarded_child references={} assignment_targets_skipped={} conditions_skipped={} short_circuit_guards_skipped={} evidence={} facts={} changed_files={}",
+            "[profile] unguarded_child subtype_index={:?} reference_scan={:?} publish={:?} references={} assignment_targets_skipped={} conditions_skipped={} short_circuit_guards_skipped={} evidence={} facts={} changed_files={}",
+            profile.subtype_index,
+            profile.reference_scan,
+            profile.publish,
             profile.references_scanned,
             profile.assignment_targets_skipped,
             profile.conditions_skipped,
@@ -447,7 +471,7 @@ pub(super) fn stabilize_unguarded_children(
             changed.len(),
         );
     }
-    changed
+    changed_any
 }
 
 fn type_has_visible_member_at_use(

@@ -9,7 +9,7 @@ use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
+    DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
     LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::InferFailReason,
@@ -220,9 +220,34 @@ impl LuaInferCache {
         self.dynamic_field_resolving.clear();
     }
 
-    /// Clears all caches. Used before the unresolve phase.
-    pub fn clear_for_unresolve(&mut self) {
-        self.clear();
+    /// Clears inference results that can become stale as deferred declarations,
+    /// members, signatures, and dynamic fields are resolved. Structural caches
+    /// derived only from the immutable syntax/reference/flow indexes survive the
+    /// phase transition so unresolve does not rebuild them for every expression.
+    pub fn clear_for_unresolve(&mut self, db: &DbIndex) {
+        self.expr_cache.clear();
+        self.call_cache.clear();
+        self.call_arg_types_cache.clear();
+        self.flow_node_cache.clear();
+        self.flow_query_realm = None;
+        self.index_ref_origin_type_cache.clear();
+        self.param_type_cache.clear();
+        // Local reference identities come directly from immutable reference
+        // indexes and are safe to retain. Global/member/self roots can be
+        // selected through types and overloads that unresolve is about to
+        // materialize, so discard only those semantic entries.
+        self.expr_var_ref_id_cache
+            .retain(|_, var_ref_id| var_ref_is_phase_stable(db, var_ref_id));
+        self.pending_str_tpl_type_decls.clear();
+        self.self_type_cache.clear();
+        self.self_base_seed = None;
+        self.decl_cache.clear();
+        self.for_range_iter_var_type_cache.clear();
+        self.dynamic_field_scope_metatable_cache.clear();
+        self.dynamic_field_resolution_cache.clear();
+        self.local_class_table_member_ids_cache.clear();
+        self.dynamic_field_type_cache.clear();
+        self.dynamic_field_resolving.clear();
     }
 
     pub fn get_flow_cache(
@@ -337,5 +362,77 @@ impl LuaInferCache {
             .values()
             .map(|entries| entries.len())
             .sum()
+    }
+}
+
+fn var_ref_is_phase_stable(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let local_decl_is_stable = |decl_id: &LuaDeclId| {
+        db.get_decl_index()
+            .get_decl(decl_id)
+            .is_some_and(|decl| decl.is_local())
+    };
+
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => local_decl_is_stable(decl_id),
+        VarRefId::IndexRef(VarRefRootId::Decl(decl_id), _) => local_decl_is_stable(decl_id),
+        VarRefId::SelfRef(_)
+        | VarRefId::IndexRef(VarRefRootId::Member(_) | VarRefRootId::SelfRef(_), _)
+        | VarRefId::GlobalName(_, _) => false,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::{CacheEntry, LuaInferCache};
+    use crate::{DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaType, VarRefId};
+
+    #[test]
+    fn clear_for_unresolve_preserves_only_structural_lookup_caches() {
+        let file_id = FileId { id: 7 };
+        let syntax_id = LuaSyntaxId::new(
+            LuaSyntaxKind::NameExpr.into(),
+            TextRange::new(TextSize::from(3), TextSize::from(4)),
+        );
+        let decl_id = LuaDeclId::new(file_id, TextSize::from(3));
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        cache
+            .expr_cache
+            .insert(syntax_id, CacheEntry::Cache(LuaType::Integer));
+        cache
+            .expr_var_ref_id_cache
+            .insert(syntax_id, VarRefId::VarRef(decl_id));
+        cache
+            .flow_node_realm_cache
+            .insert(FlowId(1), GmodRealm::Server);
+        cache
+            .narrow_by_literal_stop_position_cache
+            .insert(syntax_id);
+        cache
+            .local_reassignment_positions_cache
+            .insert(decl_id, vec![TextSize::from(9)]);
+        cache.local_reassignments_indexed = true;
+
+        cache.clear_for_unresolve(&DbIndex::new());
+
+        assert!(cache.expr_cache.is_empty());
+        assert!(cache.expr_var_ref_id_cache.is_empty());
+        assert_eq!(
+            cache.flow_node_realm_cache.get(&FlowId(1)),
+            Some(&GmodRealm::Server)
+        );
+        assert!(
+            cache
+                .narrow_by_literal_stop_position_cache
+                .contains(&syntax_id)
+        );
+        assert_eq!(
+            cache.local_reassignment_positions_cache.get(&decl_id),
+            Some(&vec![TextSize::from(9)])
+        );
+        assert!(cache.local_reassignments_indexed);
     }
 }
