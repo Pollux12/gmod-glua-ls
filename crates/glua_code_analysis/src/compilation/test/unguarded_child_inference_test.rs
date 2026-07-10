@@ -337,6 +337,59 @@ mod test {
     }
 
     #[test]
+    fn member_assignment_is_not_unguarded_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            value.ChildOnly = function() end
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn matching_short_circuit_member_guard_is_not_unguarded_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local result = value.ChildOnly and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
     fn child_method_call_used_as_a_condition_is_still_evidence() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);

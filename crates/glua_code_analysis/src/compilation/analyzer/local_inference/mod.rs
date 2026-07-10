@@ -6,8 +6,8 @@ use std::{collections::HashMap, sync::Arc};
 use rustc_hash::FxHashMap;
 
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr,
-    LuaRepeatStat, LuaVarExpr, LuaWhileStat,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat,
+    LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat, LuaVarExpr, LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
@@ -175,10 +175,24 @@ fn contextual_type_support(
 /// Infers a known direct child from several otherwise-invalid member uses of the
 /// same reaching definition. This is deliberately distinct from generic unknown
 /// stabilization: it only starts from a concrete parent reference type.
+#[derive(Default)]
+struct UnguardedChildProfile {
+    references_scanned: usize,
+    assignment_targets_skipped: usize,
+    conditions_skipped: usize,
+    short_circuit_guards_skipped: usize,
+    evidence_sites: usize,
+}
+
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
 ) -> std::collections::HashSet<crate::FileId> {
+    let _profile =
+        crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
+    let mut profile = std::env::var_os("GLUALS_PROFILE")
+        .is_some()
+        .then(UnguardedChildProfile::default);
     if !db.get_emmyrc().gmod.enabled {
         return Default::default();
     }
@@ -244,13 +258,31 @@ pub(super) fn stabilize_unguarded_children(
                 else {
                     continue;
                 };
+                if let Some(profile) = &mut profile {
+                    profile.references_scanned += 1;
+                }
+                if is_assignment_target(&index_expr) {
+                    if let Some(profile) = &mut profile {
+                        profile.assignment_targets_skipped += 1;
+                    }
+                    continue;
+                }
                 let Some(index_key) = index_expr.get_index_key() else {
                     continue;
                 };
                 if is_condition_evidence(&index_expr) {
+                    if let Some(profile) = &mut profile {
+                        profile.conditions_skipped += 1;
+                    }
                     continue;
                 }
                 let cache = context.infer_manager.get_infer_cache(file_id);
+                if is_matching_short_circuit_guard(db, cache, &index_expr) {
+                    if let Some(profile) = &mut profile {
+                        profile.short_circuit_guards_skipped += 1;
+                    }
+                    continue;
+                }
                 if LuaMemberKey::index_key_is_dynamic(db, cache, &index_key) {
                     continue;
                 }
@@ -289,6 +321,7 @@ pub(super) fn stabilize_unguarded_children(
                     })
                     .unwrap_or_else(|| Arc::from([LuaDefinitionId::Declaration(decl_id)]));
                 let source = InFiled::new(file_id, index_expr.get_syntax_id());
+                let mut evidence_recorded = false;
                 for child_id in children.iter() {
                     let owner = LuaMemberOwner::Type(child_id.clone());
                     let visible = db
@@ -305,6 +338,12 @@ pub(super) fn stabilize_unguarded_children(
                         });
                     if !visible {
                         continue;
+                    }
+                    if !evidence_recorded {
+                        if let Some(profile) = &mut profile {
+                            profile.evidence_sites += 1;
+                        }
+                        evidence_recorded = true;
                     }
                     for definition in definitions.iter().cloned() {
                         scores
@@ -390,9 +429,22 @@ pub(super) fn stabilize_unguarded_children(
         ));
     }
 
+    let updates_len = updates.len();
     let changed = db.publish_inference_facts(updates);
     if !changed.is_empty() {
         context.infer_manager.clear();
+    }
+    if let Some(profile) = profile {
+        eprintln!(
+            "[profile] unguarded_child references={} assignment_targets_skipped={} conditions_skipped={} short_circuit_guards_skipped={} evidence={} facts={} changed_files={}",
+            profile.references_scanned,
+            profile.assignment_targets_skipped,
+            profile.conditions_skipped,
+            profile.short_circuit_guards_skipped,
+            profile.evidence_sites,
+            updates_len,
+            changed.len(),
+        );
     }
     changed
 }
@@ -482,13 +534,7 @@ fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMember
 }
 
 fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
-    if index_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaCallExpr::cast)
-        .and_then(|call| call.get_prefix_expr())
-        .is_some_and(|prefix| prefix.syntax() == index_expr.syntax())
-    {
+    if is_call_prefix(index_expr) {
         return false;
     }
 
@@ -504,6 +550,94 @@ fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
         condition
             .is_some_and(|condition| condition.syntax().text_range().contains_range(index_range))
     })
+}
+
+fn is_assignment_target(index_expr: &LuaIndexExpr) -> bool {
+    let Some(assign_stat) = index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaAssignStat::cast)
+    else {
+        return false;
+    };
+    let index_range = index_expr.syntax().text_range();
+    let (vars, _) = assign_stat.get_var_and_expr_list();
+    vars.into_iter()
+        .any(|var| var.syntax().text_range().contains_range(index_range))
+}
+
+fn is_call_prefix(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaCallExpr::cast)
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.syntax() == index_expr.syntax())
+}
+
+fn is_matching_short_circuit_guard(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let index_range = index_expr.syntax().text_range();
+    for binary in index_expr
+        .syntax()
+        .ancestors()
+        .filter_map(LuaBinaryExpr::cast)
+    {
+        if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpAnd) {
+            continue;
+        }
+        let Some((left, right)) = binary.get_exprs() else {
+            continue;
+        };
+        if left.syntax().text_range().contains_range(index_range) {
+            return !is_call_prefix(index_expr);
+        }
+        if !right.syntax().text_range().contains_range(index_range) {
+            continue;
+        }
+        if matching_guard_in_expr(db, cache, &left, index_expr) {
+            return true;
+        }
+    }
+    false
+}
+
+fn matching_guard_in_expr(
+    db: &crate::DbIndex,
+    cache: &mut crate::semantic::LuaInferCache,
+    guard_expr: &LuaExpr,
+    guarded: &LuaIndexExpr,
+) -> bool {
+    let Some(guarded_prefix) = guarded.get_prefix_expr() else {
+        return false;
+    };
+    let Some(guarded_key) = guarded.get_index_key() else {
+        return false;
+    };
+    let Ok(guarded_key) = LuaMemberKey::from_index_key(db, cache, &guarded_key) else {
+        return false;
+    };
+
+    let direct = match guard_expr {
+        LuaExpr::IndexExpr(index) => Some(index.clone()),
+        _ => None,
+    };
+    direct
+        .into_iter()
+        .chain(guard_expr.descendants::<LuaIndexExpr>())
+        .filter(|guard| !is_call_prefix(guard))
+        .any(|guard| {
+            guard
+                .get_prefix_expr()
+                .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
+                && guard.get_index_key().is_some_and(|key| {
+                    LuaMemberKey::from_index_key(db, cache, &key)
+                        .is_ok_and(|guard_key| guard_key == guarded_key)
+                })
+        })
 }
 
 fn declaration_base_type(
