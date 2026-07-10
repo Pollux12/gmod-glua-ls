@@ -6,8 +6,8 @@ use glua_parser::{
 };
 
 use crate::{
-    AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DiagnosticCode, FlowId,
-    FlowNodeKind, LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo,
+    DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -120,7 +120,7 @@ pub fn bind_assign_stat(
         (false, true) => AssignVarHint::IndexOnly,
         _ => AssignVarHint::Mixed,
     };
-    let assignment_flow_info = collect_assignment_flow_info(&vars);
+    let assignment_flow_info = collect_assignment_flow_info(binder, &vars);
     let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr(), hint);
     let flow_id = binder.create_node(assignment_kind);
     binder.set_assignment_flow_info(flow_id, assignment_flow_info);
@@ -137,9 +137,23 @@ pub(crate) fn index_key_is_dynamic(index_expr: &LuaIndexExpr) -> bool {
     matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
 }
 
-fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
+fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
     let mut info = AssignmentFlowInfo::default();
-    for var in vars {
+    for (target_idx, var) in vars.iter().enumerate() {
+        if let LuaVarExpr::NameExpr(name_expr) = var {
+            if let Some(decl_id) = binder
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&binder.file_id, name_expr.get_range())
+                && let Ok(target_idx) = u16::try_from(target_idx)
+            {
+                info.name_targets.push(AssignmentNameTarget {
+                    decl_id,
+                    target_idx,
+                });
+            }
+            continue;
+        }
         let LuaVarExpr::IndexExpr(index_expr) = var else {
             continue;
         };
@@ -672,7 +686,9 @@ mod tests {
             .expect("expected assignment");
         let (vars, _) = assign_stat.get_var_and_expr_list();
 
-        let info = collect_assignment_flow_info(&vars);
+        let db = crate::DbIndex::new();
+        let binder = FlowBinder::new(&db, crate::FileId::new(0));
+        let info = collect_assignment_flow_info(&binder, &vars);
         let paths = info
             .index_paths
             .iter()
@@ -682,6 +698,40 @@ mod tests {
         assert!(
             paths.contains(&"holder.items"),
             "collection append should mark prefix path as affected: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_flow_info_tracks_local_decl_and_target_index() {
+        let tree = LuaParser::parse("other, value = 1, 2", ParserConfig::default());
+        let root = tree.get_chunk_node();
+        let assign_stat = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assignment");
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        let LuaVarExpr::NameExpr(value_name) = &vars[1] else {
+            panic!("expected name target");
+        };
+        let file_id = crate::FileId::new(7);
+        let decl_id = LuaDeclId::new(file_id, rowan::TextSize::new(42));
+        let mut db = crate::DbIndex::new();
+        db.get_reference_index_mut().add_decl_reference(
+            decl_id,
+            file_id,
+            value_name.get_range(),
+            true,
+        );
+        let binder = FlowBinder::new(&db, file_id);
+
+        let info = collect_assignment_flow_info(&binder, &vars);
+
+        assert_eq!(
+            info.name_targets,
+            vec![AssignmentNameTarget {
+                decl_id,
+                target_idx: 1,
+            }]
         );
     }
 }

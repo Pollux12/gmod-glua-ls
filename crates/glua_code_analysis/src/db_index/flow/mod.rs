@@ -8,7 +8,9 @@ use rowan::TextSize;
 
 use crate::{FileId, LuaSignatureId, LuaType, VarRefId};
 pub use flow_node::*;
-pub use flow_tree::{AssignmentFlowInfo, BranchLabelInfo, FileNarrowingCapability, FlowTree};
+pub use flow_tree::{
+    AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo, FileNarrowingCapability, FlowTree,
+};
 use glua_parser::{LuaAstPtr, LuaDocOpType};
 pub use signature_cast::LuaSignatureCast;
 
