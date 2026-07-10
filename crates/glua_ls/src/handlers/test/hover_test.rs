@@ -1784,6 +1784,35 @@ local EscapeStringMap: {
     }
 
     #[gtest]
+    fn test_hover_unguarded_child_inference_is_labeled_without_replacing_declared_type()
+    -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_hover(
+            r#"
+                ---@class HoverChild.Entity
+                ---@class HoverChild.Player: HoverChild.Entity
+                ---@field GetShootPos fun(self: HoverChild.Player): HoverChild.Vector
+                ---@class HoverChild.Vector
+
+                ---@type HoverChild.Entity
+                local owner
+                local pos = owner:GetShootPos()
+                print(ow<??>ner)
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(infer) local owner: HoverChild.Player {\n    GetShootPos: function,\n} : HoverChild.Entity\n```\n\n---\n\n---\n**Scripted Entity:** `Player` (Base: `Entity`)"
+                    .to_string(),
+            },
+        ));
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_contextual_infer_function_type_label_stays_before_whole_type() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
 

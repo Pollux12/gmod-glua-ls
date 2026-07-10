@@ -5,13 +5,16 @@ use std::{collections::HashMap, sync::Arc};
 
 use rustc_hash::FxHashMap;
 
-use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr, LuaVarExpr};
+use glua_parser::{
+    LuaAstNode, LuaCallExpr, LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr,
+    LuaRepeatStat, LuaVarExpr, LuaWhileStat,
+};
 use rustc_hash::FxHashSet;
 
 use crate::{
     InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
     LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberKey, LuaMemberOwner, LuaType,
-    LuaTypeFact,
+    LuaTypeDeclId, LuaTypeFact,
     compilation::analyzer::AnalyzeContext,
     semantic::{infer_bind_value_type, infer_expr},
 };
@@ -185,6 +188,7 @@ pub(super) fn stabilize_unguarded_children(
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
+    let direct_subtype_members = precompute_direct_subtype_members(db);
 
     let file_ids = context
         .tree_list
@@ -215,10 +219,9 @@ pub(super) fn stabilize_unguarded_children(
             let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = &base_type else {
                 continue;
             };
-            let direct_children = db.get_type_index().get_sub_types(base_id);
-            if direct_children.is_empty() {
+            let Some(members) = direct_subtype_members.get(base_id) else {
                 continue;
-            }
+            };
 
             for cell in references.cells.into_iter().filter(|cell| !cell.is_write) {
                 let Some(name_expr) = root
@@ -244,11 +247,17 @@ pub(super) fn stabilize_unguarded_children(
                 let Some(index_key) = index_expr.get_index_key() else {
                     continue;
                 };
+                if is_condition_evidence(&index_expr) {
+                    continue;
+                }
                 let cache = context.infer_manager.get_infer_cache(file_id);
                 if LuaMemberKey::index_key_is_dynamic(db, cache, &index_key) {
                     continue;
                 }
                 let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
+                    continue;
+                };
+                let Some(children) = members.get(&member_key) else {
                     continue;
                 };
 
@@ -270,8 +279,7 @@ pub(super) fn stabilize_unguarded_children(
                     })
                     .unwrap_or_else(|| Arc::from([LuaDefinitionId::Declaration(decl_id)]));
                 let source = InFiled::new(file_id, index_expr.get_syntax_id());
-                for child in &direct_children {
-                    let child_id = child.get_id();
+                for child_id in children.iter() {
                     let owner = LuaMemberOwner::Type(child_id.clone());
                     let visible = db
                         .get_member_index()
@@ -348,7 +356,17 @@ pub(super) fn stabilize_unguarded_children(
             kind: LuaInferenceProvenanceKind::UnguardedChild,
             source,
         };
-        let typ = LuaType::from_vec(winners.into_iter().map(LuaType::Ref).collect());
+        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let mut support = Vec::new();
+        for child in &winners {
+            support.extend(
+                contextual_type_support(db, &LuaType::Ref(child.clone()))
+                    .iter()
+                    .cloned(),
+            );
+        }
+        support.sort_by(LuaInferenceNodeId::stable_cmp);
+        support.dedup();
         updates.push((
             node,
             LuaTypeFact::new(
@@ -356,7 +374,7 @@ pub(super) fn stabilize_unguarded_children(
                 LuaInferenceConfidence::Heuristic,
                 Arc::from([LuaInferenceStep {
                     event,
-                    support: Arc::from([]),
+                    support: support.into(),
                 }]),
             ),
         ));
@@ -367,6 +385,91 @@ pub(super) fn stabilize_unguarded_children(
         context.infer_manager.clear();
     }
     changed
+}
+
+type DirectSubtypeMembers = FxHashMap<LuaTypeDeclId, FxHashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;
+
+fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMembers {
+    let type_index = db.get_type_index();
+    let member_index = db.get_member_index();
+    let mut candidates =
+        FxHashMap::<LuaTypeDeclId, FxHashMap<LuaMemberKey, FxHashSet<LuaTypeDeclId>>>::default();
+
+    for child in type_index.get_all_types() {
+        let child_id = child.get_id();
+        let owner = LuaMemberOwner::Type(child_id.clone());
+        let Some(members) = member_index.get_members(&owner) else {
+            continue;
+        };
+        let Some(super_types) = type_index.get_super_types_iter(&child_id) else {
+            continue;
+        };
+
+        for super_type in super_types {
+            let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = super_type else {
+                continue;
+            };
+            let members_for_base = candidates.entry(base_id.clone()).or_default();
+            for member in &members {
+                members_for_base
+                    .entry(member.get_key().clone())
+                    .or_default()
+                    .insert(child_id.clone());
+            }
+        }
+    }
+
+    candidates
+        .into_iter()
+        .map(|(base_id, members)| {
+            let members = members
+                .into_iter()
+                .map(|(member_key, child_ids)| {
+                    let mut child_ids = child_ids.into_iter().collect::<Vec<_>>();
+                    child_ids.sort_by(|left, right| {
+                        type_index
+                            .get_type_decl(left)
+                            .map(|decl| decl.get_name())
+                            .unwrap_or_else(|| left.get_name())
+                            .cmp(
+                                type_index
+                                    .get_type_decl(right)
+                                    .map(|decl| decl.get_name())
+                                    .unwrap_or_else(|| right.get_name()),
+                            )
+                            .then_with(|| left.get_name().cmp(right.get_name()))
+                    });
+                    (member_key, child_ids)
+                })
+                .collect();
+            (base_id, members)
+        })
+        .collect()
+}
+
+fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
+    if index_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaCallExpr::cast)
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.syntax() == index_expr.syntax())
+    {
+        return false;
+    }
+
+    let index_range = index_expr.syntax().text_range();
+    index_expr.syntax().ancestors().any(|node| {
+        let condition = LuaIfStat::cast(node.clone())
+            .and_then(|stat| stat.get_condition_expr())
+            .or_else(|| {
+                LuaElseIfClauseStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr())
+            })
+            .or_else(|| LuaWhileStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr()))
+            .or_else(|| LuaRepeatStat::cast(node).and_then(|stat| stat.get_condition_expr()));
+        condition
+            .is_some_and(|condition| condition.syntax().text_range().contains_range(index_range))
+    })
 }
 
 fn declaration_base_type(

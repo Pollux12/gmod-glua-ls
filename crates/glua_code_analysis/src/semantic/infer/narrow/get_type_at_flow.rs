@@ -712,6 +712,12 @@ fn get_decl_position_var_ref_type(
         && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
     {
         if decl.is_param()
+            && let Some(child_type) = super::unguarded_child_decl_type(db, decl.get_id())
+        {
+            return Ok(child_type);
+        }
+
+        if decl.is_param()
             && let Ok(param_type) = infer_param_with_cache(db, cache, decl)
         {
             return Ok(param_type);

@@ -341,12 +341,14 @@ mod test {
             file_id,
             DiagnosticCode::UndefinedField,
         );
-        assert_eq!(undefined_fields.len(), 2, "{undefined_fields:?}");
-        assert!(
-            undefined_fields
-                .iter()
-                .any(|diagnostic| diagnostic.message == "Undefined field `GetShootPos`. ")
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
+        let child_inference = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
         );
+        assert_eq!(child_inference.len(), 1, "{child_inference:?}");
+        assert_eq!(child_inference[0].range.start.line, 3);
     }
 
     #[test]
@@ -3465,7 +3467,7 @@ mod test {
     }
 
     #[test]
-    fn gmod_parent_receiver_member_defined_only_on_child_reports_undefined_field() {
+    fn gmod_parent_receiver_member_defined_only_on_child_reports_child_inference() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -3485,23 +3487,32 @@ owner:GetShootPos()
 "#,
         );
 
-        let diagnostics = default_diagnostics_for_code_with_shared(
+        let undefined_fields = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
             DiagnosticCode::UndefinedField,
         );
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
 
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
         let diagnostic = &diagnostics[0];
         assert_eq!(
             diagnostic.code,
             Some(NumberOrString::String(
-                DiagnosticCode::UndefinedField.get_name().to_string()
+                DiagnosticCode::InferUnguardedChild.get_name().to_string()
             ))
         );
-        assert_eq!(diagnostic.message, "Undefined field `GetShootPos`. ");
+        assert_eq!(
+            diagnostic.message,
+            "Type `Player` was inferred from an unguarded parent-to-child relationship and may be incorrect."
+        );
         assert_eq!(diagnostic.range.start.line, 2);
-        assert_eq!(diagnostic.range.start.character, 6);
+        assert_eq!(diagnostic.range.start.character, 0);
         assert_eq!(diagnostic.range.end.line, 2);
         assert_eq!(diagnostic.range.end.character, 17);
     }

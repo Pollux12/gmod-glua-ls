@@ -6,7 +6,7 @@ mod var_ref_id;
 
 use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
-    LuaInferCache, LuaType,
+    LuaDefinitionId, LuaInferCache, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaType,
     db_index::LuaTypeDeclId,
     get_real_type, infer_param_with_cache,
     semantic::cache::FlowOrigin,
@@ -26,6 +26,18 @@ pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
+
+fn unguarded_child_decl_type(db: &DbIndex, decl_id: crate::LuaDeclId) -> Option<LuaType> {
+    db.get_inference_fact(&LuaInferenceNodeId::Definition(
+        LuaDefinitionId::Declaration(decl_id),
+    ))
+    .filter(|fact| {
+        fact.provenance()
+            .iter()
+            .any(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
+    })
+    .map(|fact| fact.typ().clone())
+}
 
 fn gmod_null_decl_id() -> LuaTypeDeclId {
     LuaTypeDeclId::global(GMOD_NULL_TYPE_NAME)
@@ -237,6 +249,10 @@ pub fn get_var_ref_type(
         // Flow/assignment analysis may also create a decl type cache entry for params,
         // but that inferred cache must not replace the declared parameter type.
         if decl.is_param() {
+            if let Some(child_type) = unguarded_child_decl_type(db, decl.get_id()) {
+                return Ok(child_type);
+            }
+
             if let Ok(param_type) = infer_param_with_cache(db, cache, decl) {
                 return Ok(param_type);
             }
