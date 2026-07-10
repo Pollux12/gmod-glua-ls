@@ -2,10 +2,11 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
+    use glua_parser::{LuaAstNode, LuaTableField};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaMemberId, LuaType, LuaTypeCache, VirtualWorkspace};
 
     #[test]
     fn test_issue_216() {
@@ -433,6 +434,177 @@ mod test {
             TraceHull(traceData)
         "#
         ));
+    }
+
+    #[test]
+    fn stable_table_field_expression_overrides_stale_aggregate_member_cache() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Vector
+
+            ---@return Vector
+            local function make_vector() end
+
+            ---@class HullTrace
+            ---@field start Vector
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            local spos = make_vector()
+            TraceHull({ start = spos })
+            "#,
+        );
+
+        let (start_member_id, live_spos_type) = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let start_field = semantic_model
+                .get_root()
+                .descendants::<LuaTableField>()
+                .find(|field| field.syntax().text().to_string().contains("start = spos"))
+                .expect("expected start table field");
+            let value_expr = start_field
+                .get_value_expr()
+                .expect("expected start field value");
+            let live_spos_type = semantic_model
+                .infer_expr(value_expr)
+                .expect("expected stable spos inference");
+
+            (
+                LuaMemberId::new(start_field.get_syntax_id(), file_id),
+                live_spos_type,
+            )
+        };
+
+        assert_eq!(ws.humanize_type(live_spos_type), "Vector");
+        ws.get_db_mut().get_type_index_mut().force_bind_type(
+            start_member_id.into(),
+            LuaTypeCache::InferType(LuaType::Nil),
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatches.is_empty(),
+            "live Vector field value should override stale nil aggregate: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn contextual_inferred_table_field_type_matches_hover_fact() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class Entity
+
+            ---@class HullTrace
+            ---@field start Vector
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            ---@type Entity
+            local owner
+            local spos = owner:GetShootPos()
+            TraceHull({ start = spos })
+            "#
+        ));
+    }
+
+    #[test]
+    fn nested_live_table_field_expression_overrides_stale_aggregate_member_cache() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Vector
+
+            ---@return Vector
+            local function make_vector() end
+
+            ---@class NestedTrace
+            ---@field position Vector
+
+            ---@class HullTrace
+            ---@field nested NestedTrace
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            local spos = make_vector()
+            TraceHull({ nested = { position = spos } })
+            "#,
+        );
+
+        let position_member_id = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let position_field = semantic_model
+                .get_root()
+                .descendants::<LuaTableField>()
+                .find(|field| {
+                    field
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .contains("position = spos")
+                })
+                .expect("expected nested position field");
+            LuaMemberId::new(position_field.get_syntax_id(), file_id)
+        };
+
+        ws.get_db_mut().get_type_index_mut().force_bind_type(
+            position_member_id.into(),
+            LuaTypeCache::InferType(LuaType::Nil),
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatches.is_empty(),
+            "nested live Vector should override stale nil aggregate: {mismatches:?}"
+        );
     }
 
     #[test]

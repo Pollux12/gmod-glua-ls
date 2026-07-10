@@ -10,7 +10,7 @@ mod type_check_context;
 mod type_check_fail_reason;
 mod type_check_guard;
 
-use std::ops::Deref;
+use std::{collections::HashMap, ops::Deref};
 
 use complex_type::check_complex_type_compact;
 use func_type::{check_doc_func_type_compact, check_sig_type_compact};
@@ -21,7 +21,7 @@ pub use type_check_fail_reason::TypeCheckFailReason;
 use type_check_guard::TypeCheckGuard;
 
 use crate::{
-    LuaMemberFeature, LuaSemanticDeclId, LuaUnionType,
+    LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaTypeFact, LuaUnionType,
     db_index::{DbIndex, LuaType},
     semantic::type_check::type_check_context::TypeCheckContext,
 };
@@ -83,6 +83,18 @@ pub fn check_type_compact_detail(
 ) -> TypeCheckResult {
     let guard = TypeCheckGuard::new();
     let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal);
+    check_general_type_compact(&mut context, source, compact_type, guard)
+}
+
+pub fn check_type_compact_detail_with_member_facts(
+    db: &DbIndex,
+    source: &LuaType,
+    compact_type: &LuaType,
+    member_facts: HashMap<LuaMemberId, LuaTypeFact>,
+) -> TypeCheckResult {
+    let guard = TypeCheckGuard::new();
+    let mut context = TypeCheckContext::new(db, true, TypeCheckCheckLevel::Normal)
+        .with_member_facts(member_facts);
     check_general_type_compact(&mut context, source, compact_type, guard)
 }
 

@@ -498,7 +498,14 @@ fn check_call_expr(
                     continue;
                 }
             }
-            let result = semantic_model.type_check_detail(&check_type, arg_type);
+            let arg_expr = match (colon_call, colon_define) {
+                (true, false) if idx == 0 => None,
+                (true, false) => arg_exprs.get(idx - 1),
+                _ => arg_exprs.get(idx),
+            };
+            let result = arg_expr
+                .map(|arg_expr| semantic_model.type_check_expr_detail(&check_type, arg_expr))
+                .unwrap_or_else(|| semantic_model.type_check_detail(&check_type, arg_type));
             if result.is_err() {
                 // `never` and `SelfInfer` indicate type inference limitations, skip the diagnostic.
                 // When the original param was SelfInfer and the arg is a class/ref/def type,
@@ -518,19 +525,8 @@ fn check_call_expr(
                 }
                 // 这里执行了`AssignTypeMismatch`的检查
                 if arg_type.is_table() {
-                    let arg_expr_idx = match (colon_call, colon_define) {
-                        (true, false) => {
-                            if idx == 0 {
-                                continue;
-                            } else {
-                                idx - 1
-                            }
-                        }
-                        _ => idx,
-                    };
-
                     // 表字段已经报错了, 则不添加参数不匹配的诊断避免干扰
-                    if let Some(arg_expr) = arg_exprs.get(arg_expr_idx)
+                    if let Some(arg_expr) = arg_expr
                         && let Some(add_diagnostic) = check_table_expr(
                             context,
                             semantic_model,
@@ -543,12 +539,6 @@ fn check_call_expr(
                         continue;
                     }
                 }
-
-                let arg_expr = match (colon_call, colon_define) {
-                    (true, false) if idx == 0 => None,
-                    (true, false) => arg_exprs.get(idx - 1),
-                    _ => arg_exprs.get(idx),
-                };
 
                 if let Some(LuaExpr::IndexExpr(index_expr)) = arg_expr
                     && let Ok(flow_arg_type) = infer_index_expr(

@@ -844,9 +844,8 @@ fn check_table_expr_content(
             continue;
         };
 
-        let expr_type = semantic_model
-            .infer_expr(value_expr.clone())
-            .unwrap_or(LuaType::Any);
+        let expr_fact = semantic_model.infer_expr_fact(value_expr.clone());
+        let expr_type = expr_fact.typ().clone();
 
         // 位于的最后的 TableFieldValue 允许接受函数调用返回的多值, 而且返回的值必然会从下标 1 开始覆盖掉所有索引字段.
         if field.is_value_field()

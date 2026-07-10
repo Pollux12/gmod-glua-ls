@@ -1,5 +1,5 @@
 use crate::{
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeCache, TypeCheckFailReason, TypeCheckResult,
+    LuaMemberKey, LuaMemberOwner, LuaType, TypeCheckFailReason, TypeCheckResult,
     semantic::type_check::{
         check_general_type_compact, type_check_context::TypeCheckContext,
         type_check_guard::TypeCheckGuard,
@@ -152,16 +152,13 @@ fn check_table_generic_compact_member_owner(
         };
 
         let member_type = context
-            .db
-            .get_type_index()
-            .get_type_cache(&member.get_id().into())
-            .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
-            .as_type();
+            .member_type(member.get_id())
+            .unwrap_or(LuaType::Unknown);
         check_general_type_compact(context, source_key, &key_type, check_guard.next_level()?)?;
         check_general_type_compact(
             context,
             source_value,
-            member_type,
+            &member_type,
             check_guard.next_level()?,
         )?;
     }

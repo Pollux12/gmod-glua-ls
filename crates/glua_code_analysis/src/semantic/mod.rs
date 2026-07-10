@@ -48,7 +48,8 @@ pub(crate) use semantic_info::{
 };
 pub use semantic_info::{SemanticInfo, SemanticInfoOrigin};
 use semantic_info::{
-    infer_node_semantic_info, infer_token_semantic_decl, infer_token_semantic_info,
+    infer_expr_semantic_info, infer_node_semantic_info, infer_token_semantic_decl,
+    infer_token_semantic_info,
 };
 pub(crate) use type_check::check_type_compact;
 use type_check::is_sub_type_of;
@@ -60,8 +61,12 @@ pub use crate::semantic::member::{
     find_members_with_key_in_workspace_for_file,
     find_members_with_key_in_workspace_for_file_at_offset,
 };
-use crate::semantic::type_check::check_type_compact_detail;
-use crate::{Emmyrc, LuaDocument, LuaSemanticDeclId, ModuleInfo, db_index::LuaTypeDeclId};
+use crate::semantic::type_check::{
+    check_type_compact_detail, check_type_compact_detail_with_member_facts,
+};
+use crate::{
+    Emmyrc, LuaDocument, LuaSemanticDeclId, LuaTypeFact, ModuleInfo, db_index::LuaTypeDeclId,
+};
 use crate::{
     FileId,
     db_index::{DbIndex, LuaType},
@@ -206,6 +211,20 @@ impl<'a> SemanticModel<'a> {
         infer_expr(self.db, &mut self.infer_cache.borrow_mut(), expr)
     }
 
+    pub fn infer_expr_fact(&self, expr: LuaExpr) -> LuaTypeFact {
+        let mut cache = self.infer_cache.borrow_mut();
+        let semantic_decl = infer_expr_semantic_decl(
+            self.db,
+            &mut cache,
+            expr.clone(),
+            SemanticDeclGuard::default(),
+            SemanticDeclLevel::NoTrace,
+        );
+        infer_expr_semantic_info(self.db, &mut cache, expr, semantic_decl)
+            .inference_fact()
+            .clone()
+    }
+
     pub fn infer_table_should_be(&self, table: LuaTableExpr) -> Option<LuaType> {
         infer_table_should_be(self.db, &mut self.infer_cache.borrow_mut(), table).ok()
     }
@@ -329,6 +348,41 @@ impl<'a> SemanticModel<'a> {
 
     pub fn type_check_detail(&self, source: &LuaType, compact_type: &LuaType) -> TypeCheckResult {
         check_type_compact_detail(self.db, source, compact_type)
+    }
+
+    pub fn type_check_expr_detail(
+        &self,
+        source: &LuaType,
+        compact_expr: &LuaExpr,
+    ) -> TypeCheckResult {
+        let compact_fact = self.infer_expr_fact(compact_expr.clone());
+        let mut member_facts = HashMap::new();
+        self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
+        check_type_compact_detail_with_member_facts(
+            self.db,
+            source,
+            compact_fact.typ(),
+            member_facts,
+        )
+    }
+
+    fn collect_table_expr_member_facts(
+        &self,
+        expr: &LuaExpr,
+        member_facts: &mut HashMap<LuaMemberId, LuaTypeFact>,
+    ) {
+        let Some(table_expr) = LuaTableExpr::cast(expr.syntax().clone()) else {
+            return;
+        };
+
+        for field in table_expr.get_fields() {
+            let Some(value_expr) = field.get_value_expr() else {
+                continue;
+            };
+            let member_id = LuaMemberId::new(field.get_syntax_id(), self.file_id);
+            member_facts.insert(member_id, self.infer_expr_fact(value_expr.clone()));
+            self.collect_table_expr_member_facts(&value_expr, member_facts);
+        }
     }
 
     pub fn infer_call_expr_func(

@@ -364,16 +364,13 @@ fn check_ref_type_compact_table(
                     .get_member(table_member_id)
                     .ok_or(TypeCheckFailReason::TypeNotMatch)?;
                 let table_member_type = context
-                    .db
-                    .get_type_index()
-                    .get_type_cache(&table_member.get_id().into())
-                    .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
-                    .as_type();
+                    .member_type(table_member.get_id())
+                    .unwrap_or(LuaType::Any);
 
                 if let Err(err) = check_general_type_compact(
                     context,
                     source_member_type,
-                    table_member_type,
+                    &table_member_type,
                     check_guard.next_level()?,
                 ) && err.is_type_not_match()
                 {
@@ -387,7 +384,8 @@ fn check_ref_type_compact_table(
                             name = key.to_path(),
                             expect =
                                 humanize_type(context.db, source_member_type, RenderLevel::Simple),
-                            got = humanize_type(context.db, table_member_type, RenderLevel::Simple)
+                            got =
+                                humanize_type(context.db, &table_member_type, RenderLevel::Simple)
                         )
                         .to_string(),
                     ));
