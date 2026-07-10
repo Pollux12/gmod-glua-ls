@@ -237,7 +237,7 @@ impl LuaInferCache {
         // selected through types and overloads that unresolve is about to
         // materialize, so discard only those semantic entries.
         self.expr_var_ref_id_cache
-            .retain(|_, var_ref_id| var_ref_is_phase_stable(db, var_ref_id));
+            .retain(|syntax_id, var_ref_id| var_ref_is_phase_stable(db, syntax_id, var_ref_id));
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
@@ -365,7 +365,7 @@ impl LuaInferCache {
     }
 }
 
-fn var_ref_is_phase_stable(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+fn var_ref_is_phase_stable(db: &DbIndex, syntax_id: &LuaSyntaxId, var_ref_id: &VarRefId) -> bool {
     let local_decl_is_stable = |decl_id: &LuaDeclId| {
         db.get_decl_index()
             .get_decl(decl_id)
@@ -374,7 +374,13 @@ fn var_ref_is_phase_stable(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
 
     match var_ref_id {
         VarRefId::VarRef(decl_id) => local_decl_is_stable(decl_id),
-        VarRefId::IndexRef(VarRefRootId::Decl(decl_id), _) => local_decl_is_stable(decl_id),
+        VarRefId::IndexRef(VarRefRootId::Decl(decl_id), _) => {
+            // A call annotated as rawget can also produce an IndexRef rooted at
+            // a local, but that identity depends on its resolved signature.
+            // Only a syntactic index expression is structural across unresolve.
+            syntax_id.get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+                && local_decl_is_stable(decl_id)
+        }
         VarRefId::SelfRef(_)
         | VarRefId::IndexRef(VarRefRootId::Member(_) | VarRefRootId::SelfRef(_), _)
         | VarRefId::GlobalName(_, _) => false,
@@ -384,10 +390,15 @@ fn var_ref_is_phase_stable(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
 #[cfg(test)]
 mod tests {
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use internment::ArcIntern;
     use rowan::{TextRange, TextSize};
+    use smol_str::SmolStr;
 
     use super::{CacheEntry, LuaInferCache};
-    use crate::{DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaType, VarRefId};
+    use crate::{
+        DbIndex, FileId, FlowId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree,
+        LuaType, VarRefId, VarRefRootId,
+    };
 
     #[test]
     fn clear_for_unresolve_preserves_only_structural_lookup_caches() {
@@ -434,5 +445,54 @@ mod tests {
             Some(&vec![TextSize::from(9)])
         );
         assert!(cache.local_reassignments_indexed);
+    }
+
+    #[test]
+    fn clear_for_unresolve_discards_semantic_call_expression_var_refs() {
+        let file_id = FileId { id: 7 };
+        let local_range = TextRange::new(TextSize::from(3), TextSize::from(4));
+        let local_decl = LuaDecl::new(
+            "value",
+            file_id,
+            local_range,
+            LuaDeclExtra::Local {
+                kind: LuaSyntaxKind::LocalName.into(),
+                attrib: None,
+            },
+            None,
+        );
+        let decl_id = local_decl.get_id();
+        let mut decl_tree = LuaDeclarationTree::new(file_id);
+        decl_tree.add_decl(local_decl);
+        let mut db = DbIndex::new();
+        db.get_decl_index_mut().add_decl_tree(decl_tree);
+
+        let call_expr_id = LuaSyntaxId::new(
+            LuaSyntaxKind::CallExpr.into(),
+            TextRange::new(TextSize::from(10), TextSize::from(20)),
+        );
+        let index_expr_id = LuaSyntaxId::new(
+            LuaSyntaxKind::IndexExpr.into(),
+            TextRange::new(TextSize::from(21), TextSize::from(30)),
+        );
+        let index_ref = VarRefId::IndexRef(
+            VarRefRootId::Decl(decl_id),
+            ArcIntern::new(SmolStr::new("value.key")),
+        );
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache
+            .expr_var_ref_id_cache
+            .insert(call_expr_id, index_ref.clone());
+        cache
+            .expr_var_ref_id_cache
+            .insert(index_expr_id, index_ref.clone());
+
+        cache.clear_for_unresolve(&db);
+
+        assert!(!cache.expr_var_ref_id_cache.contains_key(&call_expr_id));
+        assert_eq!(
+            cache.expr_var_ref_id_cache.get(&index_expr_id),
+            Some(&index_ref)
+        );
     }
 }
