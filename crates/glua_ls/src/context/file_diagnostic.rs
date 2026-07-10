@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     sync::{
         Arc, Mutex as StdMutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -10,7 +10,7 @@ use std::{
 use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
 use log::{debug, info, warn};
 use lsp_types::{Diagnostic, PublishDiagnosticsParams, Uri};
-use tokio::sync::{Mutex, RwLock, Semaphore};
+use tokio::sync::{Mutex, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
@@ -500,11 +500,7 @@ impl FileDiagnostic {
 
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
-            let file_ids = analysis
-                .compilation
-                .get_db()
-                .get_module_index()
-                .get_main_workspace_file_ids();
+            let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
             info!(
                 "precomputing shared diagnostic data for {} workspace files",
                 file_ids.len()
@@ -512,7 +508,6 @@ impl FileDiagnostic {
             let shared_data = self.force_precompute_shared_diagnostic_data(&analysis);
             (file_ids, shared_data)
         };
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
         if valid_file_count != 0 {
             status_bar.update_progress_task(
@@ -526,27 +521,12 @@ impl FileDiagnostic {
                 valid_file_count,
             );
         }
-        let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
-
-        for file_id in main_workspace_file_ids {
-            let analysis = self.analysis.clone();
-            let token = cancel_token.clone();
-            let tx = tx.clone();
-            let semaphore = semaphore.clone();
-            let shared_data = shared_data.clone();
-            tokio::spawn(async move {
-                let result = diagnose_workspace_file_off_thread(
-                    analysis,
-                    semaphore,
-                    file_id,
-                    shared_data,
-                    token,
-                )
-                .await;
-                let _ = tx.send(result).await;
-            });
-        }
-        drop(tx);
+        let mut rx = spawn_workspace_diagnostic_workers(
+            self.analysis.clone(),
+            main_workspace_file_ids,
+            shared_data,
+            cancel_token.clone(),
+        );
 
         let mut count = 0;
         let mut last_percentage = 0;
@@ -641,11 +621,7 @@ impl FileDiagnostic {
 
         let (main_workspace_file_ids, shared_data) = {
             let analysis = self.analysis.read().await;
-            let file_ids = analysis
-                .compilation
-                .get_db()
-                .get_module_index()
-                .get_main_workspace_file_ids();
+            let file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
             info!(
                 "precomputing shared diagnostic data for {} workspace files",
                 file_ids.len()
@@ -654,7 +630,6 @@ impl FileDiagnostic {
             (file_ids, shared_data)
         };
 
-        let (tx, mut rx) = tokio::sync::mpsc::channel::<Option<(Vec<Diagnostic>, Uri)>>(100);
         let valid_file_count = main_workspace_file_ids.len();
         if valid_file_count != 0 {
             status_bar.update_progress_task(
@@ -669,27 +644,12 @@ impl FileDiagnostic {
             );
         }
 
-        let analysis = self.analysis.clone();
-        let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
-        for file_id in main_workspace_file_ids {
-            let analysis = analysis.clone();
-            let token = cancel_token.clone();
-            let tx = tx.clone();
-            let semaphore = semaphore.clone();
-            let shared_data = shared_data.clone();
-            tokio::spawn(async move {
-                let result = diagnose_workspace_file_off_thread(
-                    analysis,
-                    semaphore,
-                    file_id,
-                    shared_data,
-                    token,
-                )
-                .await;
-                let _ = tx.send(result).await;
-            });
-        }
-        drop(tx);
+        let mut rx = spawn_workspace_diagnostic_workers(
+            self.analysis.clone(),
+            main_workspace_file_ids,
+            shared_data,
+            cancel_token.clone(),
+        );
 
         let mut count = 0;
         if valid_file_count != 0 {
@@ -772,9 +732,58 @@ fn workspace_diagnostic_parallelism() -> usize {
         .clamp(1, 16)
 }
 
+type WorkspaceDiagnosticResult = Option<(Vec<Diagnostic>, Uri)>;
+
+fn spawn_workspace_diagnostic_workers(
+    analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    file_ids: Vec<FileId>,
+    shared_data: Arc<SharedDiagnosticData>,
+    cancel_token: CancellationToken,
+) -> tokio::sync::mpsc::Receiver<WorkspaceDiagnosticResult> {
+    let worker_count = workspace_diagnostic_parallelism().min(file_ids.len());
+    let file_ids = Arc::new(file_ids);
+    let next_file = Arc::new(AtomicUsize::new(0));
+    let (tx, rx) = tokio::sync::mpsc::channel(100);
+
+    for _ in 0..worker_count {
+        let analysis = analysis.clone();
+        let file_ids = file_ids.clone();
+        let next_file = next_file.clone();
+        let shared_data = shared_data.clone();
+        let cancel_token = cancel_token.clone();
+        let tx = tx.clone();
+        tokio::spawn(async move {
+            loop {
+                if cancel_token.is_cancelled() {
+                    break;
+                }
+                let Some(file_id) = claim_next_diagnostic_file(&file_ids, &next_file) else {
+                    break;
+                };
+                let result = diagnose_workspace_file_off_thread(
+                    analysis.clone(),
+                    file_id,
+                    shared_data.clone(),
+                    cancel_token.clone(),
+                )
+                .await;
+                if tx.send(result).await.is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    rx
+}
+
+fn claim_next_diagnostic_file(file_ids: &[FileId], next_file: &AtomicUsize) -> Option<FileId> {
+    let index = next_file.fetch_add(1, Ordering::Relaxed);
+    file_ids.get(index).copied()
+}
+
 async fn diagnose_workspace_file_off_thread(
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
-    semaphore: Arc<Semaphore>,
     file_id: FileId,
     shared_data: Arc<glua_code_analysis::SharedDiagnosticData>,
     cancel_token: CancellationToken,
@@ -783,23 +792,10 @@ async fn diagnose_workspace_file_off_thread(
         return None;
     }
 
-    let permit = tokio::select! {
-        _ = cancel_token.cancelled() => {
-            return None;
-        }
-        permit = semaphore.acquire_owned() => {
-            match permit {
-                Ok(permit) => permit,
-                Err(_) => return None,
-            }
-        }
-    };
-
     let blocking_analysis = analysis;
     let blocking_shared_data = shared_data;
     let blocking_token = cancel_token.clone();
     match tokio::task::spawn_blocking(move || {
-        let _permit = permit;
         if blocking_token.is_cancelled() {
             return None;
         }
@@ -852,11 +848,7 @@ async fn push_workspace_diagnostic(
 
     let (main_workspace_file_ids, shared_data) = {
         let read_analysis = analysis.read().await;
-        let file_ids = read_analysis
-            .compilation
-            .get_db()
-            .get_module_index()
-            .get_main_workspace_file_ids();
+        let file_ids = read_analysis.get_main_workspace_file_ids_for_diagnostics();
         info!(
             "precomputing shared diagnostic data for {} workspace files",
             file_ids.len()
@@ -864,8 +856,6 @@ async fn push_workspace_diagnostic(
         let shared_data = file_diagnostic.force_precompute_shared_diagnostic_data(&read_analysis);
         (file_ids, shared_data)
     };
-    // diagnostic files
-    let (tx, mut rx) = tokio::sync::mpsc::channel::<FileId>(100);
     let valid_file_count = main_workspace_file_ids.len();
     if !silent && valid_file_count != 0 {
         status_bar.update_progress_task(
@@ -878,35 +868,12 @@ async fn push_workspace_diagnostic(
         watchdog_status.set_progress("Diagnosing workspace files (push)", 0, valid_file_count);
     }
 
-    let semaphore = Arc::new(Semaphore::new(workspace_diagnostic_parallelism()));
-    for file_id in main_workspace_file_ids {
-        let analysis = analysis.clone();
-        let token = cancel_token.clone();
-        let client = client_proxy.clone();
-        let semaphore = semaphore.clone();
-        let tx = tx.clone();
-        let shared_data = shared_data.clone();
-        tokio::spawn(async move {
-            let result = diagnose_workspace_file_off_thread(
-                analysis,
-                semaphore,
-                file_id,
-                shared_data,
-                token,
-            )
-            .await;
-            if let Some((diagnostics, uri)) = result {
-                let diagnostic_param = lsp_types::PublishDiagnosticsParams {
-                    uri,
-                    diagnostics,
-                    version: None,
-                };
-                client.publish_diagnostics(diagnostic_param);
-            }
-            let _ = tx.send(file_id).await;
-        });
-    }
-    drop(tx);
+    let mut rx = spawn_workspace_diagnostic_workers(
+        analysis,
+        main_workspace_file_ids,
+        shared_data,
+        cancel_token.clone(),
+    );
 
     let mut count = 0;
     if valid_file_count != 0 {
@@ -916,9 +883,17 @@ async fn push_workspace_diagnostic(
                 _ = cancel_token.cancelled() => {
                     break;
                 }
-                maybe_file_id = rx.recv() => {
-                    if maybe_file_id.is_none() {
+                maybe_result = rx.recv() => {
+                    let Some(result) = maybe_result else {
                         break;
+                    };
+                    if let Some((diagnostics, uri)) = result {
+                        let diagnostic_param = lsp_types::PublishDiagnosticsParams {
+                            uri,
+                            diagnostics,
+                            version: None,
+                        };
+                        client_proxy.publish_diagnostics(diagnostic_param);
                     }
                     count += 1;
                     let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
@@ -1024,16 +999,19 @@ fn filter_diagnostics_by_line_span(
 #[cfg(test)]
 mod tests {
     use crate::context::{ClientProxy, StatusBar};
-    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, file_path_to_uri};
+    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, Emmyrc, FileId, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::NumberOrString;
     use lsp_types::{Position, Range};
-    use std::sync::Arc;
+    use std::sync::{Arc, atomic::AtomicUsize};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
-    use super::{FileDiagnostic, changed_line_span, filter_diagnostics_by_line_span};
+    use super::{
+        FileDiagnostic, changed_line_span, claim_next_diagnostic_file,
+        filter_diagnostics_by_line_span,
+    };
 
     fn diagnostic(start_line: u32, end_line: u32) -> lsp_types::Diagnostic {
         lsp_types::Diagnostic {
@@ -1095,6 +1073,27 @@ mod tests {
         .collect::<Vec<_>>();
 
         verify_that!(filtered.as_slice(), eq(&[(0, 0), (3, 3)]))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn workspace_diagnostic_workers_claim_the_shared_priority_queue_in_order() -> Result<()> {
+        let prioritized = [FileId::new(9), FileId::new(3), FileId::new(7)];
+        let next_file = AtomicUsize::new(0);
+
+        verify_that!(
+            claim_next_diagnostic_file(&prioritized, &next_file),
+            some(eq(FileId::new(9)))
+        )?;
+        verify_that!(
+            claim_next_diagnostic_file(&prioritized, &next_file),
+            some(eq(FileId::new(3)))
+        )?;
+        verify_that!(
+            claim_next_diagnostic_file(&prioritized, &next_file),
+            some(eq(FileId::new(7)))
+        )?;
+        verify_that!(claim_next_diagnostic_file(&prioritized, &next_file), none())?;
         Ok(())
     }
 

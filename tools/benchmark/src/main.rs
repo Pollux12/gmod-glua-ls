@@ -254,8 +254,7 @@ async fn main() {
 
     // Phase 5: Diagnostics (parallel, matching real LS behavior)
     let t = Instant::now();
-    let db = analysis.compilation.get_db();
-    let main_file_ids = db.get_module_index().get_main_workspace_file_ids();
+    let main_file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
     let diag_file_count = main_file_ids.len();
 
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)

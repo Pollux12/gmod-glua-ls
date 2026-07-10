@@ -801,15 +801,6 @@ fn literal_member_key(index_expr: &LuaIndexExpr) -> Option<LuaMemberKey> {
     }
 }
 
-fn is_expr_guarded_by_prior_type_guard_early_return(
-    semantic_model: &SemanticModel,
-    expr: &LuaExpr,
-) -> bool {
-    is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
-        condition_is_negative_type_guard(semantic_model, condition, guarded)
-    })
-}
-
 fn is_expr_guarded_by_prior_null_excluding_type_guard_early_return(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
@@ -1345,13 +1336,9 @@ fn is_expr_guarded_by_prior_nil_early_return(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> bool {
-    // Try annotation-backed guard first (structural, more precise)
-    if is_expr_guarded_by_prior_type_guard_early_return(semantic_model, expr) {
-        return true;
-    }
-    // Fall back to general negation guard (text-based, handles dynamic keys)
     is_expr_guarded_by_prior_early_return(semantic_model, expr, |condition, guarded| {
-        condition_is_negative_expr_guard(condition, guarded)
+        condition_is_negative_type_guard(semantic_model, condition, guarded)
+            || condition_is_negative_expr_guard(condition, guarded)
     })
 }
 
