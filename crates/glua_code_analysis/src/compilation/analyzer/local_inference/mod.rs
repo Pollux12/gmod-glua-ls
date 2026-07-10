@@ -271,6 +271,16 @@ pub(super) fn stabilize_unguarded_children(
                 ) {
                     continue;
                 }
+                if type_has_visible_member_at_use(
+                    db,
+                    context,
+                    &base_type,
+                    &member_key,
+                    file_id,
+                    index_expr.get_position(),
+                ) {
+                    continue;
+                }
 
                 let definitions = flow_tree
                     .and_then(|tree| {
@@ -385,6 +395,30 @@ pub(super) fn stabilize_unguarded_children(
         context.infer_manager.clear();
     }
     changed
+}
+
+fn type_has_visible_member_at_use(
+    db: &crate::DbIndex,
+    context: &AnalyzeContext,
+    typ: &LuaType,
+    member_key: &LuaMemberKey,
+    file_id: crate::FileId,
+    position: rowan::TextSize,
+) -> bool {
+    context
+        .workspace_id
+        .and_then(|workspace_id| {
+            crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
+                db,
+                typ,
+                member_key.clone(),
+                false,
+                workspace_id,
+                file_id,
+                position,
+            )
+        })
+        .is_some_and(|members| !members.is_empty())
 }
 
 type DirectSubtypeMembers = FxHashMap<LuaTypeDeclId, FxHashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;

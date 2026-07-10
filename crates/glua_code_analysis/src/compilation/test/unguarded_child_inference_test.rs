@@ -151,6 +151,29 @@ mod test {
     }
 
     #[test]
+    fn unguarded_child_does_not_refine_parent_member_override() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@field Shared fun(self: Base)
+            ---@class Child: Base
+            ---@field Shared fun(self: Child)
+            ---@type Base
+            local value
+            value:Shared()
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+    }
+
+    #[test]
     fn unguarded_child_never_uses_a_grandchild() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
