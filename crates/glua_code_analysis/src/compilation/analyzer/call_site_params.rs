@@ -1,6 +1,7 @@
 use crate::{
-    DbIndex, FileId, LuaDeclExtra, LuaInferCache, LuaSignatureId, LuaType, infer_expr,
-    profile::Profile,
+    DbIndex, FileId, InFiled, LuaDeclExtra, LuaInferCache, LuaInferenceConfidence,
+    LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
+    LuaSignatureId, LuaType, LuaTypeFact, infer_expr, profile::Profile,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaNameExpr,
@@ -63,7 +64,7 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
                 (file_id, contributions)
             });
         db.get_call_site_param_index_mut()
-            .set_files_contributions(contribution_updates);
+            .set_files_fact_contributions(contribution_updates);
     }
 }
 
@@ -140,7 +141,7 @@ fn collect_call_site_param_types(
     cache: &mut LuaInferCache,
     file_id: FileId,
     call_expr: LuaCallExpr,
-    contributions: &mut Vec<(LuaSignatureId, usize, LuaType)>,
+    contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
 ) -> Option<()> {
     let args = call_expr.get_args_list()?;
     let useful_args = args
@@ -178,6 +179,7 @@ fn collect_call_site_param_types(
         {
             continue;
         }
+        let arg_syntax_id = arg.get_syntax_id();
         let Some(arg_type) = infer_supported_call_site_arg_type(db, cache, file_id, arg) else {
             continue;
         };
@@ -185,7 +187,28 @@ fn collect_call_site_param_types(
             continue;
         }
 
-        contributions.push((signature_id, param_idx, arg_type));
+        let node = LuaInferenceNodeId::SignatureParam {
+            signature_id,
+            param_idx: u16::try_from(param_idx).ok()?,
+        };
+        let event = LuaInferenceEventId {
+            node,
+            kind: LuaInferenceProvenanceKind::ContextualUnknown,
+            source: InFiled::new(file_id, arg_syntax_id),
+        };
+        contributions.push((
+            signature_id,
+            param_idx,
+            LuaTypeFact::new(
+                arg_type,
+                LuaInferenceConfidence::Anchored,
+                vec![LuaInferenceStep {
+                    event,
+                    support: vec![].into(),
+                }]
+                .into(),
+            ),
+        ));
     }
 
     Some(())

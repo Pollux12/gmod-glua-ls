@@ -3,13 +3,13 @@ use std::collections::HashMap;
 use rowan::TextSize;
 
 use super::traits::LuaIndex;
-use crate::{FileId, LuaSignatureId, LuaType};
+use crate::{FileId, LuaInferenceDiagnosticEvent, LuaSignatureId, LuaType, LuaTypeFact};
 
 #[derive(Debug, Clone)]
 struct CallSiteParamContribution {
     signature_id: LuaSignatureId,
     param_idx: usize,
-    param_type: LuaType,
+    param_fact: LuaTypeFact,
 }
 
 fn sorted_file_ids<V>(map: &HashMap<FileId, V>) -> Vec<FileId> {
@@ -29,7 +29,8 @@ pub struct CallSiteParamIndex {
     /// file → observed call-site param evidence contributed by calls in that file.
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
     /// signature → param index → union of all observed types from current file contributions.
-    inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaType>>,
+    inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    inference_events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
 }
 
 impl CallSiteParamIndex {
@@ -73,16 +74,38 @@ impl CallSiteParamIndex {
         &mut self,
         updates: Vec<(FileId, Vec<(LuaSignatureId, usize, LuaType)>)>,
     ) {
+        self.set_files_fact_contributions(
+            updates
+                .into_iter()
+                .map(|(file_id, contributions)| {
+                    (
+                        file_id,
+                        contributions
+                            .into_iter()
+                            .map(|(signature_id, param_idx, typ)| {
+                                (signature_id, param_idx, LuaTypeFact::certain(typ))
+                            })
+                            .collect(),
+                    )
+                })
+                .collect(),
+        );
+    }
+
+    pub fn set_files_fact_contributions(
+        &mut self,
+        updates: Vec<(FileId, Vec<(LuaSignatureId, usize, LuaTypeFact)>)>,
+    ) {
         for (file_id, contributions) in updates {
             self.file_contributions.insert(
                 file_id,
                 contributions
                     .into_iter()
                     .map(
-                        |(signature_id, param_idx, param_type)| CallSiteParamContribution {
+                        |(signature_id, param_idx, param_fact)| CallSiteParamContribution {
                             signature_id,
                             param_idx,
-                            param_type,
+                            param_fact,
                         },
                     )
                     .collect(),
@@ -96,13 +119,30 @@ impl CallSiteParamIndex {
         signature_id: &LuaSignatureId,
         param_idx: usize,
     ) -> Option<&LuaType> {
+        self.get_inferred_param_fact(signature_id, param_idx)
+            .map(LuaTypeFact::typ)
+    }
+
+    pub fn get_inferred_param_fact(
+        &self,
+        signature_id: &LuaSignatureId,
+        param_idx: usize,
+    ) -> Option<&LuaTypeFact> {
         self.inferred_params
             .get(signature_id)
             .and_then(|params| params.get(&param_idx))
     }
 
+    pub fn get_inference_events_for_file(&self, file_id: FileId) -> &[LuaInferenceDiagnosticEvent] {
+        self.inference_events_by_file
+            .get(&file_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
     fn rebuild_derived_state(&mut self) {
         self.inferred_params.clear();
+        self.inference_events_by_file.clear();
 
         for file_id in sorted_file_ids(&self.file_contributions) {
             let Some(contributions) = self.file_contributions.get(&file_id) else {
@@ -115,13 +155,39 @@ impl CallSiteParamIndex {
                     .or_default()
                     .entry(contribution.param_idx)
                     .and_modify(|current| {
-                        *current = LuaType::from_vec(vec![
-                            current.clone(),
-                            contribution.param_type.clone(),
-                        ])
+                        let mut provenance = current.provenance().to_vec();
+                        provenance.extend_from_slice(contribution.param_fact.provenance());
+                        *current = LuaTypeFact::new(
+                            LuaType::from_vec(vec![
+                                current.typ().clone(),
+                                contribution.param_fact.typ().clone(),
+                            ]),
+                            current
+                                .confidence()
+                                .max(contribution.param_fact.confidence()),
+                            provenance.into(),
+                        )
                     })
-                    .or_insert_with(|| contribution.param_type.clone());
+                    .or_insert_with(|| contribution.param_fact.clone());
             }
+        }
+
+        for params in self.inferred_params.values() {
+            for fact in params.values() {
+                for step in fact.provenance() {
+                    self.inference_events_by_file
+                        .entry(step.event.source.file_id)
+                        .or_default()
+                        .push(LuaInferenceDiagnosticEvent {
+                            event: step.event.clone(),
+                            fact: fact.clone(),
+                        });
+                }
+            }
+        }
+        for events in self.inference_events_by_file.values_mut() {
+            events.sort_by(|left, right| left.event.stable_cmp(&right.event));
+            events.dedup_by(|left, right| left.event == right.event);
         }
     }
 
@@ -160,6 +226,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.source_signatures_by_path.clear();
         self.file_contributions.clear();
         self.inferred_params.clear();
+        self.inference_events_by_file.clear();
         self.mutated_params.clear();
     }
 }

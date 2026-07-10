@@ -206,7 +206,13 @@ impl DbIndex {
             LuaInferenceNodeId::Definition(definition) => {
                 self.types_index.get_definition_fact(definition).cloned()
             }
-            LuaInferenceNodeId::SignatureParam { .. } => None,
+            LuaInferenceNodeId::SignatureParam {
+                signature_id,
+                param_idx,
+            } => self
+                .call_site_param_index
+                .get_inferred_param_fact(signature_id, usize::from(*param_idx))
+                .cloned(),
         }
     }
 

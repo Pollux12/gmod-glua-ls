@@ -13,11 +13,19 @@ impl Checker for InferenceTrustChecker {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let events = semantic_model
+        let mut events = semantic_model
             .get_db()
             .get_type_index()
             .get_inference_events_for_file(context.get_file_id())
             .to_vec();
+        events.extend_from_slice(
+            semantic_model
+                .get_db()
+                .get_call_site_param_index()
+                .get_inference_events_for_file(context.get_file_id()),
+        );
+        events.sort_by(|left, right| left.event.stable_cmp(&right.event));
+        events.dedup_by(|left, right| left.event == right.event);
         for inference in events {
             let (code, source) = match inference.event.kind {
                 LuaInferenceProvenanceKind::ContextualUnknown => {
