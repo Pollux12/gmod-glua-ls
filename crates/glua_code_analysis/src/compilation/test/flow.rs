@@ -192,6 +192,41 @@ mod test {
     }
 
     #[test]
+    fn deferred_closure_keeps_preceding_zero_delay_timer_effect() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class MenuPanel
+        MenuPanel = {}
+
+        ---@type MenuPanel
+        pnlMainMenu = nil
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        timer = {}
+        function timer.Simple(delay, callback) end
+
+        timer.Simple(0, function()
+            pnlMainMenu = MenuPanel
+        end)
+
+        local refresh = function()
+            local captured = pnlMainMenu
+        end
+        "#,
+        );
+
+        let captured = nth_name_expr_type_from_end(&mut ws, file_id, "pnlMainMenu", 0);
+        assert_eq!(ws.humanize_type(captured), "MenuPanel");
+    }
+
+    #[test]
     fn untyped_global_nil_assignment_still_reports_unchecked_access() {
         let mut ws = VirtualWorkspace::new();
 
@@ -939,6 +974,26 @@ end
         let b = ws.expr_ty("b");
         let b_desc = ws.humanize_type(b);
         assert_eq!(b_desc, "table");
+    }
+
+    #[test]
+    fn deferred_closure_keeps_preceding_tag_cast() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@type string|number
+        local value = 1
+        ---@cast value string
+
+        local callback = function()
+            local captured = value
+        end
+        "#,
+        );
+
+        let captured = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_eq!(ws.humanize_type(captured), "string");
     }
 
     #[test]

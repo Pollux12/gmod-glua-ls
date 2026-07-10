@@ -161,3 +161,68 @@ pub fn bind_call_expr(
     bind_each_child(binder, LuaAst::LuaCallExpr(call_expr.clone()), current);
     Some(())
 }
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaParser, ParserConfig};
+
+    use super::*;
+    use crate::{DbIndex, FileId};
+
+    #[test]
+    fn closure_children_do_not_attach_to_enclosing_control_targets() {
+        let parser = LuaParser::parse(
+            r#"
+            local callback = function()
+                result = left and right
+                break
+            end
+            "#,
+            ParserConfig::default(),
+        );
+        let closure = parser
+            .get_chunk_node()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("closure expression");
+        let db = DbIndex::new();
+        let mut binder = FlowBinder::new(&db, FileId::new(1));
+        let outer_loop = binder.create_loop_label();
+        let outer_break = binder.create_branch_label();
+        let outer_true = binder.create_branch_label();
+        let outer_false = binder.create_branch_label();
+        binder.loop_label = outer_loop;
+        binder.break_target_label = outer_break;
+        binder.true_target = outer_true;
+        binder.false_target = outer_false;
+
+        let start = binder.start;
+        bind_closure_expr(&mut binder, closure, start).expect("closure expression should bind");
+
+        assert_eq!(
+            [
+                binder.loop_label,
+                binder.break_target_label,
+                binder.true_target,
+                binder.false_target,
+            ],
+            [outer_loop, outer_break, outer_true, outer_false]
+        );
+
+        let (tree, errors) = binder.finish();
+        let outer_targets_have_antecedents =
+            [outer_break, outer_true, outer_false].map(|flow_id| {
+                tree.get_flow_node(flow_id)
+                    .is_some_and(|node| node.antecedent.is_some())
+            });
+
+        assert_eq!(outer_targets_have_antecedents, [false, false, false]);
+        assert_eq!(
+            errors
+                .iter()
+                .map(|error| error.message.as_str())
+                .collect::<Vec<_>>(),
+            vec!["Break outside loop"]
+        );
+    }
+}
