@@ -126,6 +126,10 @@ pub enum DiagnosticCode {
     InvertIf,
     /// Call to a non-callable value
     CallNonCallable,
+    /// A formerly unknown value was inferred from usage context
+    InferUnknown,
+    /// A child value was inferred from an unguarded parent relationship
+    InferUnguardedChild,
     /// gmod-invalid-hook-name
     GmodInvalidHookName,
     /// gmod-realm-mismatch (strict realm mismatch)
@@ -182,6 +186,8 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::IterVariableReassign => DiagnosticSeverity::ERROR,
         DiagnosticCode::PreferredLocalAlias => DiagnosticSeverity::HINT,
         DiagnosticCode::CallNonCallable => DiagnosticSeverity::WARNING,
+        DiagnosticCode::InferUnknown => DiagnosticSeverity::HINT,
+        DiagnosticCode::InferUnguardedChild => DiagnosticSeverity::WARNING,
         DiagnosticCode::NeedCheckNil => DiagnosticSeverity::HINT,
         DiagnosticCode::UncheckedNilAccess => DiagnosticSeverity::WARNING,
         DiagnosticCode::GenericConstraintMismatch => DiagnosticSeverity::INFORMATION,
@@ -384,6 +390,29 @@ mod tests {
             DiagnosticCode::UncheckedNilAccess.get_name(),
             eq("unchecked-nil-access")
         );
+    }
+
+    #[gtest]
+    fn inference_diagnostics_have_independent_names_and_defaults() {
+        let level = LuaLanguageLevel::Lua54;
+        assert_that!(DiagnosticCode::InferUnknown.get_name(), eq("infer-unknown"));
+        assert_that!(
+            DiagnosticCode::InferUnguardedChild.get_name(),
+            eq("infer-unguarded-child")
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::InferUnknown),
+            eq(DiagnosticSeverity::HINT)
+        );
+        assert_that!(
+            get_default_severity(DiagnosticCode::InferUnguardedChild),
+            eq(DiagnosticSeverity::WARNING)
+        );
+        assert!(is_code_default_enable(&DiagnosticCode::InferUnknown, level));
+        assert!(is_code_default_enable(
+            &DiagnosticCode::InferUnguardedChild,
+            level
+        ));
     }
 
     #[gtest]

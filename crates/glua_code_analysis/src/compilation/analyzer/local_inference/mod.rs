@@ -18,6 +18,8 @@ pub(super) fn stabilize_unknown_locals(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
 ) -> std::collections::HashSet<crate::FileId> {
+    let _profile =
+        crate::profile::Profile::cond_new("local inference stabilize", context.tree_list.len() > 1);
     let mut candidates = context
         .tree_list
         .iter()
@@ -86,12 +88,14 @@ pub(super) fn stabilize_unknown_locals(
                         target,
                         candidate.clone(),
                         InFiled::new(file_id, name_expr.get_syntax_id()),
+                        contextual_type_support(db, &candidate),
                     ),
                 );
             }
         }
     }
 
+    let evidence_count = evidence_by_node.values().map(Vec::len).sum::<usize>();
     let solved = solver::solve_local_inference_graph(&evidence_by_node);
     log::debug!(
         "local inference: candidates={} sccs={} resolved={} unresolved={}",
@@ -101,8 +105,48 @@ pub(super) fn stabilize_unknown_locals(
         solved.stats.unresolved
     );
     let changed = db.publish_inference_facts(solved.facts);
+    if std::env::var_os("GLUALS_PROFILE").is_some() {
+        eprintln!(
+            "[profile] local_inference candidates={} evidence={} sccs={} resolved={} unresolved={} changed_files={}",
+            solved.stats.nodes,
+            evidence_count,
+            solved.stats.sccs,
+            solved.stats.resolved,
+            solved.stats.unresolved,
+            changed.len()
+        );
+    }
     if !changed.is_empty() {
         context.infer_manager.clear();
     }
     changed
+}
+
+fn contextual_type_support(
+    db: &crate::DbIndex,
+    candidate: &crate::LuaType,
+) -> Arc<[LuaInferenceNodeId]> {
+    let type_decl_id = match candidate {
+        crate::LuaType::Ref(id) | crate::LuaType::Def(id) => id,
+        _ => return Arc::from([]),
+    };
+    let Some(type_decl) = db.get_type_index().get_type_decl(type_decl_id) else {
+        return Arc::from([]);
+    };
+    let mut support = type_decl
+        .get_locations()
+        .iter()
+        .map(|location| {
+            LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(InFiled::new(
+                location.file_id,
+                glua_parser::LuaSyntaxId::new(
+                    glua_parser::LuaSyntaxKind::DocTagClass.into(),
+                    location.range,
+                ),
+            )))
+        })
+        .collect::<Vec<_>>();
+    support.sort_by(LuaInferenceNodeId::stable_cmp);
+    support.dedup();
+    support.into()
 }

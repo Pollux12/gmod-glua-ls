@@ -26,6 +26,7 @@ mod gmod_network;
 mod gmod_realm_misuse;
 mod gmod_systems;
 mod incomplete_signature_doc;
+mod inference_trust;
 mod local_const_reassign;
 mod missing_fields;
 mod need_check_nil;
@@ -158,6 +159,7 @@ pub fn check_file(
         cancel_token,
     );
     run_check::<call_non_callable::CallNonCallableChecker>(context, semantic_model, cancel_token);
+    run_check::<inference_trust::InferenceTrustChecker>(context, semantic_model, cancel_token);
     run_check::<missing_fields::MissingFieldsChecker>(context, semantic_model, cancel_token);
     run_check::<param_type_check::ParamTypeCheckChecker>(context, semantic_model, cancel_token);
     run_check::<code_style_check::CodeStyleCheckChecker>(context, semantic_model, cancel_token);

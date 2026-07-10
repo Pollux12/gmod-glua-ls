@@ -20,6 +20,7 @@ mod gmod_network_test;
 mod gmod_realm_misuse_test;
 mod gmod_systems_test;
 mod incomplete_signature_doc_test;
+mod inference_trust_test;
 mod inject_field_test;
 mod instance_type_test;
 mod legacy_module_test;

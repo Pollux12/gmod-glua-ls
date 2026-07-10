@@ -294,6 +294,16 @@
           "type": "string"
         },
         {
+          "const": "infer-unknown",
+          "description": "A formerly unknown value was inferred from usage context",
+          "type": "string"
+        },
+        {
+          "const": "infer-unguarded-child",
+          "description": "A child value was inferred from an unguarded parent relationship",
+          "type": "string"
+        },
+        {
           "const": "gmod-invalid-hook-name",
           "description": "gmod-invalid-hook-name",
           "type": "string"

@@ -45,7 +45,9 @@ pub(crate) fn solve_local_inference_graph(
                         .support
                         .iter()
                         .all(|support| members.contains(support) || resolved.contains_key(support));
-                    let independently_anchored = item.support.is_empty()
+                    let independently_anchored = item.confidence
+                        >= crate::LuaInferenceConfidence::Anchored
+                        || item.support.is_empty()
                         || (external_ready && item.support.iter().all(|s| !members.contains(s)));
                     if independently_anchored {
                         anchors.push(item.candidate.clone());
@@ -218,9 +220,14 @@ mod tests {
         support: Vec<LuaInferenceNodeId>,
         position: u32,
     ) -> ContextualTypeEvidence {
+        let confidence = if support.is_empty() {
+            LuaInferenceConfidence::Anchored
+        } else {
+            LuaInferenceConfidence::Heuristic
+        };
         ContextualTypeEvidence {
             candidate,
-            confidence: LuaInferenceConfidence::Anchored,
+            confidence,
             event: LuaInferenceEventId {
                 node: target,
                 kind: LuaInferenceProvenanceKind::ContextualUnknown,

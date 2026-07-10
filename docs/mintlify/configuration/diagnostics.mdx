@@ -67,6 +67,8 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `enum-value-mismatch` | On | Warning | Value not part of the declared enum |
 | `need-check-nil` | On | Hint | Potential nil dereference (try `if x then ... end`) |
 | `unchecked-nil-access` | On | Warning | Chained access or call through an opaque table member that may be nil |
+| `infer-unknown` | On | Hint | An otherwise unknown value was stabilized from usage context and may be incorrect |
+| `infer-unguarded-child` | On | Warning | A child value was inferred from an unguarded parent relationship and may be incorrect |
 
 Nil diagnostics understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
 

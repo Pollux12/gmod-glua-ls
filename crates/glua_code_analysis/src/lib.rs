@@ -384,8 +384,13 @@ impl EmmyLuaAnalysis {
                 .get_db()
                 .get_type_index()
                 .files_with_type_caches_referencing_files(&expanded);
+            let inference_dependents = self
+                .compilation
+                .get_db()
+                .get_type_index()
+                .files_depending_on_inference_support(&expanded);
             let mut added = false;
-            for file_id in dependent_files {
+            for file_id in dependent_files.into_iter().chain(inference_dependents) {
                 added |= expanded.insert(file_id);
             }
 

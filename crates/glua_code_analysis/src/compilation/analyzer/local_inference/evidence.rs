@@ -18,6 +18,7 @@ impl ContextualTypeEvidence {
         target: LuaInferenceNodeId,
         candidate: LuaType,
         source: InFiled<glua_parser::LuaSyntaxId>,
+        support: Arc<[LuaInferenceNodeId]>,
     ) -> Self {
         Self {
             candidate,
@@ -27,7 +28,7 @@ impl ContextualTypeEvidence {
                 kind: LuaInferenceProvenanceKind::ContextualUnknown,
                 source,
             },
-            support: Arc::from([]),
+            support,
         }
     }
 }
