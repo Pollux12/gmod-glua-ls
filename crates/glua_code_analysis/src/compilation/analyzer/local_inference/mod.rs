@@ -593,7 +593,12 @@ fn is_matching_short_circuit_guard(
             continue;
         };
         if left.syntax().text_range().contains_range(index_range) {
-            return !is_call_prefix(index_expr);
+            if positive_guard_contains_index(&left, &mut |guard| {
+                guard.syntax() == index_expr.syntax()
+            }) {
+                return true;
+            }
+            continue;
         }
         if !right.syntax().text_range().contains_range(index_range) {
             continue;
@@ -621,23 +626,36 @@ fn matching_guard_in_expr(
         return false;
     };
 
-    let direct = match guard_expr {
-        LuaExpr::IndexExpr(index) => Some(index.clone()),
-        _ => None,
-    };
-    direct
-        .into_iter()
-        .chain(guard_expr.descendants::<LuaIndexExpr>())
-        .filter(|guard| !is_call_prefix(guard))
-        .any(|guard| {
-            guard
-                .get_prefix_expr()
-                .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
-                && guard.get_index_key().is_some_and(|key| {
-                    LuaMemberKey::from_index_key(db, cache, &key)
-                        .is_ok_and(|guard_key| guard_key == guarded_key)
-                })
-        })
+    positive_guard_contains_index(guard_expr, &mut |guard| {
+        guard
+            .get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax().text() == guarded_prefix.syntax().text())
+            && guard.get_index_key().is_some_and(|key| {
+                LuaMemberKey::from_index_key(db, cache, &key)
+                    .is_ok_and(|guard_key| guard_key == guarded_key)
+            })
+    })
+}
+
+fn positive_guard_contains_index(
+    expr: &LuaExpr,
+    predicate: &mut impl FnMut(&LuaIndexExpr) -> bool,
+) -> bool {
+    match expr {
+        LuaExpr::IndexExpr(index) => predicate(index),
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| positive_guard_contains_index(&inner, predicate)),
+        LuaExpr::BinaryExpr(binary)
+            if binary.get_op_token().map(|token| token.get_op()) == Some(BinaryOperator::OpAnd) =>
+        {
+            binary.get_exprs().is_some_and(|(left, right)| {
+                positive_guard_contains_index(&left, predicate)
+                    || positive_guard_contains_index(&right, predicate)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn declaration_base_type(
@@ -657,4 +675,33 @@ fn declaration_base_type(
     db.get_type_index()
         .get_type_cache(&decl_id.into())
         .map(|cache| cache.as_type().clone())
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaAstNode, LuaIndexExpr, LuaParser, ParserConfig};
+
+    use super::is_assignment_target;
+
+    fn parse_index_expr(code: &str) -> LuaIndexExpr {
+        LuaParser::parse(code, ParserConfig::default())
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .next()
+            .expect("expected index expression")
+    }
+
+    #[test]
+    fn assignment_target_classifier_accepts_index_on_left_hand_side() {
+        let index_expr = parse_index_expr("value.ChildOnly = function() end");
+
+        assert!(is_assignment_target(&index_expr));
+    }
+
+    #[test]
+    fn assignment_target_classifier_rejects_index_on_right_hand_side() {
+        let index_expr = parse_index_expr("result = value.ChildOnly");
+
+        assert!(!is_assignment_target(&index_expr));
+    }
 }

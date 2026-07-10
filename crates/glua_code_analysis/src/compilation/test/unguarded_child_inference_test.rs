@@ -390,6 +390,142 @@ mod test {
     }
 
     #[test]
+    fn parenthesized_positive_short_circuit_guard_suppresses_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local result = (value.ChildOnly) and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn nested_positive_short_circuit_guard_suppresses_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local enabled = true
+            local result = enabled and value.ChildOnly and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn negated_short_circuit_member_check_does_not_guard_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local result = not value.ChildOnly and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn comparison_short_circuit_member_check_does_not_guard_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local result = value.ChildOnly == nil and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn table_short_circuit_member_check_does_not_guard_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local result = { value.ChildOnly } and value:ChildOnly()
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
     fn child_method_call_used_as_a_condition_is_still_evidence() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
