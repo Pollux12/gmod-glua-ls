@@ -16,10 +16,9 @@ use crate::{
                 ResultTypeOrContinue,
                 condition_flow::{
                     InferConditionFlow, call_flow::get_type_at_call_expr,
-                    get_type_at_condition_flow,
+                    get_condition_antecedent_type, get_type_at_condition_flow,
                 },
-                get_single_antecedent,
-                get_type_at_flow::get_type_at_flow,
+                get_type_at_flow::FlowWalkPolicy,
                 get_var_ref_type, narrow_down_type,
                 var_ref_id::{get_var_expr_var_ref_id, unknown_prefix_should_widen_to_any},
             },
@@ -40,6 +39,7 @@ pub fn get_type_at_binary_expr(
     flow_node: &FlowNode,
     binary_expr: LuaBinaryExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(op_token) = binary_expr.get_op_token() else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -60,6 +60,7 @@ pub fn get_type_at_binary_expr(
             left_expr.clone(),
             right_expr.clone(),
             condition_flow,
+            policy,
         ),
         BinaryOperator::OpNe => try_get_at_eq_or_neq_expr(
             db,
@@ -71,6 +72,7 @@ pub fn get_type_at_binary_expr(
             left_expr.clone(),
             right_expr.clone(),
             condition_flow.get_negated(),
+            policy,
         ),
         BinaryOperator::OpGt => try_get_at_gt_or_ge_expr(
             db,
@@ -83,6 +85,7 @@ pub fn get_type_at_binary_expr(
             right_expr.clone(),
             condition_flow,
             true,
+            policy,
         ),
         BinaryOperator::OpGe => try_get_at_gt_or_ge_expr(
             db,
@@ -95,6 +98,7 @@ pub fn get_type_at_binary_expr(
             right_expr.clone(),
             condition_flow,
             false,
+            policy,
         ),
         BinaryOperator::OpAnd => try_get_at_and_expr(
             db,
@@ -106,6 +110,7 @@ pub fn get_type_at_binary_expr(
             left_expr.clone(),
             right_expr.clone(),
             condition_flow,
+            policy,
         ),
         _ => Ok(ResultTypeOrContinue::Continue),
     }?;
@@ -136,9 +141,9 @@ pub fn get_type_at_binary_expr(
             continue;
         }
         if let LuaExpr::IndexExpr(index_expr) = operand {
-            if let Some(result) =
-                try_unknown_prefix_widen(db, tree, cache, root, var_ref_id, flow_node, index_expr)?
-            {
+            if let Some(result) = try_unknown_prefix_widen(
+                db, tree, cache, root, var_ref_id, flow_node, index_expr, policy,
+            )? {
                 return Ok(ResultTypeOrContinue::Result(result));
             }
         }
@@ -160,6 +165,7 @@ fn try_unknown_prefix_widen(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
     index_expr: &glua_parser::LuaIndexExpr,
+    policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
     let mut current = LuaExpr::IndexExpr(index_expr.clone());
     loop {
@@ -182,8 +188,8 @@ fn try_unknown_prefix_widen(
         return Ok(None);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let left_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
     if matches!(left_type, LuaType::Unknown) && unknown_prefix_should_widen_to_any(db, var_ref_id) {
         Ok(Some(LuaType::Any))
     } else {
@@ -202,6 +208,7 @@ fn try_get_at_eq_or_neq_expr(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let mut result_type = maybe_type_guard_binary(
         db,
@@ -213,6 +220,7 @@ fn try_get_at_eq_or_neq_expr(
         left_expr.clone(),
         right_expr.clone(),
         condition_flow,
+        policy,
     )?;
     if let ResultTypeOrContinue::Result(result_type) = result_type {
         return Ok(ResultTypeOrContinue::Result(result_type));
@@ -228,6 +236,7 @@ fn try_get_at_eq_or_neq_expr(
         left_expr.clone(),
         right_expr.clone(),
         condition_flow,
+        policy,
     )?;
 
     if let ResultTypeOrContinue::Result(result_type) = result_type {
@@ -244,6 +253,7 @@ fn try_get_at_eq_or_neq_expr(
         left_expr.clone(),
         right_expr.clone(),
         condition_flow,
+        policy,
     )?;
 
     if let ResultTypeOrContinue::Result(result_type) = result_type {
@@ -260,6 +270,7 @@ fn try_get_at_eq_or_neq_expr(
         left_expr,
         right_expr,
         condition_flow,
+        policy,
     )
 }
 
@@ -275,6 +286,7 @@ fn try_get_at_gt_or_ge_expr(
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
     gt: bool,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     match left_expr {
         LuaExpr::UnaryExpr(unary_expr) => {
@@ -301,9 +313,9 @@ fn try_get_at_gt_or_ge_expr(
             }
 
             let right_expr_type = infer_expr(db, cache, right_expr)?;
-            let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-            let antecedent_type =
-                get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+            let antecedent_type = get_condition_antecedent_type(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
             match (&antecedent_type, &right_expr_type) {
                 (
                     LuaType::Array(array_type),
@@ -340,6 +352,7 @@ fn maybe_type_guard_binary(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let mut type_guard_expr: Option<LuaCallExpr> = None;
     let mut literal_string = String::new();
@@ -445,19 +458,19 @@ fn maybe_type_guard_binary(
         None
     };
 
-    let anatecedent_flow_id = get_single_antecedent(tree, flow_node)?;
     let narrowed_var_ref_id = if related_member_query.is_some() {
         &maybe_var_ref_id
     } else {
         var_ref_id
     };
-    let antecedent_type = get_type_at_flow(
+    let antecedent_type = get_condition_antecedent_type(
         db,
         tree,
         cache,
         root,
         narrowed_var_ref_id,
-        anatecedent_flow_id,
+        flow_node,
+        policy,
     )?;
 
     let narrow = match literal_string.as_str() {
@@ -731,6 +744,7 @@ fn maybe_var_eq_narrow(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     // only check left as need narrow
     match left_expr {
@@ -746,9 +760,9 @@ fn maybe_var_eq_narrow(
                 return Ok(ResultTypeOrContinue::Continue);
             }
 
-            let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-            let left_type =
-                get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+            let left_type = get_condition_antecedent_type(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
             let right_expr_type = infer_expr(db, cache, right_expr)?;
 
             let result_type = match condition_flow {
@@ -792,6 +806,7 @@ fn maybe_var_eq_narrow(
                             flow_node,
                             left_call_expr,
                             flow,
+                            policy,
                         );
                     }
                     _ => return Ok(ResultTypeOrContinue::Continue),
@@ -816,9 +831,9 @@ fn maybe_var_eq_narrow(
             let result_type = match condition_flow {
                 InferConditionFlow::TrueCondition => right_expr_type,
                 InferConditionFlow::FalseCondition => {
-                    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-                    let antecedent_type =
-                        get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+                    let antecedent_type = get_condition_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )?;
                     TypeOps::Remove.apply(db, &antecedent_type, &right_expr_type)
                 }
             };
@@ -848,9 +863,9 @@ fn maybe_var_eq_narrow(
             }
 
             let right_expr_type = infer_expr(db, cache, right_expr)?;
-            let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-            let antecedent_type =
-                get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+            let antecedent_type = get_condition_antecedent_type(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
             match (&antecedent_type, &right_expr_type) {
                 (
                     LuaType::Array(array_type),
@@ -887,6 +902,7 @@ fn maybe_field_literal_eq_narrow(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     // only check left as need narrow
     let syntax_id = left_expr.get_syntax_id();
@@ -923,8 +939,8 @@ fn maybe_field_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let left_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
     let LuaType::Union(union_type) = left_type else {
         return Ok(ResultTypeOrContinue::Continue);
     };
@@ -982,6 +998,7 @@ fn maybe_type_name_literal_eq_narrow(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let (call_expr, literal_expr) = match (left_expr, right_expr) {
         (LuaExpr::CallExpr(call_expr), LuaExpr::LiteralExpr(literal_expr)) => {
@@ -1013,8 +1030,8 @@ fn maybe_type_name_literal_eq_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let LuaType::Ref(target_type_id) = &target_type else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -1155,6 +1172,7 @@ fn try_get_at_and_expr(
     left_expr: LuaExpr,
     right_expr: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     // False branch of `a and b` is disjunctive: `!a OR (a AND !b)`.
     // The simple per-side narrowing below is only sound for the true branch.
@@ -1179,6 +1197,7 @@ fn try_get_at_and_expr(
         flow_node,
         left_expr,
         condition_flow,
+        policy,
     )?;
 
     // Try to narrow based on right expression
@@ -1191,6 +1210,7 @@ fn try_get_at_and_expr(
         flow_node,
         right_expr,
         condition_flow,
+        policy,
     )?;
 
     if !matches!(right_result, ResultTypeOrContinue::Continue) {

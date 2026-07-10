@@ -13,8 +13,10 @@ use crate::{
             infer_index::infer_member_by_member_key,
             infer_param_with_cache,
             narrow::{
-                ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-                get_type_at_cast_flow::cast_type, get_type_at_flow::get_type_at_flow,
+                ResultTypeOrContinue,
+                condition_flow::{InferConditionFlow, get_condition_antecedent_type},
+                get_type_at_cast_flow::cast_type,
+                get_type_at_flow::FlowWalkPolicy,
                 gmod_null_type, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
                 var_ref_id::get_var_expr_var_ref_id,
             },
@@ -34,6 +36,7 @@ pub fn get_type_at_call_expr(
     flow_node: &FlowNode,
     call_expr: LuaCallExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(prefix_expr) = call_expr.get_prefix_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -72,6 +75,7 @@ pub fn get_type_at_call_expr(
                         signature_cast,
                         is_valid_guard,
                         condition_flow,
+                        policy,
                     ),
                     _ => {
                         // If the return type is not a type guard, we cannot infer the type cast.
@@ -106,6 +110,7 @@ pub fn get_type_at_call_expr(
                             signature_cast.map(|cast| (cast, signature_id)),
                             is_valid_guard,
                             condition_flow,
+                            policy,
                         );
                         if !matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue)) {
                             return type_guard_result;
@@ -146,6 +151,7 @@ pub fn get_type_at_call_expr(
                             signature_cast,
                             signature_id,
                             condition_flow,
+                            policy,
                         ),
                         name => get_type_at_call_expr_by_signature_param_name(
                             db,
@@ -159,6 +165,7 @@ pub fn get_type_at_call_expr(
                             signature_id,
                             name,
                             condition_flow,
+                            policy,
                         ),
                     };
                 }
@@ -189,6 +196,7 @@ pub fn get_type_at_call_expr(
             &call_expr_ref,
             &prefix_expr_ref,
             condition_flow,
+            policy,
         )? {
             return Ok(ResultTypeOrContinue::Result(member_guard_type));
         }
@@ -206,6 +214,7 @@ pub fn get_type_at_call_expr(
                 &call_expr_ref,
                 &fallback_target_expr,
                 condition_flow,
+                policy,
             )? {
                 return Ok(ResultTypeOrContinue::Result(member_guard_type));
             }
@@ -346,6 +355,7 @@ fn try_narrow_member_guard(
     call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
         return Ok(None);
@@ -376,8 +386,8 @@ fn try_narrow_member_guard(
         return Ok(None);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
     let Some(candidates) = collect_member_guard_narrow_candidates(db, &antecedent_type) else {
         return Ok(None);
     };
@@ -468,6 +478,7 @@ fn get_type_at_call_expr_by_type_guard(
     signature_cast: Option<(&LuaSignatureCast, LuaSignatureId)>,
     is_valid_guard: bool,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(target_expr) = type_guard_target_expr(&call_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -501,8 +512,8 @@ fn get_type_at_call_expr_by_type_guard(
         _ => return Ok(ResultTypeOrContinue::Continue),
     };
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let result_type = match condition_flow {
         InferConditionFlow::TrueCondition => narrow_type_guard_true_branch(
@@ -887,6 +898,7 @@ fn get_type_at_call_expr_by_signature_self(
     signature_cast: &LuaSignatureCast,
     signature_id: LuaSignatureId,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let LuaExpr::IndexExpr(call_prefix_index) = call_prefix else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -904,8 +916,8 @@ fn get_type_at_call_expr_by_signature_self(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -972,6 +984,7 @@ fn get_type_at_call_expr_by_signature_param_name(
     signature_id: LuaSignatureId,
     name: &str,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let colon_call = call_expr.is_colon_call();
     let Some(arg_list) = call_expr.get_args_list() else {
@@ -1013,8 +1026,8 @@ fn get_type_at_call_expr_by_signature_param_name(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
         return Ok(ResultTypeOrContinue::Continue);

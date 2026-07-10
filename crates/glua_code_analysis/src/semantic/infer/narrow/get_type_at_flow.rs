@@ -682,6 +682,7 @@ fn get_type_at_flow_walk(
                     flow_node,
                     condition,
                     InferConditionFlow::TrueCondition,
+                    policy,
                 ) {
                     Ok(r) => r,
                     Err(_) => ResultTypeOrContinue::Continue,
@@ -735,6 +736,7 @@ fn get_type_at_flow_walk(
                     flow_node,
                     condition,
                     InferConditionFlow::FalseCondition,
+                    policy,
                 ) {
                     Ok(r) => r,
                     Err(_) => ResultTypeOrContinue::Continue,
@@ -3673,7 +3675,7 @@ fn walk_antecedents_for_default(
 mod tests {
     use std::collections::HashMap;
 
-    use glua_parser::{LuaParser, ParserConfig};
+    use glua_parser::{LuaNameExpr, LuaParser, ParserConfig};
     use internment::ArcIntern;
     use rowan::TextSize;
     use smol_str::SmolStr;
@@ -3772,6 +3774,99 @@ mod tests {
         assert!(matches!(
             cache
                 .get_flow_cache_with_origin(&var_ref_id, FlowId(2), query_realm, FlowOrigin::Real,),
+            Some(CacheEntry::Cache(LuaType::String))
+        ));
+    }
+
+    #[test]
+    fn condition_recursive_antecedent_lookup_preserves_counterfactual_origin() {
+        let file_id = FileId::new(2);
+        let parser = LuaParser::parse("value", ParserConfig::default());
+        let root = parser.get_chunk_node();
+        let condition = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .next()
+            .map(LuaExpr::NameExpr)
+            .expect("condition name expression");
+        let db = DbIndex::new();
+        let flow_tree = FlowTree::new(
+            HashMap::new(),
+            vec![
+                FlowNode {
+                    id: FlowId(0),
+                    kind: FlowNodeKind::Start,
+                    antecedent: None,
+                },
+                FlowNode {
+                    id: FlowId(1),
+                    kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+                    antecedent: Some(FlowAntecedent::Single(FlowId(0))),
+                },
+            ],
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![AssignmentFlowInfo::default(); 2],
+            FileNarrowingCapability::default(),
+        );
+        let var_ref_id =
+            VarRefId::GlobalName(ArcIntern::from(SmolStr::new("value")), TextSize::new(0));
+        let query_realm = GmodRealm::Shared;
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache.flow_query_realm = Some(query_realm);
+        cache.set_flow_cache_with_origin(
+            &var_ref_id,
+            FlowId(0),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Cache(LuaType::String),
+        );
+        cache.set_flow_cache_with_origin(
+            &var_ref_id,
+            FlowId(0),
+            query_realm,
+            FlowOrigin::NilCounterfactual,
+            CacheEntry::Cache(LuaType::Number),
+        );
+
+        let counterfactual_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(1),
+            FlowOrigin::NilCounterfactual,
+        )
+        .expect("counterfactual condition flow should resolve");
+        let real_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(1),
+            FlowOrigin::Real,
+        )
+        .expect("real condition flow should resolve");
+
+        assert_eq!(
+            (counterfactual_result, real_result),
+            (LuaType::Number, LuaType::String)
+        );
+        assert!(matches!(
+            cache.get_flow_cache_with_origin(
+                &var_ref_id,
+                FlowId(1),
+                query_realm,
+                FlowOrigin::NilCounterfactual,
+            ),
+            Some(CacheEntry::Cache(LuaType::Number))
+        ));
+        assert!(matches!(
+            cache
+                .get_flow_cache_with_origin(&var_ref_id, FlowId(1), query_realm, FlowOrigin::Real,),
             Some(CacheEntry::Cache(LuaType::String))
         ));
     }

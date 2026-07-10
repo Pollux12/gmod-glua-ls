@@ -8,9 +8,8 @@ use crate::{
         infer_index::infer_member_by_member_key,
         narrow::{
             ResultTypeOrContinue,
-            condition_flow::InferConditionFlow,
-            get_single_antecedent,
-            get_type_at_flow::get_type_at_flow,
+            condition_flow::{InferConditionFlow, get_condition_antecedent_type},
+            get_type_at_flow::FlowWalkPolicy,
             narrow_false_or_nil, remove_false_or_nil,
             var_ref_id::{
                 get_var_expr_var_ref_id, is_untyped_param_rooted_index,
@@ -30,6 +29,7 @@ pub fn get_type_at_index_expr(
     flow_node: &FlowNode,
     index_expr: LuaIndexExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     // The IndexExpr may not resolve to its own VarRefId — e.g. when the prefix
     // is an undefined global (`tmysql.Version`), `get_index_expr_var_ref_id`
@@ -49,11 +49,12 @@ pub fn get_type_at_index_expr(
             flow_node,
             index_expr,
             condition_flow,
+            policy,
         );
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     if matches!(condition_flow, InferConditionFlow::TrueCondition)
         && antecedent_type.is_nil()
@@ -80,6 +81,7 @@ fn maybe_field_exist_narrow(
     flow_node: &FlowNode,
     index_expr: LuaIndexExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -101,11 +103,12 @@ fn maybe_field_exist_narrow(
             flow_node,
             &prefix_expr,
             condition_flow,
+            policy,
         );
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let left_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     // Base type already owns field directly: skip subtype expansion (avoids Entity -> EFFECT).
     if let LuaType::Ref(type_id) | LuaType::Def(type_id) = &left_type {
@@ -412,6 +415,7 @@ fn maybe_transitive_unknown_prefix_narrow(
     flow_node: &FlowNode,
     prefix_expr: &LuaExpr,
     _condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let mut current = prefix_expr.clone();
     loop {
@@ -435,8 +439,8 @@ fn maybe_transitive_unknown_prefix_narrow(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let left_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let left_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
     if matches!(left_type, LuaType::Unknown) && unknown_prefix_should_widen_to_any(db, var_ref_id) {
         return Ok(ResultTypeOrContinue::Result(LuaType::Any));
     }

@@ -7,7 +7,7 @@ use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaNameExpr, LuaUnaryExpr, Unar
 use crate::{
     DbIndex, FlowNode, FlowTree, InferFailReason, LuaInferCache,
     semantic::infer::{
-        VarRefId,
+        InferResult, VarRefId,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{
@@ -15,7 +15,7 @@ use crate::{
                 index_flow::get_type_at_index_expr,
             },
             get_single_antecedent,
-            get_type_at_flow::get_type_at_flow,
+            get_type_at_flow::{FlowWalkPolicy, get_type_at_flow_in_mode},
             narrow_false_or_nil, remove_false_or_nil,
             var_ref_id::get_var_expr_var_ref_id,
         },
@@ -56,6 +56,7 @@ pub fn get_type_at_condition_flow(
     flow_node: &FlowNode,
     condition: LuaExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     match condition {
         LuaExpr::NameExpr(name_expr) => get_type_at_name_expr(
@@ -67,6 +68,7 @@ pub fn get_type_at_condition_flow(
             flow_node,
             name_expr,
             condition_flow,
+            policy,
         ),
         LuaExpr::CallExpr(call_expr) => get_type_at_call_expr(
             db,
@@ -77,6 +79,7 @@ pub fn get_type_at_condition_flow(
             flow_node,
             call_expr,
             condition_flow,
+            policy,
         ),
         LuaExpr::IndexExpr(index_expr) => get_type_at_index_expr(
             db,
@@ -87,6 +90,7 @@ pub fn get_type_at_condition_flow(
             flow_node,
             index_expr,
             condition_flow,
+            policy,
         ),
         LuaExpr::TableExpr(_) | LuaExpr::LiteralExpr(_) | LuaExpr::ClosureExpr(_) => {
             Ok(ResultTypeOrContinue::Continue)
@@ -100,6 +104,7 @@ pub fn get_type_at_condition_flow(
             flow_node,
             binary_expr,
             condition_flow,
+            policy,
         ),
         LuaExpr::UnaryExpr(unary_expr) => get_type_at_unary_flow(
             db,
@@ -110,6 +115,7 @@ pub fn get_type_at_condition_flow(
             flow_node,
             unary_expr,
             condition_flow,
+            policy,
         ),
         LuaExpr::ParenExpr(paren_expr) => {
             let Some(inner_expr) = paren_expr.get_expr() else {
@@ -125,6 +131,7 @@ pub fn get_type_at_condition_flow(
                 flow_node,
                 inner_expr,
                 condition_flow,
+                policy,
             )
         }
     }
@@ -140,6 +147,7 @@ fn get_type_at_name_expr(
     flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(name_var_ref_id) =
         get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr.clone()))
@@ -157,11 +165,12 @@ fn get_type_at_name_expr(
             flow_node,
             name_expr,
             condition_flow,
+            policy,
         );
     }
 
-    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let antecedent_type = get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let result_type = match condition_flow {
         InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),
@@ -181,6 +190,7 @@ fn get_type_at_name_ref(
     flow_node: &FlowNode,
     name_expr: LuaNameExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(decl_id) = db
         .get_reference_index()
@@ -206,6 +216,7 @@ fn get_type_at_name_ref(
         flow_node,
         expr,
         condition_flow,
+        policy,
     )
 }
 
@@ -219,6 +230,7 @@ fn get_type_at_unary_flow(
     flow_node: &FlowNode,
     unary_expr: LuaUnaryExpr,
     condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(inner_expr) = unary_expr.get_expr() else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -244,5 +256,27 @@ fn get_type_at_unary_flow(
         flow_node,
         inner_expr,
         condition_flow.get_negated(),
+        policy,
+    )
+}
+
+pub(super) fn get_condition_antecedent_type(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    policy: FlowWalkPolicy,
+) -> InferResult {
+    let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+    get_type_at_flow_in_mode(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        antecedent_flow_id,
+        policy,
     )
 }
