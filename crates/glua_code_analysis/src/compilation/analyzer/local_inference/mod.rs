@@ -14,10 +14,7 @@ use crate::{
 
 use self::evidence::ContextualTypeEvidence;
 
-pub(super) fn stabilize_unknown_locals(
-    db: &mut crate::DbIndex,
-    context: &mut AnalyzeContext,
-) -> std::collections::HashSet<crate::FileId> {
+pub(super) fn stabilize_unknown_locals(db: &mut crate::DbIndex, context: &mut AnalyzeContext) {
     let _profile =
         crate::profile::Profile::cond_new("local inference stabilize", context.tree_list.len() > 1);
     let mut candidates = context
@@ -137,7 +134,6 @@ pub(super) fn stabilize_unknown_locals(
     if !changed.is_empty() {
         context.infer_manager.clear();
     }
-    changed
 }
 
 fn contextual_type_support(
