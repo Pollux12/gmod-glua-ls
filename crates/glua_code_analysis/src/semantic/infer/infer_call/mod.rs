@@ -54,8 +54,10 @@ pub fn infer_call_expr_func(
     }
 
     cache.call_cache.insert(key.clone(), CacheEntry::Ready);
-    if matches!(call_expr_type, LuaType::DocFunction(_))
-        && let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
+    let prefix_signature_id = matches!(call_expr_type, LuaType::DocFunction(_))
+        .then(|| get_prefix_expr_signature_id(db, cache, &call_expr))
+        .flatten();
+    if let Some(signature_id) = prefix_signature_id
         && should_prefer_signature_for_call(db, signature_id, &call_expr_type)
     {
         let result =
@@ -71,9 +73,14 @@ pub fn infer_call_expr_func(
     }
 
     let result = match &call_expr_type {
-        LuaType::DocFunction(func) => {
-            infer_doc_function(db, cache, func, call_expr.clone(), args_count)
-        }
+        LuaType::DocFunction(func) => infer_doc_function(
+            db,
+            cache,
+            func,
+            call_expr.clone(),
+            args_count,
+            prefix_signature_id,
+        ),
         LuaType::Signature(signature_id) => {
             infer_signature_doc_function(db, cache, *signature_id, call_expr.clone(), args_count)
         }
@@ -399,6 +406,7 @@ fn infer_doc_function(
     func: &LuaFunctionType,
     call_expr: LuaCallExpr,
     _: Option<usize>,
+    prefix_signature_id: Option<LuaSignatureId>,
 ) -> InferCallFuncResult {
     if func.contain_tpl() {
         let result = instantiate_func_generic(db, cache, func, call_expr.clone())?;
@@ -418,7 +426,7 @@ fn infer_doc_function(
         }
     }
 
-    if let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
+    if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
         && (!signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
@@ -429,7 +437,7 @@ fn infer_doc_function(
     }
 
     if let Some(registered_convar_type) =
-        get_registered_convar_type_at_call(db, cache, &call_expr, func)
+        get_registered_convar_type_at_call(db, cache, prefix_signature_id, &call_expr, func)
     {
         return Ok(Arc::new(
             LuaFunctionType::new(
@@ -449,10 +457,11 @@ fn infer_doc_function(
 fn get_registered_convar_type_at_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
+    signature_id: Option<LuaSignatureId>,
     call_expr: &LuaCallExpr,
     func: &LuaFunctionType,
 ) -> Option<LuaType> {
-    if !is_getconvar_reference_call(db, cache, call_expr) {
+    if !is_getconvar_reference_call(db, signature_id, call_expr) {
         return None;
     }
     get_registered_convar_type_for_verified_call(db, cache, call_expr, func)
@@ -538,32 +547,16 @@ fn is_getconvar_reference_signature_call(
 
 fn is_getconvar_reference_call(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
+    signature_id: Option<LuaSignatureId>,
     call_expr: &LuaCallExpr,
 ) -> bool {
-    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+    let Some(signature_id) = signature_id else {
         return false;
     };
-    if prefix_expr.syntax().text() != "GetConVar" {
-        return false;
-    }
-    let Some(signature_id) = get_prefix_expr_signature_id(db, cache, call_expr) else {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
         return false;
     };
-    if let Some(signature) = db.get_signature_index().get(&signature_id)
-        && signature.call_arg_roles_for_param(0).iter().any(|role| {
-            role.is_direct_arg()
-                && role.domain == GMOD_DOMAIN_CONVAR
-                && role.role == GMOD_ROLE_REFERENCE
-        })
-    {
-        return true;
-    }
-    db.get_vfs()
-        .get_file_path(&signature_id.get_file_id())
-        .and_then(|path| path.to_str())
-        .map(|path| path.replace('\\', "/"))
-        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+    is_getconvar_reference_signature_call(db, signature_id, signature, call_expr)
 }
 
 fn convar_registration_is_load_available(
