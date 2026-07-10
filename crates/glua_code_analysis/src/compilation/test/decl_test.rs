@@ -1,9 +1,126 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaFuncStat, LuaVarExpr};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaFuncStat, LuaNameExpr, LuaVarExpr};
     use googletest::prelude::*;
 
     use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+
+    #[test]
+    fn unknown_local_stabilizes_from_anchored_usage_for_every_raw_query() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "annotations/context.lua",
+            r#"
+            ---@meta
+            ---@class Vector
+            ---@class HullTrace
+            ---@field start Vector
+            util = {}
+            ---@param trace HullTrace
+            function util.TraceHull(trace) end
+            ---@return unknown
+            function unknown_source() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/context.lua",
+            r#"
+            local value = unknown_source()
+            local before = value
+            util.TraceHull({ start = value })
+            local after = value
+            "#,
+        );
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let root = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let types = root
+            .descendants::<LuaNameExpr>()
+            .filter(|name| name.get_name_text().as_deref() == Some("value"))
+            .map(|name| {
+                model
+                    .infer_expr(LuaVarExpr::NameExpr(name).into())
+                    .expect("value type")
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            types,
+            vec![LuaType::Ref(crate::LuaTypeDeclId::global("Vector")); 3]
+        );
+    }
+
+    #[test]
+    fn stabilized_local_respects_assignment_regions() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "annotations/context-region.lua",
+            r#"
+            ---@meta
+            ---@class RegionVector
+            ---@class RegionTrace
+            ---@field start RegionVector
+            region_util = {}
+            ---@param trace RegionTrace
+            function region_util.Trace(trace) end
+            ---@return unknown
+            function region_unknown() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/context-region.lua",
+            r#"
+            local value = region_unknown()
+            region_util.Trace({ start = value })
+            value = "changed"
+            local after = value
+            "#,
+        );
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let root = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let mut uses = root
+            .descendants::<LuaNameExpr>()
+            .filter(|name| name.get_name_text().as_deref() == Some("value"));
+        let before = uses.next().expect("contextual use");
+        let _assignment = uses.next().expect("assignment target");
+        let after = uses.next().expect("post-assignment use");
+
+        assert_eq!(
+            model
+                .infer_expr(LuaVarExpr::NameExpr(before).into())
+                .expect("before type"),
+            LuaType::Ref(crate::LuaTypeDeclId::global("RegionVector"))
+        );
+        assert_eq!(
+            model
+                .infer_expr(LuaVarExpr::NameExpr(after).into())
+                .expect("after type"),
+            LuaType::StringConst(internment::ArcIntern::from(smol_str::SmolStr::new(
+                "changed",
+            )))
+        );
+    }
 
     #[test]
     fn test_1() {

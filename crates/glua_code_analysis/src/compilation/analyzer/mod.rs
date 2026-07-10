@@ -6,6 +6,7 @@ mod dynamic_field;
 mod flow;
 pub(crate) mod gmod;
 mod infer_cache_manager;
+mod local_inference;
 mod lua;
 mod parallel;
 mod setmetatable_factory;
@@ -78,6 +79,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) ->
         setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
+
+        let inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
+        stabilization_candidates.extend(inference_changed);
 
         if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);

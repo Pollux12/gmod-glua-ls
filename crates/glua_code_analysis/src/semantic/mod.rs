@@ -22,16 +22,14 @@ use glua_parser::{
     LuaTableExpr,
 };
 pub(crate) use infer::check_iter_var_range;
+pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;
 pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
-use infer::{
-    infer_bind_value_type, infer_call_arg_expr_list_types, infer_expr_list_types,
-    infer_expr_list_value_type_at,
-};
+use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;

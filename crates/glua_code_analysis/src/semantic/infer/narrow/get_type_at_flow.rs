@@ -303,6 +303,30 @@ fn get_type_at_flow_walk(
                 }
             }
             FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
+                if let Some(decl_id) = var_ref_id.get_decl_id_ref()
+                    && let Some(target) =
+                        tree.get_assignment_flow_info(flow_node.id)
+                            .and_then(|info| {
+                                info.name_targets
+                                    .iter()
+                                    .find(|target| target.decl_id == decl_id)
+                            })
+                    && let Some(fact) = db.get_type_index().get_definition_fact(
+                        &crate::LuaDefinitionId::Assignment {
+                            file_id: decl_id.file_id,
+                            assignment: assign_ptr.get_syntax_id(),
+                            target_idx: target.target_idx,
+                        },
+                    )
+                {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(fact.typ().clone()),
+                    );
+                }
+
                 let can_match_assignment = matches!(
                     (assign_hint, var_ref_id),
                     (AssignVarHint::Mixed, _)

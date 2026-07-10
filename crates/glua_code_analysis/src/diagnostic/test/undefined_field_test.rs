@@ -257,7 +257,7 @@ mod test {
     }
 
     #[test]
-    fn fangs_member_on_subtype_preserves_actual_unknown_for_spos() {
+    fn fangs_member_on_subtype_stabilizes_spos_for_all_consumers() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -309,8 +309,8 @@ mod test {
         let local_spos_type = local_name_type(&mut ws, file_id, "spos");
         assert_eq!(
             ws.humanize_type(local_spos_type),
-            "unknown",
-            "indexed/local semantic info for spos currently stays unknown after FieldNotFound"
+            "Vector",
+            "indexed local type uses the shared contextual fact"
         );
 
         let spos_types = name_expr_types(&ws, file_id, "spos");
@@ -318,22 +318,22 @@ mod test {
             spos_types,
             vec![
                 (
-                    "unknown".to_string(),
-                    "any".to_string(),
+                    "Vector".to_string(),
+                    "Vector".to_string(),
                     SemanticInfoOrigin::ContextualExpected,
                 ),
                 (
-                    "unknown".to_string(),
-                    "unknown".to_string(),
-                    SemanticInfoOrigin::Actual,
+                    "Vector".to_string(),
+                    "Vector".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
                 ),
                 (
-                    "unknown".to_string(),
+                    "Vector".to_string(),
                     "Vector".to_string(),
                     SemanticInfoOrigin::ContextualExpected,
                 ),
             ],
-            "same local keeps actual infer_expr distinct from labeled contextual SemanticInfo overlays"
+            "all uses consume the same stabilized fact while retaining inferred provenance"
         );
 
         let subtype_only = default_diagnostics_for_code_with_shared(
