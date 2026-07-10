@@ -94,6 +94,18 @@ impl DynamicFieldIndex {
             .is_some_and(|fields| fields.contains_key(field_name))
     }
 
+    pub fn has_field_in_file(
+        &self,
+        owner: &DynamicFieldOwner,
+        field_name: &str,
+        file_id: FileId,
+    ) -> bool {
+        self.owner_fields
+            .get(owner)
+            .and_then(|fields| fields.get(field_name))
+            .is_some_and(|files| files.contains(&file_id))
+    }
+
     pub fn get_fields(
         &self,
         owner: &DynamicFieldOwner,
@@ -416,6 +428,21 @@ mod tests {
         assert!(!index.has_field(&owner, &field));
         assert!(index.get_fields(&owner).is_none());
         assert!(index.get_field_definitions(&owner, &field).is_empty());
+    }
+
+    #[test]
+    fn keyed_file_lookup_only_matches_contributing_files() {
+        let file_a = FileId::new(1);
+        let file_b = FileId::new(2);
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let field = SmolStr::new("value");
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(owner.clone(), field.clone(), file_a, range(1, 2));
+
+        assert!(index.has_field(&owner, &field));
+        assert!(index.has_field_in_file(&owner, &field, file_a));
+        assert!(!index.has_field_in_file(&owner, &field, file_b));
+        assert!(!index.has_field_in_file(&owner, "missing", file_a));
     }
 
     #[test]
