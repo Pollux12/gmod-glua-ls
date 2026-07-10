@@ -771,7 +771,7 @@ end
     }
 
     #[test]
-    fn test_issue_147() {
+    fn test_deferred_closure_does_not_inherit_outer_nullable_guard() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -787,7 +787,7 @@ end
         );
 
         let e = ws.expr_ty("e");
-        assert_eq!(e, LuaType::String);
+        assert_eq!(ws.humanize_type(e), "string?");
     }
 
     #[test]

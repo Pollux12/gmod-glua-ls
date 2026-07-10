@@ -245,6 +245,50 @@ mod tests {
             &[LuaDefinitionId::Declaration(decl_id)]
         );
     }
+
+    #[test]
+    fn reaching_definitions_walks_through_closure_entry_to_assignment() {
+        let file_id = FileId::new(4);
+        let decl_id = LuaDeclId::new(file_id, TextSize::new(4));
+        let assignment = assignment_ptr("value = 1");
+        let nodes = vec![
+            node(0, FlowNodeKind::Start, None),
+            node(
+                1,
+                FlowNodeKind::Assignment(assignment.clone(), AssignVarHint::NameOnly),
+                Some(FlowAntecedent::Single(FlowId(0))),
+            ),
+            node(
+                2,
+                FlowNodeKind::ClosureEntry(TextSize::new(12)),
+                Some(FlowAntecedent::Single(FlowId(1))),
+            ),
+        ];
+        let tree = tree(
+            nodes,
+            vec![],
+            vec![
+                AssignmentFlowInfo::default(),
+                AssignmentFlowInfo {
+                    name_targets: vec![AssignmentNameTarget {
+                        decl_id,
+                        target_idx: 0,
+                    }],
+                    ..AssignmentFlowInfo::default()
+                },
+                AssignmentFlowInfo::default(),
+            ],
+        );
+
+        assert_eq!(
+            tree.reaching_definitions(decl_id, FlowId(2)).as_ref(),
+            &[LuaDefinitionId::Assignment {
+                file_id,
+                assignment: assignment.get_syntax_id(),
+                target_idx: 0,
+            }]
+        );
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

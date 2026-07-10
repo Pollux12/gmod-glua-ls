@@ -5,11 +5,15 @@ use glua_parser::{
 use crate::{
     DbIndex, FileId, FlowId, FlowNode, FlowNodeKind, FlowTree, InFiled, InferFailReason,
     LuaInferCache, LuaType, LuaTypeOwner, TypeOps,
+    semantic::cache::FlowOrigin,
     semantic::infer::{
         VarRefId,
         narrow::{
-            ResultTypeOrContinue, condition_flow::InferConditionFlow, get_single_antecedent,
-            get_type_at_flow::get_type_at_flow, var_ref_id::get_var_expr_var_ref_id,
+            ResultTypeOrContinue,
+            condition_flow::InferConditionFlow,
+            get_single_antecedent,
+            get_type_at_flow::{FlowWalkMode, get_type_at_flow_in_mode},
+            var_ref_id::get_var_expr_var_ref_id,
         },
     },
 };
@@ -22,12 +26,33 @@ pub fn get_type_at_cast_flow(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
     tag_cast: LuaDocTagCast,
+    flow_origin: FlowOrigin,
+    mode: FlowWalkMode,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     match tag_cast.get_key_expr() {
-        Some(expr) => {
-            get_type_at_cast_expr(db, tree, cache, root, var_ref_id, flow_node, tag_cast, expr)
-        }
-        None => get_type_at_inline_cast(db, tree, cache, root, var_ref_id, flow_node, tag_cast),
+        Some(expr) => get_type_at_cast_expr(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            tag_cast,
+            expr,
+            flow_origin,
+            mode,
+        ),
+        None => get_type_at_inline_cast(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            tag_cast,
+            flow_origin,
+            mode,
+        ),
     }
 }
 
@@ -41,6 +66,8 @@ fn get_type_at_cast_expr(
     flow_node: &FlowNode,
     tag_cast: LuaDocTagCast,
     key_expr: LuaExpr,
+    flow_origin: FlowOrigin,
+    mode: FlowWalkMode,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let Some(maybe_ref_id) = get_var_expr_var_ref_id(db, cache, key_expr) else {
         return Ok(ResultTypeOrContinue::Continue);
@@ -51,8 +78,16 @@ fn get_type_at_cast_expr(
     }
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let mut antecedent_type =
-        get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let mut antecedent_type = get_type_at_flow_in_mode(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        antecedent_flow_id,
+        flow_origin,
+        mode,
+    )?;
     for cast_op_type in tag_cast.get_op_types() {
         antecedent_type = cast_type(
             db,
@@ -73,10 +108,20 @@ fn get_type_at_inline_cast(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
     tag_cast: LuaDocTagCast,
+    flow_origin: FlowOrigin,
+    mode: FlowWalkMode,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    let mut antecedent_type =
-        get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)?;
+    let mut antecedent_type = get_type_at_flow_in_mode(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        antecedent_flow_id,
+        flow_origin,
+        mode,
+    )?;
     for cast_op_type in tag_cast.get_op_types() {
         antecedent_type = cast_type(
             db,

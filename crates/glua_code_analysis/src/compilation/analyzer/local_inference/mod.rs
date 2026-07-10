@@ -6,8 +6,9 @@ use std::{collections::HashMap, sync::Arc};
 use rustc_hash::FxHashMap;
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat,
-    LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat, LuaVarExpr, LuaWhileStat,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
+    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat, LuaVarExpr,
+    LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
@@ -581,11 +582,13 @@ fn is_matching_short_circuit_guard(
     index_expr: &LuaIndexExpr,
 ) -> bool {
     let index_range = index_expr.syntax().text_range();
-    for binary in index_expr
-        .syntax()
-        .ancestors()
-        .filter_map(LuaBinaryExpr::cast)
-    {
+    for ancestor in index_expr.syntax().ancestors() {
+        if LuaClosureExpr::cast(ancestor.clone()).is_some() {
+            break;
+        }
+        let Some(binary) = LuaBinaryExpr::cast(ancestor) else {
+            continue;
+        };
         if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpAnd) {
             continue;
         }

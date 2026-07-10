@@ -15,6 +15,34 @@ mod test {
         last_name_info(ws, file_id, name).display_typ().clone()
     }
 
+    fn nth_name_type_from_end(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+        nth_from_end: usize,
+    ) -> crate::LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let name_exprs = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|expr| expr.get_name_text().as_deref() == Some(name))
+            .collect::<Vec<_>>();
+        let name_expr = name_exprs
+            .into_iter()
+            .rev()
+            .nth(nth_from_end)
+            .expect("name expression");
+        semantic_model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("semantic info")
+            .display_typ()
+            .clone()
+    }
+
     fn last_name_info(
         ws: &VirtualWorkspace,
         file_id: crate::FileId,
@@ -441,6 +469,218 @@ mod test {
         assert_eq!(
             diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
             0
+        );
+    }
+
+    #[test]
+    fn deferred_closure_call_does_not_inherit_short_circuit_member_guard() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local callback = value.ChildOnly and function()
+                value:ChildOnly()
+            end
+            print(callback)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_named_function_does_not_inherit_outer_member_guard() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            if value.ChildOnly then
+                function callback()
+                    value:ChildOnly()
+                end
+            end
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_local_function_does_not_inherit_outer_member_guard() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            if value.ChildOnly then
+                local function callback()
+                    value:ChildOnly()
+                end
+            end
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn deferred_closure_local_member_guard_remains_guarded() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local callback = function()
+                if value.ChildOnly then
+                    value:ChildOnly()
+                end
+            end
+            print(callback)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn deferred_closure_keeps_concrete_assignment_before_creation() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            ---@type Child
+            local child
+            value = child
+            local callback = function()
+                value:ChildOnly()
+            end
+            print(callback)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(nth_name_type_from_end(&ws, file_id, "value", 1)),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn deferred_closure_does_not_capture_assignment_after_creation() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local callback = function()
+                print(value)
+            end
+            ---@type Child
+            local child
+            value = child
+            print(callback)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(nth_name_type_from_end(&ws, file_id, "value", 2)),
+            "Base"
+        );
+    }
+
+    #[test]
+    fn nested_deferred_closure_ignores_each_outer_member_guard() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child)
+            ---@type Base
+            local value
+            local outer = value.ChildOnly and function()
+                local inner = value.ChildOnly and function()
+                    value:ChildOnly()
+                end
+                print(inner)
+            end
+            print(outer)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
         );
     }
 

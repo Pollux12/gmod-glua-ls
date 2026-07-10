@@ -86,7 +86,24 @@ pub fn bind_closure_expr(
     closure_expr: LuaClosureExpr,
     current: FlowId,
 ) -> Option<()> {
-    bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr), current);
+    let entry = binder.create_node(FlowNodeKind::ClosureEntry(closure_expr.get_position()));
+    binder.add_antecedent(entry, current);
+
+    let old_loop = binder.loop_label;
+    let old_break = binder.break_target_label;
+    let old_true = binder.true_target;
+    let old_false = binder.false_target;
+    binder.loop_label = binder.unreachable;
+    binder.break_target_label = binder.unreachable;
+    binder.true_target = binder.unreachable;
+    binder.false_target = binder.unreachable;
+
+    bind_each_child(binder, LuaAst::LuaClosureExpr(closure_expr), entry);
+
+    binder.loop_label = old_loop;
+    binder.break_target_label = old_break;
+    binder.true_target = old_true;
+    binder.false_target = old_false;
     Some(())
 }
 
