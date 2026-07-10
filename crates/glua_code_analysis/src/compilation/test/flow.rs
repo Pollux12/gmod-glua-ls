@@ -5198,7 +5198,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_truthy_keeps_nil_without_index_evidence() {
+    fn test_undefined_global_guard_after_truthy_stays_unknown_without_index_evidence() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -5210,7 +5210,7 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Unknown);
     }
 
     #[gtest]

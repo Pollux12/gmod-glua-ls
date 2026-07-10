@@ -34,11 +34,13 @@ pub(super) fn stabilize_unknown_locals(
                 .map(move |(decl_id, references)| (file_id, decl_id, references))
         })
         .filter(|(_, decl_id, _)| {
-            db.get_type_index()
-                .get_type_cache(&(*decl_id).into())
-                .is_none_or(|cache| {
-                    cache.is_infer() && super::type_is_uninformative(cache.as_type())
-                })
+            db.get_decl_index()
+                .get_decl(decl_id)
+                .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }))
+                && db
+                    .get_type_index()
+                    .get_type_cache(&(*decl_id).into())
+                    .is_none_or(|cache| cache.is_infer() && cache.as_type().is_unknown())
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
@@ -56,7 +58,7 @@ pub(super) fn stabilize_unknown_locals(
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
         let mut cells = references.cells;
         cells.sort_by_key(|cell| cell.range.start());
-        for cell in cells.into_iter().filter(|cell| !cell.is_write) {
+        for cell in cells {
             let Some(name_expr) = root
                 .covering_element(cell.range)
                 .ancestors()
@@ -65,6 +67,18 @@ pub(super) fn stabilize_unknown_locals(
             else {
                 continue;
             };
+            let is_function_definition = cell.is_write
+                && name_expr
+                    .ancestors::<glua_parser::LuaFuncStat>()
+                    .next()
+                    .is_some_and(|function| {
+                        function
+                            .get_func_name()
+                            .is_some_and(|name| name.syntax() == name_expr.syntax())
+                    });
+            if cell.is_write && !is_function_definition {
+                continue;
+            }
             let expr: LuaExpr = LuaVarExpr::NameExpr(name_expr.clone()).into();
             let Some(candidate) =
                 infer_bind_value_type(db, context.infer_manager.get_infer_cache(file_id), expr)
@@ -74,13 +88,17 @@ pub(super) fn stabilize_unknown_locals(
             if super::type_is_uninformative(&candidate) {
                 continue;
             }
-            let definitions = flow_tree
-                .and_then(|tree| {
-                    tree.get_flow_id(name_expr.get_syntax_id())
-                        .map(|flow| (tree, flow))
-                })
-                .map(|(tree, flow)| tree.reaching_definitions(decl_id, flow))
-                .unwrap_or_else(|| Arc::from([crate::LuaDefinitionId::Declaration(decl_id)]));
+            let definitions = if is_function_definition {
+                Arc::from([crate::LuaDefinitionId::Declaration(decl_id)])
+            } else {
+                flow_tree
+                    .and_then(|tree| {
+                        tree.get_flow_id(name_expr.get_syntax_id())
+                            .map(|flow| (tree, flow))
+                    })
+                    .map(|(tree, flow)| tree.reaching_definitions(decl_id, flow))
+                    .unwrap_or_else(|| Arc::from([crate::LuaDefinitionId::Declaration(decl_id)]))
+            };
             for definition in definitions.iter().cloned() {
                 let target = LuaInferenceNodeId::Definition(definition);
                 evidence_by_node.entry(target.clone()).or_default().push(

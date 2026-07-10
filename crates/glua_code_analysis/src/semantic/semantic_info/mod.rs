@@ -107,6 +107,9 @@ pub fn infer_token_semantic_info(
                 db.get_inference_fact(&LuaInferenceNodeId::Definition(
                     crate::LuaDefinitionId::Declaration(decl_id),
                 ))
+                .filter(|fact| {
+                    fact.confidence() < LuaInferenceConfidence::Certain && !fact.typ().is_unknown()
+                })
                 .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
                 .unwrap_or_else(|| SemanticInfo::actual(typ, semantic_decl)),
             )
@@ -216,6 +219,7 @@ fn infer_expr_display_semantic_info(
         .as_ref()
         .and_then(semantic_decl_inference_node)
         .and_then(|node| db.get_inference_fact(&node))
+        && fact.confidence() < LuaInferenceConfidence::Certain
         && !fact.typ().is_unknown()
     {
         return SemanticInfo::canonical(fact, semantic_decl);
@@ -223,11 +227,23 @@ fn infer_expr_display_semantic_info(
 
     match infer_expr(db, cache, expr.clone()) {
         Ok(typ) if !typ.is_unknown() => SemanticInfo::actual(typ, semantic_decl),
-        Ok(typ) => SemanticInfo::actual(typ, semantic_decl),
+        Ok(typ) => semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .and_then(|node| db.get_inference_fact(&node))
+            .filter(|fact| matches!(fact.typ(), LuaType::Signature(_)))
+            .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
+            .unwrap_or_else(|| SemanticInfo::actual(typ, semantic_decl)),
         Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
             SemanticInfo::actual(LuaType::Nil, semantic_decl)
         }
-        Err(_) => SemanticInfo::actual(LuaType::Unknown, semantic_decl),
+        Err(_) => semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .and_then(|node| db.get_inference_fact(&node))
+            .filter(|fact| matches!(fact.typ(), LuaType::Signature(_)))
+            .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
+            .unwrap_or_else(|| SemanticInfo::actual(LuaType::Unknown, semantic_decl)),
     }
 }
 
