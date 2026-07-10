@@ -9,12 +9,35 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, LuaAliasCallKind, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaMemberId, LuaType,
-    infer_expr,
+    DbIndex, LuaAliasCallKind, LuaDeclExtra, LuaDeclId, LuaDeclOrMemberId, LuaInferCache,
+    LuaMemberId, LuaType, infer_expr,
     semantic::infer::{
         infer_index::get_index_expr_var_ref_id, infer_name::get_name_expr_var_ref_id,
     },
 };
+
+/// Returns whether this reference is an immutable direct lexical binding.
+///
+/// This deliberately excludes roots whose identity can outlive or differ from
+/// one local binding. Missing reference metadata also fails closed.
+pub(super) fn is_immutable_direct_lexical_decl(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let VarRefId::VarRef(decl_id) = var_ref_id else {
+        return false;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+        return false;
+    };
+    if !matches!(
+        &decl.extra,
+        LuaDeclExtra::Local { .. } | LuaDeclExtra::Param { .. }
+    ) {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_decl_references(&decl_id.file_id, decl_id)
+        .is_some_and(|references| !references.mutable)
+}
 
 /// Returns true when a successfully-indexed `Unknown` prefix is authoritative
 /// and may widen to `Any`.

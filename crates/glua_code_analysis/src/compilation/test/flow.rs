@@ -806,7 +806,7 @@ end
     }
 
     #[test]
-    fn test_deferred_closure_does_not_inherit_outer_nullable_guard() {
+    fn deferred_closure_retains_immutable_local_truthiness_guard() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -822,7 +822,279 @@ end
         );
 
         let e = ws.expr_ty("e");
-        assert_eq!(ws.humanize_type(e), "string?");
+        assert_eq!(ws.humanize_type(e), "string");
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_parameter_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value string?
+            local function register(value)
+                if value then
+                    local callback = function()
+                        immutable_parameter_capture = value
+                    end
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("immutable_parameter_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_local_explicit_nil_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if value ~= nil then
+                local callback = function()
+                    explicit_nil_capture = value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("explicit_nil_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_exact_nil_guard_preserves_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type boolean?
+            if value == nil then
+                return
+            end
+
+            local callback = function()
+                exact_nil_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("exact_nil_capture");
+        assert_eq!(captured, LuaType::Boolean);
+    }
+
+    #[test]
+    fn deferred_closure_exact_false_guard_preserves_false_literal() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type boolean?
+            if value ~= false then
+                return
+            end
+
+            local callback = function()
+                exact_false_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("exact_false_capture");
+        assert_eq!(captured, LuaType::BooleanConst(false));
+    }
+
+    #[test]
+    fn false_branch_of_unknown_is_limited_to_runtime_falsy_values() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type unknown
+            if value then
+                return
+            end
+            unknown_falsy_capture = value
+            "#,
+        );
+
+        let captured = ws.expr_ty("unknown_falsy_capture");
+        let expected = LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)]);
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_unknown_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type unknown
+            if value then
+                return
+            end
+
+            local callback = function()
+                deferred_unknown_falsy_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("deferred_unknown_falsy_capture");
+        let expected = LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)]);
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_local_parenthesized_early_return_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if not (value) then
+                return
+            end
+
+            local callback = function()
+                early_return_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("early_return_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_local_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if value then
+                local callback = function()
+                    mutable_local_capture = value
+                end
+            end
+            value = nil
+            "#,
+        );
+
+        let captured = ws.expr_ty("mutable_local_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_parameter_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value string?
+            local function register(value)
+                if value then
+                    local callback = function()
+                        mutable_parameter_capture = value
+                    end
+                end
+                value = nil
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("mutable_parameter_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_member_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local state ---@type { value: string? }
+            if state.value then
+                local callback = function()
+                    member_capture = state.value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("member_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_global_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@return string?
+            local function maybe_string() end
+
+            GLOBAL_VALUE = maybe_string()
+            if GLOBAL_VALUE then
+                local callback = function()
+                    global_capture = GLOBAL_VALUE
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("global_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_immutable_entity_isvalid_guard() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        ws.def(
+            r#"
+            local entity ---@type Entity|NULL
+            if IsValid(entity) then
+                local callback = function()
+                    isvalid_capture = entity
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("isvalid_capture");
+        let expected = ws.ty("Entity|NULL");
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_drops_custom_type_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<string>
+            local function is_string(value) end
+
+            local value ---@type string|number
+            if is_string(value) then
+                local callback = function()
+                    custom_guard_capture = value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("custom_guard_capture");
+        let expected = ws.ty("string|number");
+        assert_eq!(captured, expected);
     }
 
     #[test]

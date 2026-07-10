@@ -5401,4 +5401,38 @@ owner:CompletelyMadeUpMethod()
             "#
         ));
     }
+
+    #[test]
+    fn falsy_unknown_reassigned_callback_parameter_reports_index_access() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param value unknown
+            ---@return unknown
+            ---@return boolean
+            local function find(value) end
+
+            ---@param callback fun(target: unknown)
+            local function register(callback) end
+
+            ---@param value any
+            local function use(value) end
+
+            register(function(target)
+                local more
+                target, more = find(target[1])
+                if target then
+                    use(target)
+                elseif more then
+                    use(target[1])
+                else
+                    use(target[1])
+                end
+            end)
+            "#,
+        );
+
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
 }

@@ -13,7 +13,7 @@ use smol_str::SmolStr;
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
     LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
-    enum_variable_is_param, get_keyof_members,
+    enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
         infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
         resolve_decl_backed_global_path_member_type,
@@ -741,6 +741,9 @@ fn is_valid_member_inner(
         }
     }
 
+    let has_definitely_non_indexable_prefix = matches!(code, DiagnosticCode::UndefinedField)
+        && all_runtime_components_are_non_indexable_primitives(semantic_model.get_db(), prefix_typ);
+
     // Check flow-based semantic info before expensive AST walks like
     // is_nil_safe_expr_context. Many ordinary member hits return above without
     // needing full declaration resolution.
@@ -748,6 +751,8 @@ fn is_valid_member_inner(
         // InjectField diagnostics run on assignment sites. At those locations,
         // declaration inference can resolve a non-unknown type from the assignment
         // value and incorrectly suppress legitimate InjectField reports.
+        true
+    } else if has_definitely_non_indexable_prefix {
         true
     } else {
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
@@ -891,6 +896,33 @@ fn is_valid_member_inner(
     }
 
     None
+}
+
+fn all_runtime_components_are_non_indexable_primitives(db: &DbIndex, typ: &LuaType) -> bool {
+    let typ = get_real_type(db, typ).unwrap_or(typ);
+    match typ {
+        LuaType::Nil
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::Boolean
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::BooleanConst(_)
+        | LuaType::IntegerConst(_)
+        | LuaType::FloatConst(_)
+        | LuaType::DocFunction(_)
+        | LuaType::Signature(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::DocBooleanConst(_) => true,
+        LuaType::Union(union) => union
+            .types()
+            .all(|typ| all_runtime_components_are_non_indexable_primitives(db, typ)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| all_runtime_components_are_non_indexable_primitives(db, typ)),
+        _ => false,
+    }
 }
 
 fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {

@@ -14036,4 +14036,184 @@ mod test {
             "Without IsValid guard, accessing Constraints on nullable entX must trigger NeedCheckNil"
         );
     }
+
+    #[gtest]
+    fn test_deferred_menu_immutable_parameter_truthiness_guard_has_no_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class MenuItem
+            ---@field name string
+
+            ---@class Menu
+            ---@field AddOption fun(self: Menu, label: string, callback: fun())
+
+            ---@param menu Menu
+            ---@param item MenuItem?
+            local function populate_menu(menu, item)
+                if item then
+                    menu:AddOption("Use", function()
+                        print(item.name)
+                    end)
+                end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_deferred_timer_immutable_local_truthiness_guard_has_no_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class TimerValue
+            ---@field name string
+
+            ---@return TimerValue?
+            local function find_value() end
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+
+            local value = find_value()
+            if value then
+                timer.Simple(0, function()
+                    print(value.name)
+                end)
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_deferred_timer_mutable_local_truthiness_guard_needs_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class TimerValue
+            ---@field name string
+
+            ---@return TimerValue?
+            local function find_value() end
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+
+            local value = find_value()
+            if value then
+                timer.Simple(0, function()
+                    print(value.name)
+                end)
+            end
+            value = nil
+            "#,
+        );
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_deferred_timer_immutable_entity_isvalid_guard_needs_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_type_guard(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+
+            local entity ---@type Entity?
+            if IsValid(entity) then
+                timer.Simple(0, function()
+                    local captured = entity
+                    captured:GetClass()
+                end)
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_deferred_timer_member_truthiness_guard_needs_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class TimerValue
+            ---@field name string
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+
+            local state ---@type { value: TimerValue? }
+            if state.value then
+                timer.Simple(0, function()
+                    print(state.value.name)
+                end)
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, not(is_empty()));
+    }
+
+    #[gtest]
+    fn test_deferred_callback_reassigned_nullable_parameter_falsy_branches_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@param value unknown
+            ---@return unknown
+            ---@return boolean
+            local function find(value) end
+
+            ---@param callback fun(target: unknown)
+            local function register(callback) end
+
+            ---@param value any
+            local function use(value) end
+
+            register(function(target)
+                local more
+                target, more = find(target[1])
+                if target then
+                    use(target)
+                elseif more then
+                    use(target[1])
+                else
+                    use(target[1])
+                end
+            end)
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(2_usize));
+    }
 }

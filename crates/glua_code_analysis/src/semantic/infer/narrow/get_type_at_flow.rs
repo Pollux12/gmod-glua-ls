@@ -23,8 +23,12 @@ use crate::{
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
             get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
-            get_var_ref_type, narrow_down_type,
-            var_ref_id::{get_var_expr_var_ref_id, is_untyped_param_rooted_index},
+            get_var_ref_type, narrow_direct_name_false_or_nil, narrow_down_type,
+            remove_false_or_nil,
+            var_ref_id::{
+                get_var_expr_var_ref_id, is_immutable_direct_lexical_decl,
+                is_untyped_param_rooted_index,
+            },
         },
     },
 };
@@ -202,6 +206,134 @@ pub(super) fn get_type_at_flow_in_mode(
                 policy,
             )
         }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_type_at_immutable_closure_condition(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    mut condition: LuaExpr,
+    mut condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
+) -> Result<Option<LuaType>, InferFailReason> {
+    if !is_immutable_direct_lexical_decl(db, var_ref_id) {
+        return Ok(None);
+    }
+
+    loop {
+        condition = strip_condition_parens(condition)?;
+        let LuaExpr::UnaryExpr(unary_expr) = condition else {
+            break;
+        };
+        if unary_expr
+            .get_op_token()
+            .is_none_or(|token| token.get_op() != UnaryOperator::OpNot)
+        {
+            return Ok(None);
+        }
+        let Some(inner_expr) = unary_expr.get_expr() else {
+            return Ok(None);
+        };
+        condition = inner_expr;
+        condition_flow = condition_flow.get_negated();
+    }
+
+    match condition {
+        LuaExpr::NameExpr(name_expr) => {
+            if !condition_name_matches_var_ref(db, cache, name_expr, var_ref_id) {
+                return Ok(None);
+            }
+            let antecedent_type = get_antecedent_type_for_flow_node(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
+            Ok(Some(match condition_flow {
+                InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
+                InferConditionFlow::FalseCondition => {
+                    narrow_direct_name_false_or_nil(db, antecedent_type)
+                }
+            }))
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op_token) = binary_expr.get_op_token() else {
+                return Ok(None);
+            };
+            let op = op_token.get_op();
+            if !matches!(op, BinaryOperator::OpEq | BinaryOperator::OpNe) {
+                return Ok(None);
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return Ok(None);
+            };
+            let exact_type = if condition_expr_matches_var_ref(db, cache, left.clone(), var_ref_id)
+            {
+                falsey_condition_literal_type(right)
+            } else if condition_expr_matches_var_ref(db, cache, right.clone(), var_ref_id) {
+                falsey_condition_literal_type(left)
+            } else {
+                None
+            };
+            let Some(exact_type) = exact_type else {
+                return Ok(None);
+            };
+
+            let antecedent_type = get_antecedent_type_for_flow_node(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
+            let equality_holds = matches!(condition_flow, InferConditionFlow::TrueCondition)
+                == matches!(op, BinaryOperator::OpEq);
+            let narrowed = if equality_holds {
+                TypeOps::Intersect.apply(db, &antecedent_type, &exact_type)
+            } else {
+                TypeOps::Remove.apply(db, &antecedent_type, &exact_type)
+            };
+            Ok(Some(narrowed))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn strip_condition_parens(mut expr: LuaExpr) -> Result<LuaExpr, InferFailReason> {
+    while let LuaExpr::ParenExpr(paren_expr) = expr {
+        expr = paren_expr.get_expr().ok_or(InferFailReason::None)?;
+    }
+    Ok(expr)
+}
+
+fn condition_name_matches_var_ref(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: glua_parser::LuaNameExpr,
+    var_ref_id: &VarRefId,
+) -> bool {
+    get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr))
+        .is_some_and(|condition_ref| condition_ref == *var_ref_id)
+}
+
+fn condition_expr_matches_var_ref(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let Ok(LuaExpr::NameExpr(name_expr)) = strip_condition_parens(expr) else {
+        return false;
+    };
+    condition_name_matches_var_ref(db, cache, name_expr, var_ref_id)
+}
+
+fn falsey_condition_literal_type(expr: LuaExpr) -> Option<LuaType> {
+    let Ok(LuaExpr::LiteralExpr(literal_expr)) = strip_condition_parens(expr) else {
+        return None;
+    };
+    match literal_expr.get_literal()? {
+        LuaLiteralToken::Nil(_) => Some(LuaType::Nil),
+        LuaLiteralToken::Bool(token) if !token.is_true() => Some(LuaType::BooleanConst(false)),
+        _ => None,
     }
 }
 
@@ -655,6 +787,26 @@ fn get_type_at_flow_walk(
             }
             FlowNodeKind::TrueCondition(condition_ptr) => {
                 if policy.is_closure_baseline() {
+                    if let Some(condition) = condition_ptr.to_node(root)
+                        && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            condition,
+                            InferConditionFlow::TrueCondition,
+                            policy,
+                        )
+                    {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(condition_type),
+                        );
+                    }
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {
@@ -711,6 +863,26 @@ fn get_type_at_flow_walk(
             }
             FlowNodeKind::FalseCondition(condition_ptr) => {
                 if policy.is_closure_baseline() {
+                    if let Some(condition) = condition_ptr.to_node(root)
+                        && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            condition,
+                            InferConditionFlow::FalseCondition,
+                            policy,
+                        )
+                    {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(condition_type),
+                        );
+                    }
                     if let Some(merged_type) = try_get_multi_antecedent_type(
                         db, tree, cache, root, var_ref_id, flow_node, policy,
                     )? {

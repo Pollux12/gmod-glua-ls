@@ -45,6 +45,19 @@ pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
     narrow_down_type(db, t.clone(), LuaType::Nil, None).unwrap_or(LuaType::Never)
 }
 
+/// Narrows a direct name known to be on a false condition branch.
+///
+/// Unlike compound-expression narrowing, a direct name condition proves that
+/// even an otherwise `Unknown` runtime value is exactly `nil` or `false`.
+/// Explicit `Any` remains dynamic and retains its opt-out behavior.
+pub fn narrow_direct_name_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
+    if t.is_unknown() {
+        LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)])
+    } else {
+        narrow_false_or_nil(db, t)
+    }
+}
+
 /// Removes falsy values (false and nil) from a type.
 ///
 /// This function filters out `nil` and `false` from a type, leaving only the truthy

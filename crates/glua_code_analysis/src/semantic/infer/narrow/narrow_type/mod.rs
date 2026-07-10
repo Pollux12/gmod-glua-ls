@@ -4,7 +4,9 @@ use crate::{
     DbIndex, LuaInstanceType, LuaIntersectionType, LuaType, TypeOps, check_type_compact,
     get_real_type, semantic::type_check::is_sub_type_of,
 };
-pub use false_or_nil_type::{narrow_false_or_nil, remove_false_or_nil};
+pub use false_or_nil_type::{
+    narrow_direct_name_false_or_nil, narrow_false_or_nil, remove_false_or_nil,
+};
 
 fn is_class_def(db: &DbIndex, declared_type: &LuaType) -> bool {
     match declared_type {

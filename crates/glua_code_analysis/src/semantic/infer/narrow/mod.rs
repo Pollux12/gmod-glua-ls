@@ -22,7 +22,9 @@ pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
-pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
+pub use narrow_type::{
+    narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+};
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";

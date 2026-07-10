@@ -16,7 +16,7 @@ use crate::{
             },
             get_single_antecedent,
             get_type_at_flow::{FlowWalkPolicy, get_type_at_flow_in_mode},
-            narrow_false_or_nil, remove_false_or_nil,
+            narrow_direct_name_false_or_nil, remove_false_or_nil,
             var_ref_id::get_var_expr_var_ref_id,
         },
     },
@@ -173,7 +173,7 @@ fn get_type_at_name_expr(
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
 
     let result_type = match condition_flow {
-        InferConditionFlow::FalseCondition => narrow_false_or_nil(db, antecedent_type),
+        InferConditionFlow::FalseCondition => narrow_direct_name_false_or_nil(db, antecedent_type),
         InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
     };
 
