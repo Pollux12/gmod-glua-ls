@@ -14,7 +14,6 @@ use super::checker::precompute_missing_required_fields;
 use super::checker::precompute_nodiscard_candidates;
 use super::checker::precompute_param_type_candidates;
 use super::checker::precompute_sorted_send_flows;
-use super::checker::precompute_subtype_members;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
 use crate::{DiagnosticCode, Emmyrc, FileId, LuaCompilation, WorkspaceId};
@@ -125,7 +124,6 @@ impl LuaDiagnostic {
         let (
             workspace_realm_data,
             missing_required_fields,
-            subtype_members,
             await_candidates,
             param_type_candidates,
             nodiscard_candidates,
@@ -161,7 +159,6 @@ impl LuaDiagnostic {
                 )
             });
             let missing = s.spawn(|| precompute_missing_required_fields(db));
-            let subtype_members = s.spawn(|| precompute_subtype_members(db));
             let await_c = s.spawn(|| precompute_await_candidates(db));
             let param_type = s.spawn(|| precompute_param_type_candidates(db));
             let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
@@ -176,9 +173,6 @@ impl LuaDiagnostic {
                 missing
                     .join()
                     .expect("precompute_missing_required_fields panicked"),
-                subtype_members
-                    .join()
-                    .expect("precompute_subtype_members panicked"),
                 await_c
                     .join()
                     .expect("precompute_await_candidates panicked"),
@@ -206,7 +200,6 @@ impl LuaDiagnostic {
             callee_realms_by_workspace,
             realm_call_candidates_by_workspace,
             missing_required_fields: Arc::new(missing_required_fields),
-            subtype_members: Arc::new(subtype_members),
             await_candidates: Arc::new(await_candidates),
             param_type_candidates: Arc::new(param_type_candidates),
             nodiscard_candidates: Arc::new(nodiscard_candidates),

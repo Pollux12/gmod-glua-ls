@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -24,26 +23,17 @@ use crate::{
 use super::{
     AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
     is_initialized_assignment_access, is_initialized_assignment_prefix,
-    subtype_member::{PrecomputedSubtypeMembers, precompute_subtype_members, query_subtype_member},
 };
 
 pub struct CheckFieldChecker;
 
 impl Checker for CheckFieldChecker {
-    const CODES: &[DiagnosticCode] = &[
-        DiagnosticCode::InjectField,
-        DiagnosticCode::UndefinedField,
-        DiagnosticCode::GmodMemberOnSubtypeOnly,
-    ];
+    const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
-        let subtype_members = context
-            .get_shared_data_arc()
-            .map(|shared_data| shared_data.subtype_members.clone())
-            .unwrap_or_else(|| Arc::new(precompute_subtype_members(semantic_model.get_db())));
         let initialized_assignment_accesses =
             if has_reusable_table_literal_assignment(&assignment_prefixes) {
                 collect_initialized_assignment_accesses(&root, &assignment_prefixes)
@@ -81,7 +71,6 @@ impl Checker for CheckFieldChecker {
                                 semantic_model,
                                 index_expr,
                                 DiagnosticCode::InjectField,
-                                &subtype_members,
                                 &mut state,
                                 profile.as_mut(),
                             );
@@ -99,7 +88,6 @@ impl Checker for CheckFieldChecker {
                             semantic_model,
                             &index_expr,
                             DiagnosticCode::InjectField,
-                            &subtype_members,
                             &mut state,
                             profile.as_mut(),
                         );
@@ -126,7 +114,6 @@ impl Checker for CheckFieldChecker {
                         semantic_model,
                         &index_expr,
                         DiagnosticCode::UndefinedField,
-                        &subtype_members,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -204,7 +191,6 @@ struct CheckFieldProfile {
     invalid_prefix_skips: usize,
     valid_member_hits: usize,
     dynamic_field_skips: usize,
-    subtype_advisories_emitted: usize,
     diagnostics_emitted: usize,
     prefix_infer_time: Duration,
     valid_member_time: Duration,
@@ -213,7 +199,7 @@ struct CheckFieldProfile {
 impl CheckFieldProfile {
     fn log(&self, file_id: crate::FileId, member_cache_entries: usize) {
         log::info!(
-            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subtype_advisories={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
+            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
             file_id,
             self.nodes_scanned,
             self.assignment_nodes,
@@ -224,7 +210,6 @@ impl CheckFieldProfile {
             self.invalid_prefix_skips,
             self.valid_member_hits,
             self.dynamic_field_skips,
-            self.subtype_advisories_emitted,
             self.diagnostics_emitted,
             self.prefix_infer_time,
             self.valid_member_time,
@@ -238,7 +223,6 @@ fn check_index_expr(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
-    subtype_members: &PrecomputedSubtypeMembers,
     state: &mut CheckFieldState,
     mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
@@ -372,47 +356,6 @@ fn check_index_expr(
             );
         }
         DiagnosticCode::UndefinedField => {
-            // This advisory is emitted from the undefined-field pass: disabling
-            // `undefined-field` also disables subtype-only member diagnostics.
-            let subtype_member =
-                if context.is_checker_enable_by_code(&DiagnosticCode::UndefinedField) {
-                    let key = LuaMemberKey::Name(field_name.clone());
-                    query_subtype_member(
-                        db,
-                        subtype_members,
-                        &prefix_typ,
-                        &key,
-                        context.get_file_id(),
-                        index_expr.get_position(),
-                    )
-                } else {
-                    Default::default()
-                };
-            if !subtype_member.direct_candidates.is_empty() {
-                if let Some(profile) = profile.as_mut() {
-                    profile.subtype_advisories_emitted += 1;
-                    profile.diagnostics_emitted += 1;
-                }
-                context.add_diagnostic(
-                    DiagnosticCode::GmodMemberOnSubtypeOnly,
-                    index_key.get_range()?,
-                    subtype_only_member_message(
-                        db,
-                        &prefix_typ,
-                        &field_name,
-                        &subtype_member.direct_candidates,
-                    ),
-                    None,
-                );
-                return Some(());
-            }
-            // Tier rule: direct subtype members produce the advisory above, while
-            // deeper/transitive subtype hits stay silent for baseline parity and
-            // open-world inheritance trees such as VGUI panels. Only a full subtype
-            // closure miss falls through to ordinary `UndefinedField`.
-            if subtype_member.has_transitive_hit {
-                return Some(());
-            }
             if let Some(profile) = profile.as_mut() {
                 profile.diagnostics_emitted += 1;
             }
@@ -2176,34 +2119,4 @@ fn owner_has_named_dynamic_fields(
     index
         .get_fields(owner)
         .is_some_and(|fields| !fields.is_empty())
-}
-
-fn subtype_only_member_message(
-    db: &DbIndex,
-    base_typ: &LuaType,
-    field_name: &SmolStr,
-    candidates: &[SmolStr],
-) -> String {
-    let base = humanize_lint_type(db, base_typ);
-    let shown = candidates
-        .iter()
-        .take(3)
-        .map(|name| format!("`{name}`"))
-        .collect::<Vec<_>>();
-    let more = candidates.len().saturating_sub(shown.len());
-    let candidate_text = if more == 0 {
-        shown.join(", ")
-    } else {
-        format!("{}, and {more} more", shown.join(", "))
-    };
-
-    if candidates.len() == 1 {
-        format!(
-            "Field `{field_name}` is defined on subtype {candidate_text} but not on `{base}`. Narrow or cast the value before access."
-        )
-    } else {
-        format!(
-            "Field `{field_name}` is defined on subtypes {candidate_text} but not on `{base}`. Narrow or cast the value before access."
-        )
-    }
 }

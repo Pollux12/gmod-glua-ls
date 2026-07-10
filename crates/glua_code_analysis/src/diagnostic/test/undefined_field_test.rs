@@ -336,21 +336,21 @@ mod test {
             "all uses consume the same stabilized fact while retaining inferred provenance"
         );
 
-        let subtype_only = default_diagnostics_for_code_with_shared(
+        let undefined_fields = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
+            DiagnosticCode::UndefinedField,
         );
-        assert_eq!(subtype_only.len(), 2, "{subtype_only:?}");
-        assert!(subtype_only.iter().any(|diagnostic| {
-            diagnostic
-                .message
-                .contains("Field `GetShootPos` is defined on subtype `Player` but not on `Entity`")
-        }));
+        assert_eq!(undefined_fields.len(), 2, "{undefined_fields:?}");
+        assert!(
+            undefined_fields
+                .iter()
+                .any(|diagnostic| diagnostic.message == "Undefined field `GetShootPos`. ")
+        );
     }
 
     #[test]
-    fn recursive_descendant_member_suppresses_undefined_field() {
+    fn recursive_descendant_member_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -375,13 +375,7 @@ mod test {
 
         let undefined_fields =
             diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
-        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
-        let subtype_only = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert!(subtype_only.is_empty(), "{subtype_only:?}");
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
     }
 
     #[test]
@@ -3471,75 +3465,30 @@ mod test {
     }
 
     #[test]
-    fn test_field_on_direct_subclass_reports_subtype_only_diagnostic() {
+    fn gmod_parent_receiver_member_defined_only_on_child_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
-        let file_id = ws.def(
-            r#"
-                ---@class SubclassTest.BaseEntity
-                local BaseEntity = {}
+        ws.def_file(
+            "annotations/entity.lua",
+            r#"---@meta
 
-                ---@class SubclassTest.Vehicle : SubclassTest.BaseEntity
-                local Vehicle = {}
-                function Vehicle:GetDriver() end
-
-                ---@type SubclassTest.BaseEntity
-                local ent = nil
-                ent:GetDriver()
-            "#,
+---@class Entity
+---@class Player : Entity
+---@field GetShootPos fun(self: Player)
+"#,
         );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_child_only_member.lua",
+            r#"---@type Entity
+local owner
+owner:GetShootPos()
+"#,
+        );
+
         let diagnostics = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(diagnostics[0].message.contains(
-            "Field `GetDriver` is defined on subtype `Vehicle` but not on `SubclassTest.BaseEntity`"
-        ));
-    }
-
-    #[test]
-    fn test_subtype_only_diagnostic_merges_union_and_table_of_candidates_with_cap() {
-        let mut ws = VirtualWorkspace::new();
-        enable_gmod(&mut ws);
-        let file_id = ws.def(
-            r#"
-                ---@class MergeCap.BaseA
-                local BaseA = {}
-
-                ---@class MergeCap.BaseB
-                local BaseB = {}
-
-                ---@class MergeCap.Alpha : MergeCap.BaseA
-                local Alpha = {}
-                function Alpha:SharedOnly() end
-
-                ---@class MergeCap.Bravo : MergeCap.BaseA
-                local Bravo = {}
-                function Bravo:SharedOnly() end
-
-                ---@class MergeCap.Charlie : MergeCap.BaseB
-                local Charlie = {}
-                function Charlie:SharedOnly() end
-
-                ---@class MergeCap.Delta : MergeCap.BaseB
-                local Delta = {}
-                function Delta:SharedOnly() end
-
-                ---@class MergeCap.AlphaDuplicate : MergeCap.BaseB
-                local AlphaDuplicate = {}
-                function AlphaDuplicate:SharedOnly() end
-
-                ---@type MergeCap.BaseA|tableof<MergeCap.BaseB>
-                local ent = nil
-                ent:SharedOnly()
-            "#,
-        );
-        let diagnostics = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
+            DiagnosticCode::UndefinedField,
         );
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -3547,82 +3496,14 @@ mod test {
         assert_eq!(
             diagnostic.code,
             Some(NumberOrString::String(
-                DiagnosticCode::GmodMemberOnSubtypeOnly
-                    .get_name()
-                    .to_string()
+                DiagnosticCode::UndefinedField.get_name().to_string()
             ))
         );
-        assert!(
-            diagnostic.message.contains("Field `SharedOnly`"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            diagnostic.message.contains("defined on subtypes"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            diagnostic.message.contains("`Alpha`"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            diagnostic.message.contains("`AlphaDuplicate`"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            diagnostic.message.contains("`Bravo`"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            diagnostic.message.contains("and 2 more"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            !diagnostic.message.contains("`Charlie`"),
-            "{}",
-            diagnostic.message
-        );
-        assert!(
-            !diagnostic.message.contains("`Delta`"),
-            "{}",
-            diagnostic.message
-        );
-    }
-
-    #[test]
-    fn test_subtype_only_diagnostic_is_silent_when_undefined_field_disabled() {
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        emmyrc.diagnostics.disable = vec![DiagnosticCode::UndefinedField];
-        ws.analysis.update_config(Arc::new(emmyrc));
-
-        let file_id = ws.def(
-            r#"
-                ---@class DisabledSubtypeOnly.BaseEntity
-                local BaseEntity = {}
-
-                ---@class DisabledSubtypeOnly.Vehicle : DisabledSubtypeOnly.BaseEntity
-                local Vehicle = {}
-                function Vehicle:GetDriver() end
-
-                ---@type DisabledSubtypeOnly.BaseEntity
-                local ent = nil
-                ent:GetDriver()
-            "#,
-        );
-        let diagnostics = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-
-        assert!(diagnostics.is_empty(), "{diagnostics:?}");
+        assert_eq!(diagnostic.message, "Undefined field `GetShootPos`. ");
+        assert_eq!(diagnostic.range.start.line, 2);
+        assert_eq!(diagnostic.range.start.character, 6);
+        assert_eq!(diagnostic.range.end.line, 2);
+        assert_eq!(diagnostic.range.end.character, 17);
     }
 
     #[test]
@@ -3650,13 +3531,6 @@ mod test {
                 ent:ClientOnly()
             "#,
         );
-
-        let subtype_only = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert!(subtype_only.is_empty(), "{subtype_only:?}");
 
         let undefined_fields = default_diagnostics_for_code_with_shared(
             &mut ws,
@@ -3695,13 +3569,6 @@ mod test {
             "#,
         );
 
-        let subtype_only = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert!(subtype_only.is_empty(), "{subtype_only:?}");
-
         let undefined_fields = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
@@ -3711,138 +3578,10 @@ mod test {
     }
 
     #[test]
-    fn test_direct_subtype_member_in_compatible_realm_reports_subtype_only_diagnostic() {
-        let mut ws = VirtualWorkspace::new();
-        enable_gmod(&mut ws);
-        ws.def_file(
-            "lua/autorun/sh_compatible_subtype_realms.lua",
-            r#"
-                ---@class RealmSubtypeCompatible.Base
-                local Base = {}
-
-                ---@class RealmSubtypeCompatible.ClientChild : RealmSubtypeCompatible.Base
-                local ClientChild = {}
-
-                ---@realm client
-                function ClientChild:ClientOnly() end
-            "#,
-        );
-        let file_id = ws.def_file(
-            "lua/autorun/client/cl_compatible_subtype_realms.lua",
-            r#"
-                ---@type RealmSubtypeCompatible.Base
-                local ent = nil
-                ent:ClientOnly()
-            "#,
-        );
-
-        let diagnostics = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(
-            diagnostics[0].message.contains("`ClientChild`"),
-            "{}",
-            diagnostics[0].message
-        );
-    }
-
-    #[test]
-    fn test_direct_subtype_candidates_are_sorted_after_realm_filtering() {
-        let mut ws = VirtualWorkspace::new();
-        enable_gmod(&mut ws);
-        ws.def_file(
-            "lua/autorun/sh_sorted_subtype_realms.lua",
-            r#"
-                ---@class RealmSubtypeSorted.Base
-                local Base = {}
-
-                ---@class RealmSubtypeSorted.Charlie : RealmSubtypeSorted.Base
-                local Charlie = {}
-                ---@realm client
-                function Charlie:VisibleOnly() end
-
-                ---@class RealmSubtypeSorted.Bravo : RealmSubtypeSorted.Base
-                local Bravo = {}
-                ---@realm server
-                function Bravo:VisibleOnly() end
-
-                ---@class RealmSubtypeSorted.Alpha : RealmSubtypeSorted.Base
-                local Alpha = {}
-                ---@realm client
-                function Alpha:VisibleOnly() end
-            "#,
-        );
-        let file_id = ws.def_file(
-            "lua/autorun/client/cl_sorted_subtype_realms.lua",
-            r#"
-                ---@type RealmSubtypeSorted.Base
-                local ent = nil
-                ent:VisibleOnly()
-            "#,
-        );
-
-        let diagnostics = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        let message = &diagnostics[0].message;
-        let alpha = message.find("`Alpha`").expect(message);
-        let charlie = message.find("`Charlie`").expect(message);
-        assert!(alpha < charlie, "{message}");
-        assert!(!message.contains("`Bravo`"), "{message}");
-    }
-
-    #[test]
-    fn test_menu_caller_sees_client_subtype_member() {
-        let mut ws = VirtualWorkspace::new();
-        enable_gmod(&mut ws);
-        ws.def_file(
-            "lua/autorun/sh_menu_subtype_realms.lua",
-            r#"
-                ---@class RealmSubtypeMenu.Base
-                local Base = {}
-
-                ---@class RealmSubtypeMenu.ClientChild : RealmSubtypeMenu.Base
-                local ClientChild = {}
-
-                ---@realm client
-                function ClientChild:ClientOrMenuOnly() end
-            "#,
-        );
-        let file_id = ws.def_file(
-            "lua/menu/menu_subtype_realms.lua",
-            r#"
-                ---@realm menu
-                ---@type RealmSubtypeMenu.Base
-                local ent = nil
-                ent:ClientOrMenuOnly()
-            "#,
-        );
-
-        let diagnostics = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
-        assert!(
-            diagnostics[0].message.contains("`ClientChild`"),
-            "{}",
-            diagnostics[0].message
-        );
-    }
-
-    #[test]
     fn test_field_on_deep_subclass_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
-        assert!(ws.check_code_for(
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
+        let file_id = ws.def(
             r#"
                 ---@class DeepSubTest.Entity
                 local Entity = {}
@@ -3858,29 +3597,17 @@ mod test {
                 local ent = nil
                 ent:GetSpecialField()
             "#,
-        ));
-        assert!(ws.check_code_for(
+        );
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
             DiagnosticCode::UndefinedField,
-            r#"
-                ---@class DeepSubTest.Entity
-                local Entity = {}
-
-                ---@class DeepSubTest.Vehicle : DeepSubTest.Entity
-                local Vehicle = {}
-
-                ---@class DeepSubTest.Airboat : DeepSubTest.Vehicle
-                local Airboat = {}
-                function Airboat:GetSpecialField() end
-
-                ---@type DeepSubTest.Entity
-                local ent = nil
-                ent:GetSpecialField()
-            "#,
-        ));
+        );
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
     }
 
     #[test]
-    fn test_panel_member_on_deep_custom_panel_suppresses_undefined_field() {
+    fn test_panel_member_on_deep_custom_panel_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -3906,34 +3633,52 @@ mod test {
             file_id,
             DiagnosticCode::UndefinedField,
         );
-        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
-
-        let subtype_only = default_diagnostics_for_code_with_shared(
-            &mut ws,
-            file_id,
-            DiagnosticCode::GmodMemberOnSubtypeOnly,
-        );
-        assert!(subtype_only.is_empty(), "{subtype_only:?}");
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
     }
 
     #[test]
-    fn test_field_not_on_any_subclass_still_reported() {
+    fn gmod_truly_absent_parent_member_reports_undefined_field() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/absent_member.lua",
+            r#"---@meta
+
+---@class Entity
+---@class Player : Entity
+---@field GetShootPos fun(self: Player)
+"#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_absent_member.lua",
+            r#"---@type Entity
+local owner
+owner:CompletelyMadeUpMethod()
+"#,
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
             DiagnosticCode::UndefinedField,
-            r#"
-                ---@class NoSubField.BaseEntity
-                local BaseEntity = {}
+        );
 
-                ---@class NoSubField.Vehicle : NoSubField.BaseEntity
-                local Vehicle = {}
-                function Vehicle:GetDriver() end
-
-                ---@type NoSubField.BaseEntity
-                local ent = nil
-                ent:CompletelyMadeUpMethod()
-            "#,
-        ));
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                DiagnosticCode::UndefinedField.get_name().to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Undefined field `CompletelyMadeUpMethod`. "
+        );
+        assert_eq!(diagnostic.range.start.line, 2);
+        assert_eq!(diagnostic.range.start.character, 6);
+        assert_eq!(diagnostic.range.end.line, 2);
+        assert_eq!(diagnostic.range.end.character, 28);
     }
 
     #[test]

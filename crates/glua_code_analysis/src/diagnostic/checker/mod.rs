@@ -35,7 +35,6 @@ mod readonly_check;
 mod redefined_local;
 mod require_module_visibility;
 mod return_type_mismatch;
-mod subtype_member;
 mod syntax_error;
 mod unbalanced_assignments;
 mod undefined_doc_param;
@@ -81,7 +80,6 @@ pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
-pub use subtype_member::{PrecomputedSubtypeMembers, precompute_subtype_members};
 
 pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
 pub type AssignmentPrefixKey = (TextSize, TextSize, String);
@@ -264,8 +262,6 @@ pub struct SharedDiagnosticData {
         HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
-    /// Realm-neutral subtype member candidates, queried with caller realm at diagnostic time.
-    pub subtype_members: Arc<PrecomputedSubtypeMembers>,
     /// Whether any indexed signature/type cache can produce an async callable.
     pub await_candidates: Arc<PrecomputedAwaitCandidates>,
     /// Static callee names whose callable metadata has parameter types worth checking.
