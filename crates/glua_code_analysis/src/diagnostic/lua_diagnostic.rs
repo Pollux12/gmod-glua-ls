@@ -112,6 +112,12 @@ impl LuaDiagnostic {
         let module_index = db.get_module_index();
         let mut workspace_file_ids = module_index.get_main_workspace_file_ids();
         workspace_file_ids.sort_unstable();
+        // Callee resolution for a main workspace can select declarations from
+        // compatible library and std workspaces. Include those files in the
+        // realm lookup precompute while keeping `workspace_file_ids` limited to
+        // main files for diagnostics that intentionally scan only user code.
+        let mut realm_candidate_file_ids = db.get_vfs().get_all_local_file_ids();
+        realm_candidate_file_ids.sort_unstable();
 
         // Every precomputation here scans the workspace-wide db independently and
         // reads only immutable `&DbIndex` state, so run them all concurrently. On
@@ -121,6 +127,7 @@ impl LuaDiagnostic {
         // own sequential ordering inside a single task (insertion order is
         // significant for the "first definition wins" realm-candidate rule).
         let workspace_file_ids_ref = &workspace_file_ids;
+        let realm_candidate_file_ids_ref = &realm_candidate_file_ids;
         let (
             workspace_realm_data,
             missing_required_fields,
@@ -139,7 +146,7 @@ impl LuaDiagnostic {
                     let mut callee_realm_data = precompute_callee_realm_data_for_workspace(
                         db,
                         workspace_id,
-                        workspace_file_ids_ref,
+                        realm_candidate_file_ids_ref,
                     );
                     callee_realm_data
                         .realm_call_candidates

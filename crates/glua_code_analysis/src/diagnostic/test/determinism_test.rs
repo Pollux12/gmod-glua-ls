@@ -4,7 +4,8 @@ mod tests {
 
     use crate::test_lib::DiagnosticSnapshot;
     use crate::{
-        DiagnosticCode, Emmyrc, FileId, RenderLevel, VirtualWorkspace, WorkspaceId, humanize_type,
+        DiagnosticCode, Emmyrc, FileId, LuaSemanticDeclId, RenderLevel, VirtualWorkspace,
+        WorkspaceId, humanize_type,
     };
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
     use googletest::prelude::*;
@@ -286,6 +287,18 @@ mod tests {
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
 
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        let library_id = ws.def_file(
+            "library/sh_api.lua",
+            r#"
+            ---@realm shared
+            function SharedLibraryApi()
+                return true
+            end
+            "#,
+        );
+
         let server_id = ws.def_file(
             "lua/autorun/server/sv_api.lua",
             r#"
@@ -320,6 +333,23 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_that!(precomputed.is_empty(), eq(false));
+        let library_decl_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_decl_index()
+            .get_decl_tree(&library_id)
+            .and_then(|tree| {
+                tree.get_decls()
+                    .values()
+                    .find(|decl| decl.get_name() == "SharedLibraryApi")
+                    .map(|decl| decl.get_id())
+            })
+            .expect("expected library declaration");
+        assert_that!(
+            precomputed.contains_key(&LuaSemanticDeclId::LuaDecl(library_decl_id)),
+            eq(true)
+        );
     }
 
     #[gtest]
