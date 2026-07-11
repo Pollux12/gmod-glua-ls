@@ -926,6 +926,73 @@ mod test {
         );
     }
 
+    fn define_scripted_override_parent_signatures(ws: &mut VirtualWorkspace, multiple: bool) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        let parent = if multiple {
+            r#"
+                ---@meta
+                ---@class Entity
+                local Entity = {}
+                ---@class ENTITY: Entity
+                ENTITY = Entity
+                ---@class ENT: ENTITY
+
+                ---@param value_arg Entity
+                function Entity:Use(value_arg) end
+
+                ---@param value_arg Entity
+                function Entity:Use(value_arg) end
+            "#
+        } else {
+            r#"
+                ---@meta
+                ---@class Entity
+                local Entity = {}
+                ---@class ENTITY: Entity
+                ENTITY = Entity
+                ---@class ENT: ENTITY
+
+                ---@param value_arg Entity
+                function Entity:Use(value_arg) end
+            "#
+        };
+
+        ws.def_files(vec![
+            ("annotations/entity.lua", parent),
+            (
+                "entities/entities/test_override/shared.lua",
+                r#"
+                    function ENT:Use(value_arg)
+                        inherited_value = value_arg
+                    end
+                "#,
+            ),
+        ]);
+    }
+
+    #[gtest]
+    fn test_scripted_override_inherits_single_parent_signature() {
+        let mut ws = VirtualWorkspace::new();
+        define_scripted_override_parent_signatures(&mut ws, false);
+
+        assert_eq!(ws.expr_ty("inherited_value"), ws.ty("Entity"));
+    }
+
+    #[gtest]
+    fn test_scripted_override_inherits_multiple_parent_signatures() {
+        let mut ws = VirtualWorkspace::new();
+        define_scripted_override_parent_signatures(&mut ws, true);
+
+        assert_eq!(ws.expr_ty("inherited_value"), ws.ty("Entity"));
+    }
+
     #[gtest]
     fn test_accessor_func_synthesizes_get_set_members() {
         let mut ws = VirtualWorkspace::new();
