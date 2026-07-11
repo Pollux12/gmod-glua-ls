@@ -947,7 +947,7 @@ mod test {
                 ---@param value_arg Entity
                 function Entity:Use(value_arg) end
 
-                ---@param value_arg Entity
+                ---@param value_arg string
                 function Entity:Use(value_arg) end
             "#
         } else {

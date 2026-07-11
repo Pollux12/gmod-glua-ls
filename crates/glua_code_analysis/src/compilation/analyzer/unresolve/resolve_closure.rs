@@ -795,25 +795,29 @@ fn find_best_function_type(
 ) -> Option<LuaType> {
     // 寻找非自身定义的签名
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
-        if result.is_current_owner {
-            // 对应当前类型下的声明, 我们需要过滤掉所有`signature`类型
-            if let Some(filtered_types) =
-                filter_signature_type(db, &result.typ, origin_sig_id, false)
+        if let Some(filtered_types) = filter_signature_type(db, &result.typ, origin_sig_id, false) {
+            // Parent declarations may describe distinct callback and callable forms.
+            if !result.is_current_owner
+                && let Some(parent_type) = filtered_types.first()
             {
-                match filtered_types.len() {
-                    0 => {}
-                    1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),
-                    _ => {
-                        return Some(LuaType::from_vec(
-                            filtered_types
-                                .into_iter()
-                                .map(|func| LuaType::DocFunction(func.clone()))
-                                .collect(),
-                        ));
-                    }
+                return Some(LuaType::DocFunction(parent_type.clone()));
+            }
+
+            match filtered_types.len() {
+                0 => {}
+                1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),
+                _ => {
+                    return Some(LuaType::from_vec(
+                        filtered_types
+                            .into_iter()
+                            .map(|func| LuaType::DocFunction(func.clone()))
+                            .collect(),
+                    ));
                 }
             }
-        } else {
+        }
+
+        if !result.is_current_owner {
             return Some(result.typ);
         }
     }
