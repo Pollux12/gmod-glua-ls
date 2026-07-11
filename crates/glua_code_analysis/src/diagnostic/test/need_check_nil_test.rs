@@ -35,6 +35,21 @@ mod test {
         ws
     }
 
+    #[test]
+    fn uninitialized_annotated_local_uses_authoritative_declared_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+                ---@type string
+                local value
+
+                print(value:upper())
+            "#
+        ));
+    }
+
     fn need_check_nil_for_file(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,

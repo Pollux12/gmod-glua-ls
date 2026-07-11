@@ -1,6 +1,9 @@
 use crate::{
     TypeSubstitutor,
-    db_index::{LuaFunctionType, LuaOperatorMetaMethod, LuaSignatureId, LuaType, LuaTypeDeclId},
+    db_index::{
+        LuaFunctionType, LuaOperatorMetaMethod, LuaSignatureId, LuaType, LuaTypeDeclId,
+        VariadicType,
+    },
     semantic::type_check::type_check_context::TypeCheckContext,
 };
 
@@ -137,7 +140,210 @@ fn check_doc_func_type_compact_for_params(
         }
     }
 
-    // todo check return type
+    check_doc_func_returns_compact(
+        context,
+        source_func.get_ret(),
+        compact_func.get_ret(),
+        check_guard.next_level()?,
+    )?;
+
+    Ok(())
+}
+
+fn check_doc_func_returns_compact(
+    context: &mut TypeCheckContext,
+    expected: &LuaType,
+    actual: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    if actual.is_never() || expected.is_nil() {
+        return Ok(());
+    }
+
+    match expected {
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(expected_type) => check_actual_return_tail(
+                context,
+                expected_type,
+                actual,
+                0,
+                check_guard.next_level()?,
+            ),
+            VariadicType::Multi(expected_types) => check_expected_return_types(
+                context,
+                expected_types,
+                actual,
+                check_guard.next_level()?,
+            ),
+        },
+        _ => check_expected_return_types(
+            context,
+            std::slice::from_ref(expected),
+            actual,
+            check_guard.next_level()?,
+        ),
+    }
+}
+
+fn check_expected_return_types(
+    context: &mut TypeCheckContext,
+    expected_types: &[LuaType],
+    actual: &LuaType,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    for (index, expected_type) in expected_types.iter().enumerate() {
+        if let LuaType::Variadic(variadic) = expected_type
+            && let VariadicType::Base(expected_type) = variadic.as_ref()
+        {
+            return check_actual_return_tail(
+                context,
+                expected_type,
+                actual,
+                index,
+                check_guard.next_level()?,
+            );
+        }
+
+        match actual_return_slot(actual, index) {
+            ActualReturnSlot::Missing => {
+                if !expected_type.is_optional() {
+                    return Err(TypeCheckFailReason::TypeNotMatch);
+                }
+            }
+            ActualReturnSlot::Guaranteed(actual_type) => {
+                check_general_type_compact(
+                    context,
+                    expected_type,
+                    actual_type,
+                    check_guard.next_level()?,
+                )?;
+            }
+            ActualReturnSlot::Variadic(actual_type) => {
+                if !expected_type.is_optional() {
+                    return Err(TypeCheckFailReason::TypeNotMatch);
+                }
+                check_general_type_compact(
+                    context,
+                    expected_type,
+                    actual_type,
+                    check_guard.next_level()?,
+                )?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+enum ActualReturnSlot<'a> {
+    Missing,
+    Guaranteed(&'a LuaType),
+    Variadic(&'a LuaType),
+}
+
+fn actual_return_slot(actual: &LuaType, index: usize) -> ActualReturnSlot<'_> {
+    match actual {
+        LuaType::Nil => ActualReturnSlot::Missing,
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(actual_type) => ActualReturnSlot::Variadic(actual_type),
+            VariadicType::Multi(actual_types) => actual_return_slot_from_types(actual_types, index),
+        },
+        _ if index == 0 => ActualReturnSlot::Guaranteed(actual),
+        _ => ActualReturnSlot::Missing,
+    }
+}
+
+fn actual_return_slot_from_types(actual_types: &[LuaType], index: usize) -> ActualReturnSlot<'_> {
+    if let Some(actual_type) = actual_types.get(index) {
+        return match actual_type {
+            LuaType::Variadic(variadic) => match variadic.as_ref() {
+                VariadicType::Base(actual_type) => ActualReturnSlot::Variadic(actual_type),
+                VariadicType::Multi(actual_types) => actual_return_slot_from_types(actual_types, 0),
+            },
+            _ => ActualReturnSlot::Guaranteed(actual_type),
+        };
+    }
+
+    let tail_start = actual_types.len().saturating_sub(1);
+    match actual_types.last() {
+        Some(LuaType::Variadic(variadic)) => match variadic.as_ref() {
+            VariadicType::Base(actual_type) => ActualReturnSlot::Variadic(actual_type),
+            VariadicType::Multi(nested_types) => {
+                let nested_index = index.saturating_sub(tail_start);
+                actual_return_slot_from_types(nested_types, nested_index)
+            }
+        },
+        _ => ActualReturnSlot::Missing,
+    }
+}
+
+fn check_actual_return_tail(
+    context: &mut TypeCheckContext,
+    expected_type: &LuaType,
+    actual: &LuaType,
+    start: usize,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    match actual {
+        LuaType::Nil => Ok(()),
+        LuaType::Variadic(variadic) => match variadic.as_ref() {
+            VariadicType::Base(actual_type) => check_general_type_compact(
+                context,
+                expected_type,
+                actual_type,
+                check_guard.next_level()?,
+            ),
+            VariadicType::Multi(actual_types) => check_actual_return_types_tail(
+                context,
+                expected_type,
+                actual_types,
+                start,
+                check_guard.next_level()?,
+            ),
+        },
+        _ if start == 0 => {
+            check_general_type_compact(context, expected_type, actual, check_guard.next_level()?)
+        }
+        _ => Ok(()),
+    }
+}
+
+fn check_actual_return_types_tail(
+    context: &mut TypeCheckContext,
+    expected_type: &LuaType,
+    actual_types: &[LuaType],
+    start: usize,
+    check_guard: TypeCheckGuard,
+) -> TypeCheckResult {
+    for actual_type in actual_types.iter().skip(start) {
+        match actual_type {
+            LuaType::Variadic(variadic) => match variadic.as_ref() {
+                VariadicType::Base(actual_type) => {
+                    return check_general_type_compact(
+                        context,
+                        expected_type,
+                        actual_type,
+                        check_guard.next_level()?,
+                    );
+                }
+                VariadicType::Multi(actual_types) => {
+                    check_actual_return_types_tail(
+                        context,
+                        expected_type,
+                        actual_types,
+                        0,
+                        check_guard.next_level()?,
+                    )?;
+                }
+            },
+            _ => check_general_type_compact(
+                context,
+                expected_type,
+                actual_type,
+                check_guard.next_level()?,
+            )?,
+        }
+    }
 
     Ok(())
 }

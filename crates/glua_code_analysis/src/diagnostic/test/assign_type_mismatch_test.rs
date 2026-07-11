@@ -1796,16 +1796,99 @@ return t
     }
 
     #[test]
-    fn test_never_target_no_assign_mismatch() {
+    fn test_never_value_no_assign_mismatch() {
         let mut ws = VirtualWorkspace::new();
-        // Assigning to a field whose type resolves to `never` should not produce a diagnostic.
-        // `never` indicates a type inference limitation rather than an actual type error.
+        // A value of type `never` never returns, so it is assignable to every target type.
         assert!(ws.check_code_for(
             DiagnosticCode::AssignTypeMismatch,
             r#"
+                ---@return never
+                local function stop() end
+
+                ---@type number
+                local value
+                value = stop()
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_nil_local_rejects_non_nil_initializer() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type nil
+                local value = 1
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_nil_local_rejects_later_non_nil_assignment() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type nil
+                local value
+                value = 1
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_void_local_rejects_value_initializer() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type void
+                local value = 1
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_void_local_rejects_later_value_assignment() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type void
+                local value
+                value = 1
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_never_local_rejects_initializer() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
                 ---@type never
-                local x
-                x = 42
+                local value = 1
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_explicit_never_local_rejects_later_assignment() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+                ---@type never
+                local value
+                value = 1
             "#
         ));
     }

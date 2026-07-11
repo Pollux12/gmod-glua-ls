@@ -27,6 +27,216 @@ mod test {
     }
 
     #[test]
+    fn issue_40_callback_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return number
+            local function returns_number()
+                return 1
+            end
+
+            accepts_string_callback(returns_number)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_multi_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string, number
+            local function accepts_string_number_callback(callback) end
+
+            ---@return string
+            ---@return boolean
+            local function returns_string_boolean()
+                return "value", true
+            end
+
+            accepts_string_number_callback(returns_string_boolean)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_with_fewer_params_and_compatible_return_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: string): string
+            local function accepts_string_callback(callback) end
+
+            ---@return string
+            local function returns_string()
+                return "value"
+            end
+
+            accepts_string_callback(returns_string)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_expected_variadic_return_accepts_no_results() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string...
+            local function accepts_string_results(callback) end
+
+            local function returns_nothing() end
+
+            accepts_string_results(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_actual_variadic_return_does_not_satisfy_required_result() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_required_string(callback) end
+
+            ---@return string ...
+            local function maybe_returns_strings() end
+
+            accepts_required_string(maybe_returns_strings)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_never_return_is_accepted_for_required_result() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return never
+            local function never_returns() end
+
+            accepts_string_callback(never_returns)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_missing_required_return_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            local function returns_nothing() end
+
+            accepts_string_callback(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_extra_finite_return_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return string
+            ---@return number
+            local function returns_string_number()
+                return "value", 1
+            end
+
+            accepts_string_callback(returns_string_number)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_void_return_contracts_are_compatible() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun()
+            local function accepts_void_callback(callback) end
+
+            local function returns_nothing() end
+
+            accepts_void_callback(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_void_contract_ignores_actual_results() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun()
+            local function accepts_void_callback(callback) end
+
+            ---@return string
+            local function returns_string()
+                return "value"
+            end
+
+            accepts_void_callback(returns_string)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_return_uses_matching_actual_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@overload fun(): string
+            ---@return number
+            local function returns_by_overload()
+                return 1
+            end
+
+            accepts_string_callback(returns_by_overload)
+            "#
+        ));
+    }
+
+    #[test]
     fn test_mutual_alias_type_check_does_not_overflow() {
         let mut ws = VirtualWorkspace::new();
 

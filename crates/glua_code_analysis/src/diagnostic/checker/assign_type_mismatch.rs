@@ -136,6 +136,7 @@ fn check_name_expr(
         &value_type,
         false,
         source_is_inferred,
+        true,
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
@@ -211,6 +212,7 @@ fn check_index_expr(
         &value_type,
         true,
         source_is_inferred,
+        false,
     );
     if let Some(expr) = expr {
         if !source_is_inferred
@@ -775,6 +777,7 @@ fn check_local_stat(
             &value_type,
             false,
             source_is_inferred,
+            true,
         );
         let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
         if let Some(expr) = value_exprs.get(idx)
@@ -912,6 +915,7 @@ fn check_table_expr_content(
             &expr_type,
             allow_nil,
             source_is_inferred,
+            false,
         ) {
             has_diagnostic = has_diagnostic || result;
         }
@@ -968,6 +972,7 @@ fn check_table_last_variadic_type(
                     expr_type,
                     false,
                     false,
+                    false,
                 ) && result
                 {
                     return Some(true);
@@ -987,6 +992,7 @@ fn check_assign_type_mismatch(
     value_type: &LuaType,
     allow_nil: bool,
     source_is_inferred: bool,
+    source_is_direct_target: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
     // 如果一致, 则不进行类型检查
@@ -998,8 +1004,13 @@ fn check_assign_type_mismatch(
         return Some(false);
     }
 
-    // `never` indicates a type inference limitation, not an actual error
-    if matches!(source_type, LuaType::Never) || matches!(value_type, LuaType::Never) {
+    let source_is_explicit = source_is_direct_target && !source_is_inferred;
+
+    // Derived `never` is an inference limitation, and a `never` value is assignable to any target.
+    // An explicitly annotated direct target is a declared constraint and must be checked.
+    if matches!(value_type, LuaType::Never)
+        || (matches!(source_type, LuaType::Never) && !source_is_explicit)
+    {
         return Some(false);
     }
 
@@ -1014,7 +1025,8 @@ fn check_assign_type_mismatch(
         (LuaType::Def(_), _) => return Some(false),
         // 此时检查交给 table_field
         (LuaType::Ref(_) | LuaType::Tuple(_), LuaType::TableConst(_)) => return Some(false),
-        (LuaType::Nil, _) => return Some(false),
+        // Inferred/derived nil is a sentinel. Explicit nil/void direct targets remain authoritative.
+        (LuaType::Nil, _) if !source_is_explicit => return Some(false),
         // Allow nil assignment to reference/class types (common Lua cleanup pattern)
         (LuaType::Ref(_), LuaType::Nil) => return Some(false),
         (LuaType::Ref(_), LuaType::Instance(instance)) => {
