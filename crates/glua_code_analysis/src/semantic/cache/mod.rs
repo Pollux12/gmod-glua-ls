@@ -206,6 +206,7 @@ impl LuaInferCache {
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
+        self.narrow_by_literal_stop_position_cache.clear();
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
@@ -238,6 +239,7 @@ impl LuaInferCache {
         // materialize, so discard only those semantic entries.
         self.expr_var_ref_id_cache
             .retain(|syntax_id, var_ref_id| var_ref_is_phase_stable(db, syntax_id, var_ref_id));
+        self.narrow_by_literal_stop_position_cache.clear();
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;
@@ -435,16 +437,29 @@ mod tests {
             cache.flow_node_realm_cache.get(&FlowId(1)),
             Some(&GmodRealm::Server)
         );
-        assert!(
-            cache
-                .narrow_by_literal_stop_position_cache
-                .contains(&syntax_id)
-        );
+        assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
         assert_eq!(
             cache.local_reassignment_positions_cache.get(&decl_id),
             Some(&vec![TextSize::from(9)])
         );
         assert!(cache.local_reassignments_indexed);
+    }
+
+    #[test]
+    fn clear_discards_literal_narrowing_stop_markers() {
+        let file_id = FileId { id: 7 };
+        let syntax_id = LuaSyntaxId::new(
+            LuaSyntaxKind::IndexExpr.into(),
+            TextRange::new(TextSize::from(3), TextSize::from(9)),
+        );
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache
+            .narrow_by_literal_stop_position_cache
+            .insert(syntax_id);
+
+        cache.clear();
+
+        assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
     }
 
     #[test]
