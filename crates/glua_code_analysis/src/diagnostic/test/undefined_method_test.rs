@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
@@ -98,5 +98,202 @@ mod tests {
         );
 
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn truthy_player_or_false_result_allows_player_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field IsActive fun(self: Player): boolean
+            ---@field Nick fun(self: Player): string
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            function IsValid(value) end
+
+            local function IsPlayer(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@return Entity
+            function FindEntity() end
+
+            local function FindPlayer()
+                local ent = FindEntity()
+                if not ent then return false end
+                return (IsPlayer(ent) and ent:IsActive()) and ent or false
+            end
+
+            local target = FindPlayer()
+            if target then
+                target:Nick()
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn gamemode_methods_defined_across_files_are_visible() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "annotations/gm.lua",
+            r#"
+            ---@class GM
+            GM = {}
+            ---@type GM
+            GAMEMODE = nil
+            "#,
+        );
+        let file_ids = ws.def_files(vec![
+            (
+                "gamemodes/terrortown/gamemode/cl_init.lua",
+                r#"
+                function GM:InitializeClient()
+                    GAMEMODE:ClearClientState()
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/client_state.lua",
+                r#"
+                function GM:ClearClientState() end
+                "#,
+            ),
+        ]);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_ids[0], CancellationToken::new())
+            .unwrap_or_default();
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn early_return_valid_player_guard_preserves_player_methods() {
+        let diagnostics = diagnostics(
+            &mut VirtualWorkspace::new(),
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field IsActive fun(self: Player): boolean
+            ---@field Nick fun(self: Player): string
+
+            player = {}
+            ---@return Player|false
+            function player.GetBySteamID64(id) end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            ---@[valid_guard]
+            function IsValid(value) end
+
+            ---@param ply Player
+            local function Transfer(id, ply)
+                local target = player.GetBySteamID64(id)
+                if not IsValid(target) or not target:IsActive() or target == ply then return end
+                target:Nick()
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn dynamic_callback_table_uses_call_site_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(
+            r#"
+            ---@class ScoreReport
+            local ScoreReport = {}
+            function ScoreReport:BuildSummaryPanel() end
+            function ScoreReport:BuildEventLogPanel() end
+
+            local tabs = {
+                summary = function(panel)
+                    panel:BuildSummaryPanel()
+                end,
+                events = function(panel)
+                    panel:BuildEventLogPanel()
+                end,
+            }
+
+            function ScoreReport:Show(selected)
+                tabs[selected](self)
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn erased_panel_parent_accepts_known_subtype_methods_but_reports_unknown_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class ParentPanel: Panel
+            local ParentPanel = {}
+            function ParentPanel:UpdatePlayerData() end
+
+            ---@class ChildPanel: Panel
+            local ChildPanel = {}
+            function ChildPanel:UpdateParent()
+                self:GetParent():UpdatePlayerData()
+                self:GetParent():DefinitelyMissing()
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_methods = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            undefined_methods,
+            ["Undefined method `DefinitelyMissing`. "]
+        );
     }
 }

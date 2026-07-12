@@ -2256,6 +2256,11 @@ mod test {
                 ---@type DColorMixer
                 DColorMixer = nil
 
+                ---@generic T: Panel
+                ---@param className `T`
+                ---@return (instance) T?
+                function vgui.Create(className, parent, name) end
+
                 function DColorMixer:SetLabel(label) end
                 function DColorMixer:SetAlphaBar(enabled) end
                 function DColorMixer:SetPalette(enabled) end
@@ -2286,13 +2291,15 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let undefined_field_code = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
-        ));
+        let undefined_member_codes = [
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
+        ]
+        .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
         assert!(
             diagnostics
                 .iter()
-                .all(|diagnostic| diagnostic.code != undefined_field_code),
+                .all(|diagnostic| !undefined_member_codes.contains(&diagnostic.code)),
             "DColorMixer reassignment should replace the older local panel type, got {diagnostics:?}"
         );
     }

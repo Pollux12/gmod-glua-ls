@@ -1683,6 +1683,13 @@ fn analyze_return(
     };
 
     let return_points = analyze_func_body_returns(block);
+    analyzer
+        .context
+        .add_inferred_return_candidate(UnResolveReturn {
+            file_id: analyzer.file_id,
+            signature_id: *signature_id,
+            return_points: return_points.clone(),
+        });
     let return_correlations = analyze_return_correlations(
         analyzer.db,
         analyzer

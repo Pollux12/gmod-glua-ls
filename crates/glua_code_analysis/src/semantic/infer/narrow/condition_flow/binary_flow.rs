@@ -763,6 +763,7 @@ fn maybe_var_eq_narrow(
             let left_type = get_condition_antecedent_type(
                 db, tree, cache, root, var_ref_id, flow_node, policy,
             )?;
+            let right_is_literal = matches!(right_expr, LuaExpr::LiteralExpr(_));
             let right_expr_type = infer_expr(db, cache, right_expr)?;
 
             let result_type = match condition_flow {
@@ -782,7 +783,11 @@ fn maybe_var_eq_narrow(
                     }
                 }
                 InferConditionFlow::FalseCondition => {
-                    TypeOps::Remove.apply(db, &left_type, &right_expr_type)
+                    if right_is_literal {
+                        TypeOps::Remove.apply(db, &left_type, &right_expr_type)
+                    } else {
+                        left_type
+                    }
                 }
             };
             Ok(ResultTypeOrContinue::Result(result_type))

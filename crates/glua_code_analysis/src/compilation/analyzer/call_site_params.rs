@@ -154,61 +154,77 @@ fn collect_call_site_param_types(
     }
 
     let prefix_expr = call_expr.get_prefix_expr()?;
-    let signature_id =
-        signature_id_from_call_prefix(db, file_id, &prefix_expr, call_expr.get_position())?;
-    if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
-        return None;
-    }
-
-    let signature = db.get_signature_index().get(&signature_id)?;
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
-    for (arg_idx, arg) in useful_args {
-        let param_idx = arg_idx + colon_call_arg_shift;
-        if param_idx >= signature.params.len() || signature.param_docs.contains_key(&param_idx) {
+    let has_self_arg = useful_args.iter().any(|(_, arg)| is_self_name_expr(arg));
+    let (signature_ids, inferred_callable_union) = signature_ids_from_call_prefix(
+        db,
+        cache,
+        file_id,
+        &prefix_expr,
+        call_expr.get_position(),
+        has_self_arg,
+    );
+    for signature_id in signature_ids {
+        if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
             continue;
         }
-        let Some(param_name) = signature.params.get(param_idx) else {
+        let Some(signature) = db.get_signature_index().get(&signature_id) else {
             continue;
         };
-        if !has_gmod_param_name_hint(db, param_name) {
-            continue;
-        }
-        if db
-            .get_call_site_param_index()
-            .is_param_mutated(&signature_id, param_idx)
-        {
-            continue;
-        }
-        let arg_syntax_id = arg.get_syntax_id();
-        let Some(arg_type) = infer_supported_call_site_arg_type(db, cache, file_id, arg) else {
-            continue;
-        };
-        if arg_type.is_unknown() || arg_type.is_never() {
-            continue;
-        }
+        for (arg_idx, arg) in &useful_args {
+            if inferred_callable_union && !is_self_name_expr(arg) {
+                continue;
+            }
+            let param_idx = *arg_idx + colon_call_arg_shift;
+            if param_idx >= signature.params.len() || signature.param_docs.contains_key(&param_idx)
+            {
+                continue;
+            }
+            let Some(param_name) = signature.params.get(param_idx) else {
+                continue;
+            };
+            if !has_gmod_param_name_hint(db, param_name) {
+                continue;
+            }
+            if db
+                .get_call_site_param_index()
+                .is_param_mutated(&signature_id, param_idx)
+            {
+                continue;
+            }
+            let arg_syntax_id = arg.get_syntax_id();
+            let Some(arg_type) =
+                infer_supported_call_site_arg_type(db, cache, file_id, arg.clone())
+            else {
+                continue;
+            };
+            if arg_type.is_unknown() || arg_type.is_never() {
+                continue;
+            }
 
-        let node = LuaInferenceNodeId::SignatureParam {
-            signature_id,
-            param_idx: u16::try_from(param_idx).ok()?,
-        };
-        let event = LuaInferenceEventId {
-            node,
-            kind: LuaInferenceProvenanceKind::ContextualUnknown,
-            source: InFiled::new(file_id, arg_syntax_id),
-        };
-        contributions.push((
-            signature_id,
-            param_idx,
-            LuaTypeFact::new(
-                arg_type,
-                LuaInferenceConfidence::Anchored,
-                vec![LuaInferenceStep {
-                    event,
-                    support: vec![].into(),
-                }]
-                .into(),
-            ),
-        ));
+            let node = LuaInferenceNodeId::SignatureParam {
+                signature_id,
+                param_idx: u16::try_from(param_idx).ok()?,
+            };
+            let event = LuaInferenceEventId {
+                node,
+                kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                source: InFiled::new(file_id, arg_syntax_id),
+            };
+            contributions.push((
+                signature_id,
+                param_idx,
+                LuaTypeFact::new(
+                    arg_type,
+                    LuaInferenceConfidence::Anchored,
+                    vec![LuaInferenceStep {
+                        event,
+                        support: vec![].into(),
+                    }]
+                    .into(),
+                ),
+            ));
+        }
     }
 
     Some(())
@@ -254,13 +270,15 @@ fn has_gmod_param_name_hint(db: &DbIndex, param_name: &str) -> bool {
         .is_some_and(|hint| !hint.trim().is_empty())
 }
 
-fn signature_id_from_call_prefix(
+fn signature_ids_from_call_prefix(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     file_id: FileId,
     prefix_expr: &LuaExpr,
     call_position: TextSize,
-) -> Option<LuaSignatureId> {
-    match prefix_expr {
+    infer_callable_union: bool,
+) -> (Vec<LuaSignatureId>, bool) {
+    let direct = match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
             signature_id_from_name_expr(db, file_id, name_expr, call_position)
         }
@@ -269,6 +287,45 @@ fn signature_id_from_call_prefix(
                 .get_source_signature_for_file_at(path.as_str(), file_id, call_position)
         }),
         _ => None,
+    };
+    if let Some(signature_id) = direct {
+        return (vec![signature_id], false);
+    }
+    if !infer_callable_union {
+        return (Vec::new(), false);
+    }
+
+    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
+        return (Vec::new(), true);
+    };
+    let mut signature_ids = Vec::new();
+    collect_signature_ids(&prefix_type, &mut signature_ids);
+    signature_ids.sort_unstable_by_key(|signature_id| {
+        (signature_id.get_file_id().id, signature_id.get_position())
+    });
+    signature_ids.dedup();
+    (signature_ids, true)
+}
+
+fn is_self_name_expr(expr: &LuaExpr) -> bool {
+    matches!(expr, LuaExpr::NameExpr(name) if name.get_name_text().as_deref() == Some("self"))
+}
+
+fn collect_signature_ids(typ: &LuaType, signature_ids: &mut Vec<LuaSignatureId>) {
+    match typ {
+        LuaType::Signature(signature_id) => signature_ids.push(*signature_id),
+        LuaType::Instance(instance) => collect_signature_ids(instance.get_base(), signature_ids),
+        LuaType::Union(union) => {
+            for typ in union.types() {
+                collect_signature_ids(typ, signature_ids);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            for (typ, _) in union.get_unions() {
+                collect_signature_ids(typ, signature_ids);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -343,6 +400,10 @@ fn infer_supported_call_site_arg_type(
             infer_expr(db, cache, arg).ok()
         }
         LuaExpr::NameExpr(name_expr) => {
+            if name_expr.get_name_text().as_deref() == Some("self") {
+                let typ = infer_expr(db, cache, arg).ok()?;
+                return (!typ.is_unknown() && !typ.is_any() && !typ.is_never()).then_some(typ);
+            }
             if is_mutable_local_name_arg(db, file_id, &arg) {
                 return None;
             }
@@ -374,6 +435,9 @@ fn is_supported_call_site_arg_shape(db: &DbIndex, file_id: FileId, arg: &LuaExpr
         LuaExpr::LiteralExpr(_) => true,
         LuaExpr::CallExpr(call_expr) => is_zero_arg_call(call_expr),
         LuaExpr::NameExpr(name_expr) => {
+            if name_expr.get_name_text().as_deref() == Some("self") {
+                return true;
+            }
             if is_mutable_local_name_arg(db, file_id, arg) {
                 return false;
             }

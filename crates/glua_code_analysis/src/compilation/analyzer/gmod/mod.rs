@@ -2332,7 +2332,7 @@ pub(crate) fn resolve_scoped_authoring_type(
     }
 
     let info = db.get_gmod_infer_index().get_scoped_class_info(&file_id)?;
-    (info.global_name == name)
+    (info.global_name == name || (info.global_name == "GM" && name == "GAMEMODE"))
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
 }
 

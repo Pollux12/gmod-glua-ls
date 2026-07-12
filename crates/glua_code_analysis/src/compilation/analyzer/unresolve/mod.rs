@@ -674,7 +674,7 @@ impl From<UnResolveModule> for UnResolve {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnResolveReturn {
     pub file_id: FileId,
     pub signature_id: LuaSignatureId,

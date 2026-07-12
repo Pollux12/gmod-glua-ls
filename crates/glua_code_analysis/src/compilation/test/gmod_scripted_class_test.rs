@@ -2625,6 +2625,123 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_accessor_func_with_shipped_annotation_is_visible_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+            ---@accessorfunc 2
+            ---@param tab table
+            ---@param key any
+            ---@param name string
+            function _G.AccessorFunc(tab, key, name, force) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+        "#,
+        );
+
+        ws.def_file(
+            "library/terrortown/gamemode/vgui/coloredbox.lua",
+            r#"
+            local PANEL = {}
+            AccessorFunc(PANEL, "m_bBorder", "Border")
+            AccessorFunc(PANEL, "m_Color", "Color")
+
+            function PANEL:Init()
+                self:SetBorder(true)
+                self:SetColor(Color(0, 255, 0, 255))
+            end
+
+            derma.DefineControl("ColoredBox", "", PANEL, "DPanel")
+        "#,
+        );
+
+        let usage_file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_c4/cl_init.lua",
+            r#"
+            local box = vgui.Create("ColoredBox")
+            box:SetColor(Color(50, 50, 50))
+        "#,
+        );
+
+        let prefix_type = index_expr_prefix_type(&mut ws, usage_file_id, "box:SetColor");
+        let mut base_type = &prefix_type;
+        while let LuaType::Instance(instance) = base_type {
+            base_type = instance.get_base();
+        }
+        assert_eq!(
+            base_type,
+            &LuaType::Ref(LuaTypeDeclId::global("ColoredBox"))
+        );
+
+        let colored_box_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ColoredBox"));
+        let db = ws.analysis.compilation.get_db();
+        let colored_box_members = db
+            .get_member_index()
+            .get_members(&colored_box_owner)
+            .expect("expected members on ColoredBox");
+        let member_names = colored_box_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert_that!(
+            member_names,
+            contains_each![
+                "m_bBorder",
+                "GetBorder",
+                "SetBorder",
+                "m_Color",
+                "GetColor",
+                "SetColor"
+            ]
+        );
+        assert!(!member_names.iter().any(|name| name == "Getm_Color"));
+        assert!(!member_names.iter().any(|name| name == "Setm_Color"));
+
+        let set_color = colored_box_members
+            .iter()
+            .find(|member| {
+                member
+                    .get_key()
+                    .get_name()
+                    .is_some_and(|name| name == "SetColor")
+            })
+            .map(|member| member.get_id())
+            .expect("expected AccessorFunc to synthesize ColoredBox:SetColor");
+        assert_eq!(
+            db.get_member_index().get_current_owner(&set_color),
+            Some(&colored_box_owner)
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(usage_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == undefined_method_code)
+                .collect::<Vec<_>>(),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_reassigned_local_panel_stress_three_panels() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

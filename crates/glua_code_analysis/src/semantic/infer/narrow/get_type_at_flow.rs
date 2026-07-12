@@ -2918,6 +2918,20 @@ fn assigned_prefix_member_type(
 fn assigned_member_type_id(assigned_type: &LuaType) -> Option<LuaTypeDeclId> {
     match assigned_type {
         LuaType::Instance(instance) => assigned_member_type_id(instance.get_base()),
+        LuaType::Union(union) => {
+            let mut resolved = None;
+            for typ in union.types().filter(|typ| !typ.is_nil()) {
+                let type_id = assigned_member_type_id(typ)?;
+                if resolved
+                    .as_ref()
+                    .is_some_and(|existing| existing != &type_id)
+                {
+                    return None;
+                }
+                resolved = Some(type_id);
+            }
+            resolved
+        }
         LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
         _ => None,
     }

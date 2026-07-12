@@ -7,8 +7,8 @@ use rustc_hash::FxHashMap;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat, LuaVarExpr,
-    LuaWhileStat,
+    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat,
+    LuaReturnStat, LuaVarExpr, LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
@@ -196,14 +196,15 @@ struct UnguardedChildProfile {
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
-) -> bool {
+    only_return_evidence: bool,
+) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
     let mut profile = std::env::var_os("GLUALS_PROFILE")
         .is_some()
         .then(UnguardedChildProfile::default);
     if !db.get_emmyrc().gmod.enabled {
-        return false;
+        return Vec::new();
     }
 
     let mut scores =
@@ -272,6 +273,14 @@ pub(super) fn stabilize_unguarded_children(
                 else {
                     continue;
                 };
+                if only_return_evidence
+                    && !index_expr
+                        .syntax()
+                        .ancestors()
+                        .any(|node| LuaReturnStat::cast(node).is_some())
+                {
+                    continue;
+                }
                 if let Some(profile) = &mut profile {
                     profile.references_scanned += 1;
                 }
@@ -396,6 +405,7 @@ pub(super) fn stabilize_unguarded_children(
     }
 
     let mut updates = Vec::new();
+    let mut update_sources = Vec::new();
     for (definition, candidates) in scores {
         let Some(max_score) = candidates.values().map(FxHashSet::len).max() else {
             continue;
@@ -425,11 +435,23 @@ pub(super) fn stabilize_unguarded_children(
         else {
             continue;
         };
+        if only_return_evidence
+            && !db
+                .get_vfs()
+                .get_syntax_tree(&source.file_id)
+                .and_then(|tree| source.value.to_node_from_root(&tree.get_red_root()))
+                .is_some_and(|node| {
+                    node.ancestors()
+                        .any(|node| LuaReturnStat::cast(node).is_some())
+                })
+        {
+            continue;
+        }
         let node = LuaInferenceNodeId::Definition(definition);
         let event = LuaInferenceEventId {
             node: node.clone(),
             kind: LuaInferenceProvenanceKind::UnguardedChild,
-            source,
+            source: source.clone(),
         };
         let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
@@ -442,6 +464,7 @@ pub(super) fn stabilize_unguarded_children(
         }
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
+        update_sources.push(source.clone());
         updates.push((
             node,
             LuaTypeFact::new(
@@ -480,7 +503,12 @@ pub(super) fn stabilize_unguarded_children(
             changed.len(),
         );
     }
-    changed_any
+    if changed_any {
+        update_sources.retain(|source| changed.contains(&source.file_id));
+        update_sources
+    } else {
+        Vec::new()
+    }
 }
 
 fn type_has_visible_member_at_use(

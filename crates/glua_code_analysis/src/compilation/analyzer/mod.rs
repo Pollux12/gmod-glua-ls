@@ -28,7 +28,8 @@ use crate::{
 };
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 use infer_cache_manager::InferCacheManager;
-use unresolve::UnResolve;
+use lua::LuaReturnPoint;
+use unresolve::{UnResolve, UnResolveReturn};
 
 pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
     if need_analyzed_files.is_empty() {
@@ -74,6 +75,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
         }
 
+        // Seed direct parent-to-child evidence before function returns are
+        // resolved. The later pass still captures evidence unlocked by unresolve.
+        let early_child_sources =
+            local_inference::stabilize_unguarded_children(db, &mut context, true);
+        context.invalidate_inferred_returns_for_sources(db, &early_child_sources);
+
         run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
         setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
 
@@ -81,7 +88,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
         let child_inference_changed =
-            local_inference::stabilize_unguarded_children(db, &mut context);
+            !local_inference::stabilize_unguarded_children(db, &mut context, false).is_empty();
         let late_inference_changed = local_inference_changed || child_inference_changed;
 
         let infer_dynamic_fields =
@@ -186,6 +193,18 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
                 continue;
             }
 
+            // The GMod post-analysis path synthesizes standard AccessorFunc calls
+            // with backing fields and force types. Its setter uses the call syntax
+            // ID, so its presence means this call has already been handled.
+            let setter_member_id = LuaMemberId::new(call.syntax_id, file_id);
+            if db
+                .get_member_index()
+                .get_member(&setter_member_id)
+                .is_some()
+            {
+                continue;
+            }
+
             let owner = LuaMemberOwner::Type(call.owner_type_id.clone());
 
             let getter_name = format!("Get{}", call.accessor_name);
@@ -216,7 +235,6 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
                 vec![("value".to_string(), Some(LuaType::Any))],
                 LuaType::Nil,
             );
-            let setter_member_id = LuaMemberId::new(call.syntax_id, file_id);
             let setter_member = LuaMember::new(
                 setter_member_id,
                 LuaMemberKey::Name(setter_name.as_str().into()),
@@ -336,6 +354,7 @@ pub struct AnalyzeContext {
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
+    inferred_return_candidates: Vec<UnResolveReturn>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
@@ -350,6 +369,7 @@ impl AnalyzeContext {
             scripted_scope_files: None,
             scripted_scope_infos: None,
             unresolves: Vec::new(),
+            inferred_return_candidates: Vec::new(),
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
@@ -370,6 +390,32 @@ impl AnalyzeContext {
             self.pending_unresolve_decl_ids.insert(decl.decl_id);
         }
         self.unresolves.push((un_resolve, reason));
+    }
+
+    pub fn add_inferred_return_candidate(&mut self, return_: UnResolveReturn) {
+        self.inferred_return_candidates.push(return_);
+    }
+
+    fn invalidate_inferred_returns_for_sources(
+        &self,
+        db: &mut DbIndex,
+        sources: &[InFiled<glua_parser::LuaSyntaxId>],
+    ) {
+        for return_ in self.inferred_return_candidates.iter().filter(|return_| {
+            sources.iter().any(|source| {
+                source.file_id == return_.file_id
+                    && return_
+                        .return_points
+                        .iter()
+                        .any(|point| return_point_contains_range(point, source.value.get_range()))
+            })
+        }) {
+            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+            }
+        }
     }
 
     pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
@@ -445,5 +491,15 @@ impl AnalyzeContext {
 
         self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
         self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
+    }
+}
+
+fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) -> bool {
+    match point {
+        LuaReturnPoint::Expr(expr) => expr.get_range().contains_range(range),
+        LuaReturnPoint::MuliExpr(exprs) => exprs
+            .iter()
+            .any(|expr| expr.get_range().contains_range(range)),
+        LuaReturnPoint::Nil | LuaReturnPoint::Error => false,
     }
 }
