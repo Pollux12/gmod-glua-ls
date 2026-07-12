@@ -18,7 +18,8 @@
             "pages": [
               "index",
               "getting-started/installation",
-              "getting-started/workspace-setup"
+              "getting-started/workspace-setup",
+              "tools/glua-check"
             ]
           }
         ]
@@ -157,7 +158,7 @@
     "global": {
       "anchors": [
         {
-          "anchor": "GitHub - VSCode",
+          "anchor": "GitHub - VS Code",
           "href": "https://github.com/Pollux12/vscode-gmod-glua-ls",
           "icon": "github"
         },

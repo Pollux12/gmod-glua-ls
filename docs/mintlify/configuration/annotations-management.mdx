@@ -21,6 +21,8 @@ On first launch and on later checks, the extension:
 
 VS Code stores annotations in global extension storage, separate from your project. All workspaces share them.
 
+GLuaLS loads these API definitions before other library folders. This lets framework and addon libraries use Garry's Mod types and wrapper behavior correctly.
+
 ---
 
 ## Annotation source
@@ -29,12 +31,14 @@ By default, the extension downloads annotations from `Pollux12/annotations-gmod-
 
 You can change the repository, channel, branch, or commit hash in VS Code settings:
 
-| VSCode Setting | Default | Description |
+| VS Code setting | Default | Description |
 |---|---|---|
 | `gluals.gmod.annotationsRepository` | `Pollux12/annotations-gmod-glua-ls` | GitHub repository in `owner/repository` format, or a GitHub repository URL |
 | `gluals.gmod.annotationsChannel` | `auto` | `auto` follows the extension build. `stable` uses `gluals-annotations`. `prerelease` uses `gluals-annotations-prerelease` |
 | `gluals.gmod.annotationsBranch` | `gluals-annotations` | Advanced setting. Download from this branch instead of the selected channel. Plugin branches are not supported |
 | `gluals.gmod.annotationsCommit` | `""` | Advanced setting. Download this exact commit hash. Automatic annotation update checks stop until you remove it |
+| `gluals.gmod.autoCheckAnnotationUpdates` | `true` | Check for annotation updates in the background |
+| `gluals.gmod.annotationUpdateCheckIntervalMinutes` | `60` | Minutes between background update checks |
 
 ```json VS Code settings
 {
@@ -52,7 +56,7 @@ If more than one setting is set, GLuaLS uses the first one in this list: custom 
 To force an annotations update:
 
 1. Open the Command Palette (`Ctrl+Shift+P`)
-2. Run **GLua: Update Annotations**
+2. Run **GLuaLS: Update GLuaLS Annotations**
 
 ---
 
@@ -60,11 +64,11 @@ To force an annotations update:
 
 If you need to use a custom annotations build or are in an environment without internet access:
 
-| VSCode Setting | .gluarc.json Key | Default | Description |
+| VS Code setting | .gluarc.json key | Default | Description |
 |---|---|---|---|
 | `gluals.gmod.autoLoadAnnotations` | `gmod.autoLoadAnnotations` | `true` (`null` in workspace) | Auto-download and load Garry's Mod wiki annotations |
 
-### Via VSCode settings
+### Via VS Code settings
 
 ```json VS Code settings
 {

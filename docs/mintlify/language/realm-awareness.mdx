@@ -11,17 +11,15 @@ Garry's Mod Lua runs in two **realms**: client (`CLIENT`) and server (`SERVER`).
 
 Many GMod API functions only exist in one realm (for example, `LocalPlayer()` is client-only). Calling them in the wrong realm is a common bug.
 
-GLuaLS detects which realm each file runs in and reports diagnostics when you call realm-restricted functions from the wrong realm.
+GLuaLS works out where each file and code block runs, then reports realm-restricted calls that cannot run there.
 
 ---
 
 ## Realm detection
 
-GLuaLS detects realm using multiple signals. Most projects need no extra setup.
+GLuaLS combines file names, project folders, load calls, code branches, and annotations. Most projects need no extra setup.
 
-GLuaLS infers realm with this **5-level priority** system (highest to lowest):
-
-### 1. `@realm` annotation (highest priority)
+### `@realm` annotations
 
 <Warning>
 Do not add file-level realm overrides if inference is already correct. It can hide real cross-realm mistakes. Prefer function-level overrides.
@@ -35,9 +33,9 @@ Put `---@realm` at the top of a file or on a function:
 -- Everything in this file is clientside
 ```
 
-See the [`@realm` annotation reference](/annotations/realm) for full syntax. `@realm` overrides all other detection methods, and function-level annotations override file-level ones.
+See the [`@realm` annotation reference](/annotations/realm) for full syntax. A function annotation can be more specific than its file.
 
-### 2. Filename prefix detection
+### File names
 
 GLuaLS assigns realms to files that begin with `cl_`, `sv_`, or `sh_`:
 
@@ -47,7 +45,7 @@ GLuaLS assigns realms to files that begin with `cl_`, `sv_`, or `sh_`:
 | `sv_` | Server |
 | `sh_` | Shared |
 
-### 3. Directory-based detection
+### Project folders
 
 GLuaLS assigns realms to files in common GMod directories:
 
@@ -64,7 +62,7 @@ This works for both common workspace layouts:
 - Garry's Mod root: `addons/<name>/lua/...` and `gamemodes/<name>/...`
 - Addon or gamemode root: `lua/...`, `gamemode/...`, and `entities/...`
 
-### 4. Block-level narrowing
+### `CLIENT` and `SERVER` branches
 
 Within shared files, GLuaLS narrows realm within `if CLIENT` / `if SERVER` blocks:
 
@@ -80,13 +78,7 @@ if SERVER then
 end
 ```
 
-### 5. Heuristic inference (lowest priority)
-
-When no other rule applies, GLuaLS infers realm from code usage. Calling a server-only API suggests server realm. This heuristic is less reliable than explicit detection.
-
----
-
-## Call-based inference
+## Load calls
 
 When call-based detection is on, GLuaLS also looks at file-loading calls:
 
@@ -99,7 +91,7 @@ When call-based detection is on, GLuaLS also looks at file-loading calls:
 
 `AddCSLuaFile` does not mark the caller as server. It only affects the target file.
 
-These rules also apply to wrappers annotated with `@call_arg("gmod.load", "...")`. Use the roles `include`, `addcsluafile`, `includecs`, and `require` to model wrappers around the matching load operation. GLuaLS also understands `file.Find` loops when the discovery function is annotated with `@call_arg("gmod.file_find", "glob")` and `@call_arg("gmod.file_find", "search_path")`; matching files can then inherit the realm of the load calls inside the loop.
+These rules also apply to annotated wrappers. GLuaLS can follow common `file.Find` loader loops too, including wrappers described by the GMod annotations.
 
 See [`@call_arg`](/annotations/call-arg#lua-loading) for wrapper examples.
 
@@ -115,9 +107,9 @@ Default path-based realm rules follow Garry's Mod's usual loading conventions an
 
 | Code | Description |
 |---|---|
-| `gmod-realm-mismatch` | Confident realm mismatch based on annotations |
-| `gmod-realm-mismatch-heuristic` | Probable realm mismatch based on inference |
-| `gmod-unknown-realm` | Realm could not be determined |
+| `gmod-realm-mismatch` | Code uses an API that is unavailable in its known realm |
+| `gmod-realm-mismatch-heuristic` | Code probably uses an API from the wrong realm, but the file realm is less certain |
+| `gmod-unknown-realm` | GLuaLS cannot determine the realm for a realm-specific call |
 
 ---
 
@@ -160,13 +152,13 @@ function MyAddon.ServerAction()
 end
 ```
 
-Use function-level overrides when possible. They help the language server skip expensive inference when annotations are present.
+Use function-level annotations when only one function needs a different realm.
 
 ---
 
 ## Realm in hover and autocomplete
 
-Every hover tooltip for a GMod API function includes a realm badge showing where it runs:
+GMod API hovers and completions show where a symbol is available:
 
 - **Client** badge: function is clientside only
 - **Server** badge: function is serverside only

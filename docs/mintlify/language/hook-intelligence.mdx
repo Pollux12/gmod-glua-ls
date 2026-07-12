@@ -19,11 +19,7 @@ hook.Add("PlayerSpan", "MyAddon", function(ply) -- ❌ did you mean PlayerSpawn?
 end)
 ```
 
-GLuaLS recognizes base GMod hooks from the built-in hook definitions. It also tracks custom hooks in your workspace when your code calls `hook.Run("MyCustomHook", ...)`.
-
-<Info>
-For custom hooks, autocomplete works after code uses the hook once. Go to definition, parameter type inference, and other advanced hook features need a `GM:` function for that hook.
-</Info>
+GLuaLS recognizes built-in GMod hooks from the downloaded API definitions. It also tracks custom hook names used by your workspace.
 
 ---
 
@@ -73,7 +69,7 @@ function GM:PlayerSpawn(ply)
 end
 ```
 
-A `GM:` hook definition is required for advanced features to work on custom hooks.
+A `GM:` definition gives a custom hook a clear signature and definition target.
 
 ---
 
@@ -101,13 +97,17 @@ hook.Add("MyAddon.OnPlayerAction", "handler", function(ply, action)
 end)
 ```
 
-<Info>
-For advanced features (parameter type inference, hover descriptions, function validation), define a `GM:` method for each custom hook.
-</Info>
+Add annotations to a custom `GM:` method when you want stable parameter types and hover documentation across the project.
+
+## Hook wrappers
+
+Framework wrappers around hook registration and execution can provide the same features. GLuaLS reads wrapper behavior from the Garry's Mod annotations instead of requiring a specific function name.
+
+See [`@call_arg`](/annotations/call-arg#hooks-with-callbacks) when you need to describe your own wrapper.
 
 ---
 
-## VSCode integration
+## VS Code integration
 
 Hook intelligence works when you use `hook.Add`, `hook.Run`, or define `GM:` methods. Configure validation behavior in the [settings panel](/configuration/overview#settings-panel-recommended). See [Garry's Mod settings](/configuration/gmod#hooks) for the full reference.
 

@@ -1,5 +1,5 @@
 ---
-title: "Workspace Settings"
+title: Workspace settings
 description: Configure library paths, ignore patterns, module maps, and file encoding.
 ---
 
@@ -16,7 +16,7 @@ The `workspace` section tells the language server which files to analyze, which 
 | `workspace.library` | `array` | `[]` | External library paths to include in analysis (strings or objects) |
 | `workspace.workspaceRoots` | `string[]` | `[]` | Additional workspace root directories for multi-root setups |
 | `workspace.ignoreDir` | `string[]` | `[]` | Directory names to exclude from analysis |
-| `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and globs to ignore. Accepts legacy strings or override objects; see below. |
+| `workspace.ignoreDirDefaults` | `(string \| object)[]` | built-in list | Built-in directories and patterns to ignore. Accepts strings or the objects described below. |
 | `workspace.useDefaultIgnores` | `boolean` | `true` | Whether to apply `workspace.ignoreDirDefaults` |
 | `workspace.enableIsolation` | `boolean` | `false` | Keep multi-root main workspaces isolated. Set to `false` to merge workspace configs into one global baseline (first workspace config wins scalar conflicts, arrays are unioned) while still allowing per-workspace file-scoped overrides. |
 | `workspace.ignoreGlobs` | `string[]` | `[]` | Glob patterns of files to exclude from analysis |
@@ -85,8 +85,8 @@ Common directories to ignore for GMod projects:
 
 The list accepts two forms:
 
-- **Legacy strings**: when the list contains only plain strings, those strings replace all built-in defaults (original behavior, backward compatible).
-- **Object entries**: when any object entry is present, GLuaLS uses the built-in list as the starting point and applies each entry in turn.
+- **Strings** replace the built-in list with your own patterns.
+- **Objects** change, remove, or add individual entries while keeping the rest of the built-in list.
 
 Built-in default ids:
 
@@ -192,12 +192,13 @@ Available values: `"utf-8"`, `"utf-16"`, `"gbk"`, `"latin1"`, `"ascii"`.
 
 ---
 
-## VSCode extension settings
+## VS Code extension settings
 
 You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
-| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+| VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.workspace.enableReindex` | `workspace.enableReindex` | `boolean` | `false` | Enable reindex after file changes |
 | `gluals.workspace.reindexDuration` | `workspace.reindexDuration` | `integer` | `5000` | Delay before reindex (ms) |
-| `gluals.workspace.workspaceRoots` | `workspace.workspaceRoots` | `array` | `[]` | Additional workspace roots |
+| `gluals.workspace.enableIsolation` | `workspace.enableIsolation` | `boolean \| null` | `null` | Override multi-root isolation |
+| `gluals.workspace.useDefaultIgnores` | `workspace.useDefaultIgnores` | `boolean \| null` | `null` | Override built-in ignore rules |

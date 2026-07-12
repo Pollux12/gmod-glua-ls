@@ -1,11 +1,11 @@
 ---
 title: Network analysis
-description: GLuaLS tracks net.Start / net.Receive pairs and validates message types and order across realms.
+description: Check network message registration, senders, receivers, and payload order across realms.
 ---
 
 ## Overview
 
-GMod networking requires matching `net.Start(name)` and `net.Write*` calls on one realm with `net.Receive(name)` and `net.Read*` calls on the other. GLuaLS tracks these pairs across your workspace and reports mismatches before you run the game.
+GMod networking requires senders and receivers to use the same message name and payload layout. GLuaLS connects these calls across your workspace and reports mistakes before you run the game.
 
 ---
 
@@ -18,14 +18,14 @@ Every `net.Start(name)` call must have a corresponding `util.AddNetworkString(na
 In real Garry's Mod code, `util.AddNetworkString` must run on the server. GLuaLS checks for that registration across the workspace so it can still connect senders and receivers across files.
 
 ```lua
--- ❌ Error: "PlayerData" not registered with util.AddNetworkString
+-- Error: "PlayerData" is not registered with util.AddNetworkString
 net.Start("PlayerData")
 net.WriteString("test")
 net.Broadcast()
 ```
 
 ```lua
--- ✅ OK
+-- Registered on the server
 util.AddNetworkString("PlayerData")  -- in a sv_ file or SERVER block
 
 net.Start("PlayerData")
@@ -35,7 +35,7 @@ net.Broadcast()
 
 ### Missing counterpart
 
-Each `net.Start(name)` sender should have a matching `net.Receive(name)` receiver somewhere in your workspace:
+Each `net.Start(name)` sender should have a matching `net.Receive(name)` receiver in the expected realm:
 
 ```lua
 -- sv_comms.lua: sends "PlayerInfo" to client
@@ -43,7 +43,7 @@ net.Start("PlayerInfo")
 net.WriteString(ply:Nick())
 net.Send(ply)
 
--- Elsewhere in your workspace: ❌ Warning — no net.Receive("PlayerInfo") found
+-- Warning: no net.Receive("PlayerInfo") was found
 ```
 
 ### Read/write type mismatch
@@ -58,14 +58,16 @@ net.WriteString(name)  -- WriteString second
 
 -- Client reads:
 net.Receive("EntityData", function()
-    local name = net.ReadString()  -- ❌ reads string where entity was written
-    local ent  = net.ReadEntity()  -- ❌ reads entity where string was written
+    local name = net.ReadString()  -- Reads a string where an entity was written
+    local ent  = net.ReadEntity()  -- Reads an entity where a string was written
 end)
 ```
 
-### Read/write order mismatch
+### Conditional and repeated payloads
 
-Read order must match write order. GLuaLS compares the read call sequence against the write call sequence.
+GLuaLS understands reads and writes inside `if`, `for`, `while`, and `repeat` blocks. It treats these operations as optional or repeated instead of reporting a simple count mismatch.
+
+If both sides use compatible loops or branches, they are matched as the same payload flow. When the code is too dynamic to compare safely, GLuaLS avoids guessing.
 
 ---
 
@@ -83,7 +85,11 @@ Read order must match write order. GLuaLS compares the read call sequence agains
 
 ## Smart completions
 
-When typing the name argument to `net.Start()` or `net.Receive()`, GLuaLS autocompletes with known network message names from your workspace.
+GLuaLS completes known message names in `net.Start()` and `net.Receive()`. Inside a receive callback, it can also suggest the expected `net.Read*` calls in payload order.
+
+## Hover and navigation
+
+Hover over a network message name to see its known senders, receivers, and payload layout. Code lenses show how many matching senders and receivers exist and let you jump to them.
 
 ---
 
@@ -105,10 +111,10 @@ See the [Garry's Mod settings](/configuration/gmod#network-analysis) for the ful
 
 ## Limitations
 
-- GLuaLS does not track dynamic message names computed at runtime, such as `net.Start("msg" .. id)`
-- GLuaLS does not track conditional logic around `net.Write*` calls
-- GLuaLS checks only files included in workspace analysis, so files outside the current analysis scope do not count as counterparts
+- Message names must resolve to a known string. A value such as `"msg" .. id` cannot be connected to one message flow.
+- Code outside your workspace or configured libraries cannot count as a sender, receiver, or registration.
+- Runtime behavior that cannot be determined from the code is skipped rather than guessed.
 
-## VSCode integration
+## VS Code integration
 
 Network diagnostics run in the background. Diagnostics appear as squiggly underlines and in the Problems panel. Configure them in the [settings panel](/configuration/overview#settings-panel-recommended). See [Garry's Mod settings](/configuration/gmod) for the full network configuration reference.

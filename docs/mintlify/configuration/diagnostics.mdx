@@ -149,8 +149,8 @@ Nil diagnostics understand validity guards such as `IsValid` and annotated guard
 | Code | Default | Severity | Description |
 |---|---|---|---|
 | `gmod-invalid-hook-name` | On | Warning | Invalid or unknown GMod hook name |
-| `gmod-realm-mismatch` | On | Warning | Definite realm mismatch: client API in server realm (or vice versa) |
-| `gmod-realm-mismatch-heuristic` | On | Warning | Probable realm mismatch based on inferred evidence |
+| `gmod-realm-mismatch` | On | Error | Client-only code used on the server, or server-only code used on the client |
+| `gmod-realm-mismatch-heuristic` | On | Error | Likely realm mismatch when the file realm is not certain |
 | `gmod-unknown-realm` | On | Hint | Realm could not be determined for a realm-sensitive call |
 | `gmod-net-missing-network-counterpart` | On | Warning | `net.Start` block with no `net.Receive` in the opposite realm (or vice versa) |
 | `gmod-net-read-write-order-mismatch` | On | Warning | `net.Read*` order doesn't match `net.Write*` order |
@@ -158,19 +158,19 @@ Nil diagnostics understand validity guards such as `IsValid` and annotated guard
 | `gmod-net-read-write-bits-mismatch` | On | Warning | Literal bit-width differs between a matched write/read pair (e.g. `WriteUInt(8)` vs `ReadUInt(16)`) |
 | `gmod-unknown-net-message` | On | Warning | Unregistered net message identifier |
 | `gmod-duplicate-system-registration` | On | Hint | Duplicate registration for `net.Receive`, `concommand.Add`, `timer.Create`, etc. |
+| `gmod-null-check` | On | Warning | Entity validity checked with truthiness or `nil` instead of `IsValid` |
 
 
 ---
 
-## VSCode extension settings
+## VS Code extension settings
 
 You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
-| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+| VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.diagnostics.diagnosticInterval` | `diagnostics.diagnosticInterval` | `integer` | `500` | Scan delay in milliseconds |
 | `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
-| `gluals.strict.strictTypeCoercion` | `strict.strictTypeCoercion` | `boolean` | `false` | Requires exact types in param-type-mismatch and disables GLua-aware coercions (e.g. number/boolean → string, numeric string literal → number/integer) |
 | `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
 
 ---

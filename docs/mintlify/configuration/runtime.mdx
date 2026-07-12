@@ -1,5 +1,5 @@
 ---
-title: "Runtime & Strict Settings"
+title: Runtime and strict settings
 description: Configure non-standard Lua symbols, strict type checking, special functions, and documentation format.
 ---
 
@@ -16,8 +16,8 @@ The `runtime`, `strict`, `doc`, and `references` sections control how the langua
 | `runtime.extensions` | `string[]` | `[]` | Additional file extensions to treat as Lua (e.g., `".lua.txt"`) |
 | `runtime.requireLikeFunction` | `string[]` | `[]` | Functions that behave like `require` for module resolution |
 | `runtime.requirePattern` | `string[]` | `[]` | Require path resolution patterns (e.g., `"?.lua"`, `"?/init.lua"`) |
-| `runtime.version` | `string` | `LuaJIT` | Lua version for runtime behavior (not used in GLuaLS) |
-| `runtime.nonstandardSymbol` | `string[]` | see below | Non-standard Lua syntax tokens to accept (not used in GLuaLS) |
+| `runtime.version` | `string` | `LuaJIT` | Lua version used for syntax and type behavior. Keep `LuaJIT` for Garry's Mod |
+| `runtime.nonstandardSymbol` | `string[]` | see below | Extra syntax accepted by the parser |
 | `runtime.frameworkVersions` | `string[]` | `[]` | Framework version identifiers |
 | `runtime.special` | `object` | `{}` | Map function names to special behaviours |
 
@@ -43,7 +43,7 @@ All available non-standard symbols:
 
 ### Special functions
 
-Map custom function names to built-in semantic behavior:
+Tell GLuaLS that a custom function behaves like a built-in Lua function:
 
 ```json .gluarc.json
 {
@@ -72,6 +72,7 @@ Available behavior values: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"
 | `strict.requireExportGlobal` | `boolean` | `false` | Require explicit `---@export global` annotation for globals to be visible outside their file |
 | `strict.allowNullableAsNonNullable` | `boolean` | `true` | Allow optional types (`T?`) to be passed where non-optional (`T`) is expected (lenient nil-safety) |
 | `strict.inferredTypeMismatch` | `boolean` | `false` | Report type mismatch diagnostics for inferred values (stricter checker, may produce false positives) |
+| `strict.strictTypeCoercion` | `boolean` | `false` | Require exact primitive types instead of GLua's common string and number conversions |
 
 ### Enabling stricter nil checking
 
@@ -93,6 +94,8 @@ Available behavior values: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"
 | `doc.syntax` | `string` | `"md"` | Documentation syntax: `"md"`, `"myst"`, `"rst"`, `"none"` |
 | `doc.knownTags` | `string[]` | `[]` | Custom annotation tags to suppress `unknown-doc-tag` warnings for |
 | `doc.privateName` | `string[]` | `[]` | Field name patterns to treat as private (e.g., `["m_*", "_*"]`) |
+| `doc.rstPrimaryDomain` | `string \| null` | `null` | Main reStructuredText domain when `doc.syntax` is `"rst"` or `"myst"` |
+| `doc.rstDefaultRole` | `string \| null` | `null` | Default reStructuredText role when `doc.syntax` is `"rst"` or `"myst"` |
 
 ### Custom tag suppression
 
@@ -134,11 +137,19 @@ Available behavior values: `"none"`, `"require"`, `"error"`, `"assert"`, `"type"
 
 ---
 
-## VSCode extension settings
+## Resource paths (`resource.*`)
+
+| Option | Type | Default | Description |
+|---|---|---|---|
+| `resource.paths` | `string[]` | `[]` | Extra folders used for file path completion and clickable file links |
+
+---
+
+## VS Code extension settings
 
 You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
-| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+| VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.references.enable` | `references.enable` | `boolean` | `true` | Find all references |
 | `gluals.references.fuzzySearch` | `references.fuzzySearch` | `boolean` | `true` | Fuzzy search for references |

@@ -104,12 +104,13 @@ Semantic tokens provide syntax highlighting based on type analysis. GLuaLS color
 
 ---
 
-## VSCode extension settings
+## VS Code extension settings
 
 You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
-| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+| VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
+| `gluals.hint.enable` | All `hint.*` settings | `boolean \| null` | `null` | Enable or disable all inlay hints |
 | `gluals.hint.paramHint` | `hint.paramHint` | `boolean` | `true` | Parameter name hints |
 | `gluals.hint.localHint` | `hint.localHint` | `boolean` | `true` | Local variable type hints |
 | `gluals.hint.indexHint` | `hint.indexHint` | `boolean` | `true` | Named array index hints |

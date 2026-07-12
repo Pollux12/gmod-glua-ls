@@ -1,6 +1,6 @@
 ---
 title: Scripted classes
-description: GLuaLS automatically understands ENT, SWEP, EFFECT, and other scripted class patterns.
+description: Completion, inheritance, generated accessors, and navigation for Garry's Mod scripted classes.
 ---
 
 import ConfigTip from "/snippets/config-tip.mdx"
@@ -18,24 +18,26 @@ Garry's Mod uses a "scripted class" pattern. You define a global table, such as 
 
 ## Automatic detection
 
-GLuaLS detects scripted classes by **file path**. It treats any file under a recognized directory as defining the matching table. For example:
+GLuaLS detects the standard class table from the file's project folder. For example:
 
 | Directory pattern | Class table | Base class |
 |---|---|---|
 | `lua/entities/**/` | `ENT` | `Entity` |
 | `lua/weapons/**/` | `SWEP` | `Weapon` |
 | `lua/effects/**/` | `EFFECT` | (none) |
+| `lua/weapons/gmod_tool/stools/` | `TOOL` | Tool |
+| `gamemode/` | `GM` | Gamemode |
 
 GLuaLS types the detected class table with the base class's methods and fields, so you get completions and type checking without annotations.
 
-You can adjust this table in settings.
+Player classes, plugins, and custom project layouts are also supported through the scripted class settings.
 
 ---
 
 
-## AccessorFunc synthesis
+## AccessorFunc methods
 
-`AccessorFunc(table, member, name, ...)` generates getter and setter methods. GLuaLS detects these calls and synthesizes the methods:
+`AccessorFunc(table, member, name, ...)` creates getter and setter methods. GLuaLS adds those methods to completion and type checking:
 
 ```lua
 AccessorFunc(ENT, "m_bOrient", "Orient", FORCE_BOOL)
@@ -49,9 +51,9 @@ Use the `---@accessorfunc` annotation for custom getters and setters. See [@acce
 
 ---
 
-## NetworkVar synthesis
+## NetworkVar methods
 
-`ENT:NetworkVar(type, slot, name, ...)` generates entity accessors. GLuaLS detects these calls and synthesizes matching methods:
+`ENT:NetworkVar(type, slot, name, ...)` creates entity accessors. GLuaLS adds the matching methods:
 
 ```lua
 function ENT:SetupDataTables()
@@ -195,7 +197,7 @@ If you use a non-standard directory structure or custom class types, configure G
 
 
 
-## Disabling scripted class inference
+## Disabling a scripted class group
 
 To disable a built-in scripted class scope, add an override with the same `id` and set `"disabled": true`.
 

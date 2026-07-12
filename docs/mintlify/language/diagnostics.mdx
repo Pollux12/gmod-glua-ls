@@ -53,6 +53,7 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 
 | Code | Default | Description |
 |---|---|---|
+| `syntax-error` | Error | Lua syntax is invalid |
 | `param-type-mismatch` | Warning | Argument type doesn't match the expected parameter type |
 | `missing-parameter` | Warning | Required parameter not provided |
 | `redundant-parameter` | Information | Extra argument passed beyond what the function accepts |
@@ -74,6 +75,8 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 | `type-not-found` | Warning | A referenced type name doesn't exist |
 | `generic-constraint-mismatch` | Information | Generic type argument violates a constraint |
 | `enum-value-mismatch` | Warning | Value doesn't match a known enum entry |
+| `call-non-callable` | Off | Code tries to call a value that is not a function |
+| `require-module-not-visible` | Warning | Required module is not visible from this file |
 
 `need-check-nil` and `unchecked-nil-access` understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
 
@@ -94,6 +97,14 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 | `unbalanced-assignments` | Warning | Left-hand and right-hand sides of an assignment have different counts |
 | `local-const-reassign` | Error | Code reassigns a `<const>` local |
 | `read-only` | Warning | Code writes to a value declared as read-only |
+| `iter-variable-reassign` | Off in LuaJIT | Code reassigns a loop variable in a Lua version where it is constant |
+| `preferred-local-alias` | Hint | A local alias is preferred for this value |
+| `await-in-sync` | Warning | `await` is used in a function that is not asynchronous |
+| `code-style-check` | Off | Code does not match the configured style rules |
+| `non-literal-expressions-in-assert` | Off | An assertion uses an expression that is hard to report clearly |
+| `unnecessary-assert` | Off | An assertion is not needed |
+| `unnecessary-if` | Off | An `if` statement can be simplified |
+| `invert-if` | Off | Inverting an `if` statement would simplify the code |
 
 ### Documentation
 
@@ -107,6 +118,11 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 | `missing-global-doc` | Off | Global function or variable lacks documentation |
 | `unknown-doc-tag` | Off | Unknown `@tag` in an annotation comment |
 | `inject-field` | Off | Code adds a field to a type outside its class definition |
+| `circle-doc-class` | Warning | Documented classes form an inheritance loop |
+| `attribute-param-type-mismatch` | Warning | Annotation attribute argument has the wrong type |
+| `attribute-missing-parameter` | Warning | Annotation attribute is missing an argument |
+| `attribute-redundant-parameter` | Warning | Annotation attribute has an extra argument |
+| `global-in-non-module` | Off | A file that is not a module defines a global |
 
 ### Access control
 
@@ -129,6 +145,7 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 | `gmod-net-read-write-type-mismatch` | Warning | `net.Read*` type doesn't match the corresponding `net.Write*` |
 | `gmod-net-read-write-bits-mismatch` | Warning | Literal bit-width differs between a matched write/read pair |
 | `gmod-duplicate-system-registration` | Hint | Duplicate registration (concommand, net, timer, etc.) |
+| `gmod-null-check` | Warning | Entity validity is checked with truthiness or `nil` instead of `IsValid` |
 
 ---
 

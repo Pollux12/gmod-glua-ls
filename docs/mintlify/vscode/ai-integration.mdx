@@ -1,53 +1,65 @@
 ---
-title: AI & Copilot integration
-description: Use the built-in MCP server to let GitHub Copilot interact directly with your running SRCDS server.
+title: AI and Copilot integration
+description: Let AI tools search GLua documentation and work with a connected Garry's Mod session.
 ---
 
 ## Overview
 
-GLuaLS includes a built-in **MCP (Model Context Protocol) server**. It exposes your connected SRCDS instance as tools for AI agents.
+The VS Code extension provides tools for GitHub Copilot and a local MCP server for other compatible AI clients.
 
-When the debugger is connected, GitHub Copilot Chat (and other MCP-capable tools) can run Lua code, fetch console output, read errors, and check debug state without leaving chat.
+AI tools can search GLua API documentation without a running game. Runtime tools can also execute Lua, run commands, and inspect recent output when the debugger is connected.
 
 <Note>
-The GLuaLS team tests AI features with GitHub Copilot Chat. Other MCP AI providers may work, but GLuaLS does not support them.
+Runtime commands can change game state. Review tool requests before allowing them to run.
 </Note>
 
 ---
 
-## Available MCP tools
+## GitHub Copilot tools
 
-When the debugger is connected, AI agents can use these tools:
+The extension registers these tools directly with VS Code:
 
 | Tool | Description |
 |---|---|
-| `run_lua` | Execute a Lua string on the server and return the output |
-| `run_command` | Send a console command and return the result |
-| `run_file` | Run a specific Lua file on the server |
-| `get_output` | Fetch recent console output from the server |
-| `get_errors` | Get recent Lua errors from the error tracking panel |
-| `get_debug_state` | Get the current debugger state (paused, running, realm, etc.) |
+| `gluaDocs` | Search Garry's Mod API definitions and workspace symbols |
+| `gmodRunLua` | Execute Lua in the selected realm |
+| `gmodRunCommand` | Run a Garry's Mod console command |
+| `gmodRunFile` | Run a Lua file in the selected realm |
+| `gmodGetOutput` | Read recent debugger output |
+| `gmodGetErrors` | Read recent debugger errors |
+| `gmodGetDebugState` | Check the debugger, realm, and language server state |
 
 ---
 
-## Setting up
+The runtime tools require the [debugger](/debugger/setup). Documentation search does not.
 
-The extension starts the MCP server when it loads. It also registers tools with GitHub Copilot.
+## MCP tools
 
-To connect Copilot:
+The local MCP server provides these tool names for compatible clients:
+
+| Tool | Description |
+|---|---|
+| `run_lua` | Execute Lua in the active debug session |
+| `run_command` | Run a Garry's Mod console command |
+| `run_file` | Run a Lua file |
+| `get_output` | Read recent debugger output |
+| `get_errors` | Read recent debugger errors |
+| `get_debug_state` | Read the current debugger state |
+| `list_realms` | List available realms and the currently selected realm |
+
+The MCP server listens only on your computer and uses an authentication token. It is enabled by default.
+
+## Set up Copilot
 
 <Steps>
-  <Step title="Connect the debugger">
-    Code execution tools (`run_lua`, `run_command`, `run_file`) require an active debug session. `get_output`, `get_errors`, and `get_debug_state` can work whenever the MCP server is running.
+  <Step title="Enable the GLuaLS tools">
+    Open Copilot Chat's tool picker and enable the GLuaLS tools you want to use.
   </Step>
-  <Step title="Configure Copilot to use the MCP server">
-    The VS Code extension usually handles this step. Check that the "Garry's Mod Language Server" toolset is enabled.
+  <Step title="Connect the debugger for runtime tools">
+    Start a Garry's Mod debug session before asking Copilot to run Lua, run files, or send commands.
   </Step>
   <Step title="Use Copilot Chat">
-    Once connected, Copilot can do things like:
-    - "Investigate all recent lua errors on the server."
-    - "Run `print("hello world")` on the server"
-    - "What does the current console output show?"
+    Ask a direct question, such as "What arguments does `Entity:TakeDamageInfo` accept?" or "Show the recent Lua errors."
   </Step>
 </Steps>
 
@@ -56,19 +68,22 @@ To connect Copilot:
 ## Example interactions
 
 ```
-You: What recent Lua errors have occurred?
+You: What arguments does Entity:TakeDamageInfo accept?
 
-Copilot: [calls get_errors] I found 2 errors:
-1. addons/my-addon/lua/init.lua:42 - attempt to index nil value 'ply'
-   (occurred 3 times, last seen 2 minutes ago)
-2. addons/my-addon/lua/cl_hud.lua:18 - attempt to call nil value
-   (occurred 1 time, last seen 5 minutes ago)
+Copilot: [uses gluaDocs] Entity:TakeDamageInfo accepts one CTakeDamageInfo value.
 ```
 
 ```
 You: Run print(game.GetMap()) on the server
 
-Copilot: [calls run_lua] Output: gm_flatgrass
+Copilot: [uses gmodRunLua] Output: gm_flatgrass
 ```
 
+## Settings
 
+| Setting | Default | Description |
+|---|---|---|
+| `gluals.gmod.mcp.enabled` | `true` | Start the local MCP server |
+| `gluals.gmod.mcp.port` | `0` | Local port. `0` chooses an available port |
+| `gluals.gmod.mcp.authToken` | `""` | Authentication token. An empty value creates a local token |
+| `gluals.gmod.mcp.rateLimitPerMinute` | `60` | Maximum MCP requests per minute for each client |
