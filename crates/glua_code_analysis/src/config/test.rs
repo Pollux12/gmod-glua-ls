@@ -202,6 +202,36 @@ mod test {
     }
 
     #[test]
+    fn test_prioritize_gmod_annotations_library_preserves_library_config() {
+        use crate::config::configs::{EmmyLibraryConfig, EmmyLibraryItem};
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.library = vec![
+            EmmyLibraryItem::Path("/library".to_string()),
+            EmmyLibraryItem::Config(EmmyLibraryConfig {
+                path: "/annotations".to_string(),
+                ignore_dir: vec!["generated".to_string()],
+                ignore_globs: vec!["**/*.generated.lua".to_string()],
+            }),
+        ];
+
+        emmyrc.prioritize_gmod_annotations_library("/annotations".to_string());
+
+        assert_eq!(
+            emmyrc.gmod.annotations_path.as_deref(),
+            Some("/annotations")
+        );
+        assert_eq!(emmyrc.workspace.library[0].get_path(), "/annotations");
+        assert!(matches!(
+            &emmyrc.workspace.library[0],
+            EmmyLibraryItem::Config(config)
+                if config.ignore_dir == ["generated"]
+                    && config.ignore_globs == ["**/*.generated.lua"]
+        ));
+        assert_eq!(emmyrc.workspace.library[1].get_path(), "/library");
+    }
+
+    #[test]
     fn test_pre_process_empty_library_path_stays_empty() {
         use crate::config::configs::EmmyLibraryItem;
 

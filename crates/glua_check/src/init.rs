@@ -90,6 +90,23 @@ pub async fn load_workspace(
 
     emmyrc.pre_process_emmyrc(&config_root);
 
+    if let Some(annotations_path) = gmod_annotations {
+        if annotations_path.is_dir() {
+            log::info!(
+                "Adding GMod annotations from: {}",
+                annotations_path.display()
+            );
+            emmyrc.prioritize_gmod_annotations_library(
+                annotations_path.to_string_lossy().into_owned(),
+            );
+        } else {
+            log::warn!(
+                "GMod annotations path is not an existing directory: {}",
+                annotations_path.display()
+            );
+        }
+    }
+
     let mut workspace_folders = cmd_workspace_folders
         .iter()
         .map(|path| WorkspaceFolder::new(path.clone(), false))
@@ -97,23 +114,6 @@ pub async fn load_workspace(
     let mut analysis = EmmyLuaAnalysis::new();
     analysis.update_config(emmyrc.clone().into());
     analysis.init_std_lib();
-
-    // Add GMod annotations as library workspace if provided
-    if let Some(annotations_path) = gmod_annotations {
-        if annotations_path.exists() {
-            log::info!(
-                "Adding GMod annotations from: {}",
-                annotations_path.display()
-            );
-            analysis.add_library_workspace(annotations_path.clone());
-            workspace_folders.push(WorkspaceFolder::new(annotations_path, true));
-        } else {
-            log::warn!(
-                "GMod annotations path does not exist: {}",
-                annotations_path.display()
-            );
-        }
-    }
 
     // Canonicalize main workspace root for self-overlap detection.
     let main_root_canon = main_path.canonicalize().ok();
@@ -415,5 +415,51 @@ mod tests {
             emmyrc.workspace.library
         );
         let _ = fs::remove_dir_all(root);
+    }
+
+    #[tokio::test]
+    async fn loads_gmod_annotations_before_configured_libraries() {
+        let root = make_workspace();
+        let annotations = make_workspace();
+        let library = make_workspace();
+        let config_path = root.join(".gluarc.json");
+        fs::write(
+            &config_path,
+            format!(
+                r#"{{"workspace":{{"library":["{}"]}}}}"#,
+                library.to_string_lossy().replace('\\', "/")
+            ),
+        )
+        .unwrap();
+
+        let analysis = load_workspace(
+            root.clone(),
+            vec![root.clone()],
+            Some(vec![config_path]),
+            None,
+            Some(annotations.clone()),
+        )
+        .await
+        .expect("workspace should load");
+
+        let annotations_id = analysis
+            .get_workspace_id_for_root(&annotations)
+            .expect("annotations workspace should be registered");
+        let library_id = analysis
+            .get_workspace_id_for_root(&library)
+            .expect("configured library workspace should be registered");
+        assert!(annotations_id.id < library_id.id);
+        assert_eq!(
+            analysis.emmyrc.gmod.annotations_path.as_deref(),
+            Some(annotations.to_string_lossy().as_ref())
+        );
+        assert_eq!(
+            analysis.emmyrc.workspace.library[0].get_path(),
+            annotations.to_string_lossy().as_ref()
+        );
+
+        let _ = fs::remove_dir_all(root);
+        let _ = fs::remove_dir_all(annotations);
+        let _ = fs::remove_dir_all(library);
     }
 }

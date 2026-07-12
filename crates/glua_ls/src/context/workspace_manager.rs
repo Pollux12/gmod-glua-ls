@@ -859,27 +859,8 @@ fn inject_gmod_annotations(client_config: &ClientConfig, emmyrc: &mut Emmyrc) {
         return;
     };
 
-    if matches!(emmyrc.gmod.annotations_path.as_deref(), None | Some("")) {
-        emmyrc.gmod.annotations_path = Some(annotations_path.clone());
-    }
-
-    // Add to library paths
-    use glua_code_analysis::EmmyLibraryItem;
-    if emmyrc
-        .workspace
-        .library
-        .iter()
-        .any(|item| item.get_path() == &annotations_path)
-    {
-        log::info!("GMod annotations path already exists in workspace library");
-        return;
-    }
-
-    emmyrc
-        .workspace
-        .library
-        .push(EmmyLibraryItem::Path(annotations_path));
-    log::info!("GMod annotations added to workspace library");
+    emmyrc.prioritize_gmod_annotations_library(annotations_path);
+    log::info!("GMod annotations prioritized before configured libraries");
 }
 
 /// Validate that the resolved GMod annotations set is usable for the language
@@ -1188,8 +1169,9 @@ mod tests {
 
     use super::{
         WorkspaceFileMatcher, collect_config_files_from_dir, collect_config_roots, dedup_paths,
-        directory_contains_lua_file, load_emmy_config, push_configs_from_preferred_workspace_root,
-        resolve_gmod_annotations_path, validate_gmod_annotations_for_ls,
+        directory_contains_lua_file, inject_gmod_annotations, load_emmy_config,
+        push_configs_from_preferred_workspace_root, resolve_gmod_annotations_path,
+        validate_gmod_annotations_for_ls,
     };
 
     fn create_temp_dir() -> PathBuf {
@@ -2395,6 +2377,50 @@ mod tests {
 
         let resolved = resolve_gmod_annotations_path(&client, &emmyrc);
         assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn inject_annotations_places_metadata_before_configured_libraries() {
+        use glua_code_analysis::EmmyLibraryItem;
+
+        let client = client_config_with_annotations_path(Some("/annotations"));
+        let mut emmyrc = Emmyrc::default();
+        emmyrc
+            .workspace
+            .library
+            .push(EmmyLibraryItem::Path("/library".to_string()));
+
+        inject_gmod_annotations(&client, &mut emmyrc);
+
+        let paths = emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| item.get_path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/annotations", "/library"]);
+    }
+
+    #[test]
+    fn inject_annotations_moves_existing_entry_before_configured_libraries() {
+        use glua_code_analysis::EmmyLibraryItem;
+
+        let client = client_config_with_annotations_path(Some("/annotations"));
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.library = vec![
+            EmmyLibraryItem::Path("/library".to_string()),
+            EmmyLibraryItem::Path("/annotations".to_string()),
+        ];
+
+        inject_gmod_annotations(&client, &mut emmyrc);
+
+        let paths = emmyrc
+            .workspace
+            .library
+            .iter()
+            .map(|item| item.get_path().as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/annotations", "/library"]);
     }
 
     #[test]
