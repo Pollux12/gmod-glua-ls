@@ -89,6 +89,11 @@
           "type": "string"
         },
         {
+          "const": "undefined-method",
+          "description": "Undefined method",
+          "type": "string"
+        },
+        {
           "const": "local-const-reassign",
           "description": "Local const reassign",
           "type": "string"

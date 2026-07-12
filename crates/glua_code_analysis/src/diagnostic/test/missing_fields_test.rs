@@ -168,7 +168,7 @@ foo({})
     fn test_issue_296() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@generic T
                 ---@param table table

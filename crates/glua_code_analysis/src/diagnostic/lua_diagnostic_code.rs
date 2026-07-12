@@ -44,6 +44,8 @@ pub enum DiagnosticCode {
     DiscardReturns,
     /// Undefined field
     UndefinedField,
+    /// Undefined method
+    UndefinedMethod,
     /// Local const reassign
     LocalConstReassign,
     /// Iter variable reassign
@@ -176,6 +178,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::AccessInvisible => DiagnosticSeverity::WARNING,
         DiagnosticCode::DiscardReturns => DiagnosticSeverity::WARNING,
         DiagnosticCode::UndefinedField => DiagnosticSeverity::WARNING,
+        DiagnosticCode::UndefinedMethod => DiagnosticSeverity::ERROR,
         DiagnosticCode::LocalConstReassign => DiagnosticSeverity::ERROR,
         DiagnosticCode::DuplicateType => DiagnosticSeverity::WARNING,
         DiagnosticCode::AnnotationUsageError => DiagnosticSeverity::ERROR,

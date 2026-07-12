@@ -4104,7 +4104,7 @@ _2 = a[1]
     fn test_type_guard_class_name_preserves_missing_field_diagnostic() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
             ---@class Dog
             local Dog = {}
@@ -4126,7 +4126,7 @@ _2 = a[1]
     fn test_type_guard_class_name_does_not_narrow_incompatible_primitive() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
             ---@class Dog
             local Dog = {}

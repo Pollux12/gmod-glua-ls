@@ -143,7 +143,7 @@ mod test {
 
         let typo = format!("{DTREE_STUBS}\nnode:GetRoot():DoRightCick(node)");
         expect_that!(
-            ws.check_code_for(DiagnosticCode::UndefinedField, &typo),
+            ws.check_code_for(DiagnosticCode::UndefinedMethod, &typo),
             eq(false)
         );
     }

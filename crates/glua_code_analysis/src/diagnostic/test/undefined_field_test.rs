@@ -352,7 +352,7 @@ mod test {
     }
 
     #[test]
-    fn recursive_descendant_member_reports_undefined_field() {
+    fn recursive_descendant_member_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -375,9 +375,9 @@ mod test {
             "#,
         );
 
-        let undefined_fields =
-            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
-        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        let undefined_methods =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
@@ -3518,7 +3518,7 @@ owner:GetShootPos()
     }
 
     #[test]
-    fn test_direct_subtype_member_in_incompatible_realm_reports_undefined_field() {
+    fn test_direct_subtype_member_in_incompatible_realm_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -3543,16 +3543,16 @@ owner:GetShootPos()
             "#,
         );
 
-        let undefined_fields = default_diagnostics_for_code_with_shared(
+        let undefined_methods = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
-    fn test_transitive_subtype_member_in_incompatible_realm_reports_undefined_field() {
+    fn test_transitive_subtype_member_in_incompatible_realm_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -3580,16 +3580,16 @@ owner:GetShootPos()
             "#,
         );
 
-        let undefined_fields = default_diagnostics_for_code_with_shared(
+        let undefined_methods = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
-    fn test_field_on_deep_subclass_reports_undefined_field() {
+    fn test_method_on_deep_subclass_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -3609,16 +3609,16 @@ owner:GetShootPos()
                 ent:GetSpecialField()
             "#,
         );
-        let undefined_fields = default_diagnostics_for_code_with_shared(
+        let undefined_methods = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
-    fn test_panel_member_on_deep_custom_panel_reports_undefined_field() {
+    fn test_panel_method_on_deep_custom_panel_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -3639,16 +3639,16 @@ owner:GetShootPos()
             "#,
         );
 
-        let undefined_fields = default_diagnostics_for_code_with_shared(
+        let undefined_methods = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
         );
-        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
-    fn gmod_truly_absent_parent_member_reports_undefined_field() {
+    fn gmod_truly_absent_parent_method_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         ws.def_file(
@@ -3671,7 +3671,7 @@ owner:CompletelyMadeUpMethod()
         let diagnostics = default_diagnostics_for_code_with_shared(
             &mut ws,
             file_id,
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
         );
 
         assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
@@ -3679,12 +3679,12 @@ owner:CompletelyMadeUpMethod()
         assert_eq!(
             diagnostic.code,
             Some(NumberOrString::String(
-                DiagnosticCode::UndefinedField.get_name().to_string()
+                DiagnosticCode::UndefinedMethod.get_name().to_string()
             ))
         );
         assert_eq!(
             diagnostic.message,
-            "Undefined field `CompletelyMadeUpMethod`. "
+            "Undefined method `CompletelyMadeUpMethod`. "
         );
         assert_eq!(diagnostic.range.start.line, 2);
         assert_eq!(diagnostic.range.start.character, 6);
@@ -3945,9 +3945,9 @@ owner:CompletelyMadeUpMethod()
     #[test]
     fn test_tableof_colon_call_flags_diagnostic() {
         let mut ws = VirtualWorkspace::new();
-        // Colon calls on tableof should trigger undefined-field diagnostic
+        // Colon calls on tableof should trigger undefined-method diagnostic
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class MyEntity
                 local MyEntity = {}
@@ -4748,7 +4748,7 @@ owner:CompletelyMadeUpMethod()
         // Regression test: a method defined via func-stat on a Ref-typed local
         // must NOT leak to other instances of the same class.
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class FuncStatPollutionPanel
                 ---@field name string

@@ -93,7 +93,7 @@ mod test {
         // Members added to one Instance must NOT appear on another instance.
         // Use (exact) base class and READ from the second instance.
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class (exact) InstancePollutionPanel
                 ---@field name string
@@ -176,7 +176,7 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         // Members on a @type (instance) should not leak to another instance.
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class (exact) TypeInstancePollutionPanel
                 ---@field name string

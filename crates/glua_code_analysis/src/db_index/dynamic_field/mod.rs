@@ -23,6 +23,8 @@ pub struct DynamicFieldIndex {
     owner_fields: HashMap<DynamicFieldOwner, HashMap<SmolStr, HashSet<FileId>>>,
     /// owner → (field_name → assignment locations)
     field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    /// Exact fields collected on their original owner, excluding inherited propagation.
+    direct_field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
     /// owner → assignment locations for writes through non-literal keys.
@@ -37,6 +39,36 @@ impl DynamicFieldIndex {
     }
 
     pub fn add_field(
+        &mut self,
+        owner: DynamicFieldOwner,
+        field_name: SmolStr,
+        file_id: FileId,
+        range: TextRange,
+    ) {
+        let definition = InFiled::new(file_id, range);
+        let direct_definitions = self
+            .direct_field_definitions
+            .entry(owner.clone())
+            .or_default()
+            .entry(field_name.clone())
+            .or_default();
+        if !direct_definitions.contains(&definition) {
+            direct_definitions.push(definition);
+        }
+        self.add_field_inner(owner, field_name, file_id, range);
+    }
+
+    pub fn add_propagated_field(
+        &mut self,
+        owner: DynamicFieldOwner,
+        field_name: SmolStr,
+        file_id: FileId,
+        range: TextRange,
+    ) {
+        self.add_field_inner(owner, field_name, file_id, range);
+    }
+
+    fn add_field_inner(
         &mut self,
         owner: DynamicFieldOwner,
         field_name: SmolStr,
@@ -111,6 +143,13 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
     ) -> Option<&HashMap<SmolStr, HashSet<FileId>>> {
         self.owner_fields.get(owner)
+    }
+
+    pub fn get_direct_fields(
+        &self,
+        owner: &DynamicFieldOwner,
+    ) -> Option<&HashMap<SmolStr, Vec<InFiled<TextRange>>>> {
+        self.direct_field_definitions.get(owner)
     }
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
@@ -299,6 +338,13 @@ impl LuaIndex for DynamicFieldIndex {
             });
             !fields.is_empty()
         });
+        self.direct_field_definitions.retain(|_, fields| {
+            fields.retain(|_, definitions| {
+                definitions.retain(|definition| definition.file_id != file_id);
+                !definitions.is_empty()
+            });
+            !fields.is_empty()
+        });
 
         let mut removed_wildcard_definitions = false;
         self.wildcard_definitions.retain(|_, definitions| {
@@ -324,6 +370,7 @@ impl LuaIndex for DynamicFieldIndex {
     fn clear(&mut self) {
         self.owner_fields.clear();
         self.field_definitions.clear();
+        self.direct_field_definitions.clear();
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();

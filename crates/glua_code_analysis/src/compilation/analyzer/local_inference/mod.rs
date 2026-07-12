@@ -17,7 +17,7 @@ use crate::{
     LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberKey, LuaMemberOwner, LuaType,
     LuaTypeDeclId, LuaTypeFact,
     compilation::analyzer::AnalyzeContext,
-    semantic::{infer_bind_value_type, infer_expr},
+    semantic::{infer_bind_value_type, infer_expr, resolve_dynamic_field_member},
 };
 
 use self::evidence::ContextualTypeEvidence;
@@ -327,6 +327,7 @@ pub(super) fn stabilize_unguarded_children(
                 ) {
                     continue;
                 }
+                let cache = context.infer_manager.get_infer_cache(file_id);
 
                 let definitions = flow_tree
                     .and_then(|tree| {
@@ -349,7 +350,15 @@ pub(super) fn stabilize_unguarded_children(
                                     index_expr.get_position(),
                                 )
                                 .is_empty()
-                        });
+                        })
+                        || resolve_dynamic_field_member(
+                            db,
+                            cache,
+                            &LuaType::Ref(child_id.clone()),
+                            &member_key,
+                            None,
+                        )
+                        .is_some();
                     if !visible {
                         continue;
                     }
@@ -482,7 +491,7 @@ fn type_has_visible_member_at_use(
     file_id: crate::FileId,
     position: rowan::TextSize,
 ) -> bool {
-    context
+    let visible_in_workspace = context
         .workspace_id
         .and_then(|workspace_id| {
             crate::semantic::find_members_with_key_in_workspace_for_file_at_offset(
@@ -495,7 +504,41 @@ fn type_has_visible_member_at_use(
                 position,
             )
         })
-        .is_some_and(|members| !members.is_empty())
+        .is_some_and(|members| !members.is_empty());
+    visible_in_workspace
+        && type_has_visible_static_member_at_use(db, typ, member_key, file_id, position)
+}
+
+fn type_has_visible_static_member_at_use(
+    db: &crate::DbIndex,
+    typ: &LuaType,
+    member_key: &LuaMemberKey,
+    file_id: crate::FileId,
+    position: rowan::TextSize,
+) -> bool {
+    let (LuaType::Ref(type_id) | LuaType::Def(type_id)) = typ else {
+        return false;
+    };
+    let mut owners = vec![type_id.clone()];
+    let mut super_types = Vec::new();
+    type_id.collect_super_types(db, &mut super_types);
+    owners.extend(
+        super_types
+            .into_iter()
+            .filter_map(|super_type| match super_type {
+                LuaType::Ref(super_id) | LuaType::Def(super_id) => Some(super_id),
+                _ => None,
+            }),
+    );
+    owners.into_iter().any(|owner_id| {
+        db.get_member_index()
+            .get_member_item(&LuaMemberOwner::Type(owner_id), member_key)
+            .is_some_and(|item| {
+                !item
+                    .visible_member_ids_with_realm_at_offset(db, &file_id, position)
+                    .is_empty()
+            })
+    })
 }
 
 type DirectSubtypeMembers = FxHashMap<LuaTypeDeclId, FxHashMap<LuaMemberKey, Vec<LuaTypeDeclId>>>;
@@ -509,9 +552,14 @@ fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMember
     for child in type_index.get_all_types() {
         let child_id = child.get_id();
         let owner = LuaMemberOwner::Type(child_id.clone());
-        let Some(members) = member_index.get_members(&owner) else {
+        let members = member_index.get_members(&owner);
+        let dynamic_owner = crate::DynamicFieldOwner::Type(child_id.clone());
+        let dynamic_fields = db
+            .get_dynamic_field_index()
+            .get_direct_fields(&dynamic_owner);
+        if members.is_none() && dynamic_fields.is_none() {
             continue;
-        };
+        }
         let Some(super_types) = type_index.get_super_types_iter(&child_id) else {
             continue;
         };
@@ -521,11 +569,21 @@ fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMember
                 continue;
             };
             let members_for_base = candidates.entry(base_id.clone()).or_default();
-            for member in &members {
-                members_for_base
-                    .entry(member.get_key().clone())
-                    .or_default()
-                    .insert(child_id.clone());
+            if let Some(members) = &members {
+                for member in members {
+                    members_for_base
+                        .entry(member.get_key().clone())
+                        .or_default()
+                        .insert(child_id.clone());
+                }
+            }
+            if let Some(dynamic_fields) = dynamic_fields {
+                for field_name in dynamic_fields.keys() {
+                    members_for_base
+                        .entry(LuaMemberKey::Name(field_name.clone()))
+                        .or_default()
+                        .insert(child_id.clone());
+                }
             }
         }
     }

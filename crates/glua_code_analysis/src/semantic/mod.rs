@@ -41,6 +41,7 @@ pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
+pub(crate) use member::resolve_dynamic_field_member;
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
 pub(crate) use semantic_info::{

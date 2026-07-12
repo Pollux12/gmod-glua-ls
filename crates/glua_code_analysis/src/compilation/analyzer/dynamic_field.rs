@@ -2,13 +2,14 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Duration;
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat, LuaFuncStat,
-    LuaIndexKey, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexKey, LuaLiteralToken, LuaSyntaxKind,
+    LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
+    InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner},
     profile::Profile,
     semantic::{
@@ -141,6 +142,10 @@ impl DynamicFieldAnalysisMode {
         matches!(self, Self::Full)
     }
 
+    fn collect_finite_direct_assignments(self) -> bool {
+        true
+    }
+
     fn collect_setmetatable_tables(self) -> bool {
         matches!(self, Self::Full)
     }
@@ -194,11 +199,6 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
             let value_expr = exprs.get(idx);
-            if mode.collects_only_declared_member_table_fields()
-                && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
-            {
-                continue;
-            }
             let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                 continue;
             };
@@ -209,6 +209,15 @@ fn collect_dynamic_fields_for_file(
             };
 
             let field_names = get_field_names(db, cache, &index_expr);
+            let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
+                && is_dynamic_index_key(&index_expr)
+                && !field_names.is_empty();
+            if mode.collects_only_declared_member_table_fields()
+                && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
+                && !collect_finite_direct_assignment
+            {
+                continue;
+            }
             let should_collect_wildcard = mode.collect_direct_assignments()
                 && is_dynamic_index_key(&index_expr)
                 && (field_names.is_empty()
@@ -268,7 +277,7 @@ fn collect_dynamic_fields_for_file(
                         &mut collected,
                     );
                 }
-                if mode.collect_direct_assignments() {
+                if mode.collect_direct_assignments() || collect_finite_direct_assignment {
                     collect_for_type(
                         &effective_type,
                         &field_name,
@@ -384,7 +393,7 @@ fn analyze_dynamic_fields(
         index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
     }
     for (owner, field_name, file_id, range) in &propagated {
-        index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
+        index.add_propagated_field(owner.clone(), field_name.clone(), *file_id, *range);
     }
     for (owner, file_id, range) in &collected_wildcards {
         index.add_wildcard_definition(owner.clone(), *file_id, *range);
@@ -1154,12 +1163,213 @@ fn get_field_names(
         LuaIndexKey::Expr(expr) => {
             let names = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
             if names.is_empty() {
-                field_names_from_for_range_pairs_key(expr)
+                let mut visiting = FxHashSet::default();
+                let names = finite_dynamic_key_strings(db, cache, &expr, &mut visiting);
+                if names.is_empty() {
+                    field_names_from_for_range_pairs_key(expr)
+                } else {
+                    names
+                }
             } else {
                 names
             }
         }
         _ => Vec::new(),
+    }
+}
+
+fn finite_dynamic_key_strings(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    expr: &LuaExpr,
+    visiting: &mut FxHashSet<LuaDeclId>,
+) -> Vec<SmolStr> {
+    let inferred = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
+    if !inferred.is_empty() {
+        return inferred;
+    }
+
+    match expr {
+        LuaExpr::LiteralExpr(literal) => match literal.get_literal() {
+            Some(LuaLiteralToken::String(value)) => vec![value.get_value().into()],
+            _ => Vec::new(),
+        },
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .map(|inner| finite_dynamic_key_strings(db, cache, &inner, visiting))
+            .unwrap_or_default(),
+        LuaExpr::NameExpr(name_expr) => {
+            let Some(decl_id) = db
+                .get_reference_index()
+                .get_local_reference(&cache.get_file_id())
+                .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+            else {
+                return Vec::new();
+            };
+            if !visiting.insert(decl_id) {
+                return Vec::new();
+            }
+            let result = local_initializer_expr(db, decl_id)
+                .map(|initializer| finite_dynamic_key_strings(db, cache, &initializer, visiting))
+                .unwrap_or_default();
+            visiting.remove(&decl_id);
+            result
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpConcat) {
+                return Vec::new();
+            }
+            let Some((left, right)) = binary.get_exprs() else {
+                return Vec::new();
+            };
+            let left = finite_dynamic_key_strings(db, cache, &left, visiting);
+            let right = finite_dynamic_key_strings(db, cache, &right, visiting);
+            concatenate_finite_strings(&left, &right)
+        }
+        LuaExpr::CallExpr(call) => finite_string_transform_call(db, cache, call, visiting),
+        LuaExpr::IndexExpr(index_expr) => {
+            finite_numeric_loop_table_values(db, cache, index_expr, visiting)
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaExpr> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&decl_id.file_id)?
+        .get_red_root();
+    LuaExpr::cast(initializer.get_expr_syntax_id().to_node_from_root(&root)?)
+}
+
+fn concatenate_finite_strings(left: &[SmolStr], right: &[SmolStr]) -> Vec<SmolStr> {
+    if left.len() != 1 && right.len() != 1 {
+        return Vec::new();
+    }
+    let mut result = Vec::with_capacity(left.len().saturating_mul(right.len()));
+    for left in left {
+        for right in right {
+            result.push(SmolStr::new(format!("{left}{right}")));
+        }
+    }
+    result
+}
+
+fn finite_string_transform_call(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    call: &LuaCallExpr,
+    visiting: &mut FxHashSet<LuaDeclId>,
+) -> Vec<SmolStr> {
+    if call.get_access_path().as_deref() != Some("string.gsub") {
+        return Vec::new();
+    }
+    let Some(args) = call.get_args_list() else {
+        return Vec::new();
+    };
+    let args = args.get_args().collect::<Vec<_>>();
+    if args.len() < 3
+        || literal_string(&args[1]).as_deref() != Some("%s+")
+        || literal_string(&args[2]).as_deref() != Some("")
+    {
+        return Vec::new();
+    }
+
+    finite_dynamic_key_strings(db, cache, &args[0], visiting)
+        .into_iter()
+        .map(|value| {
+            SmolStr::new(
+                value
+                    .chars()
+                    .filter(|character| !character.is_ascii_whitespace())
+                    .collect::<String>(),
+            )
+        })
+        .collect()
+}
+
+fn literal_string(expr: &LuaExpr) -> Option<String> {
+    let LuaExpr::LiteralExpr(literal) = expr else {
+        return None;
+    };
+    let LuaLiteralToken::String(value) = literal.get_literal()? else {
+        return None;
+    };
+    Some(value.get_value())
+}
+
+fn finite_numeric_loop_table_values(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+    visiting: &mut FxHashSet<LuaDeclId>,
+) -> Vec<SmolStr> {
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return Vec::new();
+    };
+    let Some(key_text) = key_name.get_name_text() else {
+        return Vec::new();
+    };
+    let Some(for_stat) = index_expr.syntax().ancestors().find_map(LuaForStat::cast) else {
+        return Vec::new();
+    };
+    if for_stat
+        .get_var_name()
+        .is_none_or(|name| name.get_name_text() != key_text)
+    {
+        return Vec::new();
+    }
+    let bounds = for_stat
+        .get_iter_expr()
+        .take(2)
+        .filter_map(|bound| infer_integer_const(db, cache, bound))
+        .collect::<Vec<_>>();
+    let bounds = (bounds.len() == 2).then(|| (bounds[0], bounds[1]));
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr) else {
+        return Vec::new();
+    };
+    let Some(members) = crate::semantic::get_member_map(db, &prefix_type) else {
+        return Vec::new();
+    };
+
+    let mut values = Vec::new();
+    for (key, member_infos) in members {
+        let LuaMemberKey::Integer(key) = key else {
+            continue;
+        };
+        if bounds.is_some_and(|(start, end)| key < start || key > end) {
+            continue;
+        }
+        for member_info in member_infos {
+            if let Some(crate::LuaSemanticDeclId::Member(member_id)) = member_info.property_owner_id
+                && let Some(value_expr) = crate::semantic::get_member_value_expr(db, member_id)
+            {
+                values.extend(finite_dynamic_key_strings(db, cache, &value_expr, visiting));
+            }
+            collect_string_const_names(&member_info.typ, &mut values);
+        }
+    }
+    values.sort();
+    values.dedup();
+    values
+}
+
+fn infer_integer_const(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    expr: LuaExpr,
+) -> Option<i64> {
+    match infer_expr(db, cache, expr).ok()? {
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => Some(value),
+        _ => None,
     }
 }
 

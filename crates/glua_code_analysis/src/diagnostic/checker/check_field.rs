@@ -28,7 +28,11 @@ use super::{
 pub struct CheckFieldChecker;
 
 impl Checker for CheckFieldChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
+    const CODES: &[DiagnosticCode] = &[
+        DiagnosticCode::InjectField,
+        DiagnosticCode::UndefinedField,
+        DiagnosticCode::UndefinedMethod,
+    ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
@@ -109,11 +113,16 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
+                    let code = if is_colon_method_call(&index_expr) {
+                        DiagnosticCode::UndefinedMethod
+                    } else {
+                        DiagnosticCode::UndefinedField
+                    };
                     check_index_expr(
                         context,
                         semantic_model,
                         &index_expr,
-                        DiagnosticCode::UndefinedField,
+                        code,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -273,7 +282,7 @@ fn check_index_expr(
         // GetTable() returns a plain table with fields; colon calls pass the wrong self.
         if is_tableof_colon_access(&prefix_typ, index_expr) {
             context.add_diagnostic(
-                DiagnosticCode::UndefinedField,
+                DiagnosticCode::UndefinedMethod,
                 index_key.get_range()?,
                 format!(
                     "Cannot call methods via `:` on a table returned by GetTable(). Use dot-access `.{field}` instead. ",
@@ -295,19 +304,22 @@ fn check_index_expr(
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && has_unresolved_metatable_index(
-            db,
-            semantic_model,
-            &prefix_typ,
-            Some(index_expr.get_position()),
-        )
-    {
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && has_unresolved_metatable_index(
+        db,
+        semantic_model,
+        &prefix_typ,
+        Some(index_expr.get_position()),
+    ) {
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && !is_enum_type(db, &prefix_typ)
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && !is_enum_type(db, &prefix_typ)
         && is_nil_guarded_in_scope(index_expr)
     {
         return Some(());
@@ -366,6 +378,17 @@ fn check_index_expr(
                 None,
             );
         }
+        DiagnosticCode::UndefinedMethod => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
+            context.add_diagnostic(
+                DiagnosticCode::UndefinedMethod,
+                index_key.get_range()?,
+                format!("Undefined method `{field}`. ", field = field_name),
+                None,
+            );
+        }
         _ => {}
     }
 
@@ -418,6 +441,20 @@ fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> b
     index_expr
         .get_index_token()
         .is_some_and(|token| token.is_colon())
+}
+
+fn is_colon_method_call(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
+        && index_expr
+            .syntax()
+            .parent()
+            .and_then(LuaCallExpr::cast)
+            .is_some_and(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax() == index_expr.syntax())
+            })
 }
 
 fn has_unresolved_metatable_index(
@@ -741,7 +778,10 @@ fn is_valid_member_inner(
         }
     }
 
-    let has_definitely_non_indexable_prefix = matches!(code, DiagnosticCode::UndefinedField)
+    let has_definitely_non_indexable_prefix = matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    )
         && all_runtime_components_are_non_indexable_primitives(semantic_model.get_db(), prefix_typ);
 
     // Check flow-based semantic info before expensive AST walks like
@@ -758,7 +798,12 @@ fn is_valid_member_inner(
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
             Some(info) => {
                 let mut need = info.semantic_decl.is_none();
-                if need && code == DiagnosticCode::UndefinedField {
+                if need
+                    && matches!(
+                        code,
+                        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+                    )
+                {
                     // For UndefinedField, if flow analysis resolved the type to a
                     // Signature (func-stat method definitions on Ref-typed variables),
                     // the field is genuinely defined on this variable and no diagnostic
@@ -788,8 +833,10 @@ fn is_valid_member_inner(
 
     // nil-safe context check (ancestor walk) — only needed when flow analysis
     // didn't already resolve the field above.
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && is_nil_safe_expr_context(semantic_model, index_expr)
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && is_nil_safe_expr_context(semantic_model, index_expr)
     {
         if allows_nil_safe_expr_undefined_field_suppression(semantic_model, prefix_typ, &index_key)
         {
@@ -1147,10 +1194,6 @@ fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
 }
 
 fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node: &T) -> bool {
-    if in_conditional_statement(node) {
-        return true;
-    }
-
     for ancestor in node.syntax().ancestors().skip(1) {
         match ancestor.kind().into() {
             LuaSyntaxKind::CallExpr => {
@@ -1216,7 +1259,7 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node:
         }
     }
 
-    false
+    in_conditional_statement(node)
 }
 
 /// Returns `true` when `node_range` falls inside an argument of `call_expr`

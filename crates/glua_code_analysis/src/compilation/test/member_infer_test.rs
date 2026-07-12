@@ -2593,11 +2593,11 @@ Editor:MissingMethod()
         );
 
         let has_undef_missing =
-            file_has_diagnostic(&mut ws, file_c, DiagnosticCode::UndefinedField);
+            file_has_diagnostic(&mut ws, file_c, DiagnosticCode::UndefinedMethod);
         assert_that!(
             has_undef_missing,
             eq(true),
-            "Method missing from Editor should trigger UndefinedField"
+            "Method missing from Editor should trigger UndefinedMethod"
         );
 
         let editor_type_a = local_name_type(&mut ws, file_a, "Editor");

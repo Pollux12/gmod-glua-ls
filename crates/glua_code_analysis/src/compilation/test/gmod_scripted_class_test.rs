@@ -3811,7 +3811,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/menu/create_from_table_dynamic_overwrite.lua",
@@ -3839,14 +3839,14 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let undefined_field = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
 
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == undefined_field),
+                .any(|diagnostic| diagnostic.code == undefined_method),
             "vgui.CreateFromTable must not infer stale Base after dynamic table overwrite, got {diagnostics:?}"
         );
     }
@@ -3859,7 +3859,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/menu/create_from_table_table_overwrite.lua",
@@ -3883,14 +3883,14 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let undefined_field = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
 
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == undefined_field),
+                .any(|diagnostic| diagnostic.code == undefined_method),
             "vgui.CreateFromTable must not infer stale Base after table overwrite without Base, got {diagnostics:?}"
         );
     }
@@ -3903,7 +3903,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/menu/create_from_table_shadowed_local.lua",
@@ -3928,14 +3928,14 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let undefined_field = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
 
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == undefined_field),
+                .any(|diagnostic| diagnostic.code == undefined_method),
             "vgui.CreateFromTable must not use Base from a shadowed local PANEL, got {diagnostics:?}"
         );
     }
@@ -3948,7 +3948,7 @@ mod test {
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/menu/create_from_table_missing_multi_assign_rhs.lua",
@@ -3973,14 +3973,14 @@ mod test {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-        let undefined_field = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
 
         assert!(
             diagnostics
                 .iter()
-                .any(|diagnostic| diagnostic.code == undefined_field),
+                .any(|diagnostic| diagnostic.code == undefined_method),
             "vgui.CreateFromTable must not reuse the previous RHS for a missing multi-assign value, got {diagnostics:?}"
         );
     }
@@ -4234,17 +4234,17 @@ mod test {
     }
 
     /// Negative control: calling a method that exists on NO region should still
-    /// produce an undefined-field diagnostic. Guards against an over-broad fix
+    /// produce an undefined-method diagnostic. Guards against an over-broad fix
     /// that suppresses all field checks on reassigned PANEL.
     #[gtest]
-    fn test_vgui_reassigned_panel_wrong_method_still_flags_undefined_field() {
+    fn test_vgui_reassigned_panel_wrong_method_still_flags_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/vgui/reassigned_panel_wrong_method.lua",
@@ -4266,14 +4266,14 @@ mod test {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
 
-        let undefined_field_code = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
         assert!(
             diagnostics
                 .iter()
-                .any(|diag| diag.code == undefined_field_code),
-            "self:DoesNotExistAnywhere() should produce an undefined-field diagnostic, got {diagnostics:?}"
+                .any(|diag| diag.code == undefined_method_code),
+            "self:DoesNotExistAnywhere() should produce an undefined-method diagnostic, got {diagnostics:?}"
         );
     }
 
@@ -5844,6 +5844,9 @@ mod test {
         let missing_parameter_code = Some(NumberOrString::String(
             DiagnosticCode::MissingParameter.get_name().to_string(),
         ));
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
         let undefined_field_code = Some(NumberOrString::String(
             DiagnosticCode::UndefinedField.get_name().to_string(),
         ));
@@ -5860,36 +5863,55 @@ mod test {
             "unexpected param diagnostics for synthesized NetworkVar accessors: {param_diagnostics:?}"
         );
 
-        let undefined_field_diags: Vec<_> = diagnostics
+        let undefined_method_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|diag| diag.code == undefined_field_code)
+            .filter(|diag| diag.code == undefined_method_code)
             .collect();
 
-        let extract_undefined_field_name = |message: &str| {
-            let prefix = "Undefined field `";
+        let extract_undefined_method_name = |message: &str| {
+            let prefix = "Undefined method `";
             message
                 .strip_prefix(prefix)
                 .and_then(|rest| rest.split_once('`'))
                 .map(|(name, _)| name.to_string())
         };
 
+        let mut undefined_method_names: Vec<String> = undefined_method_diags
+            .iter()
+            .filter_map(|diag| extract_undefined_method_name(&diag.message))
+            .collect();
+        undefined_method_names.sort();
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
         let mut undefined_field_names: Vec<String> = undefined_field_diags
             .iter()
-            .filter_map(|diag| extract_undefined_field_name(&diag.message))
+            .filter_map(|diag| {
+                diag.message
+                    .strip_prefix("Undefined field `")
+                    .and_then(|rest| rest.split_once('`'))
+                    .map(|(name, _)| name.to_string())
+            })
             .collect();
         undefined_field_names.sort();
 
+        let allowed_undefined_method_names = ["NetworkVar", "NetworkVarNotify", "GetTable"];
         let allowed_undefined_field_names = [
-            "NetworkVar",
-            "NetworkVarNotify",
             "OnWaterStateChange",
             "OnEngineStateChange",
             "OnEngineStateChangePhoton",
             "OnHeadlightStateChangePhoton",
             "OnTurnSignalStateChangePhoton",
-            "GetTable",
         ];
 
+        assert!(
+            undefined_method_names
+                .iter()
+                .all(|name| allowed_undefined_method_names.contains(&name.as_str())),
+            "unexpected undefined-method diagnostics in same file: {undefined_method_diags:?}; undefined_method_names={undefined_method_names:?}; member_names={member_names:?}"
+        );
         assert!(
             undefined_field_names
                 .iter()
@@ -5898,7 +5920,7 @@ mod test {
         );
 
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "NetworkVar")
                 .count(),
@@ -5906,7 +5928,7 @@ mod test {
             "expected 16 undefined NetworkVar members"
         );
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "NetworkVarNotify")
                 .count(),
@@ -5914,7 +5936,7 @@ mod test {
             "expected 5 undefined NetworkVarNotify members"
         );
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "GetTable")
                 .count(),

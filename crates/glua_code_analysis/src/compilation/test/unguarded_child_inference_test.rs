@@ -127,6 +127,109 @@ mod test {
     }
 
     #[test]
+    fn generated_finite_player_method_names_drive_child_inference() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/shared.lua",
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ROLE_MAX = 2
+            ROLE_STRINGS = {
+                [0] = "Innocent",
+                [1] = "Killer",
+                [2] = "Old Man",
+            }
+            "#,
+        );
+
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/player_ext_shd.lua",
+            r#"
+            ---@type Player
+            local plymeta = {}
+
+            for role = 0, ROLE_MAX do
+                local name = string.gsub(ROLE_STRINGS[role], "%s+", "")
+                plymeta["Get" .. name] = function(self)
+                    return true
+                end
+                plymeta["Is" .. name] = plymeta["Get" .. name]
+                plymeta["IsActive" .. name] = function(self)
+                    return true
+                end
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_crowbar/shared.lua",
+            r#"
+            ---@type Entity
+            local activator
+            local is_killer = activator:IsKiller()
+            print(activator)
+            print(is_killer)
+            "#,
+        );
+
+        let player_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .find_type_decl(file_id, "Player")
+            .expect("Player type")
+            .get_id();
+        assert!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .has_field(
+                    &crate::DynamicFieldOwner::Type(player_id.clone()),
+                    "IsKiller"
+                ),
+            "generated IsKiller dynamic field"
+        );
+        assert!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_dynamic_field_index()
+                .has_field(
+                    &crate::DynamicFieldOwner::Type(player_id.clone()),
+                    "IsOldMan"
+                ),
+            "generated names apply their constant string transform"
+        );
+        let mut cache = crate::LuaInferCache::new(file_id, Default::default());
+        assert!(
+            crate::semantic::resolve_dynamic_field_member(
+                ws.analysis.compilation.get_db(),
+                &mut cache,
+                &crate::LuaType::Ref(player_id.clone()),
+                &crate::LuaMemberKey::Name("IsKiller".into()),
+                None,
+            )
+            .is_some(),
+            "generated IsKiller dynamic field resolves"
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "activator")),
+            "Player"
+        );
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "is_killer")),
+            "true"
+        );
+    }
+
+    #[test]
     fn unguarded_child_fact_refines_a_declared_parameter_for_hover_and_members() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
@@ -304,13 +407,13 @@ mod test {
             "Base"
         );
         assert_eq!(
-            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
             1
         );
     }
 
     #[test]
-    fn truly_absent_child_member_stays_an_undefined_field() {
+    fn truly_absent_child_member_stays_an_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
         let file_id = ws.def(
@@ -330,7 +433,7 @@ mod test {
             "Base"
         );
         assert_eq!(
-            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
             1
         );
         assert_eq!(
@@ -362,7 +465,7 @@ mod test {
             "Base"
         );
         assert_eq!(
-            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
             1
         );
     }
