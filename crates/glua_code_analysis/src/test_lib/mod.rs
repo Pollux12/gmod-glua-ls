@@ -158,8 +158,17 @@ function timer.Simple(delay, func) end
 ---@generic T: Panel
 ---@[call_arg("gmod.vgui_panel", "reference")]
 ---@param className `T`
----@return (instance) T
+---@[call_arg("gmod.vgui_panel", "parent")]
+---@param parent Panel?
+---@return (instance) T?
 function vgui.Create(className, parent, name) end
+
+---@generic T: Panel
+---@[call_arg("gmod.vgui_panel", "reference")]
+---@[call_arg("gmod.vgui_panel", "parent_self")]
+---@param className `T`
+---@return (instance) T
+function Panel:Add(className) end
 
 ---@generic T: table
 ---@[call_arg("gmod.vgui_panel", "register_table")]

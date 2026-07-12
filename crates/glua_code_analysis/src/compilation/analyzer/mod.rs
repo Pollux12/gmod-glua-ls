@@ -193,17 +193,7 @@ fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
                 continue;
             }
 
-            // The GMod post-analysis path synthesizes standard AccessorFunc calls
-            // with backing fields and force types. Its setter uses the call syntax
-            // ID, so its presence means this call has already been handled.
             let setter_member_id = LuaMemberId::new(call.syntax_id, file_id);
-            if db
-                .get_member_index()
-                .get_member(&setter_member_id)
-                .is_some()
-            {
-                continue;
-            }
 
             let owner = LuaMemberOwner::Type(call.owner_type_id.clone());
 

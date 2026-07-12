@@ -2625,7 +2625,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_vgui_accessor_func_with_shipped_annotation_is_visible_cross_file() {
+    fn test_vgui_accessor_func_with_annotation_is_visible_cross_file() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -2636,7 +2636,7 @@ mod test {
             "annotations/global.lua",
             r#"
             ---@meta
-            ---@accessorfunc 2
+            ---@accessorfunc 3
             ---@param tab table
             ---@param key any
             ---@param name string

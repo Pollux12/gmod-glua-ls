@@ -199,7 +199,7 @@ fn resolve_str_default_from_arg_inner(
 /// First tries semantic-declaration resolution (which yields a `Signature` id
 /// carrying the `call_arg` metadata), then falls back to inferring the
 /// expression type and using direct call-arg role metadata.
-fn check_vgui_panel_ref_role(
+pub(crate) fn check_vgui_panel_ref_role(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     prefix_expr: &LuaExpr,

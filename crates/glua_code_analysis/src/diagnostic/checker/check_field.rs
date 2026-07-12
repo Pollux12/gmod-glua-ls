@@ -15,8 +15,8 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
     enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
-        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, is_sub_type_of,
-        member_key_matches_type, resolve_decl_backed_global_path_member_type,
+        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
+        resolve_decl_backed_global_path_member_type,
     },
 };
 
@@ -304,17 +304,6 @@ fn check_index_expr(
         return Some(());
     }
 
-    if erased_panel_base_has_known_subtype_member(
-        db,
-        semantic_model,
-        index_expr,
-        &prefix_typ,
-        &field_name,
-        index_expr.get_position(),
-    ) {
-        return Some(());
-    }
-
     if matches!(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
@@ -404,54 +393,6 @@ fn check_index_expr(
     }
 
     Some(())
-}
-
-fn erased_panel_base_has_known_subtype_member(
-    db: &DbIndex,
-    semantic_model: &SemanticModel,
-    index_expr: &LuaIndexExpr,
-    prefix_type: &LuaType,
-    field_name: &SmolStr,
-    position: rowan::TextSize,
-) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
-        return false;
-    }
-    if !matches!(index_expr.get_prefix_expr(), Some(LuaExpr::CallExpr(_))) {
-        return false;
-    }
-
-    let mut base_type = prefix_type;
-    while let LuaType::Instance(instance) = base_type {
-        base_type = instance.get_base();
-    }
-    let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = base_type else {
-        return false;
-    };
-    if base_id.get_name() != "Panel" {
-        return false;
-    }
-
-    let key = LuaMemberKey::Name(field_name.clone());
-    db.get_member_index()
-        .get_current_members_for_key(&key)
-        .into_iter()
-        .filter_map(|member| db.get_member_index().get_current_owner(&member.get_id()))
-        .filter_map(LuaMemberOwner::get_type_id)
-        .filter(|type_id| *type_id != base_id && is_sub_type_of(db, type_id, base_id))
-        .any(|type_id| {
-            db.get_member_index()
-                .get_member_item(&LuaMemberOwner::Type(type_id.clone()), &key)
-                .is_some_and(|item| {
-                    !item
-                        .visible_member_ids_with_realm_at_offset(
-                            db,
-                            &semantic_model.get_file_id(),
-                            position,
-                        )
-                        .is_empty()
-                })
-        })
 }
 
 fn is_invalid_prefix_type(typ: &LuaType) -> bool {

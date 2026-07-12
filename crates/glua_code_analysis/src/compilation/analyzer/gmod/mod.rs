@@ -19,10 +19,10 @@ use crate::{
     EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArgSource, GmodClassCallLiteral,
     GmodDermaSkinCallRoles, GmodNamedStringCallRoles, GmodNetworkVarCallRoles,
     GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata,
-    GmodVguiPanelCallRoles, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
-    LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodVguiPanelCallRoles, GmodVguiParentCallMetadata, InFiled, LuaCallArgRole, LuaDecl,
+    LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache,
+    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalysisPipeline, AnalyzeContext,
         common::{TypeCacheWriteMode, add_member, write_type_cache},
@@ -496,6 +496,7 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
+        resolve_vgui_parent_relations(db, context, &file_ids);
 
         let t_local_register = do_profile.then(std::time::Instant::now);
         synthesize_scripted_ent_registrations(db, &file_ids);
@@ -2334,6 +2335,70 @@ pub(crate) fn resolve_scoped_authoring_type(
     let info = db.get_gmod_infer_index().get_scoped_class_info(&file_id)?;
     (info.global_name == name || (info.global_name == "GM" && name == "GAMEMODE"))
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
+}
+
+fn resolve_vgui_parent_relations(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    file_ids: &[FileId],
+) {
+    let mut resolved_by_file = Vec::new();
+    for &file_id in file_ids {
+        let calls = db
+            .get_gmod_class_metadata_index()
+            .get_vgui_parent_calls(&file_id)
+            .to_vec();
+        if calls.is_empty() {
+            continue;
+        }
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            continue;
+        };
+        let mut resolved = Vec::with_capacity(calls.len());
+        for call in calls {
+            let type_ids = call
+                .parent_syntax_id
+                .to_node_from_root(&root)
+                .and_then(LuaExpr::cast)
+                .and_then(|expr| {
+                    infer_expr(db, context.infer_manager.get_infer_cache(file_id), expr).ok()
+                })
+                .map(|typ| {
+                    let mut type_ids = Vec::new();
+                    collect_panel_type_ids(db, &typ, &mut type_ids);
+                    type_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+                    type_ids.dedup();
+                    type_ids
+                })
+                .unwrap_or_default();
+            resolved.push((call.syntax_id, type_ids));
+        }
+        resolved_by_file.push((file_id, resolved));
+    }
+    db.get_gmod_class_metadata_index_mut()
+        .set_vgui_parent_types(resolved_by_file);
+}
+
+fn collect_panel_type_ids(db: &DbIndex, typ: &LuaType, type_ids: &mut Vec<LuaTypeDeclId>) {
+    match typ {
+        LuaType::Instance(instance) => collect_panel_type_ids(db, instance.get_base(), type_ids),
+        LuaType::Union(union) => {
+            for typ in union.types() {
+                collect_panel_type_ids(db, typ, type_ids);
+            }
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            let panel_id = LuaTypeDeclId::global("Panel");
+            if *type_id == panel_id || crate::semantic::is_sub_type_of(db, type_id, &panel_id) {
+                type_ids.push(type_id.clone());
+            }
+        }
+        _ => {}
+    }
 }
 
 pub(crate) fn name_expr_resolves_to_scoped_authoring_table(
@@ -5767,6 +5832,16 @@ struct AnnotatedGmodCallArgRole {
     field_path: Vec<String>,
 }
 
+enum AnnotatedVguiParentSource {
+    Arg(GmodClassCallArgSource),
+    SelfExpr,
+}
+
+struct AnnotatedVguiParentCallRoles {
+    child: GmodClassCallArgSource,
+    parent: AnnotatedVguiParentSource,
+}
+
 impl AnnotatedGmodCallArgRole {
     fn from_role(role: &LuaCallArgRole) -> Self {
         Self {
@@ -5814,6 +5889,9 @@ struct AnnotatedGmodCallRoles {
     vgui_panel_define_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_table_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_base_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_reference_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_parent_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_parent_self_roles: Vec<AnnotatedGmodCallArgRole>,
     derma_skin_define_roles: Vec<AnnotatedGmodCallArgRole>,
 }
 
@@ -5956,6 +6034,15 @@ impl AnnotatedGmodCallRoles {
             ("gmod.vgui_panel", "base") => {
                 self.vgui_panel_base_roles.push(arg_role);
             }
+            ("gmod.vgui_panel", crate::GMOD_ROLE_REFERENCE) => {
+                self.vgui_panel_reference_roles.push(arg_role);
+            }
+            ("gmod.vgui_panel", crate::GMOD_ROLE_VGUI_PARENT) => {
+                self.vgui_panel_parent_roles.push(arg_role);
+            }
+            ("gmod.vgui_panel", crate::GMOD_ROLE_VGUI_PARENT_SELF) => {
+                self.vgui_panel_parent_self_roles.push(arg_role);
+            }
             ("gmod.derma_skin", "define") => {
                 self.derma_skin_define_roles.push(arg_role);
             }
@@ -5987,6 +6074,12 @@ impl AnnotatedGmodCallRoles {
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_base_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.vgui_panel_reference_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.vgui_panel_parent_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.vgui_panel_parent_self_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.derma_skin_define_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
     }
@@ -6002,6 +6095,9 @@ impl AnnotatedGmodCallRoles {
             || !self.inheritance_roles.is_empty()
             || !self.network_var_define_roles.is_empty()
             || !self.vgui_panel_define_roles.is_empty()
+            || (!self.vgui_panel_reference_roles.is_empty()
+                && (!self.vgui_panel_parent_roles.is_empty()
+                    || !self.vgui_panel_parent_self_roles.is_empty()))
             || matches!(
                 self.vgui_panel_kind,
                 Some(
@@ -6120,6 +6216,9 @@ impl AnnotatedGmodCallRoles {
             has_scripted_class: !self.inheritance_roles.is_empty()
                 || !self.network_var_define_roles.is_empty()
                 || !self.vgui_panel_define_roles.is_empty()
+                || (!self.vgui_panel_reference_roles.is_empty()
+                    && (!self.vgui_panel_parent_roles.is_empty()
+                        || !self.vgui_panel_parent_self_roles.is_empty()))
                 || matches!(
                     self.vgui_panel_kind,
                     Some(
@@ -6235,6 +6334,21 @@ impl AnnotatedGmodCallRoles {
                     .and_then(|role| role.to_arg_source(is_colon_call, self.is_colon_define)),
             },
         ))
+    }
+
+    fn vgui_parent_call(&self, is_colon_call: bool) -> Option<AnnotatedVguiParentCallRoles> {
+        let child = self
+            .vgui_panel_reference_roles
+            .first()?
+            .to_arg_source(is_colon_call, self.is_colon_define)?;
+        let parent = if let Some(role) = self.vgui_panel_parent_roles.first() {
+            AnnotatedVguiParentSource::Arg(role.to_arg_source(is_colon_call, self.is_colon_define)?)
+        } else if !self.vgui_panel_parent_self_roles.is_empty() && is_colon_call {
+            AnnotatedVguiParentSource::SelfExpr
+        } else {
+            return None;
+        };
+        Some(AnnotatedVguiParentCallRoles { child, parent })
     }
 
     fn derma_skin_call_roles(&self, is_colon_call: bool) -> Option<GmodDermaSkinCallRoles> {
@@ -6705,6 +6819,17 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.vgui_panel_call(call_expr.is_colon_call()))
     }
 
+    fn vgui_parent_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<AnnotatedVguiParentCallRoles> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.vgui_parent_call(call_expr.is_colon_call()))
+    }
+
     fn inheritance_call(
         &self,
         db: &DbIndex,
@@ -7163,6 +7288,40 @@ fn collect_annotated_scripted_class_call_metadata(
     call_expr: LuaCallExpr,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
+
+    if let Some(roles) = annotated_roles.vgui_parent_call(db, file_id, &call_expr, &call_path) {
+        let (literal_args, args, _) = extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
+        let child_name = literal_args
+            .get(roles.child.arg_idx)
+            .and_then(Option::as_ref)
+            .and_then(|literal| match literal {
+                GmodClassCallLiteral::String(name) if !name.is_empty() => Some(name.clone()),
+                _ => None,
+            });
+        let parent_syntax_id = match roles.parent {
+            AnnotatedVguiParentSource::Arg(source) => {
+                args.get(source.arg_idx).map(|arg| arg.syntax_id)
+            }
+            AnnotatedVguiParentSource::SelfExpr => call_expr
+                .get_prefix_expr()
+                .and_then(|prefix| match prefix {
+                    LuaExpr::IndexExpr(index) => index.get_prefix_expr(),
+                    _ => None,
+                })
+                .map(|expr| expr.get_syntax_id()),
+        };
+        if let (Some(child_name), Some(parent_syntax_id)) = (child_name, parent_syntax_id) {
+            db.get_gmod_class_metadata_index_mut().add_vgui_parent_call(
+                file_id,
+                GmodVguiParentCallMetadata {
+                    syntax_id: call_expr.get_syntax_id(),
+                    child_name,
+                    parent_syntax_id,
+                    parent_type_ids: Vec::new(),
+                },
+            );
+        }
+    }
 
     if let Some((kind, inheritance_roles)) =
         annotated_roles.inheritance_call(db, file_id, &call_expr, &call_path)

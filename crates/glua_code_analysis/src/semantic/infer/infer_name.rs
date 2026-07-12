@@ -1374,7 +1374,7 @@ fn is_vgui_panel_context_type(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
-fn type_decl_is_vgui_panel(db: &DbIndex, type_id: &LuaTypeDeclId, depth: usize) -> bool {
+pub(crate) fn type_decl_is_vgui_panel(db: &DbIndex, type_id: &LuaTypeDeclId, depth: usize) -> bool {
     if depth > 8 {
         return false;
     }

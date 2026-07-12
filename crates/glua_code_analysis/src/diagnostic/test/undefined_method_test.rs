@@ -144,7 +144,6 @@ mod tests {
             .analysis
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
-
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
     }
 
@@ -255,11 +254,12 @@ mod tests {
     }
 
     #[test]
-    fn erased_panel_parent_accepts_known_subtype_methods_but_reports_unknown_methods() {
+    fn indexed_panel_parent_returns_known_parent_type_and_reports_unknown_methods() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
         let file_id = ws.def(
             r#"
             ---@class Panel
@@ -267,12 +267,31 @@ mod tests {
             ---@class ParentPanel: Panel
             local ParentPanel = {}
             function ParentPanel:UpdatePlayerData() end
+            function ParentPanel:CreateChild()
+                return vgui.Create("ChildPanel", self)
+            end
+            function ParentPanel:CreateAddedChild()
+                return self:Add("AddedChildPanel")
+            end
+
+            ---@class AlternateParentPanel: Panel
+            local AlternateParentPanel = {}
+            function AlternateParentPanel:UpdatePlayerData() end
+            function AlternateParentPanel:CreateChild()
+                return vgui.Create("ChildPanel", self)
+            end
 
             ---@class ChildPanel: Panel
             local ChildPanel = {}
             function ChildPanel:UpdateParent()
                 self:GetParent():UpdatePlayerData()
                 self:GetParent():DefinitelyMissing()
+            end
+
+            ---@class AddedChildPanel: Panel
+            local AddedChildPanel = {}
+            function AddedChildPanel:UpdateParent()
+                self:GetParent():UpdatePlayerData()
             end
             "#,
         );

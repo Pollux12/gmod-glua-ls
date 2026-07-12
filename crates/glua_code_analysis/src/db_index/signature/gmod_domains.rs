@@ -80,6 +80,12 @@ pub const GMOD_ROLE_REFERENCE: &str = "reference";
 /// See [`GMOD_ROLE_REFERENCE`] for the diagnostic-layer existence guard contract.
 pub const GMOD_ROLE_EXISTS: &str = "exists";
 
+/// Explicit runtime parent argument for a constructed VGUI panel.
+pub const GMOD_ROLE_VGUI_PARENT: &str = "parent";
+
+/// The call receiver is the runtime parent of the constructed VGUI panel.
+pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
+
 // ---------------------------------------------------------------------------
 // Phase 1 reserved metadata names.
 // ---------------------------------------------------------------------------

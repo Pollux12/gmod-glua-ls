@@ -2218,6 +2218,7 @@ mod test {
 
                 local ctrl = vgui.Create("DCategoryList")
                 a = ctrl
+                b = vgui.Create("MissingPanelClass")
             "#,
         );
 
@@ -2225,6 +2226,8 @@ mod test {
         let base = unwrap_instance(&a_ty).clone();
         let expected = ws.ty("DCategoryList");
         assert_eq!(base, expected);
+        let unknown_ty = ws.expr_ty("b");
+        assert!(unwrap_instance(&unknown_ty).is_nullable());
     }
 
     #[gtest]

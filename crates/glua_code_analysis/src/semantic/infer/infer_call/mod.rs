@@ -3,6 +3,7 @@ use std::sync::Arc;
 use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaNameExpr, LuaSyntaxKind};
 use rowan::TextRange;
 
+use super::infer_name::type_decl_is_vgui_panel;
 use super::{
     super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
     InferFailReason, InferResult,
@@ -18,7 +19,10 @@ use crate::{GmodConVarKind, GmodLoadEdgeKind, GmodStateMask};
 use crate::{
     InferGuardRef,
     semantic::{
-        generic::{TypeSubstitutor, get_tpl_ref_extend_type, instantiate_doc_function},
+        generic::{
+            TypeSubstitutor, check_vgui_panel_ref_role, get_tpl_ref_extend_type,
+            instantiate_doc_function,
+        },
         get_member_value_expr,
         infer::narrow::get_type_at_call_expr_inline_cast,
         infer_expr_semantic_decl,
@@ -166,10 +170,12 @@ pub fn infer_call_expr_func(
             _ => func_ty,
         };
 
-        let func_ret = func_ty.get_ret();
-        match func_ret {
+        let func_ret =
+            refine_known_vgui_panel_return(db, cache, func_ty.get_ret().clone(), &call_expr);
+        let func_ret = refine_known_vgui_parent_return(db, cache, func_ret, &call_expr);
+        match &func_ret {
             LuaType::TypeGuard(_) => Ok(func_ty),
-            _ => unwrapp_return_type(db, cache, func_ret.clone(), call_expr).map(|new_ret| {
+            _ => unwrapp_return_type(db, cache, func_ret, call_expr).map(|new_ret| {
                 LuaFunctionType::new(
                     func_ty.get_async_state(),
                     func_ty.is_colon_define(),
@@ -201,6 +207,146 @@ pub fn infer_call_expr_func(
     }
 
     result
+}
+
+fn refine_known_vgui_panel_return(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    return_type: LuaType,
+    call_expr: &LuaCallExpr,
+) -> LuaType {
+    if !db.get_emmyrc().gmod.enabled {
+        return return_type;
+    }
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return return_type;
+    };
+    let Some(args) = call_expr.get_args_list() else {
+        return return_type;
+    };
+    if !args.get_args().enumerate().any(|(arg_idx, _)| {
+        check_vgui_panel_ref_role(db, cache, &prefix_expr, arg_idx, call_expr.is_colon_call())
+    }) {
+        return return_type;
+    }
+
+    let Some(type_id) = single_non_nil_instance_type_id(&return_type) else {
+        return return_type;
+    };
+    if !type_decl_is_vgui_panel(db, &type_id, 0)
+        && db
+            .get_gmod_class_metadata_index()
+            .get_vgui_panel_base(type_id.get_name())
+            .is_none()
+    {
+        return return_type;
+    }
+
+    remove_nested_nil(return_type)
+}
+
+fn refine_known_vgui_parent_return(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    return_type: LuaType,
+    call_expr: &LuaCallExpr,
+) -> LuaType {
+    if !db.get_emmyrc().gmod.enabled || !call_expr.is_colon_call() {
+        return return_type;
+    }
+    let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr() else {
+        return return_type;
+    };
+    if !index_expr.get_index_key().is_some_and(|key| {
+        key.get_name()
+            .is_some_and(|name| name.get_name_text() == "GetParent")
+    }) {
+        return return_type;
+    }
+    let Some(receiver) = index_expr.get_prefix_expr() else {
+        return return_type;
+    };
+    let Ok(receiver_type) = infer_expr(db, cache, receiver) else {
+        return return_type;
+    };
+    let mut child_ids = Vec::new();
+    collect_non_nil_type_ids(&receiver_type, &mut child_ids);
+    child_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+    child_ids.dedup();
+    if child_ids.is_empty() {
+        return return_type;
+    }
+
+    let metadata = db.get_gmod_class_metadata_index();
+    let mut parent_ids = Vec::new();
+    for child_id in child_ids {
+        if !metadata.vgui_panel_parents_are_complete(child_id.get_name()) {
+            return return_type;
+        }
+        parent_ids.extend(
+            metadata
+                .get_vgui_panel_parents(child_id.get_name())
+                .cloned(),
+        );
+    }
+    parent_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+    parent_ids.dedup();
+    if parent_ids.is_empty() {
+        return return_type;
+    }
+
+    LuaType::from_vec(parent_ids.into_iter().map(LuaType::Ref).collect())
+}
+
+fn single_non_nil_instance_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Instance(instance) => single_non_nil_instance_type_id(instance.get_base()),
+        LuaType::Union(union) => {
+            let mut resolved = None;
+            for typ in union.types().filter(|typ| !typ.is_nil()) {
+                let type_id = single_non_nil_instance_type_id(typ)?;
+                if resolved
+                    .as_ref()
+                    .is_some_and(|existing| existing != &type_id)
+                {
+                    return None;
+                }
+                resolved = Some(type_id);
+            }
+            resolved
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
+        _ => None,
+    }
+}
+
+fn collect_non_nil_type_ids(typ: &LuaType, type_ids: &mut Vec<LuaTypeDeclId>) {
+    match typ {
+        LuaType::Instance(instance) => collect_non_nil_type_ids(instance.get_base(), type_ids),
+        LuaType::Union(union) => {
+            for typ in union.types().filter(|typ| !typ.is_nil()) {
+                collect_non_nil_type_ids(typ, type_ids);
+            }
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => type_ids.push(type_id.clone()),
+        _ => {}
+    }
+}
+
+fn remove_nested_nil(typ: LuaType) -> LuaType {
+    match typ {
+        LuaType::Instance(instance) => LuaType::Instance(
+            LuaInstanceType::new(
+                remove_nested_nil(instance.get_base().clone()),
+                instance.get_range().clone(),
+            )
+            .into(),
+        ),
+        LuaType::Union(union) => {
+            LuaType::from_vec(union.types().filter(|typ| !typ.is_nil()).cloned().collect())
+        }
+        _ => typ,
+    }
 }
 
 fn infer_wrapped_setmetatable_call(
