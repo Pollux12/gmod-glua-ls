@@ -455,6 +455,16 @@ fn get_type_at_flow_walk(
                     if let Some(decl_id) = var_ref_id.get_decl_id_ref()
                         && should_defer_uninitialized_local_decl_type(db, decl_id)
                     {
+                        if policy.is_closure_baseline() {
+                            let baseline_type = get_var_ref_type(db, cache, var_ref_id)
+                                .map(|typ| TypeOps::Union.apply(db, &typ, &LuaType::Nil));
+                            return finish_flow_walk_result(
+                                db,
+                                var_ref_id,
+                                &pending_branch_types,
+                                baseline_type,
+                            );
+                        }
                         return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
 

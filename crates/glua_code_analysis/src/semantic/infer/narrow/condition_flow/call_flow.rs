@@ -610,8 +610,8 @@ fn narrow_valid_guard_true_branch(
     antecedent_type: LuaType,
     guard_type: LuaType,
 ) -> LuaType {
-    if let Some(narrowed_type) =
-        narrow_down_type(db, antecedent_type.clone(), guard_type.clone(), None)
+    if !guard_type.is_any()
+        && let Some(narrowed_type) = narrow_down_type(db, antecedent_type.clone(), guard_type, None)
     {
         return narrowed_type;
     }

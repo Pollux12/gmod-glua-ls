@@ -3901,6 +3901,94 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_generated_isvalid_conjunction_narrows_later_assigned_captured_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@realm shared
+            ---@param object any
+            ---@return TypeGuard<any>
+            ---@return_cast object -NULL
+            ---@[valid_guard]
+            function _G.IsValid(object) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/wire_display.lua",
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel
+            local function createLabel() end
+
+            local dclock = createLabel()
+            local dwires
+
+            local callback
+            callback = function(val)
+                if not (IsValid(dclock) and IsValid(dwires)) then return end
+
+                dwires:Update(val)
+                _G.afterGuard = dwires
+            end
+
+            dwires = createLabel()
+            "#,
+        );
+
+        let dwires_after_guard = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 1);
+        let desc = ws.humanize_type(dwires_after_guard.clone());
+        assert_that!(desc.as_str(), eq("DLabel"));
+        let expected = ws.ty("DLabel");
+        assert_that!(ws.check_type(&dwires_after_guard, &expected), eq(true));
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_unguarded_later_assigned_captured_local_reports_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def(
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel
+            local function createLabel() end
+
+            local dclock = createLabel()
+            local dwires
+
+            local callback
+            callback = function(val)
+                if not IsValid(dclock) then return end
+                dwires:Update(val)
+            end
+
+            dwires = createLabel()
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(true)
+        );
+        let dwires_at_access = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 1);
+        let desc = ws.humanize_type(dwires_at_access);
+        assert_that!(desc.as_str(), eq("DLabel?"));
+    }
+
+    #[gtest]
     fn test_isstring_guard_narrows() {
         // isstring(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
