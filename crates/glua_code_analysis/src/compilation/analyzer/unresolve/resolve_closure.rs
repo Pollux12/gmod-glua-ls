@@ -289,9 +289,13 @@ pub fn resolve_gmod_hook_callback_doc_function(
             let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
                 continue;
             };
-            let Some(function_types) =
-                filter_signature_type(db, type_cache.as_type(), origin_signature_id.as_ref(), true)
-            else {
+            let Some(function_types) = filter_signature_type(
+                db,
+                type_cache.as_type(),
+                origin_signature_id.as_ref(),
+                true,
+                false,
+            ) else {
                 continue;
             };
             let member_mask =
@@ -700,6 +704,7 @@ fn filter_signature_type(
     typ: &LuaType,
     origin_signature_id: Option<&LuaSignatureId>,
     preserve_returns: bool,
+    preserve_implicit_receiver: bool,
 ) -> Option<Vec<Arc<LuaFunctionType>>> {
     let mut result: Vec<Arc<LuaFunctionType>> = Vec::new();
     let mut stack = Vec::new();
@@ -715,9 +720,10 @@ fn filter_signature_type(
                 if origin_signature_id != Some(&sig_id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
                         // Convert annotated signature to DocFunction for param propagation.
-                        // When preserve_returns is false (monkey-patch path), only emit a
-                        // DocFunction when params are annotated — we want param propagation but
-                        // must NOT force a return constraint (could break os.exit-style patches).
+                        // When preserve_returns is false (monkey-patch path), emit a DocFunction
+                        // for annotated params or an implicit colon receiver. We want parameter
+                        // propagation but must NOT force a return constraint (could break
+                        // os.exit-style patches).
                         // When preserve_returns is true (hook hover path), emit even for return-
                         // only hooks so that `@return`-annotated hooks with no params display
                         // correctly as `function() -> boolean` rather than silently degrading.
@@ -725,6 +731,7 @@ fn filter_signature_type(
                             !sig.param_docs.is_empty() || !sig.get_return_type().is_nil()
                         } else {
                             !sig.param_docs.is_empty()
+                                || (preserve_implicit_receiver && sig.is_colon_define)
                         };
                         if has_useful_info {
                             let params = sig.get_type_params();
@@ -795,7 +802,18 @@ fn find_best_function_type(
 ) -> Option<LuaType> {
     // 寻找非自身定义的签名
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
-        if let Some(filtered_types) = filter_signature_type(db, &result.typ, origin_sig_id, false) {
+        let preserve_implicit_receiver = !origin_signature.is_colon_define
+            && origin_signature
+                .params
+                .first()
+                .is_some_and(|param| param != "...");
+        if let Some(filtered_types) = filter_signature_type(
+            db,
+            &result.typ,
+            origin_sig_id,
+            false,
+            preserve_implicit_receiver,
+        ) {
             // Parent declarations may describe distinct callback and callable forms.
             if !result.is_current_owner
                 && let Some(parent_type) = filtered_types.first()

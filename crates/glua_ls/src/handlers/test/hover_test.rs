@@ -323,6 +323,74 @@ mod tests {
     }
 
     #[gtest]
+    fn test_hover_dot_assigned_panel_method_receiver_alias() -> Result<()> {
+        fn hover_receiver(callback: &str) -> String {
+            let mut ws = ProviderVirtualWorkspace::new();
+            let mut emmyrc = ws.get_emmyrc();
+            emmyrc.gmod.enabled = true;
+            ws.update_emmyrc(emmyrc);
+
+            let library_root = ws.virtual_url_generator.base.join("library");
+            ws.analysis.add_library_workspace(library_root);
+            ws.def_file(
+                "library/output/panel.lua",
+                r#"
+                    ---@meta
+                    ---@class Panel
+                    Panel = {}
+
+                    ---@return Panel
+                    function Panel:GetParent() end
+
+                    ---@hook OnMousePressed
+                    ---@param keyCode number
+                    ---@return boolean
+                    function Panel:OnMousePressed(keyCode) end
+
+                    ---@hook OnCursorEntered
+                    function Panel:OnCursorEntered() end
+
+                    ---@hook OnCursorExited
+                    function Panel:OnCursorExited() end
+                "#,
+            );
+
+            let source = format!(
+                r#"
+                    ---@type Panel
+                    local p
+
+                    p.OnMousePressed  = function(s, mc) {mouse}s:GetParent():OnMousePressed(mc) end
+                    p.OnCursorEntered = function(s) {entered}s:GetParent():OnCursorEntered() end
+                    p.OnCursorExited  = function(s) {exited}s:GetParent():OnCursorExited() end
+                "#,
+                mouse = if callback == "mouse" { "<??>" } else { "" },
+                entered = if callback == "entered" { "<??>" } else { "" },
+                exited = if callback == "exited" { "<??>" } else { "" },
+            );
+            let (content, position) =
+                ProviderVirtualWorkspace::handle_file_content(&source).expect("cursor marker");
+            let file_id = ws.def_file(
+                "gamemodes/terrortown/gamemode/vgui/simpleicon.lua",
+                &content,
+            );
+            extract_hover_markdown(&ws, file_id, position)
+        }
+
+        let mouse = hover_receiver("mouse");
+        let entered = hover_receiver("entered");
+        let exited = hover_receiver("exited");
+
+        assert!(
+            mouse.contains("local s: Panel")
+                && entered.contains("local s: Panel")
+                && exited.contains("local s: Panel"),
+            "mouse hover:\n{mouse}\nentered hover:\n{entered}\nexited hover:\n{exited}"
+        );
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_param_func() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
