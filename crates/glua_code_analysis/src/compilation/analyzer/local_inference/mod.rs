@@ -661,7 +661,22 @@ fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
     }
 
     let index_range = index_expr.syntax().text_range();
-    index_expr.syntax().ancestors().any(|node| {
+    for node in index_expr.syntax().ancestors() {
+        if LuaClosureExpr::cast(node.clone()).is_some() {
+            break;
+        }
+
+        if let Some(binary) = LuaBinaryExpr::cast(node.clone())
+            && binary.get_op_token().is_some_and(|token| {
+                matches!(token.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+            })
+            && binary
+                .get_exprs()
+                .is_some_and(|(left, _)| logical_condition_contains_index(&left, index_expr))
+        {
+            return true;
+        }
+
         let condition = LuaIfStat::cast(node.clone())
             .and_then(|stat| stat.get_condition_expr())
             .or_else(|| {
@@ -669,9 +684,34 @@ fn is_condition_evidence(index_expr: &LuaIndexExpr) -> bool {
             })
             .or_else(|| LuaWhileStat::cast(node.clone()).and_then(|stat| stat.get_condition_expr()))
             .or_else(|| LuaRepeatStat::cast(node).and_then(|stat| stat.get_condition_expr()));
-        condition
+        if condition
             .is_some_and(|condition| condition.syntax().text_range().contains_range(index_range))
-    })
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn logical_condition_contains_index(expr: &LuaExpr, index_expr: &LuaIndexExpr) -> bool {
+    match expr {
+        LuaExpr::IndexExpr(index) => index.syntax() == index_expr.syntax(),
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| logical_condition_contains_index(&inner, index_expr)),
+        LuaExpr::BinaryExpr(binary)
+            if binary.get_op_token().is_some_and(|token| {
+                matches!(token.get_op(), BinaryOperator::OpAnd | BinaryOperator::OpOr)
+            }) =>
+        {
+            binary.get_exprs().is_some_and(|(left, right)| {
+                logical_condition_contains_index(&left, index_expr)
+                    || logical_condition_contains_index(&right, index_expr)
+            })
+        }
+        _ => false,
+    }
 }
 
 fn is_assignment_target(index_expr: &LuaIndexExpr) -> bool {

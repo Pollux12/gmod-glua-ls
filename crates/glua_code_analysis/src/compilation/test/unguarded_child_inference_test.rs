@@ -602,6 +602,145 @@ mod test {
     }
 
     #[test]
+    fn optional_member_fallback_is_not_unguarded_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly string
+            ---@type Base
+            local value
+            local result = value.ChildOnly or "fallback"
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn guarded_method_and_optional_field_fallbacks_are_not_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@field GetClass fun(self: Base): string
+            ---@class Child: Base
+            ---@field GetPrintName fun(self: Child): string
+            ---@field PrintName string
+            ---@type Base
+            local value
+            local result = value.GetPrintName and value:GetPrintName() or value.PrintName or value:GetClass() or "..."
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Base"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn child_method_call_controlling_fallback_is_still_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly fun(self: Child): string?
+            ---@type Base
+            local value
+            local result = value:ChildOnly() or "fallback"
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn child_member_used_before_fallback_is_still_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly number
+            ---@type Base
+            local value
+            local result = value.ChildOnly + 1 or 0
+            print(result)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
+    fn outer_fallback_does_not_suppress_deferred_closure_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Base
+            ---@class Child: Base
+            ---@field ChildOnly string
+            ---@type Base
+            local value
+            local callback = (function()
+                return value.ChildOnly
+            end) or function() end
+            print(callback)
+            print(value)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "value")),
+            "Child"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+    }
+
+    #[test]
     fn parenthesized_positive_short_circuit_guard_suppresses_child_evidence() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
