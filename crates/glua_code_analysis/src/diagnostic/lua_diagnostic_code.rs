@@ -169,6 +169,7 @@ pub fn get_default_severity(code: DiagnosticCode) -> DiagnosticSeverity {
         DiagnosticCode::MissingReturn => DiagnosticSeverity::WARNING,
         DiagnosticCode::ParamTypeMismatch => DiagnosticSeverity::WARNING,
         DiagnosticCode::MissingParameter => DiagnosticSeverity::WARNING,
+        DiagnosticCode::AssignTypeMismatch => DiagnosticSeverity::HINT,
         DiagnosticCode::UnreachableCode => DiagnosticSeverity::HINT,
         DiagnosticCode::Unused => DiagnosticSeverity::HINT,
         DiagnosticCode::UnusedSelf => DiagnosticSeverity::HINT,
