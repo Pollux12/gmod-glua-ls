@@ -2543,6 +2543,34 @@ mod test {
     }
 
     #[gtest]
+    fn test_positive_loop_index_guarded_by_table_length_has_no_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            local tutorialPages = {
+                { title = "Overview" },
+                { title = "Karma" },
+            }
+            local enabledPages = {}
+
+            for _, page in ipairs(tutorialPages) do
+                table.insert(enabledPages, page)
+            end
+
+            local maxPages = #enabledPages + 2
+            for i = 1, maxPages do
+                if i <= #enabledPages then
+                    local title = enabledPages[i].title
+                end
+            end
+        "#;
+
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+    }
+
+    #[gtest]
     fn test_numeric_for_populated_table_field_constant_index_has_no_nil_access_diagnostic() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

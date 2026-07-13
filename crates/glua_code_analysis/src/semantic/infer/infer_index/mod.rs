@@ -1,5 +1,5 @@
 mod infer_array;
-pub(crate) use infer_array::check_iter_var_range;
+pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
@@ -539,7 +539,7 @@ fn infer_table_member_owner(
         Err(err)
             if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
         {
-            if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+            if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                 return Ok(LuaType::Any);
             }
             return Ok(nullable_any_type());
@@ -714,7 +714,7 @@ fn infer_table_member_owner(
             }
 
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
-                if is_dynamic_index_in_len_for_range(db, cache, &index_expr, &index_key) {
+                if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                     return Ok(LuaType::Any);
                 }
                 return Ok(nullable_any_type());
@@ -1313,7 +1313,7 @@ fn is_dynamic_expr_key_without_table_data(
     matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
 }
 
-fn is_dynamic_index_in_len_for_range(
+fn is_dynamic_index_proven_in_range(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexMemberExpr,
@@ -1323,26 +1323,8 @@ fn is_dynamic_index_in_len_for_range(
         return false;
     };
 
-    if !matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::UnaryExpr(_)) {
-        return false;
-    };
-
-    if !is_inside_numeric_for_stat(index_expr) {
-        return false;
-    }
-
-    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-        return false;
-    };
-    check_iter_var_range(db, cache, expr, prefix_expr).unwrap_or(false)
-}
-
-fn is_inside_numeric_for_stat(index_expr: &LuaIndexMemberExpr) -> bool {
-    index_expr
-        .syntax()
-        .ancestors()
-        .skip(1)
-        .any(|ancestor| LuaForStat::cast(ancestor).is_some())
+    matches!(expr, LuaExpr::NameExpr(_) | LuaExpr::UnaryExpr(_))
+        && check_index_in_range(db, cache, index_expr)
 }
 
 fn table_const_has_no_specific_data(
@@ -1369,18 +1351,15 @@ fn infer_plain_table_member(
         return Ok(global_path_type);
     }
 
-    let index_prefix_expr = match index_expr.clone() {
-        LuaIndexMemberExpr::TableField(_) => return Ok(nullable_any_type()),
-        _ => index_expr.get_prefix_expr().ok_or(InferFailReason::None)?,
-    };
+    if matches!(&index_expr, LuaIndexMemberExpr::TableField(_)) {
+        return Ok(nullable_any_type());
+    }
 
     let Some(index_key) = index_expr.get_index_key() else {
         return Ok(nullable_any_type());
     };
 
-    if let LuaIndexKey::Expr(expr) = index_key
-        && check_iter_var_range(db, cache, &expr, index_prefix_expr).unwrap_or(false)
-    {
+    if matches!(index_key, LuaIndexKey::Expr(_)) && check_index_in_range(db, cache, &index_expr) {
         return Ok(LuaType::Any);
     }
 
