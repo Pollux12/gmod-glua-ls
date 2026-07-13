@@ -249,10 +249,10 @@ pub(super) fn stabilize_unguarded_children(
             let Some(base_type) = declaration_base_type(db, context, decl_id) else {
                 continue;
             };
-            let (LuaType::Ref(base_id) | LuaType::Def(base_id)) = &base_type else {
+            let Some(base_id) = unguarded_child_base_id(&base_type) else {
                 continue;
             };
-            let Some(members) = direct_subtype_members.get(base_id) else {
+            let Some(members) = direct_subtype_members.get(&base_id) else {
                 continue;
             };
 
@@ -324,16 +324,13 @@ pub(super) fn stabilize_unguarded_children(
                 // evidence nor an unguarded-child diagnostic site.
                 let current = infer_expr(db, cache, LuaExpr::NameExpr(name_expr.clone()))
                     .unwrap_or(LuaType::Unknown);
-                if !matches!(
-                    &current,
-                    LuaType::Ref(current_id) | LuaType::Def(current_id) if current_id == base_id
-                ) {
+                if !unguarded_child_current_matches_base(&current, &base_type, &base_id) {
                     continue;
                 }
                 if type_has_visible_member_at_use(
                     db,
                     context,
-                    &base_type,
+                    &LuaType::Ref(base_id.clone()),
                     &member_key,
                     file_id,
                     index_expr.get_position(),
@@ -520,6 +517,41 @@ pub(super) fn stabilize_unguarded_children(
     } else {
         Vec::new()
     }
+}
+
+fn unguarded_child_base_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(type_id.clone()),
+        LuaType::Union(union) => {
+            let mut base_id = None;
+            let mut saw_nullable_arm = false;
+            for component in union.types() {
+                match component {
+                    LuaType::Nil => saw_nullable_arm = true,
+                    LuaType::Ref(type_id) | LuaType::Def(type_id)
+                        if type_id == &LuaTypeDeclId::global("NULL") =>
+                    {
+                        saw_nullable_arm = true;
+                    }
+                    LuaType::Ref(type_id) | LuaType::Def(type_id) if base_id.is_none() => {
+                        base_id = Some(type_id.clone());
+                    }
+                    _ => return None,
+                }
+            }
+            saw_nullable_arm.then_some(base_id).flatten()
+        }
+        _ => None,
+    }
+}
+
+fn unguarded_child_current_matches_base(
+    current: &LuaType,
+    declared: &LuaType,
+    base_id: &LuaTypeDeclId,
+) -> bool {
+    current == declared
+        || matches!(current, LuaType::Ref(current_id) | LuaType::Def(current_id) if current_id == base_id)
 }
 
 fn type_has_visible_member_at_use(

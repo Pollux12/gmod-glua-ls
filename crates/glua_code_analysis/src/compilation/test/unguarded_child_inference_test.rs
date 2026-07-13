@@ -127,6 +127,130 @@ mod test {
     }
 
     #[test]
+    fn nullable_parent_member_evidence_selects_child_and_resolves_member_result() {
+        for parent_type in ["Entity|NULL", "Entity|nil"] {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class TraceResult
+
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class Player: Entity
+                ---@field GetEyeTrace fun(self: Player): TraceResult
+
+                ---@type {parent_type}
+                local owner
+                local trace = owner:GetEyeTrace()
+                print(owner)
+                print(trace)
+                "#,
+            ));
+
+            assert_eq!(
+                ws.humanize_type(last_name_type(&ws, file_id, "owner")),
+                "Player",
+                "nullable parent {parent_type} should retain child inference"
+            );
+            assert_eq!(
+                ws.humanize_type(last_name_type(&ws, file_id, "trace")),
+                "TraceResult",
+                "nullable parent {parent_type} should resolve the child method return"
+            );
+            assert_eq!(
+                diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+                0,
+                "nullable parent {parent_type} should resolve the child method"
+            );
+            assert_eq!(
+                diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+                1,
+                "nullable parent {parent_type} should keep the unguarded-child warning"
+            );
+        }
+    }
+
+    #[test]
+    fn null_union_resolves_member_owned_by_parent_without_child_inference() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Vector
+
+            ---@class Entity
+            ---@field EyePos fun(self: Entity): Vector
+            ---@class NULL: Entity
+
+            ---@type Entity|NULL
+            local owner
+            local position = owner:EyePos()
+            print(owner)
+            print(position)
+            "#,
+        );
+
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "owner")),
+            "(Entity|NULL)"
+        );
+        assert_eq!(
+            ws.humanize_type(last_name_type(&ws, file_id, "position")),
+            "Vector"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn nullable_concrete_class_resolves_its_member_without_child_inference() {
+        for receiver_type in ["Player|NULL", "Player|nil"] {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+
+            let file_id = ws.def(&format!(
+                r#"
+                ---@class TraceResult
+
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class Player: Entity
+                ---@field GetEyeTrace fun(self: Player): TraceResult
+
+                ---@type {receiver_type}
+                local owner
+                local trace = owner:GetEyeTrace()
+                print(owner)
+                print(trace)
+                "#,
+            ));
+
+            assert_eq!(last_name_type(&ws, file_id, "owner"), ws.ty(receiver_type));
+            assert_eq!(
+                ws.humanize_type(last_name_type(&ws, file_id, "trace")),
+                "TraceResult"
+            );
+            assert_eq!(
+                diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+                0
+            );
+            assert_eq!(
+                diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+                0
+            );
+        }
+    }
+
+    #[test]
     fn generated_finite_player_method_names_drive_child_inference() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
