@@ -220,6 +220,7 @@ fn collect_call_site_param_types(
                     vec![LuaInferenceStep {
                         event,
                         support: vec![].into(),
+                        found_type: None,
                     }]
                     .into(),
                 ),

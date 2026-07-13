@@ -27,14 +27,13 @@ impl Checker for InferenceTrustChecker {
         events.sort_by(|left, right| left.event.stable_cmp(&right.event));
         events.dedup_by(|left, right| left.event == right.event);
         for inference in events {
-            let (code, source) = match inference.event.kind {
+            let (code, is_unguarded_child) = match inference.event.kind {
                 LuaInferenceProvenanceKind::ContextualUnknown => {
-                    (DiagnosticCode::InferUnknown, "usage context")
+                    (DiagnosticCode::InferUnknown, false)
                 }
-                LuaInferenceProvenanceKind::UnguardedChild => (
-                    DiagnosticCode::InferUnguardedChild,
-                    "an unguarded parent-to-child relationship",
-                ),
+                LuaInferenceProvenanceKind::UnguardedChild => {
+                    (DiagnosticCode::InferUnguardedChild, true)
+                }
                 _ => continue,
             };
             let typ = humanize_type(
@@ -45,7 +44,25 @@ impl Checker for InferenceTrustChecker {
             context.add_diagnostic(
                 code,
                 inference.event.source.value.get_range(),
-                format!("Type `{typ}` was inferred from {source} and may be incorrect."),
+                if is_unguarded_child {
+                    let found = inference
+                        .fact
+                        .provenance()
+                        .iter()
+                        .find(|step| step.event == inference.event)
+                        .and_then(|step| step.found_type.as_deref())
+                        .map_or_else(
+                            || "unknown".to_string(),
+                            |typ| {
+                                humanize_type(semantic_model.get_db(), typ, RenderLevel::Simple)
+                            },
+                        );
+                    format!(
+                        "expected `{typ}` but found `{found}`. Add a guard to narrow the parent to `{typ}`."
+                    )
+                } else {
+                    format!("Type `{typ}` was inferred from usage context and may be incorrect.")
+                },
                 None,
             );
         }

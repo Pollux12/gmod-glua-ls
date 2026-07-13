@@ -153,6 +153,7 @@ impl LuaInferenceEventId {
 pub struct LuaInferenceStep {
     pub event: LuaInferenceEventId,
     pub support: Arc<[LuaInferenceNodeId]>,
+    pub found_type: Option<Arc<LuaType>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

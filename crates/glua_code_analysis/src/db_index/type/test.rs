@@ -57,6 +57,7 @@ mod test {
             provenance: Arc::from([LuaInferenceStep {
                 event,
                 support: Arc::from([]),
+                found_type: None,
             }]),
         }
     }
@@ -95,14 +96,17 @@ mod test {
             Arc::from([
                 LuaInferenceStep {
                     event: second.clone(),
+                    found_type: None,
                     support: Arc::from([]),
                 },
                 LuaInferenceStep {
                     event: first.clone(),
+                    found_type: None,
                     support: Arc::from([]),
                 },
                 LuaInferenceStep {
                     event: second.clone(),
+                    found_type: None,
                     support: Arc::from([]),
                 },
             ]),
@@ -231,6 +235,7 @@ mod test {
             provenance: Arc::from([LuaInferenceStep {
                 event,
                 support: Arc::from([]),
+                found_type: None,
             }]),
         };
 
@@ -265,6 +270,7 @@ mod test {
                     kind: LuaInferenceProvenanceKind::ContextualUnknown,
                     source: source_in(source_file, position),
                 },
+                found_type: None,
                 support: Arc::from([]),
             }]),
         };
@@ -343,6 +349,7 @@ mod test {
                         ),
                     ),
                 },
+                found_type: None,
                 support: Arc::from([LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(
                     InFiled::new(
                         support_file,

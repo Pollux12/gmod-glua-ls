@@ -108,6 +108,7 @@ mod tests {
                 vec![LuaInferenceStep {
                     event,
                     support: vec![].into(),
+                    found_type: None,
                 }]
                 .into(),
             ),

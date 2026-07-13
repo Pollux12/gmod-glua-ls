@@ -1307,6 +1307,7 @@ mod batch_removal_tests {
                     kind: LuaInferenceProvenanceKind::ContextualUnknown,
                     source: source(source_file, 20),
                 },
+                found_type: None,
                 support: Arc::from([LuaInferenceNodeId::TypeOwner(owner(support_file, 30))]),
             }]),
         }

@@ -193,6 +193,11 @@ struct UnguardedChildProfile {
     evidence_sites: usize,
 }
 
+struct UnguardedChildCandidates {
+    parent_type: LuaType,
+    children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
+}
+
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
@@ -207,8 +212,7 @@ pub(super) fn stabilize_unguarded_children(
         return Vec::new();
     }
 
-    let mut scores =
-        HashMap::<LuaDefinitionId, HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>>::new();
+    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::new();
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
@@ -380,7 +384,11 @@ pub(super) fn stabilize_unguarded_children(
                     for definition in definitions.iter().cloned() {
                         scores
                             .entry(definition.clone())
-                            .or_default()
+                            .or_insert_with(|| UnguardedChildCandidates {
+                                parent_type: base_type.clone(),
+                                children: HashMap::new(),
+                            })
+                            .children
                             .entry(child_id.clone())
                             .or_default()
                             .insert(member_key.clone());
@@ -407,6 +415,8 @@ pub(super) fn stabilize_unguarded_children(
     let mut updates = Vec::new();
     let mut update_sources = Vec::new();
     for (definition, candidates) in scores {
+        let found_type = candidates.parent_type;
+        let candidates = candidates.children;
         let Some(max_score) = candidates.values().map(FxHashSet::len).max() else {
             continue;
         };
@@ -473,6 +483,7 @@ pub(super) fn stabilize_unguarded_children(
                 Arc::from([LuaInferenceStep {
                     event,
                     support: support.into(),
+                    found_type: Some(Arc::new(found_type)),
                 }]),
             ),
         ));

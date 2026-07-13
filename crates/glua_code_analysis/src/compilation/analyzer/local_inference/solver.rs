@@ -81,6 +81,7 @@ pub(crate) fn solve_local_inference_graph(
                     .map(|item| LuaInferenceStep {
                         event: item.event.clone(),
                         support: item.support.clone(),
+                        found_type: None,
                     })
                     .collect::<Vec<_>>();
                 resolved.insert(

@@ -3509,7 +3509,7 @@ owner:GetShootPos()
         );
         assert_eq!(
             diagnostic.message,
-            "Type `Player` was inferred from an unguarded parent-to-child relationship and may be incorrect."
+            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
         );
         assert_eq!(diagnostic.range.start.line, 2);
         assert_eq!(diagnostic.range.start.character, 0);

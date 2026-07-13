@@ -255,6 +255,7 @@ pub(crate) fn infer_expr_semantic_info(
                             kind: LuaInferenceProvenanceKind::ContextualUnknown,
                             source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
                         },
+                        found_type: None,
                         support: Arc::from([]),
                     }]),
                 );
