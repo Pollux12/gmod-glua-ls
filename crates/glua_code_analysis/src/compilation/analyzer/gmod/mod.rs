@@ -8542,7 +8542,7 @@ fn mark_main_workspace_load_shadows(
         let Some(info) = file_infos.get(file_id) else {
             continue;
         };
-        if info.status != GmodLoadStatus::EngineLoaded || info.roots.is_empty() {
+        if !is_static_load_shadow_candidate(info) {
             continue;
         }
         let Some(workspace_id) = module_index.get_workspace_id(*file_id) else {
@@ -8581,7 +8581,7 @@ fn mark_main_workspace_load_shadows(
         let Some(winning_info) = file_infos.get(&winning_file_id) else {
             continue;
         };
-        let winning_roots = winning_info.roots.clone();
+        let winning_info = winning_info.clone();
 
         for file_id in files {
             if *file_id == winning_file_id {
@@ -8596,13 +8596,35 @@ fn mark_main_workspace_load_shadows(
             let Some(info) = file_infos.get(file_id) else {
                 continue;
             };
-            if !has_matching_load_root(&winning_roots, &info.roots) {
+            if !has_matching_load_evidence(&winning_info, info) {
                 continue;
             }
             if let Some(info) = file_infos.get_mut(file_id) {
                 info.mark_shadowed_by(winning_file_id);
             }
         }
+    }
+}
+
+fn is_static_load_shadow_candidate(info: &GmodFileLoadInfo) -> bool {
+    match info.status {
+        GmodLoadStatus::EngineLoaded => !info.roots.is_empty(),
+        GmodLoadStatus::ReachableByLoadEdge => {
+            info.confidence >= GmodLoadConfidence::Static && !info.state_mask.is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn has_matching_load_evidence(left: &GmodFileLoadInfo, right: &GmodFileLoadInfo) -> bool {
+    match (left.status, right.status) {
+        (GmodLoadStatus::EngineLoaded, GmodLoadStatus::EngineLoaded) => {
+            has_matching_load_root(&left.roots, &right.roots)
+        }
+        (GmodLoadStatus::ReachableByLoadEdge, GmodLoadStatus::ReachableByLoadEdge) => {
+            left.state_mask.intersects(right.state_mask)
+        }
+        _ => false,
     }
 }
 

@@ -1,6 +1,44 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+
+    #[test]
+    fn test_shadowed_library_accessor_func_field_is_not_duplicate() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/gamemodes/terrortown/gamemode/cl_init.lua",
+            r#"include("vgui/simpleicon.lua")"#,
+        );
+        ws.def_file(
+            "library/gamemodes/terrortown/gamemode/vgui/simpleicon.lua",
+            r#"
+            local PANEL = {}
+            AccessorFunc(PANEL, "m_iIconSize", "IconSize")
+            vgui.Register("SimpleIcon", PANEL, "Panel")
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/terrortown/gamemode/cl_init.lua",
+            r#"include("vgui/simpleicon.lua")"#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::DuplicateDocField,
+            "gamemodes/terrortown/gamemode/vgui/simpleicon.lua",
+            r#"
+            local PANEL = {}
+            AccessorFunc(PANEL, "m_iIconSize", "IconSize")
+            vgui.Register("SimpleIcon", PANEL, "Panel")
+            "#,
+        ));
+    }
 
     #[test]
     fn test_duplicate_field() {
