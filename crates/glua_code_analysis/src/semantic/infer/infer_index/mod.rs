@@ -2038,6 +2038,8 @@ fn infer_union_member(
 ) -> InferResult {
     let mut member_types = Vec::new();
     let mut meet_string = false;
+    let mut missing_arm = false;
+    let mut last_resolve_reason = None;
     for sub_type in union_type.types() {
         if sub_type.is_string() {
             if meet_string {
@@ -2053,19 +2055,29 @@ fn infer_union_member(
             &infer_guard.fork(),
             table_member_lookup_guard,
         );
-        if let Ok(typ) = result {
-            if !typ.is_never() {
-                member_types.push(typ);
-            }
-        } else {
-            member_types.push(LuaType::Nil);
+        match result {
+            Ok(typ) if !typ.is_never() => member_types.push(typ),
+            Ok(_) => {}
+            Err(InferFailReason::FieldNotFound | InferFailReason::None) => missing_arm = true,
+            Err(reason) if reason.is_need_resolve() => last_resolve_reason = Some(reason),
+            Err(reason) => return Err(reason),
         }
     }
 
-    if member_types.iter().all(|t| t.is_nil()) {
-        return Err(InferFailReason::FieldNotFound);
-    }
+    finish_union_member_inference(member_types, missing_arm, last_resolve_reason)
+}
 
+fn finish_union_member_inference(
+    mut member_types: Vec<LuaType>,
+    missing_arm: bool,
+    last_resolve_reason: Option<InferFailReason>,
+) -> InferResult {
+    if member_types.is_empty() {
+        return Err(last_resolve_reason.unwrap_or(InferFailReason::FieldNotFound));
+    }
+    if missing_arm {
+        member_types.push(LuaType::Nil);
+    }
     Ok(LuaType::from_vec(member_types))
 }
 
@@ -3082,4 +3094,37 @@ fn infer_tpl_ref_member(
         infer_guard,
         table_member_lookup_guard,
     )
+}
+
+#[cfg(test)]
+mod union_member_tests {
+    use rowan::TextSize;
+
+    use super::finish_union_member_inference;
+    use crate::{FileId, InferFailReason, LuaDeclId, LuaType};
+
+    #[test]
+    fn successful_union_arm_does_not_materialize_deferred_failure_as_nil() {
+        let result = finish_union_member_inference(
+            vec![LuaType::String],
+            false,
+            Some(InferFailReason::UnResolveDeclType(LuaDeclId::new(
+                FileId::new(1),
+                TextSize::new(1),
+            ))),
+        );
+
+        assert_eq!(result, Ok(LuaType::String));
+    }
+
+    #[test]
+    fn unresolved_union_without_success_preserves_deferred_failure() {
+        let reason =
+            InferFailReason::UnResolveDeclType(LuaDeclId::new(FileId::new(1), TextSize::new(1)));
+
+        assert_eq!(
+            finish_union_member_inference(Vec::new(), false, Some(reason.clone())),
+            Err(reason)
+        );
+    }
 }
