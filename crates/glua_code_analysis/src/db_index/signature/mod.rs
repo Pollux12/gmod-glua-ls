@@ -30,7 +30,7 @@ pub use signature::{
     SignatureReturnStatus, find_call_arg_role_from_type, visit_call_arg_roles_from_type,
 };
 
-use crate::{FileId, GmodStateMask, db_index::LuaDeclId};
+use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
@@ -40,8 +40,17 @@ pub struct LuaSignatureIndex {
     in_file_signatures: HashMap<FileId, HashSet<LuaSignatureId>>,
     local_func_decls: HashMap<LuaSignatureId, LuaDeclId>,
     effective_valid_guard_signatures: HashMap<LuaSignatureId, GmodStateMask>,
+    inferred_positive_guards: HashMap<LuaSignatureId, LuaInferredPositiveGuard>,
+    inferred_positive_guards_changed: bool,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
+}
+
+/// A conservative true-branch parameter narrowing derived from a function body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaInferredPositiveGuard {
+    pub param_idx: usize,
+    pub narrowed_type: LuaType,
 }
 
 impl Default for LuaSignatureIndex {
@@ -57,6 +66,8 @@ impl LuaSignatureIndex {
             in_file_signatures: HashMap::new(),
             local_func_decls: HashMap::new(),
             effective_valid_guard_signatures: HashMap::new(),
+            inferred_positive_guards: HashMap::new(),
+            inferred_positive_guards_changed: false,
             receiver_out_param_member_names: HashMap::new(),
             in_file_receiver_out_param_member_names: HashMap::new(),
         }
@@ -119,6 +130,36 @@ impl LuaSignatureIndex {
             .copied()
     }
 
+    pub fn set_inferred_positive_guard(
+        &mut self,
+        signature_id: LuaSignatureId,
+        guard: LuaInferredPositiveGuard,
+    ) {
+        if self.inferred_positive_guards.get(&signature_id) != Some(&guard) {
+            self.inferred_positive_guards_changed = true;
+            self.inferred_positive_guards.insert(signature_id, guard);
+        }
+    }
+
+    pub fn inferred_positive_guard(
+        &self,
+        signature_id: &LuaSignatureId,
+    ) -> Option<&LuaInferredPositiveGuard> {
+        self.inferred_positive_guards.get(signature_id)
+    }
+
+    pub fn clear_inferred_positive_guards_for_file(&mut self, file_id: FileId) {
+        let previous_len = self.inferred_positive_guards.len();
+        self.inferred_positive_guards
+            .retain(|signature_id, _| signature_id.get_file_id() != file_id);
+        let changed = self.inferred_positive_guards.len() != previous_len;
+        self.inferred_positive_guards_changed |= changed;
+    }
+
+    pub fn take_inferred_positive_guards_changed(&mut self) -> bool {
+        std::mem::take(&mut self.inferred_positive_guards_changed)
+    }
+
     pub fn add_receiver_out_param_member_name(&mut self, file_id: FileId, member_name: String) {
         if !self
             .in_file_receiver_out_param_member_names
@@ -157,6 +198,7 @@ impl LuaIndex for LuaSignatureIndex {
         }
         self.effective_valid_guard_signatures
             .retain(|signature_id, _| signature_id.get_file_id() != file_id);
+        self.clear_inferred_positive_guards_for_file(file_id);
 
         if let Some(member_names) = self
             .in_file_receiver_out_param_member_names
@@ -184,6 +226,8 @@ impl LuaIndex for LuaSignatureIndex {
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
         self.effective_valid_guard_signatures.clear();
+        self.inferred_positive_guards.clear();
+        self.inferred_positive_guards_changed = false;
         self.receiver_out_param_member_names.clear();
         self.in_file_receiver_out_param_member_names.clear();
     }

@@ -62,7 +62,7 @@ pub fn get_type_at_call_expr(
                         .map(|cast| (cast, signature_id))
                 });
                 let return_type = f.get_ret();
-                match return_type {
+                let type_guard_result = match return_type {
                     LuaType::TypeGuard(_) => get_type_at_call_expr_by_type_guard(
                         db,
                         tree,
@@ -70,7 +70,7 @@ pub fn get_type_at_call_expr(
                         root,
                         var_ref_id,
                         flow_node,
-                        call_expr,
+                        call_expr.clone(),
                         f,
                         signature_cast,
                         is_valid_guard,
@@ -81,7 +81,25 @@ pub fn get_type_at_call_expr(
                         // If the return type is not a type guard, we cannot infer the type cast.
                         Ok(ResultTypeOrContinue::Continue)
                     }
+                };
+                if matches!(type_guard_result, Ok(ResultTypeOrContinue::Continue))
+                    && matches!(condition_flow, InferConditionFlow::TrueCondition)
+                    && let Some(signature_id) = prefix_signature_id
+                    && let Some(narrowed_type) = try_inferred_positive_guard(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        &call_expr_ref,
+                        signature_id,
+                        policy,
+                    )?
+                {
+                    return Ok(ResultTypeOrContinue::Result(narrowed_type));
                 }
+                type_guard_result
             }
             LuaType::Signature(signature_id) => {
                 let Some(signature) = db.get_signature_index().get(&signature_id) else {
@@ -132,6 +150,22 @@ pub fn get_type_at_call_expr(
                         );
                     }
                     _ => {}
+                }
+
+                if matches!(condition_flow, InferConditionFlow::TrueCondition)
+                    && let Some(narrowed_type) = try_inferred_positive_guard(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        flow_node,
+                        &call_expr_ref,
+                        signature_id,
+                        policy,
+                    )?
+                {
+                    return Ok(ResultTypeOrContinue::Result(narrowed_type));
                 }
 
                 // If TypeGuard narrowing didn't apply, skip the signature_cast path
@@ -222,6 +256,52 @@ pub fn get_type_at_call_expr(
     }
 
     result
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_inferred_positive_guard(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+    policy: FlowWalkPolicy,
+) -> Result<Option<LuaType>, InferFailReason> {
+    if call_expr.is_colon_call() {
+        return Ok(None);
+    }
+    let Some(guard) = db
+        .get_signature_index()
+        .inferred_positive_guard(&signature_id)
+    else {
+        return Ok(None);
+    };
+    let Some(argument) = call_expr
+        .get_args_list()
+        .and_then(|args| args.get_args().nth(guard.param_idx))
+    else {
+        return Ok(None);
+    };
+    let Some(argument_ref_id) = get_var_expr_var_ref_id(db, cache, argument) else {
+        return Ok(None);
+    };
+    if argument_ref_id != *var_ref_id {
+        return Ok(None);
+    }
+
+    let antecedent_type =
+        get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+    Ok(Some(narrow_type_guard_true_branch(
+        db,
+        cache,
+        var_ref_id,
+        antecedent_type,
+        guard.narrowed_type.clone(),
+        false,
+    )))
 }
 
 /// Resolves an alias chain for member-guard predicate callees. When the

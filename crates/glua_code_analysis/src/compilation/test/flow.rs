@@ -2556,6 +2556,193 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Player: Entity
+            ---@field IsFrozen fun(self: Player): boolean
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class TraceResult
+            ---@field Entity Entity?
+
+            function IsPlayer(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@param tr TraceResult
+            local function useTrace(tr)
+                if IsPlayer(tr.Entity) then
+                    local ply = tr.Entity
+                    ply:IsFrozen()
+                else
+                    local other = tr.Entity
+                    print(other)
+                end
+            end
+            "#,
+        );
+
+        let inferred_guards = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .iter()
+            .filter_map(|(signature_id, _)| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_positive_guard(signature_id)
+            })
+            .map(|guard| {
+                (
+                    guard.param_idx,
+                    ws.humanize_type(guard.narrowed_type.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inferred_guards, vec![(0, "Player".to_string())]);
+
+        let positive_type = nth_name_expr_type_from_end(&mut ws, file_id, "ply", 0);
+        let negative_type = nth_name_expr_type_from_end(&mut ws, file_id, "other", 0);
+        assert_that!(ws.humanize_type(positive_type), eq("Player"));
+        assert_eq!(negative_type, ws.ty("Entity|nil"));
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_mutated_predicate_wrapper_parameter_does_not_narrow_caller() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Player: Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@return Entity?
+            local function findEntity() end
+
+            ---@class TraceResult
+            ---@field Entity Entity?
+
+            function IsPlayer(ent)
+                ent = findEntity()
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@param tr TraceResult
+            local function useTrace(tr)
+                if IsPlayer(tr.Entity) then
+                    local ply = tr.Entity
+                    print(ply)
+                end
+            end
+            "#,
+        );
+
+        let inferred_guard_count = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .iter()
+            .filter(|(signature_id, _)| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_positive_guard(signature_id)
+                    .is_some()
+            })
+            .count();
+        let ply_type = nth_name_expr_type_from_end(&mut ws, file_id, "ply", 0);
+        assert_eq!(inferred_guard_count, 0);
+        assert_eq!(ply_type, ws.ty("Entity|nil"));
+    }
+
+    #[gtest]
+    fn test_inferred_predicate_guard_is_removed_after_incremental_edit() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("inferred_guard_incremental.lua");
+        let source = |predicate: &str| {
+            format!(
+                r#"
+                ---@class Player: Entity
+
+                ---@return boolean
+                ---@return_cast self Player
+                function Entity:IsPlayer() end
+
+                ---@class TraceResult
+                ---@field Entity Entity?
+
+                function IsPlayer(ent)
+                    {predicate}
+                end
+
+                ---@param tr TraceResult
+                local function useTrace(tr)
+                    if IsPlayer(tr.Entity) then
+                        local ply = tr.Entity
+                        print(ply)
+                    end
+                end
+                "#,
+            )
+        };
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(source("return IsValid(ent) and ent:IsPlayer()")))
+            .expect("file id");
+
+        let inferred_guard_count = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .iter()
+                .filter(|(signature_id, _)| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_signature_index()
+                        .inferred_positive_guard(signature_id)
+                        .is_some()
+                })
+                .count()
+        };
+        assert_eq!(inferred_guard_count(&ws), 1);
+
+        let updated_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(source("return true")))
+            .expect("file id after update");
+        assert_eq!(updated_file_id, file_id);
+        assert_eq!(inferred_guard_count(&ws), 0);
+    }
+
+    #[gtest]
     fn test_getclass_guard_narrows_entity_to_matching_class() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

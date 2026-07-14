@@ -1,7 +1,7 @@
 pub(in crate::compilation::analyzer) mod call;
 mod closure;
 mod for_range_stat;
-mod func_body;
+pub(in crate::compilation::analyzer) mod func_body;
 mod member_write_policy;
 mod metatable;
 mod module;

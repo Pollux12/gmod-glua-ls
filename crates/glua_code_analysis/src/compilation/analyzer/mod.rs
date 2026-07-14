@@ -89,7 +89,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
         let child_inference_changed =
             !local_inference::stabilize_unguarded_children(db, &mut context, false).is_empty();
-        let late_inference_changed = local_inference_changed || child_inference_changed;
+        let inferred_guard_changed =
+            local_inference::rebuild_inferred_positive_guards(db, &mut context);
+        let late_inference_changed =
+            local_inference_changed || child_inference_changed || inferred_guard_changed;
 
         let infer_dynamic_fields =
             db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;

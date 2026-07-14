@@ -10182,6 +10182,51 @@ mod test {
     }
 
     #[gtest]
+    fn test_unannotated_player_predicate_wrapper_guards_nullable_trace_entity() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Entity
+            ---@class NULL: Entity
+            ---@class Player: Entity
+            ---@field IsFrozen fun(self: Player): boolean
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class TraceResult
+            ---@field Hit boolean
+            ---@field Entity Entity?
+
+            function IsPlayer(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@param tr TraceResult
+            local function pushPlayer(tr)
+                if tr.Hit and IsPlayer(tr.Entity) then
+                    local ply = tr.Entity
+                    if not ply:IsFrozen() then
+                        print(ply)
+                    end
+                end
+            end
+        "#;
+
+        let diagnostics = diagnostics_for_code(&mut ws, DiagnosticCode::UncheckedNilAccess, code);
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
     fn test_isvalid_not_narrows_entity_null_early_return() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -46,7 +46,7 @@ pub(super) struct FlowWalkPolicy {
 }
 
 impl FlowWalkPolicy {
-    fn normal(origin: FlowOrigin) -> Self {
+    pub(super) fn normal(origin: FlowOrigin) -> Self {
         Self {
             origin,
             mode: FlowWalkMode::Normal,

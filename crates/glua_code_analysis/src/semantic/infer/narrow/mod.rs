@@ -154,6 +154,60 @@ pub fn infer_expr_narrow_type(
     result
 }
 
+pub(crate) fn infer_true_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    target_expr: LuaExpr,
+    condition: LuaExpr,
+) -> Option<(LuaType, LuaType)> {
+    let var_ref_id = get_var_expr_var_ref_id(db, cache, target_expr.clone())?;
+    let file_id = cache.get_file_id();
+    let flow_tree = db.get_flow_index().get_flow_tree(&file_id)?;
+    let flow_id = flow_tree.get_flow_id(target_expr.get_syntax_id())?;
+    let root = LuaChunk::cast(condition.get_root())?;
+    let flow_node = FlowNode {
+        id: flow_id,
+        kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+        antecedent: Some(FlowAntecedent::Single(flow_id)),
+    };
+    let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, condition.get_position());
+    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let result = (|| {
+        let antecedent = condition_flow::get_condition_antecedent_type(
+            db,
+            flow_tree,
+            cache,
+            &root,
+            &var_ref_id,
+            &flow_node,
+            policy,
+        )
+        .ok()?;
+        let narrowed = match condition_flow::get_type_at_condition_flow(
+            db,
+            flow_tree,
+            cache,
+            &root,
+            &var_ref_id,
+            &flow_node,
+            condition,
+            InferConditionFlow::TrueCondition,
+            policy,
+        )
+        .ok()?
+        {
+            ResultTypeOrContinue::Result(typ) => typ,
+            ResultTypeOrContinue::Continue => return None,
+        };
+        Some((antecedent, narrowed))
+    })();
+    cache.flow_query_realm = previous_query_realm;
+    result
+}
+
 pub fn infer_expr_narrow_type_with_flow_origin(
     db: &DbIndex,
     cache: &mut LuaInferCache,
