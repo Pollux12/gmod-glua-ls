@@ -16,6 +16,7 @@ use glua_parser::{
     LuaTableExpr, LuaVarExpr, NumberResult,
 };
 use infer_binary::infer_binary_expr;
+pub(crate) use infer_call::get_prefix_expr_signature_id;
 use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};

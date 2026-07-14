@@ -44,7 +44,7 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
                     .get_syntax_tree(&file_id)
                     .map(|tree| tree.get_chunk_node())
                 else {
-                    return (file_id, contributions);
+                    return (file_id, contributions, Default::default());
                 };
                 let mut cache = LuaInferCache::new(
                     file_id,
@@ -61,10 +61,19 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
                         &mut contributions,
                     );
                 }
-                (file_id, contributions)
+                (
+                    file_id,
+                    contributions,
+                    cache.take_inferred_guard_dependencies(),
+                )
             });
+        let mut fact_updates = Vec::with_capacity(contribution_updates.len());
+        for (file_id, contributions, dependencies) in contribution_updates {
+            context.add_inferred_guard_dependencies(file_id, dependencies);
+            fact_updates.push((file_id, contributions));
+        }
         db.get_call_site_param_index_mut()
-            .set_files_fact_contributions(contribution_updates);
+            .set_files_fact_contributions(fact_updates);
     }
 }
 

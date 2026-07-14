@@ -9,7 +9,8 @@ use glua_parser::{
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, LuaDeclId, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeOwner, VarRefId,
+    InFiled, LuaDeclId, LuaInferredGuardOwner, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
+    LuaTypeOwner, VarRefId,
     db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner},
     profile::Profile,
     semantic::{
@@ -178,6 +179,7 @@ fn collect_dynamic_fields_for_file(
 ) -> (
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    std::collections::HashSet<LuaInferredGuardOwner>,
 ) {
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
@@ -302,7 +304,11 @@ fn collect_dynamic_fields_for_file(
             collect_setmetatable_table_fields(db, cache, &call_expr, file_id, &mut collected);
         }
     }
-    (collected, collected_wildcards)
+    (
+        collected,
+        collected_wildcards,
+        cache.take_inferred_guard_dependencies(),
+    )
 }
 
 fn analyze_dynamic_fields(
@@ -341,7 +347,7 @@ fn analyze_dynamic_fields(
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_chunk_node())
         else {
-            return (Vec::new(), Vec::new());
+            return (Vec::new(), Vec::new(), Default::default());
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
     });
@@ -349,9 +355,12 @@ fn analyze_dynamic_fields(
         profile.collection_time += collection_start.elapsed();
     }
     let merge_start = profile_enabled.then(std::time::Instant::now);
-    for (file_collected, file_wildcards) in per_file {
+    for ((file_collected, file_wildcards, dependencies), file_id) in
+        per_file.into_iter().zip(file_ids)
+    {
         collected.extend(file_collected);
         collected_wildcards.extend(file_wildcards);
+        context.add_inferred_guard_dependencies(file_id, dependencies);
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
         profile.collection_merge_time += merge_start.elapsed();

@@ -105,6 +105,13 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
     let signature_id = LuaSignatureId::from_closure(analyzer.get_file_id(), &expr);
     let file_id = analyzer.get_file_id();
     let member_id = get_closure_member_id(&expr, file_id);
+    if expr.get_parent::<glua_parser::LuaAssignStat>().is_some()
+        && let Some(member_id) = member_id
+    {
+        analyzer
+            .context
+            .add_early_callable_signature(member_id.into(), signature_id);
+    }
     try_add_self_param(analyzer, &expr);
 
     for (idx, param) in params.get_params().enumerate() {
@@ -137,7 +144,49 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
 
     analyze_closure_params(analyzer, &signature_id, &expr);
 
+    if is_structural_inferred_guard_candidate(&expr) {
+        analyzer
+            .context
+            .add_inferred_guard_candidate(InFiled::new(file_id, expr.get_syntax_id()));
+    }
+
     Some(())
+}
+
+fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
+    let Some(params) = closure.get_params_list() else {
+        return false;
+    };
+    let param_names = params
+        .get_params()
+        .filter_map(|param| param.get_name_token())
+        .map(|token| token.get_name_text().to_string())
+        .collect::<Vec<_>>();
+    if param_names.is_empty() {
+        return false;
+    }
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+    let return_points = super::super::lua::func_body::analyze_func_body_returns(block);
+    let [super::super::lua::LuaReturnPoint::Expr(return_expr)] = return_points.as_slice() else {
+        return false;
+    };
+    inferred_guard_candidate_references_param(return_expr, &param_names)
+}
+
+fn inferred_guard_candidate_references_param(expr: &LuaExpr, param_names: &[String]) -> bool {
+    if let LuaExpr::ParenExpr(paren) = expr {
+        return paren
+            .get_expr()
+            .is_some_and(|inner| inferred_guard_candidate_references_param(&inner, param_names));
+    }
+    matches!(expr, LuaExpr::BinaryExpr(_) | LuaExpr::CallExpr(_))
+        && expr.descendants::<LuaNameExpr>().any(|name_expr| {
+            name_expr
+                .get_name_text()
+                .is_some_and(|name| param_names.iter().any(|param| param == &name))
+        })
 }
 
 fn try_add_self_param(analyzer: &mut DeclAnalyzer, closure: &LuaClosureExpr) -> Option<()> {

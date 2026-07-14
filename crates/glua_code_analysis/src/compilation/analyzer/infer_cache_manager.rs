@@ -1,7 +1,9 @@
+use std::collections::HashSet;
+
 use rustc_hash::FxHashMap;
 
 use crate::{
-    DbIndex, FileId, LuaAnalysisPhase,
+    DbIndex, FileId, LuaAnalysisPhase, LuaInferredGuardOwner,
     semantic::{LuaInferCache, PendingStrTplTypeDecl},
 };
 
@@ -58,5 +60,22 @@ impl InferCacheManager {
         }
 
         pending
+    }
+
+    pub fn clear_files(&mut self, file_ids: &HashSet<FileId>) {
+        for file_id in file_ids {
+            if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
+                infer_cache.clear();
+            }
+        }
+    }
+
+    pub fn drain_inferred_guard_dependencies(
+        &mut self,
+    ) -> Vec<(FileId, HashSet<LuaInferredGuardOwner>)> {
+        self.infer_map
+            .iter_mut()
+            .map(|(file_id, cache)| (*file_id, cache.take_inferred_guard_dependencies()))
+            .collect()
     }
 }

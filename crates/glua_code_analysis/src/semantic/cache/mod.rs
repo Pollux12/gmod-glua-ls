@@ -9,8 +9,8 @@ use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaMemberId, LuaMemberKey,
-    LuaSemanticDeclId, VarRefId, VarRefRootId,
+    DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
+    LuaMemberId, LuaMemberKey, LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::InferFailReason,
 };
@@ -124,6 +124,7 @@ pub struct LuaInferCache {
         FxHashMap<(LuaTypeDeclId, LuaMemberKey), Arc<Vec<LuaMemberId>>>,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
+    inferred_guard_dependencies: HashSet<LuaInferredGuardOwner>,
 }
 
 impl LuaInferCache {
@@ -153,6 +154,7 @@ impl LuaInferCache {
             local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
+            inferred_guard_dependencies: HashSet::new(),
         }
     }
 
@@ -194,6 +196,14 @@ impl LuaInferCache {
 
     pub fn take_pending_str_tpl_type_decls(&mut self) -> Vec<PendingStrTplTypeDecl> {
         std::mem::take(&mut self.pending_str_tpl_type_decls)
+    }
+
+    pub fn add_inferred_guard_dependency(&mut self, owner: LuaInferredGuardOwner) {
+        self.inferred_guard_dependencies.insert(owner);
+    }
+
+    pub fn take_inferred_guard_dependencies(&mut self) -> HashSet<LuaInferredGuardOwner> {
+        std::mem::take(&mut self.inferred_guard_dependencies)
     }
 
     pub fn clear(&mut self) {

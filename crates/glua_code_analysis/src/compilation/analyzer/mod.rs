@@ -21,11 +21,13 @@ use std::{
 
 use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaFunctionType,
-    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaType, LuaTypeCache, WorkspaceId,
+    LuaInferredGuardOwner, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId,
+    LuaType, LuaTypeCache, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
+use glua_parser::LuaSyntaxId;
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
@@ -50,15 +52,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
         run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
-
-        // Gmod pre-analysis: collect realm metadata, scripted class types, hooks,
-        // and network flow before flow/lua analysis. This ensures flow analysis uses
-        // correct realm keys (Client/Server/Shared) from the start, avoiding the
-        // previous problem where all flow caches used realm=Unknown and had to be
-        // fully recomputed in the unresolve phase.
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
-
+        let early_signature_owners = publish_callable_signatures(db, &context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
+
+        let early_member_owners = resolve_early_member_owners(db, &mut context);
+        local_inference::prepare_inferred_positive_guards(db, &context);
+        let guard_candidates = context.inferred_guard_candidates.len();
+        let early_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
 
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
@@ -89,8 +90,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
         let child_inference_changed =
             !local_inference::stabilize_unguarded_children(db, &mut context, false).is_empty();
-        let inferred_guard_changed =
-            local_inference::rebuild_inferred_positive_guards(db, &mut context);
+        let late_guard_retries = context.inferred_guard_candidates.len();
+        let late_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
+        let inferred_guard_changed = late_guard_stats.changed;
         let late_inference_changed =
             local_inference_changed || child_inference_changed || inferred_guard_changed;
 
@@ -111,7 +113,104 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
             resolve_uninformative_local_decl_caches(db, &mut context);
         }
+
+        for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
+        {
+            context.add_inferred_guard_dependencies(consumer_file_id, owners);
+        }
+        for (consumer_file_id, owners) in std::mem::take(&mut context.inferred_guard_dependencies) {
+            db.get_signature_index_mut()
+                .set_inferred_guard_dependencies(consumer_file_id, owners);
+        }
+
+        if std::env::var_os("GLUALS_PROFILE").is_some() {
+            eprintln!(
+                "[profile] inferred_guard candidates={} candidate_attempts={} candidate_iterations={} early_published={} late_retries={} late_published={} pending={} early_signature_owners={} early_member_owners={}",
+                guard_candidates,
+                early_guard_stats.attempts + late_guard_stats.attempts,
+                early_guard_stats.iterations + late_guard_stats.iterations,
+                early_guard_stats.published,
+                late_guard_retries,
+                late_guard_stats.published,
+                context.inferred_guard_candidates.len(),
+                early_signature_owners,
+                early_member_owners,
+            );
+        }
     }
+}
+
+#[derive(Default)]
+struct InferredGuardFixedPointStats {
+    attempts: usize,
+    iterations: usize,
+    published: usize,
+    changed: bool,
+}
+
+fn stabilize_inferred_positive_guards(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+) -> InferredGuardFixedPointStats {
+    let mut stats = InferredGuardFixedPointStats::default();
+    let max_iterations = context.inferred_guard_candidates.len().saturating_add(1);
+
+    while !context.inferred_guard_candidates.is_empty() && stats.iterations < max_iterations {
+        let attempted = context.inferred_guard_candidates.len();
+        let published = local_inference::publish_inferred_positive_guards(db, context);
+        let changed = db
+            .get_signature_index_mut()
+            .take_inferred_positive_guards_changed();
+        stats.attempts += attempted;
+        stats.iterations += 1;
+        stats.published += published;
+        stats.changed |= changed;
+        if !changed {
+            break;
+        }
+
+        let pending_files = context
+            .inferred_guard_candidates
+            .iter()
+            .map(|candidate| candidate.file_id)
+            .collect::<HashSet<_>>();
+        context.infer_manager.clear_files(&pending_files);
+    }
+
+    stats
+}
+
+fn publish_callable_signatures(db: &mut DbIndex, context: &AnalyzeContext) -> usize {
+    let mut published = 0;
+    for (type_owner, signature_id) in &context.early_callable_signatures {
+        write_type_cache(
+            db,
+            type_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Signature(*signature_id)),
+            TypeCacheWriteMode::InsertOnly,
+        );
+        published += 1;
+    }
+    published
+}
+
+fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -> usize {
+    let mut resolved = 0;
+    for (member_id, decl_id) in std::mem::take(&mut context.early_member_owner_candidates) {
+        let Some(type_cache) = db.get_type_index().get_type_cache(&decl_id.into()) else {
+            continue;
+        };
+        if !type_cache.is_doc() {
+            continue;
+        }
+        let type_id = match type_cache.as_type() {
+            LuaType::Def(type_id) | LuaType::Ref(type_id) => type_id.clone(),
+            _ => continue,
+        };
+        common::add_member(db, LuaMemberOwner::Type(type_id), member_id);
+        resolved += 1;
+    }
+    resolved
 }
 
 fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -351,6 +450,10 @@ pub struct AnalyzeContext {
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
+    inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
+    inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
+    early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
+    early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
     pub workspace_id: Option<WorkspaceId>,
 }
 
@@ -366,6 +469,10 @@ impl AnalyzeContext {
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
+            inferred_guard_dependencies: HashMap::new(),
+            inferred_guard_candidates: Vec::new(),
+            early_callable_signatures: Vec::new(),
+            early_member_owner_candidates: Vec::new(),
             workspace_id: None,
         }
     }
@@ -387,6 +494,24 @@ impl AnalyzeContext {
 
     pub fn add_inferred_return_candidate(&mut self, return_: UnResolveReturn) {
         self.inferred_return_candidates.push(return_);
+    }
+
+    pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
+        self.inferred_guard_candidates.push(candidate);
+    }
+
+    pub fn add_early_callable_signature(
+        &mut self,
+        type_owner: crate::LuaTypeOwner,
+        signature_id: LuaSignatureId,
+    ) {
+        self.early_callable_signatures
+            .push((type_owner, signature_id));
+    }
+
+    pub fn add_early_member_owner_candidate(&mut self, member_id: LuaMemberId, decl_id: LuaDeclId) {
+        self.early_member_owner_candidates
+            .push((member_id, decl_id));
     }
 
     fn invalidate_inferred_returns_for_sources(
@@ -417,6 +542,17 @@ impl AnalyzeContext {
 
     pub fn request_uninformative_local_decl_reinfer(&mut self, decl_id: LuaDeclId) {
         self.uninformative_local_decl_candidates.insert(decl_id);
+    }
+
+    fn add_inferred_guard_dependencies(
+        &mut self,
+        file_id: FileId,
+        owners: HashSet<LuaInferredGuardOwner>,
+    ) {
+        self.inferred_guard_dependencies
+            .entry(file_id)
+            .or_default()
+            .extend(owners);
     }
 
     pub fn get_or_compute_scripted_scope_files(&mut self, db: &DbIndex) -> Arc<HashSet<FileId>> {

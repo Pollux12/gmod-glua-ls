@@ -437,7 +437,7 @@ fn should_prefer_signature_for_call(
         })
 }
 
-fn get_prefix_expr_signature_id(
+pub(crate) fn get_prefix_expr_signature_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,

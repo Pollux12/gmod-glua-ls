@@ -26,7 +26,9 @@ pub use db_index::*;
 pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
-use glua_parser::{LineIndex, LuaParser, LuaSyntaxTree};
+use glua_parser::{
+    LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaParser, LuaSyntaxTree,
+};
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;
@@ -40,6 +42,54 @@ pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
+
+#[derive(Default)]
+struct InferredGuardSnapshot {
+    facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
+    consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
+}
+
+#[cfg(test)]
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct InferredGuardPropagationStats {
+    pub changed_facts: usize,
+    pub reference_edges: usize,
+    pub frontiers: usize,
+    pub reindexed_files: usize,
+    pub broad_stabilizations: usize,
+}
+
+fn sort_inferred_guard_owners(owners: &mut [LuaInferredGuardOwner]) {
+    owners.sort_by(|left, right| {
+        (left.source_file_id(), left.source_position(), left.path()).cmp(&(
+            right.source_file_id(),
+            right.source_position(),
+            right.path(),
+        ))
+    });
+}
+
+fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => {
+            Some(vec![name_expr.get_name_token()?.get_name_text().into()])
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            if index_expr.get_index_token()?.is_colon() {
+                return None;
+            }
+            let mut path = global_path_for_expr(&index_expr.get_prefix_expr()?)?;
+            let member = match index_expr.get_index_key()? {
+                LuaIndexKey::Name(name) => name.get_name_text().into(),
+                LuaIndexKey::String(string) => string.get_value().into(),
+                _ => return None,
+            };
+            path.push(member);
+            Some(path)
+        }
+        _ => None,
+    }
+}
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
     let mut url_contents = HashMap::new();
@@ -88,6 +138,10 @@ pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
     pub diagnostic: LuaDiagnostic,
     pub emmyrc: Arc<Emmyrc>,
+    #[cfg(test)]
+    pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
+    #[cfg(test)]
+    cross_file_stabilization_invocations: usize,
 }
 
 impl EmmyLuaAnalysis {
@@ -97,6 +151,10 @@ impl EmmyLuaAnalysis {
             compilation: LuaCompilation::new(emmyrc.clone()),
             diagnostic: LuaDiagnostic::new(),
             emmyrc,
+            #[cfg(test)]
+            inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
+            #[cfg(test)]
+            cross_file_stabilization_invocations: 0,
         }
     }
 
@@ -193,6 +251,15 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
+        let existing_reindex_file_ids =
+            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+        let old_guard_fact_file_ids = existing_reindex_file_ids
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
+
         let is_removed = text.is_none();
         let file_id = self
             .compilation
@@ -200,17 +267,25 @@ impl EmmyLuaAnalysis {
             .get_vfs_mut()
             .set_file_content(uri, text);
 
-        let reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
+        let reindex_file_ids = existing_reindex_file_ids
+            .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
         self.compilation.remove_index(reindex_file_ids.clone());
 
         let update_file_ids = reindex_file_ids
-            .into_iter()
+            .iter()
+            .copied()
             .filter(|id| !is_removed || *id != file_id)
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
             self.compilation.update_index(update_file_ids.clone());
             self.stabilize_cross_file_type_caches(&update_file_ids);
         }
+        let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
+        self.reindex_changed_inferred_guard_references(
+            &guard_fact_file_ids,
+            &old_guard_facts,
+            &reindex_file_ids,
+        );
 
         Some(file_id)
     }
@@ -275,6 +350,15 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
+        let existing_reindex_file_ids =
+            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+        let old_guard_fact_file_ids = existing_reindex_file_ids
+            .iter()
+            .flatten()
+            .copied()
+            .collect::<HashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
+
         let is_removed = text.is_none();
         let file_id = self
             .compilation
@@ -283,11 +367,23 @@ impl EmmyLuaAnalysis {
             .set_file_content_preparsed(&uri, text, tree, line_index, version)?;
 
         if trigger_reindex {
-            self.compilation.remove_index(vec![file_id]);
+            let reindex_file_ids = existing_reindex_file_ids
+                .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
+            self.compilation.remove_index(reindex_file_ids.clone());
 
-            if !is_removed {
-                self.compilation.update_index(vec![file_id]);
+            let update_file_ids = reindex_file_ids
+                .iter()
+                .copied()
+                .filter(|id| !is_removed || *id != file_id)
+                .collect::<Vec<_>>();
+            if !update_file_ids.is_empty() {
+                self.compilation.update_index(update_file_ids);
             }
+            self.reindex_changed_inferred_guard_references(
+                &reindex_file_ids.iter().copied().collect(),
+                &old_guard_facts,
+                &reindex_file_ids,
+            );
         }
 
         Some(file_id)
@@ -371,9 +467,16 @@ impl EmmyLuaAnalysis {
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
         let file_ids = self.expand_reindex_file_ids(file_ids);
+        let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
         self.compilation.remove_index(file_ids.clone());
         self.compilation.update_index(file_ids.clone());
         self.stabilize_cross_file_type_caches(&file_ids);
+        self.reindex_changed_inferred_guard_references(
+            &guard_fact_file_ids,
+            &old_guard_facts,
+            &file_ids,
+        );
     }
 
     fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
@@ -404,7 +507,307 @@ impl EmmyLuaAnalysis {
         expanded
     }
 
+    fn reindex_changed_inferred_guard_references(
+        &mut self,
+        source_file_ids: &HashSet<FileId>,
+        old_snapshot: &InferredGuardSnapshot,
+        already_reindexed: &[FileId],
+    ) {
+        #[cfg(test)]
+        let initial_stabilization_invocations = self.cross_file_stabilization_invocations;
+        let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+        let mut profile_changed_facts = 0usize;
+        let mut profile_reference_edges = 0usize;
+        let mut profile_waves = 0usize;
+        let mut profile_reindexed_files = 0usize;
+        let mut propagation_reindexed_files = source_file_ids
+            .iter()
+            .copied()
+            .chain(already_reindexed.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut new_facts = self
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .inferred_guard_facts_for_files(source_file_ids);
+        let equivalent_owners = self.reconcile_equivalent_inferred_guard_owners(
+            old_snapshot,
+            &new_facts,
+            &propagation_reindexed_files,
+        );
+        let old_facts = &old_snapshot.facts;
+        let mut changed_owners = old_facts
+            .keys()
+            .chain(new_facts.keys())
+            .filter(|owner| {
+                !equivalent_owners.contains(*owner)
+                    && old_facts.get(*owner) != new_facts.get(*owner)
+            })
+            .cloned()
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        if changed_owners.is_empty() {
+            #[cfg(test)]
+            {
+                self.inferred_guard_propagation_stats = InferredGuardPropagationStats::default();
+            }
+            if profile_enabled {
+                eprintln!(
+                    "[profile] inferred_guard_incremental changed_facts=0 reference_edges=0 waves=0 reindexed_files=0"
+                );
+            }
+            return;
+        }
+        profile_changed_facts += changed_owners.len();
+        sort_inferred_guard_owners(&mut changed_owners);
+        let mut frontier_old_facts = old_snapshot.facts.clone();
+        let mut frontier_old_consumers = old_snapshot.consumers.clone();
+
+        while !changed_owners.is_empty() {
+            let mut reference_files = HashSet::new();
+            for owner in &changed_owners {
+                let newly_added =
+                    !frontier_old_facts.contains_key(owner) && new_facts.contains_key(owner);
+                let old_consumers = frontier_old_consumers
+                    .get(owner)
+                    .into_iter()
+                    .flatten()
+                    .copied();
+                let current_consumers = self
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_guard_consumers(owner);
+                let discovered_consumers = newly_added
+                    .then(|| self.resolve_inferred_guard_reference_files(owner))
+                    .into_iter()
+                    .flatten();
+                for file_id in old_consumers
+                    .chain(current_consumers)
+                    .chain(discovered_consumers)
+                {
+                    if !propagation_reindexed_files.contains(&file_id) {
+                        profile_reference_edges += 1;
+                        reference_files.insert(file_id);
+                    }
+                }
+            }
+            if reference_files.is_empty() {
+                break;
+            }
+
+            let mut reindex_file_ids = reference_files.into_iter().collect::<Vec<_>>();
+            reindex_file_ids.sort_unstable();
+            let wave_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
+            let old_wave_snapshot = self.inferred_guard_snapshot(&wave_file_ids);
+            self.compilation.remove_index(reindex_file_ids.clone());
+            let update_file_ids = reindex_file_ids
+                .into_iter()
+                .filter(|file_id| {
+                    self.compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_syntax_tree(file_id)
+                        .is_some()
+                })
+                .collect::<Vec<_>>();
+            if update_file_ids.is_empty() {
+                break;
+            }
+            profile_waves += 1;
+            profile_reindexed_files += update_file_ids.len();
+            propagation_reindexed_files.extend(wave_file_ids.iter().copied());
+            self.compilation.update_index(update_file_ids.clone());
+
+            new_facts = self
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .inferred_guard_facts_for_files(&wave_file_ids);
+            let equivalent_owners = self.reconcile_equivalent_inferred_guard_owners(
+                &old_wave_snapshot,
+                &new_facts,
+                &propagation_reindexed_files,
+            );
+            changed_owners = old_wave_snapshot
+                .facts
+                .keys()
+                .chain(new_facts.keys())
+                .filter(|owner| {
+                    !equivalent_owners.contains(*owner)
+                        && old_wave_snapshot.facts.get(*owner) != new_facts.get(*owner)
+                })
+                .cloned()
+                .collect::<HashSet<_>>()
+                .into_iter()
+                .collect();
+            frontier_old_facts = old_wave_snapshot.facts;
+            frontier_old_consumers = old_wave_snapshot.consumers;
+            profile_changed_facts += changed_owners.len();
+            sort_inferred_guard_owners(&mut changed_owners);
+        }
+        if profile_enabled {
+            eprintln!(
+                "[profile] inferred_guard_incremental changed_facts={} reference_edges={} waves={} reindexed_files={}",
+                profile_changed_facts,
+                profile_reference_edges,
+                profile_waves,
+                profile_reindexed_files
+            );
+        }
+        #[cfg(test)]
+        {
+            self.inferred_guard_propagation_stats = InferredGuardPropagationStats {
+                changed_facts: profile_changed_facts,
+                reference_edges: profile_reference_edges,
+                frontiers: profile_waves,
+                reindexed_files: profile_reindexed_files,
+                broad_stabilizations: self
+                    .cross_file_stabilization_invocations
+                    .saturating_sub(initial_stabilization_invocations),
+            };
+        }
+    }
+
+    fn inferred_guard_snapshot(&self, file_ids: &HashSet<FileId>) -> InferredGuardSnapshot {
+        let signature_index = self.compilation.get_db().get_signature_index();
+        let facts = signature_index.inferred_guard_facts_for_files(file_ids);
+        let consumers = facts
+            .keys()
+            .map(|owner| {
+                (
+                    owner.clone(),
+                    signature_index.inferred_guard_consumers(owner).collect(),
+                )
+            })
+            .collect();
+        InferredGuardSnapshot { facts, consumers }
+    }
+
+    fn reconcile_equivalent_inferred_guard_owners(
+        &mut self,
+        old_snapshot: &InferredGuardSnapshot,
+        new_facts: &HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
+        reindexed_file_ids: &HashSet<FileId>,
+    ) -> HashSet<LuaInferredGuardOwner> {
+        let mut reconciled = HashSet::new();
+        for owner in old_snapshot
+            .facts
+            .keys()
+            .filter(|owner| old_snapshot.facts.get(*owner) == new_facts.get(*owner))
+        {
+            if let Some(consumers) = old_snapshot.consumers.get(owner) {
+                self.compilation
+                    .get_db_mut()
+                    .get_signature_index_mut()
+                    .migrate_inferred_guard_consumers(owner.clone(), consumers, reindexed_file_ids);
+            }
+            reconciled.insert(owner.clone());
+        }
+
+        let mut old_owners = old_snapshot
+            .facts
+            .keys()
+            .filter(|owner| !new_facts.contains_key(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut new_owners = new_facts
+            .keys()
+            .filter(|owner| !old_snapshot.facts.contains_key(*owner))
+            .cloned()
+            .collect::<Vec<_>>();
+        sort_inferred_guard_owners(&mut old_owners);
+        sort_inferred_guard_owners(&mut new_owners);
+
+        for old_owner in old_owners {
+            let Some(new_idx) = new_owners.iter().position(|new_owner| {
+                old_owner.source_file_id() == new_owner.source_file_id()
+                    && old_owner.path() == new_owner.path()
+                    && old_owner.state_mask() == new_owner.state_mask()
+                    && old_snapshot.facts.get(&old_owner) == new_facts.get(new_owner)
+            }) else {
+                continue;
+            };
+            let new_owner = new_owners.remove(new_idx);
+            if let Some(consumers) = old_snapshot.consumers.get(&old_owner) {
+                self.compilation
+                    .get_db_mut()
+                    .get_signature_index_mut()
+                    .migrate_inferred_guard_consumers(
+                        new_owner.clone(),
+                        consumers,
+                        reindexed_file_ids,
+                    );
+            }
+            reconciled.insert(old_owner);
+            reconciled.insert(new_owner);
+        }
+        reconciled
+    }
+
+    fn resolve_inferred_guard_reference_files(
+        &self,
+        owner: &LuaInferredGuardOwner,
+    ) -> HashSet<FileId> {
+        let Some(member_name) = owner.path().last() else {
+            return HashSet::new();
+        };
+        let references = if owner.path().len() == 1 {
+            self.compilation
+                .get_db()
+                .get_reference_index()
+                .get_global_references(member_name)
+        } else {
+            self.compilation
+                .get_db()
+                .get_reference_index()
+                .get_index_references(&LuaMemberKey::Name(member_name.clone()))
+        };
+        let Some(references) = references else {
+            return HashSet::new();
+        };
+
+        let db = self.compilation.get_db();
+        let mut caches = HashMap::<FileId, LuaInferCache>::new();
+        references
+            .into_iter()
+            .filter_map(|reference| {
+                let root = db
+                    .get_vfs()
+                    .get_syntax_tree(&reference.file_id)?
+                    .get_red_root();
+                let expr = LuaExpr::cast(reference.value.to_node_from_root(&root)?)?;
+                if global_path_for_expr(&expr).as_deref() != Some(owner.path()) {
+                    return None;
+                }
+                if !db.get_gmod_infer_index().are_offsets_compatible(
+                    &reference.file_id,
+                    expr.get_range().start(),
+                    &owner.source_file_id(),
+                    owner.signature_id().get_position(),
+                ) {
+                    return None;
+                }
+                let call = expr.get_parent::<LuaCallExpr>()?;
+                if call.get_prefix_expr()?.get_syntax_id() != expr.get_syntax_id() {
+                    return None;
+                }
+                let cache = caches
+                    .entry(reference.file_id)
+                    .or_insert_with(|| LuaInferCache::new(reference.file_id, Default::default()));
+                (semantic::get_prefix_expr_signature_id(db, cache, &call)
+                    == Some(owner.signature_id()))
+                .then_some(reference.file_id)
+            })
+            .collect()
+    }
+
     fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
+        #[cfg(test)]
+        {
+            self.cross_file_stabilization_invocations += 1;
+        }
         if file_ids.is_empty() {
             return;
         }
@@ -462,6 +865,15 @@ impl EmmyLuaAnalysis {
                 .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
                 .unwrap_or_else(|| uri.as_str().to_string())
         });
+        let old_source_file_ids = files
+            .iter()
+            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
+            .collect::<HashSet<_>>();
+        let old_guard_fact_file_ids = self
+            .expand_reindex_file_ids(old_source_file_ids.into_iter().collect())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
 
         // Separate files into: unchanged (skip), to-remove, and to-parse
         let mut to_parse: Vec<(Uri, String)> = Vec::new();
@@ -583,6 +995,7 @@ impl EmmyLuaAnalysis {
         }
 
         let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -595,6 +1008,11 @@ impl EmmyLuaAnalysis {
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
         self.stabilize_cross_file_type_caches(&updated_files);
+        self.reindex_changed_inferred_guard_references(
+            &guard_fact_file_ids,
+            &old_guard_facts,
+            &updated_files,
+        );
         updated_files
     }
 
@@ -609,6 +1027,15 @@ impl EmmyLuaAnalysis {
                 .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
                 .unwrap_or_else(|| uri.as_str().to_string())
         });
+        let old_source_file_ids = files
+            .iter()
+            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
+            .collect::<HashSet<_>>();
+        let old_guard_fact_file_ids = self
+            .expand_reindex_file_ids(old_source_file_ids.into_iter().collect())
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();
         {
@@ -650,6 +1077,7 @@ impl EmmyLuaAnalysis {
         }
 
         let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -662,17 +1090,42 @@ impl EmmyLuaAnalysis {
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
         self.stabilize_cross_file_type_caches(&updated_files);
+        self.reindex_changed_inferred_guard_references(
+            &guard_fact_file_ids,
+            &old_guard_facts,
+            &updated_files,
+        );
         updated_files
     }
 
     pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
-        if let Some(file_id) = self.compilation.get_db_mut().get_vfs_mut().remove_file(uri) {
+        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
+            let reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
+            let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
+            let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
+            self.compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .remove_file(uri)?;
             log::info!(
                 "remove_file_by_uri: uri={} file_id={:?}",
                 uri.as_str(),
                 file_id
             );
-            self.compilation.remove_index(vec![file_id]);
+            self.compilation.remove_index(reindex_file_ids.clone());
+            let update_file_ids = reindex_file_ids
+                .iter()
+                .copied()
+                .filter(|id| *id != file_id)
+                .collect::<Vec<_>>();
+            if !update_file_ids.is_empty() {
+                self.compilation.update_index(update_file_ids);
+            }
+            self.reindex_changed_inferred_guard_references(
+                &guard_fact_file_ids,
+                &old_guard_facts,
+                &reindex_file_ids,
+            );
             return Some(file_id);
         }
 

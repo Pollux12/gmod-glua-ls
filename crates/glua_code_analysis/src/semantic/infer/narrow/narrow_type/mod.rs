@@ -244,8 +244,11 @@ pub fn narrow_down_type(
         LuaType::Variadic(_) => return Some(source),
         LuaType::Def(type_id) | LuaType::Ref(type_id) => match real_source_ref {
             LuaType::Def(ref_id) | LuaType::Ref(ref_id) => {
-                if is_sub_type_of(db, ref_id, type_id) || is_sub_type_of(db, type_id, ref_id) {
+                if is_sub_type_of(db, ref_id, type_id) {
                     return Some(source);
+                }
+                if is_sub_type_of(db, type_id, ref_id) {
+                    return Some(target);
                 }
             }
             _ => {}

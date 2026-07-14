@@ -22,6 +22,7 @@ use glua_parser::{
     LuaTableExpr,
 };
 pub(crate) use infer::check_iter_var_range;
+pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;
 pub(crate) use infer::narrow::infer_true_condition_narrowing;

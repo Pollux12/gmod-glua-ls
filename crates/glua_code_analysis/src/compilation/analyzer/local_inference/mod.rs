@@ -7,15 +7,16 @@ use rustc_hash::FxHashMap;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaClosureExpr,
-    LuaElseIfClauseStat, LuaExpr, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat,
+    LuaElseIfClauseStat, LuaExpr, LuaFuncStat, LuaIfStat, LuaIndexExpr, LuaNameExpr, LuaRepeatStat,
     LuaReturnStat, LuaVarExpr, LuaWhileStat,
 };
 use rustc_hash::FxHashSet;
 
 use crate::{
     InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
-    LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredPositiveGuard, LuaMemberKey,
-    LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, SignatureReturnStatus,
+    LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner, LuaInferredPositiveGuard,
+    LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
+    SignatureReturnStatus,
     compilation::analyzer::AnalyzeContext,
     semantic::{
         infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
@@ -522,10 +523,7 @@ pub(super) fn stabilize_unguarded_children(
     }
 }
 
-pub(super) fn rebuild_inferred_positive_guards(
-    db: &mut crate::DbIndex,
-    context: &mut AnalyzeContext,
-) -> bool {
+pub(super) fn prepare_inferred_positive_guards(db: &mut crate::DbIndex, context: &AnalyzeContext) {
     let file_ids = context
         .tree_list
         .iter()
@@ -535,9 +533,18 @@ pub(super) fn rebuild_inferred_positive_guards(
         db.get_signature_index_mut()
             .clear_inferred_positive_guards_for_file(*file_id);
     }
+    db.get_signature_index_mut()
+        .take_inferred_positive_guards_changed();
+}
 
-    let mut guards = Vec::new();
-    for file_id in file_ids {
+pub(super) fn publish_inferred_positive_guards(
+    db: &mut crate::DbIndex,
+    context: &mut AnalyzeContext,
+) -> usize {
+    let mut published = 0;
+    let mut pending = Vec::new();
+    for candidate in std::mem::take(&mut context.inferred_guard_candidates) {
+        let file_id = candidate.file_id;
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -545,21 +552,91 @@ pub(super) fn rebuild_inferred_positive_guards(
         else {
             continue;
         };
-        for closure in root.descendants().filter_map(LuaClosureExpr::cast) {
-            let Some(guard) = inferred_positive_guard_for_closure(db, context, file_id, &closure)
-            else {
-                continue;
-            };
-            guards.push((LuaSignatureId::from_closure(file_id, &closure), guard));
+        let Some(node) = candidate.value.to_node_from_root(&root) else {
+            continue;
+        };
+        let Some(closure) = LuaClosureExpr::cast(node) else {
+            continue;
+        };
+        let Some((guard, returns)) =
+            inferred_positive_guard_for_closure(db, context, file_id, &closure)
+        else {
+            pending.push(candidate);
+            continue;
+        };
+        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+        let owner = inferred_guard_owner(db, signature_id, &closure);
+        if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
+            && signature.resolve_return == SignatureReturnStatus::UnResolve
+        {
+            signature.return_docs = returns;
+            signature.resolve_return = SignatureReturnStatus::InferResolve;
         }
+        if let Some(owner) = owner {
+            db.get_signature_index_mut()
+                .set_owned_inferred_positive_guard(signature_id, owner, guard);
+        } else {
+            db.get_signature_index_mut()
+                .set_inferred_positive_guard(signature_id, guard);
+        }
+        published += 1;
     }
+    context.inferred_guard_candidates = pending;
+    published
+}
 
-    for (signature_id, guard) in guards {
-        db.get_signature_index_mut()
-            .set_inferred_positive_guard(signature_id, guard);
+fn inferred_guard_owner(
+    db: &crate::DbIndex,
+    signature_id: LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<LuaInferredGuardOwner> {
+    let var = if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
+        func_stat.get_func_name()?
+    } else {
+        let assign_stat = closure.get_parent::<LuaAssignStat>()?;
+        let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+        let value_idx = value_exprs
+            .iter()
+            .position(|expr| expr.get_position() == closure.get_position())?;
+        vars.get(value_idx)?.clone()
+    };
+    let path = match var {
+        LuaVarExpr::NameExpr(name_expr) => {
+            vec![name_expr.get_name_token()?.get_name_text().into()]
+        }
+        LuaVarExpr::IndexExpr(index_expr) => global_path_from_index_expr(index_expr)?,
+    };
+    Some(LuaInferredGuardOwner::GlobalPath {
+        signature_id,
+        state_mask: db
+            .get_gmod_infer_index()
+            .get_state_mask_at_offset(&signature_id.get_file_id(), closure.get_range().start()),
+        path: path.into_boxed_slice(),
+    })
+}
+
+fn global_path_from_index_expr(
+    index_expr: glua_parser::LuaIndexExpr,
+) -> Option<Vec<smol_str::SmolStr>> {
+    use glua_parser::LuaIndexKey;
+
+    if index_expr.get_index_token()?.is_colon() {
+        return None;
     }
-    db.get_signature_index_mut()
-        .take_inferred_positive_guards_changed()
+    let mut path = match index_expr.get_prefix_expr()? {
+        LuaExpr::NameExpr(name_expr) => {
+            vec![name_expr.get_name_token()?.get_name_text().into()]
+        }
+        LuaExpr::IndexExpr(prefix) => global_path_from_index_expr(prefix)?,
+        _ => return None,
+    };
+    let member = match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => name.get_name_text().into(),
+        LuaIndexKey::String(string) => string.get_value().into(),
+        _ => return None,
+    };
+    path.push(member);
+    Some(path)
 }
 
 fn inferred_positive_guard_for_closure(
@@ -567,16 +644,15 @@ fn inferred_positive_guard_for_closure(
     context: &mut AnalyzeContext,
     file_id: crate::FileId,
     closure: &LuaClosureExpr,
-) -> Option<LuaInferredPositiveGuard> {
+) -> Option<(LuaInferredPositiveGuard, Vec<crate::LuaDocReturnInfo>)> {
     let signature_id = LuaSignatureId::from_closure(file_id, closure);
     let signature = db.get_signature_index().get(&signature_id)?;
-    if signature.resolve_return != SignatureReturnStatus::InferResolve
+    if signature.resolve_return == SignatureReturnStatus::DocResolve
         || signature.is_colon_define
         || signature.is_generic()
         || signature.is_vararg
         || !signature.param_docs.is_empty()
         || !signature.overloads.is_empty()
-        || !signature.get_return_type().is_boolean()
     {
         return None;
     }
@@ -585,6 +661,25 @@ fn inferred_positive_guard_for_closure(
     let [super::lua::LuaReturnPoint::Expr(return_expr)] = return_points.as_slice() else {
         return None;
     };
+    let return_type = if signature.resolve_return == SignatureReturnStatus::InferResolve {
+        signature.get_return_type()
+    } else {
+        crate::infer_expr(
+            db,
+            context.infer_manager.get_infer_cache(file_id),
+            return_expr.clone(),
+        )
+        .ok()?
+    };
+    if !type_is_boolean(&return_type) {
+        return None;
+    }
+    let returns = super::lua::analyze_return_point(
+        db,
+        context.infer_manager.get_infer_cache(file_id),
+        &return_points,
+    )
+    .ok()?;
     let mut candidates = closure
         .get_params_list()?
         .get_params()
@@ -628,7 +723,18 @@ fn inferred_positive_guard_for_closure(
             })
         });
     let guard = candidates.next()?;
-    candidates.next().is_none().then_some(guard)
+    candidates.next().is_none().then_some((guard, returns))
+}
+
+fn type_is_boolean(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Union(union) => union.types().all(type_is_boolean),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| type_is_boolean(typ)),
+        _ => typ.is_boolean(),
+    }
 }
 
 fn unguarded_child_base_id(typ: &LuaType) -> Option<LuaTypeDeclId> {

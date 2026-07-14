@@ -4,6 +4,7 @@ mod await_in_sync_test;
 mod call_non_callable_test;
 mod cast_type_mismatch_test;
 mod check_return_count_test;
+mod circle_doc_class_test;
 mod code_style;
 mod determinism_test;
 mod disable_line_test;
