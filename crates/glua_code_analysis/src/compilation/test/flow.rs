@@ -2875,6 +2875,117 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_explicit_global_root_inferred_guard_addition_reindexes_all_global_consumers() {
+        let definitions = [
+            ("function _G.IsPlayer(ent) {body} end", "dot_g_function"),
+            ("function _ENV.IsPlayer(ent) {body} end", "dot_env_function"),
+            (
+                "_G[\"IsPlayer\"] = function(ent) {body} end",
+                "indexed_g_assignment",
+            ),
+            (
+                "_ENV[\"IsPlayer\"] = function(ent) {body} end",
+                "indexed_env_assignment",
+            ),
+        ];
+        let consumers = [
+            "IsPlayer(ent)",
+            "_G.IsPlayer(ent)",
+            "_ENV.IsPlayer(ent)",
+            "_G[\"IsPlayer\"](ent)",
+            "_ENV[\"IsPlayer\"](ent)",
+        ];
+
+        for (definition, case) in definitions {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let guard_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_guard.lua"));
+            let mut files = vec![
+                (
+                    ws.virtual_url_generator
+                        .new_uri(&format!("lua/includes/{case}_types.lua")),
+                    Some(
+                        r#"
+                        ---@class Entity
+                        ---@class NULL: Entity
+                        ---@class Player: Entity
+                        ---@param value any
+                        ---@return TypeGuard<any>
+                        ---@return_cast value -NULL
+                        function IsValid(value) end
+                        ---@return boolean
+                        ---@return_cast self Player
+                        function Entity:IsPlayer() end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+                (
+                    guard_uri.clone(),
+                    Some(definition.replace("{body}", "return true")),
+                ),
+            ];
+            let mut consumer_uris = Vec::new();
+            for (idx, call) in consumers.iter().enumerate() {
+                let uri = ws
+                    .virtual_url_generator
+                    .new_uri(&format!("lua/autorun/server/{case}_consumer_{idx}.lua"));
+                files.push((
+                    uri.clone(),
+                    Some(format!(
+                        "---@type Entity\nlocal ent\nif {call} then\n    local narrowed = ent\n    print(narrowed)\nend"
+                    )),
+                ));
+                consumer_uris.push(uri);
+            }
+            ws.analysis.update_files_by_uri_sorted(files);
+
+            for consumer_uri in &consumer_uris {
+                let consumer_file_id = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_id(consumer_uri)
+                    .unwrap_or_else(|| panic!("{case} consumer file id"));
+                let narrowed =
+                    nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+                assert_eq!(
+                    ws.humanize_type(narrowed),
+                    "Entity",
+                    "{case}: {consumer_uri:?} before guard addition"
+                );
+            }
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
+                )
+                .unwrap_or_else(|| panic!("{case} guard file id after update"));
+
+            for consumer_uri in consumer_uris {
+                let consumer_file_id = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_id(&consumer_uri)
+                    .unwrap_or_else(|| panic!("{case} consumer file id"));
+                let narrowed =
+                    nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+                assert_eq!(
+                    ws.humanize_type(narrowed),
+                    "Player",
+                    "{case}: {consumer_uri:?} after guard addition"
+                );
+            }
+        }
+    }
+
+    #[gtest]
     fn test_incremental_inferred_guard_addition_reaches_three_wrapper_levels() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

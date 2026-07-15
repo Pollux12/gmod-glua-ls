@@ -8,6 +8,7 @@ use glua_parser::{
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
+use std::borrow::Cow;
 use std::collections::HashSet;
 
 use crate::{
@@ -2933,15 +2934,16 @@ fn infer_global_field_member(
     index_expr: LuaIndexMemberExpr,
 ) -> InferResult {
     let member_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
-    let name = member_key
-        .get_name()
-        .ok_or(InferFailReason::None)?
-        .get_name_text();
+    let name = match &member_key {
+        LuaIndexKey::Name(name) => Cow::Borrowed(name.get_name_text()),
+        LuaIndexKey::String(string) => Cow::Owned(string.get_value()),
+        _ => return Err(InferFailReason::None),
+    };
     infer_global_type(
         db,
         Some(cache.get_file_id()),
         Some(index_expr.get_position()),
-        name,
+        &name,
     )
 }
 

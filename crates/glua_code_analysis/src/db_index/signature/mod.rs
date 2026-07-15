@@ -68,6 +68,12 @@ pub enum LuaInferredGuardOwner {
     },
 }
 
+pub(crate) fn canonicalize_global_root_path(path: &mut Vec<SmolStr>) {
+    if path.len() > 1 && matches!(path[0].as_str(), "_G" | "_ENV") {
+        path.remove(0);
+    }
+}
+
 impl LuaInferredGuardOwner {
     pub fn source_file_id(&self) -> FileId {
         match self {

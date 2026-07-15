@@ -70,7 +70,7 @@ fn sort_inferred_guard_owners(owners: &mut [LuaInferredGuardOwner]) {
 }
 
 fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
-    match expr {
+    let mut path = match expr {
         LuaExpr::NameExpr(name_expr) => {
             Some(vec![name_expr.get_name_token()?.get_name_text().into()])
         }
@@ -88,7 +88,9 @@ fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
             Some(path)
         }
         _ => None,
-    }
+    }?;
+    canonicalize_global_root_path(&mut path);
+    Some(path)
 }
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {

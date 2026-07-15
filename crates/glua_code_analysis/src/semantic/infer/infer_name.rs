@@ -38,7 +38,7 @@ pub fn infer_name_expr(
         "self" => {
             return infer_self(db, cache, name_expr);
         }
-        "_G" => return Ok(LuaType::Global),
+        "_G" | "_ENV" => return Ok(LuaType::Global),
         _ => {}
     }
 

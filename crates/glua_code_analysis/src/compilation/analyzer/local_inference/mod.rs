@@ -600,12 +600,13 @@ fn inferred_guard_owner(
             .position(|expr| expr.get_position() == closure.get_position())?;
         vars.get(value_idx)?.clone()
     };
-    let path = match var {
+    let mut path = match var {
         LuaVarExpr::NameExpr(name_expr) => {
             vec![name_expr.get_name_token()?.get_name_text().into()]
         }
         LuaVarExpr::IndexExpr(index_expr) => global_path_from_index_expr(index_expr)?,
     };
+    crate::canonicalize_global_root_path(&mut path);
     Some(LuaInferredGuardOwner::GlobalPath {
         signature_id,
         state_mask: db
