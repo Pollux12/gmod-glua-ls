@@ -1,10 +1,10 @@
 use std::collections::HashSet;
 
 use glua_code_analysis::{
-    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
-    RenderLevel, SemanticDeclLevel, SemanticInfo, SemanticModel,
-    explicit_param_string_default_reaches_flow, get_member_value_expr,
+    DbIndex, LuaCompilation, LuaDeclExtra, LuaDeclId, LuaDocument, LuaInferCache,
+    LuaInferenceProvenanceKind, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, SemanticInfo,
+    SemanticModel, explicit_param_string_default_reaches_flow, get_member_value_expr,
     inferred_string_default_reaches_flow,
 };
 use glua_code_analysis::{humanize_member_key_name, humanize_type};
@@ -39,6 +39,13 @@ pub fn build_semantic_info_hover(
     range: TextRange,
     render_level: Option<RenderLevel>,
 ) -> Option<Hover> {
+    let type_before_unguarded_child_inference = semantic_info
+        .inference_fact()
+        .provenance()
+        .iter()
+        .find(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
+        .and_then(|step| step.found_type.as_deref())
+        .cloned();
     let typ = semantic_info.display_typ().clone();
     let type_label = HoverTypeLabel::from_semantic_origin(semantic_info.origin);
     if semantic_info.semantic_decl.is_none() {
@@ -55,7 +62,15 @@ pub fn build_semantic_info_hover(
         render_level,
         type_label,
     );
-    if let Some(hover_builder) = hover_builder {
+    if let Some(mut hover_builder) = hover_builder {
+        if let Some(found_type) = type_before_unguarded_child_inference {
+            let detail_render_level = hover_builder.detail_render_level;
+            let found_type =
+                hover_humanize_type(&mut hover_builder, &found_type, Some(detail_render_level));
+            hover_builder.add_annotation_description(format!(
+                "Inferred from unguarded member usage. Type before usage inference: `{found_type}`."
+            ));
+        }
         hover_builder.build_hover_result(document.to_lsp_range(range))
     } else {
         None

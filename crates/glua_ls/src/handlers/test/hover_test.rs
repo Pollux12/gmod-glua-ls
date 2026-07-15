@@ -1872,7 +1872,7 @@ local EscapeStringMap: {
                 print(ow<??>ner)
             "#,
             VirtualHoverResult {
-                value: "```lua\n(infer) local owner: HoverChild.Player {\n    GetShootPos: function,\n} : HoverChild.Entity\n```\n\n---\n\n---\n**Scripted Entity:** `Player` (Base: `Entity`)"
+                value: "```lua\n(infer) local owner: HoverChild.Player {\n    GetShootPos: function,\n} : HoverChild.Entity\n```\n\n---\n\n---\n**Scripted Entity:** `Player` (Base: `Entity`)\n\nInferred from unguarded member usage. Type before usage inference: `HoverChild.Entity`."
                     .to_string(),
             },
         ));
