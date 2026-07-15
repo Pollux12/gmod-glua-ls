@@ -12,6 +12,7 @@ dhat-heap.json
 .cortexkit/
 .slim/deepwork/
 .codex-artifacts/
+docs/superpowers/
 
 benchmark_*.log
 .bench-*.log
