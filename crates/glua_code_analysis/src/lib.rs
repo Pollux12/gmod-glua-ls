@@ -27,14 +27,15 @@ pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{
-    LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaParser, LuaSyntaxTree,
+    LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
+    LuaParenExpr, LuaParser, LuaSyntaxTree,
 };
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::Path;
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
@@ -47,6 +48,12 @@ pub use vfs::*;
 struct InferredGuardSnapshot {
     facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
     consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
+}
+
+#[derive(Default)]
+struct InferredGuardReferenceFiles {
+    files: HashSet<FileId>,
+    alias_calls: HashSet<FileId>,
 }
 
 #[cfg(test)]
@@ -91,6 +98,86 @@ fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
     }?;
     canonicalize_global_root_path(&mut path);
     Some(path)
+}
+
+fn immutable_local_alias_decl(
+    db: &DbIndex,
+    file_id: FileId,
+    alias_value: &LuaExpr,
+) -> Option<LuaDeclId> {
+    let alias_value = enclosing_parenthesized_expr(alias_value);
+    let local_stat = alias_value.get_parent::<LuaLocalStat>()?;
+    let local_name = local_stat.get_local_name_by_value(alias_value.clone())?;
+    let decl_id = LuaDeclId::new(file_id, local_name.get_position());
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. })
+        || decl.get_value_syntax_id() != Some(alias_value.get_syntax_id())
+        || db
+            .get_reference_index()
+            .get_decl_references(&file_id, &decl_id)
+            .is_none_or(|references| references.mutable)
+    {
+        return None;
+    }
+    Some(decl_id)
+}
+
+fn enclosing_parenthesized_expr(expr: &LuaExpr) -> LuaExpr {
+    let mut expr = expr.clone();
+    while let Some(paren_expr) = expr.get_parent::<LuaParenExpr>() {
+        if paren_expr
+            .get_expr()
+            .is_none_or(|inner| inner.get_syntax_id() != expr.get_syntax_id())
+        {
+            break;
+        }
+        expr = LuaExpr::ParenExpr(paren_expr);
+    }
+    expr
+}
+
+fn is_call_prefix(expr: &LuaExpr) -> bool {
+    let expr = enclosing_parenthesized_expr(expr);
+    expr.get_parent::<LuaCallExpr>()
+        .and_then(|call| call.get_prefix_expr())
+        .is_some_and(|prefix| prefix.get_syntax_id() == expr.get_syntax_id())
+}
+
+fn expr_resolves_to_inferred_guard_owner(
+    db: &DbIndex,
+    caches: &mut HashMap<FileId, LuaInferCache>,
+    owner: &LuaInferredGuardOwner,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> bool {
+    let cache = caches
+        .entry(file_id)
+        .or_insert_with(|| LuaInferCache::new(file_id, Default::default()));
+    semantic::infer_expr(db, cache, expr.clone()).ok()
+        == Some(LuaType::Signature(owner.signature_id()))
+}
+
+fn call_resolves_to_inferred_guard_owner(
+    db: &DbIndex,
+    caches: &mut HashMap<FileId, LuaInferCache>,
+    owner: &LuaInferredGuardOwner,
+    file_id: FileId,
+    prefix_expr: &LuaExpr,
+) -> bool {
+    let prefix_expr = enclosing_parenthesized_expr(prefix_expr);
+    let Some(call) = prefix_expr.get_parent::<LuaCallExpr>() else {
+        return false;
+    };
+    if call
+        .get_prefix_expr()
+        .is_none_or(|prefix| prefix.get_syntax_id() != prefix_expr.get_syntax_id())
+    {
+        return false;
+    }
+    let cache = caches
+        .entry(file_id)
+        .or_insert_with(|| LuaInferCache::new(file_id, Default::default()));
+    semantic::get_prefix_expr_signature_id(db, cache, &call) == Some(owner.signature_id())
 }
 
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
@@ -268,6 +355,7 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content(uri, text);
+        let incremental_source_file_ids = HashSet::from([file_id]);
 
         let reindex_file_ids = existing_reindex_file_ids
             .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
@@ -287,6 +375,7 @@ impl EmmyLuaAnalysis {
             &guard_fact_file_ids,
             &old_guard_facts,
             &reindex_file_ids,
+            &incremental_source_file_ids,
         );
 
         Some(file_id)
@@ -367,6 +456,7 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content_preparsed(&uri, text, tree, line_index, version)?;
+        let incremental_source_file_ids = HashSet::from([file_id]);
 
         if trigger_reindex {
             let reindex_file_ids = existing_reindex_file_ids
@@ -385,6 +475,7 @@ impl EmmyLuaAnalysis {
                 &reindex_file_ids.iter().copied().collect(),
                 &old_guard_facts,
                 &reindex_file_ids,
+                &incremental_source_file_ids,
             );
         }
 
@@ -468,6 +559,7 @@ impl EmmyLuaAnalysis {
     /// Reindex specific files: remove old index entries + run full analysis pipeline.
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
+        let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let file_ids = self.expand_reindex_file_ids(file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
@@ -478,6 +570,7 @@ impl EmmyLuaAnalysis {
             &guard_fact_file_ids,
             &old_guard_facts,
             &file_ids,
+            &incremental_source_file_ids,
         );
     }
 
@@ -514,6 +607,7 @@ impl EmmyLuaAnalysis {
         source_file_ids: &HashSet<FileId>,
         old_snapshot: &InferredGuardSnapshot,
         already_reindexed: &[FileId],
+        incremental_source_file_ids: &HashSet<FileId>,
     ) {
         #[cfg(test)]
         let initial_stabilization_invocations = self.cross_file_stabilization_invocations;
@@ -581,17 +675,26 @@ impl EmmyLuaAnalysis {
                     .get_db()
                     .get_signature_index()
                     .inferred_guard_consumers(owner);
-                let discovered_consumers = newly_added
-                    .then(|| self.resolve_inferred_guard_reference_files(owner))
-                    .into_iter()
-                    .flatten();
-                for file_id in old_consumers
-                    .chain(current_consumers)
-                    .chain(discovered_consumers)
-                {
+                for file_id in old_consumers.chain(current_consumers) {
                     if !propagation_reindexed_files.contains(&file_id) {
                         profile_reference_edges += 1;
                         reference_files.insert(file_id);
+                    }
+                }
+                if newly_added {
+                    let allow_alias_retry =
+                        incremental_source_file_ids.contains(&owner.source_file_id());
+                    let discovered = self.resolve_inferred_guard_reference_files(owner, true);
+                    for file_id in discovered.files {
+                        // Cold batches resolve aliases in the main pipeline. Only edits need a
+                        // post-publication retry for alias calls analyzed with the old guard fact.
+                        let alias_retry = allow_alias_retry
+                            && discovered.alias_calls.contains(&file_id)
+                            && file_id != owner.source_file_id();
+                        if !propagation_reindexed_files.contains(&file_id) || alias_retry {
+                            profile_reference_edges += 1;
+                            reference_files.insert(file_id);
+                        }
                     }
                 }
             }
@@ -751,9 +854,10 @@ impl EmmyLuaAnalysis {
     fn resolve_inferred_guard_reference_files(
         &self,
         owner: &LuaInferredGuardOwner,
-    ) -> HashSet<FileId> {
+        discover_aliases: bool,
+    ) -> InferredGuardReferenceFiles {
         let Some(member_name) = owner.path().last() else {
-            return HashSet::new();
+            return InferredGuardReferenceFiles::default();
         };
         let references = if owner.path().len() == 1 {
             self.compilation
@@ -767,12 +871,12 @@ impl EmmyLuaAnalysis {
                 .get_index_references(&LuaMemberKey::Name(member_name.clone()))
         };
         let Some(references) = references else {
-            return HashSet::new();
+            return InferredGuardReferenceFiles::default();
         };
 
         let db = self.compilation.get_db();
         let mut caches = HashMap::<FileId, LuaInferCache>::new();
-        references
+        let mut matching_references = references
             .into_iter()
             .filter_map(|reference| {
                 let root = db
@@ -780,29 +884,84 @@ impl EmmyLuaAnalysis {
                     .get_syntax_tree(&reference.file_id)?
                     .get_red_root();
                 let expr = LuaExpr::cast(reference.value.to_node_from_root(&root)?)?;
-                if global_path_for_expr(&expr).as_deref() != Some(owner.path()) {
-                    return None;
+                (global_path_for_expr(&expr).as_deref() == Some(owner.path())
+                    && db.get_gmod_infer_index().are_offsets_compatible(
+                        &reference.file_id,
+                        expr.get_range().start(),
+                        &owner.source_file_id(),
+                        owner.signature_id().get_position(),
+                    ))
+                .then_some((reference.file_id, expr))
+            })
+            .collect::<Vec<_>>();
+        matching_references.sort_by_key(|(file_id, expr)| (*file_id, expr.get_range().start()));
+
+        let mut result = InferredGuardReferenceFiles::default();
+        let mut alias_queue = VecDeque::new();
+        let mut visited_aliases = HashSet::new();
+        for (file_id, expr) in matching_references {
+            if call_resolves_to_inferred_guard_owner(db, &mut caches, owner, file_id, &expr) {
+                result.files.insert(file_id);
+            }
+            if discover_aliases
+                && expr_resolves_to_inferred_guard_owner(db, &mut caches, owner, file_id, &expr)
+                && let Some(decl_id) = immutable_local_alias_decl(db, file_id, &expr)
+            {
+                alias_queue.push_back(decl_id);
+            }
+        }
+
+        while let Some(decl_id) = alias_queue.pop_front() {
+            if !visited_aliases.insert(decl_id) {
+                continue;
+            }
+            let Some(root) = db
+                .get_vfs()
+                .get_syntax_tree(&decl_id.file_id)
+                .map(|tree| tree.get_red_root())
+            else {
+                continue;
+            };
+            let Some(decl_references) = db
+                .get_reference_index()
+                .get_decl_references(&decl_id.file_id, &decl_id)
+            else {
+                continue;
+            };
+            let mut cells = decl_references.cells.clone();
+            cells.sort_by_key(|cell| cell.range.start());
+            for cell in cells {
+                if cell.is_write {
+                    continue;
                 }
+                let Some(name_expr) = root
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .find_map(LuaNameExpr::cast)
+                    .filter(|name_expr| name_expr.get_range() == cell.range)
+                else {
+                    continue;
+                };
+                let expr = LuaExpr::NameExpr(name_expr);
                 if !db.get_gmod_infer_index().are_offsets_compatible(
-                    &reference.file_id,
+                    &decl_id.file_id,
                     expr.get_range().start(),
                     &owner.source_file_id(),
                     owner.signature_id().get_position(),
                 ) {
-                    return None;
+                    continue;
                 }
-                let call = expr.get_parent::<LuaCallExpr>()?;
-                if call.get_prefix_expr()?.get_syntax_id() != expr.get_syntax_id() {
-                    return None;
+                if is_call_prefix(&expr) {
+                    result.files.insert(decl_id.file_id);
+                    result.alias_calls.insert(decl_id.file_id);
                 }
-                let cache = caches
-                    .entry(reference.file_id)
-                    .or_insert_with(|| LuaInferCache::new(reference.file_id, Default::default()));
-                (semantic::get_prefix_expr_signature_id(db, cache, &call)
-                    == Some(owner.signature_id()))
-                .then_some(reference.file_id)
-            })
-            .collect()
+                if let Some(next_decl_id) = immutable_local_alias_decl(db, decl_id.file_id, &expr) {
+                    alias_queue.push_back(next_decl_id);
+                }
+            }
+        }
+
+        result
     }
 
     fn stabilize_cross_file_type_caches(&mut self, file_ids: &[FileId]) {
@@ -872,7 +1031,7 @@ impl EmmyLuaAnalysis {
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
         let old_guard_fact_file_ids = self
-            .expand_reindex_file_ids(old_source_file_ids.into_iter().collect())
+            .expand_reindex_file_ids(old_source_file_ids.iter().copied().collect())
             .into_iter()
             .collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
@@ -1014,6 +1173,7 @@ impl EmmyLuaAnalysis {
             &guard_fact_file_ids,
             &old_guard_facts,
             &updated_files,
+            &old_source_file_ids,
         );
         updated_files
     }
@@ -1034,7 +1194,7 @@ impl EmmyLuaAnalysis {
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
         let old_guard_fact_file_ids = self
-            .expand_reindex_file_ids(old_source_file_ids.into_iter().collect())
+            .expand_reindex_file_ids(old_source_file_ids.iter().copied().collect())
             .into_iter()
             .collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
@@ -1096,6 +1256,7 @@ impl EmmyLuaAnalysis {
             &guard_fact_file_ids,
             &old_guard_facts,
             &updated_files,
+            &old_source_file_ids,
         );
         updated_files
     }
@@ -1127,6 +1288,7 @@ impl EmmyLuaAnalysis {
                 &guard_fact_file_ids,
                 &old_guard_facts,
                 &reindex_file_ids,
+                &HashSet::new(),
             );
             return Some(file_id);
         }

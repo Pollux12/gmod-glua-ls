@@ -31,6 +31,49 @@ mod test {
         );
     }
 
+    fn define_incremental_alias_guard_workspace(
+        ws: &mut VirtualWorkspace,
+        consumer: String,
+    ) -> (Uri, crate::FileId) {
+        set_gmod_enabled(ws);
+        let guard_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/incremental_alias_guard.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/incremental_alias_consumer.lua");
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/includes/incremental_alias_types.lua"),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (consumer_uri.clone(), Some(consumer)),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("incremental alias consumer file id");
+        (guard_uri, consumer_file_id)
+    }
+
     fn define_cross_file_predicate_workspace(
         ws: &mut VirtualWorkspace,
         predicate: &str,
@@ -2872,6 +2915,278 @@ _2 = a[1]
 
         let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
         assert_eq!(ws.humanize_type(narrowed_type), "(Player|false)");
+    }
+
+    #[gtest]
+    fn test_incremental_inferred_guard_addition_reindexes_immutable_alias_calls() {
+        let cases = [
+            ("function IsPlayer(ent) {body} end", "IsPlayer", "global"),
+            (
+                "Predicates = Predicates or {}\nfunction Predicates.IsPlayer(ent) {body} end",
+                "Predicates.IsPlayer",
+                "namespaced",
+            ),
+            (
+                "function _G.IsPlayer(ent) {body} end",
+                "_G.IsPlayer",
+                "global_root",
+            ),
+        ];
+
+        for (definition, predicate, case) in cases {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let guard_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_alias_guard.lua"));
+            let consumer_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_alias_consumer.lua"));
+            ws.analysis.update_files_by_uri_sorted(vec![
+                (
+                    ws.virtual_url_generator
+                        .new_uri(&format!("lua/includes/{case}_alias_types.lua")),
+                    Some(
+                        r#"
+                        ---@class Entity
+                        ---@class NULL: Entity
+                        ---@class Player: Entity
+                        ---@param value any
+                        ---@return TypeGuard<any>
+                        ---@return_cast value -NULL
+                        function IsValid(value) end
+                        ---@return boolean
+                        ---@return_cast self Player
+                        function Entity:IsPlayer() end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+                (
+                    guard_uri.clone(),
+                    Some(definition.replace("{body}", "return true")),
+                ),
+                (
+                    consumer_uri.clone(),
+                    Some(format!(
+                        "---@type Entity\nlocal ent\nlocal Alias = {predicate}\nlocal Alias2 = Alias\nif Alias2(ent) then\n    local narrowed = ent\n    print(narrowed)\nend"
+                    )),
+                ),
+            ]);
+            let consumer_file_id = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&consumer_uri)
+                .unwrap_or_else(|| panic!("{case} alias consumer file id"));
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Entity", "{case} before edit");
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
+                )
+                .unwrap_or_else(|| panic!("{case} guard addition"));
+
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Player", "{case} after edit");
+            assert_eq!(
+                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+                1
+            );
+            assert_eq!(
+                ws.analysis
+                    .inferred_guard_propagation_stats
+                    .broad_stabilizations,
+                0
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_file_reindexes_existing_immutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("new guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_file_batch_reindexes_existing_immutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis.update_files_by_uri(vec![(
+            guard_uri,
+            Some("function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string()),
+        )]);
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_reindexes_parenthesized_alias_initializers_and_calls() {
+        let cases = [
+            (
+                "---@type Entity\nlocal ent\nlocal Alias = ((IsPlayer))\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized initializer",
+            ),
+            (
+                "---@type Entity\nlocal ent\nlocal Alias = (IsPlayer)\nlocal Alias2 = ((Alias))\nif ((Alias2))(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized alias chain and call",
+            ),
+            (
+                "---@type Entity\nlocal ent\nif ((IsPlayer))(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized direct call",
+            ),
+        ];
+
+        for (consumer, case) in cases {
+            let mut ws = VirtualWorkspace::new();
+            let (guard_uri, consumer_file_id) =
+                define_incremental_alias_guard_workspace(&mut ws, consumer.to_string());
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(
+                        "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end"
+                            .to_string(),
+                    ),
+                )
+                .unwrap_or_else(|| panic!("{case} guard source file id"));
+
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Player", "{case}");
+            assert_eq!(
+                ws.analysis
+                    .inferred_guard_propagation_stats
+                    .broad_stabilizations,
+                0,
+                "{case}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_reindexes_alias_chain_longer_than_eight_declarations() {
+        let mut aliases = "local Alias0 = IsPlayer\n".to_string();
+        for index in 1..12 {
+            aliases.push_str(&format!("local Alias{index} = Alias{}\n", index - 1));
+        }
+        let consumer = format!(
+            "---@type Entity\nlocal ent\n{aliases}if Alias11(ent) then\n    local narrowed = ent\n    print(narrowed)\nend"
+        );
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) =
+            define_incremental_alias_guard_workspace(&mut ws, consumer);
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("deep alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_alias_cycle_terminates_without_narrowing() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nlocal Alias2 = Alias\nAlias = Alias2\nAlias2 = Alias\nif Alias2(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("cyclic alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_does_not_reindex_mutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nAlias = function() return true end\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("mutable alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            0
+        );
     }
 
     #[gtest]

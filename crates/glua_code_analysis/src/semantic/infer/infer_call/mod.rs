@@ -442,7 +442,10 @@ pub(crate) fn get_prefix_expr_signature_id(
     cache: &mut LuaInferCache,
     call_expr: &LuaCallExpr,
 ) -> Option<LuaSignatureId> {
-    let prefix_expr = call_expr.get_prefix_expr()?;
+    let mut prefix_expr = call_expr.get_prefix_expr()?;
+    while let LuaExpr::ParenExpr(paren_expr) = prefix_expr {
+        prefix_expr = paren_expr.get_expr()?;
+    }
     if let LuaExpr::NameExpr(name_expr) = &prefix_expr
         && let Some(signature_id) = get_local_name_signature_id(db, cache, name_expr)
     {
