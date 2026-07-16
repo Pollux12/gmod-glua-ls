@@ -18,6 +18,7 @@ mod gmod_annotation_shape_test;
 mod gmod_compilefile_environment_test;
 mod gmod_dynamic_field_test;
 mod gmod_hook_name_test;
+mod gmod_mixin_receiver_test;
 mod gmod_network_test;
 mod gmod_realm_misuse_test;
 mod gmod_systems_test;

@@ -1,13 +1,13 @@
 #[cfg(test)]
 mod test {
     use glua_parser::{
-        LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat, LuaVarExpr,
+        LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat, LuaTableField, LuaVarExpr,
     };
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, InFiled, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
+        DiagnosticCode, Emmyrc, InFiled, LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType,
         VirtualWorkspace,
     };
 
@@ -35,6 +35,34 @@ mod test {
             .get(&signature_id)
             .expect("expected function signature")
             .get_return_type()
+    }
+
+    fn table_field_closure_signatures(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        field_name: &str,
+    ) -> Vec<LuaSignatureId> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        semantic_model
+            .get_root()
+            .descendants::<LuaTableField>()
+            .filter_map(|field| {
+                let Some(LuaIndexKey::Name(key)) = field.get_field_key() else {
+                    return None;
+                };
+                if key.get_name_text() != field_name {
+                    return None;
+                }
+                let Some(LuaExpr::ClosureExpr(closure)) = field.get_value_expr() else {
+                    return None;
+                };
+                Some(LuaSignatureId::from_closure(file_id, &closure))
+            })
+            .collect()
     }
 
     fn function_stat_name_is(stat: &LuaFuncStat, name: &str) -> bool {
@@ -486,6 +514,315 @@ mod test {
     }
 
     #[test]
+    fn test_callable_self_metatable_constructor_preserves_raw_and_index_members() {
+        const SOURCE: &str = r#"
+            local pending
+            local function runLater(callback)
+                pending = callback
+            end
+
+            local Parent = {}
+            function Parent:Inherited() end
+            function Parent:unregister() end
+
+            local Methods = {}
+            function Methods:Own() end
+            setmetatable(Methods, { __index = Parent })
+
+            local Constructor = {
+                __index = Methods,
+                __call = function(p)
+                    local t = {
+                        bass = true,
+                        fadeStart = 0,
+                        fadeEnd = 1,
+                    }
+                    runLater(function()
+                        t.rate = 1
+                        t.max = 10
+                        t:Own()
+                        t:Inherited()
+                        t:unregister()
+                    end)
+                    return setmetatable(t, p)
+                end,
+            }
+            setmetatable(Constructor, Constructor)
+
+            local value = Constructor()
+            pending()
+            print(value.bass, value.fadeStart, value.fadeEnd, value.rate, value.max)
+            value:Own()
+            value:Inherited()
+            value:unregister()
+            Result = value
+        "#;
+
+        let mut inspection = VirtualWorkspace::new();
+        inspection.def(SOURCE);
+        let result_type = inspection.expr_ty("Result");
+        assert!(
+            matches!(result_type, LuaType::Instance(_)),
+            "callable constructor must return an instance retaining raw backing members, got {result_type:?}"
+        );
+
+        let mut fields = VirtualWorkspace::new();
+        assert!(
+            fields.check_code_for(DiagnosticCode::UndefinedField, SOURCE),
+            "callable self-metatable constructor must retain raw and captured dynamic fields"
+        );
+
+        let mut methods = VirtualWorkspace::new();
+        assert!(
+            methods.check_code_for(DiagnosticCode::UndefinedMethod, SOURCE),
+            "callable self-metatable constructor must retain direct and inherited __index methods"
+        );
+    }
+
+    #[test]
+    fn test_callable_render_stack_product_keeps_materialized_index_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local RenderStack = {
+                __index = {
+                    create = function(self)
+                        return setmetatable({ dirty = false }, self.objindex)
+                    end,
+                    makeDirty = function(self) end,
+                },
+                __call = function(p)
+                    local ret = setmetatable({ stack = true }, p)
+                    ret.objindex = { __index = ret }
+                    return ret
+                end,
+            }
+            setmetatable(RenderStack, RenderStack)
+
+            RenderStack("root"):create():makeDirty()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_callable_ent_manager_return_keeps_derived_and_inherited_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local LimitObject = {
+                __index = {
+                    inherited = function(self) end,
+                },
+                __call = function(p)
+                    return setmetatable({ count = 0 }, p)
+                end,
+            }
+            setmetatable(LimitObject, LimitObject)
+
+            local EntManager = {
+                __index = {
+                    unregister = function(self) end,
+                },
+                __call = function(p)
+                    local t = LimitObject()
+                    t.removeCb = function() end
+                    return setmetatable(t, p)
+                end,
+            }
+            setmetatable(EntManager, EntManager)
+            setmetatable(EntManager.__index, LimitObject)
+
+            local manager = EntManager()
+            manager.removeCb()
+            manager:unregister()
+            manager:inherited()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_does_not_expose_derived_method_before_call() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Base = {
+                __index = {},
+                __call = function(p)
+                    return setmetatable({ value = true }, p)
+                end,
+            }
+            setmetatable(Base, Base)
+
+            local Derived = {
+                __index = {
+                    DerivedOnly = function(self) end,
+                },
+            }
+            setmetatable(Derived, Derived)
+            setmetatable(Derived.__index, Base)
+
+            local function build()
+                local t = Base()
+                t:DerivedOnly()
+                return setmetatable(t, Derived)
+            end
+
+            build()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_colon_receiver_contribution_requires_leading_self_name() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {
+                __index = {
+                    create = function(receiver)
+                        return setmetatable({ value = true }, receiver.objindex)
+                    end,
+                    makeDirty = function(self) end,
+                },
+                __call = function(p)
+                    local ret = setmetatable({}, p)
+                    ret.objindex = { __index = ret }
+                    return ret
+                end,
+            }
+            setmetatable(Class, Class)
+
+            Class():create():makeDirty()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_colon_receiver_contribution_rejects_nonleading_self() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {
+                __index = {
+                    create = function(prefix, self)
+                        return setmetatable({ value = true }, self.objindex)
+                    end,
+                    makeDirty = function(self) end,
+                },
+                __call = function(p)
+                    local ret = setmetatable({}, p)
+                    ret.objindex = { __index = ret }
+                    return ret
+                end,
+            }
+            setmetatable(Class, Class)
+
+            Class():create(nil):makeDirty()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_colon_receiver_contribution_rejects_mutated_self() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {
+                __index = {
+                    create = function(self)
+                        self = {}
+                        return setmetatable({ value = true }, self.objindex)
+                    end,
+                    makeDirty = function(self) end,
+                },
+                __call = function(p)
+                    local ret = setmetatable({}, p)
+                    ret.objindex = { __index = ret }
+                    return ret
+                end,
+            }
+            setmetatable(Class, Class)
+
+            Class():create():makeDirty()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_colon_receiver_contribution_rejects_ambiguous_method_signature() {
+        const SOURCE: &str = r#"
+            local MethodsA = {
+                create = function(self)
+                    return setmetatable({ value = true }, self.objindex)
+                end,
+            }
+            local MethodsB = {
+                create = function(self)
+                    return setmetatable({ value = true }, self.objindex)
+                end,
+            }
+            local function selectMethods()
+                if unknownCondition then
+                    return MethodsA
+                end
+                return MethodsB
+            end
+            local receiver = selectMethods()
+
+            receiver:create():makeDirty()
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(SOURCE);
+        let signature_ids = table_field_closure_signatures(&ws, file_id, "create");
+        let call_site_params = ws.analysis.compilation.get_db().get_call_site_param_index();
+        assert!(
+            signature_ids.len() == 2
+                && signature_ids.iter().all(|signature_id| call_site_params
+                    .get_inferred_param(signature_id, 0)
+                    .is_none()),
+            "ambiguous receiver member signatures must not receive an exact self contribution"
+        );
+    }
+
+    #[test]
+    fn test_materialized_metatable_instance_missing_members_remain_visible() {
+        const SOURCE: &str = r#"
+            local Methods = {}
+            local Constructor = {
+                __index = Methods,
+                __call = function(p)
+                    return setmetatable({ shared = true }, p)
+                end,
+            }
+            setmetatable(Constructor, Constructor)
+
+            local first = Constructor()
+            local second = Constructor()
+            print(first.shared, second.shared, second.missingField)
+            second:Missing()
+        "#;
+
+        let mut fields = VirtualWorkspace::new();
+        assert!(
+            !fields.check_code_for(DiagnosticCode::UndefinedField, SOURCE),
+            "genuinely missing fields must remain diagnosable"
+        );
+
+        let mut methods = VirtualWorkspace::new();
+        assert!(
+            !methods.check_code_for(DiagnosticCode::UndefinedMethod, SOURCE),
+            "genuinely missing methods must remain diagnosable"
+        );
+    }
+
+    #[test]
     fn test_mutated_callable_table_parameter_is_not_used_as_instance_metatable() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
@@ -524,6 +861,669 @@ mod test {
             }
 
             setmetatable(Setting, Setting)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_named_metatable_factory_exposes_later_method() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        ws.def_file(
+            "lua/autorun/server/init.lua",
+            "SF = {}\ninclude(\"starfall/sflib.lua\")\n",
+        );
+        ws.def_file(
+            "lua/autorun/client/init.lua",
+            "SF = {}\ninclude(\"starfall/sflib.lua\")\n",
+        );
+        ws.def_file("lua/starfall/sflib.lua", "include(\"instance.lua\")\n");
+        let file_id = ws.def_file(
+            "lua/starfall/instance.lua",
+            r#"
+            SF.Instance = {}
+            SF.Instance.__index = SF.Instance
+
+            function SF.Instance.make()
+                local instance = setmetatable({}, SF.Instance)
+                instance.value = true
+                instance:later()
+                return instance
+            end
+
+            function SF.Instance:later() end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_method_code),
+            "unexpected UndefinedMethod diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_colon_factory_receiver_resolves_exact_metatable_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local manager = {}
+            local requestClass = {}
+            requestClass.__index = requestClass
+            manager.requestClass = requestClass
+
+            function requestClass:new(sender, receiver, amount, message, expiry, instance, callbackSuccess, callbackFailure)
+                return setmetatable({
+                    sender = sender,
+                    receiver = receiver,
+                    amount = amount,
+                    message = message,
+                    expiry = expiry,
+                    instance = instance,
+                    callbackSuccess = callbackSuccess,
+                    callbackFailure = callbackFailure
+                }, self)
+            end
+
+            if SERVER then
+                function requestClass:send() end
+                manager.requests = {}
+                function manager:add(sender, receiver, amount, message, instance, callbackSuccess, callbackFailure)
+                    local requestsForSender = self.requests[sender]
+                    if not requestsForSender then
+                        requestsForSender = {}
+                        self.requests[sender] = requestsForSender
+                    end
+                    local expiry = CurTime() + 10
+                    local request = requestClass:new(sender, receiver, amount, message, expiry, instance, callbackSuccess, callbackFailure)
+                    requestsForSender[receiver] = request
+                    request:send()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_arbitrary_factory_parameter_is_not_treated_as_metatable_owner() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:known() end
+
+            local function make(metatable)
+                return setmetatable({}, metatable)
+            end
+
+            make(Class):known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_mutated_colon_self_is_not_used_as_metatable_owner() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:known() end
+
+            local Other = {}
+            function Class:new()
+                self = Other
+                return setmetatable({}, self)
+            end
+
+            Class:new():known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_cross_file_callable_class_preserves_nested_index_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        ws.def_file(
+            "lua/autorun/server/init.lua",
+            "SF = {}\ninclude(\"starfall/sflib.lua\")\n",
+        );
+        ws.def_file(
+            "lua/autorun/client/init.lua",
+            "SF = {}\ninclude(\"starfall/sflib.lua\")\n",
+        );
+        ws.def_file(
+            "lua/starfall/sflib.lua",
+            r#"
+            SF.BurstObject = {
+                __index = {
+                    use = function(self) end,
+                    check = function(self) end,
+                },
+                __call = function(meta, name, limit, rate, max, rate_help, max_help, scale)
+                    local instance = {
+                        name = "burst",
+                        objects = {},
+                    }
+                    register(function(value)
+                        instance.rate = value
+                    end)
+                    register(function(value)
+                        instance.max = value
+                    end)
+                    return setmetatable(instance, meta)
+                end,
+            }
+            setmetatable(SF.BurstObject, SF.BurstObject)
+            include("libs_sh/game.lua")
+            "#,
+        );
+        let consumer = ws.def_file(
+            "lua/starfall/libs_sh/game.lua",
+            r#"
+            local instance = SERVER and SF.BurstObject("name", "limit", 1, 2, "rate", "max", 1)
+            if SERVER then
+                instance:use()
+                instance:check()
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(consumer, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| diag.code != undefined_method_code),
+            "unexpected UndefinedMethod diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_literal_index_later_function_overwrite_rejects_factory_recovery() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {}
+            function Class:known() end
+
+            local Meta = { __index = Class }
+            Meta.__index = function(_, key)
+                return rawget(Class, key)
+            end
+
+            local value = setmetatable({}, Meta)
+            value:known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_literal_index_later_dynamic_overwrite_rejects_factory_recovery() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local Class = {}
+            function Class:known() end
+
+            local dynamic_index = unknown_provider()
+            local Meta = { __index = Class }
+            Meta.__index = dynamic_index
+
+            local value = setmetatable({}, Meta)
+            A = value.known
+            "#,
+        );
+        let known_type = ws.expr_ty("A");
+        assert!(
+            !matches!(known_type, LuaType::Signature(_) | LuaType::DocFunction(_)),
+            "dynamic overwrite must not recover Class.known, got {known_type:?}"
+        );
+    }
+
+    #[test]
+    fn test_literal_index_supported_later_overwrite_wins() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Other = {}
+            local Class = {}
+            function Class:known() end
+
+            local Meta = { __index = Other }
+            Meta.__index = Class
+
+            local value = setmetatable({}, Meta)
+            value:known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_duplicate_inline_index_uses_last_field() {
+        let mut supported_last = VirtualWorkspace::new();
+        supported_last.def(
+            r#"
+            local Class = {}
+            function Class:known() end
+
+            local value = setmetatable({}, {
+                __index = function() end,
+                __index = Class,
+            })
+            A = value.known
+            "#,
+        );
+        let supported_type = supported_last.expr_ty("A");
+        assert!(
+            matches!(
+                supported_type,
+                LuaType::Signature(_) | LuaType::DocFunction(_)
+            ),
+            "last supported __index field must expose Class.known, got {supported_type:?}"
+        );
+
+        let mut unsupported_last = VirtualWorkspace::new();
+        unsupported_last.def(
+            r#"
+            local Class = {}
+            function Class:known() end
+
+            local value = setmetatable({}, {
+                __index = Class,
+                __index = function() end,
+            })
+            A = value.known
+            "#,
+        );
+        let unsupported_type = unsupported_last.expr_ty("A");
+        assert!(
+            !matches!(
+                unsupported_type,
+                LuaType::Signature(_) | LuaType::DocFunction(_)
+            ),
+            "last unsupported __index field must not expose Class.known, got {unsupported_type:?}"
+        );
+    }
+
+    #[test]
+    fn test_realm_conflicting_literal_index_owners_remain_conservative() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        ws.def_file(
+            "lua/autorun/server/init.lua",
+            r#"
+            RealmIndex = {}
+            function RealmIndex:known() end
+            RealmMeta = { __index = RealmIndex }
+            include("literal_realm_factory.lua")
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/init.lua",
+            r#"
+            RealmMeta = {
+                __index = function(_, key)
+                    return rawget(RealmMeta, key)
+                end,
+            }
+            include("literal_realm_factory.lua")
+            "#,
+        );
+        let shared_file_id = ws.def_file(
+            "lua/literal_realm_factory.lua",
+            r#"
+            local value = setmetatable({}, RealmMeta)
+            value:known()
+            "#,
+        );
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_method_code),
+            "expected conflicting literal realm __index owners to preserve UndefinedMethod, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_literal_index_overwrite_refreshes_across_edit_delete_and_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/literal_metatable_lifecycle.lua");
+        let supported_content = r#"
+            local Other = {}
+            local Class = {}
+            function Class:known() end
+            local Meta = { __index = Other }
+            Meta.__index = Class
+            local value = setmetatable({}, Meta)
+            value:known()
+        "#;
+        let unsupported_content = r#"
+            local Class = {}
+            function Class:known() end
+            local Meta = { __index = Class }
+            Meta.__index = function(_, key)
+                return rawget(Class, key)
+            end
+            local value = setmetatable({}, Meta)
+            value:known()
+        "#;
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        let has_undefined_method = |ws: &VirtualWorkspace, file_id| {
+            ws.analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .any(|diag| diag.code == undefined_method_code)
+        };
+
+        let initial_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .expect("literal metatable lifecycle file must be created");
+        assert!(has_undefined_method(&ws, initial_file_id));
+
+        let edited_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .expect("literal metatable lifecycle file must be updated");
+        assert!(!has_undefined_method(&ws, edited_file_id));
+
+        ws.analysis
+            .remove_file_by_uri(&uri)
+            .expect("literal metatable lifecycle file must be removed");
+        let reopened_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(unsupported_content.to_string()))
+            .expect("literal metatable lifecycle file must reopen");
+        assert!(has_undefined_method(&ws, reopened_file_id));
+
+        let restored_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(supported_content.to_string()))
+            .expect("literal metatable lifecycle file must be restored");
+        assert!(!has_undefined_method(&ws, restored_file_id));
+    }
+
+    #[test]
+    fn test_metatable_receiver_ranges_refresh_across_edit_delete_and_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/metatable_lifecycle.lua");
+        let self_index_content = r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:known() end
+            function Class:new()
+                return setmetatable({}, self)
+            end
+
+            Class:new():known()
+        "#;
+        let other_index_content = r#"
+            local Other = {}
+            local Class = {}
+            Class.__index = Other
+            function Class:known() end
+            function Class:new()
+                return setmetatable({}, self)
+            end
+
+            Class:new():known()
+        "#;
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        let has_undefined_method = |ws: &VirtualWorkspace, file_id| {
+            ws.analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default()
+                .iter()
+                .any(|diag| diag.code == undefined_method_code)
+        };
+
+        let initial_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .expect("metatable lifecycle file must be created");
+        assert!(!has_undefined_method(&ws, initial_file_id));
+
+        let edited_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .expect("metatable lifecycle file must be updated");
+        assert!(has_undefined_method(&ws, edited_file_id));
+
+        ws.analysis
+            .remove_file_by_uri(&uri)
+            .expect("metatable lifecycle file must be removed");
+        let reopened_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(other_index_content.to_string()))
+            .expect("metatable lifecycle file must reopen");
+        assert!(has_undefined_method(&ws, reopened_file_id));
+
+        let restored_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(self_index_content.to_string()))
+            .expect("metatable lifecycle file must be restored");
+        assert!(!has_undefined_method(&ws, restored_file_id));
+    }
+
+    #[test]
+    fn test_realm_conflicting_index_owners_remain_conservative() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        ws.def_file(
+            "lua/autorun/server/init.lua",
+            r#"
+            RealmClass = {}
+            RealmClass.__index = RealmClass
+            function RealmClass:known() end
+            include("realm_factory.lua")
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/init.lua",
+            r#"
+            local Other = {}
+            RealmClass = {}
+            RealmClass.__index = Other
+            include("realm_factory.lua")
+            "#,
+        );
+        let shared_file_id = ws.def_file(
+            "lua/realm_factory.lua",
+            r#"
+            function RealmClass:new()
+                return setmetatable({}, self)
+            end
+
+            RealmClass:new():known()
+            "#,
+        );
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_method_code),
+            "expected conflicting realm __index owners to preserve UndefinedMethod, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_realm_mixed_table_and_function_index_remains_conservative() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+        ws.def_file(
+            "lua/autorun/server/init.lua",
+            r#"
+            RealmClass = {}
+            RealmClass.__index = RealmClass
+            function RealmClass:known() end
+            include("realm_function_index.lua")
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/init.lua",
+            r#"
+            RealmClass = {}
+            RealmClass.__index = function(_, key)
+                return rawget(RealmClass, key)
+            end
+            include("realm_function_index.lua")
+            "#,
+        );
+        let shared_file_id = ws.def_file(
+            "lua/realm_function_index.lua",
+            r#"
+            function RealmClass:new()
+                return setmetatable({}, self)
+            end
+
+            RealmClass:new():known()
+            "#,
+        );
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(shared_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diag| diag.code == undefined_method_code),
+            "expected mixed table/function __index owners to preserve UndefinedMethod, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
+    fn test_union_table_and_function_index_remains_conservative() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@class UnionIndexClass
+            local Class = {}
+            ---@type UnionIndexClass|fun(self: table, key: string): unknown
+            local index = Class
+            Class.__index = index
+            function Class:known() end
+
+            function Class:new()
+                return setmetatable({}, self)
+            end
+
+            Class:new():known()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_metatable_factory_missing_method_still_diagnoses() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {}
+            Class.__index = Class
+            function Class:new()
+                return setmetatable({}, self)
+            end
+
+            Class:new():missing()
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_non_self_index_does_not_expose_class_method() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Class = {}
+            local Other = {}
+            Class.__index = Other
+            function Class:known() end
+            function Class:new()
+                return setmetatable({}, self)
+            end
+
+            Class:new():known()
             "#,
         ));
     }

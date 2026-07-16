@@ -23,6 +23,7 @@ use crate::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
         member::{find_members_with_key, merge_open_table_types},
+        resolve_registered_vgui_method_context,
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -525,11 +526,44 @@ fn infer_implicit_method_self_type_inner(
         return Some(scoped_type);
     }
 
-    // 2. General case: infer the enclosing colon-method prefix at its position.
+    // 2. Registered VGUI method tables have a declaration-precise class type.
+    //    Keep this ahead of call-site evidence so sibling methods do not split
+    //    between the raw PANEL table and the registered panel owner.
+    if let Some(context) = resolve_registered_vgui_method_context(db, cache, name_expr) {
+        return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
+    }
+
+    // 3. A colon method selected as a raw table member can be invoked with an
+    // explicit receiver (`callback(self, ...)`). Call-site analysis stores that
+    // receiver in the synthetic slot immediately after the explicit params.
+    if let Some(call_site_type) =
+        infer_implicit_self_type_from_call_site(db, cache.get_file_id(), name_expr)
+    {
+        return Some(call_site_type);
+    }
+
+    // 4. General case: infer the enclosing colon-method prefix at its position.
     //    This is region-aware, so a reused local resolves `self` to the class
     //    of the table backing the current region.
     let prefix_type = infer_enclosing_self_type(db, cache, name_expr)?;
     is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
+}
+
+fn infer_implicit_self_type_from_call_site(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
+    let closure = name_expr.ancestors::<LuaClosureExpr>().next()?;
+    let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if !signature.is_colon_define {
+        return None;
+    }
+    db.get_call_site_param_index()
+        .get_inferred_param(&signature_id, signature.params.len())
+        .filter(|typ| is_concrete_self_receiver_type(typ))
+        .cloned()
 }
 
 /// Resolves `self` for virtual scoped authoring tables (ENT/SWEP/GM),
@@ -2284,6 +2318,10 @@ pub(crate) fn infer_enclosing_self_type(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
+    if let Some(context) = resolve_registered_vgui_method_context(db, cache, name_expr) {
+        return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
+    }
+
     for func_stat in name_expr.ancestors::<LuaFuncStat>() {
         // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
         // walking outward to the enclosing colon method, rather than bailing out

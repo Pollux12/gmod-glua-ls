@@ -1596,7 +1596,7 @@ end
     }
 
     #[test]
-    fn test_call_cast2() {
+    fn test_call_cast_preserves_existing_multiple_inheritance_subtype() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -1628,13 +1628,9 @@ end
         "#,
         );
 
-        let a = ws.expr_ty("a");
-        let a_expected = ws.ty("My1");
-        assert_eq!(a, a_expected);
-
-        let b = ws.expr_ty("b");
-        let b_expected = ws.ty("My2");
-        assert_eq!(b, b_expected);
+        let source_type = LuaType::Def(crate::LuaTypeDeclId::global("My3"));
+        assert_eq!(ws.expr_ty("a"), source_type);
+        assert_eq!(ws.expr_ty("b"), source_type);
     }
 
     #[test]

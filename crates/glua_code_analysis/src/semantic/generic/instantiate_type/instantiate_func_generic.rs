@@ -1,18 +1,13 @@
 use std::{collections::HashSet, ops::Deref, sync::Arc};
 
-use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaFuncStat, LuaNameExpr,
-    LuaVarExpr,
-};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaNameExpr};
 use internment::ArcIntern;
-use rowan::TextSize;
 use smol_str::SmolStr;
 
-use crate::db_index::GmodClassCallLiteral;
 use crate::db_index::find_best_direct_call_arg_role_from_type;
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDocDefaultValue, LuaFunctionType,
-    LuaGenericType, LuaSemanticDeclId, LuaSignatureId, TypeVisitTrait,
+    LuaGenericType, LuaSemanticDeclId, TypeVisitTrait,
     db_index::{DbIndex, LuaType},
     infer_doc_type,
     semantic::{
@@ -311,133 +306,13 @@ fn resolve_vgui_panel_ref_from_arg(
         return None;
     };
 
-    // The enclosing function must be a colon-method (i.e. defined on a PANEL
-    // table).  We don't use the returned self type directly — after
-    // derma.DefineControl the PANEL local is still a plain table, not a
-    // Ref(DCategoryList).  Instead, presence of an enclosing colon method is
-    // the gate that distinguishes PANEL callbacks from arbitrary functions.
-    infer_enclosing_self_type(db, cache, &name_expr)?;
-
-    // Find the enclosing colon-method's receiver PANEL declaration.
-    // This allows us to match the correct registration even when a file
-    // has multiple `local PANEL = {}` blocks.
-    let (receiver_decl_id, receiver_position, receiver_signature_id) =
-        find_enclosing_panel_receiver_context(db, cache, &name_expr)?;
-
-    if *signature_id != receiver_signature_id {
+    let context = crate::semantic::resolve_registered_vgui_method_context(db, cache, &name_expr)?;
+    if *signature_id != context.receiver_signature_id {
         return None;
     }
-
-    // Look up the panel class name from the file's GmodClassMetadataIndex.
-    // Match by declaration: the registration's table argument must resolve
-    // to the same local declaration as the enclosing method's receiver.
-    let gmod_metadata = db.get_gmod_class_metadata_index();
-    let file_metadata = gmod_metadata.get_file_metadata(&file_id)?;
-
-    for call in file_metadata
-        .derma_define_control_calls
-        .iter()
-        .chain(file_metadata.vgui_register_calls.iter())
-    {
-        let Some(panel_name) = get_panel_name_from_call(call) else {
-            continue;
-        };
-        let Some((table_decl_id, region_start, register_position)) =
-            resolve_call_table_registration_region(db, file_id, call)
-        else {
-            continue;
-        };
-        if table_decl_id == receiver_decl_id
-            && receiver_position >= region_start
-            && receiver_position < register_position
-            && gmod_metadata.get_vgui_panel_base(panel_name).is_some()
-        {
-            return Some(LuaType::StringConst(SmolStr::new(panel_name).into()));
-        }
-    }
-
-    None
-}
-
-/// Walk up from `name_expr` to the enclosing colon-method and return the
-/// `LuaDeclId` of its receiver variable (the `PANEL` in `PANEL:Method()`).
-fn find_enclosing_panel_receiver_context(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
-) -> Option<(crate::LuaDeclId, TextSize, LuaSignatureId)> {
-    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
-        if !index_expr
-            .get_index_token()
-            .is_some_and(|token| token.is_colon())
-        {
-            continue;
-        }
-        let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        let file_id = cache.get_file_id();
-        let range = prefix_name.get_range();
-        let local_ref = db.get_reference_index().get_local_reference(&file_id)?;
-        let decl_id = local_ref.get_decl_id(&range)?;
-        let closure = func_stat.get_closure()?;
-        let signature_id = LuaSignatureId::from_closure(file_id, &closure);
-        return Some((decl_id, range.start(), signature_id));
-    }
-    None
-}
-
-/// Return the registered panel class name from a VGUI registration call's
-/// literal arguments (the define / class name arg).
-fn get_panel_name_from_call(call: &crate::db_index::GmodScriptedClassCallMetadata) -> Option<&str> {
-    let define_idx = call.vgui_panel_define_arg_idx();
-    match call.literal_args.get(define_idx)? {
-        Some(GmodClassCallLiteral::String(s)) if !s.is_empty() => Some(s.as_str()),
-        _ => None,
-    }
-}
-
-/// Resolve the registration call's table argument to its local declaration and
-/// active registration region.
-///
-/// Returns `(decl_id, region_start, register_position)` when the table
-/// argument is a simple name reference; otherwise `None`.
-fn resolve_call_table_registration_region(
-    db: &DbIndex,
-    file_id: crate::FileId,
-    call: &crate::db_index::GmodScriptedClassCallMetadata,
-) -> Option<(crate::LuaDeclId, TextSize, TextSize)> {
-    let table_source = call.vgui_panel_roles.as_ref()?.table.as_ref()?;
-    let arg = call.args.get(table_source.arg_idx)?;
-    let range = arg.syntax_id.get_range();
-    let register_position = call.syntax_id.get_range().start();
-    let local_ref = db.get_reference_index().get_local_reference(&file_id)?;
-    let decl_id = local_ref.get_decl_id(&range)?;
-    let region_start =
-        find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
-            .unwrap_or(decl_id.position);
-    Some((decl_id, region_start, register_position))
-}
-
-fn find_latest_decl_write_before_position(
-    db: &DbIndex,
-    file_id: crate::FileId,
-    decl_id: crate::LuaDeclId,
-    position: TextSize,
-) -> Option<TextSize> {
-    db.get_reference_index()
-        .get_decl_references(&file_id, &decl_id)
-        .and_then(|decl_references| {
-            decl_references
-                .cells
-                .iter()
-                .filter(|cell| cell.is_write && cell.range.start() < position)
-                .max_by_key(|cell| cell.range.start())
-                .map(|cell| cell.range.start())
-        })
+    Some(LuaType::StringConst(
+        SmolStr::new(&context.panel_name).into(),
+    ))
 }
 
 pub fn instantiate_func_generic(

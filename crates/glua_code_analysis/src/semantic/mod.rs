@@ -2,6 +2,7 @@ mod cache;
 mod decl;
 mod generic;
 pub(crate) mod gmod_call_effect;
+mod gmod_vgui_context;
 mod guard;
 mod infer;
 mod member;
@@ -21,6 +22,7 @@ use glua_parser::{
     LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken,
     LuaTableExpr,
 };
+pub(crate) use gmod_vgui_context::resolve_registered_vgui_method_context;
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;

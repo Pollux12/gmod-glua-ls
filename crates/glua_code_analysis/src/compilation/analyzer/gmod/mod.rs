@@ -681,6 +681,10 @@ fn collect_annotated_load_dependency_site(
     let target_file_id = path
         .as_deref()
         .and_then(|path| resolve_load_dependency_target(db, file_id, kind, path));
+    let path_keys = path
+        .as_deref()
+        .map(|path| crate::dependency_site_path_keys(db, file_id, path))
+        .unwrap_or_default();
 
     db.get_file_dependencies_index_mut()
         .add_dependency_site(LuaDependencySite {
@@ -688,7 +692,9 @@ fn collect_annotated_load_dependency_site(
             target_file_id,
             kind,
             path,
+            path_keys,
             original_expr: call_expr.syntax().text().to_string(),
+            call_range: call_expr.get_range(),
             range: arg_expr.get_range(),
         });
     Some(())
@@ -2273,6 +2279,9 @@ fn collect_scripted_scope_type_bindings_with(
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
+            let mut table_member_ids = table_member_ids;
+            table_member_ids
+                .sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
             }
@@ -5425,7 +5434,10 @@ fn synthesize_panel_class_with_id(
             for (source_idx, source_range) in member_source_ranges.iter().enumerate() {
                 let is_initializer_fallback = source_idx > 0;
                 let source_owner = LuaMemberOwner::Element(source_range.clone());
-                if let Some(members) = db.get_member_index().get_members(&source_owner) {
+                let members = db
+                    .get_member_index()
+                    .get_current_owner_member_history(&source_owner);
+                if !members.is_empty() {
                     for member in members {
                         let member_position = member.get_id().get_position();
                         if member_position < register_position
@@ -5454,6 +5466,9 @@ fn synthesize_panel_class_with_id(
                 }
             }
 
+            let mut table_member_ids = table_member_ids.into_iter().collect::<Vec<_>>();
+            table_member_ids
+                .sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
             }
@@ -6335,7 +6350,7 @@ impl AnnotatedGmodCallRoles {
                 )
             }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
-            has_load: !self.load_roles.is_empty(),
+            has_load: !self.load_roles.is_empty() || !self.compilefile_roles.is_empty(),
             has_environment: !self.compilefile_roles.is_empty()
                 || (!self.environment_target_roles.is_empty()
                     && !self.environment_table_roles.is_empty()),
@@ -6376,11 +6391,18 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn load_call(&self, is_colon_call: bool) -> Option<(LuaDependencyKind, usize)> {
-        let (kind, role) = self.load_roles.first()?;
-        Some((
-            *kind,
-            param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
-        ))
+        self.load_roles
+            .first()
+            .and_then(|(kind, role)| {
+                Some((
+                    *kind,
+                    param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
+                ))
+            })
+            .or_else(|| {
+                self.compilefile_call(is_colon_call)
+                    .map(|path_arg_idx| (LuaDependencyKind::CompileFile, path_arg_idx))
+            })
     }
 
     fn compilefile_call(&self, is_colon_call: bool) -> Option<usize> {
@@ -9476,7 +9498,7 @@ impl DynamicLoadAlias {
                 path_arg_idx: Some(path_arg_idx),
                 ..Self::default()
             }),
-            LuaDependencyKind::Require => None,
+            LuaDependencyKind::Require | LuaDependencyKind::CompileFile => None,
         }
     }
 
@@ -11115,6 +11137,7 @@ fn resolve_load_dependency_target(
             .find_module_for_file(dependency_path, source_file_id)
             .map(|module| module.file_id),
         LuaDependencyKind::Include
+        | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
         | LuaDependencyKind::IncludeCS => {
             resolve_load_include_target(db, source_file_id, dependency_path).or_else(|| {
@@ -11273,6 +11296,7 @@ fn apply_load_site(
                 );
             }
         }
+        LuaDependencyKind::CompileFile => {}
         LuaDependencyKind::IncludeCS => {
             target_info.client_send_available = true;
             changed |= target_info.mark_states(

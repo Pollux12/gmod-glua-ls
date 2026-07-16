@@ -1497,7 +1497,7 @@ pub(crate) fn unwrapp_return_type(
                     value: call_expr.get_range(),
                 };
 
-                return Ok(materialize_instance_return(inst.get_base().clone(), id));
+                return Ok(materialize_instance_return(return_type.clone(), id));
             }
 
             return Ok(return_type);
@@ -1531,24 +1531,46 @@ pub(crate) fn unwrapp_return_type(
 }
 
 fn materialize_instance_return(base: LuaType, range: InFiled<TextRange>) -> LuaType {
-    match base {
-        LuaType::Union(union) if union.types().any(LuaType::is_nil) => {
-            let non_nil_types = union
-                .types()
-                .filter(|typ| !typ.is_nil())
-                .cloned()
-                .collect::<Vec<_>>();
-            if non_nil_types.is_empty() {
-                return LuaType::Nil;
-            }
+    let (non_nil_base, nullable) = separate_nested_instance_nil(base);
+    let Some(non_nil_base) = non_nil_base else {
+        return LuaType::Nil;
+    };
+    let materialized = LuaType::Instance(LuaInstanceType::new(non_nil_base, range).into());
+    if nullable {
+        LuaType::from_vec(vec![materialized, LuaType::Nil])
+    } else {
+        materialized
+    }
+}
 
-            let instance_base = LuaType::from_vec(non_nil_types);
-            LuaType::from_vec(vec![
-                LuaType::Instance(LuaInstanceType::new(instance_base, range).into()),
-                LuaType::Nil,
-            ])
+fn separate_nested_instance_nil(base: LuaType) -> (Option<LuaType>, bool) {
+    match base {
+        LuaType::Nil => (None, true),
+        LuaType::Union(union) => {
+            let mut nullable = false;
+            let mut non_nil_types = Vec::new();
+            for typ in union.types() {
+                let (non_nil_type, nested_nullable) = separate_nested_instance_nil(typ.clone());
+                nullable |= nested_nullable;
+                if let Some(non_nil_type) = non_nil_type {
+                    non_nil_types.push(non_nil_type);
+                }
+            }
+            let non_nil_type =
+                (!non_nil_types.is_empty()).then(|| LuaType::from_vec(non_nil_types));
+            (non_nil_type, nullable)
         }
-        _ => LuaType::Instance(LuaInstanceType::new(base, range).into()),
+        LuaType::Instance(instance) => {
+            let (non_nil_base, nullable) =
+                separate_nested_instance_nil(instance.get_base().clone());
+            let non_nil_instance = non_nil_base.map(|non_nil_base| {
+                LuaType::Instance(
+                    LuaInstanceType::new(non_nil_base, instance.get_range().clone()).into(),
+                )
+            });
+            (non_nil_instance, nullable)
+        }
+        _ => (Some(base), false),
     }
 }
 

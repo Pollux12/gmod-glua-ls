@@ -32,8 +32,8 @@ pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cac
 use rowan::{TextRange, TextSize};
 
 use super::{
-    InferFailReason, LuaInferCache, SemanticDeclLevel, infer_expr, infer_node_semantic_decl,
-    infer_table_should_be,
+    InferFailReason, LuaInferCache, SemanticDeclLevel, infer_expr, infer_expr_list_value_type_at,
+    infer_node_semantic_decl, infer_table_should_be,
 };
 
 pub fn get_buildin_type_map_type_id(type_: &LuaType) -> Option<LuaTypeDeclId> {
@@ -288,6 +288,17 @@ pub(crate) struct DynamicFieldResolution {
     pub semantic_decl: Option<LuaSemanticDeclId>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DynamicFieldDefinitionVisibility {
+    Runtime,
+    ShapeOnly,
+}
+
+struct VisibleDynamicFieldDefinition {
+    location: InFiled<TextRange>,
+    visibility: DynamicFieldDefinitionVisibility,
+}
+
 pub(crate) fn resolve_dynamic_field_member(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -321,9 +332,10 @@ pub(crate) fn resolve_dynamic_field_member(
 
     let mut member_types = Vec::new();
     let mut semantic_decl = None;
+    let mut has_runtime_type = false;
     for definition in definitions {
-        let Some(member_id) = dynamic_field_member_id(db, definition.file_id, definition.value)
-        else {
+        let location = definition.location;
+        let Some(member_id) = dynamic_field_member_id(db, location.file_id, location.value) else {
             continue;
         };
         if semantic_decl.is_none() {
@@ -331,7 +343,14 @@ pub(crate) fn resolve_dynamic_field_member(
         }
         if let Some(typ) = dynamic_field_member_type(db, cache, &member_id) {
             member_types.push(typ);
+            if definition.visibility == DynamicFieldDefinitionVisibility::Runtime {
+                has_runtime_type = true;
+            }
         }
+    }
+
+    if !member_types.is_empty() && !has_runtime_type {
+        member_types.push(LuaType::Nil);
     }
 
     let typ = match member_types.as_slice() {
@@ -407,12 +426,13 @@ fn dynamic_field_member_type_inner(
         let assign_node = index_expr.syntax().parent()?;
         let assign_stat = LuaAssignStat::cast(assign_node)?;
         let (vars, exprs) = assign_stat.get_var_and_expr_list();
-        for (var, expr) in vars.iter().zip(exprs.iter()) {
-            if var.syntax().text_range() == node.text_range() {
-                let mut definition_cache = dynamic_field_definition_cache(cache, member_id.file_id);
-                return infer_expr(db, &mut definition_cache, expr.clone()).ok();
-            }
-        }
+        let value_idx = vars
+            .iter()
+            .position(|var| var.syntax().text_range() == node.text_range())?;
+        let mut definition_cache = dynamic_field_definition_cache(cache, member_id.file_id);
+        return infer_expr_list_value_type_at(db, &mut definition_cache, &exprs, value_idx)
+            .ok()
+            .map(|typ| typ.unwrap_or(LuaType::Nil));
     }
 
     None
@@ -431,7 +451,7 @@ fn dynamic_field_definitions(
     prefix_type: &LuaType,
     field_name: &str,
     access_position: Option<TextSize>,
-) -> Vec<crate::InFiled<TextRange>> {
+) -> Vec<VisibleDynamicFieldDefinition> {
     match prefix_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => dynamic_field_definitions_for_owner(
             db,
@@ -464,36 +484,63 @@ fn dynamic_field_definitions_for_owner(
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
     access_position: Option<TextSize>,
-) -> Vec<crate::InFiled<TextRange>> {
+) -> Vec<VisibleDynamicFieldDefinition> {
     let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
     let caller_realm = infer_dynamic_field_caller_realm(db, &caller_file_id);
+    let access_function = access_position.and_then(|position| {
+        db.get_member_index()
+            .enclosing_function_scope_range(caller_file_id, position)
+    });
     db.get_dynamic_field_index()
         .get_field_definitions(owner, field_name)
         .into_iter()
         .filter(|definition| dynamic_fields_global || definition.file_id == caller_file_id)
         .filter(|definition| is_dynamic_field_realm_compatible(db, caller_realm, definition))
-        .filter(|definition| {
-            dynamic_field_definition_visible_at(db, caller_file_id, definition, access_position)
+        .filter_map(|definition| {
+            dynamic_field_definition_visibility_at(
+                db,
+                caller_file_id,
+                &definition,
+                access_position,
+                access_function,
+            )
+            .map(|visibility| VisibleDynamicFieldDefinition {
+                location: definition,
+                visibility,
+            })
         })
         .collect()
 }
 
-fn dynamic_field_definition_visible_at(
+fn dynamic_field_definition_visibility_at(
     db: &DbIndex,
     caller_file_id: FileId,
     definition: &crate::InFiled<TextRange>,
     access_position: Option<TextSize>,
-) -> bool {
+    access_function: Option<TextRange>,
+) -> Option<DynamicFieldDefinitionVisibility> {
     let Some(access_position) = access_position else {
-        return true;
+        return Some(DynamicFieldDefinitionVisibility::Runtime);
     };
     if definition.file_id != caller_file_id {
-        return true;
+        return Some(DynamicFieldDefinitionVisibility::Runtime);
     }
-    if definition.value.start() > access_position {
-        return false;
+    if definition_enclosing_assignment_contains(db, definition, access_position) {
+        return None;
     }
-    !definition_enclosing_assignment_contains(db, definition, access_position)
+
+    let member_index = db.get_member_index();
+    let definition_function =
+        member_index.enclosing_function_scope_range(definition.file_id, definition.value.start());
+
+    if definition_function != access_function
+        && (definition_function.is_some() || access_function.is_some())
+    {
+        return Some(DynamicFieldDefinitionVisibility::ShapeOnly);
+    }
+
+    (definition.value.start() <= access_position)
+        .then_some(DynamicFieldDefinitionVisibility::Runtime)
 }
 
 fn definition_enclosing_assignment_contains(

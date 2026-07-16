@@ -1,83 +1,156 @@
+use std::{
+    collections::{HashMap, HashSet},
+    sync::{Arc, Mutex, OnceLock},
+};
+
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclExtra, LuaInferCache, LuaInferenceConfidence,
-    LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
-    LuaSignatureId, LuaType, LuaTypeFact, infer_expr, profile::Profile,
+    DbIndex, FileId, InFiled, LuaDeclExtra, LuaDeclId, LuaDependencyKind, LuaInferCache,
+    LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
+    LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberOwner, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId, get_member_value_expr,
+    get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaNameExpr,
-    LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
+    LuaIfStat, LuaIndexKey, LuaNameExpr, LuaReturnStat, LuaVarExpr, PathTrait,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use super::{AnalysisPipeline, AnalyzeContext};
 
 pub struct CallSiteParamAnalysisPipeline;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SignatureLookupKind {
+    Direct,
+    InferredCallable,
+    IncludeReturnedMember,
+}
+
+#[derive(Debug)]
+struct ReturnedTableInfo {
+    member_signatures: Vec<ReturnedMemberSignature>,
+}
+
+#[derive(Debug)]
+struct ReturnedMemberSignature {
+    member_id: LuaMemberId,
+    signature_id: LuaSignatureId,
+    history: LuaMemberIndexItem,
+}
+
+// Shared by all parallel file workers in one analysis pass. Each exact include
+// target gets its own once-cell, so different targets initialize concurrently
+// while each target's return, members, and histories are scanned at most once,
+// including misses.
+type ReturnedTableCache = Mutex<HashMap<FileId, Arc<OnceLock<Option<Arc<ReturnedTableInfo>>>>>>;
+
 impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
-        let _p = Profile::cond_new("call-site param analyze", context.tree_list.len() > 1);
-        let mut trees = context.tree_list.clone();
-        trees.sort_by_key(|tree| tree.file_id.id);
+        analyze_call_site_param_files(db, context);
+    }
+}
 
-        let source_signature_updates = trees
-            .iter()
-            .map(|tree| {
-                let root = tree.value.get_root().clone();
-                (tree.file_id, source_signatures_in_file(tree.file_id, &root))
-            })
-            .collect();
-        db.get_call_site_param_index_mut()
-            .set_files_source_signatures(source_signature_updates);
+fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut trees = context.tree_list.clone();
+    if trees.is_empty() {
+        return;
+    }
+    let _p = Profile::cond_new("call-site param analyze", trees.len() > 1);
+    trees.sort_by_key(|tree| tree.file_id.id);
 
-        // The contribution collection reads only immutable state (signature
-        // index, the source-signature map just installed above, decl/reference
-        // indexes from earlier passes) and writes to per-file local buffers, so
-        // it runs concurrently across files. A fresh per-file infer cache is
-        // used (the db is immutable during this pass, so a cold cache yields
-        // identical inference). Results merge sequentially in file-id order.
-        let file_ids: Vec<FileId> = trees.iter().map(|tree| tree.file_id).collect();
-        let contribution_updates =
-            super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
-                let mut contributions = Vec::new();
-                let Some(root) = db
-                    .get_vfs()
-                    .get_syntax_tree(&file_id)
-                    .map(|tree| tree.get_chunk_node())
-                else {
-                    return (file_id, contributions, Default::default());
-                };
-                let mut cache = LuaInferCache::new(
-                    file_id,
-                    crate::CacheOptions {
-                        analysis_phase: crate::LuaAnalysisPhase::Force,
-                    },
-                );
-                for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
-                    collect_call_site_param_types(
-                        db,
-                        &mut cache,
-                        file_id,
-                        call_expr,
-                        &mut contributions,
-                    );
-                }
-                (
+    let source_signature_updates = trees
+        .iter()
+        .map(|tree| {
+            let root = tree.value.get_root().clone();
+            (
+                tree.file_id,
+                source_signatures_in_file(db, tree.file_id, &root),
+            )
+        })
+        .collect();
+    db.get_call_site_param_index_mut()
+        .set_files_source_signatures(source_signature_updates);
+
+    // The contribution collection reads only immutable state (signature
+    // index, the source-signature map just installed above, decl/reference
+    // indexes from earlier passes) and writes to per-file local buffers, so
+    // it runs concurrently across files. A fresh per-file infer cache is
+    // used (the db is immutable during this pass, so a cold cache yields
+    // identical inference). Results merge sequentially in file-id order.
+    let file_ids: Vec<FileId> = trees.iter().map(|tree| tree.file_id).collect();
+    let returned_table_cache = ReturnedTableCache::default();
+    let contribution_updates =
+        super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
+            let mut contributions = Vec::new();
+            let mut receiver_signatures = Vec::new();
+            let mut exact_receiver_eligibility = HashMap::new();
+            let Some(root) = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| tree.get_chunk_node())
+            else {
+                return (
                     file_id,
                     contributions,
-                    cache.take_inferred_guard_dependencies(),
-                )
-            });
-        let mut fact_updates = Vec::with_capacity(contribution_updates.len());
-        for (file_id, contributions, dependencies) in contribution_updates {
-            context.add_inferred_guard_dependencies(file_id, dependencies);
-            fact_updates.push((file_id, contributions));
+                    receiver_signatures,
+                    Default::default(),
+                );
+            };
+            let mut cache = LuaInferCache::new(
+                file_id,
+                crate::CacheOptions {
+                    analysis_phase: crate::LuaAnalysisPhase::Force,
+                },
+            );
+            for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+                collect_call_site_param_types(
+                    db,
+                    &mut cache,
+                    file_id,
+                    call_expr,
+                    &returned_table_cache,
+                    &mut exact_receiver_eligibility,
+                    &mut contributions,
+                    &mut receiver_signatures,
+                );
+            }
+            (
+                file_id,
+                contributions,
+                receiver_signatures,
+                cache.take_inferred_guard_dependencies(),
+            )
+        });
+    let mut fact_updates = Vec::with_capacity(contribution_updates.len());
+    let mut receiver_signatures = Vec::new();
+    for (file_id, contributions, file_receiver_signatures, dependencies) in contribution_updates {
+        context.add_inferred_guard_dependencies(file_id, dependencies);
+        fact_updates.push((file_id, contributions));
+        receiver_signatures.extend(file_receiver_signatures);
+    }
+    db.get_call_site_param_index_mut()
+        .set_files_fact_contributions(fact_updates);
+    receiver_signatures.sort_unstable_by_key(|signature_id| {
+        (signature_id.get_file_id().id, signature_id.get_position())
+    });
+    receiver_signatures.dedup();
+    let mut invalidated_return = false;
+    for signature_id in receiver_signatures {
+        if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
+            && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+        {
+            signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+            invalidated_return = true;
         }
-        db.get_call_site_param_index_mut()
-            .set_files_fact_contributions(fact_updates);
+    }
+    if invalidated_return {
+        context.mark_call_site_return_invalidation();
     }
 }
 
 fn source_signatures_in_file(
+    db: &DbIndex,
     file_id: FileId,
     root: &glua_parser::LuaSyntaxNode,
 ) -> Vec<(String, LuaSignatureId, Vec<usize>)> {
@@ -93,7 +166,14 @@ fn source_signatures_in_file(
                 .get_func_name()
                 .and_then(|func_name| func_name.get_access_path())?;
             let closure = func_stat.get_closure()?;
-            let mutated = get_mutated_params(&closure);
+            let is_colon_define = func_stat
+                .get_func_name()
+                .and_then(|func_name| match func_name {
+                    LuaVarExpr::IndexExpr(index_expr) => index_expr.get_index_token(),
+                    LuaVarExpr::NameExpr(_) => None,
+                })
+                .is_some_and(|token| token.is_colon());
+            let mutated = get_mutated_params(db, file_id, &closure, is_colon_define);
             Some((
                 path.to_string(),
                 LuaSignatureId::from_closure(file_id, &closure),
@@ -103,20 +183,43 @@ fn source_signatures_in_file(
         .collect()
 }
 
-fn get_mutated_params(closure: &LuaClosureExpr) -> Vec<usize> {
+fn get_mutated_params(
+    db: &DbIndex,
+    file_id: FileId,
+    closure: &LuaClosureExpr,
+    has_implicit_receiver: bool,
+) -> Vec<usize> {
     let Some(params_list) = closure.get_params_list() else {
         return Vec::new();
     };
     let mut mutated = Vec::new();
+    let explicit_param_count = params_list.get_params().count();
     let params = params_list
         .get_params()
         .enumerate()
         .filter_map(|(idx, param)| {
-            param
-                .get_name_token()
-                .map(|token| (idx, token.get_name_text().to_string()))
+            param.get_name_token().map(|token| {
+                let name = token.get_name_text().to_string();
+                let is_receiver_binding = !has_implicit_receiver && idx == 0 && name == "self";
+                let receiver_decl_id =
+                    is_receiver_binding.then(|| LuaDeclId::new(file_id, token.get_range().start()));
+                (idx, name, is_receiver_binding, receiver_decl_id)
+            })
         })
         .collect::<Vec<_>>();
+
+    let params = if has_implicit_receiver {
+        let mut params = params;
+        params.push((
+            explicit_param_count,
+            "self".to_string(),
+            true,
+            implicit_receiver_decl_id(file_id, closure),
+        ));
+        params
+    } else {
+        params
+    };
 
     if params.is_empty() {
         return Vec::new();
@@ -126,14 +229,39 @@ fn get_mutated_params(closure: &LuaClosureExpr) -> Vec<usize> {
         return Vec::new();
     };
 
+    let file_refs = db.get_reference_index().get_local_reference(&file_id);
     for assign in block.descendants::<LuaAssignStat>() {
-        if assign.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
-            continue;
-        }
+        let is_direct_closure =
+            assign.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure);
         let (vars, _) = assign.get_var_and_expr_list();
         for var in vars {
-            for (idx, param_name) in &params {
-                if var_writes_param(&var, param_name) {
+            for (idx, param_name, is_receiver_binding, receiver_decl_id) in &params {
+                let is_mutated = if *is_receiver_binding {
+                    let LuaVarExpr::NameExpr(name_expr) = &var else {
+                        continue;
+                    };
+                    if name_expr
+                        .get_name_text()
+                        .is_none_or(|name| name.as_str() != param_name)
+                    {
+                        continue;
+                    }
+                    let write_decl_id =
+                        file_refs.and_then(|refs| refs.get_decl_id(&name_expr.get_range()));
+                    match (*receiver_decl_id, write_decl_id) {
+                        (Some(receiver_decl_id), Some(write_decl_id)) => {
+                            receiver_decl_id == write_decl_id
+                        }
+                        // Declaration identity should normally be available. Preserve the old,
+                        // direct-closure behavior as the narrow syntax fallback.
+                        _ => is_direct_closure,
+                    }
+                } else if is_direct_closure {
+                    var_writes_param(&var, param_name)
+                } else {
+                    false
+                };
+                if is_mutated {
                     if !mutated.contains(idx) {
                         mutated.push(*idx);
                     }
@@ -145,33 +273,63 @@ fn get_mutated_params(closure: &LuaClosureExpr) -> Vec<usize> {
     mutated
 }
 
+fn implicit_receiver_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<LuaDeclId> {
+    let LuaVarExpr::IndexExpr(func_name) = closure.get_parent::<LuaFuncStat>()?.get_func_name()?
+    else {
+        return None;
+    };
+    let index_token = func_name.get_index_token()?;
+    if !index_token.is_colon() {
+        return None;
+    }
+    Some(LuaDeclId::new(file_id, index_token.get_range().start()))
+}
+
 fn collect_call_site_param_types(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     file_id: FileId,
     call_expr: LuaCallExpr,
+    returned_table_cache: &ReturnedTableCache,
+    exact_receiver_eligibility: &mut HashMap<LuaSignatureId, bool>,
     contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+    receiver_signatures: &mut Vec<LuaSignatureId>,
 ) -> Option<()> {
     let args = call_expr.get_args_list()?;
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    if let Some(signature_id) = collect_exact_colon_receiver_type(
+        db,
+        cache,
+        file_id,
+        &call_expr,
+        &prefix_expr,
+        exact_receiver_eligibility,
+        contributions,
+    ) {
+        receiver_signatures.push(signature_id);
+    }
+
     let useful_args = args
         .get_args()
         .enumerate()
         .filter(|(_, arg)| is_supported_call_site_arg_shape(db, file_id, arg))
         .collect::<Vec<_>>();
     if useful_args.is_empty() {
-        return None;
+        return Some(());
     }
 
-    let prefix_expr = call_expr.get_prefix_expr()?;
     let colon_call_arg_shift = usize::from(call_expr.is_colon_call());
-    let has_self_arg = useful_args.iter().any(|(_, arg)| is_self_name_expr(arg));
-    let (signature_ids, inferred_callable_union) = signature_ids_from_call_prefix(
+    let first_arg_is_self = useful_args
+        .iter()
+        .any(|(arg_idx, arg)| *arg_idx == 0 && is_self_name_expr(arg));
+    let (signature_ids, lookup_kind) = signature_ids_from_call_prefix(
         db,
         cache,
         file_id,
         &prefix_expr,
         call_expr.get_position(),
-        has_self_arg,
+        first_arg_is_self,
+        returned_table_cache,
     );
     for signature_id in signature_ids {
         if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
@@ -181,19 +339,52 @@ fn collect_call_site_param_types(
             continue;
         };
         for (arg_idx, arg) in &useful_args {
-            if inferred_callable_union && !is_self_name_expr(arg) {
-                continue;
+            let is_implicit_receiver = signature.is_colon_define
+                && !call_expr.is_colon_call()
+                && *arg_idx == 0
+                && is_self_name_expr(arg);
+            let is_exact_include_receiver = lookup_kind
+                == SignatureLookupKind::IncludeReturnedMember
+                && !call_expr.is_colon_call()
+                && *arg_idx == 0
+                && is_self_name_expr(arg)
+                && (signature.is_colon_define
+                    || signature
+                        .params
+                        .first()
+                        .is_some_and(|param| param == "self"));
+            match lookup_kind {
+                SignatureLookupKind::Direct => {}
+                SignatureLookupKind::InferredCallable if !is_self_name_expr(arg) => continue,
+                SignatureLookupKind::IncludeReturnedMember if !is_exact_include_receiver => {
+                    continue;
+                }
+                _ => {}
             }
-            let param_idx = *arg_idx + colon_call_arg_shift;
-            if param_idx >= signature.params.len() || signature.param_docs.contains_key(&param_idx)
+            let param_idx = if is_implicit_receiver {
+                signature.params.len()
+            } else if signature.is_colon_define && !call_expr.is_colon_call() {
+                let Some(param_idx) = arg_idx.checked_sub(1) else {
+                    continue;
+                };
+                param_idx
+            } else if signature.is_colon_define {
+                *arg_idx
+            } else {
+                *arg_idx + colon_call_arg_shift
+            };
+            if (!is_implicit_receiver && param_idx >= signature.params.len())
+                || signature.param_docs.contains_key(&param_idx)
             {
                 continue;
             }
-            let Some(param_name) = signature.params.get(param_idx) else {
-                continue;
-            };
-            if !has_gmod_param_name_hint(db, param_name) {
-                continue;
+            if !is_implicit_receiver && !is_exact_include_receiver {
+                let Some(param_name) = signature.params.get(param_idx) else {
+                    continue;
+                };
+                if !has_gmod_param_name_hint(db, param_name) {
+                    continue;
+                }
             }
             if db
                 .get_call_site_param_index()
@@ -238,6 +429,130 @@ fn collect_call_site_param_types(
     }
 
     Some(())
+}
+
+fn collect_exact_colon_receiver_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    prefix_expr: &LuaExpr,
+    exact_receiver_eligibility: &mut HashMap<LuaSignatureId, bool>,
+    contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+) -> Option<LuaSignatureId> {
+    if !call_expr.is_colon_call() {
+        return None;
+    }
+    let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
+        return None;
+    };
+    let receiver_expr = index_expr.get_prefix_expr()?;
+    let signature_id = get_prefix_expr_signature_id(db, cache, call_expr)?;
+    if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
+        return None;
+    }
+
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if signature.is_colon_define
+        || signature.params.first().is_none_or(|param| param != "self")
+        || signature.param_docs.contains_key(&0)
+        || db
+            .get_call_site_param_index()
+            .is_param_mutated(&signature_id, 0)
+        || !*exact_receiver_eligibility
+            .entry(signature_id)
+            .or_insert_with(|| exact_explicit_self_param_is_eligible(db, signature_id))
+    {
+        return None;
+    }
+
+    let receiver_type = infer_expr(db, cache, receiver_expr.clone()).ok()?;
+    if receiver_type.is_unknown()
+        || receiver_type.is_any()
+        || receiver_type.is_never()
+        || matches!(receiver_type, LuaType::Union(_) | LuaType::Intersection(_))
+    {
+        return None;
+    }
+
+    let node = LuaInferenceNodeId::SignatureParam {
+        signature_id,
+        param_idx: 0,
+    };
+    let event = LuaInferenceEventId {
+        node,
+        kind: LuaInferenceProvenanceKind::ContextualUnknown,
+        source: InFiled::new(file_id, receiver_expr.get_syntax_id()),
+    };
+    contributions.push((
+        signature_id,
+        0,
+        LuaTypeFact::new(
+            receiver_type,
+            LuaInferenceConfidence::Anchored,
+            vec![LuaInferenceStep {
+                event,
+                support: vec![].into(),
+                found_type: None,
+            }]
+            .into(),
+        ),
+    ));
+    Some(signature_id)
+}
+
+fn exact_explicit_self_param_is_eligible(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+    if !matches!(
+        signature.resolve_return,
+        crate::SignatureReturnStatus::UnResolve | crate::SignatureReturnStatus::InferResolve
+    ) {
+        return false;
+    }
+
+    let Some(closure) = exact_signature_closure(db, signature_id) else {
+        return false;
+    };
+    if get_mutated_params(db, signature_id.get_file_id(), &closure, false).contains(&0) {
+        return false;
+    }
+    let Some(self_decl_id) = closure
+        .get_params_list()
+        .and_then(|params| params.get_params().next())
+        .and_then(|param| param.get_name_token())
+        .map(|token| LuaDeclId::new(signature_id.get_file_id(), token.get_range().start()))
+    else {
+        return false;
+    };
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+
+    block.descendants::<LuaReturnStat>().any(|return_stat| {
+        if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(&closure) {
+            return false;
+        }
+        return_stat.descendants::<LuaNameExpr>().any(|name_expr| {
+            db.get_reference_index()
+                .get_var_reference_decl(&signature_id.get_file_id(), name_expr.get_range())
+                == Some(self_decl_id)
+        })
+    })
+}
+
+fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option<LuaClosureExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())
+        .map(|tree| tree.get_red_root())?;
+    root.token_at_offset(signature_id.get_position())
+        .right_biased()
+        .and_then(|token| token.parent_ancestors().find_map(LuaClosureExpr::cast))
+        .filter(|closure| {
+            LuaSignatureId::from_closure(signature_id.get_file_id(), closure) == signature_id
+        })
 }
 
 fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {
@@ -286,8 +601,9 @@ fn signature_ids_from_call_prefix(
     file_id: FileId,
     prefix_expr: &LuaExpr,
     call_position: TextSize,
-    infer_callable_union: bool,
-) -> (Vec<LuaSignatureId>, bool) {
+    first_arg_is_self: bool,
+    returned_table_cache: &ReturnedTableCache,
+) -> (Vec<LuaSignatureId>, SignatureLookupKind) {
     let direct = match prefix_expr {
         LuaExpr::NameExpr(name_expr) => {
             signature_id_from_name_expr(db, file_id, name_expr, call_position)
@@ -299,22 +615,686 @@ fn signature_ids_from_call_prefix(
         _ => None,
     };
     if let Some(signature_id) = direct {
-        return (vec![signature_id], false);
+        return (vec![signature_id], SignatureLookupKind::Direct);
     }
-    if !infer_callable_union {
-        return (Vec::new(), false);
+    if !first_arg_is_self {
+        return (Vec::new(), SignatureLookupKind::InferredCallable);
     }
 
-    let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
-        return (Vec::new(), true);
-    };
     let mut signature_ids = Vec::new();
-    collect_signature_ids(&prefix_type, &mut signature_ids);
+    if let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) {
+        collect_signature_ids(&prefix_type, &mut signature_ids);
+    }
+    let mut lookup_kind = SignatureLookupKind::InferredCallable;
+    if let LuaExpr::NameExpr(name_expr) = prefix_expr {
+        let include_signature_ids = signature_ids_from_include_returned_table_member(
+            db,
+            cache,
+            file_id,
+            name_expr,
+            call_position,
+            returned_table_cache,
+        );
+        if !include_signature_ids.is_empty() {
+            signature_ids = include_signature_ids;
+            lookup_kind = SignatureLookupKind::IncludeReturnedMember;
+        }
+    }
     signature_ids.sort_unstable_by_key(|signature_id| {
         (signature_id.get_file_id().id, signature_id.get_position())
     });
     signature_ids.dedup();
-    (signature_ids, true)
+    (signature_ids, lookup_kind)
+}
+
+fn signature_ids_from_include_returned_table_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    call_position: TextSize,
+    returned_table_cache: &ReturnedTableCache,
+) -> Vec<LuaSignatureId> {
+    let Some(file_refs) = db.get_reference_index().get_local_reference(&file_id) else {
+        return Vec::new();
+    };
+    let Some(decl_id) = file_refs.get_decl_id(&name_expr.get_range()) else {
+        return Vec::new();
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return Vec::new();
+    };
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. }) || decl.get_position() > call_position {
+        return Vec::new();
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return Vec::new();
+    };
+    let Some(LuaExpr::IndexExpr(index_expr)) = decl
+        .get_value_syntax_id()
+        .and_then(|syntax_id| syntax_id.to_node_from_root(&root))
+        .and_then(LuaExpr::cast)
+    else {
+        return Vec::new();
+    };
+    if file_refs
+        .get_decl_references(&decl_id)
+        .is_some_and(|references| {
+            references.cells.iter().any(|cell| {
+                cell.is_write
+                    && cell.range.start() >= index_expr.get_range().end()
+                    && cell.range.start() < call_position
+                    && !write_only_replaces_absent_callback(&root, cell.range, name_expr)
+            })
+        })
+    {
+        return Vec::new();
+    }
+    if !matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))) {
+        return Vec::new();
+    }
+    let Some(source_expr) = index_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+
+    let Some(member_id) = exact_source_member_id(db, cache, &source_expr) else {
+        return Vec::new();
+    };
+    let mut visited = HashSet::new();
+    let target_file_ids =
+        include_targets_from_member(db, cache, file_id, call_position, member_id, &mut visited);
+    let [target_file_id] = target_file_ids.as_slice() else {
+        return Vec::new();
+    };
+
+    returned_table_info(db, returned_table_cache, *target_file_id)
+        .into_iter()
+        .flat_map(|returned_table| {
+            returned_table
+                .member_signatures
+                .iter()
+                .filter_map(|member| {
+                    (stable_visible_member_id_from_history(
+                        db,
+                        &member.history,
+                        file_id,
+                        call_position,
+                    ) == Some(member.member_id))
+                    .then_some(member.signature_id)
+                })
+                .collect::<Vec<_>>()
+        })
+        .collect()
+}
+
+fn exact_source_member_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    source_expr: &LuaExpr,
+) -> Option<LuaMemberId> {
+    let member_id = match source_expr {
+        LuaExpr::IndexExpr(index_expr) => {
+            let semantic_decl = infer_expr_semantic_decl(
+                db,
+                cache,
+                LuaExpr::IndexExpr(index_expr.clone()),
+                Default::default(),
+                Default::default(),
+            );
+            match semantic_decl {
+                Some(LuaSemanticDeclId::Member(member_id)) => member_id,
+                Some(_) => return None,
+                None => exact_index_member_candidate(db, cache, index_expr)?,
+            }
+        }
+        LuaExpr::ParenExpr(paren_expr) => {
+            exact_source_member_id(db, cache, &paren_expr.get_expr()?)?
+        }
+        LuaExpr::CallExpr(call_expr) => {
+            let signature_id = get_prefix_expr_signature_id(db, cache, call_expr)?;
+            let guarded_arg_idx = exact_returned_arg_idx(db, call_expr, signature_id)?;
+            let guarded_arg = call_expr.get_args_list()?.get_args().nth(guarded_arg_idx)?;
+            exact_source_member_id(db, cache, &guarded_arg)?
+        }
+        _ => return None,
+    };
+
+    Some(member_id)
+}
+
+fn exact_index_member_candidate(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &glua_parser::LuaIndexExpr,
+) -> Option<LuaMemberId> {
+    let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
+    let owner = match prefix_type {
+        LuaType::TableConst(table_id) => LuaMemberOwner::Element(table_id),
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => LuaMemberOwner::Type(type_id),
+        _ => return None,
+    };
+    let member_key =
+        crate::LuaMemberKey::from_index_key(db, cache, &index_expr.get_index_key()?).ok()?;
+    let member_ids = db
+        .get_member_index()
+        .get_member_item(&owner, &member_key)?
+        .get_member_ids();
+    member_ids
+        .into_iter()
+        .min_by_key(|member_id| (member_id.file_id.id, u32::from(member_id.get_position())))
+}
+
+fn exact_returned_arg_idx(
+    db: &DbIndex,
+    call_expr: &LuaCallExpr,
+    signature_id: LuaSignatureId,
+) -> Option<usize> {
+    // Template correlation (`f<T>(value: T): T`) does not prove that a call
+    // returns the same value. `assert` is the one language-library primitive
+    // this path needs to unwrap; require its resolved signature to come from
+    // the embedded standard-library workspace so local shadows stay opaque.
+    (call_expr.is_assert()
+        && db
+            .get_module_index()
+            .get_workspace_id(signature_id.get_file_id())
+            == Some(WorkspaceId::STD))
+    .then_some(0)
+}
+
+fn stable_visible_member_id_at_call(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    caller_file_id: FileId,
+    call_position: TextSize,
+) -> Option<LuaMemberId> {
+    let history_item = member_history_item(db, member_id)?;
+    stable_visible_member_id_from_history(db, &history_item, caller_file_id, call_position)
+}
+
+fn member_history_item(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaMemberIndexItem> {
+    let member = db.get_member_index().get_member(&member_id)?;
+    let owner = db.get_member_index().get_current_owner(&member_id)?;
+    let historical_ids = db
+        .get_member_index()
+        .get_current_owner_members_for_key(owner, member.get_key())
+        .into_iter()
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    let history_item = match historical_ids.as_slice() {
+        [] => return None,
+        [member_id] => LuaMemberIndexItem::One(*member_id),
+        _ => LuaMemberIndexItem::Many(historical_ids),
+    };
+    Some(history_item)
+}
+
+fn stable_visible_member_id_from_history(
+    db: &DbIndex,
+    history_item: &LuaMemberIndexItem,
+    caller_file_id: FileId,
+    call_position: TextSize,
+) -> Option<LuaMemberId> {
+    let visible_ids = history_item.visible_member_ids_with_realm_at_offset_from_history(
+        db,
+        &caller_file_id,
+        call_position,
+    );
+    match visible_ids.as_slice() {
+        [visible_id] => Some(*visible_id),
+        [] => {
+            // Same-file members assigned in a realm branch are hidden by the
+            // general control-flow visibility rule once execution leaves that
+            // branch. For this exact-source lookup, the caller's realm is
+            // sufficient to recover a single earlier assignment. Multiple
+            // compatible writes remain ambiguous and are rejected.
+            let caller_mask = db
+                .get_gmod_infer_index()
+                .get_state_mask_at_offset(&caller_file_id, call_position);
+            let compatible_ids = history_item
+                .get_member_ids()
+                .into_iter()
+                .filter(|candidate_id| {
+                    (candidate_id.file_id != caller_file_id
+                        || candidate_id.get_position() < call_position)
+                        && member_has_narrower_enclosing_realm(db, *candidate_id)
+                        && caller_mask.is_compatible_with(
+                            db.get_gmod_infer_index().get_state_mask_at_offset(
+                                &candidate_id.file_id,
+                                candidate_id.get_position(),
+                            ),
+                        )
+                })
+                .collect::<Vec<_>>();
+            let [compatible_id] = compatible_ids.as_slice() else {
+                return None;
+            };
+            Some(*compatible_id)
+        }
+        _ => None,
+    }
+}
+
+fn member_has_narrower_enclosing_realm(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let infer_index = db.get_gmod_infer_index();
+    let member_mask =
+        infer_index.get_state_mask_at_offset(&member_id.file_id, member_id.get_position());
+    if member_mask.is_empty() {
+        return false;
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+        return false;
+    };
+
+    node.ancestors().filter_map(LuaIfStat::cast).any(|if_stat| {
+        infer_index.get_state_mask_at_offset(&member_id.file_id, if_stat.get_position())
+            != member_mask
+    })
+}
+
+fn include_targets_from_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    call_position: TextSize,
+    member_id: LuaMemberId,
+    visited: &mut HashSet<LuaMemberId>,
+) -> Vec<FileId> {
+    let Some(history) = member_history_item(db, member_id) else {
+        return Vec::new();
+    };
+    let candidate_member_ids =
+        history.visible_member_ids_with_realm_at_offset(db, &caller_file_id, call_position);
+    let candidate_member_ids = possible_member_assignments_by_scope(db, candidate_member_ids);
+    let mut targets = Vec::new();
+    for candidate_member_id in candidate_member_ids {
+        targets.extend(include_targets_from_exact_member(
+            db,
+            cache,
+            caller_file_id,
+            call_position,
+            candidate_member_id,
+            visited,
+        ));
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn possible_member_assignments_by_scope(
+    db: &DbIndex,
+    mut member_ids: Vec<LuaMemberId>,
+) -> Vec<LuaMemberId> {
+    member_ids.sort_unstable_by_key(|member_id| {
+        let scope = db
+            .get_member_index()
+            .member_function_scope_range(*member_id);
+        (
+            member_id.file_id.id,
+            scope.map(|range| range.start()),
+            scope.map(|range| range.end()),
+            member_id.get_position(),
+        )
+    });
+
+    let mut possible_ids = Vec::with_capacity(member_ids.len());
+    let mut current_scope = None;
+    let mut current_scope_start = 0;
+    for member_id in member_ids {
+        let scope = (
+            member_id.file_id,
+            db.get_member_index().member_function_scope_range(member_id),
+        );
+        if current_scope != Some(scope) {
+            current_scope = Some(scope);
+            current_scope_start = possible_ids.len();
+        }
+
+        if !db
+            .get_member_index()
+            .is_non_overwriting_assignment_member(member_id)
+        {
+            possible_ids.truncate(current_scope_start);
+        }
+        possible_ids.push(member_id);
+    }
+    possible_ids
+}
+
+fn include_targets_from_exact_member(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    call_position: TextSize,
+    member_id: LuaMemberId,
+    visited: &mut HashSet<LuaMemberId>,
+) -> Vec<FileId> {
+    if !visited.insert(member_id) {
+        return Vec::new();
+    }
+
+    let Some(value_expr) = get_member_value_expr(db, member_id) else {
+        return Vec::new();
+    };
+    let mut targets = match value_expr {
+        LuaExpr::CallExpr(call_expr) => {
+            if let Some(target_file_id) =
+                dependency_target_from_value_call(db, member_id.file_id, &call_expr)
+            {
+                vec![target_file_id]
+            } else if let Some(signature_id) = get_prefix_expr_signature_id(db, cache, &call_expr)
+                && let Some(returned_arg_idx) = exact_returned_arg_idx(db, &call_expr, signature_id)
+                && let Some(returned_arg) = call_expr
+                    .get_args_list()
+                    .and_then(|args| args.get_args().nth(returned_arg_idx))
+                && let Some(next_member_id) = exact_source_member_id(db, cache, &returned_arg)
+            {
+                include_targets_from_member(
+                    db,
+                    cache,
+                    caller_file_id,
+                    call_position,
+                    next_member_id,
+                    visited,
+                )
+            } else {
+                Vec::new()
+            }
+        }
+        LuaExpr::IndexExpr(index_expr) => {
+            if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_))) {
+                include_targets_from_dynamic_table_members(
+                    db,
+                    cache,
+                    caller_file_id,
+                    call_position,
+                    &index_expr,
+                    visited,
+                )
+            } else {
+                let Some(LuaSemanticDeclId::Member(next_member_id)) = infer_expr_semantic_decl(
+                    db,
+                    cache,
+                    LuaExpr::IndexExpr(index_expr),
+                    Default::default(),
+                    Default::default(),
+                ) else {
+                    return Vec::new();
+                };
+                include_targets_from_member(
+                    db,
+                    cache,
+                    caller_file_id,
+                    call_position,
+                    next_member_id,
+                    visited,
+                )
+            }
+        }
+        _ => Vec::new(),
+    };
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn include_targets_from_dynamic_table_members(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    caller_file_id: FileId,
+    call_position: TextSize,
+    index_expr: &glua_parser::LuaIndexExpr,
+    visited: &mut HashSet<LuaMemberId>,
+) -> Vec<FileId> {
+    let Some(source_table_expr) = index_expr.get_prefix_expr() else {
+        return Vec::new();
+    };
+    let Some(source_member_id) = exact_source_member_id(db, cache, &source_table_expr) else {
+        return Vec::new();
+    };
+    let Some(source_history) = member_history_item(db, source_member_id) else {
+        return Vec::new();
+    };
+    if source_history.get_member_ids().len() != 1
+        || !matches!(
+            get_member_value_expr(db, source_member_id),
+            Some(LuaExpr::TableExpr(_))
+        )
+    {
+        return Vec::new();
+    }
+
+    let Ok(LuaType::TableConst(table_id)) = infer_expr(db, cache, source_table_expr) else {
+        return Vec::new();
+    };
+    let Some(members) = db
+        .get_member_index()
+        .get_members(&LuaMemberOwner::Element(table_id))
+    else {
+        return Vec::new();
+    };
+    let mut member_ids = members
+        .into_iter()
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    member_ids.sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
+    member_ids.dedup();
+
+    let mut targets = Vec::new();
+    for member_id in member_ids {
+        if stable_visible_member_id_at_call(db, member_id, caller_file_id, call_position)
+            != Some(member_id)
+        {
+            continue;
+        }
+        targets.extend(include_targets_from_member(
+            db,
+            cache,
+            caller_file_id,
+            call_position,
+            member_id,
+            visited,
+        ));
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
+}
+
+fn dependency_target_from_value_call(
+    db: &DbIndex,
+    source_file_id: FileId,
+    value_call: &LuaCallExpr,
+) -> Option<FileId> {
+    let compilefile_call_range = direct_called_prefix(value_call).map(|call| call.get_range());
+    let mut target_file_ids = db
+        .get_file_dependencies_index()
+        .get_dependency_sites(&source_file_id)?
+        .iter()
+        .filter_map(|site| {
+            let is_exact_call = match site.kind {
+                LuaDependencyKind::Include => site.call_range == value_call.get_range(),
+                LuaDependencyKind::CompileFile => compilefile_call_range == Some(site.call_range),
+                _ => false,
+            };
+            is_exact_call.then_some(site.target_file_id).flatten()
+        })
+        .collect::<Vec<_>>();
+    target_file_ids.sort_unstable();
+    target_file_ids.dedup();
+    let [target_file_id] = target_file_ids.as_slice() else {
+        return None;
+    };
+    Some(*target_file_id)
+}
+
+fn write_only_replaces_absent_callback(
+    root: &glua_parser::LuaSyntaxNode,
+    write_range: TextRange,
+    callback_name: &LuaNameExpr,
+) -> bool {
+    let Some(callback_name) = callback_name.get_name_text() else {
+        return false;
+    };
+    let Some(write_name) = root
+        .covering_element(write_range)
+        .ancestors()
+        .find_map(LuaNameExpr::cast)
+        .filter(|name_expr| name_expr.get_range() == write_range)
+    else {
+        return false;
+    };
+
+    // `if not callback then callback = fallback end` cannot replace the mixin callback on
+    // a path where that callback is subsequently invoked.
+    write_name.ancestors::<LuaIfStat>().any(|if_stat| {
+        let Some(block_range) = if_stat.get_block().map(|block| block.get_range()) else {
+            return false;
+        };
+        if block_range.start() > write_range.start() || block_range.end() < write_range.end() {
+            return false;
+        }
+        let Some(LuaExpr::UnaryExpr(condition)) = if_stat.get_condition_expr() else {
+            return false;
+        };
+        condition
+            .get_op_token()
+            .is_some_and(|op| op.get_op() == glua_parser::UnaryOperator::OpNot)
+            && matches!(
+                condition.get_expr(),
+                Some(LuaExpr::NameExpr(name_expr))
+                    if name_expr.get_name_text().as_deref() == Some(callback_name.as_str())
+            )
+    })
+}
+
+fn direct_called_prefix(call_expr: &LuaCallExpr) -> Option<LuaCallExpr> {
+    if !is_zero_arg_call(call_expr) {
+        return None;
+    }
+    let mut prefix_expr = call_expr.get_prefix_expr()?;
+    loop {
+        match prefix_expr {
+            LuaExpr::CallExpr(loader_call) => return Some(loader_call),
+            LuaExpr::ParenExpr(paren_expr) => prefix_expr = paren_expr.get_expr()?,
+            _ => return None,
+        }
+    }
+}
+
+fn returned_table_info(
+    db: &DbIndex,
+    cache: &ReturnedTableCache,
+    target_file_id: FileId,
+) -> Option<Arc<ReturnedTableInfo>> {
+    let entry = {
+        let mut entries = cache
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        entries
+            .entry(target_file_id)
+            .or_insert_with(|| Arc::new(OnceLock::new()))
+            .clone()
+    };
+
+    entry
+        .get_or_init(|| {
+            returned_local_table_owner(db, target_file_id).and_then(|owner| {
+                let members = db.get_member_index().get_members(&owner)?;
+                let member_signatures = members
+                    .into_iter()
+                    .filter_map(|member| {
+                        let member_id = member.get_id();
+                        let LuaExpr::ClosureExpr(closure) = get_member_value_expr(db, member_id)?
+                        else {
+                            return None;
+                        };
+                        let signature_id = LuaSignatureId::from_closure(target_file_id, &closure);
+                        let signature = db.get_signature_index().get(&signature_id)?;
+                        let receiver_param_idx = if signature.is_colon_define {
+                            signature.params.len()
+                        } else if signature
+                            .params
+                            .first()
+                            .is_some_and(|param| param == "self")
+                        {
+                            0
+                        } else {
+                            return None;
+                        };
+                        if get_mutated_params(
+                            db,
+                            target_file_id,
+                            &closure,
+                            signature.is_colon_define,
+                        )
+                        .contains(&receiver_param_idx)
+                        {
+                            return None;
+                        }
+                        Some(ReturnedMemberSignature {
+                            member_id,
+                            signature_id,
+                            history: member_history_item(db, member_id)?,
+                        })
+                    })
+                    .collect();
+                Some(Arc::new(ReturnedTableInfo { member_signatures }))
+            })
+        })
+        .clone()
+}
+
+fn returned_local_table_owner(db: &DbIndex, file_id: FileId) -> Option<LuaMemberOwner> {
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let mut return_stats = root
+        .descendants()
+        .filter_map(LuaReturnStat::cast)
+        .filter(|return_stat| return_stat.ancestors::<LuaClosureExpr>().next().is_none());
+    let return_stat = return_stats.next()?;
+    if return_stats.next().is_some() {
+        return None;
+    }
+    let mut return_exprs = return_stat.get_expr_list();
+    let LuaExpr::NameExpr(return_name) = return_exprs.next()? else {
+        return None;
+    };
+    if return_exprs.next().is_some() {
+        return None;
+    }
+
+    let file_refs = db.get_reference_index().get_local_reference(&file_id)?;
+    let decl_id = file_refs.get_decl_id(&return_name.get_range())?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. })
+        || file_refs
+            .get_decl_references(&decl_id)
+            .is_some_and(|references| references.mutable)
+    {
+        return None;
+    }
+    let LuaExpr::TableExpr(table_expr) = decl
+        .get_value_syntax_id()
+        .and_then(|syntax_id| syntax_id.to_node_from_root(&root))
+        .and_then(LuaExpr::cast)?
+    else {
+        return None;
+    };
+    Some(LuaMemberOwner::Element(InFiled::new(
+        file_id,
+        table_expr.get_range(),
+    )))
 }
 
 fn is_self_name_expr(expr: &LuaExpr) -> bool {

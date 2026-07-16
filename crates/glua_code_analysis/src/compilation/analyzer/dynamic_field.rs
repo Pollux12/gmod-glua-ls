@@ -2,16 +2,17 @@ use rustc_hash::{FxHashMap, FxHashSet};
 use std::time::Duration;
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr,
     LuaForRangeStat, LuaForStat, LuaFuncStat, LuaIndexKey, LuaLiteralToken, LuaSyntaxKind,
     LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
+use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
     InFiled, LuaDeclId, LuaInferredGuardOwner, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
     LuaTypeOwner, VarRefId,
-    db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner},
+    db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, WorkspaceKind},
     profile::Profile,
     semantic::{
         find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
@@ -64,6 +65,18 @@ enum DynamicFieldAnalysisMode {
 struct FieldSetterHelper {
     table_param_index: usize,
     key_param_index: usize,
+}
+
+#[derive(Default)]
+struct ResolvedDynamicFieldNames {
+    names: Vec<SmolStr>,
+    may_have_other_string_names: bool,
+}
+
+struct ForRangePairsFieldNames {
+    names: Vec<SmolStr>,
+    iter_decl_id: LuaDeclId,
+    may_have_other_string_names: bool,
 }
 
 #[derive(Default, Clone)]
@@ -194,6 +207,7 @@ fn collect_dynamic_fields_for_file(
     );
     let cache = &mut cache;
     let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
+    let mut local_reassignment_positions = None;
     for assign in root.descendants::<LuaAssignStat>() {
         let (vars, exprs) = assign.get_var_and_expr_list();
         for (idx, var) in vars.iter().enumerate() {
@@ -210,10 +224,16 @@ fn collect_dynamic_fields_for_file(
                 continue;
             };
 
-            let field_names = get_field_names(db, cache, &index_expr);
+            let field_names = get_field_names(
+                db,
+                cache,
+                root,
+                &mut local_reassignment_positions,
+                &index_expr,
+            );
             let collect_finite_direct_assignment = mode.collect_finite_direct_assignments()
                 && is_dynamic_index_key(&index_expr)
-                && !field_names.is_empty();
+                && !field_names.names.is_empty();
             if mode.collects_only_declared_member_table_fields()
                 && !matches!(value_expr, Some(LuaExpr::TableExpr(_)))
                 && !collect_finite_direct_assignment
@@ -222,9 +242,8 @@ fn collect_dynamic_fields_for_file(
             }
             let should_collect_wildcard = mode.collect_direct_assignments()
                 && is_dynamic_index_key(&index_expr)
-                && (field_names.is_empty()
-                    || dynamic_index_key_has_inferred_string_names(db, cache, &index_expr));
-            if field_names.is_empty() && !should_collect_wildcard {
+                && field_names.may_have_other_string_names;
+            if field_names.names.is_empty() && !should_collect_wildcard {
                 continue;
             }
 
@@ -259,11 +278,11 @@ fn collect_dynamic_fields_for_file(
                 );
             }
 
-            if field_names.is_empty() {
+            if field_names.names.is_empty() {
                 continue;
             };
 
-            for field_name in field_names {
+            for field_name in field_names.names {
                 if mode.collect_declared_member_table_fields()
                     && let Some(value_expr) = value_expr
                 {
@@ -1161,30 +1180,124 @@ fn is_supported_metatable_index_type(typ: &LuaType) -> bool {
 fn get_field_names(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
+    root: &glua_parser::LuaChunk,
+    local_reassignment_positions: &mut Option<FxHashMap<LuaDeclId, Vec<TextSize>>>,
     index_expr: &glua_parser::LuaIndexExpr,
-) -> Vec<SmolStr> {
+) -> ResolvedDynamicFieldNames {
     let Some(key) = index_expr.get_index_key() else {
-        return Vec::new();
+        return ResolvedDynamicFieldNames::default();
     };
     match key {
-        LuaIndexKey::Name(name) => vec![name.get_name_text().into()],
-        LuaIndexKey::String(s) => vec![s.get_value().into()],
+        LuaIndexKey::Name(name) => ResolvedDynamicFieldNames {
+            names: vec![name.get_name_text().into()],
+            may_have_other_string_names: false,
+        },
+        LuaIndexKey::String(s) => ResolvedDynamicFieldNames {
+            names: vec![s.get_value().into()],
+            may_have_other_string_names: false,
+        },
         LuaIndexKey::Expr(expr) => {
+            let for_range_names =
+                field_names_from_for_range_pairs_key(db, cache.get_file_id(), expr.clone());
+            if let Some(for_range_names) = for_range_names {
+                let local_reassignment_positions =
+                    local_reassignment_positions.get_or_insert_with(|| {
+                        collect_local_reassignment_positions(db, cache.get_file_id(), root)
+                    });
+                let key_position = index_expr
+                    .get_index_key()
+                    .and_then(|key| key.get_range())
+                    .map(|range| range.start())
+                    .unwrap_or_else(|| index_expr.get_position());
+                return ResolvedDynamicFieldNames {
+                    names: for_range_names.names,
+                    may_have_other_string_names: for_range_names.may_have_other_string_names
+                        || has_local_reassignment_before(
+                            local_reassignment_positions,
+                            for_range_names.iter_decl_id,
+                            key_position,
+                        ),
+                };
+            }
+
             let names = string_const_names(&infer_expr(db, cache, expr.clone()).ok());
-            if names.is_empty() {
+            if !names.is_empty() {
+                return ResolvedDynamicFieldNames {
+                    names,
+                    // Inferred literal names can come from non-exhaustive call-site evidence.
+                    // Keep the wildcard unless syntax proves the key's full finite domain.
+                    may_have_other_string_names: true,
+                };
+            }
+
+            let names = {
                 let mut visiting = FxHashSet::default();
-                let names = finite_dynamic_key_strings(db, cache, &expr, &mut visiting);
-                if names.is_empty() {
-                    field_names_from_for_range_pairs_key(expr)
-                } else {
-                    names
-                }
-            } else {
-                names
+                finite_dynamic_key_strings(db, cache, &expr, &mut visiting)
+            };
+            ResolvedDynamicFieldNames {
+                may_have_other_string_names: names.is_empty(),
+                names,
             }
         }
-        _ => Vec::new(),
+        _ => ResolvedDynamicFieldNames::default(),
     }
+}
+
+fn collect_local_reassignment_positions(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    root: &glua_parser::LuaChunk,
+) -> FxHashMap<LuaDeclId, Vec<TextSize>> {
+    let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) else {
+        return FxHashMap::default();
+    };
+
+    let references = db.get_reference_index().get_local_reference(&file_id);
+    let mut positions: FxHashMap<LuaDeclId, Vec<TextSize>> = FxHashMap::default();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let position = assign.get_position();
+        for var in assign.get_var_and_expr_list().0 {
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+            let assigned_decl_id = references
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .or_else(|| {
+                    let name = name_expr.get_name_text()?;
+                    decl_tree
+                        .find_local_decl(&name, name_expr.get_position())
+                        .map(|decl| decl.get_id())
+                });
+            let Some(assigned_decl_id) = assigned_decl_id else {
+                continue;
+            };
+            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
+                continue;
+            }
+
+            positions
+                .entry(assigned_decl_id)
+                .or_default()
+                .push(position);
+        }
+    }
+
+    for decl_positions in positions.values_mut() {
+        decl_positions.sort_unstable();
+        decl_positions.dedup();
+    }
+    positions
+}
+
+fn has_local_reassignment_before(
+    local_reassignment_positions: &FxHashMap<LuaDeclId, Vec<TextSize>>,
+    decl_id: LuaDeclId,
+    query_position: TextSize,
+) -> bool {
+    local_reassignment_positions
+        .get(&decl_id)
+        .and_then(|positions| positions.first())
+        .is_some_and(|position| *position < query_position)
 }
 
 fn finite_dynamic_key_strings(
@@ -1382,79 +1495,131 @@ fn infer_integer_const(
     }
 }
 
-fn field_names_from_for_range_pairs_key(key_expr: LuaExpr) -> Vec<SmolStr> {
+fn field_names_from_for_range_pairs_key(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    key_expr: LuaExpr,
+) -> Option<ForRangePairsFieldNames> {
     let LuaExpr::NameExpr(name_expr) = key_expr else {
-        return Vec::new();
+        return None;
     };
-    let Some(name_text) = name_expr.get_name_text() else {
-        return Vec::new();
-    };
-    let Some(for_range) = name_expr
+    let name_text = name_expr.get_name_text()?;
+    let for_range = name_expr
         .syntax()
         .ancestors()
-        .find_map(LuaForRangeStat::cast)
-    else {
-        return Vec::new();
-    };
+        .find_map(LuaForRangeStat::cast)?;
 
-    let is_first_iter_var = for_range
-        .get_var_name_list()
-        .next()
-        .is_some_and(|iter_name| iter_name.get_name_text() == name_text);
-    if !is_first_iter_var {
-        return Vec::new();
+    let iter_name = for_range.get_var_name_list().next()?;
+    if iter_name.get_name_text() != name_text {
+        return None;
+    }
+    let iter_decl_id = LuaDeclId::new(file_id, iter_name.get_position());
+    let key_decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)?
+        .get_decl_id(&name_expr.get_range())?;
+    if key_decl_id != iter_decl_id {
+        return None;
     }
 
     let mut iter_exprs = for_range.get_expr_list();
     let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.next() else {
-        return Vec::new();
+        return None;
     };
-    if iter_exprs.next().is_some() || call_expr.get_access_path().as_deref() != Some("pairs") {
-        return Vec::new();
+    if iter_exprs.next().is_some() || !is_provably_builtin_pairs_call(db, file_id, &call_expr) {
+        return None;
     }
 
-    let Some(args_list) = call_expr.get_args_list() else {
-        return Vec::new();
-    };
+    let args_list = call_expr.get_args_list()?;
     let mut args = args_list.get_args();
     let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
-        return Vec::new();
+        return None;
     };
     if args.next().is_some() {
-        return Vec::new();
+        return None;
     }
 
-    field_names_from_table_expr_keys(&table_expr)
+    let (mut names, may_have_other_string_names) =
+        field_names_from_pairs_table_expr_keys(&table_expr);
+    names.sort();
+    names.dedup();
+    Some(ForRangePairsFieldNames {
+        names,
+        iter_decl_id,
+        may_have_other_string_names,
+    })
 }
 
-fn field_names_from_table_expr_keys(table_expr: &LuaTableExpr) -> Vec<SmolStr> {
-    table_expr
-        .get_fields()
-        .filter_map(|field| {
-            let field_key = field.get_field_key()?;
-            match field_key {
-                LuaIndexKey::Name(name) => Some(name.get_name_text().into()),
-                LuaIndexKey::String(string) => Some(string.get_value().into()),
-                _ => None,
-            }
-        })
-        .collect()
+fn is_provably_builtin_pairs_call(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    if call_expr.get_access_path().as_deref() != Some("pairs") {
+        return false;
+    }
+    let Some(LuaExpr::NameExpr(pairs_name)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    if db
+        .get_reference_index()
+        .get_local_reference(&file_id)
+        .and_then(|references| references.get_decl_id(&pairs_name.get_range()))
+        .is_some()
+    {
+        return false;
+    }
+
+    let module_index = db.get_module_index();
+    let Some(current_workspace_id) = module_index.get_workspace_id(file_id) else {
+        return false;
+    };
+    let Some(priority_tiers) = db.get_global_index().get_global_decl_id_priority_tiers(
+        "pairs",
+        module_index,
+        current_workspace_id,
+    ) else {
+        return false;
+    };
+    let Some((_, decl_ids)) = priority_tiers
+        .into_iter()
+        .find(|(_, decl_ids)| !decl_ids.is_empty())
+    else {
+        return false;
+    };
+
+    decl_ids.iter().all(|decl_id| {
+        module_index
+            .get_workspace_id(decl_id.file_id)
+            .is_some_and(|workspace_id| {
+                module_index.get_workspace_kind(workspace_id) == WorkspaceKind::Std
+            })
+    })
+}
+
+fn field_names_from_pairs_table_expr_keys(table_expr: &LuaTableExpr) -> (Vec<SmolStr>, bool) {
+    let mut names = Vec::new();
+    let mut may_have_other_string_names = false;
+    for field in table_expr.get_fields() {
+        match field.get_field_key() {
+            Some(LuaIndexKey::Name(name)) => names.push(name.get_name_text().into()),
+            Some(LuaIndexKey::String(string)) => names.push(string.get_value().into()),
+            Some(LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_)) | None => {}
+            Some(LuaIndexKey::Expr(LuaExpr::LiteralExpr(literal))) => match literal.get_literal() {
+                Some(LuaLiteralToken::String(string)) => names.push(string.get_value().into()),
+                Some(
+                    LuaLiteralToken::Number(_) | LuaLiteralToken::Bool(_) | LuaLiteralToken::Nil(_),
+                ) => {}
+                _ => may_have_other_string_names = true,
+            },
+            Some(LuaIndexKey::Expr(_)) => may_have_other_string_names = true,
+        }
+    }
+    (names, may_have_other_string_names)
 }
 
 fn is_dynamic_index_key(index_expr: &glua_parser::LuaIndexExpr) -> bool {
     matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
-}
-
-fn dynamic_index_key_has_inferred_string_names(
-    db: &DbIndex,
-    cache: &mut crate::LuaInferCache,
-    index_expr: &glua_parser::LuaIndexExpr,
-) -> bool {
-    let Some(LuaIndexKey::Expr(expr)) = index_expr.get_index_key() else {
-        return false;
-    };
-
-    !string_const_names(&infer_expr(db, cache, expr.clone()).ok()).is_empty()
 }
 
 fn string_const_names(typ: &Option<LuaType>) -> Vec<SmolStr> {

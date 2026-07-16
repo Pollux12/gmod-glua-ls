@@ -1347,6 +1347,8 @@ fn assign_merge_type_owner_and_expr_type(
     {
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
+        let conditional_branch_assignment =
+            is_member_assignment_in_conditional_branch(analyzer, *member_id);
         if guarded_table_assignment {
             let already_preserved = analyzer
                 .db
@@ -1359,8 +1361,12 @@ fn assign_merge_type_owner_and_expr_type(
                     .mark_non_overwriting_assignment_member(*member_id);
                 preserve_guarded_table_assignment_members(analyzer, *member_id);
             }
+        } else if conditional_branch_assignment {
+            analyzer
+                .db
+                .get_member_index_mut()
+                .mark_non_overwriting_assignment_member(*member_id);
         } else if !dynamic_expr_key_member
-            && !is_member_assignment_in_conditional_branch(analyzer, *member_id)
             && analyzer
                 .db
                 .get_member_index()

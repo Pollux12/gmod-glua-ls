@@ -158,6 +158,7 @@ pub struct GmodLoadOrderKey {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum GmodLoadEdgeKind {
     Include,
+    CompileFile,
     AddCSLuaFile,
     IncludeCS,
     Require,
@@ -173,6 +174,7 @@ impl From<LuaDependencyKind> for GmodLoadEdgeKind {
         match value {
             LuaDependencyKind::Require => Self::Require,
             LuaDependencyKind::Include => Self::Include,
+            LuaDependencyKind::CompileFile => Self::CompileFile,
             LuaDependencyKind::AddCSLuaFile => Self::AddCSLuaFile,
             LuaDependencyKind::IncludeCS => Self::IncludeCS,
         }

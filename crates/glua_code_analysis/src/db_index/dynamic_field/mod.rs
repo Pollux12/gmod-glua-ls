@@ -25,6 +25,8 @@ pub struct DynamicFieldIndex {
     field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// Exact fields collected on their original owner, excluding inherited propagation.
     direct_field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
+    /// Assignment locations which contributed one or more exact finite field names.
+    direct_definition_ranges: HashMap<DynamicFieldOwner, HashSet<InFiled<TextRange>>>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
     /// owner → assignment locations for writes through non-literal keys.
@@ -46,6 +48,10 @@ impl DynamicFieldIndex {
         range: TextRange,
     ) {
         let definition = InFiled::new(file_id, range);
+        self.direct_definition_ranges
+            .entry(owner.clone())
+            .or_default()
+            .insert(definition.clone());
         let direct_definitions = self
             .direct_field_definitions
             .entry(owner.clone())
@@ -152,6 +158,26 @@ impl DynamicFieldIndex {
         self.direct_field_definitions.get(owner)
     }
 
+    pub fn has_direct_definition(
+        &self,
+        owner: &DynamicFieldOwner,
+        definition: &InFiled<TextRange>,
+    ) -> bool {
+        self.direct_definition_ranges
+            .get(owner)
+            .is_some_and(|definitions| definitions.contains(definition))
+    }
+
+    pub fn has_wildcard_definition(
+        &self,
+        owner: &DynamicFieldOwner,
+        definition: &InFiled<TextRange>,
+    ) -> bool {
+        self.wildcard_definitions
+            .get(owner)
+            .is_some_and(|definitions| definitions.contains(definition))
+    }
+
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
         self.owner_fields
             .get(owner)
@@ -196,8 +222,18 @@ impl DynamicFieldIndex {
 
     fn rebuild_derived_state(&mut self) {
         self.owner_fields.clear();
+        self.direct_definition_ranges.clear();
         self.file_contributions.clear();
         self.wildcard_file_contributions.clear();
+
+        for (owner, fields) in &self.direct_field_definitions {
+            for definitions in fields.values() {
+                self.direct_definition_ranges
+                    .entry(owner.clone())
+                    .or_default()
+                    .extend(definitions.iter().cloned());
+            }
+        }
 
         for (owner, fields) in &self.field_definitions {
             for (field_name, definitions) in fields {
@@ -345,6 +381,10 @@ impl LuaIndex for DynamicFieldIndex {
             });
             !fields.is_empty()
         });
+        self.direct_definition_ranges.retain(|_, definitions| {
+            definitions.retain(|definition| definition.file_id != file_id);
+            !definitions.is_empty()
+        });
 
         let mut removed_wildcard_definitions = false;
         self.wildcard_definitions.retain(|_, definitions| {
@@ -371,6 +411,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.owner_fields.clear();
         self.field_definitions.clear();
         self.direct_field_definitions.clear();
+        self.direct_definition_ranges.clear();
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
@@ -490,6 +531,34 @@ mod tests {
         assert!(index.has_field_in_file(&owner, &field, file_a));
         assert!(!index.has_field_in_file(&owner, &field, file_b));
         assert!(!index.has_field_in_file(&owner, "missing", file_a));
+    }
+
+    #[test]
+    fn direct_and_wildcard_definition_lookups_track_lifecycle() {
+        let file_id = FileId::new(1);
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let direct = InFiled::new(file_id, range(1, 2));
+        let wildcard = InFiled::new(file_id, range(3, 4));
+        let mut index = DynamicFieldIndex::new();
+
+        index.add_field(owner.clone(), "first".into(), file_id, direct.value);
+        index.add_field(owner.clone(), "second".into(), file_id, direct.value);
+        index.add_wildcard_definition(owner.clone(), file_id, wildcard.value);
+
+        assert!(index.has_direct_definition(&owner, &direct));
+        assert!(!index.has_direct_definition(&owner, &wildcard));
+        assert!(index.has_wildcard_definition(&owner, &wildcard));
+        assert!(!index.has_wildcard_definition(&owner, &direct));
+
+        index.remove(file_id);
+        assert!(!index.has_direct_definition(&owner, &direct));
+        assert!(!index.has_wildcard_definition(&owner, &wildcard));
+
+        index.add_field(owner.clone(), "first".into(), file_id, direct.value);
+        index.add_wildcard_definition(owner.clone(), file_id, wildcard.value);
+        index.clear();
+        assert!(!index.has_direct_definition(&owner, &direct));
+        assert!(!index.has_wildcard_definition(&owner, &wildcard));
     }
 
     #[test]

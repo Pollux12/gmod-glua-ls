@@ -11257,4 +11257,277 @@ GM.TestValue = 1"#,
             "NewPanel should NOT inherit OldOnly from the aliased OLD table, got {new_panel_members:?}"
         );
     }
+
+    #[gtest]
+    fn test_vgui_constructor_field_type_visible_to_earlier_method_body() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class DHTML: DPanel
+            function DHTML:RunJavascript(code) end
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@param name string?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent, name) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let path = "lua/vgui/constructor_field_order.lua";
+        let finite_source = r#"
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                end
+                self.html = vgui.Create("DHTML", self)
+            end
+
+            function Handler:Cleanup()
+                self.html = nil
+            end
+            "#;
+        let file_id = ws.def_file(path, finite_source);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a constructor-assigned field should be available to sibling method bodies regardless of declaration order: {diagnostics:?}"
+        );
+
+        let reassigned_before_source = r#"
+            local Handler = {}
+
+            ---@return string
+            function DynamicMethodName() end
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    method_name = DynamicMethodName()
+                    self[method_name] = function() end
+                end
+            end
+            "#;
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_text_only(&uri, reassigned_before_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a reassigned loop key remains a wildcard and may overwrite the concrete field: {diagnostics:?}"
+        );
+
+        let reassigned_after_source = r#"
+            local Handler = {}
+
+            ---@return string
+            function DynamicMethodName() end
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                    method_name = DynamicMethodName()
+                end
+                self.html = vgui.Create("DHTML", self)
+            end
+            "#;
+        ws.analysis
+            .update_file_text_only(&uri, reassigned_after_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a reassignment after the indexed write should not make that write a wildcard: {diagnostics:?}"
+        );
+
+        ws.analysis
+            .update_file_text_only(&uri, finite_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "removing the reassignment should remove the wildcard on incremental reindex: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_finite_dynamic_method_names_reject_global_pairs_override() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class DHTML: DPanel
+            function DHTML:RunJavascript(code) end
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@param name string?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent, name) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/constructor_field_pairs_override.lua",
+            r#"
+            function pairs(value) end
+
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a same-file global pairs override is not provably the builtin and should remain a wildcard: {diagnostics:?}"
+        );
+
+        let other_file_id = ws.def_file(
+            "lua/vgui/constructor_field_workspace_pairs_override.lua",
+            r#"
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(other_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().any(|diagnostic| diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a workspace global pairs override is not provably the builtin for other files either: {diagnostics:?}"
+        );
+    }
 }

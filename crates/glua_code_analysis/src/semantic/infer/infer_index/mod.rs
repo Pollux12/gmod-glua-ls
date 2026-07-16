@@ -3,7 +3,7 @@ pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
-    LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
+    LuaLocalStat, LuaNameExpr, LuaTableField, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
@@ -16,7 +16,7 @@ use crate::{
     LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
     db_index::{
-        DbIndex, LuaGenericType, LuaIntersectionType, LuaMemberIndexItem, LuaMemberKey,
+        DbIndex, LuaGenericType, LuaIntersectionType, LuaMember, LuaMemberIndexItem, LuaMemberKey,
         LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod, LuaTupleType, LuaType,
         LuaTypeDeclId, LuaUnionType,
     },
@@ -567,6 +567,19 @@ fn infer_table_member_owner(
             &cache.get_file_id(),
             index_expr.get_position(),
         )?;
+        if is_literal_table_field_access(&index_key)
+            && owner_has_finite_named_dynamic_assignment(db, &owner)
+            && let Some(dynamic_field) = resolve_dynamic_field_member(
+                db,
+                cache,
+                &LuaType::TableConst(inst.clone()),
+                &key,
+                Some(index_expr.get_position()),
+            )
+            && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+        {
+            return Ok(dynamic_field.typ);
+        }
         if !type_is_uninformative(&member_type) {
             return Ok(member_type);
         }
@@ -843,6 +856,11 @@ fn infer_table_dynamic_key_member_type(
         if dynamic_key == key || !dynamic_key.is_expr() {
             continue;
         }
+        if is_literal_member_key(key)
+            && member_is_finite_named_dynamic_assignment(db, owner, member)
+        {
+            continue;
+        }
 
         let dynamic_key_matches = matches!(dynamic_key, LuaMemberKey::ExprType(typ) if typ.is_unknown())
             || member_key_matches_type(db, &access_key_type, dynamic_key);
@@ -917,6 +935,11 @@ fn infer_gmod_same_file_expr_key_member_type(
     let mut matched_covered_numeric_for_write = false;
     for member in members {
         if member.get_file_id() != access_file_id {
+            continue;
+        }
+        if is_literal_member_key(key)
+            && member_is_finite_named_dynamic_assignment(db, owner, member)
+        {
             continue;
         }
 
@@ -1143,6 +1166,11 @@ fn infer_cross_file_matching_expr_key_member_type(
         {
             continue;
         }
+        if is_literal_member_key(key)
+            && member_is_finite_named_dynamic_assignment(db, owner, member)
+        {
+            continue;
+        }
 
         let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
         let Ok(member_type) =
@@ -1201,6 +1229,8 @@ fn table_has_cross_file_matching_expr_key_member(
             members.iter().any(|member| {
                 member.get_key().is_expr()
                     && member.get_file_id() != access_file_id
+                    && (!is_literal_member_key(key)
+                        || !member_is_finite_named_dynamic_assignment(db, owner, member))
                     && is_dynamic_field_fallback_realm_compatible(
                         db,
                         access_realm,
@@ -1214,6 +1244,53 @@ fn table_has_cross_file_matching_expr_key_member(
 
 fn is_literal_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
+}
+
+fn member_is_finite_named_dynamic_assignment(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    member: &LuaMember,
+) -> bool {
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    let dynamic_owner = match owner {
+        LuaMemberOwner::Type(type_id) => crate::DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
+        _ => return false,
+    };
+    let Some(definition) = dynamic_member_key_definition(db, member) else {
+        return false;
+    };
+    let dynamic_fields = db.get_dynamic_field_index();
+    dynamic_fields.has_direct_definition(&dynamic_owner, &definition)
+        && !dynamic_fields.has_wildcard_definition(&dynamic_owner, &definition)
+}
+
+fn dynamic_member_key_definition(db: &DbIndex, member: &LuaMember) -> Option<InFiled<TextRange>> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member.get_file_id())?
+        .get_red_root();
+    let node = member.get_syntax_id().to_node_from_root(&root)?;
+    let range = if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        index_expr.get_index_key()?.get_range()?
+    } else {
+        LuaTableField::cast(node)?.get_field_key()?.get_range()?
+    };
+    Some(InFiled::new(member.get_file_id(), range))
+}
+
+fn owner_has_finite_named_dynamic_assignment(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+    db.get_member_index()
+        .get_members(owner)
+        .is_some_and(|members| {
+            members.iter().any(|member| {
+                member.get_key().is_expr()
+                    && member_is_finite_named_dynamic_assignment(db, owner, member)
+            })
+        })
 }
 
 fn member_key_is_broad_wildcard_expr(key: &LuaMemberKey) -> bool {

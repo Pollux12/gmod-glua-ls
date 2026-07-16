@@ -50,6 +50,34 @@ mod test {
         ));
     }
 
+    #[test]
+    fn inferred_nullable_api_fallback_keeps_omitted_field_nullable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class DebugInfo
+            ---@field short_src string
+            ---@field currentline integer
+            ---@field source string
+
+            ---@return DebugInfo?
+            local function getinfo() end
+
+            local info = getinfo()
+            if not info then
+                info = {
+                    short_src = "",
+                    currentline = 0,
+                }
+            end
+
+            print(info.source:upper())
+            "#,
+        ));
+    }
+
     fn need_check_nil_for_file(
         ws: &mut VirtualWorkspace,
         file_id: crate::FileId,

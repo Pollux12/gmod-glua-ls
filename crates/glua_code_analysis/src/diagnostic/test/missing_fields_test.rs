@@ -480,4 +480,77 @@ foo({})
             "#
         ));
     }
+
+    #[test]
+    fn inferred_nullable_api_result_accepts_partial_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class DebugInfo
+            ---@field short_src string
+            ---@field currentline integer
+            ---@field source string
+
+            ---@return DebugInfo?
+            local function getinfo() end
+
+            local info = getinfo()
+            if not info then
+                info = {
+                    short_src = "",
+                    currentline = 0,
+                }
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn explicitly_typed_nullable_local_rejects_partial_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class DebugInfo
+            ---@field short_src string
+            ---@field currentline integer
+            ---@field source string
+
+            ---@return DebugInfo?
+            local function getinfo() end
+
+            ---@type DebugInfo?
+            local info = getinfo()
+            if not info then
+                info = {
+                    short_src = "",
+                    currentline = 0,
+                }
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn table_completed_after_typed_use_still_reports_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            local function consume_typed(value) end
+
+            local value = {}
+            consume_typed(value)
+            value.required = "ready"
+            "#,
+        ));
+    }
 }

@@ -526,6 +526,25 @@ fn infer_table_type_by_assign_stat(
         .0;
     let name = vars.get(num).ok_or(InferFailReason::None)?;
 
+    if let LuaVarExpr::NameExpr(name_expr) = name
+        && let Some(decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&cache.get_file_id())
+            .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        && let Some(type_cache) = db.get_type_index().get_type_cache(&decl_id.into())
+    {
+        // An inferred declaration type describes accumulated values, not an assignment
+        // contract. Keep this literal independent so assignment inference can union it.
+        if type_cache.is_infer() {
+            return Err(InferFailReason::None);
+        }
+
+        return match type_cache.as_type() {
+            LuaType::TableConst(_) => Err(InferFailReason::None),
+            typ => Ok(typ.clone()),
+        };
+    }
+
     let decl_id = LuaDeclId::new(cache.get_file_id(), name.get_position());
     if db.get_decl_index().get_decl(&decl_id).is_some() {
         match db.get_type_index().get_type_cache(&decl_id.into()) {

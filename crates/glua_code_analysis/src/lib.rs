@@ -36,7 +36,7 @@ use resources::load_resource_std;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
 use std::collections::{HashMap, VecDeque};
-use std::path::Path;
+use std::path::{Component, Path};
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
 pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
@@ -220,6 +220,120 @@ fn normalize_workspace_root(root: PathBuf) -> PathBuf {
     file_path_to_uri(&root)
         .and_then(|uri| uri_to_file_path(&uri))
         .unwrap_or(root)
+}
+
+pub(crate) fn dependency_site_path_keys(
+    db: &DbIndex,
+    source_file_id: FileId,
+    dependency_path: &str,
+) -> Vec<String> {
+    let dependency_path = normalize_dependency_path(dependency_path);
+    if dependency_path.is_empty() {
+        return Vec::new();
+    }
+
+    let mut keys = HashSet::new();
+    insert_dependency_path_key_variants(&mut keys, dependency_path.clone());
+
+    if let Some(source_parent) = db
+        .get_vfs()
+        .get_file_path(&source_file_id)
+        .and_then(|source_path| source_path.parent())
+    {
+        let relative_candidate =
+            lexically_normalize_path(&source_parent.join(Path::new(&dependency_path)));
+        insert_dependency_path_key_variants(&mut keys, normalize_file_path(&relative_candidate));
+    }
+
+    let mut keys = keys.into_iter().collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
+fn dependency_path_keys_for_target(db: &DbIndex, target_path: &Path) -> Vec<String> {
+    let mut keys = HashSet::new();
+    let Some(target_path_text) = target_path.to_str() else {
+        return Vec::new();
+    };
+
+    let normalized_target_path = normalize_file_path(target_path);
+    insert_dependency_path_key_variants(&mut keys, normalized_target_path.clone());
+
+    if let Some(lua_idx) = normalized_target_path.find("/lua/") {
+        let lua_relative = normalized_target_path[(lua_idx + 1)..].to_string();
+        insert_dependency_path_key_variants(&mut keys, lua_relative.clone());
+        insert_dependency_path_key_variants(&mut keys, lua_relative.replace('/', "."));
+        if let Some(without_lua) = lua_relative.strip_prefix("lua/") {
+            insert_dependency_path_key_variants(&mut keys, without_lua.to_string());
+            insert_dependency_path_key_variants(&mut keys, without_lua.replace('/', "."));
+        }
+    }
+
+    if let Some((module_path, _)) = db.get_module_index().extract_module_path(target_path_text) {
+        let module_path = normalize_dependency_path(&module_path.replace('\\', "/"));
+        insert_dependency_path_key_variants(&mut keys, module_path.replace('.', "/"));
+        insert_dependency_path_key_variants(&mut keys, module_path);
+    }
+
+    let mut keys = keys.into_iter().collect::<Vec<_>>();
+    keys.sort_unstable();
+    keys
+}
+
+fn insert_dependency_path_key_variants(keys: &mut HashSet<String>, path: String) {
+    let normalized = normalize_dependency_path(&path);
+    if normalized.is_empty() {
+        return;
+    }
+    keys.insert(normalized.clone());
+    if let Some(without_lua_ext) = normalized.strip_suffix(".lua") {
+        keys.insert(without_lua_ext.to_string());
+    } else {
+        keys.insert(format!("{normalized}.lua"));
+    }
+}
+
+fn normalize_dependency_path(path: &str) -> String {
+    let mut normalized = normalize_path_case(path.replace('\\', "/"));
+    while let Some(stripped) = normalized.strip_prefix("./") {
+        normalized = stripped.to_string();
+    }
+    normalized.trim_matches('/').to_string()
+}
+
+fn normalize_file_path(path: &Path) -> String {
+    normalize_path_case(path.to_string_lossy().replace('\\', "/"))
+        .trim_end_matches('/')
+        .to_string()
+}
+
+fn normalize_path_case(path: String) -> String {
+    #[cfg(target_os = "windows")]
+    {
+        path.to_lowercase()
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        path
+    }
+}
+
+fn lexically_normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    normalized.push(component.as_os_str());
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    normalized
 }
 
 #[derive(Debug)]
@@ -577,6 +691,15 @@ impl EmmyLuaAnalysis {
     fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
         loop {
+            // Include/require callers must be rebuilt with their changed target.
+            // Traverse the indexed dependency graph; never rescan workspace ASTs.
+            let dependency_dependents = self
+                .compilation
+                .get_db()
+                .get_file_dependencies_index()
+                .get_file_dependencies()
+                .collect_file_dependents(expanded.iter().copied().collect());
+            let unresolved_path_dependents = self.unresolved_path_dependency_dependents(&expanded);
             let dependent_files = self
                 .compilation
                 .get_db()
@@ -588,7 +711,12 @@ impl EmmyLuaAnalysis {
                 .get_type_index()
                 .files_depending_on_inference_support(&expanded);
             let mut added = false;
-            for file_id in dependent_files.into_iter().chain(inference_dependents) {
+            for file_id in dependency_dependents
+                .into_iter()
+                .chain(unresolved_path_dependents)
+                .chain(dependent_files)
+                .chain(inference_dependents)
+            {
                 added |= expanded.insert(file_id);
             }
 
@@ -600,6 +728,18 @@ impl EmmyLuaAnalysis {
         let mut expanded = expanded.into_iter().collect::<Vec<_>>();
         expanded.sort_unstable();
         expanded
+    }
+
+    fn unresolved_path_dependency_dependents(&self, file_ids: &HashSet<FileId>) -> Vec<FileId> {
+        let db = self.compilation.get_db();
+        let target_path_keys = file_ids
+            .iter()
+            .filter_map(|file_id| db.get_vfs().get_file_path(file_id).cloned())
+            .flat_map(|target_path| dependency_path_keys_for_target(db, &target_path))
+            .collect::<HashSet<_>>();
+
+        db.get_file_dependencies_index()
+            .collect_unresolved_path_dependents(target_path_keys)
     }
 
     fn reindex_changed_inferred_guard_references(
@@ -1519,7 +1659,160 @@ mod tests {
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{EmmyLuaAnalysis, FileId, select_cross_file_stabilization_dependents};
+    use crate::{
+        EmmyLuaAnalysis, FileId, LuaDependencyKind, select_cross_file_stabilization_dependents,
+    };
+
+    #[test]
+    fn reindex_expansion_includes_indexed_file_dependents() {
+        let changed = FileId { id: 1 };
+        let direct_caller = FileId { id: 2 };
+        let transitive_caller = FileId { id: 3 };
+        let unrelated = FileId { id: 4 };
+        let mut analysis = EmmyLuaAnalysis::new();
+        let dependencies = analysis
+            .compilation
+            .get_db_mut()
+            .get_file_dependencies_index_mut();
+        dependencies.add_dependency_file(direct_caller, changed, LuaDependencyKind::Include);
+        dependencies.add_dependency_file(
+            transitive_caller,
+            direct_caller,
+            LuaDependencyKind::Include,
+        );
+        dependencies.add_dependency_file(unrelated, unrelated, LuaDependencyKind::Include);
+
+        assert_eq!(
+            analysis.expand_reindex_file_ids(vec![changed]),
+            vec![changed, direct_caller, transitive_caller]
+        );
+    }
+
+    #[test]
+    fn reindex_expansion_includes_unresolved_path_dependents_for_reopened_file() {
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_reopen_dependency_workspace");
+        let uri = |name: &str| {
+            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
+        };
+        let target_uri = uri("lua/mixins/reopened.lua");
+        let caller_uri = uri("lua/autorun/reopen_consumer.lua");
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(workspace);
+        let old_target = analysis
+            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
+            .expect("target should be created");
+        let caller = analysis
+            .update_file_by_uri(
+                &caller_uri,
+                Some(r#"local reopened = include("mixins/reopened.lua")"#.to_string()),
+            )
+            .expect("caller should be created");
+
+        analysis
+            .remove_file_by_uri(&target_uri)
+            .expect("target should be removed");
+        assert_ne!(
+            analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&target_uri),
+            Some(old_target)
+        );
+
+        let reopened_target = analysis
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_file_content(&target_uri, Some("return {}".to_string()));
+
+        assert!(
+            analysis
+                .expand_reindex_file_ids(vec![reopened_target])
+                .contains(&caller)
+        );
+    }
+
+    fn reopen_path_expands_to_caller(
+        target_path: &str,
+        caller_path: &str,
+        dependency_expr: &str,
+    ) -> bool {
+        let workspace = std::env::temp_dir().join(format!(
+            "gmod_glua_ls_reopen_path_variants_{}",
+            target_path.replace(['/', '.'], "_")
+        ));
+        let uri = |name: &str| {
+            Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
+        };
+        let target_uri = uri(target_path);
+        let caller_uri = uri(caller_path);
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(workspace);
+        analysis
+            .update_file_by_uri(&target_uri, Some("return {}".to_string()))
+            .expect("target should be created");
+        let caller = analysis
+            .update_file_by_uri(
+                &caller_uri,
+                Some(format!("local reopened = {dependency_expr}")),
+            )
+            .expect("caller should be created");
+
+        analysis
+            .remove_file_by_uri(&target_uri)
+            .expect("target should be removed");
+        let reopened_target = analysis
+            .compilation
+            .get_db_mut()
+            .get_vfs_mut()
+            .set_file_content(&target_uri, Some("return {}".to_string()));
+
+        analysis
+            .expand_reindex_file_ids(vec![reopened_target])
+            .contains(&caller)
+    }
+
+    #[test]
+    fn reindex_expansion_matches_reopened_dependency_path_variants() {
+        for (target_path, caller_path, dependency_expr) in [
+            (
+                "lua/autorun/mixins/parent.lua",
+                "lua/autorun/sub/parent_consumer.lua",
+                r#"include("../mixins/parent.lua")"#,
+            ),
+            (
+                "lua/mixins/lua_prefixed.lua",
+                "lua/autorun/lua_prefixed_consumer.lua",
+                r#"include("lua/mixins/lua_prefixed.lua")"#,
+            ),
+            (
+                "lua/mixins/extensionless.lua",
+                "lua/autorun/extensionless_consumer.lua",
+                r#"include("mixins/extensionless")"#,
+            ),
+            (
+                "lua/mixins/required.lua",
+                "lua/autorun/required_consumer.lua",
+                r#"require("mixins.required")"#,
+            ),
+        ] {
+            assert!(
+                reopen_path_expands_to_caller(target_path, caller_path, dependency_expr),
+                "{dependency_expr} should match {target_path}"
+            );
+        }
+    }
+
+    #[test]
+    fn reindex_expansion_path_case_matches_vfs_platform_semantics() {
+        let matched = reopen_path_expands_to_caller(
+            "lua/mixins/CaseSensitive.lua",
+            "lua/autorun/case_consumer.lua",
+            r#"include("mixins/casesensitive.lua")"#,
+        );
+        assert_eq!(matched, cfg!(target_os = "windows"));
+    }
 
     #[test]
     fn stabilization_dependents_exclude_files_already_analyzed_in_batch() {

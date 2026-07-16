@@ -769,6 +769,32 @@ impl LuaMemberIndex {
         members
     }
 
+    /// Returns every still-current member ever indexed under `owner`, including
+    /// assignment history entries hidden by the normal latest-value view.
+    ///
+    /// This is intended for metadata synthesis that must migrate a bounded
+    /// owner region wholesale. Ordinary semantic lookup should continue using
+    /// `get_members`, which applies runtime overwrite visibility.
+    pub fn get_current_owner_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            return Vec::new();
+        };
+
+        let member_ids = owner_items
+            .values()
+            .flatten()
+            .copied()
+            .filter(|member_id| self.member_current_owner.get(member_id) == Some(owner))
+            .collect::<HashSet<_>>();
+
+        let mut members = member_ids
+            .into_iter()
+            .filter_map(|member_id| self.get_member(&member_id))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|member| stable_member_sort_key(member));
+        members
+    }
+
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
         let key_current_index = self
             .member_key_current_cache

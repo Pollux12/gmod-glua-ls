@@ -87,14 +87,17 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
 
+        let call_site_return_invalidation_changed = context.call_site_return_invalidation_changed;
         let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
         let child_inference_changed =
             !local_inference::stabilize_unguarded_children(db, &mut context, false).is_empty();
         let late_guard_retries = context.inferred_guard_candidates.len();
         let late_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
         let inferred_guard_changed = late_guard_stats.changed;
-        let late_inference_changed =
-            local_inference_changed || child_inference_changed || inferred_guard_changed;
+        let late_inference_changed = call_site_return_invalidation_changed
+            || local_inference_changed
+            || child_inference_changed
+            || inferred_guard_changed;
 
         let infer_dynamic_fields =
             db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
@@ -454,6 +457,7 @@ pub struct AnalyzeContext {
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
     early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
+    call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
 
@@ -473,6 +477,7 @@ impl AnalyzeContext {
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
+            call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
     }
@@ -514,6 +519,10 @@ impl AnalyzeContext {
             .push((member_id, decl_id));
     }
 
+    pub(crate) fn mark_call_site_return_invalidation(&mut self) {
+        self.call_site_return_invalidation_changed = true;
+    }
+
     fn invalidate_inferred_returns_for_sources(
         &self,
         db: &mut DbIndex,
@@ -522,10 +531,12 @@ impl AnalyzeContext {
         for return_ in self.inferred_return_candidates.iter().filter(|return_| {
             sources.iter().any(|source| {
                 source.file_id == return_.file_id
-                    && return_
+                    && (return_.body.as_ref().is_some_and(|body| {
+                        body.get_range().contains_range(source.value.get_range())
+                    }) || return_
                         .return_points
                         .iter()
-                        .any(|point| return_point_contains_range(point, source.value.get_range()))
+                        .any(|point| return_point_contains_range(point, source.value.get_range())))
             })
         }) {
             if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)

@@ -24,6 +24,19 @@ mod test {
             .collect()
     }
 
+    fn nil_diagnostic_messages_for_file(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+    ) -> Vec<String> {
+        let mut messages = diagnostic_messages_for_file(ws, file_id, DiagnosticCode::NeedCheckNil);
+        messages.extend(diagnostic_messages_for_file(
+            ws,
+            file_id,
+            DiagnosticCode::UncheckedNilAccess,
+        ));
+        messages
+    }
+
     #[gtest]
     fn test_inject_field_suppressed_for_dynamic_field() {
         let mut ws = VirtualWorkspace::new();
@@ -269,6 +282,125 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_later_assignment_slot_uses_multi_return_type() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let target_path = "lua/autorun/dynamic_multi_return_slot.lua";
+        let target_source = r#"
+            ---@class DynMultiReturn.First
+            ---@field FirstOnly fun(self: DynMultiReturn.First)
+            ---@class DynMultiReturn.Second
+            ---@field SecondOnly fun(self: DynMultiReturn.Second)
+            ---@class DynMultiReturn.Owner
+
+            ---@return DynMultiReturn.First
+            ---@return DynMultiReturn.Second
+            local function make_pair() end
+
+            ---@param value DynMultiReturn.First
+            local function takes_first(value) end
+
+            ---@type DynMultiReturn.Owner
+            local owner
+            local ignored
+            ignored, owner.value = make_pair()
+
+            takes_first(owner.value)
+            owner.value:SecondOnly()
+            "#;
+        let file_id = ws.def_file(target_path, target_source);
+
+        let before_param =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch);
+        verify_that!(&before_param, not(is_empty()))?;
+        let before_method =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
+        verify_that!(&before_method, is_empty())?;
+
+        let uri = ws.virtual_url_generator.new_uri(target_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{target_source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after_param =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch);
+        verify_that!(after_param, eq(&before_param))?;
+        let after_method =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
+        verify_that!(after_method, eq(&before_method))
+    }
+
+    #[gtest]
+    fn test_dynamic_field_later_assignment_slot_keeps_one_to_one_rhs_type() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/dynamic_one_to_one_slot.lua",
+            r#"
+            ---@class DynOneToOne.First
+            ---@field FirstOnly fun(self: DynOneToOne.First)
+            ---@class DynOneToOne.Second
+            ---@field SecondOnly fun(self: DynOneToOne.Second)
+            ---@class DynOneToOne.Owner
+
+            ---@param value DynOneToOne.First
+            local function takes_first(value) end
+
+            ---@type DynOneToOne.First
+            local first
+            ---@type DynOneToOne.Second
+            local second
+            ---@type DynOneToOne.Owner
+            local owner
+            local ignored
+            ignored, owner.value = first, second
+
+            takes_first(owner.value)
+            owner.value:SecondOnly()
+            "#,
+        );
+
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            not(is_empty())
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        )
+    }
+
+    #[gtest]
+    fn test_dynamic_field_missing_multi_return_slot_is_nil() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/dynamic_missing_return_slot.lua",
+            r#"
+            ---@class DynMissingReturn.First
+            ---@field FirstOnly fun(self: DynMissingReturn.First)
+            ---@class DynMissingReturn.Owner
+
+            ---@return DynMissingReturn.First
+            local function make_one() end
+
+            ---@param value DynMissingReturn.First
+            local function takes_first(value) end
+
+            ---@type DynMissingReturn.Owner
+            local owner
+            local ignored
+            ignored, owner.value = make_one()
+
+            takes_first(owner.value)
+            owner.value:FirstOnly()
+            "#,
+        );
+
+        verify_that!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            not(is_empty())
+        )
+    }
+
+    #[gtest]
     fn test_dynamic_field_defined_on_base_visible_to_subclass() {
         let mut ws = VirtualWorkspace::new();
         assert!(ws.check_code_for(
@@ -318,6 +450,217 @@ mod test {
             end
             "#
         ));
+    }
+
+    #[gtest]
+    fn test_later_sibling_dynamic_field_recovers_nullable_class_type() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/vgui/dynamic_sibling.lua",
+            r#"
+            ---@class DynSibling.DHTML
+            ---@field OpenURL fun(self: DynSibling.DHTML, url: string)
+
+            ---@class DynSibling.Owner
+
+            ---@param value number
+            local function takes_number(value) end
+
+            ---@type DynSibling.Owner
+            local owner
+
+            local function use_browser()
+                takes_number(owner.browser)
+                owner.browser:OpenURL("https://example.com")
+            end
+
+            local function init_browser()
+                ---@type DynSibling.DHTML
+                local browser
+                owner.browser = browser
+            end
+            "#,
+        );
+
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            not(is_empty())
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        )?;
+        verify_that!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            not(is_empty())
+        )
+    }
+
+    #[gtest]
+    fn test_earlier_sibling_dynamic_field_stays_nullable() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/vgui/dynamic_earlier_sibling.lua",
+            r#"
+            ---@class DynEarlierSibling.DHTML
+            ---@field OpenURL fun(self: DynEarlierSibling.DHTML, url: string)
+
+            ---@class DynEarlierSibling.Owner
+
+            ---@param value number
+            local function takes_number(value) end
+
+            ---@type DynEarlierSibling.Owner
+            local owner
+
+            local function init_browser()
+                ---@type DynEarlierSibling.DHTML
+                local browser
+                owner.browser = browser
+            end
+
+            local function use_browser()
+                takes_number(owner.browser)
+                owner.browser:OpenURL("https://example.com")
+            end
+            "#,
+        );
+
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            not(is_empty())
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        )?;
+        verify_that!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            not(is_empty())
+        )
+    }
+
+    #[gtest]
+    fn test_guarded_later_sibling_dynamic_field_is_safe() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/vgui/dynamic_sibling_guarded.lua",
+            r#"
+            ---@class DynSiblingGuarded.DHTML
+            ---@field OpenURL fun(self: DynSiblingGuarded.DHTML, url: string)
+
+            ---@class DynSiblingGuarded.Owner
+
+            ---@param value number
+            local function takes_number(value) end
+
+            ---@type DynSiblingGuarded.Owner
+            local owner
+
+            local function use_browser()
+                if owner.browser then
+                    takes_number(owner.browser)
+                    owner.browser:OpenURL("https://example.com")
+                end
+            end
+
+            local function init_browser()
+                ---@type DynSiblingGuarded.DHTML
+                local browser
+                owner.browser = browser
+            end
+            "#,
+        );
+
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            not(is_empty())
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        )?;
+        verify_that!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            is_empty()
+        )
+    }
+
+    #[gtest]
+    fn test_dynamic_field_order_stays_position_sensitive_within_scope() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/dynamic_ordering.lua",
+            r#"
+            ---@class DynOrdering.FunctionOwner
+            ---@class DynOrdering.TopLevelOwner
+
+            ---@param value number
+            local function takes_number(value) end
+
+            ---@param self DynOrdering.FunctionOwner
+            local function same_function(self)
+                takes_number(self.value)
+                self.value = "assigned"
+                takes_number(self.value)
+            end
+
+            ---@type DynOrdering.TopLevelOwner
+            local owner
+            takes_number(owner.value)
+            owner.value = "assigned"
+            takes_number(owner.value)
+            "#,
+        );
+
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            len(eq(2))
+        )
+    }
+
+    #[gtest]
+    fn test_multiple_later_sibling_definitions_union_stably_after_reindex() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let target_path = "lua/vgui/dynamic_sibling_union.lua";
+        let target_source = r#"
+            ---@class DynSiblingUnion.Owner
+
+            ---@param value string
+            local function takes_string(value) end
+            ---@param value number
+            local function takes_number(value) end
+
+            ---@type DynSiblingUnion.Owner
+            local owner
+
+            local function use_value()
+                takes_string(owner.value)
+                takes_number(owner.value)
+            end
+
+            local function init_string()
+                owner.value = "text"
+            end
+
+            local function init_number()
+                owner.value = 42
+            end
+            "#;
+        let file_id = ws.def_file(target_path, target_source);
+
+        let before =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch);
+        verify_that!(&before, len(eq(2)))?;
+
+        let uri = ws.virtual_url_generator.new_uri(target_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{target_source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let after =
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch);
+        verify_that!(after, eq(&before))
     }
 
     #[gtest]

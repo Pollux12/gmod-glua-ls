@@ -1,6 +1,6 @@
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr,
-    LuaTableExpr, LuaTableField,
+    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
+    LuaNameExpr, LuaTableExpr, LuaTableField, LuaVarExpr,
 };
 
 use crate::{
@@ -51,7 +51,11 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
             .add(backing_table, metatable_range.clone());
     }
 
-    if let LuaExpr::TableExpr(metatable) = metatable {
+    let metatable_table = match metatable {
+        LuaExpr::TableExpr(table) => Some(table),
+        _ => table_expr_from_range(analyzer, &metatable_range),
+    };
+    if let Some(metatable) = metatable_table {
         let operator_owner = LuaOperatorOwner::Table(metatable_range);
         for field in metatable.get_fields() {
             analyze_metable_field(analyzer, &field, &operator_owner);
@@ -112,7 +116,7 @@ fn resolve_metatable_backing_table(
 }
 
 fn table_backing_range_from_expr(
-    analyzer: &LuaAnalyzer,
+    analyzer: &mut LuaAnalyzer,
     expr: &LuaExpr,
 ) -> Option<InFiled<rowan::TextRange>> {
     match expr {
@@ -135,15 +139,23 @@ fn table_backing_range_from_expr(
                 .get_var_reference_decl(&analyzer.file_id, name_expr.get_range())?;
             let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
             if !decl.is_local() {
-                return None;
+                return inferred_table_range(analyzer, expr);
             }
 
-            if let LuaDeclExtra::Param {
-                idx: 0,
-                signature_id,
-                ..
-            } = &decl.extra
-            {
+            let receiver_signature_id = match &decl.extra {
+                LuaDeclExtra::Param {
+                    idx: 0,
+                    signature_id,
+                    ..
+                } => Some(*signature_id),
+                LuaDeclExtra::ImplicitSelf { .. } => name_expr
+                    .syntax()
+                    .ancestors()
+                    .find_map(LuaClosureExpr::cast)
+                    .map(|closure| LuaSignatureId::from_closure(analyzer.file_id, &closure)),
+                _ => None,
+            };
+            if let Some(signature_id) = receiver_signature_id {
                 let is_mutated = analyzer
                     .db
                     .get_reference_index()
@@ -153,7 +165,7 @@ fn table_backing_range_from_expr(
                     return None;
                 }
 
-                return callable_owner_table_range(analyzer, name_expr, *signature_id);
+                return receiver_owner_table_range(analyzer, name_expr, signature_id);
             }
 
             let root = analyzer
@@ -167,15 +179,56 @@ fn table_backing_range_from_expr(
                 .and_then(LuaExpr::cast)?;
             table_backing_range_from_expr(analyzer, &value_expr)
         }
+        LuaExpr::IndexExpr(_) => inferred_table_range(analyzer, expr),
         _ => None,
     }
 }
 
-fn callable_owner_table_range(
+fn table_expr_from_range(
     analyzer: &LuaAnalyzer,
+    range: &InFiled<rowan::TextRange>,
+) -> Option<LuaTableExpr> {
+    if range.file_id != analyzer.file_id {
+        return None;
+    }
+
+    let root = analyzer
+        .db
+        .get_vfs()
+        .get_syntax_tree(&range.file_id)?
+        .get_red_root();
+    root.token_at_offset(range.value.start())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaTableExpr::cast)
+        .filter(|table| table.get_range() == range.value)
+}
+
+fn inferred_table_range(
+    analyzer: &mut LuaAnalyzer,
+    expr: &LuaExpr,
+) -> Option<InFiled<rowan::TextRange>> {
+    match analyzer.infer_expr(expr).ok()? {
+        crate::LuaType::TableConst(range) => Some(range),
+        crate::LuaType::Instance(instance) => Some(instance.get_range().clone()),
+        _ => None,
+    }
+}
+
+fn receiver_owner_table_range(
+    analyzer: &mut LuaAnalyzer,
     name_expr: &LuaNameExpr,
     signature_id: LuaSignatureId,
 ) -> Option<InFiled<rowan::TextRange>> {
+    let signature = analyzer.db.get_signature_index().get(&signature_id)?;
+    if signature.is_colon_define {
+        let func_stat = name_expr.syntax().ancestors().find_map(LuaFuncStat::cast)?;
+        let LuaVarExpr::IndexExpr(func_name) = func_stat.get_func_name()? else {
+            return None;
+        };
+        return table_backing_range_from_expr(analyzer, &func_name.get_prefix_expr()?);
+    }
+
     let closure = name_expr.syntax().ancestors().find_map(|node| {
         let closure = LuaClosureExpr::cast(node)?;
         (LuaSignatureId::from_closure(analyzer.file_id, &closure) == signature_id)

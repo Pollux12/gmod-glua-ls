@@ -413,6 +413,10 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
     } else {
         None
     };
+    let dependency_path_keys = dependency_path
+        .as_deref()
+        .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
+        .unwrap_or_default();
 
     analyzer
         .db
@@ -422,7 +426,9 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
             target_file_id: dependency_file_id,
             kind: dependency_kind,
             path: dependency_path,
+            path_keys: dependency_path_keys,
             original_expr: expr.syntax().text().to_string(),
+            call_range: expr.get_range(),
             range: expr.get_range(),
         });
 
@@ -680,6 +686,7 @@ fn resolve_dependency_file_id(
             .find_module_for_file(dependency_path, file_id)
             .map(|it| it.file_id),
         LuaDependencyKind::Include
+        | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
         | LuaDependencyKind::IncludeCS => {
             resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {
