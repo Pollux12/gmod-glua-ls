@@ -79,6 +79,14 @@ struct ForRangePairsFieldNames {
     may_have_other_string_names: bool,
 }
 
+type FiniteNamedMemberEvidence = (
+    DynamicFieldOwner,
+    LuaMemberId,
+    crate::FileId,
+    rowan::TextRange,
+    bool,
+);
+
 #[derive(Default, Clone)]
 struct FieldSetterHelperCache {
     complete_helper_registry: bool,
@@ -192,12 +200,14 @@ fn collect_dynamic_fields_for_file(
 ) -> (
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
+    Vec<FiniteNamedMemberEvidence>,
     std::collections::HashSet<LuaInferredGuardOwner>,
 ) {
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
+    let mut collected_finite_members = Vec::new();
     let mut field_setter_helpers = field_setter_helpers.clone();
     let mut cache = crate::LuaInferCache::new(
         file_id,
@@ -278,6 +288,17 @@ fn collect_dynamic_fields_for_file(
                 );
             }
 
+            if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
+                collect_finite_member_for_type(
+                    &effective_type,
+                    LuaMemberId::new(index_expr.get_syntax_id(), file_id),
+                    file_id,
+                    definition_range,
+                    !field_names.may_have_other_string_names,
+                    &mut collected_finite_members,
+                );
+            }
+
             if field_names.names.is_empty() {
                 continue;
             };
@@ -296,6 +317,7 @@ fn collect_dynamic_fields_for_file(
                         value_expr,
                         file_id,
                         &mut collected,
+                        &mut collected_finite_members,
                     );
                 }
                 if mode.collect_direct_assignments() || collect_finite_direct_assignment {
@@ -320,12 +342,20 @@ fn collect_dynamic_fields_for_file(
                 &mut field_setter_helpers,
                 &mut collected,
             );
-            collect_setmetatable_table_fields(db, cache, &call_expr, file_id, &mut collected);
+            collect_setmetatable_table_fields(
+                db,
+                cache,
+                &call_expr,
+                file_id,
+                &mut collected,
+                &mut collected_finite_members,
+            );
         }
     }
     (
         collected,
         collected_wildcards,
+        collected_finite_members,
         cache.take_inferred_guard_dependencies(),
     )
 }
@@ -341,6 +371,7 @@ fn analyze_dynamic_fields(
         Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
         Vec::new();
+    let mut collected_finite_members = Vec::new();
     let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
     let profile_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
     let mut profile = profile_enabled.then(DynamicFieldProfile::default);
@@ -366,7 +397,7 @@ fn analyze_dynamic_fields(
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_chunk_node())
         else {
-            return (Vec::new(), Vec::new(), Default::default());
+            return (Vec::new(), Vec::new(), Vec::new(), Default::default());
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
     });
@@ -374,11 +405,12 @@ fn analyze_dynamic_fields(
         profile.collection_time += collection_start.elapsed();
     }
     let merge_start = profile_enabled.then(std::time::Instant::now);
-    for ((file_collected, file_wildcards, dependencies), file_id) in
+    for ((file_collected, file_wildcards, file_finite_members, dependencies), file_id) in
         per_file.into_iter().zip(file_ids)
     {
         collected.extend(file_collected);
         collected_wildcards.extend(file_wildcards);
+        collected_finite_members.extend(file_finite_members);
         context.add_inferred_guard_dependencies(file_id, dependencies);
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
@@ -425,6 +457,14 @@ fn analyze_dynamic_fields(
     }
     for (owner, file_id, range) in &collected_wildcards {
         index.add_wildcard_definition(owner.clone(), *file_id, *range);
+    }
+    let wildcard_definitions = collected_wildcards.into_iter().collect::<FxHashSet<_>>();
+    for (owner, member_id, file_id, range, has_finite_domain) in collected_finite_members {
+        if has_finite_domain && !wildcard_definitions.contains(&(owner.clone(), file_id, range)) {
+            index.add_finite_named_member(owner, member_id);
+        } else {
+            index.remove_finite_named_member(&owner, member_id);
+        }
     }
     if let (Some(profile), Some(insert_start)) = (profile.as_mut(), insert_start) {
         profile.insertion_time += insert_start.elapsed();
@@ -846,6 +886,7 @@ fn collect_setmetatable_table_fields(
     call_expr: &LuaCallExpr,
     file_id: crate::FileId,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    collected_finite_members: &mut Vec<FiniteNamedMemberEvidence>,
 ) {
     if !call_expr.is_setmetatable() {
         return;
@@ -868,7 +909,15 @@ fn collect_setmetatable_table_fields(
     };
 
     for field in table_expr.get_fields() {
-        collect_nested_table_field(db, cache, &field, &target_type, file_id, collected);
+        collect_nested_table_field(
+            db,
+            cache,
+            &field,
+            &target_type,
+            file_id,
+            collected,
+            collected_finite_members,
+        );
     }
 }
 
@@ -879,10 +928,12 @@ fn collect_nested_table_field(
     owner_type: &LuaType,
     file_id: crate::FileId,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    collected_finite_members: &mut Vec<FiniteNamedMemberEvidence>,
 ) {
     let Some(field_key) = field.get_field_key() else {
         return;
     };
+    let is_expression_key = matches!(field_key, LuaIndexKey::Expr(_));
     let field_names = match field_key {
         LuaIndexKey::Name(ref name) => vec![name.get_name_text().into()],
         LuaIndexKey::String(ref string) => vec![string.get_value().into()],
@@ -899,6 +950,17 @@ fn collect_nested_table_field(
         return;
     };
 
+    if is_expression_key {
+        collect_finite_member_for_type(
+            owner_type,
+            LuaMemberId::new(field.get_syntax_id(), file_id),
+            file_id,
+            definition_range,
+            true,
+            collected_finite_members,
+        );
+    }
+
     for field_name in field_names {
         collect_for_type(
             owner_type,
@@ -912,7 +974,15 @@ fn collect_nested_table_field(
     if let Some(LuaExpr::TableExpr(table_expr)) = field.get_value_expr() {
         let nested_owner = LuaType::TableConst(InFiled::new(file_id, table_expr.get_range()));
         for nested_field in table_expr.get_fields() {
-            collect_nested_table_field(db, cache, &nested_field, &nested_owner, file_id, collected);
+            collect_nested_table_field(
+                db,
+                cache,
+                &nested_field,
+                &nested_owner,
+                file_id,
+                collected,
+                collected_finite_members,
+            );
         }
     }
 }
@@ -926,6 +996,7 @@ fn collect_assigned_table_fields_for_declared_member(
     value_expr: &LuaExpr,
     file_id: crate::FileId,
     collected: &mut Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
+    collected_finite_members: &mut Vec<FiniteNamedMemberEvidence>,
 ) {
     let LuaExpr::TableExpr(table_expr) = value_expr else {
         return;
@@ -942,7 +1013,15 @@ fn collect_assigned_table_fields_for_declared_member(
 
     for member_type in member_types {
         for field in table_expr.get_fields() {
-            collect_nested_table_field(db, cache, &field, &member_type, file_id, collected);
+            collect_nested_table_field(
+                db,
+                cache,
+                &field,
+                &member_type,
+                file_id,
+                collected,
+                collected_finite_members,
+            );
         }
     }
 }
@@ -1709,6 +1788,69 @@ fn collect_for_type(
         LuaType::Union(union_type) => {
             for t in union_type.types() {
                 collect_for_type(t, field_name, file_id, range, result);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn collect_finite_member_for_type(
+    typ: &LuaType,
+    member_id: LuaMemberId,
+    file_id: crate::FileId,
+    range: rowan::TextRange,
+    has_finite_domain: bool,
+    result: &mut Vec<FiniteNamedMemberEvidence>,
+) {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            result.push((
+                DynamicFieldOwner::Type(id.clone()),
+                member_id,
+                file_id,
+                range,
+                has_finite_domain,
+            ));
+        }
+        LuaType::TableConst(table_range) => {
+            result.push((
+                DynamicFieldOwner::Table(table_range.clone()),
+                member_id,
+                file_id,
+                range,
+                has_finite_domain,
+            ));
+        }
+        LuaType::Instance(instance) => {
+            collect_finite_member_for_type(
+                instance.get_base(),
+                member_id,
+                file_id,
+                range,
+                has_finite_domain,
+                result,
+            );
+        }
+        LuaType::TableOf(inner) => {
+            collect_finite_member_for_type(
+                inner,
+                member_id,
+                file_id,
+                range,
+                has_finite_domain,
+                result,
+            );
+        }
+        LuaType::Union(union_type) => {
+            for typ in union_type.types() {
+                collect_finite_member_for_type(
+                    typ,
+                    member_id,
+                    file_id,
+                    range,
+                    has_finite_domain,
+                    result,
+                );
             }
         }
         _ => {}

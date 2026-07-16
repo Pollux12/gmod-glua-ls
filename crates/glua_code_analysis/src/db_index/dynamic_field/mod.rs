@@ -4,7 +4,7 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, InFiled, LuaTypeDeclId};
+use crate::{FileId, InFiled, LuaMemberId, LuaTypeDeclId};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum DynamicFieldOwner {
@@ -25,8 +25,8 @@ pub struct DynamicFieldIndex {
     field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// Exact fields collected on their original owner, excluding inherited propagation.
     direct_field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
-    /// Assignment locations which contributed one or more exact finite field names.
-    direct_definition_ranges: HashMap<DynamicFieldOwner, HashSet<InFiled<TextRange>>>,
+    /// Expression-key members whose complete string domain was resolved to finite names.
+    finite_named_members: HashSet<(DynamicFieldOwner, LuaMemberId)>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
     /// owner → assignment locations for writes through non-literal keys.
@@ -48,10 +48,6 @@ impl DynamicFieldIndex {
         range: TextRange,
     ) {
         let definition = InFiled::new(file_id, range);
-        self.direct_definition_ranges
-            .entry(owner.clone())
-            .or_default()
-            .insert(definition.clone());
         let direct_definitions = self
             .direct_field_definitions
             .entry(owner.clone())
@@ -158,24 +154,26 @@ impl DynamicFieldIndex {
         self.direct_field_definitions.get(owner)
     }
 
-    pub fn has_direct_definition(
-        &self,
-        owner: &DynamicFieldOwner,
-        definition: &InFiled<TextRange>,
-    ) -> bool {
-        self.direct_definition_ranges
-            .get(owner)
-            .is_some_and(|definitions| definitions.contains(definition))
+    pub fn add_finite_named_member(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
+        self.finite_named_members.insert((owner, member_id));
     }
 
-    pub fn has_wildcard_definition(
+    pub fn remove_finite_named_member(
+        &mut self,
+        owner: &DynamicFieldOwner,
+        member_id: LuaMemberId,
+    ) {
+        self.finite_named_members
+            .remove(&(owner.clone(), member_id));
+    }
+
+    pub fn member_has_finite_named_definition(
         &self,
         owner: &DynamicFieldOwner,
-        definition: &InFiled<TextRange>,
+        member_id: LuaMemberId,
     ) -> bool {
-        self.wildcard_definitions
-            .get(owner)
-            .is_some_and(|definitions| definitions.contains(definition))
+        self.finite_named_members
+            .contains(&(owner.clone(), member_id))
     }
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
@@ -222,18 +220,8 @@ impl DynamicFieldIndex {
 
     fn rebuild_derived_state(&mut self) {
         self.owner_fields.clear();
-        self.direct_definition_ranges.clear();
         self.file_contributions.clear();
         self.wildcard_file_contributions.clear();
-
-        for (owner, fields) in &self.direct_field_definitions {
-            for definitions in fields.values() {
-                self.direct_definition_ranges
-                    .entry(owner.clone())
-                    .or_default()
-                    .extend(definitions.iter().cloned());
-            }
-        }
 
         for (owner, fields) in &self.field_definitions {
             for (field_name, definitions) in fields {
@@ -381,10 +369,8 @@ impl LuaIndex for DynamicFieldIndex {
             });
             !fields.is_empty()
         });
-        self.direct_definition_ranges.retain(|_, definitions| {
-            definitions.retain(|definition| definition.file_id != file_id);
-            !definitions.is_empty()
-        });
+        self.finite_named_members
+            .retain(|(_, member_id)| member_id.file_id != file_id);
 
         let mut removed_wildcard_definitions = false;
         self.wildcard_definitions.retain(|_, definitions| {
@@ -411,7 +397,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.owner_fields.clear();
         self.field_definitions.clear();
         self.direct_field_definitions.clear();
-        self.direct_definition_ranges.clear();
+        self.finite_named_members.clear();
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
@@ -420,6 +406,7 @@ impl LuaIndex for DynamicFieldIndex {
 
 #[cfg(test)]
 mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use rowan::{TextRange, TextSize};
     use smol_str::SmolStr;
 
@@ -534,31 +521,38 @@ mod tests {
     }
 
     #[test]
-    fn direct_and_wildcard_definition_lookups_track_lifecycle() {
+    fn finite_named_member_lookups_track_lifecycle() {
         let file_id = FileId::new(1);
         let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
-        let direct = InFiled::new(file_id, range(1, 2));
-        let wildcard = InFiled::new(file_id, range(3, 4));
         let mut index = DynamicFieldIndex::new();
+        let direct_member = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(0, 2)),
+            file_id,
+        );
+        let wildcard_member = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(2, 4)),
+            file_id,
+        );
+        let containing_member = LuaMemberId::new(
+            LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range(0, 4)),
+            file_id,
+        );
+        index.add_finite_named_member(owner.clone(), direct_member);
 
-        index.add_field(owner.clone(), "first".into(), file_id, direct.value);
-        index.add_field(owner.clone(), "second".into(), file_id, direct.value);
-        index.add_wildcard_definition(owner.clone(), file_id, wildcard.value);
+        assert!(index.member_has_finite_named_definition(&owner, direct_member));
+        assert!(!index.member_has_finite_named_definition(&owner, wildcard_member));
+        assert!(!index.member_has_finite_named_definition(&owner, containing_member));
 
-        assert!(index.has_direct_definition(&owner, &direct));
-        assert!(!index.has_direct_definition(&owner, &wildcard));
-        assert!(index.has_wildcard_definition(&owner, &wildcard));
-        assert!(!index.has_wildcard_definition(&owner, &direct));
+        index.remove_finite_named_member(&owner, direct_member);
+        assert!(!index.member_has_finite_named_definition(&owner, direct_member));
+        index.add_finite_named_member(owner.clone(), direct_member);
 
         index.remove(file_id);
-        assert!(!index.has_direct_definition(&owner, &direct));
-        assert!(!index.has_wildcard_definition(&owner, &wildcard));
+        assert!(!index.member_has_finite_named_definition(&owner, direct_member));
 
-        index.add_field(owner.clone(), "first".into(), file_id, direct.value);
-        index.add_wildcard_definition(owner.clone(), file_id, wildcard.value);
+        index.add_finite_named_member(owner.clone(), direct_member);
         index.clear();
-        assert!(!index.has_direct_definition(&owner, &direct));
-        assert!(!index.has_wildcard_definition(&owner, &wildcard));
+        assert!(!index.member_has_finite_named_definition(&owner, direct_member));
     }
 
     #[test]

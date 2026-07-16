@@ -3,7 +3,7 @@ pub(crate) use infer_array::{check_index_in_range, check_iter_var_range};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaForStat, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr,
-    LuaLocalStat, LuaNameExpr, LuaTableField, NumberResult, PathTrait,
+    LuaLocalStat, LuaNameExpr, NumberResult, PathTrait,
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
@@ -1260,26 +1260,8 @@ fn member_is_finite_named_dynamic_assignment(
         LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
         _ => return false,
     };
-    let Some(definition) = dynamic_member_key_definition(db, member) else {
-        return false;
-    };
     let dynamic_fields = db.get_dynamic_field_index();
-    dynamic_fields.has_direct_definition(&dynamic_owner, &definition)
-        && !dynamic_fields.has_wildcard_definition(&dynamic_owner, &definition)
-}
-
-fn dynamic_member_key_definition(db: &DbIndex, member: &LuaMember) -> Option<InFiled<TextRange>> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member.get_file_id())?
-        .get_red_root();
-    let node = member.get_syntax_id().to_node_from_root(&root)?;
-    let range = if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-        index_expr.get_index_key()?.get_range()?
-    } else {
-        LuaTableField::cast(node)?.get_field_key()?.get_range()?
-    };
-    Some(InFiled::new(member.get_file_id(), range))
+    dynamic_fields.member_has_finite_named_definition(&dynamic_owner, member.get_id())
 }
 
 fn owner_has_finite_named_dynamic_assignment(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
