@@ -1932,7 +1932,7 @@ local EscapeStringMap: {
                 end
             "#,
             VirtualHoverResult {
-                value: "```lua\n(infer) _OriginalName: true\n```".to_string(),
+                value: "```lua\n(infer) _OriginalName: true?\n```".to_string(),
             },
         ));
 

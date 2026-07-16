@@ -16,8 +16,8 @@ use crate::{
 };
 use check_reason::{check_reach_reason, resolve_all_reason};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaNameToken,
-    LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr, LuaFuncStat,
+    LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
     try_resolve_decl, try_resolve_iter_var, try_resolve_member, try_resolve_module,
@@ -678,6 +678,7 @@ impl From<UnResolveModule> for UnResolve {
 pub struct UnResolveReturn {
     pub file_id: FileId,
     pub signature_id: LuaSignatureId,
+    pub body: Option<LuaBlock>,
     pub return_points: Vec<LuaReturnPoint>,
 }
 
@@ -720,6 +721,7 @@ pub struct UnResolveClosureReturn {
     pub signature_id: LuaSignatureId,
     pub call_expr: LuaCallExpr,
     pub param_idx: usize,
+    pub body: Option<LuaBlock>,
     pub return_points: Vec<LuaReturnPoint>,
 }
 

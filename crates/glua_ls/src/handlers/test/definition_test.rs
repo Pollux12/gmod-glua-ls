@@ -924,7 +924,7 @@ mod tests {
 
     #[gtest]
     fn test_goto_inferred_dynamic_field_definition_through_table_alias() -> Result<()> {
-        let mut ws = ProviderVirtualWorkspace::new();
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;

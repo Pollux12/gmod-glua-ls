@@ -1682,12 +1682,13 @@ fn analyze_return(
         }
     };
 
-    let return_points = analyze_func_body_returns(block);
+    let return_points = analyze_func_body_returns(block.clone());
     analyzer
         .context
         .add_inferred_return_candidate(UnResolveReturn {
             file_id: analyzer.file_id,
             signature_id: *signature_id,
+            body: Some(block.clone()),
             return_points: return_points.clone(),
         });
     let return_correlations = analyze_return_correlations(
@@ -1721,6 +1722,7 @@ fn analyze_return(
             let unresolve = UnResolveReturn {
                 file_id: analyzer.file_id,
                 signature_id: *signature_id,
+                body: Some(block),
                 return_points,
             };
 
@@ -1776,12 +1778,13 @@ fn analyze_lambda_returns(
         .get_args()
         .position(|arg| arg.get_position() == pos)?;
     let block = closure.get_block()?;
-    let return_points = analyze_func_body_returns(block);
+    let return_points = analyze_func_body_returns(block.clone());
     let unresolved = UnResolveClosureReturn {
         file_id: analyzer.file_id,
         signature_id: *signature_id,
         call_expr,
         param_idx: founded_idx,
+        body: Some(block),
         return_points,
     };
 

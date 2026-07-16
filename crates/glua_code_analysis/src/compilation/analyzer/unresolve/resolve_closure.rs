@@ -185,6 +185,7 @@ fn try_convert_to_func_body_infer(
     let mut unresolve = UnResolveReturn {
         file_id: closure_return.file_id,
         signature_id: closure_return.signature_id,
+        body: closure_return.body.clone(),
         return_points: closure_return.return_points.clone(),
     };
 
