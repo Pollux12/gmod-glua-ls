@@ -15,6 +15,7 @@ mod enum_value_mismatch_test;
 mod generic_constraint_mismatch_test;
 mod global_in_non_module_test;
 mod gmod_annotation_shape_test;
+mod gmod_compilefile_environment_test;
 mod gmod_dynamic_field_test;
 mod gmod_hook_name_test;
 mod gmod_network_test;

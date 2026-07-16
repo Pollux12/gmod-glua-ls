@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     path::Path,
     sync::Arc,
 };
@@ -30,7 +30,8 @@ use crate::{
     db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
         AsyncState, DbIndex, GmodCallbackSiteMetadata, GmodConVarKind, GmodConVarSiteMetadata,
-        GmodConcommandSiteMetadata, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
+        GmodConcommandSiteMetadata, GmodExecutionEnvironmentFileFlow, GmodExecutionEnvironmentSite,
+        GmodExecutionEnvironmentSource, GmodFileLoadInfo, GmodHookKind, GmodHookNameIssue,
         GmodHookSiteMetadata, GmodLoadConfidence, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadRoot,
         GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
@@ -67,14 +68,27 @@ struct GmodKeywords {
     has_realm_anno: bool,
 }
 
-#[derive(Default)]
+#[derive(Clone, Copy, Default)]
 struct AnnotatedGmodCandidatePresence {
     has_system: bool,
     has_net: bool,
     has_hook: bool,
     has_scripted_class: bool,
     has_load: bool,
+    has_environment: bool,
     has_file_find: bool,
+}
+
+impl AnnotatedGmodCandidatePresence {
+    fn merge(&mut self, other: Self) {
+        self.has_system |= other.has_system;
+        self.has_net |= other.has_net;
+        self.has_hook |= other.has_hook;
+        self.has_scripted_class |= other.has_scripted_class;
+        self.has_load |= other.has_load;
+        self.has_environment |= other.has_environment;
+        self.has_file_find |= other.has_file_find;
+    }
 }
 
 impl GmodKeywords {
@@ -483,7 +497,9 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t_class = do_profile.then(std::time::Instant::now);
-        collect_annotated_scripted_class_calls(db, context);
+        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
+        collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles);
+        update_compilefile_execution_environments(db, context, &annotated_global_call_roles);
         if let Some(t_class) = t_class {
             log::info!(
                 "gmod post: annotated_scripted_class_calls cost {:?}",
@@ -531,7 +547,11 @@ fn collect_numeric_range_table_populations(db: &mut DbIndex, context: &AnalyzeCo
     }
 }
 
-fn collect_annotated_scripted_class_calls(db: &mut DbIndex, context: &AnalyzeContext) {
+fn collect_annotated_scripted_class_calls(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) {
     let formatted_hook_prefixes: Vec<String> = db
         .get_emmyrc()
         .gmod
@@ -540,12 +560,11 @@ fn collect_annotated_scripted_class_calls(db: &mut DbIndex, context: &AnalyzeCon
         .iter()
         .map(|p| format!("{p}:"))
         .collect();
-    let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
     collect_annotated_scripted_class_calls_with(
         db,
         context,
         &formatted_hook_prefixes,
-        &annotated_global_call_roles,
+        annotated_global_call_roles,
     );
 }
 
@@ -5897,6 +5916,7 @@ struct AnnotatedGmodGlobalCallRoleMap {
     roles_by_path: HashMap<String, AnnotatedGmodCallRoles>,
     candidate_call_path_matcher: Option<AhoCorasick>,
     candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
+    environment_role_source_files: HashSet<FileId>,
 }
 
 struct AnnotatedGmodCallRoleMap<'a> {
@@ -5904,6 +5924,7 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_roles_by_decl: HashMap<LuaDeclId, AnnotatedGmodCallRoles>,
     local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
     local_candidate_names: HashSet<String>,
+    reassigned_local_decls: HashSet<LuaDeclId>,
 }
 
 #[derive(Clone, Default)]
@@ -5960,6 +5981,9 @@ struct AnnotatedGmodCallRoles {
     hook_roles: Vec<(GmodHookKind, AnnotatedGmodCallArgRole)>,
     hook_callback_roles: Vec<AnnotatedGmodCallArgRole>,
     load_roles: Vec<(LuaDependencyKind, AnnotatedGmodCallArgRole)>,
+    compilefile_roles: Vec<AnnotatedGmodCallArgRole>,
+    environment_target_roles: Vec<AnnotatedGmodCallArgRole>,
+    environment_table_roles: Vec<AnnotatedGmodCallArgRole>,
     file_find_glob_roles: Vec<AnnotatedGmodCallArgRole>,
     file_find_search_path_roles: Vec<AnnotatedGmodCallArgRole>,
     inheritance_roles: Vec<(GmodScriptedClassCallKind, AnnotatedGmodCallArgRole)>,
@@ -6066,6 +6090,9 @@ impl AnnotatedGmodCallRoles {
             ("gmod.load", "includecs") | ("gmod.load", "include_cs") => self
                 .load_roles
                 .push((LuaDependencyKind::IncludeCS, arg_role)),
+            ("gmod.load", "compilefile") => self.compilefile_roles.push(arg_role),
+            ("gmod.environment", "target") => self.environment_target_roles.push(arg_role),
+            ("gmod.environment", "environment") => self.environment_table_roles.push(arg_role),
             ("gmod.file_find", "glob") => {
                 self.file_find_glob_roles.push(arg_role);
             }
@@ -6139,6 +6166,12 @@ impl AnnotatedGmodCallRoles {
         self.hook_callback_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.load_roles.sort_by_key(|(_, role)| role.sort_key());
+        self.compilefile_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.environment_target_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.environment_table_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.file_find_glob_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.file_find_search_path_roles
@@ -6171,6 +6204,9 @@ impl AnnotatedGmodCallRoles {
             || !self.hook_roles.is_empty()
             || !self.hook_callback_roles.is_empty()
             || !self.load_roles.is_empty()
+            || !self.compilefile_roles.is_empty()
+            || (!self.environment_target_roles.is_empty()
+                && !self.environment_table_roles.is_empty())
             || !self.file_find_glob_roles.is_empty()
             || !self.file_find_search_path_roles.is_empty()
             || !self.inheritance_roles.is_empty()
@@ -6280,6 +6316,14 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn candidate_presence(&self) -> AnnotatedGmodCandidatePresence {
+        let mut presence = self.direct_candidate_presence();
+        for overload in &self.overloads {
+            presence.merge(overload.direct_candidate_presence());
+        }
+        presence
+    }
+
+    fn direct_candidate_presence(&self) -> AnnotatedGmodCandidatePresence {
         AnnotatedGmodCandidatePresence {
             has_system: !self.system_roles.is_empty() || !self.system_callback_roles.is_empty(),
             has_net: self.system_roles.iter().any(|(kind, _)| {
@@ -6292,6 +6336,9 @@ impl AnnotatedGmodCallRoles {
             }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
             has_load: !self.load_roles.is_empty(),
+            has_environment: !self.compilefile_roles.is_empty()
+                || (!self.environment_target_roles.is_empty()
+                    && !self.environment_table_roles.is_empty()),
             has_file_find: !self.file_find_glob_roles.is_empty()
                 || !self.file_find_search_path_roles.is_empty(),
             has_scripted_class: !self.inheritance_roles.is_empty()
@@ -6333,6 +6380,20 @@ impl AnnotatedGmodCallRoles {
         Some((
             *kind,
             param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)?,
+        ))
+    }
+
+    fn compilefile_call(&self, is_colon_call: bool) -> Option<usize> {
+        let role = self.compilefile_roles.first()?;
+        param_idx_to_call_arg_idx(role.param_idx, is_colon_call, self.is_colon_define)
+    }
+
+    fn environment_call(&self, is_colon_call: bool) -> Option<(usize, usize)> {
+        let target = self.environment_target_roles.first()?;
+        let environment = self.environment_table_roles.first()?;
+        Some((
+            param_idx_to_call_arg_idx(target.param_idx, is_colon_call, self.is_colon_define)?,
+            param_idx_to_call_arg_idx(environment.param_idx, is_colon_call, self.is_colon_define)?,
         ))
     }
 
@@ -6602,6 +6663,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 && !presence.has_hook
                 && !presence.has_scripted_class
                 && !presence.has_load
+                && !presence.has_environment
                 && !presence.has_file_find
             {
                 continue;
@@ -6636,6 +6698,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
             presence.has_hook |= candidate_presence.has_hook;
             presence.has_scripted_class |= candidate_presence.has_scripted_class;
             presence.has_load |= candidate_presence.has_load;
+            presence.has_environment |= candidate_presence.has_environment;
             presence.has_file_find |= candidate_presence.has_file_find;
 
             if presence.has_system
@@ -6643,6 +6706,7 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 && presence.has_hook
                 && presence.has_scripted_class
                 && presence.has_load
+                && presence.has_environment
                 && presence.has_file_find
             {
                 break;
@@ -6663,6 +6727,10 @@ impl AnnotatedGmodGlobalCallRoleMap {
             return;
         };
         if let Some(roles) = roles_from_signature(db, signature_id) {
+            if roles.candidate_presence().has_environment {
+                self.environment_role_source_files
+                    .insert(signature_id.get_file_id());
+            }
             self.roles_by_path.insert(call_path.clone(), roles.clone());
             if let Some(global_path) = call_path.strip_prefix("_G.") {
                 self.roles_by_path.insert(global_path.to_string(), roles);
@@ -6687,6 +6755,10 @@ impl AnnotatedGmodGlobalCallRoleMap {
                 .strip_prefix("_G.")
                 .is_some_and(|global_path| self.roles_by_path.contains_key(global_path))
     }
+
+    fn environment_role_source_files(&self) -> &HashSet<FileId> {
+        &self.environment_role_source_files
+    }
 }
 
 impl<'a> AnnotatedGmodCallRoleMap<'a> {
@@ -6701,6 +6773,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             local_roles_by_decl: HashMap::new(),
             local_roles_by_path: HashMap::new(),
             local_candidate_names: HashSet::new(),
+            reassigned_local_decls: collect_reassigned_local_decls(db, file_id, root),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -6830,6 +6903,28 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             .and_then(|roles| roles.load_call(call_expr.is_colon_call()))
     }
 
+    fn compilefile_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<usize> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.compilefile_call(call_expr.is_colon_call()))
+    }
+
+    fn environment_call(
+        &self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+        call_path: &str,
+    ) -> Option<(usize, usize)> {
+        self.roles_for_call(db, file_id, call_expr, call_path)
+            .and_then(|roles| roles.environment_call(call_expr.is_colon_call()))
+    }
+
     fn load_alias_for_call(
         &self,
         db: &DbIndex,
@@ -6951,6 +7046,12 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         call_expr: &LuaCallExpr,
         call_path: &str,
     ) -> Option<AnnotatedGmodCallRoles> {
+        if call_expr_local_root_decl_id(db, file_id, call_expr)
+            .is_some_and(|decl_id| self.reassigned_local_decls.contains(&decl_id))
+        {
+            return None;
+        }
+
         if let Some(local_path_roles) =
             annotated_roles_from_local_call_path(self, db, file_id, call_expr, call_path)
         {
@@ -6983,6 +7084,19 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
 
         annotated_roles_from_local_call_prefix(self, db, file_id, call_expr.get_prefix_expr())?
             .and_then(|roles| roles.select_for_call(call_expr))
+    }
+}
+
+fn call_expr_local_root_decl_id(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaDeclId> {
+    match call_expr.get_prefix_expr()? {
+        LuaExpr::NameExpr(name_expr) => name_expr_local_decl_id(db, file_id, &name_expr),
+        LuaExpr::IndexExpr(index_expr) => index_expr_root_name(&index_expr)
+            .and_then(|name_expr| name_expr_local_decl_id(db, file_id, &name_expr)),
+        _ => None,
     }
 }
 
@@ -8521,6 +8635,536 @@ fn realm_from_condition(expr: &LuaExpr) -> Option<GmodRealm> {
         }
         _ => None,
     }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CompilefileTargetState {
+    Unique(FileId),
+    Ambiguous,
+}
+
+fn update_compilefile_execution_environments(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) {
+    let analyzed_file_ids = context
+        .tree_list
+        .iter()
+        .map(|tree| tree.file_id)
+        .collect::<HashSet<_>>();
+    let roles_changed = db
+        .get_gmod_load_index()
+        .execution_environment_roles_changed(
+            annotated_global_call_roles.environment_role_source_files(),
+            &analyzed_file_ids,
+        );
+    let files_to_update = if roles_changed {
+        db.get_vfs().get_all_local_file_ids()
+    } else {
+        analyzed_file_ids.iter().copied().collect()
+    };
+    let flow_updates = files_to_update
+        .iter()
+        .map(|file_id| {
+            (
+                *file_id,
+                collect_compilefile_execution_environment_flow(
+                    db,
+                    *file_id,
+                    annotated_global_call_roles,
+                ),
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let load_index = db.get_gmod_load_index_mut();
+    for (file_id, flow) in flow_updates {
+        load_index.set_execution_environment_file_flow(file_id, flow);
+    }
+    load_index.set_execution_environment_role_sources(
+        annotated_global_call_roles
+            .environment_role_source_files()
+            .clone(),
+    );
+
+    rebuild_compilefile_execution_environments(db, files_to_update.len(), roles_changed);
+}
+
+fn collect_compilefile_execution_environment_flow(
+    db: &DbIndex,
+    file_id: FileId,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+) -> GmodExecutionEnvironmentFileFlow {
+    let Some(content) = db.get_vfs().get_file_content(&file_id) else {
+        return GmodExecutionEnvironmentFileFlow::default();
+    };
+    let candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
+    if !candidates.has_environment
+        && !content.contains("gmod.environment")
+        && !content.contains("compilefile")
+    {
+        return GmodExecutionEnvironmentFileFlow::default();
+    }
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return GmodExecutionEnvironmentFileFlow::default();
+    };
+    let roles = AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
+    let reassigned_decls = &roles.reassigned_local_decls;
+    let mut flow = GmodExecutionEnvironmentFileFlow::default();
+
+    let local_functions = root
+        .descendants::<LuaLocalFuncStat>()
+        .filter_map(|stat| {
+            let local_name = stat.get_local_name()?;
+            let function_decl = LuaDeclId::new(file_id, local_name.get_position());
+            let closure = stat.get_closure()?;
+            let params = closure
+                .get_params_list()
+                .into_iter()
+                .flat_map(|params| params.get_params())
+                .filter(|param| !param.is_dots())
+                .map(|param| LuaDeclId::new(file_id, param.get_position()))
+                .collect::<Vec<_>>();
+            Some((function_decl, params))
+        })
+        .collect::<HashMap<_, _>>();
+
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        let names = local_stat.get_local_name_list().collect::<Vec<_>>();
+        let values = local_stat.get_value_exprs().collect::<Vec<_>>();
+        for (idx, local_name) in names.iter().enumerate() {
+            let Some(value) = values.get(idx) else {
+                continue;
+            };
+            let destination = LuaDeclId::new(file_id, local_name.get_position());
+            if reassigned_decls.contains(&destination) {
+                continue;
+            }
+            if let Some(source) = compilefile_chunk_source_from_expr(
+                db,
+                file_id,
+                &roles,
+                value,
+                reassigned_decls,
+                &mut HashSet::new(),
+            ) {
+                add_compilefile_flow(&mut flow, destination, source);
+            }
+        }
+    }
+
+    for call_expr in root.descendants::<LuaCallExpr>() {
+        let Some(call_path) = call_expr.get_access_path() else {
+            continue;
+        };
+        let args = call_expr
+            .get_args_list()
+            .map(|args| args.get_args().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        if let Some((target_idx, environment_idx)) =
+            roles.environment_call(db, file_id, &call_expr, &call_path)
+        {
+            let Some(target_expr) = args.get(target_idx) else {
+                continue;
+            };
+            let Some(environment_expr) = args.get(environment_idx) else {
+                continue;
+            };
+            let Some(source) = compilefile_chunk_source_from_expr(
+                db,
+                file_id,
+                &roles,
+                target_expr,
+                reassigned_decls,
+                &mut HashSet::new(),
+            ) else {
+                continue;
+            };
+            let Some(fields) = static_environment_fields(
+                db,
+                file_id,
+                environment_expr,
+                reassigned_decls,
+                &mut HashSet::new(),
+            ) else {
+                continue;
+            };
+            flow.sites
+                .push(GmodExecutionEnvironmentSite { source, fields });
+            continue;
+        }
+
+        let Some(callee_decl) = call_expr.get_prefix_expr().and_then(|expr| match expr {
+            LuaExpr::NameExpr(name_expr) => name_expr_local_decl_id(db, file_id, &name_expr),
+            LuaExpr::ParenExpr(paren) => paren.get_expr().and_then(|expr| match expr {
+                LuaExpr::NameExpr(name_expr) => name_expr_local_decl_id(db, file_id, &name_expr),
+                _ => None,
+            }),
+            _ => None,
+        }) else {
+            continue;
+        };
+        let Some(params) = local_functions.get(&callee_decl) else {
+            continue;
+        };
+        for (param, arg) in params.iter().zip(&args) {
+            if reassigned_decls.contains(param) {
+                continue;
+            }
+            if let Some(source) = compilefile_chunk_source_from_expr(
+                db,
+                file_id,
+                &roles,
+                arg,
+                reassigned_decls,
+                &mut HashSet::new(),
+            ) {
+                add_compilefile_flow(&mut flow, *param, source);
+            }
+        }
+    }
+
+    flow
+}
+
+fn rebuild_compilefile_execution_environments(
+    db: &mut DbIndex,
+    updated_source_files: usize,
+    roles_changed: bool,
+) {
+    let mut environments = HashMap::<FileId, HashMap<FileId, HashSet<String>>>::new();
+    let mut cached_source_files = 0usize;
+    let mut edge_count = 0usize;
+    let mut seed_count = 0usize;
+    let mut site_count = 0usize;
+    for (source_file_id, flow) in db
+        .get_gmod_load_index()
+        .iter_execution_environment_file_flows()
+    {
+        cached_source_files += 1;
+        edge_count += flow.edges.values().map(Vec::len).sum::<usize>();
+        seed_count += flow.seeds.len();
+        site_count += flow.sites.len();
+
+        let mut targets = HashMap::<LuaDeclId, CompilefileTargetState>::new();
+        let mut queue = VecDeque::new();
+        for (decl_id, path) in &flow.seeds {
+            let Some(target) = resolve_compilefile_target(db, source_file_id, path) else {
+                continue;
+            };
+            if merge_compilefile_target(
+                &mut targets,
+                *decl_id,
+                CompilefileTargetState::Unique(target),
+            ) {
+                queue.push_back(*decl_id);
+            }
+        }
+        while let Some(source) = queue.pop_front() {
+            let Some(target) = targets.get(&source).copied() else {
+                continue;
+            };
+            for destination in flow.edges.get(&source).into_iter().flatten() {
+                if merge_compilefile_target(&mut targets, *destination, target) {
+                    queue.push_back(*destination);
+                }
+            }
+        }
+
+        for site in &flow.sites {
+            let target = match &site.source {
+                GmodExecutionEnvironmentSource::Path(path) => {
+                    resolve_compilefile_target(db, source_file_id, path)
+                }
+                GmodExecutionEnvironmentSource::Decl(decl_id) => {
+                    match targets.get(decl_id).copied() {
+                        Some(CompilefileTargetState::Unique(file_id)) => Some(file_id),
+                        Some(CompilefileTargetState::Ambiguous) | None => None,
+                    }
+                }
+            };
+            if let Some(target) = target {
+                environments
+                    .entry(source_file_id)
+                    .or_default()
+                    .entry(target)
+                    .or_default()
+                    .extend(site.fields.iter().cloned());
+            }
+        }
+    }
+
+    if std::env::var_os("GLUALS_PROFILE").is_some() {
+        eprintln!(
+            "[profile] compilefile_environments updated_source_files={updated_source_files} roles_changed={roles_changed} cached_source_files={cached_source_files} edges={edge_count} seeds={seed_count} sites={site_count} sources={} targets={}",
+            environments.len(),
+            environments.values().map(HashMap::len).sum::<usize>(),
+        );
+    }
+
+    db.get_gmod_load_index_mut()
+        .set_execution_environment_sites(environments);
+}
+
+fn merge_compilefile_target(
+    targets: &mut HashMap<LuaDeclId, CompilefileTargetState>,
+    decl_id: LuaDeclId,
+    incoming: CompilefileTargetState,
+) -> bool {
+    let Some(current) = targets.get_mut(&decl_id) else {
+        targets.insert(decl_id, incoming);
+        return true;
+    };
+    let merged = match (*current, incoming) {
+        (CompilefileTargetState::Ambiguous, _) | (_, CompilefileTargetState::Ambiguous) => {
+            CompilefileTargetState::Ambiguous
+        }
+        (CompilefileTargetState::Unique(left), CompilefileTargetState::Unique(right))
+            if left != right =>
+        {
+            CompilefileTargetState::Ambiguous
+        }
+        _ => *current,
+    };
+    if *current == merged {
+        false
+    } else {
+        *current = merged;
+        true
+    }
+}
+
+fn add_compilefile_flow(
+    flow: &mut GmodExecutionEnvironmentFileFlow,
+    destination: LuaDeclId,
+    source: GmodExecutionEnvironmentSource,
+) {
+    match source {
+        GmodExecutionEnvironmentSource::Path(path) => flow.seeds.push((destination, path)),
+        GmodExecutionEnvironmentSource::Decl(source) => {
+            flow.edges.entry(source).or_default().push(destination)
+        }
+    }
+}
+
+fn compilefile_chunk_source_from_expr(
+    db: &DbIndex,
+    file_id: FileId,
+    roles: &AnnotatedGmodCallRoleMap<'_>,
+    expr: &LuaExpr,
+    reassigned_decls: &HashSet<LuaDeclId>,
+    visiting_strings: &mut HashSet<LuaDeclId>,
+) -> Option<GmodExecutionEnvironmentSource> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = name_expr_local_decl_id(db, file_id, name_expr)?;
+            (!reassigned_decls.contains(&decl_id))
+                .then_some(GmodExecutionEnvironmentSource::Decl(decl_id))
+        }
+        LuaExpr::ParenExpr(paren) => compilefile_chunk_source_from_expr(
+            db,
+            file_id,
+            roles,
+            &paren.get_expr()?,
+            reassigned_decls,
+            visiting_strings,
+        ),
+        LuaExpr::CallExpr(call_expr) => {
+            let call_path = call_expr.get_access_path()?;
+            let path_idx = roles.compilefile_call(db, file_id, call_expr, &call_path)?;
+            let path_expr = call_expr.get_args_list()?.get_args().nth(path_idx)?;
+            let path = static_compilefile_path(
+                db,
+                file_id,
+                &path_expr,
+                reassigned_decls,
+                visiting_strings,
+            )?;
+            Some(GmodExecutionEnvironmentSource::Path(path))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_compilefile_target(
+    db: &DbIndex,
+    source_file_id: FileId,
+    dependency_path: &str,
+) -> Option<FileId> {
+    let normalized_path = dependency_path.replace('\\', "/");
+    let normalized_path = normalized_path.trim_start_matches("./");
+    let path = Path::new(normalized_path);
+    if normalized_path.is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return None;
+    }
+    let normalized_no_ext = normalized_path
+        .strip_suffix(".lua")
+        .unwrap_or(normalized_path);
+    let root_module_path = normalized_no_ext.replace('/', ".");
+    let requested_path = normalized_path.to_ascii_lowercase();
+    let module_index = db.get_module_index();
+    let source_workspace = module_index.get_workspace_id(source_file_id);
+    let module_paths = [format!("lua.{root_module_path}"), root_module_path];
+    for module_path in module_paths {
+        if let Some(module) = module_index.find_module_for_file(&module_path, source_file_id)
+            && compilefile_target_path_matches(
+                db,
+                module.file_id,
+                &requested_path,
+                normalized_path == normalized_no_ext,
+            )
+        {
+            return Some(module.file_id);
+        }
+
+        let target = module_index
+            .find_module_node(&module_path)
+            .into_iter()
+            .flat_map(|node| node.file_ids.iter().copied())
+            .filter(|file_id| {
+                source_workspace.is_none_or(|workspace_id| {
+                    module_index.get_workspace_id(*file_id) == Some(workspace_id)
+                })
+            })
+            .filter(|file_id| {
+                compilefile_target_path_matches(
+                    db,
+                    *file_id,
+                    &requested_path,
+                    normalized_path == normalized_no_ext,
+                )
+            })
+            .min_by(|left, right| {
+                db.get_vfs()
+                    .get_file_path(left)
+                    .cmp(&db.get_vfs().get_file_path(right))
+                    .then_with(|| left.cmp(right))
+            });
+        if target.is_some() {
+            return target;
+        }
+    }
+
+    None
+}
+
+fn compilefile_target_path_matches(
+    db: &DbIndex,
+    target_file_id: FileId,
+    requested_path: &str,
+    extension_was_omitted: bool,
+) -> bool {
+    let Some(target_path) = gmod_relative_path(db, target_file_id) else {
+        return false;
+    };
+    target_path == requested_path
+        || (extension_was_omitted && target_path.strip_suffix(".lua") == Some(requested_path))
+}
+
+fn static_compilefile_path(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    reassigned_decls: &HashSet<LuaDeclId>,
+    visiting: &mut HashSet<LuaDeclId>,
+) -> Option<String> {
+    match expr {
+        LuaExpr::LiteralExpr(_) => static_literal_string(expr),
+        LuaExpr::ParenExpr(paren) => {
+            static_compilefile_path(db, file_id, &paren.get_expr()?, reassigned_decls, visiting)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = name_expr_local_decl_id(db, file_id, name_expr)?;
+            if reassigned_decls.contains(&decl_id) || !visiting.insert(decl_id) {
+                return None;
+            }
+            let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+            let result =
+                static_compilefile_path(db, file_id, &initializer, reassigned_decls, visiting);
+            visiting.remove(&decl_id);
+            result
+        }
+        LuaExpr::BinaryExpr(binary_expr)
+            if binary_expr.get_op_token()?.get_op() == BinaryOperator::OpConcat =>
+        {
+            let (left, right) = binary_expr.get_exprs()?;
+            Some(format!(
+                "{}{}",
+                static_compilefile_path(db, file_id, &left, reassigned_decls, visiting)?,
+                static_compilefile_path(db, file_id, &right, reassigned_decls, visiting)?
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn static_environment_fields(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    reassigned_decls: &HashSet<LuaDeclId>,
+    visiting: &mut HashSet<LuaDeclId>,
+) -> Option<HashSet<String>> {
+    match expr {
+        LuaExpr::TableExpr(table) => Some(
+            table
+                .get_fields()
+                .filter_map(|field| match field.get_field_key()? {
+                    LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+                    LuaIndexKey::String(string) => Some(string.get_value()),
+                    _ => None,
+                })
+                .collect(),
+        ),
+        LuaExpr::ParenExpr(paren) => {
+            static_environment_fields(db, file_id, &paren.get_expr()?, reassigned_decls, visiting)
+        }
+        LuaExpr::NameExpr(name_expr) => {
+            let decl_id = name_expr_local_decl_id(db, file_id, name_expr)?;
+            if reassigned_decls.contains(&decl_id) || !visiting.insert(decl_id) {
+                return None;
+            }
+            let (_, initializer) = local_decl_initializer_expr(db, decl_id)?;
+            let result =
+                static_environment_fields(db, file_id, &initializer, reassigned_decls, visiting);
+            visiting.remove(&decl_id);
+            result
+        }
+        _ => None,
+    }
+}
+
+fn collect_reassigned_local_decls(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaChunk,
+) -> HashSet<LuaDeclId> {
+    root.descendants::<LuaAssignStat>()
+        .flat_map(|assign| assign.get_var_and_expr_list().0)
+        .filter_map(|var| match var {
+            LuaVarExpr::NameExpr(name_expr) => {
+                let name = name_expr.get_name_text()?;
+                resolve_local_decl_id_at_position(db, file_id, &name, name_expr.get_position())
+            }
+            LuaVarExpr::IndexExpr(_) => None,
+        })
+        .collect()
 }
 
 fn rebuild_gmod_load_index(

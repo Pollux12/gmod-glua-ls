@@ -75,6 +75,19 @@ function IncludeCS(fileName) end
 ---@param moduleName string
 function require(moduleName) end
 
+---@[call_arg("gmod.load", "compilefile")]
+---@param path string
+---@param showError? boolean
+---@return function?
+function CompileFile(path, showError) end
+
+---@[call_arg("gmod.environment", "target")]
+---@param target function|integer
+---@[call_arg("gmod.environment", "environment")]
+---@param environment table
+---@return function?
+function setfenv(target, environment) end
+
 ---@[call_arg("gmod.net_message", "define")]
 ---@param str string
 function util.AddNetworkString(str) end

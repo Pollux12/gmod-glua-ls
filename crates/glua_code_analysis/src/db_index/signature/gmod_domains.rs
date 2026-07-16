@@ -33,6 +33,9 @@ use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_t
 /// Load/path discovery domain (e.g. `include`, `AddCSLuaFile`, `require`).
 pub const GMOD_DOMAIN_LOAD: &str = "gmod.load";
 
+/// Execution-environment assignment domain (e.g. `setfenv`).
+pub const GMOD_DOMAIN_ENVIRONMENT: &str = "gmod.environment";
+
 /// Document-color domain (e.g. `Color(r, g, b, a)` channel roles).
 pub const GMOD_DOMAIN_COLOR: &str = "gmod.color";
 
@@ -149,6 +152,7 @@ pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
     GMOD_DOMAIN_CONCOMMAND,
     GMOD_DOMAIN_CONVAR,
     GMOD_DOMAIN_DERMA_SKIN,
+    GMOD_DOMAIN_ENVIRONMENT,
     GMOD_DOMAIN_FILE_FIND,
     GMOD_DOMAIN_GAMEMODE,
     GMOD_DOMAIN_HOOK,

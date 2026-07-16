@@ -2,7 +2,7 @@ use std::collections::{HashMap, HashSet};
 
 use rowan::TextRange;
 
-use crate::FileId;
+use crate::{FileId, LuaDeclId};
 
 use super::{GmodRealm, LuaDependencyKind, LuaIndex};
 
@@ -259,10 +259,40 @@ impl GmodFileLoadInfo {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub(crate) struct GmodExecutionEnvironmentFileFlow {
+    pub(crate) edges: HashMap<LuaDeclId, Vec<LuaDeclId>>,
+    pub(crate) seeds: Vec<(LuaDeclId, String)>,
+    pub(crate) sites: Vec<GmodExecutionEnvironmentSite>,
+}
+
+impl GmodExecutionEnvironmentFileFlow {
+    pub(crate) fn is_empty(&self) -> bool {
+        self.edges.is_empty() && self.seeds.is_empty() && self.sites.is_empty()
+    }
+}
+
+#[derive(Debug, Clone)]
+pub(crate) struct GmodExecutionEnvironmentSite {
+    pub(crate) source: GmodExecutionEnvironmentSource,
+    pub(crate) fields: HashSet<String>,
+}
+
+#[derive(Debug, Clone)]
+pub(crate) enum GmodExecutionEnvironmentSource {
+    Decl(LuaDeclId),
+    Path(String),
+}
+
 #[derive(Debug, Default)]
 pub struct GmodLoadIndex {
     file_infos: HashMap<FileId, GmodFileLoadInfo>,
     unresolved_edges: Vec<GmodLoadEdge>,
+    execution_environments: HashMap<FileId, HashSet<String>>,
+    execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
+    execution_environment_file_flows: HashMap<FileId, GmodExecutionEnvironmentFileFlow>,
+    execution_environment_role_sources: HashSet<FileId>,
+    execution_environment_roles_dirty: bool,
 }
 
 impl GmodLoadIndex {
@@ -270,6 +300,11 @@ impl GmodLoadIndex {
         Self {
             file_infos: HashMap::new(),
             unresolved_edges: Vec::new(),
+            execution_environments: HashMap::new(),
+            execution_environment_sites: HashMap::new(),
+            execution_environment_file_flows: HashMap::new(),
+            execution_environment_role_sources: HashSet::new(),
+            execution_environment_roles_dirty: false,
         }
     }
 
@@ -283,6 +318,70 @@ impl GmodLoadIndex {
 
     pub fn unresolved_edges(&self) -> &[GmodLoadEdge] {
         &self.unresolved_edges
+    }
+
+    pub fn execution_environment_contains(&self, file_id: FileId, name: &str) -> bool {
+        self.execution_environments
+            .get(&file_id)
+            .is_some_and(|fields| fields.contains(name))
+    }
+
+    pub fn set_execution_environment_sites(
+        &mut self,
+        execution_environment_sites: HashMap<FileId, HashMap<FileId, HashSet<String>>>,
+    ) {
+        self.execution_environment_sites = execution_environment_sites;
+        self.rebuild_execution_environments();
+    }
+
+    pub(crate) fn set_execution_environment_file_flow(
+        &mut self,
+        file_id: FileId,
+        flow: GmodExecutionEnvironmentFileFlow,
+    ) {
+        if flow.is_empty() {
+            self.execution_environment_file_flows.remove(&file_id);
+        } else {
+            self.execution_environment_file_flows.insert(file_id, flow);
+        }
+    }
+
+    pub(crate) fn iter_execution_environment_file_flows(
+        &self,
+    ) -> impl Iterator<Item = (FileId, &GmodExecutionEnvironmentFileFlow)> {
+        self.execution_environment_file_flows
+            .iter()
+            .map(|(file_id, flow)| (*file_id, flow))
+    }
+
+    pub(crate) fn execution_environment_roles_changed(
+        &self,
+        current_role_sources: &HashSet<FileId>,
+        analyzed_file_ids: &HashSet<FileId>,
+    ) -> bool {
+        self.execution_environment_roles_dirty
+            || self.execution_environment_role_sources != *current_role_sources
+            || analyzed_file_ids.iter().any(|file_id| {
+                self.execution_environment_role_sources.contains(file_id)
+                    || current_role_sources.contains(file_id)
+            })
+    }
+
+    pub(crate) fn set_execution_environment_role_sources(&mut self, role_sources: HashSet<FileId>) {
+        self.execution_environment_role_sources = role_sources;
+        self.execution_environment_roles_dirty = false;
+    }
+
+    fn rebuild_execution_environments(&mut self) {
+        self.execution_environments.clear();
+        for targets in self.execution_environment_sites.values() {
+            for (target, fields) in targets {
+                self.execution_environments
+                    .entry(*target)
+                    .or_default()
+                    .extend(fields.iter().cloned());
+            }
+        }
     }
 
     pub fn files_are_mutually_exclusive_by_load_shadowing(
@@ -445,6 +544,19 @@ fn is_base_gamemode_path(path_sort_key: &str) -> bool {
 impl LuaIndex for GmodLoadIndex {
     fn remove(&mut self, file_id: FileId) {
         self.file_infos.remove(&file_id);
+        self.execution_environment_file_flows.remove(&file_id);
+        if self.execution_environment_role_sources.remove(&file_id) {
+            self.execution_environment_roles_dirty = true;
+            self.execution_environment_file_flows.clear();
+            self.execution_environment_sites.clear();
+            self.execution_environments.clear();
+        }
+        self.execution_environments.remove(&file_id);
+        self.execution_environment_sites.remove(&file_id);
+        for targets in self.execution_environment_sites.values_mut() {
+            targets.remove(&file_id);
+        }
+        self.rebuild_execution_environments();
         self.unresolved_edges
             .retain(|edge| edge.source_file_id != file_id && edge.target_file_id != Some(file_id));
         for info in self.file_infos.values_mut() {
@@ -461,6 +573,27 @@ impl LuaIndex for GmodLoadIndex {
         let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         self.file_infos
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.execution_environment_file_flows
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        let previous_role_source_count = self.execution_environment_role_sources.len();
+        self.execution_environment_role_sources
+            .retain(|file_id| !removed_file_ids.contains(file_id));
+        let removed_role_source =
+            previous_role_source_count != self.execution_environment_role_sources.len();
+        self.execution_environment_roles_dirty |= removed_role_source;
+        if removed_role_source {
+            self.execution_environment_file_flows.clear();
+            self.execution_environment_sites.clear();
+            self.execution_environments.clear();
+        }
+        self.execution_environments
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.execution_environment_sites
+            .retain(|source, _| !removed_file_ids.contains(source));
+        for targets in self.execution_environment_sites.values_mut() {
+            targets.retain(|target, _| !removed_file_ids.contains(target));
+        }
+        self.rebuild_execution_environments();
         self.unresolved_edges.retain(|edge| {
             !removed_file_ids.contains(&edge.source_file_id)
                 && !edge
@@ -486,6 +619,11 @@ impl LuaIndex for GmodLoadIndex {
     fn clear(&mut self) {
         self.file_infos.clear();
         self.unresolved_edges.clear();
+        self.execution_environments.clear();
+        self.execution_environment_sites.clear();
+        self.execution_environment_file_flows.clear();
+        self.execution_environment_role_sources.clear();
+        self.execution_environment_roles_dirty = false;
     }
 }
 
@@ -501,6 +639,8 @@ fn status_rank(status: GmodLoadStatus) -> u8 {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::{HashMap, HashSet};
+
     use super::{GmodFileLoadInfo, GmodLoadEdge, GmodLoadEdgeKind, GmodLoadIndex, GmodStateMask};
     use crate::{FileId, db_index::LuaIndex};
 
@@ -536,5 +676,35 @@ mod tests {
         assert_eq!(info.incoming_edges, vec![edge(external, Some(surviving))]);
         assert_eq!(info.shadowed_by, None);
         assert_eq!(index.unresolved_edges(), &[edge(surviving, Some(external))]);
+    }
+
+    #[test]
+    fn removing_environment_source_drops_its_target_fields() {
+        let source = FileId::new(1);
+        let target = FileId::new(2);
+        let mut index = GmodLoadIndex::new();
+        index.set_execution_environment_sites(HashMap::from([(
+            source,
+            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
+        )]));
+
+        index.remove(source);
+
+        assert!(!index.execution_environment_contains(target, "simple"));
+    }
+
+    #[test]
+    fn clearing_load_index_drops_execution_environments() {
+        let source = FileId::new(1);
+        let target = FileId::new(2);
+        let mut index = GmodLoadIndex::new();
+        index.set_execution_environment_sites(HashMap::from([(
+            source,
+            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
+        )]));
+
+        index.clear();
+
+        assert!(!index.execution_environment_contains(target, "simple"));
     }
 }
