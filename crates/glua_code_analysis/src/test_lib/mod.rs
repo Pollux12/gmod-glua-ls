@@ -176,7 +176,7 @@ function Panel:Add(className) end
 ---@param metatable T
 ---@param parent? Panel
 ---@param name? string
----@return (instance) Panel?
+---@return (instance) T?
 function vgui.CreateFromTable(metatable, parent, name) end
 
 ---@[call_arg("gmod.vgui_panel", "define")]

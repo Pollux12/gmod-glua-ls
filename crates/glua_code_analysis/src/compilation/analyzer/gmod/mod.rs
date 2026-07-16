@@ -203,7 +203,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 
         let t_vgui = do_profile.then(std::time::Instant::now);
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        synthesize_vgui_registrations(db, &file_ids);
+        synthesize_vgui_registrations(db, context, &file_ids);
         if let Some(t_vgui) = t_vgui {
             log::info!(
                 "gmod pre: vgui_registration_bindings cost {:?}",
@@ -492,7 +492,7 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t1 = do_profile.then(std::time::Instant::now);
-        synthesize_vgui_registrations(db, &file_ids);
+        synthesize_vgui_registrations(db, context, &file_ids);
         if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
@@ -2948,7 +2948,11 @@ struct VguiSynthesisCache {
     table_const_replacements: HashMap<InFiled<TextRange>, LuaType>,
 }
 
-fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
+fn synthesize_vgui_registrations(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    file_ids: &[FileId],
+) {
     struct VguiRegistrationRegion {
         file_id: FileId,
         decl_id: LuaDeclId,
@@ -2993,10 +2997,15 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             let register_position = call.syntax_id.get_range().start();
             let panel_source = call.vgui_panel_define_arg_source();
             let table_source = call.vgui_panel_table_arg_source(1);
+            let panel_name = resolve_vgui_registration_name(
+                db,
+                context.infer_manager.get_infer_cache(file_id),
+                file_id,
+                call,
+                &panel_source,
+            );
             let mut resolved_registration = None;
-            if let Some(GmodClassCallLiteral::String(panel_name)) =
-                call.value_for_arg_source(&panel_source)
-            {
+            if let Some(panel_name) = panel_name.as_deref() {
                 if let Some(GmodClassCallLiteral::NameRef(table_var)) =
                     call.value_for_arg_source(&table_source)
                     && let Some((decl_id, region_start)) =
@@ -3014,20 +3023,41 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                         region_end: register_position,
                     });
                 }
+                synthesize_vgui_register(
+                    db,
+                    &mut synthesis_cache,
+                    file_id,
+                    call,
+                    panel_name,
+                    resolved_registration,
+                );
             }
-            synthesize_vgui_register(
-                db,
-                &mut synthesis_cache,
-                file_id,
-                call,
-                resolved_registration,
-            );
         }
+
+        let actual_register_table_positions: HashSet<_> = metadata
+            .vgui_register_table_calls
+            .iter()
+            .filter(|call| is_vgui_register_table_call(db, file_id, call))
+            .map(|call| call.syntax_id.get_range().start())
+            .collect();
 
         for call in &metadata.vgui_register_table_calls {
             let register_position = call.syntax_id.get_range().start();
             let table_source = call.vgui_panel_table_arg_source(0);
-            let is_actual_registration = is_vgui_register_table_call(db, file_id, call);
+            let is_actual_registration =
+                actual_register_table_positions.contains(&register_position);
+            if !is_actual_registration
+                && vgui_table_arg_is_registered_result(
+                    db,
+                    file_id,
+                    call,
+                    &table_source,
+                    register_position,
+                    &actual_register_table_positions,
+                )
+            {
+                continue;
+            }
             let mut resolved_registration = None;
             if let Some(GmodClassCallLiteral::NameRef(table_var)) =
                 call.value_for_arg_source(&table_source)
@@ -3083,10 +3113,15 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
             let register_position = call.syntax_id.get_range().start();
             let panel_source = call.vgui_panel_define_arg_source();
             let table_source = call.vgui_panel_table_arg_source(2);
+            let panel_name = resolve_vgui_registration_name(
+                db,
+                context.infer_manager.get_infer_cache(file_id),
+                file_id,
+                call,
+                &panel_source,
+            );
             let mut resolved_registration = None;
-            if let Some(GmodClassCallLiteral::String(panel_name)) =
-                call.value_for_arg_source(&panel_source)
-            {
+            if let Some(panel_name) = panel_name.as_deref() {
                 if let Some(GmodClassCallLiteral::NameRef(table_var)) =
                     call.value_for_arg_source(&table_source)
                     && let Some((decl_id, region_start)) =
@@ -3104,14 +3139,15 @@ fn synthesize_vgui_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
                         region_end: register_position,
                     });
                 }
+                synthesize_derma_define_control(
+                    db,
+                    &mut synthesis_cache,
+                    file_id,
+                    call,
+                    panel_name,
+                    resolved_registration,
+                );
             }
-            synthesize_derma_define_control(
-                db,
-                &mut synthesis_cache,
-                file_id,
-                call,
-                resolved_registration,
-            );
         }
 
         for call in &metadata.vgui_register_file_calls {
@@ -3209,6 +3245,33 @@ fn flush_vgui_table_const_replacements(db: &mut DbIndex, cache: &mut VguiSynthes
     let replacements = std::mem::take(&mut cache.table_const_replacements);
     db.get_type_index_mut()
         .replace_table_const_types(&replacements);
+}
+
+fn resolve_vgui_registration_name(
+    db: &DbIndex,
+    infer_cache: &mut LuaInferCache,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    source: &GmodClassCallArgSource,
+) -> Option<String> {
+    if let Some(GmodClassCallLiteral::String(name)) = call.value_for_arg_source(source) {
+        return (!name.is_empty()).then(|| name.clone());
+    }
+
+    let syntax_id = if source.field_path.is_empty() {
+        call.args.get(source.arg_idx)?.syntax_id
+    } else {
+        call.field_args
+            .iter()
+            .find(|arg| &arg.source == source)?
+            .syntax_id
+    };
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
+    let expr = syntax_id.to_node_from_root(&root).and_then(LuaExpr::cast)?;
+    match infer_expr(db, infer_cache, expr).ok()? {
+        LuaType::StringConst(name) if !name.is_empty() => Some(name.to_string()),
+        _ => None,
+    }
 }
 
 fn synthesize_scripted_ent_registrations(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -4565,20 +4628,15 @@ fn synthesize_vgui_register(
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    panel_name: &str,
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // vgui.Register("PanelName", TABLE, "BasePanel")
     // args[0] = panel name (string)
     // args[1] = table variable (name ref)
     // args[2] = base panel name (string)
-    let panel_source = call.vgui_panel_define_arg_source();
     let table_source = call.vgui_panel_table_arg_source(1);
     let base_source = call.vgui_panel_base_arg_source(Some(2));
-
-    let panel_name = match call.value_for_arg_source(&panel_source) {
-        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => name.clone(),
-        _ => return,
-    };
 
     let table_var_name = match call.value_for_arg_source(&table_source) {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
@@ -4597,7 +4655,7 @@ fn synthesize_vgui_register(
         db,
         cache,
         file_id,
-        &panel_name,
+        panel_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::VguiRegister,
@@ -4611,6 +4669,7 @@ fn synthesize_derma_define_control(
     cache: &mut VguiSynthesisCache,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
+    control_name: &str,
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // derma.DefineControl("ControlName", "description", TABLE, "BasePanel")
@@ -4618,14 +4677,8 @@ fn synthesize_derma_define_control(
     // args[1] = description (string, ignored)
     // args[2] = table variable (name ref)
     // args[3] = base panel name (string)
-    let panel_source = call.vgui_panel_define_arg_source();
     let table_source = call.vgui_panel_table_arg_source(2);
     let base_source = call.vgui_panel_base_arg_source(Some(3));
-
-    let control_name = match call.value_for_arg_source(&panel_source) {
-        Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => name.clone(),
-        _ => return,
-    };
 
     let table_var_name = match call.value_for_arg_source(&table_source) {
         Some(GmodClassCallLiteral::NameRef(name)) => Some(name.clone()),
@@ -4644,7 +4697,7 @@ fn synthesize_derma_define_control(
         db,
         cache,
         file_id,
-        &control_name,
+        control_name,
         table_var_name.as_deref(),
         base_panel.as_deref(),
         GmodScriptedClassCallKind::DermaDefineControl,
@@ -4653,7 +4706,7 @@ fn synthesize_derma_define_control(
     );
 
     // Register the control name as a global variable with the panel type
-    register_global_panel(db, file_id, &control_name, call);
+    register_global_panel(db, file_id, control_name, call);
 }
 
 fn synthesize_vgui_register_table(
@@ -5079,6 +5132,34 @@ fn is_vgui_register_table_call(
         },
         _ => true,
     }
+}
+
+fn vgui_table_arg_is_registered_result(
+    db: &DbIndex,
+    file_id: FileId,
+    call: &GmodScriptedClassCallMetadata,
+    table_source: &GmodClassCallArgSource,
+    position: TextSize,
+    actual_register_table_positions: &HashSet<TextSize>,
+) -> bool {
+    let Some(GmodClassCallLiteral::NameRef(table_var)) = call.value_for_arg_source(table_source)
+    else {
+        return false;
+    };
+    let Some((decl_id, region_start)) =
+        resolve_local_registration_region(db, file_id, table_var, position)
+    else {
+        return false;
+    };
+    if region_start != decl_id.position {
+        return false;
+    }
+    let Some((0, LuaExpr::CallExpr(register_call))) = local_decl_initializer_expr(db, decl_id)
+    else {
+        return false;
+    };
+
+    actual_register_table_positions.contains(&register_call.get_range().start())
 }
 
 fn find_registered_table_expr_at_write_position(

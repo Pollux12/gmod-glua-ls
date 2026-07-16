@@ -449,4 +449,82 @@ mod test {
             "expected Panel to be transferred to class owner, got {members:#?}"
         );
     }
+
+    #[test]
+    fn test_callable_table_parameter_resolves_as_instance_metatable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Setting = {
+                __index = {
+                    apply = function(self)
+                        return self.value
+                    end,
+                    update = function(self, value)
+                        self.value = value
+                        return self:apply()
+                    end,
+                    convert = function(self, value)
+                        return value
+                    end,
+                },
+                __call = function(class)
+                    local self = setmetatable({}, class)
+                    self:convert("initial")
+                    local callback = function(value)
+                        self:update(value)
+                    end
+                    callback("changed")
+                    return self
+                end,
+            }
+
+            setmetatable(Setting, Setting)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_mutated_callable_table_parameter_is_not_used_as_instance_metatable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Setting = {
+                __index = {
+                    known = function(self) end,
+                },
+                __call = function(class)
+                    class = {}
+                    local self = setmetatable({}, class)
+                    self:known()
+                end,
+            }
+
+            setmetatable(Setting, Setting)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_callable_table_nonreceiver_parameter_is_not_used_as_instance_metatable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            local Setting = {
+                __index = {
+                    known = function(self) end,
+                },
+                __call = function(class, metatable)
+                    local self = setmetatable({}, metatable)
+                    self:known()
+                end,
+            }
+
+            setmetatable(Setting, Setting)
+            "#,
+        ));
+    }
 }

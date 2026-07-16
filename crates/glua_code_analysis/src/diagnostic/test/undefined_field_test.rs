@@ -3966,6 +3966,64 @@ owner:CompletelyMadeUpMethod()
     }
 
     #[test]
+    fn test_tableof_colon_method_definition_does_not_flag_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                local ent_tbl = Entity:GetTable()
+
+                function ent_tbl:PhysicsCollide(data, collider) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_preserves_receiver_subtype_members() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute self_guard(member: string)
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@return boolean
+                ---@return_cast self Entity
+                ---@[self_guard("gmod.entity")]
+                function Entity:IsValid() end
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@meta
+                ---@class (partial) Player : Entity
+                local Player = {}
+
+                ---@return boolean
+                function Player:IsSuperAdmin() end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                ---@type Player
+                local ply
+                if ply:IsValid() and not ply:IsSuperAdmin() then
+                    return
+                end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_tableof_local_function_call() {
         // Test: local getTable = Entity.GetTable; getTable(self)
         let mut ws = VirtualWorkspace::new();

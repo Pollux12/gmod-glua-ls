@@ -438,9 +438,7 @@ fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> b
     if !is_tableof {
         return false;
     }
-    index_expr
-        .get_index_token()
-        .is_some_and(|token| token.is_colon())
+    is_colon_method_call(index_expr)
 }
 
 fn is_colon_method_call(index_expr: &LuaIndexExpr) -> bool {

@@ -1,7 +1,10 @@
-use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaTableField};
+use glua_parser::{
+    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey, LuaNameExpr,
+    LuaTableExpr, LuaTableField,
+};
 
 use crate::{
-    InFiled, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
+    InFiled, LuaDeclExtra, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId,
     OperatorFunction, SetmetatableFactoryBinding,
 };
 
@@ -135,6 +138,24 @@ fn table_backing_range_from_expr(
                 return None;
             }
 
+            if let LuaDeclExtra::Param {
+                idx: 0,
+                signature_id,
+                ..
+            } = &decl.extra
+            {
+                let is_mutated = analyzer
+                    .db
+                    .get_reference_index()
+                    .get_decl_references(&analyzer.file_id, &decl_id)
+                    .is_some_and(|references| references.mutable);
+                if is_mutated {
+                    return None;
+                }
+
+                return callable_owner_table_range(analyzer, name_expr, *signature_id);
+            }
+
             let root = analyzer
                 .db
                 .get_vfs()
@@ -148,6 +169,31 @@ fn table_backing_range_from_expr(
         }
         _ => None,
     }
+}
+
+fn callable_owner_table_range(
+    analyzer: &LuaAnalyzer,
+    name_expr: &LuaNameExpr,
+    signature_id: LuaSignatureId,
+) -> Option<InFiled<rowan::TextRange>> {
+    let closure = name_expr.syntax().ancestors().find_map(|node| {
+        let closure = LuaClosureExpr::cast(node)?;
+        (LuaSignatureId::from_closure(analyzer.file_id, &closure) == signature_id)
+            .then_some(closure)
+    })?;
+    let field = closure.syntax().parent().and_then(LuaTableField::cast)?;
+    let LuaIndexKey::Name(key) = field.get_field_key()? else {
+        return None;
+    };
+    if !matches!(
+        LuaOperatorMetaMethod::from_metatable_name(key.get_name_text()),
+        Some(LuaOperatorMetaMethod::Call)
+    ) {
+        return None;
+    }
+
+    let table = field.syntax().parent().and_then(LuaTableExpr::cast)?;
+    Some(InFiled::new(analyzer.file_id, table.get_range()))
 }
 
 fn analyze_metable_field(

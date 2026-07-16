@@ -1,11 +1,13 @@
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaExpr, LuaIndexMemberExpr, LuaNameExpr};
+use glua_parser::{
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocOpType, LuaExpr, LuaIndexMemberExpr, LuaNameExpr,
+};
 
 use crate::{
-    DbIndex, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind, LuaAliasCallType,
-    LuaFunctionType, LuaInferCache, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
-    TypeOps, infer_call_expr_func, infer_expr,
+    DbIndex, FileId, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind,
+    LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSemanticDeclId, LuaSignatureCast,
+    LuaSignatureId, LuaType, TypeOps, infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel, get_member_value_expr,
         infer::{
@@ -713,6 +715,24 @@ fn narrow_valid_guard_true_branch(
     TypeOps::Remove.apply(db, &truthy_type, &gmod_null_type())
 }
 
+fn apply_positive_signature_cast(
+    db: &DbIndex,
+    file_id: FileId,
+    cast_op_type: LuaDocOpType,
+    source_type: LuaType,
+) -> Result<LuaType, InferFailReason> {
+    let cast_result = cast_type(
+        db,
+        file_id,
+        cast_op_type,
+        source_type.clone(),
+        InferConditionFlow::TrueCondition,
+    )?;
+
+    // A successful predicate adds a constraint; it must not widen an existing subtype.
+    Ok(narrow_down_type(db, source_type, cast_result.clone(), None).unwrap_or(cast_result))
+}
+
 fn is_inferred_mutable_param_without_declared_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -905,13 +925,7 @@ fn apply_signature_cast_to_type_guard_result(
             let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
                 return Ok(result_type);
             };
-            cast_type(
-                db,
-                signature_id.get_file_id(),
-                cast_op_type,
-                result_type,
-                condition_flow,
-            )
+            apply_positive_signature_cast(db, signature_id.get_file_id(), cast_op_type, result_type)
         }
         InferConditionFlow::FalseCondition => {
             if let Some(fallback_cast_ptr) = &signature_cast.fallback_cast {
@@ -1020,12 +1034,11 @@ fn get_type_at_call_expr_by_signature_self(
             let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
                 return Ok(ResultTypeOrContinue::Continue);
             };
-            cast_type(
+            apply_positive_signature_cast(
                 db,
                 signature_id.get_file_id(),
                 cast_op_type,
                 antecedent_type,
-                condition_flow,
             )?
         }
         InferConditionFlow::FalseCondition => {
@@ -1130,12 +1143,11 @@ fn get_type_at_call_expr_by_signature_param_name(
             let Some(cast_op_type) = signature_cast.cast.to_node(&signature_root) else {
                 return Ok(ResultTypeOrContinue::Continue);
             };
-            cast_type(
+            apply_positive_signature_cast(
                 db,
                 signature_id.get_file_id(),
                 cast_op_type,
                 antecedent_type,
-                condition_flow,
             )?
         }
         InferConditionFlow::FalseCondition => {

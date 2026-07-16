@@ -2946,6 +2946,92 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_registration_name_resolves_constant_table_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/vgui/constant_registration_name.lua",
+            r#"
+            ---@class DPanel
+            ---@field Dock fun(self: DPanel, dock: integer)
+
+            local TabHandler = {
+                ControlName = "ConstantFieldPanel",
+                DermaName = "ConstantFieldControl"
+            }
+            local PANEL = {}
+            function PANEL:Init()
+                self:Dock(1)
+            end
+            vgui.Register(TabHandler.ControlName, PANEL, "DPanel")
+
+            local CONTROL = {}
+            function CONTROL:Init()
+                self:Dock(2)
+            end
+            derma.DefineControl(TabHandler.DermaName, "", CONTROL, "DPanel")
+
+            local Mutable = {
+                ControlName = "MutableFieldPanel"
+            }
+            Mutable.ControlName = get_runtime_name()
+            vgui.Register(Mutable.ControlName, {}, "DPanel")
+
+            local NonString = {
+                ControlName = 42
+            }
+            vgui.Register(NonString.ControlName, {}, "DPanel")
+
+            local Unresolved = {}
+            vgui.Register(Unresolved.ControlName, {}, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == undefined_method_code)
+                .collect::<Vec<_>>(),
+            is_empty()
+        );
+
+        let type_index = ws.get_db_mut().get_type_index();
+        assert!(
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global("ConstantFieldPanel"))
+                .is_some(),
+            "constant table field should supply the VGUI registration name"
+        );
+        assert!(
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global("ConstantFieldControl"))
+                .is_some(),
+            "constant table field should supply the Derma control name"
+        );
+        for unsupported_name in ["MutableFieldPanel", "42"] {
+            assert!(
+                type_index
+                    .get_type_decl(&LuaTypeDeclId::global(unsupported_name))
+                    .is_none(),
+                "unsafe registration name {unsupported_name:?} should not be synthesized"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_vgui_register_panel_local_name_resolves_to_correct_panel_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

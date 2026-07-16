@@ -1497,9 +1497,7 @@ pub(crate) fn unwrapp_return_type(
                     value: call_expr.get_range(),
                 };
 
-                return Ok(LuaType::Instance(
-                    LuaInstanceType::new(return_type.clone(), id).into(),
-                ));
+                return Ok(materialize_instance_return(inst.get_base().clone(), id));
             }
 
             return Ok(return_type);
@@ -1530,6 +1528,28 @@ pub(crate) fn unwrapp_return_type(
     }
 
     Ok(return_type)
+}
+
+fn materialize_instance_return(base: LuaType, range: InFiled<TextRange>) -> LuaType {
+    match base {
+        LuaType::Union(union) if union.types().any(LuaType::is_nil) => {
+            let non_nil_types = union
+                .types()
+                .filter(|typ| !typ.is_nil())
+                .cloned()
+                .collect::<Vec<_>>();
+            if non_nil_types.is_empty() {
+                return LuaType::Nil;
+            }
+
+            let instance_base = LuaType::from_vec(non_nil_types);
+            LuaType::from_vec(vec![
+                LuaType::Instance(LuaInstanceType::new(instance_base, range).into()),
+                LuaType::Nil,
+            ])
+        }
+        _ => LuaType::Instance(LuaInstanceType::new(base, range).into()),
+    }
 }
 
 fn is_need_wrap_instance(

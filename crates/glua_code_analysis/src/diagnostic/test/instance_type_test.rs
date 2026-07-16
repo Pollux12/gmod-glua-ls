@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaType, VirtualWorkspace};
 
     // ── @return (instance) ──────────────────────────────────────────────
 
@@ -467,5 +467,104 @@ mod test {
             ty,
             humanized
         );
+    }
+
+    const BUTTON_TYPE_FIXTURE: &str = r#"
+                ---@class Panel
+                ---@class DButton: Panel
+                ---@field SetImage fun(self: DButton, path: string)
+            "#;
+
+    fn gmod_workspace() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def(BUTTON_TYPE_FIXTURE);
+        ws
+    }
+
+    #[test]
+    fn registered_table_instance_resolves_inherited_vgui_method() {
+        let mut ws = gmod_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                local DMenuButton = vgui.RegisterTable({}, "DButton")
+                local button = vgui.CreateFromTable(DMenuButton)
+                button:SetImage("icon16/cog.png")
+            "#,
+        ));
+    }
+
+    #[test]
+    fn unregistered_table_instance_does_not_gain_vgui_base_method() {
+        let mut ws = gmod_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                local DMenuButton = vgui.RegisterTable({}, "DButton")
+                local UnregisteredTable = {}
+                local button = vgui.CreateFromTable(UnregisteredTable)
+                if button then
+                    button:SetImage("icon16/cog.png")
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn registered_table_instance_return_remains_nullable() {
+        let mut ws = gmod_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+                local DMenuButton = vgui.RegisterTable({}, "DButton")
+                vgui.CreateFromTable(DMenuButton):SetImage("icon16/cog.png")
+            "#,
+        ));
+    }
+
+    #[test]
+    fn same_named_non_vgui_register_table_preserves_table_method() {
+        let mut ws = gmod_workspace();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                local fake = {}
+
+                ---@generic T: table
+                ---@param panel T
+                ---@return T
+                function fake.RegisterTable(panel)
+                    return panel
+                end
+
+                local ButtonTable = fake.RegisterTable({
+                    OwnMethod = function(self) end,
+                })
+                local button = vgui.CreateFromTable(ButtonTable)
+                if button then
+                    button:OwnMethod()
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn reassigned_registered_table_does_not_keep_old_vgui_base() {
+        let mut ws = gmod_workspace();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                local ButtonTable = vgui.RegisterTable({}, "DButton")
+                ButtonTable = {}
+                local button = vgui.CreateFromTable(ButtonTable)
+                if button then
+                    button:SetImage("icon16/cog.png")
+                end
+            "#,
+        ));
     }
 }
