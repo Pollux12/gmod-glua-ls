@@ -26,7 +26,7 @@ pub struct DynamicFieldIndex {
     /// Exact fields collected on their original owner, excluding inherited propagation.
     direct_field_definitions: HashMap<DynamicFieldOwner, HashMap<SmolStr, Vec<InFiled<TextRange>>>>,
     /// Expression-key members whose complete string domain was resolved to finite names.
-    finite_named_members: HashSet<(DynamicFieldOwner, LuaMemberId)>,
+    finite_named_members: HashMap<DynamicFieldOwner, HashSet<LuaMemberId>>,
     /// file → list of (owner, field_name) pairs contributed by this file
     file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, SmolStr, TextRange)>>,
     /// owner → assignment locations for writes through non-literal keys.
@@ -155,7 +155,10 @@ impl DynamicFieldIndex {
     }
 
     pub fn add_finite_named_member(&mut self, owner: DynamicFieldOwner, member_id: LuaMemberId) {
-        self.finite_named_members.insert((owner, member_id));
+        self.finite_named_members
+            .entry(owner)
+            .or_default()
+            .insert(member_id);
     }
 
     pub fn remove_finite_named_member(
@@ -163,8 +166,13 @@ impl DynamicFieldIndex {
         owner: &DynamicFieldOwner,
         member_id: LuaMemberId,
     ) {
-        self.finite_named_members
-            .remove(&(owner.clone(), member_id));
+        let Some(members) = self.finite_named_members.get_mut(owner) else {
+            return;
+        };
+        members.remove(&member_id);
+        if members.is_empty() {
+            self.finite_named_members.remove(owner);
+        }
     }
 
     pub fn member_has_finite_named_definition(
@@ -173,7 +181,14 @@ impl DynamicFieldIndex {
         member_id: LuaMemberId,
     ) -> bool {
         self.finite_named_members
-            .contains(&(owner.clone(), member_id))
+            .get(owner)
+            .is_some_and(|members| members.contains(&member_id))
+    }
+
+    pub fn owner_has_finite_named_members(&self, owner: &DynamicFieldOwner) -> bool {
+        self.finite_named_members
+            .get(owner)
+            .is_some_and(|members| !members.is_empty())
     }
 
     pub fn get_fields_in_file(&self, owner: &DynamicFieldOwner, file_id: FileId) -> Vec<&SmolStr> {
@@ -205,6 +220,12 @@ impl DynamicFieldIndex {
             .get(owner)
             .cloned()
             .unwrap_or_default()
+    }
+
+    pub fn has_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> bool {
+        self.wildcard_definitions
+            .get(owner)
+            .is_some_and(|definitions| !definitions.is_empty())
     }
 
     pub fn get_all_wildcard_definitions(&self) -> Vec<InFiled<TextRange>> {
@@ -369,8 +390,10 @@ impl LuaIndex for DynamicFieldIndex {
             });
             !fields.is_empty()
         });
-        self.finite_named_members
-            .retain(|(_, member_id)| member_id.file_id != file_id);
+        self.finite_named_members.retain(|_, members| {
+            members.retain(|member_id| member_id.file_id != file_id);
+            !members.is_empty()
+        });
 
         let mut removed_wildcard_definitions = false;
         self.wildcard_definitions.retain(|_, definitions| {

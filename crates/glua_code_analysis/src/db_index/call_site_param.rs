@@ -3,13 +3,60 @@ use std::collections::HashMap;
 use rowan::TextSize;
 
 use super::traits::LuaIndex;
-use crate::{FileId, LuaInferenceDiagnosticEvent, LuaSignatureId, LuaType, LuaTypeFact};
+use crate::{
+    FileId, LuaInferenceConfidence, LuaInferenceDiagnosticEvent, LuaInferenceStep, LuaSignatureId,
+    LuaType, LuaTypeFact,
+};
 
 #[derive(Debug, Clone)]
 struct CallSiteParamContribution {
     signature_id: LuaSignatureId,
     param_idx: usize,
     param_fact: LuaTypeFact,
+}
+
+struct CallSiteParamAccumulator {
+    first_fact: LuaTypeFact,
+    additional_types: Vec<LuaType>,
+    confidence: LuaInferenceConfidence,
+    additional_provenance: Vec<LuaInferenceStep>,
+}
+
+impl CallSiteParamAccumulator {
+    fn new(fact: &LuaTypeFact) -> Self {
+        Self {
+            first_fact: fact.clone(),
+            additional_types: Vec::new(),
+            confidence: fact.confidence(),
+            additional_provenance: Vec::new(),
+        }
+    }
+
+    fn push(&mut self, fact: &LuaTypeFact) {
+        self.additional_types.push(fact.typ().clone());
+        self.confidence = self.confidence.max(fact.confidence());
+        self.additional_provenance
+            .extend_from_slice(fact.provenance());
+    }
+
+    fn finish(self) -> LuaTypeFact {
+        if self.additional_types.is_empty() {
+            return self.first_fact;
+        }
+        let mut types = Vec::with_capacity(self.additional_types.len() + 1);
+        types.push(self.first_fact.typ().clone());
+        types.extend(self.additional_types);
+        let mut provenance = Vec::with_capacity(
+            self.first_fact.provenance().len() + self.additional_provenance.len(),
+        );
+        provenance.extend_from_slice(self.first_fact.provenance());
+        provenance.extend(self.additional_provenance);
+        LuaTypeFact::new(
+            LuaType::from_vec(types),
+            self.confidence,
+            provenance.into(),
+        )
+    }
 }
 
 fn sorted_file_ids<V>(map: &HashMap<FileId, V>) -> Vec<FileId> {
@@ -144,33 +191,36 @@ impl CallSiteParamIndex {
         self.inferred_params.clear();
         self.inference_events_by_file.clear();
 
+        let mut accumulators =
+            HashMap::<LuaSignatureId, HashMap<usize, CallSiteParamAccumulator>>::new();
+
         for file_id in sorted_file_ids(&self.file_contributions) {
             let Some(contributions) = self.file_contributions.get(&file_id) else {
                 continue;
             };
 
             for contribution in contributions {
-                self.inferred_params
+                accumulators
                     .entry(contribution.signature_id)
                     .or_default()
                     .entry(contribution.param_idx)
-                    .and_modify(|current| {
-                        let mut provenance = current.provenance().to_vec();
-                        provenance.extend_from_slice(contribution.param_fact.provenance());
-                        *current = LuaTypeFact::new(
-                            LuaType::from_vec(vec![
-                                current.typ().clone(),
-                                contribution.param_fact.typ().clone(),
-                            ]),
-                            current
-                                .confidence()
-                                .max(contribution.param_fact.confidence()),
-                            provenance.into(),
-                        )
-                    })
-                    .or_insert_with(|| contribution.param_fact.clone());
+                    .and_modify(|current| current.push(&contribution.param_fact))
+                    .or_insert_with(|| CallSiteParamAccumulator::new(&contribution.param_fact));
             }
         }
+
+        self.inferred_params = accumulators
+            .into_iter()
+            .map(|(signature_id, params)| {
+                (
+                    signature_id,
+                    params
+                        .into_iter()
+                        .map(|(param_idx, accumulator)| (param_idx, accumulator.finish()))
+                        .collect(),
+                )
+            })
+            .collect();
 
         for params in self.inferred_params.values() {
             for fact in params.values() {

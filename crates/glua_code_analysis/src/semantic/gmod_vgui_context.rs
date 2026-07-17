@@ -21,10 +21,15 @@ pub(crate) fn resolve_registered_vgui_method_context(
     name_expr: &LuaNameExpr,
 ) -> Option<RegisteredVguiMethodContext> {
     let file_id = cache.get_file_id();
-    let (receiver_decl_id, receiver_position, receiver_signature_id) =
-        find_enclosing_panel_receiver_context(db, file_id, name_expr)?;
     let metadata = db.get_gmod_class_metadata_index();
     let file_metadata = metadata.get_file_metadata(&file_id)?;
+    if file_metadata.derma_define_control_calls.is_empty()
+        && file_metadata.vgui_register_calls.is_empty()
+    {
+        return None;
+    }
+    let (receiver_decl_id, receiver_position, receiver_signature_id) =
+        find_enclosing_panel_receiver_context(db, file_id, name_expr)?;
 
     for call in file_metadata
         .derma_define_control_calls

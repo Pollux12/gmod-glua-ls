@@ -1246,6 +1246,14 @@ fn is_literal_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
 }
 
+fn dynamic_field_owner(owner: &LuaMemberOwner) -> Option<crate::DynamicFieldOwner> {
+    match owner {
+        LuaMemberOwner::Type(type_id) => Some(crate::DynamicFieldOwner::Type(type_id.clone())),
+        LuaMemberOwner::Element(range) => Some(crate::DynamicFieldOwner::Table(range.clone())),
+        _ => None,
+    }
+}
+
 fn member_is_finite_named_dynamic_assignment(
     db: &DbIndex,
     owner: &LuaMemberOwner,
@@ -1255,24 +1263,21 @@ fn member_is_finite_named_dynamic_assignment(
         return false;
     }
 
-    let dynamic_owner = match owner {
-        LuaMemberOwner::Type(type_id) => crate::DynamicFieldOwner::Type(type_id.clone()),
-        LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
-        _ => return false,
-    };
-    let dynamic_fields = db.get_dynamic_field_index();
-    dynamic_fields.member_has_finite_named_definition(&dynamic_owner, member.get_id())
+    dynamic_field_owner(owner).is_some_and(|dynamic_owner| {
+        db.get_dynamic_field_index()
+            .member_has_finite_named_definition(&dynamic_owner, member.get_id())
+    })
 }
 
 fn owner_has_finite_named_dynamic_assignment(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
-    db.get_member_index()
-        .get_members(owner)
-        .is_some_and(|members| {
-            members.iter().any(|member| {
-                member.get_key().is_expr()
-                    && member_is_finite_named_dynamic_assignment(db, owner, member)
-            })
-        })
+    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+        return false;
+    }
+
+    dynamic_field_owner(owner).is_some_and(|dynamic_owner| {
+        db.get_dynamic_field_index()
+            .owner_has_finite_named_members(&dynamic_owner)
+    })
 }
 
 fn member_key_is_broad_wildcard_expr(key: &LuaMemberKey) -> bool {
@@ -1284,17 +1289,15 @@ fn member_key_is_unknown_expr(key: &LuaMemberKey) -> bool {
 }
 
 fn owner_has_named_dynamic_fields_and_wildcards(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
-    let dynamic_owner = match owner {
-        LuaMemberOwner::Type(type_id) => crate::DynamicFieldOwner::Type(type_id.clone()),
-        LuaMemberOwner::Element(range) => crate::DynamicFieldOwner::Table(range.clone()),
-        _ => return false,
+    let Some(dynamic_owner) = dynamic_field_owner(owner) else {
+        return false;
     };
 
     let index = db.get_dynamic_field_index();
     index
         .get_fields(&dynamic_owner)
         .is_some_and(|fields| !fields.is_empty())
-        && !index.get_wildcard_definitions(&dynamic_owner).is_empty()
+        && index.has_wildcard_definitions(&dynamic_owner)
 }
 
 fn is_precise_unknown_wildcard_value_type(typ: &LuaType) -> bool {

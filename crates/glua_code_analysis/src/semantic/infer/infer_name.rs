@@ -545,7 +545,7 @@ fn infer_implicit_method_self_type_inner(
     // 4. General case: infer the enclosing colon-method prefix at its position.
     //    This is region-aware, so a reused local resolves `self` to the class
     //    of the table backing the current region.
-    let prefix_type = infer_enclosing_self_type(db, cache, name_expr)?;
+    let prefix_type = infer_raw_enclosing_self_type(db, cache, name_expr)?;
     is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
 }
 
@@ -2322,6 +2322,14 @@ pub(crate) fn infer_enclosing_self_type(
         return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
     }
 
+    infer_raw_enclosing_self_type(db, cache, name_expr)
+}
+
+fn infer_raw_enclosing_self_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaType> {
     for func_stat in name_expr.ancestors::<LuaFuncStat>() {
         // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
         // walking outward to the enclosing colon method, rather than bailing out

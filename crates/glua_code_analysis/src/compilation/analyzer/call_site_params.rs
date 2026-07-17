@@ -6,8 +6,8 @@ use std::{
 use crate::{
     DbIndex, FileId, InFiled, LuaDeclExtra, LuaDeclId, LuaDependencyKind, LuaInferCache,
     LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
-    LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberOwner, LuaSemanticDeclId,
-    LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId, get_member_value_expr,
+    LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId, get_member_value_expr,
     get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
@@ -52,23 +52,37 @@ impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
 }
 
 fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let mut trees = context.tree_list.clone();
-    if trees.is_empty() {
+    let mut file_ids = context
+        .tree_list
+        .iter()
+        .map(|tree| tree.file_id)
+        .collect::<Vec<_>>();
+    if file_ids.is_empty() {
         return;
     }
-    let _p = Profile::cond_new("call-site param analyze", trees.len() > 1);
-    trees.sort_by_key(|tree| tree.file_id.id);
+    let _p = Profile::cond_new("call-site param analyze", file_ids.len() > 1);
+    file_ids.sort_by_key(|file_id| file_id.id);
 
-    let source_signature_updates = trees
-        .iter()
-        .map(|tree| {
-            let root = tree.value.get_root().clone();
-            (
-                tree.file_id,
-                source_signatures_in_file(db, tree.file_id, &root),
-            )
-        })
-        .collect();
+    let file_metadata = super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
+            return (file_id, Vec::new(), HashSet::new());
+        };
+        (
+            file_id,
+            source_signatures_in_file(db, file_id, root.syntax()),
+            exact_receiver_member_keys_in_file(&root),
+        )
+    });
+    let mut source_signature_updates = Vec::with_capacity(file_metadata.len());
+    let mut exact_receiver_member_keys = HashSet::new();
+    for (file_id, source_signatures, member_keys) in file_metadata {
+        source_signature_updates.push((file_id, source_signatures));
+        exact_receiver_member_keys.extend(member_keys);
+    }
     db.get_call_site_param_index_mut()
         .set_files_source_signatures(source_signature_updates);
 
@@ -78,8 +92,9 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
     // it runs concurrently across files. A fresh per-file infer cache is
     // used (the db is immutable during this pass, so a cold cache yields
     // identical inference). Results merge sequentially in file-id order.
-    let file_ids: Vec<FileId> = trees.iter().map(|tree| tree.file_id).collect();
     let returned_table_cache = ReturnedTableCache::default();
+    let exact_receiver_candidates =
+        collect_exact_receiver_candidates(db, exact_receiver_member_keys);
     let contribution_updates =
         super::parallel::map_files_collect(&*db, &file_ids, |db, file_id| {
             let mut contributions = Vec::new();
@@ -110,6 +125,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                     file_id,
                     call_expr,
                     &returned_table_cache,
+                    &exact_receiver_candidates,
                     &mut exact_receiver_eligibility,
                     &mut contributions,
                     &mut receiver_signatures,
@@ -291,6 +307,7 @@ fn collect_call_site_param_types(
     file_id: FileId,
     call_expr: LuaCallExpr,
     returned_table_cache: &ReturnedTableCache,
+    exact_receiver_candidates: &HashMap<LuaMemberKey, bool>,
     exact_receiver_eligibility: &mut HashMap<LuaSignatureId, bool>,
     contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
     receiver_signatures: &mut Vec<LuaSignatureId>,
@@ -303,6 +320,7 @@ fn collect_call_site_param_types(
         file_id,
         &call_expr,
         &prefix_expr,
+        exact_receiver_candidates,
         exact_receiver_eligibility,
         contributions,
     ) {
@@ -437,6 +455,7 @@ fn collect_exact_colon_receiver_type(
     file_id: FileId,
     call_expr: &LuaCallExpr,
     prefix_expr: &LuaExpr,
+    exact_receiver_candidates: &HashMap<LuaMemberKey, bool>,
     exact_receiver_eligibility: &mut HashMap<LuaSignatureId, bool>,
     contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
 ) -> Option<LuaSignatureId> {
@@ -446,6 +465,10 @@ fn collect_exact_colon_receiver_type(
     let LuaExpr::IndexExpr(index_expr) = prefix_expr else {
         return None;
     };
+    let member_key = exact_receiver_member_key(&index_expr)?;
+    if exact_receiver_candidates.get(&member_key) == Some(&false) {
+        return None;
+    }
     let receiver_expr = index_expr.get_prefix_expr()?;
     let signature_id = get_prefix_expr_signature_id(db, cache, call_expr)?;
     if !is_call_site_realm_compatible(db, file_id, call_expr.get_position(), signature_id) {
@@ -499,6 +522,128 @@ fn collect_exact_colon_receiver_type(
         ),
     ));
     Some(signature_id)
+}
+
+fn collect_exact_receiver_candidates(
+    db: &DbIndex,
+    keys: HashSet<LuaMemberKey>,
+) -> HashMap<LuaMemberKey, bool> {
+    keys.into_iter()
+        .map(|member_key| {
+            let has_candidate = exact_receiver_key_has_candidate(db, &member_key);
+            (member_key, has_candidate)
+        })
+        .collect()
+}
+
+fn exact_receiver_member_keys_in_file(root: &glua_parser::LuaChunk) -> HashSet<LuaMemberKey> {
+    root.descendants::<LuaCallExpr>()
+        .filter(|call_expr| call_expr.is_colon_call())
+        .filter_map(|call_expr| match call_expr.get_prefix_expr()? {
+            LuaExpr::IndexExpr(index_expr) => exact_receiver_member_key(&index_expr),
+            _ => None,
+        })
+        .collect()
+}
+
+fn exact_receiver_key_has_candidate(db: &DbIndex, member_key: &LuaMemberKey) -> bool {
+    let mut members = db
+        .get_member_index()
+        .get_current_members_for_key(member_key)
+        .into_iter();
+    let Some(first_member) = members.next() else {
+        return true;
+    };
+    member_value_may_have_exact_receiver_signature(db, first_member.get_id(), &mut HashSet::new())
+        || members.any(|member| {
+            member_value_may_have_exact_receiver_signature(db, member.get_id(), &mut HashSet::new())
+        })
+}
+
+fn exact_receiver_member_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<LuaMemberKey> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(LuaMemberKey::Name(name.get_name_text().into())),
+        LuaIndexKey::String(string) => Some(LuaMemberKey::Name(string.get_value().into())),
+        _ => None,
+    }
+}
+
+fn member_value_may_have_exact_receiver_signature(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    visiting: &mut HashSet<LuaDeclId>,
+) -> bool {
+    let Some(value_expr) = get_member_value_expr(db, member_id) else {
+        return true;
+    };
+    expr_may_have_exact_receiver_signature(db, member_id.file_id, value_expr, visiting)
+}
+
+fn expr_may_have_exact_receiver_signature(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: LuaExpr,
+    visiting: &mut HashSet<LuaDeclId>,
+) -> bool {
+    match expr {
+        LuaExpr::ClosureExpr(closure) => {
+            let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+            db.get_signature_index()
+                .get(&signature_id)
+                .is_some_and(exact_receiver_signature_is_candidate)
+        }
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_none_or(|expr| expr_may_have_exact_receiver_signature(db, file_id, expr, visiting)),
+        LuaExpr::NameExpr(name_expr) => {
+            let Some(decl_id) = db
+                .get_reference_index()
+                .get_local_reference(&file_id)
+                .and_then(|references| references.get_decl_id(&name_expr.get_range()))
+            else {
+                return true;
+            };
+            if !visiting.insert(decl_id)
+                || db
+                    .get_reference_index()
+                    .get_decl_references(&file_id, &decl_id)
+                    .is_some_and(|references| references.mutable)
+            {
+                return true;
+            }
+            let result = db
+                .get_decl_index()
+                .get_decl(&decl_id)
+                .filter(|decl| matches!(decl.extra, LuaDeclExtra::Local { .. }))
+                .and_then(|decl| decl.get_value_syntax_id())
+                .and_then(|syntax_id| {
+                    db.get_vfs()
+                        .get_syntax_tree(&file_id)
+                        .and_then(|tree| syntax_id.to_node_from_root(&tree.get_red_root()))
+                })
+                .and_then(LuaExpr::cast)
+                .is_none_or(|value_expr| {
+                    expr_may_have_exact_receiver_signature(db, file_id, value_expr, visiting)
+                });
+            visiting.remove(&decl_id);
+            result
+        }
+        LuaExpr::LiteralExpr(_) | LuaExpr::TableExpr(_) => false,
+        _ => true,
+    }
+}
+
+fn exact_receiver_signature_is_candidate(signature: &crate::LuaSignature) -> bool {
+    !signature.is_colon_define
+        && signature
+            .params
+            .first()
+            .is_some_and(|param| param == "self")
+        && !signature.param_docs.contains_key(&0)
+        && matches!(
+            signature.resolve_return,
+            crate::SignatureReturnStatus::UnResolve | crate::SignatureReturnStatus::InferResolve
+        )
 }
 
 fn exact_explicit_self_param_is_eligible(db: &DbIndex, signature_id: LuaSignatureId) -> bool {

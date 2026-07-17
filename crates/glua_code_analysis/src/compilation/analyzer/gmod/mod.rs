@@ -5939,7 +5939,6 @@ struct AnnotatedGmodCallRoleMap<'a> {
     local_roles_by_decl: HashMap<LuaDeclId, AnnotatedGmodCallRoles>,
     local_roles_by_path: HashMap<(LuaDeclId, String), AnnotatedGmodCallRoles>,
     local_candidate_names: HashSet<String>,
-    reassigned_local_decls: HashSet<LuaDeclId>,
 }
 
 #[derive(Clone, Default)]
@@ -6795,7 +6794,6 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             local_roles_by_decl: HashMap::new(),
             local_roles_by_path: HashMap::new(),
             local_candidate_names: HashSet::new(),
-            reassigned_local_decls: collect_reassigned_local_decls(db, file_id, root),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -7068,9 +7066,11 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
         call_expr: &LuaCallExpr,
         call_path: &str,
     ) -> Option<AnnotatedGmodCallRoles> {
-        if call_expr_local_root_decl_id(db, file_id, call_expr)
-            .is_some_and(|decl_id| self.reassigned_local_decls.contains(&decl_id))
-        {
+        if call_expr_local_root_decl_id(db, file_id, call_expr).is_some_and(|decl_id| {
+            db.get_reference_index()
+                .get_decl_references(&file_id, &decl_id)
+                .is_some_and(|references| references.mutable)
+        }) {
             return None;
         }
 
@@ -8736,7 +8736,8 @@ fn collect_compilefile_execution_environment_flow(
         return GmodExecutionEnvironmentFileFlow::default();
     };
     let roles = AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
-    let reassigned_decls = &roles.reassigned_local_decls;
+    let reassigned_decls = collect_reassigned_local_decls(db, file_id, &root);
+    let reassigned_decls = &reassigned_decls;
     let mut flow = GmodExecutionEnvironmentFileFlow::default();
 
     let local_functions = root

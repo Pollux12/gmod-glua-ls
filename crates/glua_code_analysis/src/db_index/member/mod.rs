@@ -6,10 +6,7 @@ mod lua_owner_members;
 
 use glua_parser::LuaSyntaxKind;
 use rowan::{TextRange, TextSize};
-use std::{
-    collections::{HashMap, HashSet},
-    sync::OnceLock,
-};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::traits::LuaIndex;
 use crate::{FileId, db_index::member::lua_owner_members::LuaOwnerMembers};
@@ -27,10 +24,9 @@ pub struct LuaMemberIndex {
     member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
     member_owner_key_history_index:
         HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
-    /// Lazy diagnostics-phase memo for global key lookups. Reset after every
-    /// member history/current-owner mutation so it rebuilds from the owner-key
-    /// indexes on demand.
-    member_key_current_cache: OnceLock<HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+    current_owner_member_history:
+        HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
+    current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     non_overwriting_assignment_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
@@ -68,7 +64,8 @@ impl LuaMemberIndex {
             member_current_owner: HashMap::new(),
             member_owner_key_index: HashMap::new(),
             member_owner_key_history_index: HashMap::new(),
-            member_key_current_cache: OnceLock::new(),
+            current_owner_member_history: HashMap::new(),
+            current_members_by_key: HashMap::new(),
             non_overwriting_assignment_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
             member_function_scope_ranges: HashMap::new(),
@@ -84,6 +81,11 @@ impl LuaMemberIndex {
         self.add_in_file_object(file_id, MemberOrOwner::Member(id));
         if !owner.is_unknown() {
             self.member_current_owner.insert(id, owner.clone());
+            self.add_current_member_key(id);
+            self.current_owner_member_history
+                .entry(owner.clone())
+                .or_default()
+                .insert(member_id_sort_key(id), id);
             self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
             self.add_new_member_to_owner_key_index(owner.clone(), id);
             self.add_new_member_to_owner_key_history_index(owner.clone(), id);
@@ -376,10 +378,6 @@ impl LuaMemberIndex {
                 member_ids.push(id);
             }
         }
-
-        if history {
-            self.invalidate_member_key_history_cache();
-        }
     }
 
     fn add_new_member_id_to_owner_key_map(
@@ -403,14 +401,6 @@ impl LuaMemberIndex {
             .entry(key)
             .or_default()
             .push(id);
-
-        if history {
-            self.invalidate_member_key_history_cache();
-        }
-    }
-
-    fn invalidate_member_key_history_cache(&mut self) {
-        self.member_key_current_cache = OnceLock::new();
     }
 
     fn remove_member_from_visible_owner_key_index(
@@ -459,10 +449,6 @@ impl LuaMemberIndex {
         if remove_owner_entry {
             target_index.remove(owner);
         }
-
-        if history {
-            self.invalidate_member_key_history_cache();
-        }
     }
 
     fn remove_file_members_from_owner_key_indexes(&mut self, file_id: FileId) {
@@ -471,7 +457,6 @@ impl LuaMemberIndex {
             &mut self.member_owner_key_history_index,
             file_id,
         );
-        self.invalidate_member_key_history_cache();
     }
 
     fn remove_file_members_from_owner_key_map(
@@ -545,11 +530,21 @@ impl LuaMemberIndex {
         id: LuaMemberId,
     ) -> Option<()> {
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
-        if let Some(previous_owner) =
-            previous_owner.filter(|previous_owner| previous_owner != &owner)
-        {
-            self.remove_member_from_visible_owner_key_index(&previous_owner, id);
+        if previous_owner.is_none() {
+            self.add_current_member_key(id);
         }
+        if let Some(previous_owner) = previous_owner
+            .as_ref()
+            .filter(|previous_owner| *previous_owner != &owner)
+        {
+            self.remove_member_from_visible_owner_key_index(previous_owner, id);
+            self.remove_current_owner_member(previous_owner, id);
+        }
+
+        self.current_owner_member_history
+            .entry(owner.clone())
+            .or_default()
+            .insert(member_id_sort_key(id), id);
 
         self.add_member_to_owner_key_index(owner.clone(), id);
         self.add_member_to_owner_key_history_index(owner.clone(), id);
@@ -776,76 +771,63 @@ impl LuaMemberIndex {
     /// owner region wholesale. Ordinary semantic lookup should continue using
     /// `get_members`, which applies runtime overwrite visibility.
     pub fn get_current_owner_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
-        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+        let Some(member_ids) = self.current_owner_member_history.get(owner) else {
             return Vec::new();
         };
-
-        let member_ids = owner_items
+        member_ids
             .values()
-            .flatten()
-            .copied()
-            .filter(|member_id| self.member_current_owner.get(member_id) == Some(owner))
-            .collect::<HashSet<_>>();
+            .filter_map(|member_id| self.get_member(member_id))
+            .collect()
+    }
 
-        let mut members = member_ids
-            .into_iter()
-            .filter_map(|member_id| self.get_member(&member_id))
-            .collect::<Vec<_>>();
-        members.sort_by_key(|member| stable_member_sort_key(member));
-        members
+    fn remove_current_owner_member(&mut self, owner: &LuaMemberOwner, member_id: LuaMemberId) {
+        let Some(members) = self.current_owner_member_history.get_mut(owner) else {
+            return;
+        };
+        members.remove(&member_id_sort_key(member_id));
+        if members.is_empty() {
+            self.current_owner_member_history.remove(owner);
+        }
     }
 
     pub fn get_current_members_for_key(&self, key: &LuaMemberKey) -> Vec<&LuaMember> {
-        let key_current_index = self
-            .member_key_current_cache
-            .get_or_init(|| self.build_member_key_current_index());
-        let Some(member_ids) = key_current_index.get(key) else {
+        let Some(member_ids) = self.current_members_by_key.get(key) else {
             return Vec::new();
         };
 
         member_ids
-            .iter()
-            .copied()
-            .filter_map(|member_id| self.get_member(&member_id))
+            .values()
+            .filter_map(|member_id| self.get_member(member_id))
             .collect()
     }
 
-    fn build_member_key_current_index(&self) -> HashMap<LuaMemberKey, Vec<LuaMemberId>> {
-        let mut key_history_index: HashMap<LuaMemberKey, HashSet<LuaMemberId>> = HashMap::new();
-        for owner_items in self.member_owner_key_history_index.values() {
-            for (key, ids) in owner_items {
-                key_history_index
-                    .entry(key.clone())
-                    .or_default()
-                    .extend(ids.iter().copied());
-            }
+    fn add_current_member_key(&mut self, member_id: LuaMemberId) {
+        let Some(key) = self
+            .get_member(&member_id)
+            .map(|member| member.get_key().clone())
+        else {
+            return;
+        };
+        self.current_members_by_key
+            .entry(key)
+            .or_default()
+            .insert(member_id_sort_key(member_id), member_id);
+    }
+
+    fn remove_current_member_key(&mut self, member_id: LuaMemberId) {
+        let Some(key) = self
+            .get_member(&member_id)
+            .map(|member| member.get_key().clone())
+        else {
+            return;
+        };
+        let Some(members) = self.current_members_by_key.get_mut(&key) else {
+            return;
+        };
+        members.remove(&member_id_sort_key(member_id));
+        if members.is_empty() {
+            self.current_members_by_key.remove(&key);
         }
-
-        key_history_index
-            .into_iter()
-            .filter_map(|(key, ids)| {
-                let mut members = ids
-                    .into_iter()
-                    .filter_map(|member_id| {
-                        self.member_current_owner.get(&member_id)?;
-                        self.get_member(&member_id)
-                            .filter(|member| member.get_key() == &key)
-                    })
-                    .collect::<Vec<_>>();
-                if members.is_empty() {
-                    return None;
-                }
-
-                members.sort_by_key(|member| stable_member_sort_key(member));
-                Some((
-                    key,
-                    members
-                        .into_iter()
-                        .map(|member| member.get_id())
-                        .collect::<Vec<_>>(),
-                ))
-            })
-            .collect()
     }
 
     pub fn get_file_members(&self, file_id: FileId) -> Vec<&LuaMember> {
@@ -955,6 +937,8 @@ impl LuaIndex for LuaMemberIndex {
                     MemberOrOwner::Member(member_id) => {
                         if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
                             self.remove_member_from_all_owner_key_indexes(&owner, member_id);
+                            self.remove_current_owner_member(&owner, member_id);
+                            self.remove_current_member_key(member_id);
                         }
                         self.members.remove(&member_id);
                         self.member_current_owner.remove(&member_id);
@@ -1014,7 +998,8 @@ impl LuaIndex for LuaMemberIndex {
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
         self.member_owner_key_history_index.clear();
-        self.member_key_current_cache = OnceLock::new();
+        self.current_owner_member_history.clear();
+        self.current_members_by_key.clear();
         self.non_overwriting_assignment_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
@@ -1169,6 +1154,19 @@ mod tests {
         assert!(index.get_member_item(&new_owner, &key).is_none());
         assert!(index.get_members_for_owner_key(&old_owner, &key).is_empty());
         assert_eq!(index.get_members_for_owner_key(&new_owner, &key).len(), 1);
+        assert!(
+            index
+                .get_current_owner_member_history(&old_owner)
+                .is_empty()
+        );
+        assert_eq!(
+            index
+                .get_current_owner_member_history(&new_owner)
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![member_id]
+        );
     }
 
     #[test]
@@ -1204,6 +1202,22 @@ mod tests {
             .map(|member| member.get_id())
             .collect::<Vec<_>>();
         assert_eq!(new_owner_member_ids, vec![first_member_id]);
+        assert_eq!(
+            index
+                .get_current_owner_member_history(&old_owner)
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![second_member_id]
+        );
+        assert_eq!(
+            index
+                .get_current_owner_member_history(&new_owner)
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![first_member_id]
+        );
 
         let new_owner_history_member_ids = index
             .get_current_owner_members_for_key(&new_owner, &key)
