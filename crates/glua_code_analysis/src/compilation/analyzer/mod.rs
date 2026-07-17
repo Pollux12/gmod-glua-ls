@@ -20,15 +20,16 @@ use std::{
 };
 
 use crate::{
-    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaFunctionType,
-    LuaInferredGuardOwner, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignatureId,
-    LuaType, LuaTypeCache, WorkspaceId,
+    AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
+    LuaFunctionType, LuaInferredGuardOwner, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeFact, LuaTypeOwner, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
 };
-use glua_parser::LuaSyntaxId;
-use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
+use glua_parser::{
+    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr, LuaSyntaxId,
+};
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
 use unresolve::{UnResolve, UnResolveReturn};
@@ -116,6 +117,8 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
             resolve_uninformative_local_decl_caches(db, &mut context);
         }
+
+        context.resolve_call_site_return_consumers(db);
 
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
         {
@@ -450,6 +453,8 @@ pub struct AnalyzeContext {
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     inferred_return_candidates: Vec<UnResolveReturn>,
+    pending_call_site_return_consumers: Vec<UnResolve>,
+    pending_call_site_definition_refreshes: Vec<(LuaDefinitionId, LuaTypeOwner)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     infer_manager: InferCacheManager,
@@ -470,6 +475,8 @@ impl AnalyzeContext {
             scripted_scope_infos: None,
             unresolves: Vec::new(),
             inferred_return_candidates: Vec::new(),
+            pending_call_site_return_consumers: Vec::new(),
+            pending_call_site_definition_refreshes: Vec::new(),
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
@@ -519,8 +526,145 @@ impl AnalyzeContext {
             .push((member_id, decl_id));
     }
 
-    pub(crate) fn mark_call_site_return_invalidation(&mut self) {
-        self.call_site_return_invalidation_changed = true;
+    pub(crate) fn requeue_call_site_inferred_returns(
+        &mut self,
+        db: &mut DbIndex,
+        signature_ids: &HashSet<LuaSignatureId>,
+        consumers: Vec<(
+            LuaSignatureId,
+            UnResolve,
+            Option<(LuaDefinitionId, LuaTypeOwner)>,
+        )>,
+    ) -> (usize, usize) {
+        let mut returns = self
+            .inferred_return_candidates
+            .iter()
+            .filter(|return_| signature_ids.contains(&return_.signature_id))
+            .cloned()
+            .collect::<Vec<_>>();
+        let current_signatures = returns
+            .iter()
+            .map(|return_| return_.signature_id)
+            .collect::<HashSet<_>>();
+        returns.extend(
+            signature_ids
+                .iter()
+                .filter(|signature_id| !current_signatures.contains(signature_id))
+                .filter_map(|signature_id| inferred_return_candidate(db, *signature_id)),
+        );
+        returns.retain(|return_| inferred_return_uses_receiver_metatable(db, return_));
+
+        let mut requeued = Vec::new();
+        for return_ in returns {
+            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+                requeued.push(return_);
+            }
+        }
+
+        let count = requeued.len();
+        let requeued_signatures = requeued
+            .iter()
+            .map(|return_| return_.signature_id)
+            .collect::<HashSet<_>>();
+        self.unresolves.extend(
+            requeued
+                .into_iter()
+                .map(|return_| (return_.into(), InferFailReason::None)),
+        );
+
+        let mut status_only_invalidated = false;
+        for signature_id in signature_ids {
+            if requeued_signatures.contains(signature_id) {
+                continue;
+            }
+            if let Some(signature) = db.get_signature_index_mut().get_mut(signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+                status_only_invalidated = true;
+            }
+        }
+
+        let mut requeued_consumers = 0;
+        for (signature_id, consumer, definition_refresh) in consumers {
+            if requeued_signatures.contains(&signature_id) {
+                self.pending_call_site_return_consumers.push(consumer);
+                if let Some(definition_refresh) = definition_refresh {
+                    self.pending_call_site_definition_refreshes
+                        .push(definition_refresh);
+                }
+                requeued_consumers += 1;
+            }
+        }
+
+        self.call_site_return_invalidation_changed |=
+            count != 0 || requeued_consumers != 0 || status_only_invalidated;
+        (count, requeued_consumers)
+    }
+
+    fn resolve_call_site_return_consumers(&mut self, db: &mut DbIndex) -> usize {
+        let consumers = std::mem::take(&mut self.pending_call_site_return_consumers);
+        let count = consumers.len();
+        if count == 0 {
+            self.pending_call_site_definition_refreshes.clear();
+            return 0;
+        }
+
+        let mut definition_refreshes =
+            HashMap::<LuaTypeOwner, Vec<LuaDefinitionId>>::new();
+        for (definition, owner) in
+            std::mem::take(&mut self.pending_call_site_definition_refreshes)
+        {
+            definition_refreshes
+                .entry(owner)
+                .or_default()
+                .push(definition);
+        }
+        self.infer_manager.clear();
+
+        for consumer in consumers {
+            let (file_id, owner, expr, ret_idx) = match consumer {
+                UnResolve::Decl(decl) => (
+                    decl.file_id,
+                    LuaTypeOwner::Decl(decl.decl_id),
+                    decl.expr,
+                    decl.ret_idx,
+                ),
+                UnResolve::Member(member) => {
+                    let Some(expr) = member.expr else {
+                        continue;
+                    };
+                    (
+                        member.file_id,
+                        LuaTypeOwner::Member(member.member_id),
+                        expr,
+                        member.ret_idx,
+                    )
+                }
+                _ => continue,
+            };
+            let cache = self.infer_manager.get_infer_cache(file_id);
+            let Ok(mut typ) = crate::infer_expr(db, cache, expr) else {
+                continue;
+            };
+            if let LuaType::Variadic(variadic) = typ {
+                typ = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
+            } else if ret_idx != 0 {
+                typ = LuaType::Nil;
+            }
+            db.get_type_index_mut()
+                .force_bind_type(owner.clone(), LuaTypeCache::InferType(typ.clone()));
+            if let Some(definitions) = definition_refreshes.get(&owner) {
+                for definition in definitions {
+                    db.get_type_index_mut()
+                        .bind_definition_fact(*definition, LuaTypeFact::certain(typ.clone()));
+                }
+            }
+        }
+        count
     }
 
     fn invalidate_inferred_returns_for_sources(
@@ -632,6 +776,68 @@ impl AnalyzeContext {
         self.scripted_scope_files = Some(Arc::new(scripted_scope_files));
         self.scripted_scope_infos = Some(Arc::new(scripted_scope_infos));
     }
+}
+
+fn inferred_return_candidate(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<UnResolveReturn> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())?
+        .get_red_root();
+    let closure = root
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .filter(|closure| {
+            LuaSignatureId::from_closure(signature_id.get_file_id(), closure) == signature_id
+        })?;
+    let body = closure.get_block()?;
+    let return_points = lua::func_body::analyze_func_body_returns(body.clone());
+    Some(UnResolveReturn {
+        file_id: signature_id.get_file_id(),
+        signature_id,
+        body: Some(body),
+        return_points,
+    })
+}
+
+fn inferred_return_uses_receiver_metatable(db: &DbIndex, return_: &UnResolveReturn) -> bool {
+    return_.return_points.iter().any(|point| {
+        let exprs = match point {
+            LuaReturnPoint::Expr(expr) => std::slice::from_ref(expr),
+            LuaReturnPoint::MuliExpr(exprs) => exprs.as_slice(),
+            LuaReturnPoint::Nil | LuaReturnPoint::Error => return false,
+        };
+        exprs.iter().any(|expr| {
+            expr.descendants::<LuaCallExpr>().any(|call| {
+                if !call.is_setmetatable() {
+                    return false;
+                }
+                let Some(metatable) = call.get_args_list().and_then(|args| args.get_args().nth(1))
+                else {
+                    return false;
+                };
+                metatable.descendants::<LuaNameExpr>().any(|name| {
+                    db.get_reference_index()
+                        .get_var_reference_decl(&return_.file_id, name.get_range())
+                        .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                        .is_some_and(|decl| {
+                            matches!(
+                                decl.extra,
+                                crate::LuaDeclExtra::Param {
+                                    idx: 0,
+                                    signature_id,
+                                    ..
+                                } if signature_id == return_.signature_id
+                            )
+                        })
+                })
+            })
+        })
+    })
 }
 
 fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) -> bool {

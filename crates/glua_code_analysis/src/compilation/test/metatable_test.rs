@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod test {
     use glua_parser::{
-        LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat, LuaTableField, LuaVarExpr,
+        LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexKey, LuaLocalFuncStat,
+        LuaLocalName, LuaTableField, LuaVarExpr,
     };
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -581,28 +582,185 @@ mod test {
 
     #[test]
     fn test_callable_render_stack_product_keeps_materialized_index_methods() {
-        let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
-            DiagnosticCode::UndefinedMethod,
-            r#"
+        const SOURCE: &str = r#"
             local RenderStack = {
                 __index = {
-                    create = function(self)
-                        return setmetatable({ dirty = false }, self.objindex)
+                    create = function(self, data)
+                        return setmetatable({
+                            run = self.runDirty,
+                            data = data,
+                        }, self.objindex)
                     end,
+                    runDirty = function(self, flags) end,
                     makeDirty = function(self) end,
                 },
-                __call = function(p)
-                    local ret = setmetatable({ stack = true }, p)
+                __call = function(p, maincode, properties)
+                    local ret = setmetatable({
+                        maincode = maincode,
+                        properties = properties,
+                    }, p)
                     ret.objindex = { __index = ret }
                     return ret
                 end,
             }
             setmetatable(RenderStack, RenderStack)
 
-            RenderStack("root"):create():makeDirty()
+            local HoloRenderStack = RenderStack({}, {})
+            local entity = {}
+            entity.renderstack = HoloRenderStack:create(entity)
+            entity.renderstack:makeDirty()
+        "#;
+
+        let mut inspection = VirtualWorkspace::new();
+        let file_id = inspection.def(SOURCE);
+        let create_id = table_field_closure_signatures(&inspection, file_id, "create")[0];
+        let db = inspection.analysis.compilation.get_db();
+        let create_self = db
+            .get_call_site_param_index()
+            .get_inferred_param(&create_id, 0);
+        assert!(
+            matches!(create_self, Some(LuaType::Instance(_))),
+            "create self must retain the callable product instance, got {create_self:?}"
+        );
+        let semantic_model = inspection
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let setmetatable_return = semantic_model
+            .get_root()
+            .descendants::<LuaCallExpr>()
+            .find(|call| {
+                matches!(
+                    call.get_prefix_expr(),
+                    Some(LuaExpr::NameExpr(name))
+                        if name.get_name_text().as_deref() == Some("setmetatable")
+                ) && call
+                    .get_args_list()
+                    .is_some_and(|args| args.get_args().count() == 2)
+            })
+            .and_then(|call| semantic_model.infer_expr(LuaExpr::CallExpr(call)).ok())
+            .expect("expected inferred create setmetatable return");
+        assert!(
+            matches!(setmetatable_return, LuaType::Instance(_)),
+            "fresh inference must retain the self.objindex metatable, got {setmetatable_return:?}"
+        );
+        let create_return = db
+            .get_signature_index()
+            .get(&create_id)
+            .expect("expected create signature")
+            .get_return_type();
+        assert!(
+            matches!(create_return, LuaType::Instance(_)),
+            "create must return the self.objindex-backed instance, got {create_return:?}"
+        );
+
+        let mut methods = VirtualWorkspace::new();
+        assert!(methods.check_code_for(DiagnosticCode::UndefinedMethod, SOURCE));
+    }
+
+    #[test]
+    fn test_cross_file_global_render_stack_product_keeps_materialized_index_methods() {
+        let mut inspection = VirtualWorkspace::new();
+        inspection.def_file("lua/autorun/client/init.lua", "SF = {}");
+        inspection.def_file("lua/autorun/server/init.lua", "SF = {}");
+        let source_id = inspection.def_file(
+            "lua/starfall/sflib.lua",
+            r#"
+            SF.RenderStack = {
+                __index = {
+                    create = function(self, data)
+                        return setmetatable({
+                            run = self.runDirty,
+                            data = data,
+                        }, self.objindex)
+                    end,
+                    runDirty = function(self, flags) end,
+                    makeDirty = function(self) end,
+                },
+                __call = function(p, maincode, properties)
+                    local ret = setmetatable({
+                        maincode = maincode,
+                        properties = properties,
+                    }, p)
+                    ret.objindex = { __index = ret }
+                    return ret
+                end,
+            }
+            setmetatable(SF.RenderStack, SF.RenderStack)
             "#,
-        ));
+        );
+        let consumer_id = inspection.def_file(
+            "lua/entities/starfall_hologram/cl_init.lua",
+            r#"
+            local HoloRenderStack = SF.RenderStack({}, {})
+            local entity = {}
+            entity.renderstack = HoloRenderStack:create(entity)
+            entity.renderstack:makeDirty()
+            "#,
+        );
+
+        let create_id = table_field_closure_signatures(&inspection, source_id, "create")[0];
+        let db = inspection.analysis.compilation.get_db();
+        let create_self = db
+            .get_call_site_param_index()
+            .get_inferred_param(&create_id, 0);
+        assert!(
+            matches!(create_self, Some(LuaType::Instance(_))),
+            "cross-file create self must retain the callable product instance, got {create_self:?}"
+        );
+        let create_return = db
+            .get_signature_index()
+            .get(&create_id)
+            .expect("expected create signature")
+            .get_return_type();
+        assert!(
+            matches!(create_return, LuaType::Instance(_)),
+            "cross-file create must return the self.objindex-backed instance, got {create_return:?}"
+        );
+        let semantic_model = inspection
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_id)
+            .expect("expected consumer semantic model");
+        let holo_local = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .find(|name| name.get_text() == "HoloRenderStack")
+            .expect("expected HoloRenderStack local");
+        let holo_type = semantic_model
+            .get_semantic_info(
+                holo_local
+                    .get_name_token()
+                    .expect("expected HoloRenderStack name token")
+                    .syntax()
+                    .clone()
+                    .into(),
+            )
+            .expect("expected HoloRenderStack semantic info")
+            .display_typ()
+            .clone();
+        assert!(
+            matches!(holo_type, LuaType::Instance(_)),
+            "cross-file callable product local must retain its instance, got {holo_type:?}"
+        );
+        inspection
+            .analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+        let diagnostics = inspection
+            .analysis
+            .diagnose_file(consumer_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| {
+                diagnostic.code
+                    != Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            }),
+            "cross-file materialized product must expose makeDirty, got {diagnostics:?}"
+        );
     }
 
     #[test]
