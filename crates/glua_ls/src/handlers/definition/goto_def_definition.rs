@@ -164,7 +164,8 @@ fn handle_member_definition(
         semantic_model,
         &Some(LuaSemanticDeclId::Member(*member_id)),
         Some(trigger_token.text_range().start()),
-    )?;
+    )
+    .unwrap_or_else(|| vec![LuaSemanticDeclId::Member(*member_id)]);
 
     let mut locations: Vec<Location> = Vec::new();
 

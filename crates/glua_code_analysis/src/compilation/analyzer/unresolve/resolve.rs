@@ -100,8 +100,9 @@ pub fn try_resolve_member(
 ) -> ResolveResult {
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
+        let member_id = unresolve_member.member_id;
         let member_owner = match prefix_type {
-            LuaType::TableConst(in_file_range) => LuaMemberOwner::Element(in_file_range),
+            LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
             LuaType::Def(def_id) => {
                 let type_decl = db
                     .get_type_index()
@@ -111,13 +112,15 @@ pub fn try_resolve_member(
                 if type_decl.is_exact() {
                     return Ok(());
                 }
-                LuaMemberOwner::Type(def_id)
+                Some(LuaMemberOwner::Type(def_id))
             }
-            LuaType::Instance(instance) => LuaMemberOwner::Element(instance.get_range().clone()),
+            LuaType::Instance(instance) => {
+                Some(LuaMemberOwner::Element(instance.get_range().clone()))
+            }
             _ => {
                 // Some annotation bundles define methods as `function TypeName:Method()`
-                // without binding a typed declaration for `TypeName` in scope.
-                // If a global type exists for that name, attach unresolved members there.
+                // without binding a typed declaration for `TypeName` in scope. Expose those
+                // runtime members through a matching class without replacing their real owner.
                 let LuaExpr::NameExpr(name_expr) = prefix_expr else {
                     return Ok(());
                 };
@@ -125,14 +128,20 @@ pub fn try_resolve_member(
                     return Ok(());
                 };
                 let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
-                if db.get_type_index().get_type_decl(&type_decl_id).is_none() {
+                let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
                     return Ok(());
+                };
+                if type_decl.is_class() {
+                    let _ = db
+                        .get_member_index_mut()
+                        .add_member_alias_to_owner(LuaMemberOwner::Type(type_decl_id), member_id);
                 }
-                LuaMemberOwner::Type(type_decl_id)
+                None
             }
         };
-        let member_id = unresolve_member.member_id;
-        add_member(db, member_owner, member_id);
+        if let Some(member_owner) = member_owner {
+            add_member(db, member_owner, member_id);
+        }
         unresolve_member.prefix = None;
     }
 

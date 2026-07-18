@@ -9,8 +9,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaMemberId, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType,
-        VirtualWorkspace,
+        DiagnosticCode, Emmyrc, GlobalId, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType,
+        LuaTypeDeclId, LuaUnionType, VirtualWorkspace,
     };
 
     fn file_has_diagnostic(
@@ -2089,6 +2089,236 @@ mod test {
             !client_get_profile_type.is_unknown(),
             "client FuelModule.GetProfile should not infer as unknown, got {client_get_profile_type:?}"
         );
+    }
+
+    #[test]
+    fn numeric_alias_name_does_not_replace_runtime_table_member_owner() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/sf_enum.lua",
+            r#"
+            ---@alias SF
+            ---| number
+            ---| 1
+            "#,
+        );
+        ws.def_file("lua/autorun/server/sf_init.lua", "SF = {}\n");
+        ws.def_file("lua/autorun/client/sf_init.lua", "SF = {}\n");
+        let transfer_file = ws.def_file(
+            "lua/starfall/transfer.lua",
+            r#"
+            if SERVER then
+                function SF.SendStarfall(msg, data, recipient) end
+            else
+                function SF.SendStarfall(msg, data) end
+            end
+            "#,
+        );
+        let usage_file = ws.def_file(
+            "lua/starfall/type_usage.lua",
+            r#"
+            ---@type SF
+            local flags
+            "#,
+        );
+
+        let owner = first_index_expr_member_owner(&ws, transfer_file, "SF.SendStarfall");
+
+        assert!(
+            matches!(
+                owner,
+                LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+            ),
+            "numeric alias captured runtime member as {owner:?}"
+        );
+
+        let flags_type = local_name_type(&mut ws, usage_file, "flags");
+        assert!(
+            ws.check_type(&flags_type, &LuaType::Number),
+            "numeric alias should remain number-compatible, got {flags_type:?}"
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(usage_file)
+            .expect("expected usage semantic model");
+        assert!(
+            semantic_model
+                .get_member_info_with_key(
+                    &LuaType::Def(LuaTypeDeclId::global("SF")),
+                    LuaMemberKey::Name("SendStarfall".into()),
+                    true,
+                )
+                .is_none_or(|members| members.is_empty()),
+            "numeric alias should not expose the runtime SendStarfall member"
+        );
+    }
+
+    #[test]
+    fn enum_name_does_not_replace_runtime_table_member_owner() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/collision_enum.lua",
+            r#"
+            ---@enum Collision
+            local CollisionValues = { Value = 1 }
+            "#,
+        );
+        ws.def_file("lua/autorun/server/collision_init.lua", "Collision = {}\n");
+        ws.def_file("lua/autorun/client/collision_init.lua", "Collision = {}\n");
+        let member_file = ws.def_file(
+            "lua/collision/member.lua",
+            "function Collision.Method() end\n",
+        );
+
+        let owner = first_index_expr_member_owner(&ws, member_file, "Collision.Method");
+        assert!(
+            matches!(
+                owner,
+                LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+            ),
+            "enum captured runtime member as {owner:?}"
+        );
+    }
+
+    #[test]
+    fn named_class_lookup_preserves_runtime_owner() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/includes/bridge_class.lua", "---@class BridgeClass\n");
+        let member_file = ws.def_file(
+            "lua/includes/bridge_method.lua",
+            "function BridgeClass.Method() end\n",
+        );
+
+        let owner = first_index_expr_member_owner(&ws, member_file, "BridgeClass.Method");
+        assert_eq!(
+            owner,
+            LuaMemberOwner::GlobalPath(GlobalId::new("BridgeClass")),
+        );
+
+        let method_key = LuaMemberKey::Name("Method".into());
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(member_file)
+            .expect("expected semantic model");
+        assert!(
+            semantic_model
+                .get_member_info_with_key(
+                    &LuaType::Def(LuaTypeDeclId::global("BridgeClass")),
+                    method_key,
+                    true,
+                )
+                .is_some(),
+            "class lookup should expose the runtime method"
+        );
+    }
+
+    #[test]
+    fn type_alias_to_class_keeps_origin_members_visible() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class AliasBase
+            local AliasBase = {}
+            function AliasBase:Method() end
+
+            ---@alias AliasDerived AliasBase
+            ---@type AliasDerived
+            local value
+            value:Method()
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        ));
+    }
+
+    #[test]
+    fn numeric_alias_collision_owner_survives_delete_and_reopen() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let alias_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/sf_lifecycle_alias.lua");
+        let alias_source = r#"
+        ---@alias SF
+        ---| number
+        ---| 1
+        "#;
+        ws.analysis
+            .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .expect("expected alias file");
+        ws.def_file("lua/autorun/server/sf_lifecycle_init.lua", "SF = {}\n");
+        ws.def_file("lua/autorun/client/sf_lifecycle_init.lua", "SF = {}\n");
+        let member_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/starfall/lifecycle.lua");
+        let member_source = "function SF.SendStarfall() end\n";
+        let member_file = ws
+            .analysis
+            .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .expect("expected runtime member file");
+
+        let assert_runtime_owner = |ws: &VirtualWorkspace, file_id| {
+            let owner = first_index_expr_member_owner(ws, file_id, "SF.SendStarfall");
+            assert!(
+                matches!(
+                    owner,
+                    LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+                ),
+                "numeric alias captured runtime member as {owner:?}"
+            );
+        };
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .update_file_by_uri(
+                &alias_uri,
+                Some(
+                    r#"
+                    ---@alias SF
+                    ---| number
+                    ---| 2
+                    "#
+                    .to_string(),
+                ),
+            )
+            .expect("expected alias origin edit");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .remove_file_by_uri(&alias_uri)
+            .expect("expected alias removal");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .expect("expected reopened alias file");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .remove_file_by_uri(&member_uri)
+            .expect("expected runtime member removal");
+        let reopened_member_file = ws
+            .analysis
+            .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .expect("expected reopened runtime member file");
+        assert_runtime_owner(&ws, reopened_member_file);
     }
 
     #[gtest]
