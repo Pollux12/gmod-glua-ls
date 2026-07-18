@@ -5,9 +5,10 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, FileId, FlowNode, FlowTree, InferFailReason, InferGuard, LuaAliasCallKind,
-    LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSemanticDeclId, LuaSignatureCast,
-    LuaSignatureId, LuaType, TypeOps, infer_call_expr_func, infer_expr,
+    DbIndex, FileId, FlowNode, FlowTree, GMOD_ATTR_SELF_GUARD, InferFailReason, InferGuard,
+    LuaAliasCallKind, LuaAliasCallType, LuaFunctionType, LuaInferCache, LuaSemanticDeclId,
+    LuaSignatureCast, LuaSignatureId, LuaType, TypeOps, find_signature_attribute_use,
+    infer_call_expr_func, infer_expr,
     semantic::{
         SemanticDeclGuard, SemanticDeclLevel, get_member_value_expr,
         infer::{
@@ -183,7 +184,7 @@ pub fn get_type_at_call_expr(
                             root,
                             var_ref_id,
                             flow_node,
-                            prefix_expr,
+                            call_expr,
                             signature_cast,
                             signature_id,
                             condition_flow,
@@ -997,17 +998,29 @@ fn get_type_at_call_expr_by_signature_self(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
-    call_prefix: LuaExpr,
+    call_expr: LuaCallExpr,
     signature_cast: &LuaSignatureCast,
     signature_id: LuaSignatureId,
     condition_flow: InferConditionFlow,
     policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
-    let LuaExpr::IndexExpr(call_prefix_index) = call_prefix else {
-        return Ok(ResultTypeOrContinue::Continue);
+    let self_expr = if call_expr.is_colon_call() {
+        let Some(LuaExpr::IndexExpr(call_prefix)) = call_expr.get_prefix_expr() else {
+            return Ok(ResultTypeOrContinue::Continue);
+        };
+        call_prefix.get_prefix_expr()
+    } else if db
+        .get_signature_index()
+        .get(&signature_id)
+        .is_some_and(|signature| signature.is_colon_define)
+    {
+        call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().next())
+    } else {
+        None
     };
-
-    let Some(self_expr) = call_prefix_index.get_prefix_expr() else {
+    let Some(self_expr) = self_expr else {
         return Ok(ResultTypeOrContinue::Continue);
     };
 
@@ -1019,8 +1032,14 @@ fn get_type_at_call_expr_by_signature_self(
         return Ok(ResultTypeOrContinue::Continue);
     }
 
-    let antecedent_type =
+    let mut antecedent_type =
         get_condition_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?;
+
+    if matches!(condition_flow, InferConditionFlow::TrueCondition)
+        && find_signature_attribute_use(db, signature_id, GMOD_ATTR_SELF_GUARD).is_some()
+    {
+        antecedent_type = narrow_valid_guard_true_branch(db, antecedent_type, LuaType::Any);
+    }
 
     let Some(syntax_tree) = db.get_vfs().get_syntax_tree(&signature_id.get_file_id()) else {
         return Ok(ResultTypeOrContinue::Continue);

@@ -219,6 +219,48 @@ mod tests {
     }
 
     #[test]
+    fn detached_entity_isvalid_guard_preserves_player_methods() {
+        let diagnostics = diagnostics(
+            &mut VirtualWorkspace::new(),
+            r#"
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+            ---@class Player: Entity
+            ---@class NULL: Entity
+
+            Entity = {}
+            Player = {}
+            function Player:Name() end
+            function Player:SteamID() end
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+
+            local IsValid = FindMetaTable("Entity").IsValid
+            ---@type Player|NULL
+            local ply
+            if IsValid(ply) then
+                ply:Name()
+                ply:SteamID()
+            end
+            "#,
+        );
+
+        assert!(
+            !has_code(&diagnostics, DiagnosticCode::UndefinedMethod),
+            "detached Entity:IsValid should preserve Player methods, got {diagnostics:?}"
+        );
+    }
+
+    #[test]
     fn dynamic_callback_table_uses_call_site_argument_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

@@ -288,6 +288,47 @@ mod test {
     }
 
     #[test]
+    fn test_detached_entity_isvalid_removes_null_from_first_argument() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetOwner() end
+
+            local IsValid = FindMetaTable("Entity").IsValid
+            local ply = GetOwner()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
     fn test_type_guard_any_false_branch_preserves_antecedent() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
