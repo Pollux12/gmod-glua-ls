@@ -90,14 +90,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         let call_site_return_invalidation_changed = context.call_site_return_invalidation_changed;
         let local_inference_changed = local_inference::stabilize_unknown_locals(db, &mut context);
-        let child_inference_changed =
-            !local_inference::stabilize_unguarded_children(db, &mut context, false).is_empty();
         let late_guard_retries = context.inferred_guard_candidates.len();
         let late_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
         let inferred_guard_changed = late_guard_stats.changed;
         let late_inference_changed = call_site_return_invalidation_changed
             || local_inference_changed
-            || child_inference_changed
             || inferred_guard_changed;
 
         let infer_dynamic_fields =
@@ -119,6 +116,29 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         context.resolve_call_site_return_consumers(db);
+
+        // Unguarded-child inference is a fallback. Run it only after dynamic
+        // fields and retained unresolves have stabilized declaration types.
+        let late_child_sources =
+            local_inference::stabilize_unguarded_children(db, &mut context, false);
+        let late_child_local_changed = if late_child_sources.is_empty() {
+            false
+        } else {
+            local_inference::stabilize_unknown_locals(db, &mut context)
+        };
+        let late_child_returns =
+            context.requeue_inferred_returns_for_sources(db, &late_child_sources);
+        if !late_child_sources.is_empty() {
+            context.infer_manager.clear();
+            if late_child_local_changed || late_child_returns != 0 {
+                run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+                setmetatable_factory::synthesize_setmetatable_factory_members(
+                    db,
+                    &workspace_file_ids,
+                );
+            }
+            resolve_uninformative_local_decl_caches(db, &mut context);
+        }
 
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
         {
@@ -224,7 +244,7 @@ fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut Analy
         return;
     }
 
-    for decl_id in std::mem::take(&mut context.uninformative_local_decl_candidates) {
+    for decl_id in context.uninformative_local_decl_candidates.clone() {
         let type_owner = decl_id.into();
         let current_cache = db.get_type_index().get_type_cache(&type_owner);
         if !type_cache_is_uninformative(current_cache) {
@@ -689,6 +709,45 @@ impl AnalyzeContext {
                 signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
             }
         }
+    }
+
+    fn requeue_inferred_returns_for_sources(
+        &mut self,
+        db: &mut DbIndex,
+        sources: &[InFiled<glua_parser::LuaSyntaxId>],
+    ) -> usize {
+        if sources.is_empty() {
+            return 0;
+        }
+
+        let returns = self
+            .inferred_return_candidates
+            .iter()
+            .filter(|return_| {
+                sources.iter().any(|source| {
+                    source.file_id == return_.file_id
+                        && (return_.body.as_ref().is_some_and(|body| {
+                            body.get_range().contains_range(source.value.get_range())
+                        }) || return_.return_points.iter().any(|point| {
+                            return_point_contains_range(point, source.value.get_range())
+                        }))
+                })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+
+        let mut requeued = 0;
+        for return_ in returns {
+            if let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+                self.unresolves
+                    .push((return_.into(), InferFailReason::None));
+                requeued += 1;
+            }
+        }
+        requeued
     }
 
     pub fn has_pending_decl_unresolve(&self, decl_id: LuaDeclId) -> bool {
