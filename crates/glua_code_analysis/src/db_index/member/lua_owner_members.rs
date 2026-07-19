@@ -50,6 +50,10 @@ impl LuaOwnerMembers {
         self.members.values()
     }
 
+    pub fn get_member_keys(&self) -> impl Iterator<Item = &LuaMemberKey> {
+        self.members.keys()
+    }
+
     pub fn sorted_member_ids(&self) -> &[LuaMemberId] {
         self.sorted_ids_cache.get_or_init(|| {
             let mut member_ids = Vec::new();

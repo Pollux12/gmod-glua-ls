@@ -5,6 +5,7 @@ mod resolve_closure;
 
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::{
@@ -218,6 +219,7 @@ fn try_resolve(
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
+        let mut retry_file_ids = HashSet::new();
 
         // Only re-sort keys when the set of reason groups has changed.
         // This avoids cloning and sorting on every inner loop iteration.
@@ -312,6 +314,7 @@ fn try_resolve(
                     Err(reason) => {
                         if reason != *check_reason {
                             changed = true;
+                            retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
                         }
                     }
@@ -333,6 +336,12 @@ fn try_resolve(
         if !changed || reason_resolve.is_empty() {
             break;
         }
+
+        // Successful deferred resolutions can make cached failures reachable in
+        // the next wave, including across files. Keep syntax-derived cache data,
+        // but discard inference results computed against the previous DB state.
+        materialize_pending_str_tpl_type_decls(db, infer_manager);
+        infer_manager.clear_files_deferred_results(&retry_file_ids);
 
         // Re-use cached sorted keys if no new reason groups were added.
         // When retain_unresolve adds items to new/existing groups, the key

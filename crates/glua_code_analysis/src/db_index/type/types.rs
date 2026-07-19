@@ -376,6 +376,19 @@ impl LuaType {
         matches!(self, LuaType::Object(_))
     }
 
+    pub fn contains_object_type(&self) -> bool {
+        match self {
+            LuaType::Object(_) => true,
+            LuaType::Union(union) => union.types().any(LuaType::contains_object_type),
+            LuaType::MultiLineUnion(union) => union
+                .get_unions()
+                .iter()
+                .any(|(typ, _)| typ.contains_object_type()),
+            LuaType::TypeGuard(inner) => inner.contains_object_type(),
+            _ => false,
+        }
+    }
+
     pub fn is_union(&self) -> bool {
         matches!(self, LuaType::Union(_))
     }

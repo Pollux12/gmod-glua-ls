@@ -33,7 +33,10 @@ use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use narrow::{contains_gmod_null_type, get_var_expr_var_ref_id, remove_false_or_nil};
+pub(crate) use narrow::{
+    contains_gmod_null_type, expr_may_have_condition_narrowing, get_var_expr_var_ref_id,
+    remove_false_or_nil,
+};
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -338,6 +341,16 @@ where
                     }
                 }
 
+                break;
+            }
+            LuaType::Unknown if matches!(expr, LuaExpr::CallExpr(_)) && var_count.is_some() => {
+                let remaining = var_count
+                    .unwrap_or(value_types.len())
+                    .saturating_sub(value_types.len());
+                value_types.extend(std::iter::repeat_n(
+                    (LuaType::Unknown, expr.get_range()),
+                    remaining,
+                ));
                 break;
             }
             _ => value_types.push((expr_type, expr.get_range())),

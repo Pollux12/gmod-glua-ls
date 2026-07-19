@@ -19,8 +19,8 @@ use crate::{
     SignatureReturnStatus,
     compilation::analyzer::AnalyzeContext,
     semantic::{
-        infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
-        resolve_dynamic_field_member,
+        expr_may_have_condition_narrowing, infer_bind_value_type, infer_expr,
+        infer_true_condition_narrowing, resolve_dynamic_field_member,
     },
 };
 
@@ -202,6 +202,19 @@ struct UnguardedChildCandidates {
     children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct NestedUnguardedChildTarget {
+    root_decl_id: crate::LuaDeclId,
+    path: Vec<LuaMemberKey>,
+}
+
+struct NestedUnguardedChildCandidates {
+    parent_type: LuaType,
+    children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
+    receivers: FxHashSet<InFiled<glua_parser::LuaSyntaxId>>,
+    source: InFiled<glua_parser::LuaSyntaxId>,
+}
+
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
@@ -215,13 +228,18 @@ pub(super) fn stabilize_unguarded_children(
     if !db.get_emmyrc().gmod.enabled {
         return Vec::new();
     }
-
     let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::new();
+    let mut nested_scores =
+        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::new();
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
     let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
     let direct_subtype_members = precompute_direct_subtype_members(db);
+    let nested_candidate_members = direct_subtype_members
+        .values()
+        .flat_map(|members| members.keys().cloned())
+        .collect::<FxHashSet<_>>();
     if let (Some(profile), Some(start)) = (&mut profile, subtype_index_start) {
         profile.subtype_index = start.elapsed();
     }
@@ -408,6 +426,22 @@ pub(super) fn stabilize_unguarded_children(
                 }
             }
         }
+
+        if db
+            .get_call_site_param_index()
+            .has_concrete_structural_callback_params(file_id)
+        {
+            collect_nested_unguarded_child_evidence(
+                db,
+                context,
+                file_id,
+                &root,
+                only_return_evidence,
+                &direct_subtype_members,
+                &nested_candidate_members,
+                &mut nested_scores,
+            );
+        }
     }
     if let (Some(profile), Some(start)) = (&mut profile, reference_scan_start) {
         profile.reference_scan = start.elapsed();
@@ -437,6 +471,7 @@ pub(super) fn stabilize_unguarded_children(
                         .unwrap_or_else(|| right.get_name()),
                 )
                 .then_with(|| left.get_name().cmp(right.get_name()))
+                .then_with(|| left.stable_cmp(right))
         });
         let Some(source) = winners
             .iter()
@@ -490,6 +525,68 @@ pub(super) fn stabilize_unguarded_children(
         ));
     }
 
+    for (_, candidates) in nested_scores {
+        let found_type = candidates.parent_type;
+        let Some(max_score) = candidates.children.values().map(FxHashSet::len).max() else {
+            continue;
+        };
+        let mut winners = candidates
+            .children
+            .into_iter()
+            .filter_map(|(child_id, keys)| (keys.len() == max_score).then_some(child_id))
+            .collect::<Vec<_>>();
+        winners.sort_by(|left, right| {
+            db.get_type_index()
+                .get_type_decl(left)
+                .map(|decl| decl.get_name())
+                .unwrap_or_else(|| left.get_name())
+                .cmp(
+                    db.get_type_index()
+                        .get_type_decl(right)
+                        .map(|decl| decl.get_name())
+                        .unwrap_or_else(|| right.get_name()),
+                )
+                .then_with(|| left.get_name().cmp(right.get_name()))
+        });
+        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let mut support = Vec::new();
+        for child in &winners {
+            support.extend(
+                contextual_type_support(db, &LuaType::Ref(child.clone()))
+                    .iter()
+                    .cloned(),
+            );
+        }
+        support.sort_by(LuaInferenceNodeId::stable_cmp);
+        support.dedup();
+        update_sources.push(candidates.source.clone());
+        let nodes = candidates
+            .receivers
+            .into_iter()
+            .map(|receiver| LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(receiver)));
+        let event_node =
+            LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(candidates.source.clone()));
+        for node in nodes {
+            let event = LuaInferenceEventId {
+                node: event_node.clone(),
+                kind: LuaInferenceProvenanceKind::UnguardedChild,
+                source: candidates.source.clone(),
+            };
+            updates.push((
+                node,
+                LuaTypeFact::new(
+                    typ.clone(),
+                    LuaInferenceConfidence::Heuristic,
+                    Arc::from([LuaInferenceStep {
+                        event,
+                        support: support.clone().into(),
+                        found_type: Some(Arc::new(found_type.clone())),
+                    }]),
+                ),
+            ));
+        }
+    }
+
     let updates_len = updates.len();
     let publish_start = profile.as_ref().map(|_| std::time::Instant::now());
     let changed = db.publish_inference_facts(updates);
@@ -520,6 +617,187 @@ pub(super) fn stabilize_unguarded_children(
         update_sources
     } else {
         Vec::new()
+    }
+}
+
+fn collect_nested_unguarded_child_evidence(
+    db: &crate::DbIndex,
+    context: &mut AnalyzeContext,
+    file_id: crate::FileId,
+    root: &glua_parser::LuaSyntaxNode,
+    only_return_evidence: bool,
+    direct_subtype_members: &DirectSubtypeMembers,
+    candidate_members: &FxHashSet<LuaMemberKey>,
+    scores: &mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
+) {
+    let mut callback_roots = FxHashMap::default();
+    for index_expr in root.descendants().filter_map(LuaIndexExpr::cast) {
+        let Some(LuaExpr::IndexExpr(receiver)) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        if only_return_evidence
+            && !index_expr
+                .syntax()
+                .ancestors()
+                .any(|node| LuaReturnStat::cast(node).is_some())
+        {
+            continue;
+        }
+        if is_assignment_target(&index_expr) {
+            continue;
+        }
+        if is_condition_evidence(&index_expr) {
+            continue;
+        }
+
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let Some(root_decl_id) = nested_receiver_root_decl_id(db, file_id, &receiver) else {
+            continue;
+        };
+        let callback_inferred = *callback_roots
+            .entry(root_decl_id)
+            .or_insert_with(|| is_callback_inferred_structural_root(db, root_decl_id));
+        if !callback_inferred {
+            continue;
+        }
+        let Some(index_key) = index_expr.get_index_key() else {
+            continue;
+        };
+        if LuaMemberKey::index_key_is_dynamic(db, cache, &index_key) {
+            continue;
+        }
+        let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
+            continue;
+        };
+        if !candidate_members.contains(&member_key) {
+            continue;
+        }
+        if !expr_may_have_condition_narrowing(db, cache, LuaExpr::IndexExpr(receiver.clone())) {
+            continue;
+        }
+        let Some(target) = nested_unguarded_child_target(db, cache, &receiver, root_decl_id) else {
+            continue;
+        };
+        let Some(receiver_prefix) = receiver.get_prefix_expr() else {
+            continue;
+        };
+        let receiver_prefix_type = infer_expr(db, cache, receiver_prefix).ok();
+        let allow_stable_path = receiver_prefix_type
+            .as_ref()
+            .is_some_and(LuaType::contains_object_type);
+        let allow_opaque_path = receiver_prefix_type
+            .as_ref()
+            .is_some_and(LuaType::is_unknown);
+        if !allow_stable_path && !allow_opaque_path {
+            continue;
+        };
+        let current =
+            infer_expr(db, cache, LuaExpr::IndexExpr(receiver.clone())).unwrap_or(LuaType::Unknown);
+        let Some(base_id) = unguarded_child_base_id(&current) else {
+            continue;
+        };
+        let Some(children) = direct_subtype_members
+            .get(&base_id)
+            .and_then(|members| members.get(&member_key))
+        else {
+            continue;
+        };
+        if is_matching_short_circuit_guard(db, cache, &index_expr) {
+            continue;
+        }
+        if type_has_visible_member_at_use(
+            db,
+            context,
+            &LuaType::Ref(base_id),
+            &member_key,
+            file_id,
+            index_expr.get_position(),
+        ) {
+            continue;
+        }
+        let source = InFiled::new(file_id, index_expr.get_syntax_id());
+        let receiver = InFiled::new(file_id, receiver.get_syntax_id());
+        let candidates = scores
+            .entry(target)
+            .or_insert_with(|| NestedUnguardedChildCandidates {
+                parent_type: current.clone(),
+                children: HashMap::new(),
+                receivers: FxHashSet::default(),
+                source: source.clone(),
+            });
+        if candidates.parent_type != current {
+            continue;
+        }
+        candidates.receivers.insert(receiver);
+        if source.value.get_range().start() < candidates.source.value.get_range().start() {
+            candidates.source = source;
+        }
+        for child_id in children {
+            candidates
+                .children
+                .entry(child_id.clone())
+                .or_default()
+                .insert(member_key.clone());
+        }
+    }
+}
+
+fn nested_receiver_root_decl_id(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+    receiver: &LuaIndexExpr,
+) -> Option<crate::LuaDeclId> {
+    let mut current = receiver.clone();
+    loop {
+        match current.get_prefix_expr()? {
+            LuaExpr::IndexExpr(parent) => current = parent,
+            LuaExpr::NameExpr(name) => {
+                return db
+                    .get_reference_index()
+                    .get_local_reference(&file_id)?
+                    .get_decl_id(&name.get_range());
+            }
+            _ => return None,
+        }
+    }
+}
+
+fn is_callback_inferred_structural_root(
+    db: &crate::DbIndex,
+    root_decl_id: crate::LuaDeclId,
+) -> bool {
+    let Some(decl) = db.get_decl_index().get_decl(&root_decl_id) else {
+        return false;
+    };
+    let crate::LuaDeclExtra::Param {
+        idx, signature_id, ..
+    } = &decl.extra
+    else {
+        return false;
+    };
+    db.get_call_site_param_index()
+        .is_concrete_structural_callback_param(signature_id, *idx)
+}
+
+fn nested_unguarded_child_target(
+    db: &crate::DbIndex,
+    cache: &mut crate::LuaInferCache,
+    receiver: &LuaIndexExpr,
+    root_decl_id: crate::LuaDeclId,
+) -> Option<NestedUnguardedChildTarget> {
+    let mut path = Vec::new();
+    let mut current = receiver.clone();
+    loop {
+        let key = current.get_index_key()?;
+        path.push(LuaMemberKey::from_index_key(db, cache, &key).ok()?);
+        match current.get_prefix_expr()? {
+            LuaExpr::IndexExpr(parent) => current = parent,
+            LuaExpr::NameExpr(_) => {
+                path.reverse();
+                return Some(NestedUnguardedChildTarget { root_decl_id, path });
+            }
+            _ => return None,
+        }
     }
 }
 

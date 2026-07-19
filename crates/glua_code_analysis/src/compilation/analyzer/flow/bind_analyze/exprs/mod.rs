@@ -26,7 +26,7 @@ pub fn bind_condition_expr(
 
     // Condition expressions can narrow any variable they mention; record all
     // referenced names / index paths so the flow-walk skip stays sound.
-    binder.record_narrowable_refs_in_expr(&condition_expr);
+    binder.record_condition_refs_in_expr(&condition_expr);
 
     binder.true_target = true_target;
     binder.false_target = false_target;
@@ -37,11 +37,13 @@ pub fn bind_condition_expr(
     if !is_binary_logical(&condition_expr) {
         let true_condition =
             binder.create_node(FlowNodeKind::TrueCondition(condition_expr.to_ptr()));
+        binder.record_condition_flow_paths(true_condition, &condition_expr);
         binder.add_antecedent(true_condition, current);
         binder.add_antecedent(true_target, true_condition);
 
         let false_condition =
             binder.create_node(FlowNodeKind::FalseCondition(condition_expr.to_ptr()));
+        binder.record_condition_flow_paths(false_condition, &condition_expr);
         binder.add_antecedent(false_condition, current);
         binder.add_antecedent(false_target, false_condition);
     }

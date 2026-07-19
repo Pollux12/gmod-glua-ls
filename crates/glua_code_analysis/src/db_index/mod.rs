@@ -28,6 +28,7 @@ use std::{collections::HashSet, path::PathBuf, sync::Arc};
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
 pub use call_site_param::CallSiteParamIndex;
+pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};

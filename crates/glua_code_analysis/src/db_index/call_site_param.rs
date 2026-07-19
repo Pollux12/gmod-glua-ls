@@ -1,12 +1,30 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::path::PathBuf;
 
 use rowan::TextSize;
 
 use super::traits::LuaIndex;
 use crate::{
-    FileId, LuaInferenceConfidence, LuaInferenceDiagnosticEvent, LuaInferenceStep, LuaSignatureId,
-    LuaType, LuaTypeFact,
+    FileId, LuaDeclId, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceDiagnosticEvent,
+    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaSignatureId, LuaType,
+    LuaTypeFact,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct CallSiteReturnConsumer {
+    pub signature_id: LuaSignatureId,
+    pub file_id: FileId,
+    pub call_syntax_id: glua_parser::LuaSyntaxId,
+    pub ret_idx: usize,
+    pub target: CallSiteReturnConsumerTarget,
+    pub definition: Option<LuaDefinitionId>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallSiteReturnConsumerTarget {
+    Decl(LuaDeclId),
+    Member(LuaMemberId),
+}
 
 #[derive(Debug, Clone)]
 struct CallSiteParamContribution {
@@ -51,11 +69,7 @@ impl CallSiteParamAccumulator {
         );
         provenance.extend_from_slice(self.first_fact.provenance());
         provenance.extend(self.additional_provenance);
-        LuaTypeFact::new(
-            LuaType::from_vec(types),
-            self.confidence,
-            provenance.into(),
-        )
+        LuaTypeFact::new(LuaType::from_vec(types), self.confidence, provenance.into())
     }
 }
 
@@ -77,7 +91,20 @@ pub struct CallSiteParamIndex {
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
     /// signature → param index → union of all observed types from current file contributions.
     inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    pending_previous_params: HashMap<(LuaSignatureId, usize), LuaTypeFact>,
+    file_return_consumers: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
+    return_consumers: HashMap<LuaSignatureId, Vec<CallSiteReturnConsumer>>,
+    /// Files owning callback parameters inferred from concrete structural table values.
+    concrete_structural_callback_files: HashSet<FileId>,
     inference_events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
+    /// consumer file → producer files used to infer callback parameter shapes.
+    ///
+    /// These survive dependent reindexing while a producer is absent so reopening the producer
+    /// can invalidate its consumers. Direct consumer edits refresh their entry exactly.
+    file_source_dependencies: HashMap<FileId, HashSet<FileId>>,
+    source_dependents: HashMap<FileId, HashSet<FileId>>,
+    source_paths: HashMap<FileId, PathBuf>,
+    source_path_dependents: HashMap<PathBuf, HashSet<FileId>>,
 }
 
 impl CallSiteParamIndex {
@@ -121,7 +148,7 @@ impl CallSiteParamIndex {
         &mut self,
         updates: Vec<(FileId, Vec<(LuaSignatureId, usize, LuaType)>)>,
     ) {
-        self.set_files_fact_contributions(
+        let _ = self.set_files_fact_contributions(
             updates
                 .into_iter()
                 .map(|(file_id, contributions)| {
@@ -142,7 +169,36 @@ impl CallSiteParamIndex {
     pub fn set_files_fact_contributions(
         &mut self,
         updates: Vec<(FileId, Vec<(LuaSignatureId, usize, LuaTypeFact)>)>,
-    ) {
+    ) -> HashSet<LuaSignatureId> {
+        let mut affected_params = HashSet::new();
+        for (file_id, _) in &updates {
+            if let Some(contributions) = self.file_contributions.get(file_id) {
+                affected_params.extend(
+                    contributions
+                        .iter()
+                        .map(|contribution| (contribution.signature_id, contribution.param_idx)),
+                );
+            }
+        }
+        affected_params.extend(updates.iter().flat_map(|(_, contributions)| {
+            contributions
+                .iter()
+                .map(|(signature_id, param_idx, _)| (*signature_id, *param_idx))
+        }));
+        affected_params.extend(self.pending_previous_params.keys().copied());
+        let mut previous = std::mem::take(&mut self.pending_previous_params)
+            .into_iter()
+            .map(|(key, fact)| (key, Some(fact)))
+            .collect::<HashMap<_, _>>();
+        for (signature_id, param_idx) in &affected_params {
+            previous
+                .entry((*signature_id, *param_idx))
+                .or_insert_with(|| {
+                    self.get_inferred_param_fact(signature_id, *param_idx)
+                        .cloned()
+                });
+        }
+
         for (file_id, contributions) in updates {
             self.file_contributions.insert(
                 file_id,
@@ -159,6 +215,16 @@ impl CallSiteParamIndex {
             );
         }
         self.rebuild_derived_state();
+
+        affected_params
+            .into_iter()
+            .filter_map(|(signature_id, param_idx)| {
+                let current = self
+                    .get_inferred_param_fact(&signature_id, param_idx)
+                    .cloned();
+                (previous.get(&(signature_id, param_idx)) != Some(&current)).then_some(signature_id)
+            })
+            .collect()
     }
 
     pub fn get_inferred_param(
@@ -180,6 +246,65 @@ impl CallSiteParamIndex {
             .and_then(|params| params.get(&param_idx))
     }
 
+    pub(crate) fn set_files_return_consumers(
+        &mut self,
+        updates: Vec<(FileId, Vec<CallSiteReturnConsumer>)>,
+    ) {
+        for (file_id, consumers) in updates {
+            self.file_return_consumers.insert(file_id, consumers);
+        }
+        self.rebuild_return_consumers();
+    }
+
+    pub(crate) fn get_return_consumers(
+        &self,
+        signature_ids: &HashSet<LuaSignatureId>,
+    ) -> Vec<CallSiteReturnConsumer> {
+        let mut consumers = signature_ids
+            .iter()
+            .filter_map(|signature_id| self.return_consumers.get(signature_id))
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        consumers.sort_unstable_by_key(|consumer| {
+            (
+                consumer.file_id,
+                consumer.call_syntax_id.get_range().start(),
+                consumer.ret_idx,
+            )
+        });
+        consumers.dedup();
+        consumers
+    }
+
+    pub fn collect_contribution_signature_files(
+        &self,
+        source_files: &HashSet<FileId>,
+    ) -> Vec<FileId> {
+        let mut files = source_files
+            .iter()
+            .filter_map(|file_id| self.file_contributions.get(file_id))
+            .flatten()
+            .map(|contribution| contribution.signature_id.get_file_id())
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
+    pub fn is_concrete_structural_callback_param(
+        &self,
+        signature_id: &LuaSignatureId,
+        param_idx: usize,
+    ) -> bool {
+        self.get_inferred_param_fact(signature_id, param_idx)
+            .is_some_and(is_concrete_structural_callback_fact)
+    }
+
+    pub fn has_concrete_structural_callback_params(&self, file_id: FileId) -> bool {
+        self.concrete_structural_callback_files.contains(&file_id)
+    }
+
     pub fn get_inference_events_for_file(&self, file_id: FileId) -> &[LuaInferenceDiagnosticEvent] {
         self.inference_events_by_file
             .get(&file_id)
@@ -187,8 +312,59 @@ impl CallSiteParamIndex {
             .unwrap_or_default()
     }
 
+    pub fn collect_source_dependents(&self, source_files: &HashSet<FileId>) -> Vec<FileId> {
+        let mut dependents = source_files
+            .iter()
+            .filter_map(|file_id| self.source_dependents.get(file_id))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        dependents.extend(
+            source_files
+                .iter()
+                .filter_map(|file_id| self.source_paths.get(file_id))
+                .filter_map(|path| self.source_path_dependents.get(path))
+                .flatten()
+                .copied(),
+        );
+        dependents.sort_unstable();
+        dependents.dedup();
+        dependents
+    }
+
+    pub fn collect_source_path_dependents<'a>(
+        &self,
+        source_paths: impl IntoIterator<Item = &'a PathBuf>,
+    ) -> Vec<FileId> {
+        let mut dependents = source_paths
+            .into_iter()
+            .filter_map(|path| self.source_path_dependents.get(path))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        dependents.sort_unstable();
+        dependents.dedup();
+        dependents
+    }
+
+    pub fn record_source_paths(&mut self, paths: impl IntoIterator<Item = (FileId, PathBuf)>) {
+        self.source_paths.extend(paths);
+        self.rebuild_source_dependents();
+    }
+
+    pub fn refresh_file_source_dependencies(&mut self, file_id: FileId) {
+        let dependencies = self.current_file_source_dependencies(file_id);
+        if dependencies.is_empty() {
+            self.file_source_dependencies.remove(&file_id);
+        } else {
+            self.file_source_dependencies.insert(file_id, dependencies);
+        }
+        self.rebuild_source_dependents();
+    }
+
     fn rebuild_derived_state(&mut self) {
         self.inferred_params.clear();
+        self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
 
         let mut accumulators =
@@ -200,6 +376,14 @@ impl CallSiteParamIndex {
             };
 
             for contribution in contributions {
+                for step in contribution.param_fact.provenance() {
+                    if step.event.source.file_id != file_id {
+                        self.file_source_dependencies
+                            .entry(file_id)
+                            .or_default()
+                            .insert(step.event.source.file_id);
+                    }
+                }
                 accumulators
                     .entry(contribution.signature_id)
                     .or_default()
@@ -222,8 +406,12 @@ impl CallSiteParamIndex {
             })
             .collect();
 
-        for params in self.inferred_params.values() {
+        for (signature_id, params) in &self.inferred_params {
             for fact in params.values() {
+                if is_concrete_structural_callback_fact(fact) {
+                    self.concrete_structural_callback_files
+                        .insert(signature_id.get_file_id());
+                }
                 for step in fact.provenance() {
                     self.inference_events_by_file
                         .entry(step.event.source.file_id)
@@ -238,6 +426,37 @@ impl CallSiteParamIndex {
         for events in self.inference_events_by_file.values_mut() {
             events.sort_by(|left, right| left.event.stable_cmp(&right.event));
             events.dedup_by(|left, right| left.event == right.event);
+        }
+        self.rebuild_source_dependents();
+    }
+
+    fn current_file_source_dependencies(&self, file_id: FileId) -> HashSet<FileId> {
+        self.file_contributions
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .flat_map(|contribution| contribution.param_fact.provenance())
+            .map(|step| step.event.source.file_id)
+            .filter(|source_file_id| *source_file_id != file_id)
+            .collect()
+    }
+
+    fn rebuild_source_dependents(&mut self) {
+        self.source_dependents.clear();
+        self.source_path_dependents.clear();
+        for (consumer_file_id, source_file_ids) in &self.file_source_dependencies {
+            for source_file_id in source_file_ids {
+                self.source_dependents
+                    .entry(*source_file_id)
+                    .or_default()
+                    .insert(*consumer_file_id);
+                if let Some(path) = self.source_paths.get(source_file_id) {
+                    self.source_path_dependents
+                        .entry(path.clone())
+                        .or_default()
+                        .insert(*consumer_file_id);
+                }
+            }
         }
     }
 
@@ -260,6 +479,20 @@ impl CallSiteParamIndex {
             }
         }
     }
+
+    fn rebuild_return_consumers(&mut self) {
+        self.return_consumers.clear();
+        for file_id in sorted_file_ids(&self.file_return_consumers) {
+            if let Some(consumers) = self.file_return_consumers.get(&file_id) {
+                for consumer in consumers {
+                    self.return_consumers
+                        .entry(consumer.signature_id)
+                        .or_default()
+                        .push(consumer.clone());
+                }
+            }
+        }
+    }
 }
 
 impl LuaIndex for CallSiteParamIndex {
@@ -268,13 +501,31 @@ impl LuaIndex for CallSiteParamIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
+        let affected_params = file_ids
+            .iter()
+            .filter_map(|file_id| self.file_contributions.get(file_id))
+            .flatten()
+            .map(|contribution| (contribution.signature_id, contribution.param_idx))
+            .collect::<HashSet<_>>();
+        for (signature_id, param_idx) in affected_params {
+            if let Some(fact) = self
+                .get_inferred_param_fact(&signature_id, param_idx)
+                .cloned()
+            {
+                self.pending_previous_params
+                    .entry((signature_id, param_idx))
+                    .or_insert(fact);
+            }
+        }
         for &file_id in file_ids {
             self.file_source_signatures.remove(&file_id);
+            self.file_return_consumers.remove(&file_id);
             self.file_contributions.remove(&file_id);
         }
 
         self.rebuild_derived_state();
         self.rebuild_source_signatures();
+        self.rebuild_return_consumers();
     }
 
     fn clear(&mut self) {
@@ -282,9 +533,25 @@ impl LuaIndex for CallSiteParamIndex {
         self.source_signatures_by_path.clear();
         self.file_contributions.clear();
         self.inferred_params.clear();
+        self.pending_previous_params.clear();
+        self.file_return_consumers.clear();
+        self.return_consumers.clear();
+        self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
+        self.file_source_dependencies.clear();
+        self.source_dependents.clear();
+        self.source_paths.clear();
+        self.source_path_dependents.clear();
         self.mutated_params.clear();
     }
+}
+
+fn is_concrete_structural_callback_fact(fact: &LuaTypeFact) -> bool {
+    fact.typ().contains_object_type()
+        && fact
+            .provenance()
+            .iter()
+            .any(|step| step.event.kind == LuaInferenceProvenanceKind::ConcreteValue)
 }
 
 #[cfg(test)]
@@ -400,5 +667,40 @@ mod tests {
             index.inference_events_by_file,
             expected.inference_events_by_file
         );
+    }
+
+    #[test]
+    fn removed_contribution_reports_its_signature_as_changed() {
+        let source_file = FileId::new(1);
+        let signature_id = signature_id(FileId::new(2), 10);
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(
+            source_file,
+            vec![(signature_id, 0, LuaType::String)],
+        )]);
+
+        index.remove(source_file);
+        let changed = index.set_files_fact_contributions(vec![(source_file, Vec::new())]);
+
+        assert_eq!(changed, HashSet::from([signature_id]));
+    }
+
+    #[test]
+    fn unchanged_reindexed_contribution_does_not_report_a_change() {
+        let source_file = FileId::new(1);
+        let signature_id = signature_id(FileId::new(2), 10);
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(
+            source_file,
+            vec![(signature_id, 0, LuaType::String)],
+        )]);
+
+        index.remove(source_file);
+        let changed = index.set_files_fact_contributions(vec![(
+            source_file,
+            vec![(signature_id, 0, LuaTypeFact::certain(LuaType::String))],
+        )]);
+
+        assert!(changed.is_empty());
     }
 }

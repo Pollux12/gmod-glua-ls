@@ -70,6 +70,14 @@ impl InferCacheManager {
         }
     }
 
+    pub fn clear_files_deferred_results(&mut self, file_ids: &HashSet<FileId>) {
+        for file_id in file_ids {
+            if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
+                infer_cache.clear_deferred_inference_results();
+            }
+        }
+    }
+
     pub fn drain_inferred_guard_dependencies(
         &mut self,
     ) -> Vec<(FileId, HashSet<LuaInferredGuardOwner>)> {

@@ -231,6 +231,12 @@ impl LuaInferCache {
         self.dynamic_field_resolving.clear();
     }
 
+    pub fn clear_deferred_inference_results(&mut self) {
+        self.expr_cache.clear();
+        self.call_cache.clear();
+        self.call_arg_types_cache.clear();
+    }
+
     /// Clears inference results that can become stale as deferred declarations,
     /// members, signatures, and dynamic fields are resolved. Structural caches
     /// derived only from the immutable syntax/reference/flow indexes survive the

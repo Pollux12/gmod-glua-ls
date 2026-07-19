@@ -120,6 +120,25 @@ fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &V
     }
 }
 
+pub(crate) fn expr_may_have_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let syntax_id = expr.get_syntax_id();
+    let Some(VarRefId::IndexRef(_, path)) = get_var_expr_var_ref_id(db, cache, expr) else {
+        return false;
+    };
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
+        return false;
+    };
+    let Some(flow_id) = flow_tree.get_flow_id(syntax_id) else {
+        return false;
+    };
+    flow_tree.has_condition_path_antecedent(flow_id, &path)
+}
+
 pub fn infer_expr_narrow_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,

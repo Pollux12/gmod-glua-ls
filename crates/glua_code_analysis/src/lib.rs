@@ -484,6 +484,10 @@ impl EmmyLuaAnalysis {
             self.compilation.update_index(update_file_ids.clone());
             self.stabilize_cross_file_type_caches(&update_file_ids);
         }
+        self.compilation
+            .get_db_mut()
+            .get_call_site_param_index_mut()
+            .refresh_file_source_dependencies(file_id);
         let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
         self.reindex_changed_inferred_guard_references(
             &guard_fact_file_ids,
@@ -585,6 +589,10 @@ impl EmmyLuaAnalysis {
             if !update_file_ids.is_empty() {
                 self.compilation.update_index(update_file_ids);
             }
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(file_id);
             self.reindex_changed_inferred_guard_references(
                 &reindex_file_ids.iter().copied().collect(),
                 &old_guard_facts,
@@ -680,6 +688,12 @@ impl EmmyLuaAnalysis {
         self.compilation.remove_index(file_ids.clone());
         self.compilation.update_index(file_ids.clone());
         self.stabilize_cross_file_type_caches(&file_ids);
+        for file_id in &incremental_source_file_ids {
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(*file_id);
+        }
         self.reindex_changed_inferred_guard_references(
             &guard_fact_file_ids,
             &old_guard_facts,
@@ -710,12 +724,28 @@ impl EmmyLuaAnalysis {
                 .get_db()
                 .get_type_index()
                 .files_depending_on_inference_support(&expanded);
+            let callback_dependents = self
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .collect_source_dependents(&expanded);
+            let callback_source_paths = expanded
+                .iter()
+                .filter_map(|file_id| self.compilation.get_db().get_vfs().get_file_path(file_id))
+                .collect::<Vec<_>>();
+            let callback_path_dependents = self
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .collect_source_path_dependents(callback_source_paths);
             let mut added = false;
             for file_id in dependency_dependents
                 .into_iter()
                 .chain(unresolved_path_dependents)
                 .chain(dependent_files)
                 .chain(inference_dependents)
+                .chain(callback_dependents)
+                .chain(callback_path_dependents)
             {
                 added |= expanded.insert(file_id);
             }
@@ -1309,6 +1339,12 @@ impl EmmyLuaAnalysis {
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
         self.stabilize_cross_file_type_caches(&updated_files);
+        for file_id in &old_source_file_ids {
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(*file_id);
+        }
         self.reindex_changed_inferred_guard_references(
             &guard_fact_file_ids,
             &old_guard_facts,
@@ -1392,6 +1428,12 @@ impl EmmyLuaAnalysis {
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
         self.stabilize_cross_file_type_caches(&updated_files);
+        for file_id in &old_source_file_ids {
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(*file_id);
+        }
         self.reindex_changed_inferred_guard_references(
             &guard_fact_file_ids,
             &old_guard_facts,
@@ -1403,7 +1445,15 @@ impl EmmyLuaAnalysis {
 
     pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
         if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
-            let reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
+            let mut reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
+            reindex_file_ids.extend(
+                self.compilation
+                    .get_db()
+                    .get_call_site_param_index()
+                    .collect_contribution_signature_files(&HashSet::from([file_id])),
+            );
+            reindex_file_ids.sort_unstable();
+            reindex_file_ids.dedup();
             let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
             let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
             self.compilation
@@ -1424,6 +1474,10 @@ impl EmmyLuaAnalysis {
             if !update_file_ids.is_empty() {
                 self.compilation.update_index(update_file_ids);
             }
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(file_id);
             self.reindex_changed_inferred_guard_references(
                 &guard_fact_file_ids,
                 &old_guard_facts,

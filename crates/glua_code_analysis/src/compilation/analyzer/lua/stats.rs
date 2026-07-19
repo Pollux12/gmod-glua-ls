@@ -220,6 +220,7 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
     if name_count > expr_count {
         let last_expr = expr_list.last();
         if let Some(last_expr) = last_expr {
+            let last_expr_is_call = matches!(last_expr, LuaExpr::CallExpr(_));
             match analyzer.infer_expr(last_expr) {
                 Ok(last_expr_type) => {
                     if let LuaType::Variadic(variadic) = last_expr_type {
@@ -235,8 +236,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                                     LuaTypeCache::InferType(ret_type.clone()),
                                 );
                             } else {
-                                // Out of variadic values; per Lua semantics
-                                // the missing values are `nil`.
                                 write_type_cache(
                                     analyzer.db,
                                     decl_id.into(),
@@ -247,17 +246,18 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         }
                         return Some(());
                     } else {
-                        // Single-return or non-variadic evaluated to a single value,
-                        // so extra slots receive `any` (legacy convention) instead of unknown.
+                        // Preserve unknown call arity; known non-variadic values
+                        // retain the legacy `any` convention for extra slots.
                         for i in expr_count..name_count {
                             let name = name_list.get(i)?;
                             let position = name.get_position();
                             let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                            bind_type(
-                                analyzer.db,
-                                decl_id.into(),
-                                LuaTypeCache::InferType(LuaType::Any),
-                            );
+                            let typ = if last_expr_type.is_unknown() && last_expr_is_call {
+                                LuaType::Unknown
+                            } else {
+                                LuaType::Any
+                            };
+                            bind_type(analyzer.db, decl_id.into(), LuaTypeCache::InferType(typ));
                         }
                         return Some(());
                     }
@@ -267,6 +267,13 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         let name = name_list.get(i)?;
                         let position = name.get_position();
                         let decl_id = LuaDeclId::new(analyzer.file_id, position);
+                        if last_expr_is_call {
+                            bind_type(
+                                analyzer.db,
+                                decl_id.into(),
+                                LuaTypeCache::InferType(LuaType::Unknown),
+                            );
+                        }
                         let unresolve = UnResolveDecl {
                             file_id: analyzer.file_id,
                             decl_id,

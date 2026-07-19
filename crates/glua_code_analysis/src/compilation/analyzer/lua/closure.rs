@@ -1842,7 +1842,7 @@ pub fn analyze_return_point(
     }])
 }
 
-fn analyze_return_correlations(
+pub fn analyze_return_correlations(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     return_points: &[LuaReturnPoint],

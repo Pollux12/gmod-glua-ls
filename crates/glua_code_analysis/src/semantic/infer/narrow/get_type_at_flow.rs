@@ -3384,9 +3384,11 @@ fn try_infer_decl_initializer_type(
     };
 
     let ret_idx = initializer.get_ret_idx();
+    let initializer_is_call = matches!(&expr, LuaExpr::CallExpr(_));
     let init_type = match infer_expr(db, cache, expr)? {
         LuaType::Variadic(variadic) => variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil),
         ty if ret_idx == 0 => ty,
+        LuaType::Unknown if initializer_is_call => LuaType::Unknown,
         _ => LuaType::Nil,
     };
 

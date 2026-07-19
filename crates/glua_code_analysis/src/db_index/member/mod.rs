@@ -592,6 +592,16 @@ impl LuaMemberIndex {
         )
     }
 
+    pub fn get_member_keys<'a>(
+        &'a self,
+        owner: &LuaMemberOwner,
+    ) -> impl Iterator<Item = &'a LuaMemberKey> + 'a {
+        self.owner_members
+            .get(owner)
+            .into_iter()
+            .flat_map(LuaOwnerMembers::get_member_keys)
+    }
+
     pub fn get_member_item_by_member_id(
         &self,
         member_id: LuaMemberId,

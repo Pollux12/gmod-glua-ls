@@ -1,6 +1,23 @@
 #[cfg(test)]
 mod test {
-    use crate::{GmodHookKind, LuaType, VirtualWorkspace};
+    use crate::{Emmyrc, GmodHookKind, LuaType, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
+
+    fn index_expr_type(ws: &VirtualWorkspace, file_id: crate::FileId, text: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == text)
+            .expect("index expression");
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(index_expr))
+            .expect("index expression type")
+    }
 
     #[test]
     fn test_closure_param_infer() {
@@ -25,6 +42,138 @@ mod test {
         let ty = ws.expr_ty("b");
         let expected = ws.ty("EventData");
         assert_eq!(ty, expected);
+    }
+
+    #[test]
+    fn unannotated_function_callback_infers_table_param_from_direct_invocations() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/shared/api.lua",
+                r#"
+                ---@class CallbackEntity
+                CallbackApi = {}
+
+                function CallbackApi.Read(callback)
+                    ---@type CallbackEntity
+                    local proc
+                    local data = { proc = proc }
+                    callback(false, data, "failed")
+                    callback(true, data)
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/shared/consumer.lua",
+                r#"
+                CallbackApi.Read(function(ok, data, err)
+                    callback_ok = ok
+                    callback_proc = data.proc
+                    callback_err = err
+                end)
+                "#,
+            ),
+        ]);
+
+        let expected_entity = ws.ty("CallbackEntity");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_ids[1])
+            .expect("consumer semantic model");
+        let param_type = |name: &str| {
+            let param = semantic_model
+                .get_root()
+                .descendants::<LuaNameExpr>()
+                .find(|param| param.get_name_text().as_deref() == Some(name))
+                .expect("callback parameter use");
+            semantic_model
+                .get_semantic_info(param.syntax().clone().into())
+                .expect("callback parameter semantic info")
+                .display_typ()
+                .clone()
+        };
+
+        assert_eq!(param_type("ok"), LuaType::Unknown);
+        let proc_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == "data.proc")
+            .expect("callback data.proc expression");
+        assert_eq!(
+            semantic_model
+                .infer_expr(LuaExpr::IndexExpr(proc_expr))
+                .expect("callback proc type"),
+            expected_entity
+        );
+        assert_eq!(param_type("err"), LuaType::Unknown);
+    }
+
+    #[test]
+    fn callback_table_param_refreshes_after_callee_edit_and_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/autorun/shared/types.lua",
+            "---@class CallbackEntityA\n---@class CallbackEntityB\n",
+        );
+        let api_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/callback_api.lua");
+        let api_source = |entity_type: &str| {
+            format!(
+                r#"
+                CallbackApi = {{}}
+                function CallbackApi.Read(callback)
+                    ---@type {entity_type}
+                    local proc
+                    local data = {{}}
+                    data.proc = proc
+                    callback(data)
+                end
+                "#,
+            )
+        };
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .expect("initial callback API");
+        let consumer_file_id = ws.def_file(
+            "lua/autorun/shared/callback_consumer.lua",
+            r#"
+            CallbackApi.Read(function(data)
+                callback_proc = data.proc
+            end)
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityA")
+        );
+
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityB")))
+            .expect("edited callback API");
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityB")
+        );
+
+        ws.analysis
+            .remove_file_by_uri(&api_uri)
+            .expect("removed callback API");
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .expect("reopened callback API");
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityA")
+        );
     }
 
     #[test]

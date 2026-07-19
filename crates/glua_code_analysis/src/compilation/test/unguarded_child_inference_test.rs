@@ -3,7 +3,7 @@ mod test {
     use std::collections::HashSet;
 
     use crate::{DiagnosticCode, Emmyrc, SemanticInfoOrigin, VirtualWorkspace};
-    use glua_parser::{LuaAstNode, LuaLocalName, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaLocalName, LuaNameExpr};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -91,6 +91,74 @@ mod test {
             .collect()
     }
 
+    #[derive(Debug, PartialEq, Eq)]
+    struct NestedCallbackState {
+        receiver_types: Vec<String>,
+        undefined_methods: usize,
+        unguarded_children: usize,
+    }
+
+    fn nested_callback_state(
+        ws: &mut VirtualWorkspace,
+        consumer_file_id: crate::FileId,
+    ) -> NestedCallbackState {
+        let undefined_methods =
+            diagnostic_count(ws, consumer_file_id, DiagnosticCode::UndefinedMethod);
+        let unguarded_children =
+            diagnostic_count(ws, consumer_file_id, DiagnosticCode::InferUnguardedChild);
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_file_id)
+            .expect("consumer semantic model");
+        let receiver_types = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter_map(|index_expr| match index_expr.get_prefix_expr() {
+                Some(LuaExpr::IndexExpr(receiver))
+                    if receiver.syntax().text().to_string().trim() == "data.proc" =>
+                {
+                    semantic_model.infer_expr(LuaExpr::IndexExpr(receiver)).ok()
+                }
+                _ => None,
+            })
+            .map(|typ| ws.humanize_type(typ))
+            .collect();
+        NestedCallbackState {
+            receiver_types,
+            undefined_methods,
+            unguarded_children,
+        }
+    }
+
+    fn fresh_nested_callback_state(producer: Option<&str>, consumer: &str) -> NestedCallbackState {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let mut files = Vec::new();
+        if let Some(producer) = producer {
+            files.push(("lua/autorun/shared/transfer.lua", producer));
+        }
+        files.push(("lua/autorun/client/consumer.lua", consumer));
+        let consumer_file_id = ws
+            .def_files(files)
+            .into_iter()
+            .find(|file_id| {
+                ws.analysis
+                    .compilation
+                    .get_semantic_model(*file_id)
+                    .is_some_and(|model| {
+                        model
+                            .get_root()
+                            .syntax()
+                            .text()
+                            .to_string()
+                            .contains("Transfer.Read(function")
+                    })
+            })
+            .expect("consumer file");
+        nested_callback_state(&mut ws, consumer_file_id)
+    }
+
     #[test]
     fn unguarded_child_member_evidence_selects_player_and_resolves_member_result() {
         let mut ws = VirtualWorkspace::new();
@@ -124,6 +192,334 @@ mod test {
         assert_eq!(ws.humanize_type(owner_type), "Player");
         assert_eq!(owner_info.origin, SemanticInfoOrigin::ContextualExpected);
         assert_eq!(ws.humanize_type(spos_type), "Vector");
+    }
+
+    #[test]
+    fn guarded_nested_member_receiver_selects_scripted_entity_child() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+            ---@class starfall_processor: Entity
+            ---@field Compile fun(self: starfall_processor, data: table)
+            ---@field Error fun(self: starfall_processor, err: table)
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+
+            local Ent_IsValid = FindMetaTable("Entity").IsValid
+            local function Read(callback)
+                ---@type unknown
+                local proc
+                callback({ proc = proc })
+                callback({ owner = proc })
+            end
+
+            Read(function(sfdata)
+                if not Ent_IsValid(sfdata.proc) then return end
+                sfdata.proc:Compile(sfdata)
+                sfdata.proc:Error({ message = "failed" })
+            end)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0,
+            "nested Entity receiver should use child-only methods as scripted-class evidence"
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1,
+            "nested Entity receiver should report one heuristic child inference"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let receiver_types = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter_map(|index_expr| match index_expr.get_prefix_expr() {
+                Some(LuaExpr::IndexExpr(receiver)) if receiver.syntax().text() == "sfdata.proc" => {
+                    semantic_model.infer_expr(LuaExpr::IndexExpr(receiver)).ok()
+                }
+                _ => None,
+            })
+            .map(|typ| ws.humanize_type(typ))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receiver_types,
+            vec!["starfall_processor", "starfall_processor"]
+        );
+    }
+
+    #[test]
+    fn cross_file_callback_preserves_entity_guard_for_nested_child_inference() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/shared/transfer.lua",
+                r#"
+                ---@attribute self_guard(member: string)
+                ---@class Entity
+                ---@class starfall_processor: Entity
+                ---@field Compile fun(self: starfall_processor, data: table)
+                ---@field Error fun(self: starfall_processor, err: table)
+
+                Entity = {}
+                ---@return boolean
+                ---@return_cast self Entity
+                ---@[self_guard("gmod.entity")]
+                function Entity:IsValid() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                function isentity(value) end
+
+                Transfer = {}
+                function Transfer.Read(callback)
+                    local data = {}
+                    ---@type unknown
+                    local proc
+                    if isentity(proc) then data.proc = proc end
+                    callback(true, data)
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/client/consumer.lua",
+                r#"
+                ---@generic T
+                ---@param name `T`
+                ---@return T
+                function FindMetaTable(name) end
+
+                local Ent_IsValid = FindMetaTable("Entity").IsValid
+                Transfer.Read(function(ok, data)
+                    if ok and Ent_IsValid(data.proc) then
+                        data.proc:Compile(data)
+                        data.proc:Error({ message = "failed" })
+                    end
+                end)
+                "#,
+            ),
+        ]);
+        let consumer_file_id = file_ids
+            .into_iter()
+            .find(|file_id| {
+                ws.analysis
+                    .compilation
+                    .get_semantic_model(*file_id)
+                    .is_some_and(|model| {
+                        model
+                            .get_root()
+                            .syntax()
+                            .text()
+                            .to_string()
+                            .contains("Transfer.Read")
+                    })
+            })
+            .expect("consumer file");
+
+        assert_eq!(
+            diagnostic_count(&mut ws, consumer_file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(consumer_file_id)
+            .expect("consumer semantic model");
+        let receiver_types = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter_map(|index_expr| match index_expr.get_prefix_expr() {
+                Some(LuaExpr::IndexExpr(receiver))
+                    if receiver.syntax().text().to_string().trim() == "data.proc" =>
+                {
+                    semantic_model.infer_expr(LuaExpr::IndexExpr(receiver)).ok()
+                }
+                _ => None,
+            })
+            .map(|typ| ws.humanize_type(typ))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            receiver_types,
+            vec!["starfall_processor", "starfall_processor"]
+        );
+        assert_eq!(
+            diagnostic_count(
+                &mut ws,
+                consumer_file_id,
+                DiagnosticCode::InferUnguardedChild
+            ),
+            1
+        );
+    }
+
+    #[test]
+    fn nested_callback_inference_matches_fresh_analysis_across_edit_delete_and_reopen() {
+        const STRUCTURAL_PRODUCER: &str = r#"
+            ---@attribute self_guard(member: string)
+            ---@class Entity
+            ---@class starfall_processor: Entity
+            ---@field Compile fun(self: starfall_processor, data: table)
+            ---@field Error fun(self: starfall_processor, err: table)
+
+            Entity = {}
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function isentity(value) end
+
+            Transfer = {}
+            function Transfer.Read(callback)
+                local data = {}
+                ---@type unknown
+                local proc
+                if isentity(proc) then data.proc = proc end
+                callback(false, { owner = proc })
+                callback(true, data)
+            end
+        "#;
+        const NON_STRUCTURAL_PRODUCER: &str = r#"
+            ---@attribute self_guard(member: string)
+            ---@class Entity
+            ---@class starfall_processor: Entity
+            ---@field Compile fun(self: starfall_processor, data: table)
+            ---@field Error fun(self: starfall_processor, err: table)
+
+            Entity = {}
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            Transfer = {}
+            function Transfer.Read(callback)
+                callback(true, nil)
+            end
+        "#;
+        const CONSUMER: &str = r#"
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+
+            local Ent_IsValid = FindMetaTable("Entity").IsValid
+            Transfer.Read(function(ok, data)
+                if ok and Ent_IsValid(data.proc) then
+                    data.proc:Compile(data)
+                    data.proc:Error({ message = "failed" })
+                end
+            end)
+        "#;
+        const EDITED_CONSUMER: &str = r#"
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+
+            local unused = true
+            local Ent_IsValid = FindMetaTable("Entity").IsValid
+            Transfer.Read(function(ok, data)
+                if ok and Ent_IsValid(data.proc) then
+                    data.proc:Compile(data)
+                    data.proc:Error({ message = "failed" })
+                end
+            end)
+        "#;
+
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let producer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/transfer.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/consumer.lua");
+        ws.analysis
+            .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .expect("initial producer");
+        let mut consumer_file_id = ws
+            .analysis
+            .update_file_by_uri(&consumer_uri, Some(CONSUMER.to_string()))
+            .expect("initial consumer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(STRUCTURAL_PRODUCER), CONSUMER)
+        );
+
+        ws.analysis
+            .update_file_by_uri(&producer_uri, Some(NON_STRUCTURAL_PRODUCER.to_string()))
+            .expect("producer without structural callback data");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(NON_STRUCTURAL_PRODUCER), CONSUMER)
+        );
+
+        ws.analysis
+            .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .expect("restored structural producer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(STRUCTURAL_PRODUCER), CONSUMER)
+        );
+
+        consumer_file_id = ws
+            .analysis
+            .update_file_by_uri(&consumer_uri, Some(EDITED_CONSUMER.to_string()))
+            .expect("edited consumer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(STRUCTURAL_PRODUCER), EDITED_CONSUMER)
+        );
+
+        ws.analysis
+            .remove_file_by_uri(&producer_uri)
+            .expect("removed producer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(None, EDITED_CONSUMER)
+        );
+
+        ws.analysis
+            .update_file_by_uri(&producer_uri, Some(STRUCTURAL_PRODUCER.to_string()))
+            .expect("reopened producer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(STRUCTURAL_PRODUCER), EDITED_CONSUMER)
+        );
+
+        ws.analysis
+            .remove_file_by_uri(&consumer_uri)
+            .expect("removed consumer");
+        consumer_file_id = ws
+            .analysis
+            .update_file_by_uri(&consumer_uri, Some(CONSUMER.to_string()))
+            .expect("reopened consumer");
+        assert_eq!(
+            nested_callback_state(&mut ws, consumer_file_id),
+            fresh_nested_callback_state(Some(STRUCTURAL_PRODUCER), CONSUMER)
+        );
     }
 
     #[test]

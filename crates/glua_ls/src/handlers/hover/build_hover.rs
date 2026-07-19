@@ -147,6 +147,9 @@ fn build_hover_without_property(
 
 fn format_type_label_hover(type_label: HoverTypeLabel, type_text: String) -> String {
     match type_label {
+        HoverTypeLabel::Plain if type_text.contains('\n') => {
+            format!("```lua\n{type_text}\n```")
+        }
         HoverTypeLabel::Plain => type_text,
         HoverTypeLabel::Inferred => format!("```lua\n{}\n```", type_label.format(type_text)),
     }
@@ -1350,4 +1353,19 @@ fn has_add_to_semantic_decls(
     }
 
     Some(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn plain_multiline_type_hover_is_fenced_for_markdown() {
+        let rendered = format_type_label_hover(
+            HoverTypeLabel::Plain,
+            "Entity {\n    IsValid: function,\n}".to_string(),
+        );
+
+        assert_eq!(rendered, "```lua\nEntity {\n    IsValid: function,\n}\n```");
+    }
 }

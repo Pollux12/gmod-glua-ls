@@ -343,9 +343,35 @@ impl<'a> FlowBinder<'a> {
     }
 
     /// Walk an expression subtree and record every name / index access path it
-    /// references as narrowable. Used for condition and cast expressions, which
-    /// can narrow any variable they mention.
+    /// references as narrowable. Used for cast expressions.
     pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
+        self.record_narrowable_refs(expr);
+    }
+
+    /// Record condition references separately from assignment and cast targets.
+    pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
+        self.record_narrowable_refs(expr);
+    }
+
+    pub fn record_condition_flow_paths(&mut self, flow_id: FlowId, expr: &LuaExpr) {
+        use glua_parser::{LuaAstNode, LuaIndexExpr, PathTrait};
+
+        for index_expr in expr.syntax().descendants().filter_map(LuaIndexExpr::cast) {
+            let dynamic = matches!(
+                index_expr.get_index_key(),
+                Some(glua_parser::LuaIndexKey::Expr(_))
+            );
+            if let Some(path) = index_expr.get_access_path().filter(|_| !dynamic) {
+                self.narrowing_capability
+                    .condition_flows_by_path
+                    .entry(ArcIntern::from(SmolStr::new(path)))
+                    .or_default()
+                    .insert(flow_id);
+            }
+        }
+    }
+
+    fn record_narrowable_refs(&mut self, expr: &LuaExpr) {
         use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
         // Record the expr itself if it is a name or index, then recurse into
         // descendants to cover nested references (e.g. `a.b and c(d.e)`).
@@ -362,8 +388,12 @@ impl<'a> FlowBinder<'a> {
                     Some(glua_parser::LuaIndexKey::Expr(_))
                 );
                 match index_expr.get_access_path() {
-                    Some(path) if !dynamic => self.record_narrowable_index_path(&path),
-                    _ => self.mark_opaque_index_target(),
+                    Some(path) if !dynamic => {
+                        self.record_narrowable_index_path(&path);
+                    }
+                    _ => {
+                        self.mark_opaque_index_target();
+                    }
                 }
             }
         }

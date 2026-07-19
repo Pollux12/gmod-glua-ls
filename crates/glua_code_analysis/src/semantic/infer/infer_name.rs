@@ -396,12 +396,14 @@ fn try_infer_local_initializer_type(
     decl_id: LuaDeclId,
 ) -> Option<LuaType> {
     let (initializer_ret_idx, expr) = local_initializer_expr(db, decl_id)?;
+    let initializer_is_call = matches!(&expr, LuaExpr::CallExpr(_));
     let init_type = match infer_expr(db, cache, expr).ok()? {
         LuaType::Variadic(variadic) => variadic
             .get_type(initializer_ret_idx)
             .cloned()
             .unwrap_or(LuaType::Nil),
         ty if initializer_ret_idx == 0 => ty,
+        LuaType::Unknown if initializer_is_call => LuaType::Unknown,
         _ => LuaType::Nil,
     };
 

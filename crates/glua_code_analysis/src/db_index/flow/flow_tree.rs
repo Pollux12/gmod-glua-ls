@@ -30,6 +30,8 @@ pub struct FileNarrowingCapability {
     /// respectively to stay sound.
     pub has_opaque_name_target: bool,
     pub has_opaque_index_target: bool,
+    /// Condition flow nodes keyed by stable index path.
+    pub condition_flows_by_path: HashMap<ArcIntern<SmolStr>, HashSet<FlowId>>,
 }
 
 impl FileNarrowingCapability {
@@ -42,6 +44,10 @@ impl FileNarrowingCapability {
     /// Whether an index reference with access `path` could be narrowed.
     pub fn index_path_can_be_narrowed(&self, path: &ArcIntern<SmolStr>) -> bool {
         self.has_opaque_index_target || self.referenced_index_paths.contains(path)
+    }
+
+    fn condition_flows(&self, path: &ArcIntern<SmolStr>) -> Option<&HashSet<FlowId>> {
+        self.condition_flows_by_path.get(path)
     }
 }
 
@@ -377,8 +383,44 @@ impl FlowTree {
         bindings: HashMap<LuaSyntaxId, FlowId>,
         branch_label_info: HashMap<FlowId, BranchLabelInfo>,
         assignment_flow_info: Vec<AssignmentFlowInfo>,
-        narrowing_capability: FileNarrowingCapability,
+        mut narrowing_capability: FileNarrowingCapability,
     ) -> Self {
+        let mut successors = vec![Vec::new(); flow_nodes.len()];
+        for node in &flow_nodes {
+            let Some(antecedent) = &node.antecedent else {
+                continue;
+            };
+            match antecedent {
+                crate::FlowAntecedent::Single(antecedent) => {
+                    if let Some(flow_successors) = successors.get_mut(antecedent.0 as usize) {
+                        flow_successors.push(node.id);
+                    }
+                }
+                crate::FlowAntecedent::Multiple(id) => {
+                    if let Some(antecedents) = multiple_antecedents.get(*id as usize) {
+                        for antecedent in antecedents {
+                            if let Some(flow_successors) = successors.get_mut(antecedent.0 as usize)
+                            {
+                                flow_successors.push(node.id);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        for reachable in narrowing_capability.condition_flows_by_path.values_mut() {
+            let mut pending = reachable.iter().copied().collect::<Vec<_>>();
+            while let Some(flow_id) = pending.pop() {
+                let Some(flow_successors) = successors.get(flow_id.0 as usize) else {
+                    continue;
+                };
+                for successor in flow_successors {
+                    if reachable.insert(*successor) {
+                        pending.push(*successor);
+                    }
+                }
+            }
+        }
         Self {
             decl_bind_expr_ref,
             flow_nodes,
@@ -400,6 +442,16 @@ impl FlowTree {
 
     pub fn get_flow_node(&self, flow_id: FlowId) -> Option<&FlowNode> {
         self.flow_nodes.get(flow_id.0 as usize)
+    }
+
+    pub fn has_condition_path_antecedent(
+        &self,
+        flow_id: FlowId,
+        path: &ArcIntern<SmolStr>,
+    ) -> bool {
+        self.narrowing_capability
+            .condition_flows(path)
+            .is_some_and(|flows| flows.contains(&flow_id))
     }
 
     pub fn get_multi_antecedents(&self, id: u32) -> Option<&[FlowId]> {

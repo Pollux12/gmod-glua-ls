@@ -85,7 +85,9 @@ pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
 pub(crate) use infer::remove_false_or_nil;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
+pub(crate) use infer::{
+    contains_gmod_null_type, expr_may_have_condition_narrowing, get_var_expr_var_ref_id,
+};
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;

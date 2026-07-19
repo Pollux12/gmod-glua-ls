@@ -19,7 +19,10 @@ use crate::{
     SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
-        lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
+        lua::{
+            analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
+            infer_for_range_iter_expr_func,
+        },
         unresolve::UnResolveSpecialCall,
     },
     db_index::{LuaFunctionType, LuaMemberOwner, LuaOutParamRoot, LuaSignature, LuaSignatureId},
@@ -309,6 +312,7 @@ pub fn try_resolve_return_point(
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
+    let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
     let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
 
     let signature = db
@@ -319,6 +323,7 @@ pub fn try_resolve_return_point(
     if should_apply_resolved_return_docs(signature, &return_docs) {
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
+        signature.set_return_correlations(return_correlations);
     }
 
     Ok(())

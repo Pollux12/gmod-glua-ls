@@ -595,19 +595,6 @@ impl AnalyzeContext {
                 .map(|return_| (return_.into(), InferFailReason::None)),
         );
 
-        let mut status_only_invalidated = false;
-        for signature_id in signature_ids {
-            if requeued_signatures.contains(signature_id) {
-                continue;
-            }
-            if let Some(signature) = db.get_signature_index_mut().get_mut(signature_id)
-                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
-            {
-                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
-                status_only_invalidated = true;
-            }
-        }
-
         let mut requeued_consumers = 0;
         for (signature_id, consumer, definition_refresh) in consumers {
             if requeued_signatures.contains(&signature_id) {
@@ -620,8 +607,7 @@ impl AnalyzeContext {
             }
         }
 
-        self.call_site_return_invalidation_changed |=
-            count != 0 || requeued_consumers != 0 || status_only_invalidated;
+        self.call_site_return_invalidation_changed |= count != 0 || requeued_consumers != 0;
         (count, requeued_consumers)
     }
 
@@ -633,10 +619,8 @@ impl AnalyzeContext {
             return 0;
         }
 
-        let mut definition_refreshes =
-            HashMap::<LuaTypeOwner, Vec<LuaDefinitionId>>::new();
-        for (definition, owner) in
-            std::mem::take(&mut self.pending_call_site_definition_refreshes)
+        let mut definition_refreshes = HashMap::<LuaTypeOwner, Vec<LuaDefinitionId>>::new();
+        for (definition, owner) in std::mem::take(&mut self.pending_call_site_definition_refreshes)
         {
             definition_refreshes
                 .entry(owner)
