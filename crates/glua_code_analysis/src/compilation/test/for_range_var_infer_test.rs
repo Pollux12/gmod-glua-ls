@@ -169,6 +169,92 @@ mod test {
     }
 
     #[test]
+    fn pairs_over_table_projection_keeps_compact_key_and_symbolic_value_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@field KnownField string
+            ---@field KnownMethod fun(self: Entity)
+
+            ---@return tableof<Entity>
+            local function GetTable() end
+
+            for key, value in pairs(GetTable()) do
+                key_out = key
+                value_out = value
+            end
+            "#,
+        );
+
+        let key_type = ws.expr_ty("key_out");
+        let value_type = ws.expr_ty("value_out");
+        assert_eq!(ws.humanize_type(key_type), "string");
+        assert_eq!(ws.humanize_type(value_type), "index<Entity,string>");
+    }
+
+    #[test]
+    fn pairs_over_table_projection_preserves_mixed_key_categories() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class MixedTable
+            ---@field [integer] boolean
+            ---@field named string
+
+            ---@return tableof<MixedTable>
+            local function GetTable() end
+
+            for key, value in pairs(GetTable()) do
+                key_out = key
+                value_out = value
+            end
+            "#,
+        );
+
+        assert_eq!(
+            ws.expr_ty("key_out"),
+            LuaType::from_vec(vec![LuaType::Integer, LuaType::String])
+        );
+        let value_type = ws.expr_ty("value_out");
+        assert_eq!(
+            ws.humanize_type(value_type),
+            "index<MixedTable,(integer|string)>"
+        );
+    }
+
+    #[test]
+    fn pairs_over_generic_table_projection_keeps_symbolic_generic_key() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@generic T
+            ---@class GenericTable<T>
+            ---@field [T] boolean
+
+            ---@return tableof<GenericTable<string>>
+            local function GetTable() end
+
+            for key, value in pairs(GetTable()) do
+                key_out = key
+                value_out = value
+            end
+            "#,
+        );
+
+        let key_type = ws.expr_ty("key_out");
+        let value_type = ws.expr_ty("value_out");
+        assert_eq!(ws.humanize_type(key_type), "keyof<GenericTable<string>>");
+        assert_eq!(
+            ws.humanize_type(value_type),
+            "index<GenericTable<string>,keyof<GenericTable<string>>>"
+        );
+    }
+
+    #[test]
     fn test_issue_291() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

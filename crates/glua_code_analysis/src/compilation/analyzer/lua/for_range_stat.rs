@@ -2,9 +2,9 @@ use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaObjectType,
-    LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor,
-    VariadicType,
+    DbIndex, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
+    TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
         unresolve::UnResolveIterVar,
@@ -214,13 +214,25 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
 
     let table_type = infer_expr(db, cache, table_arg)?;
+    if let LuaType::TableOf(inner) = &table_type {
+        // Keep the value as T[K] instead of materializing every member type. Large
+        // scripted-class hierarchies can contain hundreds of callable members.
+        let key_type = infer_table_projection_key_type(db, inner);
+        let value_type = LuaType::Call(
+            LuaAliasCallType::new(
+                LuaAliasCallKind::Index,
+                vec![inner.as_ref().clone(), key_type.clone()],
+            )
+            .into(),
+        );
+        return Ok(Some(VariadicType::Multi(vec![key_type, value_type])));
+    }
     let Some(members) = get_member_map(db, &table_type) else {
         return Ok(None);
     };
     if members.keys().any(is_pairs_metamethod_key) {
         return Ok(None);
     }
-
     let mut keys = Vec::new();
     let mut values = Vec::new();
     let mut member_entries = members
@@ -255,6 +267,75 @@ fn try_infer_pairs_iter_types_from_table_members(
     ]);
 
     Ok(Some(iter_types))
+}
+
+fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
+    let mut pending = vec![inner.clone()];
+    let mut visited_types = HashSet::new();
+    let mut key_type = None;
+
+    while let Some(typ) = pending.pop() {
+        match typ {
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                if !visited_types.insert(type_id.clone()) {
+                    continue;
+                }
+
+                let owner = LuaMemberOwner::Type(type_id.clone());
+                // Iterate direct indexed keys and visit each supertype once;
+                // flattened member discovery duplicates diamond inheritance paths.
+                for key in db.get_member_index().get_member_keys(&owner) {
+                    let Some(typ) = table_projection_member_key_type(key) else {
+                        continue;
+                    };
+                    union_optional_type(db, &mut key_type, typ);
+                }
+
+                if let Some(super_types) = db.get_type_index().get_super_types_iter(&type_id) {
+                    pending.extend(super_types.cloned());
+                }
+            }
+            LuaType::Instance(_) => {
+                let symbolic_key =
+                    LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![typ]).into());
+                union_optional_type(db, &mut key_type, symbolic_key);
+            }
+            LuaType::Union(union) => pending.extend(union.types().cloned()),
+            LuaType::MultiLineUnion(union) => pending.push(union.to_union()),
+            LuaType::TableOf(inner) => pending.push(*inner),
+            LuaType::TypeGuard(inner) => pending.push(inner.as_ref().clone()),
+            typ => {
+                let symbolic_key =
+                    LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![typ]).into());
+                union_optional_type(db, &mut key_type, symbolic_key);
+            }
+        }
+    }
+
+    key_type.unwrap_or_else(|| {
+        LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![inner.clone()]).into())
+    })
+}
+
+fn table_projection_member_key_type(key: &LuaMemberKey) -> Option<LuaType> {
+    match key {
+        LuaMemberKey::Name(_) => Some(LuaType::String),
+        LuaMemberKey::Integer(_) => Some(LuaType::Integer),
+        LuaMemberKey::ExprType(typ) => Some(match typ {
+            LuaType::StringConst(_) | LuaType::DocStringConst(_) => LuaType::String,
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => LuaType::Integer,
+            LuaType::FloatConst(_) => LuaType::Number,
+            typ => typ.clone(),
+        }),
+        LuaMemberKey::None => None,
+    }
+}
+
+fn union_optional_type(db: &DbIndex, target: &mut Option<LuaType>, typ: LuaType) {
+    *target = Some(match target.take() {
+        Some(current) => TypeOps::Union.apply(db, &current, &typ),
+        None => typ,
+    });
 }
 
 const LARGE_EXACT_PAIRS_KEY_UNION_THRESHOLD: usize = 128;
