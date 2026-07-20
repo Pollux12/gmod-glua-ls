@@ -504,15 +504,17 @@ fn build_assign_stat_hint(
     let document = semantic_model.get_document();
 
     for var in vars {
-        let Some(semantic_info) =
+        let assigned_type = semantic_model.infer_plain_assignment_target_value(&var);
+        let semantic_info = if assigned_type.is_none() {
             semantic_model.get_semantic_info(NodeOrToken::Node(var.syntax().clone()))
-        else {
-            continue;
+        } else {
+            None
         };
+        let typ = assigned_type
+            .as_ref()
+            .or_else(|| semantic_info.as_ref().map(|info| info.display_typ()))?;
 
-        let Some((panel_name, base_name)) =
-            get_vgui_panel_name(semantic_model, semantic_info.display_typ())
-        else {
+        let Some((panel_name, base_name)) = get_vgui_panel_name(semantic_model, typ) else {
             continue;
         };
 

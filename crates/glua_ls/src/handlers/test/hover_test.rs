@@ -125,6 +125,167 @@ mod tests {
     }
 
     #[gtest]
+    fn plain_assignment_targets_hover_as_assigned_values() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class AssignedA
+                ---@class AssignedB
+                ---@class AssignedBox
+                ---@field selected AssignedA?
+                ---@type AssignedBox
+                local box
+                ---@type AssignedB
+                local rhs
+                box.selected = nil
+                box.<??>selected = rhs
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) selected: AssignedB\n```".to_string(),
+            },
+        ));
+
+        check!(ws.check_hover(
+            r#"
+                ---@class AssignedBox
+                ---@field selected string?
+                ---@type AssignedBox
+                local box
+                box.<??>selected = nil
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) selected: nil\n```".to_string(),
+            },
+        ));
+
+        check!(ws.check_hover(
+            r#"
+                ---@class AssignedB
+                ---@return AssignedB
+                local function makeAssignedB() end
+                ---@type AssignedB?
+                local value
+                <??>value = makeAssignedB()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal value: AssignedB\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn assignment_projection_does_not_change_rhs_or_read_flow_hovers() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class FlowA
+                ---@class FlowB
+                ---@class FlowBox
+                ---@field selected FlowA?
+                ---@type FlowBox
+                local box
+                ---@type FlowB
+                local rhs
+                box.selected = <??>rhs
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal rhs: FlowB\n```".to_string(),
+            },
+        ));
+
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class FlowA
+                ---@class FlowB
+                ---@class FlowBox
+                ---@field selected FlowA?
+                ---@type FlowBox
+                local box
+                ---@type FlowB
+                local rhs
+                box.selected = rhs
+                local after = box.<??>selected
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) selected: FlowB\n```".to_string(),
+            },
+        ));
+
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class FlowBox
+                ---@field selected string?
+                ---@type FlowBox
+                local box
+                local before = box.<??>selected
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) selected: string?\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn assignment_target_projection_maps_multi_return_slots() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class SlotA
+                ---@class SlotB
+                ---@class SlotBox
+                ---@field first SlotA?
+                ---@field second SlotA?
+                ---@return SlotA, SlotB
+                local function slots() end
+                ---@type SlotBox
+                local box
+                box.first, box.<??>second = slots()
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) second: SlotB\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
+    fn assignment_projection_excludes_computed_keys_and_compound_assignments() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_hover(
+            r#"
+                ---@class ComputedValue
+                ---@type table<string, ComputedValue>
+                local values
+                local key = "selected"
+                ---@type ComputedValue
+                local rhs
+                values[<??>key] = rhs
+            "#,
+            VirtualHoverResult {
+                value: "```lua\nlocal key: string = \"selected\"\n```".to_string(),
+            },
+        ));
+
+        check!(ws.check_hover(
+            r#"
+                ---@class CompoundBox
+                ---@field count number|string
+                ---@type CompoundBox
+                local box
+                box.<??>count += 1
+            "#,
+            VirtualHoverResult {
+                value: "```lua\n(field) count: (number|string)\n```".to_string(),
+            },
+        ));
+        Ok(())
+    }
+
+    #[gtest]
     fn test_hover_nil() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         check!(ws.check_hover(
@@ -3870,14 +4031,11 @@ local EscapeStringMap: {
         Ok(())
     }
 
-    /// Hover at the LHS of `seat.GlideExitPos = nil` (the offending line the
-    /// user is hovering on). Pre-fix this displayed `(field) GlideExitPos: nil`
-    /// because `get_hover_type` rewrote the displayed type to the RHS being
-    /// assigned. Post-fix, `lhs_indexed_member_union_type` recovers the
-    /// field's full union from the branched assignments so the hover correctly
-    /// shows `Vector?` (i.e. `Vector | nil`).
+    /// Hover at the LHS of `seat.GlideExitPos = nil`. Assignment-target hovers
+    /// describe the value written at that site; the adjacent read-site
+    /// regression above continues to require the accumulated `Vector?` type.
     #[gtest]
-    fn test_hover_branched_dynamic_field_lhs_assign_does_not_collapse_field_type() -> Result<()> {
+    fn test_hover_branched_dynamic_field_lhs_assign_shows_assigned_nil() -> Result<()> {
         let mut ws = enable_gmod_workspace();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.infer_dynamic_fields = true;
@@ -3929,28 +4087,9 @@ local EscapeStringMap: {
         let file_id = ws.def_file("lua/entities/base_glide/init.lua", &content);
         let value = extract_hover_markdown(&ws, file_id, position);
 
-        // Post-fix the LHS hover must show the field's full union, not bare
-        // `nil` or `never`. Accept either `Vector?` rendering or explicit
-        // `Vector | nil` / `Vector|nil`.
-        assert!(
-            value.contains("GlideExitPos"),
-            "hover should include field name, got: {value}"
-        );
-        assert!(
-            value.contains("Vector"),
-            "LHS hover must include `Vector` from the other branch, got: {value}"
-        );
-        let has_nil_marker = value.contains("Vector?")
-            || value.contains("Vector | nil")
-            || value.contains("Vector|nil")
-            || value.contains("nil");
-        assert!(
-            has_nil_marker,
-            "LHS hover must include a nil marker (`?` or `| nil`), got: {value}"
-        );
-        assert!(
-            !value.contains("GlideExitPos: nil") && !value.contains("GlideExitPos: never"),
-            "LHS hover must not collapse to bare `nil` or `never`, got: {value}"
+        assert_eq!(
+            value, "```lua\n(field) GlideExitPos: nil\n```",
+            "an assignment-target hover should describe the value written at that site"
         );
         Ok(())
     }

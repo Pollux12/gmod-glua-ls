@@ -39,6 +39,62 @@ use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaRetu
 
 type ResolveResult = Result<(), InferFailReason>;
 
+pub struct PreDynamicUnResolveAnalysisPipeline;
+impl AnalysisPipeline for PreDynamicUnResolveAnalysisPipeline {
+    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
+        let (ready, deferred) =
+            partition_pre_dynamic_unresolves(std::mem::take(&mut context.unresolves));
+        context.unresolves = ready;
+        UnResolveAnalysisPipeline::analyze(db, context);
+        context.unresolves.extend(deferred);
+    }
+}
+
+fn partition_pre_dynamic_unresolves(
+    candidates: Vec<(UnResolve, InferFailReason)>,
+) -> (
+    Vec<(UnResolve, InferFailReason)>,
+    Vec<(UnResolve, InferFailReason)>,
+) {
+    let mut deferred = Vec::new();
+    let mut ready = Vec::new();
+    for (unresolve, reason) in candidates {
+        let UnResolve::Member(mut member) = unresolve else {
+            ready.push((unresolve, reason));
+            continue;
+        };
+        if !matches!(reason, InferFailReason::FieldNotFound) {
+            ready.push((UnResolve::Member(member), reason));
+            continue;
+        }
+
+        if matches!(member.prefix.as_ref(), Some(LuaExpr::IndexExpr(_))) {
+            deferred.push((UnResolve::Member(member), reason));
+            continue;
+        }
+        if !matches!(member.expr.as_ref(), Some(LuaExpr::IndexExpr(_))) {
+            ready.push((UnResolve::Member(member), reason));
+            continue;
+        }
+
+        if let Some(prefix) = member.prefix.take() {
+            ready.push((
+                UnResolveMember {
+                    file_id: member.file_id,
+                    member_id: member.member_id,
+                    expr: None,
+                    prefix: Some(prefix),
+                    ret_idx: member.ret_idx,
+                }
+                .into(),
+                InferFailReason::FieldNotFound,
+            ));
+        }
+        deferred.push((UnResolve::Member(member), reason));
+    }
+    (ready, deferred)
+}
+
 pub struct UnResolveAnalysisPipeline;
 
 impl AnalysisPipeline for UnResolveAnalysisPipeline {
@@ -803,11 +859,12 @@ impl From<UnResolveSpecialCall> for UnResolve {
 mod tests {
     use rustc_hash::FxHashMap;
 
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaParser, ParserConfig};
     use rowan::TextSize;
 
-    use crate::{FileId, InferFailReason, LuaDeclId, LuaTypeDeclId};
+    use crate::{FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaTypeDeclId};
 
-    use super::sorted_reason_keys;
+    use super::{UnResolve, UnResolveMember, partition_pre_dynamic_unresolves, sorted_reason_keys};
 
     #[test]
     fn reason_group_order_is_stable_across_hashmap_insertion_order() {
@@ -831,5 +888,42 @@ mod tests {
         }
 
         assert_eq!(sorted_reason_keys(&forward), sorted_reason_keys(&reverse));
+    }
+
+    #[test]
+    fn pre_dynamic_partition_resolves_ordinary_owner_before_deferring_dynamic_rhs() {
+        let tree = LuaParser::parse("owner.field = dynamic.value", ParserConfig::default());
+        let index_exprs = tree
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .collect::<Vec<_>>();
+        let target = &index_exprs[0];
+        let dynamic_rhs = index_exprs[1].clone();
+        let file_id = FileId::new(1);
+        let candidate = UnResolveMember {
+            file_id,
+            member_id: LuaMemberId::new(target.get_syntax_id(), file_id),
+            expr: Some(LuaExpr::IndexExpr(dynamic_rhs)),
+            prefix: target.get_prefix_expr(),
+            ret_idx: 0,
+        };
+
+        let (ready, deferred) = partition_pre_dynamic_unresolves(vec![(
+            candidate.into(),
+            InferFailReason::FieldNotFound,
+        )]);
+
+        assert_eq!(ready.len(), 1);
+        let UnResolve::Member(ready_member) = &ready[0].0 else {
+            panic!("expected ready member owner");
+        };
+        assert!(ready_member.prefix.is_some());
+        assert!(ready_member.expr.is_none());
+        assert_eq!(deferred.len(), 1);
+        let UnResolve::Member(deferred_member) = &deferred[0].0 else {
+            panic!("expected deferred member value");
+        };
+        assert!(deferred_member.prefix.is_none());
+        assert!(matches!(deferred_member.expr, Some(LuaExpr::IndexExpr(_))));
     }
 }

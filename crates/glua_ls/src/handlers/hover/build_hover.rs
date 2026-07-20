@@ -9,8 +9,9 @@ use glua_code_analysis::{
 };
 use glua_code_analysis::{humanize_member_key_name, humanize_type};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaChunk, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaSyntaxId, LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallArgList, LuaChunk, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaIndexKey, LuaSyntaxId, LuaSyntaxKind, LuaSyntaxToken, LuaTableExpr,
+    LuaTableField, LuaTokenKind, LuaVarExpr, PathTrait,
 };
 use lsp_types::{Hover, HoverContents, MarkedString, MarkupContent};
 use rowan::{TextRange, TextSize};
@@ -39,14 +40,19 @@ pub fn build_semantic_info_hover(
     range: TextRange,
     render_level: Option<RenderLevel>,
 ) -> Option<Hover> {
-    let type_before_unguarded_child_inference = semantic_info
-        .inference_fact()
-        .provenance()
-        .iter()
-        .find(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
-        .and_then(|step| step.found_type.as_deref())
-        .cloned();
-    let typ = semantic_info.display_typ().clone();
+    let assignment_type = get_assignment_target_type(&token, semantic_model);
+    let type_before_unguarded_child_inference = if assignment_type.is_none() {
+        semantic_info
+            .inference_fact()
+            .provenance()
+            .iter()
+            .find(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
+            .and_then(|step| step.found_type.as_deref())
+            .cloned()
+    } else {
+        None
+    };
+    let typ = assignment_type.unwrap_or_else(|| semantic_info.display_typ().clone());
     let type_label = HoverTypeLabel::from_semantic_origin(semantic_info.origin);
     if semantic_info.semantic_decl.is_none() {
         return build_hover_without_property(db, semantic_model, document, token, typ, type_label);
@@ -187,11 +193,7 @@ fn build_dynamic_field_hover_without_property(
         return None;
     }
 
-    let hover_type = if let Some(assignment_type) =
-        prefer_concrete_assignment_type_for_token(token, semantic_model, typ)
-    {
-        assignment_type
-    } else if matches!(typ, LuaType::Nil | LuaType::Unknown) {
+    let hover_type = if matches!(typ, LuaType::Nil | LuaType::Unknown) {
         LuaType::Any
     } else {
         typ.clone()
@@ -347,8 +349,7 @@ fn build_decl_hover(
             let description = format!("{}{}: {}", prefix, decl.get_name(), const_value);
             builder.set_type_description(builder.format_type_description(description));
         } else {
-            let decl_hover_type =
-                get_hover_type(builder, builder.semantic_model).unwrap_or(typ.clone());
+            let decl_hover_type = typ.clone();
             let type_humanize_text =
                 hover_humanize_type(builder, &decl_hover_type, Some(builder.detail_render_level));
             let prefix = if decl.is_local() {
@@ -621,22 +622,13 @@ fn build_member_hover(
             builder.set_type_description(builder.format_type_description(description));
             builder.set_location_path(Some(member));
         } else {
-            // For fields with multiple definitions (e.g. dynamic-field
-            // assignments in mutually-exclusive branches), `get_hover_type`
-            // would override the displayed type to the *local* RHS at the
-            // assignment site — producing misleading hovers like
-            // `(field) GlideExitPos: nil` on the `= nil` branch even though
-            // the field's actual type is the union `Vector | nil`.
+            // Assignment sites describe the value being written; ordinary
+            // read sites retain the accumulated member type.
             //
             // Resolution order:
-            //   1. If `find_member_origin_owners` returned >1 distinct types
-            //      (read sites usually walk all definitions), union them.
-            //   2. If `typ` is already a union (richer info), prefer it.
-            //   3. If we're at the LHS of an assignment, re-derive the field's
-            //      full union type from the IndexExpr's prefix-type via
-            //      `get_member_info_with_key_at_offset` and union that.
-            //   4. Otherwise, fall back to `get_hover_type` (preserves generic-
-            //      instantiation behavior).
+            //   1. At a plain assignment target, retain the already-projected `typ`.
+            //   2. At a read with multiple distinct origins, union them.
+            //   3. Otherwise, preserve the semantic type selected by the caller.
             let unique_origin_types: Vec<LuaType> = {
                 let mut seen: Vec<LuaType> = Vec::new();
                 for (_, t) in &semantic_decls {
@@ -646,20 +638,20 @@ fn build_member_hover(
                 }
                 seen
             };
-            let member_hover_type = if unique_origin_types.len() > 1 {
+            let is_plain_assignment_target = builder
+                .get_trigger_token()
+                .and_then(|token| get_plain_assignment_target_for_token(&token))
+                .is_some();
+            let member_hover_type = if is_plain_assignment_target {
+                typ.clone()
+            } else if unique_origin_types.len() > 1 {
                 let mut acc = unique_origin_types[0].clone();
                 for t in &unique_origin_types[1..] {
                     acc = glua_code_analysis::TypeOps::Union.apply(db, &acc, t);
                 }
-                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &acc)
-                    .unwrap_or(acc)
-            } else if typ.is_union() {
-                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &typ)
-                    .unwrap_or(typ.clone())
+                acc
             } else {
-                prefer_concrete_assignment_type_for_builder(builder, builder.semantic_model, &typ)
-                    .or_else(|| get_hover_type(builder, builder.semantic_model))
-                    .unwrap_or(typ.clone())
+                typ.clone()
             };
             let level = if member_hover_type.is_module_ref() {
                 builder.detail_render_level
@@ -1111,48 +1103,18 @@ pub fn add_signature_ret_description(
     Some(())
 }
 
-pub fn get_hover_type(builder: &HoverBuilder, semantic_model: &SemanticModel) -> Option<LuaType> {
-    let trigger_token = builder.get_trigger_token()?;
-    get_assignment_target_type(&trigger_token, semantic_model)
+fn get_plain_assignment_target_for_token(trigger_token: &LuaSyntaxToken) -> Option<LuaVarExpr> {
+    let target = get_assignment_target_for_token(trigger_token)?;
+    let assign_stat = LuaAssignStat::cast(target.syntax().parent()?)?;
+    (assign_stat.get_assign_op()?.get_token_kind() == LuaTokenKind::TkAssign).then_some(target)
 }
 
 fn get_assignment_target_type(
     trigger_token: &LuaSyntaxToken,
     semantic_model: &SemanticModel,
 ) -> Option<LuaType> {
-    let mut ancestor = trigger_token.parent();
-    let assign_stat = loop {
-        let node = ancestor?;
-        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
-            break assign_stat;
-        }
-        ancestor = node.parent();
-    };
-    let (vars, exprs) = assign_stat.get_var_and_expr_list();
-    for (i, var) in vars.iter().enumerate() {
-        if token_is_assignment_target(var, trigger_token) {
-            let mut expr: Option<&LuaExpr> = exprs.get(i);
-            let multi_return_index = if expr.is_none() {
-                expr = Some(exprs.last()?);
-                i + 1 - exprs.len()
-            } else {
-                0
-            };
-
-            let expr_type = semantic_model.infer_expr(expr.unwrap().clone());
-            match expr_type {
-                Ok(expr_type) => match expr_type {
-                    LuaType::Variadic(muli_return) => {
-                        return muli_return.get_type(multi_return_index).cloned();
-                    }
-                    _ => return Some(expr_type),
-                },
-                Err(_) => return None,
-            }
-        }
-    }
-
-    None
+    let target = get_plain_assignment_target_for_token(trigger_token)?;
+    semantic_model.infer_plain_assignment_target_value(&target)
 }
 
 fn get_assignment_target_semantic_decl(
@@ -1160,90 +1122,50 @@ fn get_assignment_target_semantic_decl(
     semantic_model: &SemanticModel,
     trigger_token: &LuaSyntaxToken,
 ) -> Option<LuaSemanticDeclId> {
+    let target = get_assignment_target_for_token(trigger_token)?;
     let file_id = semantic_model.get_file_id();
-    let mut ancestor = trigger_token.parent();
-    let assign_stat = loop {
-        let node = ancestor?;
-        if let Some(assign_stat) = LuaAssignStat::cast(node.clone()) {
-            break assign_stat;
+    match target {
+        LuaVarExpr::NameExpr(name_expr) => {
+            let decl_id = db
+                .get_reference_index()
+                .get_var_reference_decl(&file_id, name_expr.get_range())?;
+            Some(LuaSemanticDeclId::LuaDecl(decl_id))
         }
-        ancestor = node.parent();
-    };
-    let (vars, _) = assign_stat.get_var_and_expr_list();
-    for var in vars {
-        if !token_is_assignment_target(&var, trigger_token) {
-            continue;
-        }
-
-        return match var {
-            LuaVarExpr::NameExpr(name_expr) => {
-                let decl_id = db
-                    .get_reference_index()
-                    .get_var_reference_decl(&file_id, name_expr.get_range())?;
-                Some(LuaSemanticDeclId::LuaDecl(decl_id))
-            }
-            LuaVarExpr::IndexExpr(index_expr) => Some(LuaSemanticDeclId::Member(LuaMemberId::new(
-                index_expr.get_syntax_id(),
-                file_id,
-            ))),
-        };
+        LuaVarExpr::IndexExpr(index_expr) => Some(LuaSemanticDeclId::Member(LuaMemberId::new(
+            index_expr.get_syntax_id(),
+            file_id,
+        ))),
     }
-
-    None
 }
 
-fn token_is_assignment_target(var: &LuaVarExpr, trigger_token: &LuaSyntaxToken) -> bool {
-    match var {
+fn get_assignment_target_for_token(trigger_token: &LuaSyntaxToken) -> Option<LuaVarExpr> {
+    let assign_stat = trigger_token
+        .parent_ancestors()
+        .find_map(LuaAssignStat::cast)?;
+    assign_stat
+        .get_var_and_expr_list()
+        .0
+        .into_iter()
+        .find(|target| token_is_assignment_target(target, trigger_token))
+}
+
+fn token_is_assignment_target(target: &LuaVarExpr, trigger_token: &LuaSyntaxToken) -> bool {
+    let trigger_range = trigger_token.text_range();
+    match target {
         LuaVarExpr::NameExpr(name_expr) => name_expr
-            .syntax()
-            .text_range()
-            .contains(trigger_token.text_range().start()),
-        LuaVarExpr::IndexExpr(index_expr) => index_expr
-            .get_index_key()
-            .and_then(|key| key.get_range())
-            .is_some_and(|range| range.contains_range(trigger_token.text_range())),
+            .get_name_token()
+            .is_some_and(|name| name.get_range().contains_range(trigger_range)),
+        LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_index_key() {
+            Some(LuaIndexKey::Name(key)) => key.get_range().contains_range(trigger_range),
+            Some(
+                LuaIndexKey::String(_)
+                | LuaIndexKey::Integer(_)
+                | LuaIndexKey::Expr(_)
+                | LuaIndexKey::Idx(_),
+            )
+            | None => false,
+        },
     }
-}
-
-fn prefer_concrete_assignment_type_for_builder(
-    builder: &HoverBuilder,
-    semantic_model: &SemanticModel,
-    current_type: &LuaType,
-) -> Option<LuaType> {
-    let trigger_token = builder.get_trigger_token()?;
-    prefer_concrete_assignment_type_for_token(&trigger_token, semantic_model, current_type)
-}
-
-fn prefer_concrete_assignment_type_for_token(
-    trigger_token: &LuaSyntaxToken,
-    semantic_model: &SemanticModel,
-    current_type: &LuaType,
-) -> Option<LuaType> {
-    if !contains_open_table_any(current_type) {
-        return None;
-    }
-
-    let assignment_type = get_assignment_target_type(trigger_token, semantic_model)?;
-    if is_specific_assignment_type(&assignment_type) {
-        Some(assignment_type)
-    } else {
-        None
-    }
-}
-
-fn contains_open_table_any(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any => true,
-        LuaType::Union(union) => union.types().any(|typ| matches!(typ, LuaType::Any)),
-        _ => false,
-    }
-}
-
-fn is_specific_assignment_type(typ: &LuaType) -> bool {
-    !matches!(
-        typ,
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never
-    )
 }
 
 #[allow(unused)]

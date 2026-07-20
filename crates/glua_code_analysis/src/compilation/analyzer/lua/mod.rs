@@ -16,6 +16,7 @@ use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::infer_for_range_iter_expr_func;
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
+pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
 use member_write_policy::{
     DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey,
     MemberAssignmentWideningState, MemberWideningCache,

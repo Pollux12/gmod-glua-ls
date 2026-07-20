@@ -360,6 +360,19 @@ fn should_defer_nil_gmod_index_alias(
         && matches!(expr, LuaExpr::IndexExpr(_))
 }
 
+fn should_defer_weak_gmod_member_index_assignment(
+    analyzer: &LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    matches!(expr_type, LuaType::Any | LuaType::Unknown)
+        && analyzer.gmod_enabled
+        && analyzer.db.get_emmyrc().gmod.infer_dynamic_fields
+        && matches!(expr, LuaExpr::IndexExpr(_))
+        && matches!(type_owner, LuaTypeOwner::Member(_))
+}
+
 fn should_defer_weak_gmod_dynamic_index_alias(
     analyzer: &LuaAnalyzer,
     expr: &LuaExpr,
@@ -830,6 +843,21 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     continue;
                 }
                 if should_defer_weak_gmod_call_expr(analyzer, expr, &expr_type) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::FieldNotFound,
+                    );
+                    continue;
+                }
+                if should_defer_weak_gmod_member_index_assignment(
+                    analyzer,
+                    &type_owner,
+                    expr,
+                    &expr_type,
+                ) {
                     add_unresolve_for_assignment(
                         analyzer,
                         type_owner,

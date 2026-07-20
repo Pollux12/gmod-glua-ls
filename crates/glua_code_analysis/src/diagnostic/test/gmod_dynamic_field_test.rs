@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaMemberOwner, LuaType, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -22,6 +22,25 @@ mod test {
             .filter(|diagnostic| diagnostic.code == code)
             .map(|diagnostic| diagnostic.message)
             .collect()
+    }
+    fn latest_member_type(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        field_name: &str,
+    ) -> LuaType {
+        let db = ws.analysis.compilation.get_db();
+        let member = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .filter(|member| member.get_key().to_path() == field_name)
+            .max_by_key(|member| member.get_id().get_position())
+            .expect("expected named assignment member");
+        db.get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .expect("expected assignment member type cache")
+            .as_type()
+            .clone()
     }
 
     fn nil_diagnostic_messages_for_file(
@@ -971,6 +990,202 @@ mod test {
             diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::ParamTypeMismatch),
             is_empty(),
             "same-file reindex should refresh call-site evidence"
+        );
+    }
+    #[gtest]
+    fn test_deferred_vgui_callback_member_owner_and_rhs_survive_dynamic_analysis() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@class NULL : Entity
+            ---@type NULL
+            NULL = nil
+
+            ---@class Panel : Entity
+            function Panel:Dock() end
+            function Panel:SetVisible(visible) end
+
+            ---@class DPanel : Panel
+            ---@class DFrame : DPanel
+            ---@class DTree : DPanel
+            local DTree = {}
+            ---@class DTree_Node : DPanel
+            ---@class ContentContainer : DPanel
+            ---@class ContentSidebar : DPanel
+            ---@field Tree DTree
+
+            ---@param node DTree_Node
+            function DTree:OnNodeSelected(node) end
+
+            ---@return DTree_Node
+            function DTree:AddNode() end
+
+            ---@return TypeGuard<any>
+            ---@return_cast object -NULL
+            ---@valid_guard
+            function IsValid(object) end
+            "#,
+        );
+        let target_path = "lua/starfall/editor/dynamic_selected.lua";
+        let target_source = r#"
+            local PANEL = {}
+            vgui.Register("StarfallFrame", PANEL, "DFrame")
+
+            PANEL = {}
+            vgui.Register("StarfallPanel", PANEL, "DPanel")
+
+            local frame = vgui.Create("StarfallFrame")
+
+            function frame:Initialize()
+                frame.ContentNavBar = vgui.Create("ContentSidebar", frame)
+                frame.ContentNavBar.Tree.OnNodeSelected = function(self, node)
+                    if not IsValid(node.propPanel) then return end
+                    if IsValid(frame.PropPanel.selected) then
+                        frame.PropPanel.selected:SetVisible(false)
+                        frame.PropPanel.selected = nil
+                    end
+
+                    frame.PropPanel.selected = node.propPanel
+                    frame.PropPanel.selected:Dock()
+                    frame.PropPanel.selected:SetVisible(true)
+                end
+
+                frame.PropPanel = vgui.Create("StarfallPanel", frame)
+
+                local node = frame.ContentNavBar.Tree:AddNode()
+                node.propPanel = vgui.Create("ContentContainer", frame.PropPanel)
+            end
+            "#;
+        let target_file = ws.def_file(target_path, target_source);
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        );
+
+        {
+            let db = ws.analysis.compilation.get_db();
+            let selected_members = db
+                .get_member_index()
+                .get_file_members(target_file)
+                .into_iter()
+                .filter(|member| member.get_key().to_path() == "selected")
+                .collect::<Vec<_>>();
+            assert_eq!(selected_members.len(), 2);
+            assert!(selected_members.iter().all(|member| {
+                db.get_member_index()
+                    .get_current_owner(&member.get_id())
+                    .is_some()
+            }));
+        }
+        assert_eq!(
+            ws.humanize_type(latest_member_type(&ws, target_file, "selected")),
+            "ContentContainer",
+            "the selected write cache must retain its resolved RHS type"
+        );
+        let uri = ws.virtual_url_generator.new_uri(target_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{target_source}\n"));
+        ws.analysis.reindex_files(vec![target_file]);
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+        assert_eq!(
+            ws.humanize_type(latest_member_type(&ws, target_file, "selected")),
+            "ContentContainer",
+            "same-file reindex must rebuild the resolved selected write cache"
+        );
+    }
+
+    #[gtest]
+    fn test_deferred_uninformative_member_rhs_stays_any_without_owner_pollution() {
+        let mut ws = VirtualWorkspace::new();
+        let target_path = "lua/vgui/unresolved_member_rhs.lua";
+        let target_source = r#"
+            ---@type any
+            local source
+            local holder = {}
+            holder.value = source.missing
+        "#;
+        let file_id = ws.def_file(target_path, target_source);
+
+        assert_eq!(
+            ws.humanize_type(latest_member_type(&ws, file_id, "value")),
+            "any"
+        );
+        {
+            let db = ws.analysis.compilation.get_db();
+            let value_members = db
+                .get_member_index()
+                .get_file_members(file_id)
+                .into_iter()
+                .filter(|member| member.get_key().to_path() == "value")
+                .collect::<Vec<_>>();
+            assert_eq!(value_members.len(), 1);
+            assert!(matches!(
+                db.get_member_index()
+                    .get_current_owner(&value_members[0].get_id()),
+                Some(LuaMemberOwner::Element(_))
+            ));
+        }
+
+        let uri = ws.virtual_url_generator.new_uri(target_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{target_source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+        assert_eq!(
+            ws.humanize_type(latest_member_type(&ws, file_id, "value")),
+            "any"
+        );
+    }
+
+    #[gtest]
+    fn test_deferred_dynamic_member_fix_keeps_typed_entity_missing_method_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/entity_missing_method.lua",
+            r#"
+            ---@class Entity
+            ---@type Entity
+            local entity
+            entity:DefinitelyMissing()
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            vec!["Undefined method `DefinitelyMissing`. "]
+        );
+    }
+
+    #[gtest]
+    fn test_deferred_dynamic_member_fix_keeps_straight_line_nil_check() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/straight_line_nil.lua",
+            r#"
+            ---@class Panel
+            function Panel:Dock() end
+
+            ---@type Panel?
+            local panel = nil
+            panel:Dock()
+            "#,
+        );
+
+        assert_that!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            not(is_empty())
         );
     }
 }

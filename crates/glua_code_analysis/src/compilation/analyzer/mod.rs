@@ -69,7 +69,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
         synthesize_accessorfunc_members(db, &workspace_file_ids);
-        if db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields {
+        let infer_dynamic_fields =
+            db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
+        if infer_dynamic_fields {
             // Special-call resolution needs dynamic fields that point at outparam
             // tables, while some dynamic fields need unresolve-refined aliases.
             // Seed only declared-member table fields before unresolve; the full
@@ -83,7 +85,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             local_inference::stabilize_unguarded_children(db, &mut context, true);
         context.invalidate_inferred_returns_for_sources(db, &early_child_sources);
 
-        run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+        if infer_dynamic_fields {
+            run_analysis::<unresolve::PreDynamicUnResolveAnalysisPipeline>(db, &mut context);
+        } else {
+            run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
+        }
         setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
 
         run_analysis::<call_site_params::CallSiteParamAnalysisPipeline>(db, &mut context);
@@ -97,8 +103,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             || local_inference_changed
             || inferred_guard_changed;
 
-        let infer_dynamic_fields =
-            db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
         if infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
             context.infer_manager.clear();

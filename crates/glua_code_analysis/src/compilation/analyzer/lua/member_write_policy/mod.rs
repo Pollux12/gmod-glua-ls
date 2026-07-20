@@ -8,12 +8,13 @@ pub(in crate::compilation::analyzer::lua) use cache::{
     WideningCacheLookup, lookup_widening_cache, member_assignment_state_mask,
     member_assignment_state_masks_compatible, record_widening_cache,
 };
+pub(in crate::compilation::analyzer) use collection::resolve_index_expr_member_owner_for_file;
 pub(in crate::compilation::analyzer::lua) use collection::{
     direct_local_table_prefix_member_owner,
     flush_pending_dynamic_key_collection_widening_for_members,
     get_widened_member_assignment_collection_type, is_collection_append_write,
     is_member_realm_compatible, record_member_collection_assignment_widening_cache,
-    resolve_index_expr_member_owner_for_file, widen_existing_member_collection_type,
+    widen_existing_member_collection_type,
 };
 #[cfg(test)]
 pub(in crate::compilation::analyzer::lua) use collection::{

@@ -430,7 +430,7 @@ pub(in crate::compilation::analyzer::lua) fn get_member_owner_for_prefix_type(
     resolve_index_expr_member_owner_for_file(&prefix_type, None).map(|(owner, _)| owner)
 }
 
-pub(in crate::compilation::analyzer::lua) fn resolve_index_expr_member_owner_for_file(
+pub(in crate::compilation::analyzer) fn resolve_index_expr_member_owner_for_file(
     prefix_type: &LuaType,
     preferred_file_id: Option<FileId>,
 ) -> Option<(LuaMemberOwner, bool)> {

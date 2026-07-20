@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey,
-    LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken,
-    LuaTableExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr,
+    LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind,
+    LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
 pub(crate) use gmod_vgui_context::resolve_registered_vgui_method_context;
 pub(crate) use infer::check_iter_var_range;
@@ -437,6 +437,25 @@ impl<'a> SemanticModel<'a> {
         )
         .ok()
         .flatten()
+    }
+
+    /// Returns the value assigned to `target` by a plain `=` assignment.
+    ///
+    /// Raw expression inference for an assignment target intentionally observes the incoming
+    /// flow state. Editor features that describe the write itself can use this projection without
+    /// changing that flow contract. Compound assignments are excluded until their operator-result
+    /// semantics can be projected.
+    pub fn infer_plain_assignment_target_value(&self, target: &LuaVarExpr) -> Option<LuaType> {
+        let assign_stat = LuaAssignStat::cast(target.syntax().parent()?)?;
+        if assign_stat.get_assign_op()?.get_token_kind() != LuaTokenKind::TkAssign {
+            return None;
+        }
+
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let target_idx = vars
+            .iter()
+            .position(|candidate| candidate.syntax() == target.syntax())?;
+        self.infer_expr_list_value_type_at(&exprs, target_idx)
     }
 
     pub fn infer_call_arg_expr_list_types(

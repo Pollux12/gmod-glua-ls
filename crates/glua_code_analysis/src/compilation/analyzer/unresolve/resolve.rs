@@ -21,7 +21,7 @@ use crate::{
         common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
-            infer_for_range_iter_expr_func,
+            infer_for_range_iter_expr_func, resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -30,6 +30,7 @@ use crate::{
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
         get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
+        resolve_dynamic_field_member,
     },
 };
 use smol_str::SmolStr;
@@ -121,25 +122,37 @@ pub fn try_resolve_member(
                 Some(LuaMemberOwner::Element(instance.get_range().clone()))
             }
             _ => {
-                // Some annotation bundles define methods as `function TypeName:Method()`
-                // without binding a typed declaration for `TypeName` in scope. Expose those
-                // runtime members through a matching class without replacing their real owner.
-                let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-                    return Ok(());
-                };
-                let Some(name_token) = name_expr.get_name_token() else {
-                    return Ok(());
-                };
-                let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
-                let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
-                    return Ok(());
-                };
-                if type_decl.is_class() {
-                    let _ = db
-                        .get_member_index_mut()
-                        .add_member_alias_to_owner(LuaMemberOwner::Type(type_decl_id), member_id);
+                if matches!(prefix_expr, LuaExpr::IndexExpr(_)) {
+                    let dynamic_type = infer_dynamic_index_expr_shape(db, cache, prefix_expr)?;
+                    let Some((owner, _)) = resolve_index_expr_member_owner_for_file(
+                        &dynamic_type,
+                        Some(unresolve_member.file_id),
+                    ) else {
+                        return Err(InferFailReason::FieldNotFound);
+                    };
+                    Some(owner)
+                } else {
+                    // Some annotation bundles define methods as `function TypeName:Method()`
+                    // without binding a typed declaration for `TypeName` in scope. Expose those
+                    // runtime members through a matching class without replacing their real owner.
+                    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+                        return Err(InferFailReason::FieldNotFound);
+                    };
+                    let Some(name_token) = name_expr.get_name_token() else {
+                        return Ok(());
+                    };
+                    let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
+                    let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
+                        return Ok(());
+                    };
+                    if type_decl.is_class() {
+                        let _ = db.get_member_index_mut().add_member_alias_to_owner(
+                            LuaMemberOwner::Type(type_decl_id),
+                            member_id,
+                        );
+                    }
+                    None
                 }
-                None
             }
         };
         if let Some(member_owner) = member_owner {
@@ -175,6 +188,26 @@ pub fn try_resolve_member(
     }
 
     Ok(())
+}
+fn infer_dynamic_index_expr_shape(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Result<LuaType, InferFailReason> {
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+    let prefix_expr = index_expr
+        .get_prefix_expr()
+        .ok_or(InferFailReason::FieldNotFound)?;
+    let prefix_type = infer_expr(db, cache, prefix_expr)?;
+    let index_key = index_expr
+        .get_index_key()
+        .ok_or(InferFailReason::FieldNotFound)?;
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    resolve_dynamic_field_member(db, cache, &prefix_type, &member_key, None)
+        .map(|resolution| resolution.typ)
+        .ok_or(InferFailReason::FieldNotFound)
 }
 
 fn cached_local_name_expr_type(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<LuaType> {
