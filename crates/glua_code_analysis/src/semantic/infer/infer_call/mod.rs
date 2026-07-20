@@ -588,7 +588,7 @@ fn infer_doc_function(
             db,
             cache,
             signature,
-            specialized.as_ref(),
+            specialized.as_deref().unwrap_or(func),
             &call_expr,
         ));
     }
@@ -863,7 +863,8 @@ fn infer_signature_doc_function(
             signature,
             fake_doc_function.as_ref(),
             &call_expr,
-        );
+        )
+        .unwrap_or(fake_doc_function);
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -915,7 +916,8 @@ fn infer_signature_doc_function(
             signature,
             resolved.as_ref(),
             &call_expr,
-        );
+        )
+        .unwrap_or(resolved);
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -933,25 +935,21 @@ fn specialize_direct_param_return_alias_for_call(
     signature: &LuaSignature,
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
-) -> Arc<LuaFunctionType> {
-    let Some(param_idx) = signature.direct_param_return_alias() else {
-        return Arc::new(func_ty.clone());
-    };
+) -> Option<Arc<LuaFunctionType>> {
+    let param_idx = signature.direct_param_return_alias()?;
     let args = call_expr
         .get_args_list()
         .map(|args| args.get_args().collect::<Vec<_>>())
         .unwrap_or_default();
-    let Some(arg) = call_arg_for_param(call_expr, func_ty, &args, param_idx) else {
-        return Arc::new(func_ty.clone());
-    };
+    let arg = call_arg_for_param(call_expr, func_ty, &args, param_idx)?;
     let Ok(return_type) = infer_expr(db, cache, arg) else {
-        return Arc::new(func_ty.clone());
+        return None;
     };
     if direct_param_alias_type_is_uninformative(&return_type) || &return_type == func_ty.get_ret() {
-        return Arc::new(func_ty.clone());
+        return None;
     }
 
-    Arc::new(
+    Some(Arc::new(
         LuaFunctionType::new(
             func_ty.get_async_state(),
             func_ty.is_colon_define(),
@@ -960,7 +958,7 @@ fn specialize_direct_param_return_alias_for_call(
             return_type,
         )
         .with_optional_params(func_ty.get_optional_params().to_vec()),
-    )
+    ))
 }
 
 fn direct_param_alias_type_is_uninformative(typ: &LuaType) -> bool {
