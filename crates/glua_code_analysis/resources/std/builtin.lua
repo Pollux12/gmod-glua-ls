@@ -197,6 +197,14 @@
 --- - `return_self`: Whether the constructor is forced to return `self`, defaults to `true`
 ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
 
+--- Marks a function whose first return value is the exact value passed in one
+--- of its arguments. This is stronger than a generic parameter/return type
+--- correlation because it preserves runtime value identity.
+---
+--- Parameters:
+--- - `param`: Zero-based argument index returned by the function.
+---@attribute return_alias(param: integer)
+
 ---
 --- Marks a function parameter as carrying call-site metadata. Language server features can use
 --- the `domain` and `role` pair to classify string literals and other arguments without matching

@@ -178,6 +178,99 @@ mod tests {
     }
 
     #[test]
+    fn annotated_assert_alias_preserves_returned_mixin_source_identity() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@generic T
+            ---@param expression T
+            ---@return T
+            ---@[return_alias(0)]
+            function _G.assert(expression, ...) end
+            "#,
+        );
+        let _file_ids = ws.def_files(vec![
+            (
+                "lua/mixins/annotated_assert.lua",
+                r#"
+                local MIXIN = {}
+                function MIXIN:Run()
+                    self:ProvidedByReceiver()
+                end
+                return MIXIN
+                "#,
+            ),
+            (
+                "lua/autorun/annotated_assert_consumer.lua",
+                r#"
+                local PANEL = { Modes = { Text = {} } }
+                function PANEL:ProvidedByReceiver() end
+                function PANEL:Load()
+                    self.Modes.Selected = include("mixins/annotated_assert.lua")
+                    self.CurrentMode = self.Modes.Selected
+                end
+                function PANEL:Dispatch(name)
+                    local callback = assert(self.CurrentMode, "mode required")[name]
+                    if not callback then callback = PANEL.Modes.Text[name] end
+                    if callback then return callback(self) end
+                end
+                "#,
+            ),
+        ]);
+
+        let target_file_id = file_id(&ws, "lua/mixins/annotated_assert.lua");
+        assert!(has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
+        assert!(!has_undefined_method(&ws, target_file_id));
+    }
+
+    #[test]
+    fn unannotated_assert_override_does_not_claim_returned_value_identity() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@generic T
+            ---@param expression T
+            ---@return T
+            function _G.assert(expression, ...) end
+            "#,
+        );
+        let _file_ids = ws.def_files(vec![
+            (
+                "lua/mixins/unannotated_assert.lua",
+                r#"
+                local MIXIN = {}
+                function MIXIN:Run()
+                    self:ProvidedByReceiver()
+                end
+                return MIXIN
+                "#,
+            ),
+            (
+                "lua/autorun/unannotated_assert_consumer.lua",
+                r#"
+                local PANEL = { Modes = { Text = {} } }
+                function PANEL:ProvidedByReceiver() end
+                function PANEL:Load()
+                    self.Modes.Selected = include("mixins/unannotated_assert.lua")
+                    self.CurrentMode = self.Modes.Selected
+                end
+                function PANEL:Dispatch(name)
+                    local callback = assert(self.CurrentMode, "mode required")[name]
+                    if not callback then callback = PANEL.Modes.Text[name] end
+                    if callback then return callback(self) end
+                end
+                "#,
+            ),
+        ]);
+
+        let target_file_id = file_id(&ws, "lua/mixins/unannotated_assert.lua");
+        assert!(!has_inferred_receiver(&ws, target_file_id, "MIXIN.Run"));
+        assert!(has_undefined_method(&ws, target_file_id));
+    }
+
+    #[test]
     fn undocumented_vgui_panel_dispatches_returned_mixin_with_authoring_self() {
         let mut ws = gmod_workspace();
         let _file_ids = ws.def_files(vec![

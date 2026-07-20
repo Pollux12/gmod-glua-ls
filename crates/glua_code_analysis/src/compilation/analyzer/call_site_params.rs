@@ -8,9 +8,9 @@ use crate::{
     DbIndex, FileId, InFiled, LuaDeclExtra, LuaDeclId, LuaDependencyKind, LuaInferCache,
     LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
     LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId, get_member_map,
-    get_member_value_expr, get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl,
-    profile::Profile,
+    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId,
+    find_signature_attribute_use, get_member_map, get_member_value_expr,
+    get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -49,6 +49,8 @@ struct ReturnedMemberSignature {
 // while each target's return, members, and histories are scanned at most once,
 // including misses.
 type ReturnedTableCache = Mutex<HashMap<FileId, Arc<OnceLock<Option<Arc<ReturnedTableInfo>>>>>>;
+
+const RETURN_ALIAS_ATTRIBUTE: &str = "return_alias";
 
 impl AnalysisPipeline for CallSiteParamAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -1316,10 +1318,19 @@ fn exact_returned_arg_idx(
     call_expr: &LuaCallExpr,
     signature_id: LuaSignatureId,
 ) -> Option<usize> {
-    // Template correlation (`f<T>(value: T): T`) does not prove that a call
-    // returns the same value. `assert` is the one language-library primitive
-    // this path needs to unwrap; require its resolved signature to come from
-    // the embedded standard-library workspace so local shadows stay opaque.
+    if let Some(attribute) = find_signature_attribute_use(db, signature_id, RETURN_ALIAS_ATTRIBUTE)
+    {
+        let param = attribute
+            .get_param_by_name("param")
+            .or_else(|| attribute.args.first().and_then(|(_, typ)| typ.as_ref()));
+        if let Some(LuaType::IntegerConst(param) | LuaType::DocIntegerConst(param)) = param {
+            return usize::try_from(*param).ok();
+        }
+    }
+
+    // Template correlation (`f<T>(value: T): T`) does not prove value identity.
+    // Keep the embedded standard-library `assert` fallback for compatibility;
+    // external declarations must opt in explicitly with `return_alias`.
     (call_expr.is_assert()
         && db
             .get_module_index()
