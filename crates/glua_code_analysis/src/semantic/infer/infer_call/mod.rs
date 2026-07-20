@@ -947,7 +947,7 @@ fn specialize_direct_param_return_alias_for_call(
     let Ok(return_type) = infer_expr(db, cache, arg) else {
         return Arc::new(func_ty.clone());
     };
-    if return_type.is_unknown() || &return_type == func_ty.get_ret() {
+    if direct_param_alias_type_is_uninformative(&return_type) || &return_type == func_ty.get_ret() {
         return Arc::new(func_ty.clone());
     }
 
@@ -961,6 +961,35 @@ fn specialize_direct_param_return_alias_for_call(
         )
         .with_optional_params(func_ty.get_optional_params().to_vec()),
     )
+}
+
+fn direct_param_alias_type_is_uninformative(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown => true,
+        LuaType::Union(union) => {
+            let mut saw_opaque = false;
+            for component in union.types() {
+                if matches!(component, LuaType::Any | LuaType::Unknown) {
+                    saw_opaque = true;
+                } else if !component.is_nil() {
+                    return false;
+                }
+            }
+            saw_opaque
+        }
+        LuaType::MultiLineUnion(union) => {
+            let mut saw_opaque = false;
+            for (component, _) in union.get_unions() {
+                if matches!(component, LuaType::Any | LuaType::Unknown) {
+                    saw_opaque = true;
+                } else if !component.is_nil() {
+                    return false;
+                }
+            }
+            saw_opaque
+        }
+        _ => false,
+    }
 }
 
 fn specialize_registered_convar_return_for_call(
