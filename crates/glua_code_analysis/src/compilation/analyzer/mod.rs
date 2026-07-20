@@ -29,6 +29,7 @@ use crate::{
 };
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr, LuaSyntaxId,
+    LuaSyntaxNode,
 };
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
@@ -253,110 +254,234 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
         return;
     }
 
-    for decl_id in context.uninformative_local_decl_candidates.clone() {
-        let type_owner = decl_id.into();
-        let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
-        if current_cache.as_ref().is_some_and(LuaTypeCache::is_doc) {
-            continue;
-        }
-        let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
-        let can_refine_nominal_type = !current_is_uninformative
-            && db.get_emmyrc().gmod.enabled
-            && current_cache
-                .as_ref()
-                .is_some_and(|current| single_nominal_type_id(current.as_type()).is_some())
-            && db
-                .get_reference_index()
-                .get_decl_references(&decl_id.file_id, &decl_id)
-                .is_none_or(|references| !references.mutable);
-        if !current_is_uninformative && !can_refine_nominal_type {
-            continue;
-        }
+    let mut candidates_by_file = HashMap::<FileId, Vec<LuaDeclId>>::new();
+    for decl_id in &context.uninformative_local_decl_candidates {
+        candidates_by_file
+            .entry(decl_id.file_id)
+            .or_default()
+            .push(*decl_id);
+    }
+    for candidates in candidates_by_file.values_mut() {
+        candidates.sort_by_key(|decl_id| decl_id.position);
+    }
+    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.sort();
+    let analysis_phase = context.infer_manager.current_phase();
 
-        let Some((ret_idx, expr)) = local_initializer_expr(db, decl_id) else {
-            continue;
+    // Initializer inference reads the stabilized indexes and records candidate
+    // cache writes without mutating the database. Process that read-only work
+    // per file, then merge inference side effects and type writes in stable file
+    // and source order on the caller thread.
+    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let mut infer_cache =
+            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            return InitializerRefreshResult::new(file_id);
         };
-        if !matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)) {
-            continue;
-        }
+        let mut result = InitializerRefreshResult::new(file_id);
+        for decl_id in &candidates_by_file[&file_id] {
+            let type_owner = (*decl_id).into();
+            let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
+            if current_cache.as_ref().is_some_and(LuaTypeCache::is_doc) {
+                continue;
+            }
+            let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
+            let can_refine_nominal_type = !current_is_uninformative
+                && db.get_emmyrc().gmod.enabled
+                && current_cache
+                    .as_ref()
+                    .is_some_and(|current| single_nominal_type_id(current.as_type()).is_some())
+                && db
+                    .get_reference_index()
+                    .get_decl_references(&decl_id.file_id, decl_id)
+                    .is_none_or(|references| !references.mutable);
+            if !current_is_uninformative && !can_refine_nominal_type {
+                continue;
+            }
 
-        let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
-        let Ok(mut inferred_type) = crate::infer_expr(db, cache, expr) else {
-            continue;
-        };
-        if let LuaType::Variadic(variadic) = inferred_type {
-            inferred_type = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
-        } else if ret_idx != 0 {
-            inferred_type = LuaType::Nil;
-        }
-        if type_is_uninformative(&inferred_type)
-            || current_cache
-                .as_ref()
-                .is_some_and(|current| current.as_type() == &inferred_type)
-        {
-            continue;
-        }
+            let Some((ret_idx, expr)) = local_initializer_expr(db, &root, *decl_id) else {
+                continue;
+            };
+            if !matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)) {
+                continue;
+            }
+            let Ok(mut inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
+                continue;
+            };
+            if let LuaType::Variadic(variadic) = inferred_type {
+                inferred_type = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
+            } else if ret_idx != 0 {
+                inferred_type = LuaType::Nil;
+            }
+            if type_is_uninformative(&inferred_type)
+                || current_cache
+                    .as_ref()
+                    .is_some_and(|current| current.as_type() == &inferred_type)
+            {
+                continue;
+            }
 
-        // Later dynamic-field and unresolved-call passes can make an immutable
-        // initializer more precise than the broad nominal type cached during
-        // the first Lua pass (for example, Panel -> DFrame). The initializer is
-        // direct value evidence, so let a strict nominal subtype replace that
-        // stale inferred cache before subtype-use heuristics run.
-        let is_immutable_strict_refinement = can_refine_nominal_type
-            && current_cache.as_ref().is_some_and(|current| {
-                is_strict_nominal_refinement(db, &inferred_type, current.as_type())
-            });
-        if current_is_uninformative {
-            common::bind_resolved_type(db, type_owner, LuaTypeCache::InferType(inferred_type));
-        } else if is_immutable_strict_refinement {
-            common::write_type_cache(
-                db,
-                type_owner,
-                LuaTypeCache::InferType(inferred_type),
-                common::TypeCacheWriteMode::ForceOverwrite,
-            );
+            if current_is_uninformative {
+                result.updates.push(InitializerCacheUpdate::Bind {
+                    owner: type_owner,
+                    inferred_type,
+                });
+            } else if can_refine_nominal_type
+                && current_cache.as_ref().is_some_and(|current| {
+                    is_strict_nominal_refinement(db, &inferred_type, current.as_type())
+                })
+            {
+                result.updates.push(InitializerCacheUpdate::Overwrite {
+                    owner: type_owner,
+                    inferred_type,
+                });
+            }
         }
+        result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
+        result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
+        result
+    });
+
+    for result in results {
+        context.infer_manager.merge_inference_side_effects(
+            result.file_id,
+            result.pending_type_decls,
+            result.guard_dependencies,
+        );
+        apply_initializer_cache_updates(db, result.updates);
     }
 }
 
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    for member_id in context.member_initializer_reinfer_candidates.clone() {
-        let type_owner = LuaTypeOwner::Member(member_id);
-        let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned() else {
-            continue;
-        };
-        if current_cache.is_doc() || single_nominal_type_id(current_cache.as_type()).is_none() {
-            continue;
-        }
+    if context.member_initializer_reinfer_candidates.is_empty() {
+        return;
+    }
 
-        let Some(expr) = member_initializer_expr(db, member_id) else {
-            continue;
-        };
-        let cache = context.infer_manager.get_infer_cache(member_id.file_id);
-        let Ok(inferred_type) = crate::infer_expr(db, cache, expr) else {
-            continue;
-        };
-        if inferred_type == *current_cache.as_type()
-            || !is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
-        {
-            continue;
-        }
+    let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::new();
+    for member_id in &context.member_initializer_reinfer_candidates {
+        candidates_by_file
+            .entry(member_id.file_id)
+            .or_default()
+            .push(*member_id);
+    }
+    for candidates in candidates_by_file.values_mut() {
+        candidates.sort_by_key(LuaMemberId::get_position);
+    }
+    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.sort();
+    let analysis_phase = context.infer_manager.current_phase();
 
-        common::write_type_cache(
-            db,
-            type_owner,
-            LuaTypeCache::InferType(inferred_type),
-            common::TypeCacheWriteMode::ForceOverwrite,
+    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let mut infer_cache =
+            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            return InitializerRefreshResult::new(file_id);
+        };
+        let mut result = InitializerRefreshResult::new(file_id);
+        for member_id in &candidates_by_file[&file_id] {
+            let type_owner = LuaTypeOwner::Member(*member_id);
+            let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned()
+            else {
+                continue;
+            };
+            if current_cache.is_doc() || single_nominal_type_id(current_cache.as_type()).is_none() {
+                continue;
+            }
+            let Some(expr) = member_initializer_expr(&root, *member_id) else {
+                continue;
+            };
+            let Ok(inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
+                continue;
+            };
+            if inferred_type == *current_cache.as_type()
+                || !is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
+            {
+                continue;
+            }
+
+            result.updates.push(InitializerCacheUpdate::Overwrite {
+                owner: type_owner,
+                inferred_type,
+            });
+        }
+        result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
+        result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
+        result
+    });
+
+    for result in results {
+        context.infer_manager.merge_inference_side_effects(
+            result.file_id,
+            result.pending_type_decls,
+            result.guard_dependencies,
         );
+        apply_initializer_cache_updates(db, result.updates);
     }
 }
 
-fn member_initializer_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&member_id.file_id)?
-        .get_red_root();
-    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+struct InitializerRefreshResult {
+    file_id: FileId,
+    pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
+    guard_dependencies: HashSet<LuaInferredGuardOwner>,
+    updates: Vec<InitializerCacheUpdate>,
+}
+
+impl InitializerRefreshResult {
+    fn new(file_id: FileId) -> Self {
+        Self {
+            file_id,
+            pending_type_decls: Vec::new(),
+            guard_dependencies: HashSet::new(),
+            updates: Vec::new(),
+        }
+    }
+}
+
+enum InitializerCacheUpdate {
+    Bind {
+        owner: LuaTypeOwner,
+        inferred_type: LuaType,
+    },
+    Overwrite {
+        owner: LuaTypeOwner,
+        inferred_type: LuaType,
+    },
+}
+
+fn apply_initializer_cache_updates(db: &mut DbIndex, updates: Vec<InitializerCacheUpdate>) {
+    for update in updates {
+        match update {
+            InitializerCacheUpdate::Bind {
+                owner,
+                inferred_type,
+            } => {
+                common::bind_resolved_type(db, owner, LuaTypeCache::InferType(inferred_type));
+            }
+            InitializerCacheUpdate::Overwrite {
+                owner,
+                inferred_type,
+            } => {
+                common::write_type_cache(
+                    db,
+                    owner,
+                    LuaTypeCache::InferType(inferred_type),
+                    common::TypeCacheWriteMode::ForceOverwrite,
+                );
+            }
+        }
+    }
+}
+
+fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let node = member_id.get_syntax_id().to_node_from_root(root)?;
     let index_expr = glua_parser::LuaIndexExpr::cast(node)?;
     let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
@@ -398,14 +523,14 @@ fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
     }
 }
 
-fn local_initializer_expr(db: &DbIndex, decl_id: LuaDeclId) -> Option<(usize, LuaExpr)> {
+fn local_initializer_expr(
+    db: &DbIndex,
+    root: &LuaSyntaxNode,
+    decl_id: LuaDeclId,
+) -> Option<(usize, LuaExpr)> {
     let decl = db.get_decl_index().get_decl(&decl_id)?;
     let initializer = decl.get_initializer()?;
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let node = initializer.get_expr_syntax_id().to_node_from_root(root)?;
     Some((initializer.get_ret_idx(), LuaExpr::cast(node)?))
 }
 

@@ -33,6 +33,26 @@ impl InferCacheManager {
         })
     }
 
+    pub fn current_phase(&self) -> LuaAnalysisPhase {
+        self.current_phase
+    }
+
+    pub fn merge_inference_side_effects(
+        &mut self,
+        file_id: FileId,
+        pending_type_decls: Vec<PendingStrTplTypeDecl>,
+        guard_dependencies: HashSet<LuaInferredGuardOwner>,
+    ) {
+        let infer_cache = self.get_infer_cache(file_id);
+        for pending in pending_type_decls {
+            debug_assert_eq!(pending.file_id, file_id);
+            infer_cache.add_pending_str_tpl_type_decl(pending.type_decl_id, pending.super_type);
+        }
+        for dependency in guard_dependencies {
+            infer_cache.add_inferred_guard_dependency(dependency);
+        }
+    }
+
     pub fn set_force(&mut self) {
         self.current_phase = LuaAnalysisPhase::Force;
         for (_, infer_cache) in self.infer_map.iter_mut() {
