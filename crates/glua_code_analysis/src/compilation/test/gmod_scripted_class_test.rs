@@ -11274,6 +11274,10 @@ GM.TestValue = 1"#,
             ---@class DHTML: DPanel
             function DHTML:RunJavascript(code) end
 
+            ---@attribute builtin_alias(name: string)
+            ---@[builtin_alias("pairs")]
+            function _G.pairs(value) end
+
             vgui = {}
 
             ---@generic T: Panel
@@ -11305,10 +11309,10 @@ GM.TestValue = 1"#,
             end
 
             function Handler:Init()
-                for method_name in pairs({
+                for method_name in pairs {
                     UpdateSettings = true,
                     AddSession = true,
-                }) do
+                } do
                     self[method_name] = function() end
                 end
                 self.html = vgui.Create("DHTML", self)
@@ -11465,7 +11469,7 @@ GM.TestValue = 1"#,
         let file_id = ws.def_file(
             "lua/vgui/constructor_field_pairs_override.lua",
             r#"
-            function pairs(value) end
+            function _G.pairs(value) end
 
             local Handler = {}
 

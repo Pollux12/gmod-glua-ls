@@ -205,6 +205,14 @@
 --- - `param`: Zero-based argument index returned by the function.
 ---@attribute return_alias(param: integer)
 
+--- Marks an external declaration as preserving the semantics of a named Lua
+--- built-in. The declaration must still be the highest-priority visible
+--- global, so a project override takes precedence.
+---
+--- Parameters:
+--- - `name`: The built-in whose runtime semantics are preserved.
+---@attribute builtin_alias(name: string)
+
 ---
 --- Marks a function parameter as carrying call-site metadata. Language server features can use
 --- the `domain` and `role` pair to classify string literals and other arguments without matching

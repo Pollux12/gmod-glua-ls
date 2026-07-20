@@ -12,7 +12,8 @@ use smol_str::SmolStr;
 use crate::{
     InFiled, LuaDeclId, LuaInferredGuardOwner, LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType,
     LuaTypeOwner, VarRefId,
-    db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, WorkspaceKind},
+    db_index::{DbIndex, DynamicFieldOwner, LuaMemberOwner, LuaSemanticDeclId, WorkspaceKind},
+    find_signature_attribute_use,
     profile::Profile,
     semantic::{
         find_members_with_key, get_var_expr_var_ref_id, infer_expr, unwrap_paren_to_name_expr,
@@ -78,6 +79,8 @@ struct ForRangePairsFieldNames {
     iter_decl_id: LuaDeclId,
     may_have_other_string_names: bool,
 }
+
+const BUILTIN_ALIAS_ATTRIBUTE: &str = "builtin_alias";
 
 type FiniteNamedMemberEvidence = (
     DynamicFieldOwner,
@@ -1610,13 +1613,21 @@ fn field_names_from_for_range_pairs_key(
     }
 
     let args_list = call_expr.get_args_list()?;
-    let mut args = args_list.get_args();
-    let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
-        return None;
+    let table_expr = if args_list.is_single_arg_no_parens() {
+        match args_list.get_single_arg_expr()? {
+            glua_parser::LuaSingleArgExpr::TableExpr(table_expr) => table_expr,
+            glua_parser::LuaSingleArgExpr::LiteralExpr(_) => return None,
+        }
+    } else {
+        let mut args = args_list.get_args();
+        let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
+            return None;
+        };
+        if args.next().is_some() {
+            return None;
+        }
+        table_expr
     };
-    if args.next().is_some() {
-        return None;
-    }
 
     let (mut names, may_have_other_string_names) =
         field_names_from_pairs_table_expr_keys(&table_expr);
@@ -1673,7 +1684,37 @@ fn is_provably_builtin_pairs_call(
             .is_some_and(|workspace_id| {
                 module_index.get_workspace_kind(workspace_id) == WorkspaceKind::Std
             })
+            || decl_preserves_builtin_semantics(db, *decl_id, "pairs")
     })
+}
+
+fn decl_preserves_builtin_semantics(db: &DbIndex, decl_id: LuaDeclId, builtin_name: &str) -> bool {
+    let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
+    let signature_id = db
+        .get_property_index()
+        .get_signature_owner(&semantic_decl)
+        .or_else(|| {
+            db.get_type_index()
+                .get_type_cache(&decl_id.into())
+                .and_then(|type_cache| match type_cache.as_type() {
+                    LuaType::Signature(signature_id) => Some(*signature_id),
+                    _ => None,
+                })
+        });
+    let Some(signature_id) = signature_id else {
+        return false;
+    };
+    let Some(attribute) = find_signature_attribute_use(db, signature_id, BUILTIN_ALIAS_ATTRIBUTE)
+    else {
+        return false;
+    };
+    matches!(
+        attribute
+            .get_param_by_name("name")
+            .or_else(|| attribute.args.first().and_then(|(_, typ)| typ.as_ref())),
+        Some(LuaType::StringConst(name) | LuaType::DocStringConst(name))
+            if name.as_ref() == builtin_name
+    )
 }
 
 fn field_names_from_pairs_table_expr_keys(table_expr: &LuaTableExpr) -> (Vec<SmolStr>, bool) {
