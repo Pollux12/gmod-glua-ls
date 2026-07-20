@@ -108,7 +108,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            refresh_local_decl_initializer_caches(db, &mut context);
+            refresh_initializer_caches(db, &mut context);
         } else if late_inference_changed {
             // Late inference facts can unlock deferred locals even when the
             // optional dynamic-field pass is disabled. Retry that retained work
@@ -116,7 +116,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            refresh_local_decl_initializer_caches(db, &mut context);
+            refresh_initializer_caches(db, &mut context);
         }
 
         context.resolve_call_site_return_consumers(db);
@@ -141,7 +141,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     &workspace_file_ids,
                 );
             }
-            refresh_local_decl_initializer_caches(db, &mut context);
+            refresh_initializer_caches(db, &mut context);
         }
 
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
@@ -243,6 +243,11 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
     resolved
 }
 
+fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    refresh_local_decl_initializer_caches(db, context);
+    refresh_member_initializer_caches(db, context);
+}
+
 fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if context.uninformative_local_decl_candidates.is_empty() {
         return;
@@ -312,6 +317,53 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             );
         }
     }
+}
+
+fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    for member_id in context.member_initializer_reinfer_candidates.clone() {
+        let type_owner = LuaTypeOwner::Member(member_id);
+        let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned() else {
+            continue;
+        };
+        if current_cache.is_doc() || single_nominal_type_id(current_cache.as_type()).is_none() {
+            continue;
+        }
+
+        let Some(expr) = member_initializer_expr(db, member_id) else {
+            continue;
+        };
+        let cache = context.infer_manager.get_infer_cache(member_id.file_id);
+        let Ok(inferred_type) = crate::infer_expr(db, cache, expr) else {
+            continue;
+        };
+        if inferred_type == *current_cache.as_type()
+            || !is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
+        {
+            continue;
+        }
+
+        common::write_type_cache(
+            db,
+            type_owner,
+            LuaTypeCache::InferType(inferred_type),
+            common::TypeCacheWriteMode::ForceOverwrite,
+        );
+    }
+}
+
+fn member_initializer_expr(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaExpr> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let node = member_id.get_syntax_id().to_node_from_root(&root)?;
+    let index_expr = glua_parser::LuaIndexExpr::cast(node)?;
+    let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let value_idx = vars
+        .iter()
+        .position(|var| var.syntax().text_range() == index_expr.get_range())?;
+    exprs.get(value_idx).cloned()
 }
 
 fn is_strict_nominal_refinement(db: &DbIndex, candidate: &LuaType, current: &LuaType) -> bool {
@@ -548,6 +600,7 @@ pub struct AnalyzeContext {
     pending_call_site_definition_refreshes: Vec<(LuaDefinitionId, LuaTypeOwner)>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
+    member_initializer_reinfer_candidates: HashSet<LuaMemberId>,
     infer_manager: InferCacheManager,
     inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
@@ -570,6 +623,7 @@ impl AnalyzeContext {
             pending_call_site_definition_refreshes: Vec::new(),
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
+            member_initializer_reinfer_candidates: HashSet::new(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::new(),
             inferred_guard_candidates: Vec::new(),
@@ -811,6 +865,10 @@ impl AnalyzeContext {
 
     pub fn request_uninformative_local_decl_reinfer(&mut self, decl_id: LuaDeclId) {
         self.uninformative_local_decl_candidates.insert(decl_id);
+    }
+
+    pub fn request_member_initializer_reinfer(&mut self, member_id: LuaMemberId) {
+        self.member_initializer_reinfer_candidates.insert(member_id);
     }
 
     fn add_inferred_guard_dependencies(

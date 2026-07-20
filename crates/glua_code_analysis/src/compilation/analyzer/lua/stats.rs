@@ -908,6 +908,19 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             }
         }
 
+        if analyzer.gmod_enabled
+            && matches!(
+                expr,
+                LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_) | LuaExpr::NameExpr(_)
+            )
+            && type_contains_nominal_reference(&expr_type)
+            && let LuaTypeOwner::Member(member_id) = &type_owner
+        {
+            analyzer
+                .context
+                .request_member_initializer_reinfer(*member_id);
+        }
+
         let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
@@ -966,6 +979,15 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+fn type_contains_nominal_reference(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Def(_) | LuaType::Ref(_) => true,
+        LuaType::Instance(instance) => type_contains_nominal_reference(instance.get_base()),
+        LuaType::Union(union) => union.types().any(type_contains_nominal_reference),
+        _ => false,
+    }
 }
 
 fn cached_literal_index_prefix_member_owner(

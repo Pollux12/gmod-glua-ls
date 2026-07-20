@@ -11551,6 +11551,8 @@ GM.TestValue = 1"#,
             function DPanel:SetPaintBackground(enabled) end
             ---@class DDragBase: DPanel
             ---@class DListLayout: DDragBase
+            ---@class DVScrollBar: Panel
+            function DVScrollBar:SetUp(bar_size, canvas_size) end
             ---@class EditablePanel: Panel
             ---@class DFrame: EditablePanel
             function DFrame:ShowCloseButton(show) end
@@ -11587,10 +11589,12 @@ GM.TestValue = 1"#,
             function PANEL:Init()
                 local left_menu = vgui.Create("DListLayout", self)
                 self.left_menu = left_menu
+                self.scroll_bar = vgui.Create("DVScrollBar", self)
             end
 
             function PANEL:OnThemeChange()
                 self.left_menu:SetPaintBackground(true)
+                self.scroll_bar:SetUp(10, 20)
             end
 
             function PANEL:CreateFindWindow()
