@@ -84,6 +84,26 @@ fn analyze_direct_param_return_alias(
         return Some(());
     }
 
+    // Runtime identity may refine an annotation, but it must not replace a
+    // declared transformation such as `Holder<T> -> T`. Overloads can express
+    // the same distinction per call shape, so leave them to normal generic and
+    // overload resolution as well.
+    if let Some(signature) = analyzer.db.get_signature_index().get(signature_id)
+        && (!signature.overloads.is_empty()
+            || match signature.return_docs.as_slice() {
+                [] => false,
+                [return_info] => {
+                    return_info.return_kind != ReturnTypeKind::Reference
+                        || signature
+                            .get_param_info_by_id(param_idx)
+                            .is_none_or(|param_info| param_info.type_ref != return_info.type_ref)
+                }
+                _ => true,
+            })
+    {
+        return Some(());
+    }
+
     analyzer
         .db
         .get_signature_index_mut()

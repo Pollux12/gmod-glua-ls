@@ -379,7 +379,12 @@ mod test {
         "#,
         );
 
-        assert_eq!(ws.expr_ty("Color(255, 255, 255)"), ws.ty("integer"));
+        // The implementation returns `r` directly, preserving the supplied
+        // literal while the annotated integer contract remains authoritative.
+        assert_eq!(
+            ws.expr_ty("Color(255, 255, 255)"),
+            LuaType::IntegerConst(255)
+        );
     }
 
     #[test]
