@@ -29,7 +29,66 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_require_guard_param(analyzer, &signature_id, &closure);
     analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
     analyze_falsy_param_nil_free_return_slots(analyzer, &signature_id, &closure);
+    analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
+    Some(())
+}
+
+fn analyze_direct_param_return_alias(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    let block = closure.get_block()?;
+    let LuaStat::ReturnStat(return_stat) = block.get_stats().last()? else {
+        return Some(());
+    };
+
+    // Keep this identity proof deliberately narrow: a final, sole return of an
+    // unshadowed and unassigned parameter, with no nested closure that could
+    // capture and replace it before the return executes.
+    if block.descendants::<LuaClosureExpr>().next().is_some()
+        || block
+            .descendants::<LuaReturnStat>()
+            .filter(|returned| {
+                returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+            })
+            .count()
+            != 1
+    {
+        return Some(());
+    }
+    let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+    let [return_expr] = exprs.as_slice() else {
+        return Some(());
+    };
+    let Some(param_name) = expr_name_text(return_expr) else {
+        return Some(());
+    };
+    let Some(param_idx) = params.iter().position(|param| param == &param_name) else {
+        return Some(());
+    };
+    if block.get_stats().any(|stat| {
+        stat.get_range().start() < return_stat.get_range().start()
+            && stat_may_write_name(&stat, &param_name)
+    }) {
+        return Some(());
+    }
+
+    analyzer
+        .db
+        .get_signature_index_mut()
+        .get_or_create(*signature_id)
+        .set_direct_param_return_alias(param_idx);
     Some(())
 }
 

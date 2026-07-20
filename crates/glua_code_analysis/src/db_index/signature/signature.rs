@@ -34,6 +34,7 @@ pub struct LuaSignature {
     require_guard_param: Option<usize>,
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
+    direct_param_return_alias: Option<usize>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
 }
@@ -101,6 +102,7 @@ impl LuaSignature {
             require_guard_param: None,
             nil_return_guard_params: Vec::new(),
             return_correlations: Vec::new(),
+            direct_param_return_alias: None,
             falsy_param_nil_free_return_slots: Vec::new(),
             falsy_param_return_aliases: Vec::new(),
         }
@@ -119,6 +121,14 @@ impl LuaSignature {
             correlation.discriminant_slot == discriminant_slot
                 && correlation.implied_non_nil_slots.contains(&implied_slot)
         })
+    }
+
+    pub fn set_direct_param_return_alias(&mut self, param_idx: usize) {
+        self.direct_param_return_alias = Some(param_idx);
+    }
+
+    pub fn direct_param_return_alias(&self) -> Option<usize> {
+        self.direct_param_return_alias
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
@@ -186,6 +196,7 @@ impl LuaSignature {
             type_contains_str_tpl_ref(&param_info.type_ref)
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
+            || self.direct_param_return_alias.is_some()
             || self
                 .overloads
                 .iter()

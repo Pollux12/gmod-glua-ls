@@ -992,6 +992,80 @@ mod test {
             "same-file reindex should refresh call-site evidence"
         );
     }
+
+    #[gtest]
+    fn test_direct_param_return_alias_preserves_call_argument_panel_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@class DPanel : Panel
+            ---@class DTextEntry : Panel
+            function DTextEntry:SetEditable(enabled) end
+            "#,
+        );
+        let target_file = ws.def_file(
+            "lua/starfall/editor/direct_return.lua",
+            r#"
+            local Editor = { Components = {} }
+
+            function Editor:AddComponent(panel)
+                self.Components[#self.Components + 1] = panel
+                return panel
+            end
+
+            Editor.Generic = Editor:AddComponent(vgui.Create("DPanel"))
+            Editor.Credit = Editor:AddComponent(vgui.Create("DTextEntry"))
+            Editor.Credit:SetEditable(false)
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        );
+    }
+
+    #[gtest]
+    fn test_reassigned_param_is_not_treated_as_direct_return_alias() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@class DPanel : Panel
+            ---@class DTextEntry : Panel
+            function DTextEntry:SetEditable(enabled) end
+            "#,
+        );
+        let target_file = ws.def_file(
+            "lua/starfall/editor/reassigned_return.lua",
+            r#"
+            local Editor = {}
+
+            function Editor:Replace(panel)
+                panel = vgui.Create("DPanel")
+                return panel
+            end
+
+            local replaced = Editor:Replace(vgui.Create("DTextEntry"))
+            replaced:SetEditable(false)
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedMethod),
+            not(is_empty())
+        );
+    }
+
     #[gtest]
     fn test_deferred_vgui_callback_member_owner_and_rhs_survive_dynamic_analysis() {
         let mut ws = VirtualWorkspace::new();

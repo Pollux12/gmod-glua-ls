@@ -430,6 +430,7 @@ fn should_prefer_signature_for_call(
                     || !signature.overloads.is_empty()
                     || !signature.out_params.is_empty()
                     || !signature.nil_return_guard_params().is_empty()
+                    || signature.direct_param_return_alias().is_some()
                     || !signature.falsy_param_nil_free_return_slots().is_empty()
                     || !signature.falsy_param_return_aliases().is_empty()
             }
@@ -577,11 +578,18 @@ fn infer_doc_function(
 
     if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
-        && (!signature.falsy_param_nil_free_return_slots().is_empty()
+        && (signature.direct_param_return_alias().is_some()
+            || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
+        let specialized =
+            specialize_direct_param_return_alias_for_call(db, cache, signature, func, &call_expr);
         return Ok(specialize_falsy_param_returns_for_call(
-            db, cache, signature, func, &call_expr,
+            db,
+            cache,
+            signature,
+            specialized.as_ref(),
+            &call_expr,
         ));
     }
 
@@ -849,6 +857,13 @@ fn infer_signature_doc_function(
             fake_doc_function.as_ref(),
             &call_expr,
         );
+        let fake_doc_function = specialize_direct_param_return_alias_for_call(
+            db,
+            cache,
+            signature,
+            fake_doc_function.as_ref(),
+            &call_expr,
+        );
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -894,6 +909,13 @@ fn infer_signature_doc_function(
             resolved.as_ref(),
             &call_expr,
         );
+        let resolved = specialize_direct_param_return_alias_for_call(
+            db,
+            cache,
+            signature,
+            resolved.as_ref(),
+            &call_expr,
+        );
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -903,6 +925,42 @@ fn infer_signature_doc_function(
             &call_expr,
         ))
     }
+}
+
+fn specialize_direct_param_return_alias_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Arc<LuaFunctionType> {
+    let Some(param_idx) = signature.direct_param_return_alias() else {
+        return Arc::new(func_ty.clone());
+    };
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some(arg) = call_arg_for_param(call_expr, func_ty, &args, param_idx) else {
+        return Arc::new(func_ty.clone());
+    };
+    let Ok(return_type) = infer_expr(db, cache, arg) else {
+        return Arc::new(func_ty.clone());
+    };
+    if return_type.is_unknown() || &return_type == func_ty.get_ret() {
+        return Arc::new(func_ty.clone());
+    }
+
+    Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            return_type,
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    )
 }
 
 fn specialize_registered_convar_return_for_call(
