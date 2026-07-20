@@ -22,7 +22,7 @@ use std::{
 use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
     LuaFunctionType, LuaInferredGuardOwner, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeFact, LuaTypeOwner, WorkspaceId,
+    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact, LuaTypeOwner, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
@@ -108,7 +108,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            resolve_uninformative_local_decl_caches(db, &mut context);
+            refresh_local_decl_initializer_caches(db, &mut context);
         } else if late_inference_changed {
             // Late inference facts can unlock deferred locals even when the
             // optional dynamic-field pass is disabled. Retry that retained work
@@ -116,7 +116,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
-            resolve_uninformative_local_decl_caches(db, &mut context);
+            refresh_local_decl_initializer_caches(db, &mut context);
         }
 
         context.resolve_call_site_return_consumers(db);
@@ -141,7 +141,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     &workspace_file_ids,
                 );
             }
-            resolve_uninformative_local_decl_caches(db, &mut context);
+            refresh_local_decl_initializer_caches(db, &mut context);
         }
 
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
@@ -243,15 +243,28 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
     resolved
 }
 
-fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if context.uninformative_local_decl_candidates.is_empty() {
         return;
     }
 
     for decl_id in context.uninformative_local_decl_candidates.clone() {
         let type_owner = decl_id.into();
-        let current_cache = db.get_type_index().get_type_cache(&type_owner);
-        if !type_cache_is_uninformative(current_cache) {
+        let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
+        if current_cache.as_ref().is_some_and(LuaTypeCache::is_doc) {
+            continue;
+        }
+        let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
+        let can_refine_nominal_type = !current_is_uninformative
+            && db.get_emmyrc().gmod.enabled
+            && current_cache
+                .as_ref()
+                .is_some_and(|current| single_nominal_type_id(current.as_type()).is_some())
+            && db
+                .get_reference_index()
+                .get_decl_references(&decl_id.file_id, &decl_id)
+                .is_none_or(|references| !references.mutable);
+        if !current_is_uninformative && !can_refine_nominal_type {
             continue;
         }
 
@@ -271,11 +284,65 @@ fn resolve_uninformative_local_decl_caches(db: &mut DbIndex, context: &mut Analy
         } else if ret_idx != 0 {
             inferred_type = LuaType::Nil;
         }
-        if type_is_uninformative(&inferred_type) {
+        if type_is_uninformative(&inferred_type)
+            || current_cache
+                .as_ref()
+                .is_some_and(|current| current.as_type() == &inferred_type)
+        {
             continue;
         }
 
-        common::bind_resolved_type(db, type_owner, LuaTypeCache::InferType(inferred_type));
+        // Later dynamic-field and unresolved-call passes can make an immutable
+        // initializer more precise than the broad nominal type cached during
+        // the first Lua pass (for example, Panel -> DFrame). The initializer is
+        // direct value evidence, so let a strict nominal subtype replace that
+        // stale inferred cache before subtype-use heuristics run.
+        let is_immutable_strict_refinement = can_refine_nominal_type
+            && current_cache.as_ref().is_some_and(|current| {
+                is_strict_nominal_refinement(db, &inferred_type, current.as_type())
+            });
+        if current_is_uninformative {
+            common::bind_resolved_type(db, type_owner, LuaTypeCache::InferType(inferred_type));
+        } else if is_immutable_strict_refinement {
+            common::write_type_cache(
+                db,
+                type_owner,
+                LuaTypeCache::InferType(inferred_type),
+                common::TypeCacheWriteMode::ForceOverwrite,
+            );
+        }
+    }
+}
+
+fn is_strict_nominal_refinement(db: &DbIndex, candidate: &LuaType, current: &LuaType) -> bool {
+    let Some(candidate_id) = single_nominal_type_id(candidate) else {
+        return false;
+    };
+    let Some(current_id) = single_nominal_type_id(current) else {
+        return false;
+    };
+    candidate_id != current_id && crate::semantic::is_sub_type_of(db, &candidate_id, &current_id)
+}
+
+fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
+        LuaType::Instance(instance) => single_nominal_type_id(instance.get_base()),
+        LuaType::Union(union) => {
+            let mut nominal = None;
+            for component in union.types().filter(|component| !component.is_nil()) {
+                let type_id = single_nominal_type_id(component)?;
+                if nominal
+                    .as_ref()
+                    .is_some_and(|existing| existing != &type_id)
+                {
+                    return None;
+                }
+                nominal = Some(type_id);
+            }
+            nominal
+        }
+        _ => None,
     }
 }
 

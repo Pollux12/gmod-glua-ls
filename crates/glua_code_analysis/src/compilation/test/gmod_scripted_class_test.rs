@@ -11534,4 +11534,109 @@ GM.TestValue = 1"#,
             "a workspace global pairs override is not provably the builtin for other files either: {diagnostics:?}"
         );
     }
+
+    #[gtest]
+    fn test_vgui_registered_panel_field_preserves_constructor_subclass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            function DPanel:SetPaintBackground(enabled) end
+            ---@class DDragBase: DPanel
+            ---@class DListLayout: DDragBase
+            ---@class EditablePanel: Panel
+            ---@class DFrame: EditablePanel
+            function DFrame:ShowCloseButton(show) end
+            function DFrame:Close() end
+            ---@class (partial) DDrawer: Panel
+            local DDrawer = {}
+            function DDrawer:Close() end
+
+            vgui = {}
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/registered_panel_field.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                local left_menu = vgui.Create("DListLayout", self)
+                self.left_menu = left_menu
+            end
+
+            function PANEL:OnThemeChange()
+                self.left_menu:SetPaintBackground(true)
+            end
+
+            function PANEL:CreateFindWindow()
+                self.find_window = vgui.Create("DFrame", self)
+                local pnl = self.find_window
+                pnl:ShowCloseButton(true)
+                local old = pnl.Close
+                function pnl.Close()
+                    old(pnl)
+                end
+            end
+
+            vgui.Register(TabHandler.ControlName, PANEL, "Panel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a registered panel field should retain the vgui.Create subclass: {diagnostics:?}"
+        );
+
+        let mutable_file_id = ws.def_file(
+            "lua/vgui/mutable_panel_alias.lua",
+            r#"
+            local panel = vgui.Create("DFrame")
+            panel = vgui.Create("DDrawer")
+            panel:ShowCloseButton(true)
+            "#,
+        );
+        let mutable_diagnostics = ws
+            .analysis
+            .diagnose_file(mutable_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            mutable_diagnostics.iter().any(|diagnostic| diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a later incompatible assignment must not be replaced by the initializer subtype: {mutable_diagnostics:?}"
+        );
+    }
 }
