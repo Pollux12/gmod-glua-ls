@@ -480,14 +480,19 @@ fn infer_union_member_semantic_info(
     member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
+    // Fork the guard per arm so a long miss streak (NULL / unrelated Entity
+    // subclasses) cannot exhaust the depth budget and abort the whole union.
     for typ in union_type.types() {
+        let Some(arm_guard) = semantic_guard.next_level() else {
+            continue;
+        };
         if let Some(property_owner_id) = infer_member_semantic_decl_by_member_key(
             db,
             cache,
             typ,
             member_key,
             member_access_position,
-            semantic_guard.next_level()?,
+            arm_guard,
         ) {
             return Some(property_owner_id);
         }

@@ -6472,7 +6472,10 @@ _2 = a[1]
 
         let a = ws.expr_ty("a");
         let desc = ws.humanize_type(a);
+        // BrokenGlide falsy-overrides IsGlideVehicle, so BaseGlide alone is unsafe;
+        // surviving truthy subtypes (GoodGlide) must remain visible.
         assert_that!(desc, contains_substring("GoodGlide"));
+        assert_that!(desc.contains("BrokenGlide"), eq(false));
     }
 
     #[gtest]
@@ -7368,6 +7371,126 @@ _2 = a[1]
             "dynamic-key narrowing must not collapse to a subtype that merely \
              contains an unrelated dynamic write: {}",
             desc
+        );
+    }
+
+    #[gtest]
+    fn test_field_exist_narrow_skips_server_only_base_method_on_client() {
+        // Real pattern: GetNWEntity -> Entity|NULL, Vehicle:GetSteering is server-only,
+        // Glide ENT (Entity subclass, not Vehicle) defines shared NetworkVar GetSteering.
+        // Field-exist must reverse-lookup owners (not fan out every Entity subclass)
+        // and collapse to the most generic realm-compatible definer.
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "annotations/vehicle.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Vehicle : Entity
+            local Vehicle = {}
+            ---@realm server
+            function Vehicle:GetSteering() end
+
+            ---@class Player : Entity
+            ---@return Vehicle
+            function Player:GetVehicle() end
+            ---@return Entity|NULL
+            function Entity:GetNWEntity(key, fallback) end
+            ---@return Entity?
+            function Entity:GetParent() end
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+            ---@class base_glide : Entity
+            ---@field IsGlideVehicle boolean
+            local ENT = {}
+            ENT.Type = "anim"
+            ENT.IsGlideVehicle = true
+            function ENT:GetVisualSteering()
+                return 0
+            end
+
+            ---@class base_glide_car : base_glide
+            local ENT = {}
+            ENT.Base = "base_glide"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Float", "Steering")
+            end
+
+            ---@class base_glide_boat : base_glide
+            local ENT = {}
+            ENT.Base = "base_glide"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Float", "Steering")
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/glide/autoload/steering_indicator.lua",
+            r#"
+            if CLIENT then
+                ---@type Player
+                local ply
+                local veh = ply:GetNWEntity("GlideVehicle")
+                if not IsValid(veh) then
+                    local maybeSeat = ply:GetVehicle()
+                    if IsValid(maybeSeat) then
+                        local parent = maybeSeat:GetParent()
+                        if IsValid(parent) and parent.IsGlideVehicle then
+                            veh = parent
+                        elseif maybeSeat.IsGlideVehicle then
+                            veh = maybeSeat
+                        end
+                    end
+                end
+                if veh.GetVisualSteering then
+                    a = veh
+                    local _ = veh:GetVisualSteering()
+                elseif veh.GetSteering then
+                    b = veh
+                    local steeringNorm = veh:GetSteering() or 0
+                    print(steeringNorm)
+                end
+            end
+            "#,
+        );
+
+        let a_ty = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        let a_desc = ws.humanize_type(a_ty);
+        assert_that!(
+            a_desc.as_str(),
+            eq("base_glide"),
+            "GetVisualSteering should collapse to most generic definer base_glide, got {a_desc}"
+        );
+
+        let b_ty = nth_name_expr_type_from_end(&mut ws, file_id, "b", 0);
+        let b_desc = ws.humanize_type(b_ty);
+        assert_that!(
+            b_desc.contains("base_glide_car") || b_desc.contains("base_glide_boat"),
+            eq(true),
+            "elseif veh.GetSteering should narrow to realm-compatible NetworkVar owners, got {b_desc}"
+        );
+        assert_that!(
+            b_desc.contains("Vehicle") || b_desc.contains("Entity") || b_desc.contains("NULL"),
+            eq(false),
+            "must not fan out open Entity/Vehicle bases, got {b_desc}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let realm_mismatch = diagnostics.iter().any(|d| {
+            d.message.contains("GetSteering")
+                && (d.message.contains("Realm mismatch") || d.message.contains("realm"))
+        });
+        assert_that!(
+            realm_mismatch,
+            eq(false),
+            "realm-compatible narrow should not report GetSteering mismatch: {diagnostics:?}"
         );
     }
 
