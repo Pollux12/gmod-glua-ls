@@ -35,6 +35,9 @@ pub struct LuaSignature {
     nil_return_guard_params: Vec<usize>,
     return_correlations: Vec<LuaReturnCorrelation>,
     direct_param_return_alias: Option<usize>,
+    /// Param index of a classname string passed to a class-name factory
+    /// (`vgui.Create` / `ents.Create` / any `` `T` `` create) whose result is returned.
+    class_name_param_return_alias: Option<usize>,
     falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
     falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
 }
@@ -103,6 +106,7 @@ impl LuaSignature {
             nil_return_guard_params: Vec::new(),
             return_correlations: Vec::new(),
             direct_param_return_alias: None,
+            class_name_param_return_alias: None,
             falsy_param_nil_free_return_slots: Vec::new(),
             falsy_param_return_aliases: Vec::new(),
         }
@@ -129,6 +133,14 @@ impl LuaSignature {
 
     pub fn direct_param_return_alias(&self) -> Option<usize> {
         self.direct_param_return_alias
+    }
+
+    pub fn set_class_name_param_return_alias(&mut self, param_idx: usize) {
+        self.class_name_param_return_alias = Some(param_idx);
+    }
+
+    pub fn class_name_param_return_alias(&self) -> Option<usize> {
+        self.class_name_param_return_alias
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
@@ -197,6 +209,7 @@ impl LuaSignature {
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
             || self.direct_param_return_alias.is_some()
+            || self.class_name_param_return_alias.is_some()
             || self
                 .overloads
                 .iter()

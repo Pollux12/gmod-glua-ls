@@ -430,7 +430,7 @@ fn should_prefer_signature_for_call(
                     || !signature.overloads.is_empty()
                     || !signature.out_params.is_empty()
                     || !signature.nil_return_guard_params().is_empty()
-                    || signature.direct_param_return_alias().is_some()
+                    || (signature.direct_param_return_alias().is_some() || signature.class_name_param_return_alias().is_some())
                     || !signature.falsy_param_nil_free_return_slots().is_empty()
                     || !signature.falsy_param_return_aliases().is_empty()
             }
@@ -578,12 +578,12 @@ fn infer_doc_function(
 
     if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
-        && (signature.direct_param_return_alias().is_some()
+        && ((signature.direct_param_return_alias().is_some() || signature.class_name_param_return_alias().is_some())
             || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
         let specialized =
-            specialize_direct_param_return_alias_for_call(db, cache, signature, func, &call_expr);
+            specialize_return_aliases_for_call(db, cache, signature, func, &call_expr);
         return Ok(specialize_falsy_param_returns_for_call(
             db,
             cache,
@@ -857,7 +857,7 @@ fn infer_signature_doc_function(
             fake_doc_function.as_ref(),
             &call_expr,
         );
-        let fake_doc_function = specialize_direct_param_return_alias_for_call(
+        let fake_doc_function = specialize_return_aliases_for_call(
             db,
             cache,
             signature,
@@ -910,7 +910,7 @@ fn infer_signature_doc_function(
             resolved.as_ref(),
             &call_expr,
         );
-        let resolved = specialize_direct_param_return_alias_for_call(
+        let resolved = specialize_return_aliases_for_call(
             db,
             cache,
             signature,
@@ -927,6 +927,77 @@ fn infer_signature_doc_function(
             &call_expr,
         ))
     }
+}
+
+
+fn specialize_class_name_param_return_alias_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<LuaFunctionType>> {
+    let param_idx = signature.class_name_param_return_alias()?;
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let arg = call_arg_for_param(call_expr, func_ty, &args, param_idx)?;
+    let class_name = resolve_class_name_string_from_arg(db, cache, &arg)?;
+    let type_id = LuaTypeDeclId::global(&class_name);
+    if db.get_type_index().get_type_decl(&type_id).is_none() {
+        return None;
+    }
+
+    let range = InFiled {
+        file_id: cache.get_file_id(),
+        value: call_expr.get_range(),
+    };
+    let return_type = LuaType::Instance(LuaInstanceType::new(LuaType::Ref(type_id), range).into());
+
+    Some(Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            return_type,
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    ))
+}
+
+/// Resolve a classname argument to a concrete string. Supports string literals
+/// and already-inferred string constants (including flow-narrowed defaults).
+fn resolve_class_name_string_from_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    arg: &LuaExpr,
+) -> Option<String> {
+    if let LuaExpr::LiteralExpr(lit) = arg
+        && let Some(glua_parser::LuaLiteralToken::String(s)) = lit.get_literal()
+    {
+        return Some(s.get_value());
+    }
+
+    let ty = infer_expr(db, cache, arg.clone()).ok()?;
+    match ty {
+        LuaType::StringConst(s) | LuaType::DocStringConst(s) => Some(s.as_str().to_string()),
+        _ => None,
+    }
+}
+
+fn specialize_return_aliases_for_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature: &LuaSignature,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<LuaFunctionType>> {
+    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
+        .or_else(|| {
+            specialize_class_name_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
+        })
 }
 
 fn specialize_direct_param_return_alias_for_call(

@@ -1031,6 +1031,64 @@ mod test {
     }
 
     #[gtest]
+    fn test_class_name_param_factory_return_specializes_vgui_create() {
+        // Real pattern: AddTab(icon, tip, panelClass) does
+        //   tab.panel = vgui.Create(panelClass); return tab.panel
+        // Call site `frame:AddTab(..., "DPanel")` must yield DPanel so
+        // DPanel-only methods like SetPaintBackground are defined.
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            function Panel:Dock() end
+            ---@class DPanel : Panel
+            function DPanel:SetPaintBackground(paint) end
+            ---@class DFrame : Panel
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+            ---@generic T: Panel
+            ---@param classname string
+            ---@param panelTable T
+            ---@param baseName? string
+            ---@return T
+            function vgui.Register(classname, panelTable, baseName) end
+            "#,
+        );
+        let target_file = ws.def_file(
+            "lua/includes/modules/styled_theme_tabbed_frame.lua",
+            r#"
+            local TABBED_FRAME = {}
+
+            function TABBED_FRAME:AddTab(icon, tooltip, panelClass)
+                panelClass = panelClass or "DScrollPanel"
+                local tab = {}
+                tab.panel = vgui.Create(panelClass, self)
+                return tab.panel
+            end
+
+            vgui.Register("Styled_TabbedFrame", TABBED_FRAME, "DFrame")
+
+            local frame = vgui.Create("Styled_TabbedFrame")
+            local panelExtension = frame:AddTab("icon.png", "extensions", "DPanel")
+            panelExtension:SetPaintBackground(false)
+            panelExtension:Dock()
+            "#,
+        );
+
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedMethod),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_reassigned_param_is_not_treated_as_direct_return_alias() {
         let mut ws = VirtualWorkspace::new();
         ws.def_gmod_call_arg_builtins();

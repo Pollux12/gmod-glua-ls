@@ -3,6 +3,7 @@ use std::ops::Deref;
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList,
     LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat,
+    LuaIndexExpr,
     LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaVarExpr,
     PathTrait, UnaryOperator,
 };
@@ -30,6 +31,7 @@ pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> O
     analyze_nil_return_guard_params(analyzer, &signature_id, &closure);
     analyze_falsy_param_nil_free_return_slots(analyzer, &signature_id, &closure);
     analyze_direct_param_return_alias(analyzer, &signature_id, &closure);
+    analyze_class_name_param_return_alias(analyzer, &signature_id, &closure);
     analyze_return(analyzer, &signature_id, &closure);
     Some(())
 }
@@ -110,6 +112,280 @@ fn analyze_direct_param_return_alias(
         .get_or_create(*signature_id)
         .set_direct_param_return_alias(param_idx);
     Some(())
+}
+
+
+fn analyze_class_name_param_return_alias(
+    analyzer: &mut LuaAnalyzer,
+    signature_id: &LuaSignatureId,
+    closure: &LuaClosureExpr,
+) -> Option<()> {
+    if analyzer
+        .db
+        .get_signature_index()
+        .get(signature_id)
+        .is_some_and(|sig| {
+            sig.direct_param_return_alias().is_some()
+                || sig.class_name_param_return_alias().is_some()
+                || !sig.overloads.is_empty()
+        })
+    {
+        return Some(());
+    }
+
+    // Skip only when an explicit doc return describes a non-identity transformation.
+    if let Some(signature) = analyzer.db.get_signature_index().get(signature_id)
+        && signature.resolve_return == SignatureReturnStatus::DocResolve
+        && !signature.return_docs.is_empty()
+    {
+        // Annotated returns already own specialization (generics / transforms).
+        return Some(());
+    }
+
+    let params = closure
+        .get_params_list()?
+        .get_params()
+        .filter_map(|param| {
+            param
+                .get_name_token()
+                .map(|name| name.get_name_text().to_string())
+        })
+        .collect::<Vec<_>>();
+    if params.is_empty() {
+        return Some(());
+    }
+
+    let block = closure.get_block()?;
+    if block
+        .descendants::<LuaReturnStat>()
+        .filter(|returned| {
+            returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+        })
+        .count()
+        != 1
+    {
+        return Some(());
+    }
+    let LuaStat::ReturnStat(return_stat) = block.get_stats().last()? else {
+        return Some(());
+    };
+    let exprs = return_stat.get_expr_list().collect::<Vec<_>>();
+    let [return_expr] = exprs.as_slice() else {
+        return Some(());
+    };
+
+    let create = find_class_name_create_for_return(analyzer, &block, return_expr)?;
+    let class_param_name = expr_name_text(&create.class_arg)?;
+    let param_idx = params.iter().position(|p| p == &class_param_name)?;
+
+    if classname_param_is_tainted(&block, &return_stat, &class_param_name) {
+        return Some(());
+    }
+
+    analyzer
+        .db
+        .get_signature_index_mut()
+        .get_or_create(*signature_id)
+        .set_class_name_param_return_alias(param_idx);
+    Some(())
+}
+
+struct ClassNameCreateCall {
+    class_arg: LuaExpr,
+}
+
+fn find_class_name_create_for_return(
+    analyzer: &mut LuaAnalyzer,
+    block: &LuaBlock,
+    return_expr: &LuaExpr,
+) -> Option<ClassNameCreateCall> {
+    match return_expr {
+        LuaExpr::CallExpr(call) => class_name_create_call_info(analyzer, call),
+        LuaExpr::NameExpr(name_expr) => {
+            let local_name = name_expr.get_name_text()?;
+            find_local_init_create(analyzer, block, &local_name)
+        }
+        LuaExpr::IndexExpr(index_expr) => resolve_index_to_create_call(analyzer, block, index_expr),
+        LuaExpr::ParenExpr(paren) => {
+            let inner = paren.get_expr()?;
+            find_class_name_create_for_return(analyzer, block, &inner)
+        }
+        _ => None,
+    }
+}
+
+fn find_local_init_create(
+    analyzer: &mut LuaAnalyzer,
+    block: &LuaBlock,
+    local_name: &str,
+) -> Option<ClassNameCreateCall> {
+    let mut found: Option<ClassNameCreateCall> = None;
+    for stat in block.get_stats() {
+        let LuaStat::LocalStat(local_stat) = stat else {
+            continue;
+        };
+        let names: Vec<_> = local_stat
+            .get_local_name_list()
+            .filter_map(|n| n.get_name_token().map(|t| t.get_name_text().to_string()))
+            .collect();
+        let values: Vec<_> = local_stat.get_value_exprs().collect();
+        for (i, name) in names.iter().enumerate() {
+            if name != local_name {
+                continue;
+            }
+            let Some(value) = values.get(i) else {
+                continue;
+            };
+            if let LuaExpr::CallExpr(call) = value
+                && let Some(info) = class_name_create_call_info(analyzer, call)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(info);
+            } else {
+                return None;
+            }
+        }
+    }
+    found
+}
+
+fn resolve_index_to_create_call(
+    analyzer: &mut LuaAnalyzer,
+    block: &LuaBlock,
+    index_expr: &LuaIndexExpr,
+) -> Option<ClassNameCreateCall> {
+    let prefix = index_expr.get_prefix_expr()?;
+    let table_name = expr_name_text(&prefix)?;
+    let field_name = index_key_name(index_expr)?;
+
+    let mut found: Option<ClassNameCreateCall> = None;
+    for stat in block.get_stats() {
+        let LuaStat::AssignStat(assign) = &stat else {
+            continue;
+        };
+        let (vars, values) = assign.get_var_and_expr_list();
+        for (i, var) in vars.iter().enumerate() {
+            let LuaVarExpr::IndexExpr(var_index) = var else {
+                continue;
+            };
+            let Some(var_prefix) = var_index.get_prefix_expr() else {
+                continue;
+            };
+            if expr_name_text(&var_prefix).as_deref() != Some(table_name.as_str()) {
+                continue;
+            }
+            if index_key_name(var_index).as_deref() != Some(field_name.as_str()) {
+                continue;
+            }
+            let Some(value) = values.get(i) else {
+                continue;
+            };
+            if let LuaExpr::CallExpr(call) = value
+                && let Some(info) = class_name_create_call_info(analyzer, call)
+            {
+                if found.is_some() {
+                    return None;
+                }
+                found = Some(info);
+            } else {
+                return None;
+            }
+        }
+    }
+    found
+}
+
+fn index_key_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+        LuaIndexKey::String(s) => Some(s.get_value()),
+        _ => None,
+    }
+}
+
+fn class_name_create_call_info(
+    _analyzer: &mut LuaAnalyzer,
+    call: &LuaCallExpr,
+) -> Option<ClassNameCreateCall> {
+    let prefix = call.get_prefix_expr()?;
+    let LuaExpr::IndexExpr(index) = prefix else {
+        return None;
+    };
+    let method = index_key_name(&index)?;
+    if method != "Create" {
+        return None;
+    }
+    let owner = index
+        .get_prefix_expr()
+        .and_then(|p| expr_name_text(&p))?;
+    if owner != "vgui" && owner != "ents" {
+        return None;
+    }
+
+    let args = call
+        .get_args_list()
+        .map(|a| a.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let class_arg = args.first()?.clone();
+    let _ = expr_name_text(&class_arg)?;
+    Some(ClassNameCreateCall { class_arg })
+}
+
+fn classname_param_is_tainted(
+    block: &LuaBlock,
+    return_stat: &LuaReturnStat,
+    param_name: &str,
+) -> bool {
+    let return_start = return_stat.get_range().start();
+    for stat in block.get_stats() {
+        if stat.get_range().start() >= return_start {
+            break;
+        }
+        if let LuaStat::AssignStat(assign) = &stat {
+            let (vars, values) = assign.get_var_and_expr_list();
+            for (i, var) in vars.iter().enumerate() {
+                if var_source_text(var) != param_name {
+                    continue;
+                }
+                let Some(value) = values.get(i) else {
+                    return true;
+                };
+                if !is_or_string_default_assign(value, param_name) {
+                    return true;
+                }
+            }
+        } else if let LuaStat::LocalStat(local_stat) = &stat {
+            if local_stat
+                .get_local_name_list()
+                .filter_map(|n| n.get_name_token())
+                .any(|t| t.get_name_text() == param_name)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn is_or_string_default_assign(expr: &LuaExpr, param_name: &str) -> bool {
+    let LuaExpr::BinaryExpr(bin) = expr else {
+        return false;
+    };
+    if bin.get_op_token().map(|t| t.get_op()) != Some(BinaryOperator::OpOr) {
+        return false;
+    }
+    let Some((left, right)) = bin.get_exprs() else {
+        return false;
+    };
+    if expr_name_text(&left).as_deref() != Some(param_name) {
+        return false;
+    }
+    matches!(
+        right,
+        LuaExpr::LiteralExpr(lit) if matches!(lit.get_literal(), Some(LuaLiteralToken::String(_)))
+    )
 }
 
 fn analyze_falsy_param_nil_free_return_slots(
