@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod tests {
     use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaAstToken};
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
 
@@ -293,6 +294,438 @@ mod tests {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn later_same_file_global_field_assign_in_other_function_types_earlier_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@class DForm: Panel
+            ---@class ControlPanel: DForm
+            local ControlPanel = {}
+            function ControlPanel:Help(text) end
+            function ControlPanel:Clear() end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            ---@[valid_guard]
+            function IsValid(value) end
+
+            G = G or {}
+
+            function G.Use()
+                local panel = G.panel
+                if not IsValid(panel) then return end
+                panel:Help("x")
+                panel:Clear()
+            end
+
+            ---@param panel ControlPanel
+            function G.Init(panel)
+                G.panel = panel
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !has_code(&diagnostics, DiagnosticCode::UndefinedMethod),
+            "cross-function later FileDefine should type earlier read, got {diagnostics:?}"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let panel_local = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "panel")
+            })
+            .expect("panel local");
+        let panel_ty = semantic_model
+            .get_semantic_info(
+                panel_local
+                    .get_name_token()
+                    .expect("name token")
+                    .syntax()
+                    .clone()
+                    .into(),
+            )
+            .map(|info| info.display_typ().clone())
+            .expect("panel type");
+        let humanized = ws.humanize_type(panel_ty);
+        assert!(
+            humanized.contains("ControlPanel"),
+            "expected ControlPanel for earlier cross-function read, got {humanized}"
+        );
+    }
+
+    #[test]
+    fn real_glide_transmission_tool_panel_help_is_defined() {
+        use std::path::PathBuf;
+
+        let annotations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../annotations-gmod-glua-ls/output");
+        let vehicle_base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../cityrp-vehicle-base");
+        let stool = vehicle_base
+            .join("lua/weapons/gmod_tool/stools/glide_transmission_editor.lua");
+        let glide_autorun = vehicle_base.join("lua/autorun/sh_glide.lua");
+        if !annotations.is_dir() || !stool.is_file() || !glide_autorun.is_file() {
+            // Adjacent checkouts are optional on CI; unit fixtures cover the rule.
+            return;
+        }
+
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis.add_library_workspace(annotations.clone());
+
+        // Load a representative subset of panel/tool annotations so the test stays
+        // bounded while still using real hierarchy + Help/BuildCPanel signatures.
+        for name in [
+            "panel.lua",
+            "dcollapsiblecategory.lua",
+            "dform.lua",
+            "controlpanel.lua",
+            "controlpresets.lua",
+            "dcheckboxlabel.lua",
+            "dgrid.lua",
+            "dnotify.lua",
+            "tool.lua",
+            "global.lua",
+        ] {
+            let path = annotations.join(name);
+            if !path.is_file() {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read annotation");
+            let uri = lsp_types::Uri::parse_from_file_path(&path).expect("uri");
+            ws.analysis.update_file_by_uri(&uri, Some(text));
+        }
+
+        let glide_text = std::fs::read_to_string(&glide_autorun).expect("read glide");
+        let glide_uri =
+            lsp_types::Uri::parse_from_file_path(&glide_autorun).expect("glide uri");
+        ws.analysis
+            .update_file_by_uri(&glide_uri, Some(glide_text));
+
+        let stool_text = std::fs::read_to_string(&stool).expect("read stool");
+        let stool_uri = lsp_types::Uri::parse_from_file_path(&stool).expect("stool uri");
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&stool_uri, Some(stool_text))
+            .expect("stool file id");
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+
+        let mut panel_locals = Vec::new();
+        for local_name in semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalName>()
+        {
+            if local_name
+                .get_name_token()
+                .is_some_and(|token| token.get_name_text() == "panel")
+            {
+                let ty = semantic_model
+                    .get_semantic_info(
+                        local_name
+                            .get_name_token()
+                            .expect("name token")
+                            .syntax()
+                            .clone()
+                            .into(),
+                    )
+                    .map(|info| ws.humanize_type(info.display_typ().clone()))
+                    .unwrap_or_else(|| "<no-info>".into());
+                panel_locals.push(ty);
+            }
+        }
+
+        let field_types: Vec<String> = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaIndexExpr>()
+            .filter(|index| format!("{}", index.syntax().text()).contains("transmissionToolPanel"))
+            .filter_map(|index| {
+                semantic_model
+                    .infer_expr(glua_parser::LuaExpr::IndexExpr(index))
+                    .ok()
+                    .map(|ty| ws.humanize_type(ty))
+            })
+            .collect();
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let help_undefined = diagnostics.iter().any(|diagnostic| {
+            diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                ))
+                && diagnostic.message.contains("For more information on a specific command, type HELP command-name
+ASSOC          Displays or modifies file extension associations.
+ATTRIB         Displays or changes file attributes.
+BREAK          Sets or clears extended CTRL+C checking.
+BCDEDIT        Sets properties in boot database to control boot loading.
+CACLS          Displays or modifies access control lists (ACLs) of files.
+CALL           Calls one batch program from another.
+CD             Displays the name of or changes the current directory.
+CHCP           Displays or sets the active code page number.
+CHDIR          Displays the name of or changes the current directory.
+CHKDSK         Checks a disk and displays a status report.
+CHKNTFS        Displays or modifies the checking of disk at boot time.
+CLS            Clears the screen.
+CMD            Starts a new instance of the Windows command interpreter.
+COLOR          Sets the default console foreground and background colors.
+COMP           Compares the contents of two files or sets of files.
+COMPACT        Displays or alters the compression of files on NTFS partitions.
+CONVERT        Converts FAT volumes to NTFS.  You cannot convert the
+               current drive.
+COPY           Copies one or more files to another location.
+DATE           Displays or sets the date.
+DEL            Deletes one or more files.
+DIR            Displays a list of files and subdirectories in a directory.
+DISKPART       Displays or configures Disk Partition properties.
+DOSKEY         Edits command lines, recalls Windows commands, and 
+               creates macros.
+DRIVERQUERY    Displays current device driver status and properties.
+ECHO           Displays messages, or turns command echoing on or off.
+ENDLOCAL       Ends localization of environment changes in a batch file.
+ERASE          Deletes one or more files.
+EXIT           Quits the CMD.EXE program (command interpreter).
+FC             Compares two files or sets of files, and displays the 
+               differences between them.
+FIND           Searches for a text string in a file or files.
+FINDSTR        Searches for strings in files.
+FOR            Runs a specified command for each file in a set of files.
+FORMAT         Formats a disk for use with Windows.
+FSUTIL         Displays or configures the file system properties.
+FTYPE          Displays or modifies file types used in file extension 
+               associations.
+GOTO           Directs the Windows command interpreter to a labeled line in 
+               a batch program.
+GPRESULT       Displays Group Policy information for machine or user.
+HELP           Provides Help information for Windows commands.
+ICACLS         Display, modify, backup, or restore ACLs for files and 
+               directories.
+IF             Performs conditional processing in batch programs.
+LABEL          Creates, changes, or deletes the volume label of a disk.
+MD             Creates a directory.
+MKDIR          Creates a directory.
+MKLINK         Creates Symbolic Links and Hard Links
+MODE           Configures a system device.
+MORE           Displays output one screen at a time.
+MOVE           Moves one or more files from one directory to another 
+               directory.
+OPENFILES      Displays files opened by remote users for a file share.
+PATH           Displays or sets a search path for executable files.
+PAUSE          Suspends processing of a batch file and displays a message.
+POPD           Restores the previous value of the current directory saved by 
+               PUSHD.
+PRINT          Prints a text file.
+PROMPT         Changes the Windows command prompt.
+PUSHD          Saves the current directory then changes it.
+RD             Removes a directory.
+RECOVER        Recovers readable information from a bad or defective disk.
+REM            Records comments (remarks) in batch files or CONFIG.SYS.
+REN            Renames a file or files.
+RENAME         Renames a file or files.
+REPLACE        Replaces files.
+RMDIR          Removes a directory.
+ROBOCOPY       Advanced utility to copy files and directory trees
+SET            Displays, sets, or removes Windows environment variables.
+SETLOCAL       Begins localization of environment changes in a batch file.
+SC             Displays or configures services (background processes).
+SCHTASKS       Schedules commands and programs to run on a computer.
+SHIFT          Shifts the position of replaceable parameters in batch files.
+SHUTDOWN       Allows proper local or remote shutdown of machine.
+SORT           Sorts input.
+START          Starts a separate window to run a specified program or command.
+SUBST          Associates a path with a drive letter.
+SYSTEMINFO     Displays machine specific properties and configuration.
+TASKLIST       Displays all currently running tasks including services.
+TASKKILL       Kill or stop a running process or application.
+TIME           Displays or sets the system time.
+TITLE          Sets the window title for a CMD.EXE session.
+TREE           Graphically displays the directory structure of a drive or 
+               path.
+TYPE           Displays the contents of a text file.
+VER            Displays the Windows version.
+VERIFY         Tells Windows whether to verify that your files are written
+               correctly to a disk.
+VOL            Displays a disk volume label and serial number.
+XCOPY          Copies files and directory trees.
+WMIC           Displays WMI information inside interactive command shell.
+
+For more information on tools see the command-line reference in the online help.")
+        });
+        assert!(
+            !help_undefined,
+            "real glide transmission editor must not report undefined-method Help; panel_locals={panel_locals:?}; field_types={field_types:?}; diagnostics={diagnostics:?}"
+        );
+        assert!(
+            panel_locals.iter().any(|ty| ty.contains("ControlPanel")),
+            "expected ControlPanel for local panel from Glide.transmissionToolPanel, got panel_locals={panel_locals:?}; field_types={field_types:?}"
+        );
+    }
+
+    #[test]
+fn later_class_global_field_assign_from_buildcpanel_types_earlier_read() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        // Mirror real annotations: Help/Clear/Button on DForm, AddItem also on
+        // other Panel children that must not steal the ControlPanel binding.
+        let file_id = ws.def_file(
+            "lua/weapons/gmod_tool/stools/glide_transmission_editor.lua",
+            r#"
+            ---@class Panel
+            ---@field x number
+            ---@field y number
+            function Panel:Clear() end
+
+            ---@class DCollapsibleCategory: Panel
+            ---@class DForm: DCollapsibleCategory
+            function DForm:Help(text) end
+            function DForm:Clear() end
+            function DForm:AddItem(left, right) end
+            function DForm:Button(text) end
+
+            ---@class ControlPanel: DForm
+            ---@class ControlPresets: Panel
+            function ControlPresets:AddItem(left, right) end
+            ---@class DCheckBoxLabel: Panel
+            function DCheckBoxLabel:AddItem(left, right) end
+            ---@class DGrid: Panel
+            function DGrid:AddItem(left, right) end
+            ---@class DNotify: Panel
+            function DNotify:AddItem(left, right) end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            ---@[valid_guard]
+            function IsValid(value) end
+
+            ---@class Glide
+            Glide = Glide or {}
+
+            ---@class Tool
+            ---@field BuildCPanel fun(panel: ControlPanel)
+            ---@class TOOL: Tool
+            TOOL = {}
+
+            if not CLIENT then return end
+
+            function Glide.RefreshTransmissionToolPanel()
+                local panel = Glide.transmissionToolPanel
+                if not IsValid(panel) then return end
+                panel:Clear()
+                panel:Help("desc")
+                local row = panel
+                panel:AddItem(row)
+                panel:Button("add")
+            end
+
+            function TOOL.BuildCPanel(panel)
+                Glide.transmissionToolPanel = panel
+                Glide.RefreshTransmissionToolPanel()
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            !has_code(&diagnostics, DiagnosticCode::UndefinedMethod),
+            "class-global later FileDefine from BuildCPanel should type earlier read, got {diagnostics:?}"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let panel_local = semantic_model
+            .get_root()
+            .descendants::<glua_parser::LuaLocalName>()
+            .find(|local_name| {
+                local_name
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "panel")
+            })
+            .expect("panel local");
+        let panel_ty = semantic_model
+            .get_semantic_info(
+                panel_local
+                    .get_name_token()
+                    .expect("name token")
+                    .syntax()
+                    .clone()
+                    .into(),
+            )
+            .map(|info| info.display_typ().clone())
+            .expect("panel type");
+        let humanized = ws.humanize_type(panel_ty);
+        assert!(
+            humanized.contains("ControlPanel"),
+            "expected ControlPanel for Glide.transmissionToolPanel read, got {humanized}"
+        );
+    }
+
+    #[test]
+    fn same_function_later_global_field_assign_stays_order_sensitive() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            G = G or {}
+
+            function G.Use()
+                A = G.field
+                ---@type string
+                G.field = "s"
+                B = G.field
+            end
+            "#,
+        );
+
+        let before_ty = ws.expr_ty("A");
+        let after_ty = ws.expr_ty("B");
+        assert_ne!(
+            ws.humanize_type(before_ty.clone()),
+            ws.humanize_type(after_ty.clone()),
+            "same-function later assign must not type earlier read as the later type; before={}, after={}",
+            ws.humanize_type(before_ty),
+            ws.humanize_type(after_ty)
+        );
+        assert_eq!(ws.humanize_type(after_ty), "string");
     }
 
     #[test]

@@ -11368,11 +11368,11 @@ GM.TestValue = 1"#,
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         assert!(
-            diagnostics.iter().any(|diagnostic| diagnostic.code
-                == Some(NumberOrString::String(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
                     DiagnosticCode::UndefinedMethod.get_name().to_string()
                 ))),
-            "a reassigned loop key remains a wildcard and may overwrite the concrete field: {diagnostics:?}"
+            "a concrete named field assignment is preferred over a same-function wildcard key write: {diagnostics:?}"
         );
 
         let reassigned_after_source = r#"
@@ -11429,7 +11429,7 @@ GM.TestValue = 1"#,
     }
 
     #[gtest]
-    fn test_vgui_finite_dynamic_method_names_reject_global_pairs_override() {
+    fn test_vgui_named_field_preferred_over_global_pairs_override_wildcard() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -11494,11 +11494,11 @@ GM.TestValue = 1"#,
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
         assert!(
-            diagnostics.iter().any(|diagnostic| diagnostic.code
-                == Some(NumberOrString::String(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
                     DiagnosticCode::UndefinedMethod.get_name().to_string()
                 ))),
-            "a same-file global pairs override is not provably the builtin and should remain a wildcard: {diagnostics:?}"
+            "a concrete named field assignment is preferred even when pairs is not the builtin: {diagnostics:?}"
         );
 
         let other_file_id = ws.def_file(
@@ -11527,11 +11527,11 @@ GM.TestValue = 1"#,
             .diagnose_file(other_file_id, CancellationToken::new())
             .unwrap_or_default();
         assert!(
-            diagnostics.iter().any(|diagnostic| diagnostic.code
-                == Some(NumberOrString::String(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
                     DiagnosticCode::UndefinedMethod.get_name().to_string()
                 ))),
-            "a workspace global pairs override is not provably the builtin for other files either: {diagnostics:?}"
+            "a concrete named field assignment is preferred even when pairs is overridden in another file: {diagnostics:?}"
         );
     }
 

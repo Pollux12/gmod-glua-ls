@@ -234,6 +234,7 @@ pub(super) fn stabilize_unguarded_children(
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
+    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::new();
     let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
     let direct_subtype_members = precompute_direct_subtype_members(db);
     let nested_candidate_members = direct_subtype_members
@@ -358,6 +359,30 @@ pub(super) fn stabilize_unguarded_children(
                     index_expr.get_position(),
                 ) {
                     continue;
+                }
+                // Prefer a stabilized initializer type (e.g. a later same-file
+                // field assignment) over heuristic child-union refinement when
+                // that initializer already owns the used member.
+                if let Some(initializer_type) = refined_initializer_type_for_decl(
+                    db,
+                    context,
+                    decl_id,
+                    file_id,
+                ) {
+                    if type_has_visible_static_member_at_use(
+                        db,
+                        &initializer_type,
+                        &member_key,
+                        file_id,
+                        index_expr.get_position(),
+                    ) {
+                        if is_strict_nominal_refinement(db, &initializer_type, &current) {
+                            initializer_refinements
+                                .entry(decl_id)
+                                .or_insert(initializer_type);
+                        }
+                        continue;
+                    }
                 }
                 let cache = context.infer_manager.get_infer_cache(file_id);
 
@@ -587,9 +612,26 @@ pub(super) fn stabilize_unguarded_children(
         }
     }
 
+    let mut refinement_changed_files = FxHashSet::default();
+    for (decl_id, initializer_type) in initializer_refinements {
+        let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+            continue;
+        };
+        let syntax_id = decl.get_syntax_id();
+        super::common::write_type_cache(
+            db,
+            decl_id.into(),
+            crate::LuaTypeCache::InferType(initializer_type),
+            super::common::TypeCacheWriteMode::ForceOverwrite,
+        );
+        refinement_changed_files.insert(decl_id.file_id);
+        update_sources.push(InFiled::new(decl_id.file_id, syntax_id));
+    }
+
     let updates_len = updates.len();
     let publish_start = profile.as_ref().map(|_| std::time::Instant::now());
-    let changed = db.publish_inference_facts(updates);
+    let mut changed = db.publish_inference_facts(updates);
+    changed.extend(refinement_changed_files.iter().copied());
     if let (Some(profile), Some(start)) = (&mut profile, publish_start) {
         profile.publish = start.elapsed();
     }
@@ -1075,6 +1117,84 @@ fn type_has_visible_member_at_use(
         .is_some_and(|members| !members.is_empty());
     visible_in_workspace
         && type_has_visible_static_member_at_use(db, typ, member_key, file_id, position)
+}
+
+fn refined_initializer_type_for_decl(
+    db: &crate::DbIndex,
+    context: &mut AnalyzeContext,
+    decl_id: crate::LuaDeclId,
+    file_id: crate::FileId,
+) -> Option<LuaType> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())?;
+    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
+    let expr = LuaExpr::cast(node)?;
+    if !matches!(expr, LuaExpr::IndexExpr(_) | LuaExpr::CallExpr(_)) {
+        return None;
+    }
+
+    let cache = context.infer_manager.get_infer_cache(file_id);
+    let mut initializer_type = infer_expr(db, cache, expr).ok()?;
+    if let LuaType::Variadic(variadic) = initializer_type {
+        initializer_type = variadic
+            .get_type(initializer.get_ret_idx())
+            .cloned()
+            .unwrap_or(LuaType::Unknown);
+    } else if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    if type_is_uninformative(&initializer_type) {
+        return None;
+    }
+    Some(initializer_type)
+}
+
+fn type_is_uninformative(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
+        LuaType::Union(union) => union.types().all(type_is_uninformative),
+        _ => false,
+    }
+}
+
+fn is_strict_nominal_refinement(
+    db: &crate::DbIndex,
+    candidate: &LuaType,
+    current: &LuaType,
+) -> bool {
+    let Some(candidate_id) = single_nominal_type_id(candidate) else {
+        return false;
+    };
+    let Some(current_id) = single_nominal_type_id(current) else {
+        return false;
+    };
+    candidate_id != current_id && crate::semantic::is_sub_type_of(db, &candidate_id, &current_id)
+}
+
+fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
+        LuaType::Instance(instance) => single_nominal_type_id(instance.get_base()),
+        LuaType::Union(union) => {
+            let mut nominal = None;
+            for component in union.types().filter(|component| !component.is_nil()) {
+                let type_id = single_nominal_type_id(component)?;
+                if nominal
+                    .as_ref()
+                    .is_some_and(|existing| existing != &type_id)
+                {
+                    return None;
+                }
+                nominal = Some(type_id);
+            }
+            nominal
+        }
+        _ => None,
+    }
 }
 
 fn type_has_visible_static_member_at_use(
