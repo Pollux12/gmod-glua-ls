@@ -1691,4 +1691,78 @@ mod test {
             "entMaybe",
         ));
     }
+
+    #[test]
+    fn schema_globals_are_available_without_framework_configuration() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/framework-base/gamemode/core/sh_data.lua",
+            r#"
+            print(Schema)
+            print(SCHEMA)
+            "#,
+            "Schema",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/framework-base/gamemode/core/sh_data.lua",
+            r#"
+            print(Schema)
+            print(SCHEMA)
+            "#,
+            "SCHEMA",
+        ));
+
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/example-rp/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            SCHEMA.author = "Example Framework"
+            function Schema:PlayerSpawn(client) end
+            "#,
+            "Schema",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/example-rp/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            SCHEMA.author = "Example Framework"
+            function Schema:PlayerSpawn(client) end
+            "#,
+            "SCHEMA",
+        ));
+
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            SCHEMA.author = "Example Framework"
+            "#,
+        );
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/example-rp/gamemode/shared.lua",
+            r#"
+            print(Schema.name)
+            print(SCHEMA.author)
+            "#,
+            "Schema",
+        ));
+        assert!(!has_undefined_global_name(
+            &mut ws,
+            "gamemodes/example-rp/gamemode/shared.lua",
+            r#"
+            print(Schema.name)
+            print(SCHEMA.author)
+            "#,
+            "SCHEMA",
+        ));
+    }
 }

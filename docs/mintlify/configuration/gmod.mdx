@@ -56,7 +56,9 @@ This setting controls the `.txt` file lookup. `DeriveGamemode("...")` support re
 
 `gmod.scriptedClassScopes.include` defines the scripted class groups used for class analysis, the Class Explorer, and scaffolding.
 
-Built-in groups: `entities`, `weapons`, `effects`, `stools`, `player_classes`, `plugins`, `gamemodes`.
+Built-in groups: `entities`, `weapons`, `effects`, `stools`, `player_classes`, `plugins`, `schemas`, `gamemodes`.
+
+The `schemas` group is enabled by default for any framework or gamemode. Files beneath a `schema/` directory, plus single-file `gamemode/schema.lua` entrypoints, contribute to one global `SCHEMA` class. `Schema` is recognized as an alias throughout the project, and schema methods are analyzed as gamemode hooks inherited from `GM`. No framework-specific configuration is required.
 
 Each definition supports:
 
@@ -65,6 +67,10 @@ Each definition supports:
 | `id` | `string` | Name used to change or remove this entry |
 | `label` | `string` | Display name in Class Explorer and Settings UI |
 | `classGlobal` | `string` | Global variable the class uses (`ENT`, `SWEP`, etc.) |
+| `fixedClassName` | `string` | Fixed internal class name used instead of deriving one from the path |
+| `isGlobalSingleton` | `boolean` | Merge every matching file into one workspace-wide global class |
+| `aliases` | `string[]` | Additional global names that refer to the same class |
+| `superTypes` | `string[]` | Types inherited by the class, such as `GM` for gamemode hooks |
 | `path` | `string[]` | Path segments to detect class from file path |
 | `include` | `string[]` | Glob patterns for files to analyse |
 | `exclude` | `string[]` | Optional per-definition exclude globs |

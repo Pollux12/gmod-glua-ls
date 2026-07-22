@@ -251,11 +251,14 @@ impl Default for GmodRealmFileMetadata {
     }
 }
 
-/// Cached scoped class detection result: (class_name, global_name).
+/// Cached scoped class detection result and its configured semantic metadata.
 #[derive(Debug, Clone)]
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,
+    pub is_global_singleton: bool,
+    pub aliases: Vec<String>,
+    pub super_types: Vec<String>,
     /// The scope's `classNamePrefix` (if any), cached so downstream synthesis
     /// (e.g. parent-name alias for gamemodes) can strip it back off without a
     /// second path scan.

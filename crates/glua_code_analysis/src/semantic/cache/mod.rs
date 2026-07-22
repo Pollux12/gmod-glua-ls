@@ -93,6 +93,7 @@ pub struct LuaInferCache {
     pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
     pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
+    pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
     pub pending_str_tpl_type_decls: Vec<PendingStrTplTypeDecl>,
     /// Cache for `self` type per enclosing method (keyed by LuaFuncStat syntax_id).
     /// Avoids repeated ancestor walks and type resolution for each `self` reference
@@ -142,6 +143,7 @@ impl LuaInferCache {
             param_type_cache: FxHashMap::default(),
             expr_var_ref_id_cache: FxHashMap::default(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
+            scripted_global_singleton_type_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: FxHashMap::default(),
             self_base_seed: None,
@@ -217,6 +219,7 @@ impl LuaInferCache {
         self.param_type_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.narrow_by_literal_stop_position_cache.clear();
+        self.scripted_global_singleton_type_cache = None;
         self.pending_str_tpl_type_decls.clear();
         self.self_type_cache.clear();
         self.self_base_seed = None;

@@ -152,6 +152,17 @@ pub struct EmmyrcGmodScriptedClassDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub class_global: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_class_name: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub is_global_singleton: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub aliases: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub super_types: Option<Vec<String>>,
+    /// Whether this class global and its aliases define gamemode hooks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hook_owner: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
@@ -192,6 +203,16 @@ pub struct ResolvedGmodScriptedClassDefinition {
     pub exclude: Vec<String>,
     pub class_global: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub fixed_class_name: Option<String>,
+    #[serde(default)]
+    pub is_global_singleton: bool,
+    #[serde(default)]
+    pub aliases: Vec<String>,
+    #[serde(default)]
+    pub super_types: Vec<String>,
+    #[serde(default)]
+    pub hook_owner: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_id: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub icon: Option<String>,
@@ -222,6 +243,11 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
             "include",
             "exclude",
             "classGlobal",
+            "fixedClassName",
+            "isGlobalSingleton",
+            "aliases",
+            "superTypes",
+            "hookOwner",
             "parentId",
             "icon",
             "rootDir",
@@ -249,6 +275,11 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                 let mut include = None;
                 let mut exclude = None;
                 let mut class_global = None;
+                let mut fixed_class_name = None;
+                let mut is_global_singleton = None;
+                let mut aliases = None;
+                let mut super_types = None;
+                let mut hook_owner = None;
                 let mut parent_id = None;
                 let mut icon = None;
                 let mut root_dir = None;
@@ -266,6 +297,19 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                         "classGlobal" => {
                             read_unique_field(&mut class_global, &mut map, "classGlobal")?
                         }
+                        "fixedClassName" => {
+                            read_unique_field(&mut fixed_class_name, &mut map, "fixedClassName")?
+                        }
+                        "isGlobalSingleton" => read_unique_field(
+                            &mut is_global_singleton,
+                            &mut map,
+                            "isGlobalSingleton",
+                        )?,
+                        "aliases" => read_unique_field(&mut aliases, &mut map, "aliases")?,
+                        "superTypes" => {
+                            read_unique_field(&mut super_types, &mut map, "superTypes")?
+                        }
+                        "hookOwner" => read_unique_field(&mut hook_owner, &mut map, "hookOwner")?,
                         "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
                         "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
                         "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
@@ -287,6 +331,11 @@ impl<'de> Deserialize<'de> for EmmyrcGmodScriptedClassDefinition {
                     include: include.unwrap_or_default(),
                     exclude: exclude.unwrap_or_default(),
                     class_global: class_global.unwrap_or_default(),
+                    fixed_class_name: fixed_class_name.unwrap_or_default(),
+                    is_global_singleton: is_global_singleton.unwrap_or_default(),
+                    aliases: aliases.unwrap_or_default(),
+                    super_types: super_types.unwrap_or_default(),
+                    hook_owner: hook_owner.unwrap_or_default(),
                     parent_id: parent_id.unwrap_or_default(),
                     icon: icon.unwrap_or_default(),
                     root_dir: root_dir.unwrap_or_default(),
@@ -369,6 +418,11 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
             "include",
             "exclude",
             "classGlobal",
+            "fixedClassName",
+            "isGlobalSingleton",
+            "aliases",
+            "superTypes",
+            "hookOwner",
             "parentId",
             "icon",
             "rootDir",
@@ -395,6 +449,11 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                 let mut include = None;
                 let mut exclude = None;
                 let mut class_global = None;
+                let mut fixed_class_name = None;
+                let mut is_global_singleton = None;
+                let mut aliases = None;
+                let mut super_types = None;
+                let mut hook_owner = None;
                 let mut parent_id = None;
                 let mut icon = None;
                 let mut root_dir = None;
@@ -411,6 +470,19 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                         "classGlobal" => {
                             read_unique_field(&mut class_global, &mut map, "classGlobal")?
                         }
+                        "fixedClassName" => {
+                            read_unique_field(&mut fixed_class_name, &mut map, "fixedClassName")?
+                        }
+                        "isGlobalSingleton" => read_unique_field(
+                            &mut is_global_singleton,
+                            &mut map,
+                            "isGlobalSingleton",
+                        )?,
+                        "aliases" => read_unique_field(&mut aliases, &mut map, "aliases")?,
+                        "superTypes" => {
+                            read_unique_field(&mut super_types, &mut map, "superTypes")?
+                        }
+                        "hookOwner" => read_unique_field(&mut hook_owner, &mut map, "hookOwner")?,
                         "parentId" => read_unique_field(&mut parent_id, &mut map, "parentId")?,
                         "icon" => read_unique_field(&mut icon, &mut map, "icon")?,
                         "rootDir" => read_unique_field(&mut root_dir, &mut map, "rootDir")?,
@@ -431,6 +503,11 @@ impl<'de> Deserialize<'de> for ResolvedGmodScriptedClassDefinition {
                     include: required_field::<_, MapType::Error>(include, "include")?,
                     exclude: required_field::<_, MapType::Error>(exclude, "exclude")?,
                     class_global: required_field::<_, MapType::Error>(class_global, "classGlobal")?,
+                    fixed_class_name: fixed_class_name.unwrap_or_default(),
+                    is_global_singleton: is_global_singleton.unwrap_or_default(),
+                    aliases: aliases.unwrap_or_default(),
+                    super_types: super_types.unwrap_or_default(),
+                    hook_owner: hook_owner.unwrap_or_default(),
                     parent_id: parent_id.unwrap_or_default(),
                     icon: icon.unwrap_or_default(),
                     root_dir: required_field::<_, MapType::Error>(root_dir, "rootDir")?,
@@ -673,6 +750,26 @@ fn scripted_scope_include_default() -> Vec<EmmyrcGmodScriptedClassScopeEntry> {
             Some("plugins"),
             None,
         )),
+        EmmyrcGmodScriptedClassScopeEntry::Definition({
+            let mut definition = default_scripted_class_definition(
+                "schemas",
+                "Schemas",
+                &["schema"],
+                &["gamemodes/*/schema/**", "schema/**", "gamemode/schema.lua"],
+                &[],
+                "SCHEMA",
+                None,
+                None,
+                Some("gamemodes"),
+                None,
+            );
+            definition.fixed_class_name = Some("SCHEMA".to_string());
+            definition.is_global_singleton = Some(true);
+            definition.aliases = Some(vec!["Schema".to_string()]);
+            definition.super_types = Some(vec!["GM".to_string()]);
+            definition.hook_owner = Some(true);
+            definition
+        }),
         // Player classes (player_manager.RegisterClass). These live under a
         // gamemode's `player_class/` directory and author a local `PLAYER`
         // table. The `player_class` path segment is deeper than the generic
@@ -749,6 +846,11 @@ fn default_scripted_class_definition(
             )
         },
         class_global: Some(class_global.to_string()),
+        fixed_class_name: None,
+        is_global_singleton: None,
+        aliases: None,
+        super_types: None,
+        hook_owner: None,
         parent_id: parent_id.map(str::to_string),
         icon: icon.map(str::to_string),
         root_dir: root_dir.map(str::to_string),
@@ -826,6 +928,18 @@ fn resolve_scripted_class_definition(
             .collect(),
         exclude,
         class_global: class_global.to_string(),
+        fixed_class_name: definition
+            .fixed_class_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+        is_global_singleton: definition.is_global_singleton.unwrap_or(false),
+        aliases: normalized_non_empty_strings(definition.aliases.as_deref().unwrap_or_default()),
+        super_types: normalized_non_empty_strings(
+            definition.super_types.as_deref().unwrap_or_default(),
+        ),
+        hook_owner: definition.hook_owner.unwrap_or(false),
         parent_id: definition
             .parent_id
             .as_deref()
@@ -897,6 +1011,11 @@ fn merge_scripted_class_definitions(
                     include: Some(vec![trimmed.to_string()]),
                     exclude: None,
                     class_global: None,
+                    fixed_class_name: None,
+                    is_global_singleton: None,
+                    aliases: None,
+                    super_types: None,
+                    hook_owner: None,
                     parent_id: None,
                     icon: None,
                     root_dir: None,
@@ -1208,6 +1327,28 @@ fn merge_scripted_class_definition_override(
             .class_global
             .clone()
             .unwrap_or_else(|| base.class_global.clone()),
+        fixed_class_name: if override_definition.fixed_class_name.is_some() {
+            override_definition
+                .fixed_class_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|name| !name.is_empty())
+                .map(str::to_string)
+        } else {
+            base.fixed_class_name.clone()
+        },
+        is_global_singleton: override_definition
+            .is_global_singleton
+            .unwrap_or(base.is_global_singleton),
+        aliases: override_definition.aliases.as_ref().map_or_else(
+            || base.aliases.clone(),
+            |aliases| normalized_non_empty_strings(aliases),
+        ),
+        super_types: override_definition.super_types.as_ref().map_or_else(
+            || base.super_types.clone(),
+            |super_types| normalized_non_empty_strings(super_types),
+        ),
+        hook_owner: override_definition.hook_owner.unwrap_or(base.hook_owner),
         parent_id: if override_definition.parent_id.is_some() {
             override_definition
                 .parent_id
@@ -1298,6 +1439,25 @@ impl EmmyrcGmodScriptedClassScopes {
         self.resolved_definitions_cache.to_vec()
     }
 
+    pub fn hook_owner_globals(&self) -> Vec<String> {
+        let mut seen = HashSet::new();
+        let mut globals = Vec::new();
+
+        for definition in self
+            .resolved_definitions_slice()
+            .iter()
+            .filter(|definition| definition.hook_owner)
+        {
+            for name in std::iter::once(&definition.class_global).chain(&definition.aliases) {
+                if seen.insert(name.clone()) {
+                    globals.push(name.clone());
+                }
+            }
+        }
+
+        globals
+    }
+
     pub fn include_patterns(&self) -> Vec<String> {
         let legacy_include = legacy_include_patterns(&self.include);
         let has_definition_entries = self
@@ -1368,6 +1528,7 @@ impl EmmyrcGmodScriptedClassScopes {
 
         let definitions = self.resolved_definitions_slice();
         let mut best_match: Option<(ResolvedGmodScriptedClassDefinition, usize, usize)> = None;
+        let mut fixed_fallback = None;
         for definition in definitions {
             // Check THIS definition's include/exclude patterns — do not merge
             // excludes from other definitions, as they are definition-scoped.
@@ -1375,6 +1536,10 @@ impl EmmyrcGmodScriptedClassScopes {
             // STOOL files from matching the STOOL definition.
             if !matches_scope_patterns(file_path, &definition.include, &definition.exclude) {
                 continue;
+            }
+
+            if fixed_fallback.is_none() && definition.fixed_class_name.is_some() {
+                fixed_fallback = Some(definition.clone());
             }
 
             let rule_len = definition.path.len();
@@ -1411,13 +1576,26 @@ impl EmmyrcGmodScriptedClassScopes {
             }
         }
 
-        let (definition, best_end_idx, _) = best_match?;
+        let Some((definition, best_end_idx, _)) = best_match else {
+            let definition = fixed_fallback?;
+            let class_name = definition.fixed_class_name.clone()?;
+            return Some(ResolvedGmodScriptedClassMatch {
+                definition,
+                class_name,
+            });
+        };
         let class_idx = best_end_idx + 1;
         if class_idx >= lower_segments.len() {
-            return None;
+            let class_name = definition.fixed_class_name.clone()?;
+            return Some(ResolvedGmodScriptedClassMatch {
+                definition,
+                class_name,
+            });
         }
 
-        let class_name = if class_idx == original_segments.len() - 1 {
+        let class_name = if let Some(fixed_class_name) = definition.fixed_class_name.as_ref() {
+            fixed_class_name.clone()
+        } else if class_idx == original_segments.len() - 1 {
             original_segments[class_idx]
                 .strip_suffix(".lua")
                 .unwrap_or(original_segments[class_idx].as_str())
@@ -1479,6 +1657,15 @@ impl EmmyrcGmodScriptedClassScopes {
 
         (scope_files, matches)
     }
+}
+
+fn normalized_non_empty_strings(values: &[String]) -> Vec<String> {
+    values
+        .iter()
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .map(str::to_string)
+        .collect()
 }
 
 struct CompiledScopeDefinition<'a> {
@@ -1590,7 +1777,9 @@ fn detect_class_for_path_with_compiled_definitions(
         return None;
     }
 
-    let class_name = if class_idx == original_segments.len() - 1 {
+    let class_name = if let Some(fixed_class_name) = definition.fixed_class_name.as_ref() {
+        fixed_class_name.clone()
+    } else if class_idx == original_segments.len() - 1 {
         original_segments[class_idx]
             .strip_suffix(".lua")
             .unwrap_or(original_segments[class_idx].as_str())
@@ -1757,7 +1946,7 @@ mod tests {
         let definitions = gmod.scripted_class_scopes.resolved_definitions();
         verify_that!(gmod.enabled, eq(true))?;
         verify_that!(gmod.default_realm, eq(EmmyrcGmodRealm::Shared))?;
-        verify_that!(definitions.len(), eq(7usize))?;
+        verify_that!(definitions.len(), eq(8usize))?;
         verify_that!(definitions[0].id.as_str(), eq("entities"))?;
         verify_that!(definitions[0].class_global.as_str(), eq("ENT"))?;
         verify_that!(
@@ -1766,12 +1955,32 @@ mod tests {
         )?;
         verify_that!(definitions[3].parent_id.as_deref(), eq(Some("weapons")))?;
         verify_that!(definitions[4].scaffold.is_none(), eq(true))?;
-        verify_that!(definitions[5].id.as_str(), eq("player_classes"))?;
-        verify_that!(definitions[5].class_global.as_str(), eq("PLAYER"))?;
-        verify_that!(definitions[6].id.as_str(), eq("gamemodes"))?;
-        verify_that!(definitions[6].class_global.as_str(), eq("GM"))?;
+        verify_that!(definitions[5].id.as_str(), eq("schemas"))?;
+        verify_that!(definitions[5].class_global.as_str(), eq("SCHEMA"))?;
         verify_that!(
-            definitions[6].class_name_prefix.as_deref(),
+            definitions[5].fixed_class_name.as_deref(),
+            eq(Some("SCHEMA"))
+        )?;
+        verify_that!(definitions[5].is_global_singleton, eq(true))?;
+        verify_that!(
+            definitions[5].aliases.as_slice(),
+            eq(&["Schema".to_string()])
+        )?;
+        verify_that!(
+            definitions[5].super_types.as_slice(),
+            eq(&["GM".to_string()])
+        )?;
+        verify_that!(definitions[5].hook_owner, eq(true))?;
+        verify_that!(
+            gmod.scripted_class_scopes.hook_owner_globals().as_slice(),
+            eq(&["SCHEMA".to_string(), "Schema".to_string()])
+        )?;
+        verify_that!(definitions[6].id.as_str(), eq("player_classes"))?;
+        verify_that!(definitions[6].class_global.as_str(), eq("PLAYER"))?;
+        verify_that!(definitions[7].id.as_str(), eq("gamemodes"))?;
+        verify_that!(definitions[7].class_global.as_str(), eq("GM"))?;
+        verify_that!(
+            definitions[7].class_name_prefix.as_deref(),
             eq(Some("gamemode_"))
         )?;
         verify_that!(
@@ -2062,6 +2271,82 @@ mod tests {
             .detect_class_for_path(Path::new("lua/entities/MyEntity/shared.lua"))
             .map(|entry| entry.class_name);
         assert_eq!(detected, Some("MyEntity".to_string()));
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_schema_as_fixed_global_singleton_in_any_gamemode() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+        let detected = scopes
+            .detect_class_for_path(Path::new("gamemodes/example-rp/schema/libs/sh_voices.lua"))
+            .or_fail()?;
+
+        verify_that!(detected.class_name.as_str(), eq("SCHEMA"))?;
+        verify_that!(detected.definition.id.as_str(), eq("schemas"))?;
+        verify_that!(detected.definition.is_global_singleton, eq(true))?;
+        verify_that!(
+            detected.definition.aliases.as_slice(),
+            eq(&["Schema".to_string()])
+        )?;
+        verify_that!(
+            detected.definition.super_types.as_slice(),
+            eq(&["GM".to_string()])
+        )?;
+        verify_that!(detected.definition.hook_owner, eq(true))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_single_file_schema_authoring_entrypoint() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+        let detected = scopes
+            .detect_class_for_path(Path::new("gamemode/schema.lua"))
+            .or_fail()?;
+
+        verify_that!(detected.class_name.as_str(), eq("SCHEMA"))?;
+        verify_that!(detected.definition.id.as_str(), eq("schemas"))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_detect_schema_in_nested_framework_layout() -> Result<()> {
+        let scopes = EmmyrcGmodScriptedClassScopes::default();
+        let detected = scopes
+            .detect_class_for_path(Path::new("lua/framework/modules/schema/shared.lua"))
+            .or_fail()?;
+
+        verify_that!(detected.class_name.as_str(), eq("SCHEMA"))?;
+        verify_that!(detected.definition.id.as_str(), eq("schemas"))?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_custom_scripted_class_hook_owner_exposes_global_and_alias() -> Result<()> {
+        let scopes: EmmyrcGmodScriptedClassScopes = serde_json::from_str(
+            r#"{
+                "include": [{
+                    "id": "framework-state",
+                    "label": "Framework State",
+                    "classGlobal": "FRAMEWORK",
+                    "fixedClassName": "FRAMEWORK",
+                    "path": ["framework"],
+                    "include": ["framework/**"],
+                    "aliases": ["Framework"],
+                    "hookOwner": true
+                }]
+            }"#,
+        )
+        .or_fail()?;
+
+        verify_that!(
+            scopes.hook_owner_globals().as_slice(),
+            eq(&[
+                "SCHEMA".to_string(),
+                "Schema".to_string(),
+                "FRAMEWORK".to_string(),
+                "Framework".to_string(),
+            ])
+        )?;
         Ok(())
     }
 

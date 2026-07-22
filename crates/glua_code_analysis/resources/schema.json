@@ -1697,6 +1697,29 @@
                 "rootDir": "plugins"
               },
               {
+                "aliases": [
+                  "Schema"
+                ],
+                "classGlobal": "SCHEMA",
+                "fixedClassName": "SCHEMA",
+                "hookOwner": true,
+                "id": "schemas",
+                "include": [
+                  "gamemodes/*/schema/**",
+                  "schema/**",
+                  "gamemode/schema.lua"
+                ],
+                "isGlobalSingleton": true,
+                "label": "Schemas",
+                "path": [
+                  "schema"
+                ],
+                "rootDir": "gamemodes",
+                "superTypes": [
+                  "GM"
+                ]
+              },
+              {
                 "classGlobal": "PLAYER",
                 "icon": "person",
                 "id": "player_classes",
@@ -1844,6 +1867,15 @@
     },
     "EmmyrcGmodScriptedClassDefinition": {
       "properties": {
+        "aliases": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
+          ]
+        },
         "classGlobal": {
           "type": [
             "string",
@@ -1872,6 +1904,19 @@
             "null"
           ]
         },
+        "fixedClassName": {
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "hookOwner": {
+          "description": "Whether this class global and its aliases define gamemode hooks.",
+          "type": [
+            "boolean",
+            "null"
+          ]
+        },
         "icon": {
           "type": [
             "string",
@@ -1887,6 +1932,12 @@
           },
           "type": [
             "array",
+            "null"
+          ]
+        },
+        "isGlobalSingleton": {
+          "type": [
+            "boolean",
             "null"
           ]
         },
@@ -1925,6 +1976,15 @@
             {
               "type": "null"
             }
+          ]
+        },
+        "superTypes": {
+          "items": {
+            "type": "string"
+          },
+          "type": [
+            "array",
+            "null"
           ]
         }
       },
@@ -2085,6 +2145,29 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "aliases": [
+                "Schema"
+              ],
+              "classGlobal": "SCHEMA",
+              "fixedClassName": "SCHEMA",
+              "hookOwner": true,
+              "id": "schemas",
+              "include": [
+                "gamemodes/*/schema/**",
+                "schema/**",
+                "gamemode/schema.lua"
+              ],
+              "isGlobalSingleton": true,
+              "label": "Schemas",
+              "path": [
+                "schema"
+              ],
+              "rootDir": "gamemodes",
+              "superTypes": [
+                "GM"
+              ]
             },
             {
               "classGlobal": "PLAYER",
@@ -2908,6 +2991,29 @@
                 "plugins"
               ],
               "rootDir": "plugins"
+            },
+            {
+              "aliases": [
+                "Schema"
+              ],
+              "classGlobal": "SCHEMA",
+              "fixedClassName": "SCHEMA",
+              "hookOwner": true,
+              "id": "schemas",
+              "include": [
+                "gamemodes/*/schema/**",
+                "schema/**",
+                "gamemode/schema.lua"
+              ],
+              "isGlobalSingleton": true,
+              "label": "Schemas",
+              "path": [
+                "schema"
+              ],
+              "rootDir": "gamemodes",
+              "superTypes": [
+                "GM"
+              ]
             },
             {
               "classGlobal": "PLAYER",

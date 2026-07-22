@@ -14,7 +14,8 @@ use crate::{
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     SemanticDeclLevel, TypeOps,
     compilation::analyzer::{
-        gmod::name_expr_resolves_to_scoped_authoring_table, infer_for_range_iter_expr_func,
+        gmod::{get_scripted_class_type_decl_id, name_expr_resolves_to_scoped_authoring_table},
+        infer_for_range_iter_expr_func,
     },
     db_index::{DbIndex, LuaDeclOrMemberId, LuaSignature, LuaSignatureId},
     infer_node_semantic_decl,
@@ -51,7 +52,17 @@ pub fn infer_name_expr(
         .and_then(|file_ref| file_ref.get_decl_id(&range));
 
     let result = if let Some(decl_id) = decl_id {
-        infer_local_decl_name_type(db, cache, &name_expr, decl_id)
+        if db
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .is_some_and(LuaDecl::is_global)
+            && let Some(class_decl_id) =
+                resolve_global_singleton_scripted_type_decl_id(db, cache, name)
+        {
+            Ok(LuaType::Def(class_decl_id))
+        } else {
+            infer_local_decl_name_type(db, cache, &name_expr, decl_id)
+        }
     } else {
         if let Some(implicit_module_type) =
             infer_legacy_module_implicit_type(db, file_id, name_expr.get_position(), name)
@@ -61,6 +72,11 @@ pub fn infer_name_expr(
 
         if let Some(define_baseclass_type) = infer_define_baseclass_type(db, file_id, name) {
             return Ok(define_baseclass_type);
+        }
+
+        if let Some(class_decl_id) = resolve_global_singleton_scripted_type_decl_id(db, cache, name)
+        {
+            return Ok(LuaType::Def(class_decl_id));
         }
 
         if let Some(class_decl_id) =
@@ -128,6 +144,46 @@ pub fn infer_name_expr(
     }
 
     result
+}
+
+fn resolve_global_singleton_scripted_type_decl_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name: &str,
+) -> Option<LuaTypeDeclId> {
+    if cache.scripted_global_singleton_type_cache.is_none() {
+        let emmyrc = db.get_emmyrc();
+        let mut lookup = rustc_hash::FxHashMap::default();
+
+        if emmyrc.gmod.enabled {
+            for definition in emmyrc
+                .gmod
+                .scripted_class_scopes
+                .resolved_definitions_slice()
+                .iter()
+                .filter(|definition| definition.is_global_singleton)
+            {
+                let class_name = definition
+                    .fixed_class_name
+                    .as_deref()
+                    .unwrap_or(&definition.class_global);
+                let type_decl_id =
+                    get_scripted_class_type_decl_id(&definition.class_global, class_name);
+                lookup.insert(definition.class_global.clone(), type_decl_id.clone());
+                for alias in &definition.aliases {
+                    lookup.insert(alias.clone(), type_decl_id.clone());
+                }
+            }
+        }
+
+        cache.scripted_global_singleton_type_cache = Some(lookup);
+    }
+
+    cache
+        .scripted_global_singleton_type_cache
+        .as_ref()
+        .and_then(|lookup| lookup.get(name))
+        .cloned()
 }
 
 fn infer_local_decl_name_type(

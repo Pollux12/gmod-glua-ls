@@ -3,9 +3,11 @@ mod exprs;
 mod members;
 mod stats;
 
+use std::collections::HashSet;
+
 use crate::{
     compilation::analyzer::AnalysisPipeline,
-    db_index::{DbIndex, LegacyModuleEnv, LuaScopeKind},
+    db_index::{DbIndex, GmodScopedClassInfo, LegacyModuleEnv, LuaScopeKind},
     profile::Profile,
 };
 
@@ -44,13 +46,13 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
 
         for in_filed_tree in tree_list.iter() {
             // Detect scoped class once here and cache in GmodInferIndex for gmod_pre reuse.
-            let scoped_class_global_name = if let Some(scripted_scope_infos) =
+            let scoped_class_info = if let Some(scripted_scope_infos) =
                 scripted_scope_infos.as_ref()
                 && let Some(info) = scripted_scope_infos.get(&in_filed_tree.file_id)
             {
                 db.get_gmod_infer_index_mut()
                     .set_scoped_class_info(in_filed_tree.file_id, info.clone());
-                Some(info.global_name.clone())
+                Some(info.clone())
             } else {
                 None
             };
@@ -63,7 +65,7 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
                 in_filed_tree.file_id,
                 in_filed_tree.value.clone(),
                 context,
-                scoped_class_global_name,
+                scoped_class_info,
             );
             analyzer.analyze();
             let decl_tree = analyzer.get_decl_tree();
@@ -87,6 +89,7 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
     match node {
         LuaAst::LuaChunk(chunk) => {
             analyzer.create_scope(chunk.get_range(), LuaScopeKind::Normal);
+            analyzer.maybe_seed_scoped_class_decl(chunk.get_range());
         }
         LuaAst::LuaBlock(block) => {
             analyzer.create_scope(block.get_range(), LuaScopeKind::Normal);
@@ -208,7 +211,9 @@ pub struct DeclAnalyzer<'a> {
     db: &'a mut DbIndex,
     root: LuaChunk,
     decl: LuaDeclarationTree,
-    scoped_class_global_name: Option<String>,
+    scoped_class_info: Option<GmodScopedClassInfo>,
+    scoped_class_global_names: Option<HashSet<String>>,
+    seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
     is_meta: bool,
@@ -221,13 +226,21 @@ impl<'a> DeclAnalyzer<'a> {
         file_id: FileId,
         root: LuaChunk,
         context: &'a mut AnalyzeContext,
-        scoped_class_global_name: Option<String>,
+        scoped_class_info: Option<GmodScopedClassInfo>,
     ) -> DeclAnalyzer<'a> {
+        let scoped_class_global_names = scoped_class_info.as_ref().map(|info| {
+            let mut names = HashSet::with_capacity(1 + info.aliases.len());
+            names.insert(info.global_name.clone());
+            names.extend(info.aliases.iter().cloned());
+            names
+        });
         DeclAnalyzer {
             db,
             root,
             decl: LuaDeclarationTree::new(file_id),
-            scoped_class_global_name,
+            scoped_class_info,
+            scoped_class_global_names,
+            seeded_scoped_class_decl: false,
             legacy_module_envs: Vec::new(),
             scopes: Vec::new(),
             is_meta: false,
@@ -287,8 +300,9 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn add_decl(&mut self, mut decl: LuaDecl) -> LuaDeclId {
-        if let Some(scoped_class_global_name) = self.scoped_class_global_name.as_ref()
-            && decl.get_name() == scoped_class_global_name
+        if let Some(scoped_class_info) = self.scoped_class_info.as_ref()
+            && decl.get_name() == scoped_class_info.global_name
+            && !scoped_class_info.is_global_singleton
             && let LuaDeclExtra::Global { kind } = decl.extra.clone()
         {
             decl.extra = LuaDeclExtra::Local { kind, attrib: None };
@@ -359,9 +373,67 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     pub fn is_scoped_class_global_name(&self, name: &str) -> bool {
-        self.scoped_class_global_name
+        self.scoped_class_global_names
             .as_ref()
-            .is_some_and(|scoped_name| scoped_name == name)
+            .is_some_and(|global_names| global_names.contains(name))
+    }
+
+    fn maybe_seed_scoped_class_decl(&mut self, chunk_range: TextRange) {
+        if self.seeded_scoped_class_decl {
+            return;
+        }
+
+        let Some(scoped_class_info) = self.scoped_class_info.clone() else {
+            return;
+        };
+        if !scoped_class_info.is_global_singleton {
+            return;
+        }
+
+        let synthetic_base = chunk_range.start();
+        let mut synthetic_offset = 0u32;
+        let mut next_synthetic_range = || {
+            let position = synthetic_base + TextSize::new(synthetic_offset);
+            synthetic_offset += 1;
+            TextRange::new(position, position)
+        };
+
+        self.seed_scoped_class_decl_name(
+            &scoped_class_info.global_name,
+            scoped_class_info.is_global_singleton,
+            next_synthetic_range(),
+        );
+        if scoped_class_info.is_global_singleton {
+            for alias in &scoped_class_info.aliases {
+                self.seed_scoped_class_decl_name(alias, true, next_synthetic_range());
+            }
+        }
+        self.seeded_scoped_class_decl = true;
+    }
+
+    fn seed_scoped_class_decl_name(
+        &mut self,
+        global_name: &str,
+        is_global_singleton: bool,
+        range: TextRange,
+    ) {
+        let extra = if is_global_singleton {
+            LuaDeclExtra::Global {
+                kind: LuaSyntaxKind::NameExpr.into(),
+            }
+        } else {
+            LuaDeclExtra::Local {
+                kind: LuaSyntaxKind::NameExpr.into(),
+                attrib: None,
+            }
+        };
+        self.add_decl(LuaDecl::new(
+            global_name,
+            self.get_file_id(),
+            range,
+            extra,
+            None,
+        ));
     }
 
     pub fn set_legacy_module_env(&mut self, legacy_module_env: LegacyModuleEnv) {

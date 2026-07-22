@@ -336,6 +336,19 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
         "SANDBOX".to_string(),
         "PLUGIN".to_string(),
     ];
+    for scoped_hook_owner in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .hook_owner_globals()
+    {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&scoped_hook_owner))
+        {
+            names.push(scoped_hook_owner);
+        }
+    }
     for configured_prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
         let normalized = configured_prefix
             .trim()

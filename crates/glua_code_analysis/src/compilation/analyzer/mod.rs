@@ -1064,6 +1064,9 @@ impl AnalyzeContext {
                     GmodScopedClassInfo {
                         class_name: scope_match.class_name,
                         global_name: scope_match.definition.class_global,
+                        is_global_singleton: scope_match.definition.is_global_singleton,
+                        aliases: scope_match.definition.aliases,
+                        super_types: scope_match.definition.super_types,
                         class_name_prefix: scope_match.definition.class_name_prefix,
                     },
                 )

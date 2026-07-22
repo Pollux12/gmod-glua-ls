@@ -436,6 +436,61 @@ mod test {
     }
 
     #[gtest]
+    fn test_schema_scope_binds_aliases_to_global_singleton() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/example_framework/modules/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            function Schema:PlayerSpawn(client) end
+            "#,
+        );
+        let class_id = LuaTypeDeclId::global("SCHEMA");
+
+        let db = ws.get_db_mut();
+        let scope_info = db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_id)
+            .expect("expected schema scope info");
+        assert_eq!(scope_info.class_name, "SCHEMA");
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .expect("expected schema declaration tree");
+        for global_name in ["SCHEMA", "Schema"] {
+            let decl = decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == global_name && decl.is_global())
+                .unwrap_or_else(|| panic!("expected synthetic {global_name} declaration"));
+            let type_cache = db
+                .get_type_index()
+                .get_type_cache(&decl.get_id().into())
+                .unwrap_or_else(|| panic!("expected {global_name} type cache"));
+            assert_eq!(type_cache.as_type(), &LuaType::Def(class_id.clone()));
+        }
+
+        let class_decl = db
+            .get_type_index()
+            .get_type_decl(&class_id)
+            .expect("expected inferred schema singleton class declaration");
+        assert!(class_decl.is_class());
+        let super_types = db
+            .get_type_index()
+            .get_super_types(&class_id)
+            .expect("expected schema singleton super types");
+        assert!(
+            super_types
+                .iter()
+                .any(|typ| typ == &LuaType::Ref(LuaTypeDeclId::global("GM")))
+        );
+    }
+
+    #[gtest]
     fn test_player_class_scope_binds_player_decl_to_scoped_class() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

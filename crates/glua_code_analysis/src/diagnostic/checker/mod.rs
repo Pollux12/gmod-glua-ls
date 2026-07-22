@@ -45,8 +45,8 @@ mod unnecessary_if;
 mod unused;
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaIndexExpr,
-    LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment,
+    LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
@@ -506,7 +506,7 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
 
             let is_table_literal = exprs
                 .get(idx)
-                .is_some_and(|expr| matches!(expr, LuaExpr::TableExpr(_)));
+                .is_some_and(|expr| assignment_guarantees_table(var.syntax(), expr));
             events
                 .entry((block_start, block_end, prefix_text))
                 .or_default()
@@ -518,6 +518,25 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
     }
 
     events
+}
+
+fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
+    if matches!(expr, LuaExpr::TableExpr(_)) {
+        return true;
+    }
+
+    let LuaExpr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpOr) {
+        return false;
+    }
+    let Some((left, right)) = binary.get_exprs() else {
+        return false;
+    };
+
+    matches!(right, LuaExpr::TableExpr(_))
+        && normalized_syntax_text(left.syntax()) == normalized_syntax_text(var)
 }
 
 pub fn is_initialized_assignment_prefix(

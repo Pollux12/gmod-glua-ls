@@ -970,4 +970,37 @@ mod test {
         let player_type = ws.ty("Player");
         assert_eq!(ws.humanize_type(hook_ply), ws.humanize_type(player_type));
     }
+
+    #[test]
+    fn test_schema_hook_owner_infers_gamemode_hook_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@param client Player
+            function GM:PlayerSpawn(client) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_hooks.lua",
+            r#"
+            function Schema:PlayerSpawn(client)
+                schema_hook_client = client
+            end
+            "#,
+        );
+
+        let client_type = ws.expr_ty("schema_hook_client");
+        let player_type = ws.ty("Player");
+        assert_eq!(ws.humanize_type(client_type), ws.humanize_type(player_type));
+    }
 }

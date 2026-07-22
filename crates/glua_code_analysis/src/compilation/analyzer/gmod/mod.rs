@@ -26,7 +26,10 @@ use crate::{
     LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalysisPipeline, AnalyzeContext,
-        common::{TypeCacheWriteMode, add_member, write_type_cache},
+        common::{
+            TypeCacheWriteMode, add_member, migrate_global_members_when_type_resolve,
+            write_type_cache,
+        },
     },
     db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
@@ -198,7 +201,14 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             .hook_mappings
             .method_prefixes
             .iter()
-            .map(|p| format!("{p}:"))
+            .cloned()
+            .chain(
+                db.get_emmyrc()
+                    .gmod
+                    .scripted_class_scopes
+                    .hook_owner_globals(),
+            )
+            .map(|prefix| format!("{prefix}:"))
             .collect();
         let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
 
@@ -299,6 +309,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                     .map(|info| GmodScopedClassMatch {
                         class_name: info.class_name.clone(),
                         global_name: info.global_name.clone(),
+                        is_global_singleton: info.is_global_singleton,
+                        aliases: info.aliases.clone(),
+                        super_types: info.super_types.clone(),
                         class_name_prefix: info.class_name_prefix.clone(),
                     })
                     .or_else(|| {
@@ -308,6 +321,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                             GmodScopedClassInfo {
                                 class_name: m.class_name.clone(),
                                 global_name: m.global_name.clone(),
+                                is_global_singleton: m.is_global_singleton,
+                                aliases: m.aliases.clone(),
+                                super_types: m.super_types.clone(),
                                 class_name_prefix: m.class_name_prefix.clone(),
                             },
                         );
@@ -322,6 +338,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                         file_id,
                         &scope_match.class_name,
                         &scope_match.global_name,
+                        &scope_match.super_types,
                         in_filed_tree.value.syntax().text_range(),
                     );
 
@@ -570,7 +587,14 @@ fn collect_annotated_scripted_class_calls(
         .hook_mappings
         .method_prefixes
         .iter()
-        .map(|p| format!("{p}:"))
+        .cloned()
+        .chain(
+            db.get_emmyrc()
+                .gmod
+                .scripted_class_scopes
+                .hook_owner_globals(),
+        )
+        .map(|prefix| format!("{prefix}:"))
         .collect();
     collect_annotated_scripted_class_calls_with(
         db,
@@ -2223,6 +2247,9 @@ fn extract_send_target_text(call_expr: &LuaCallExpr, send_kind: NetSendKind) -> 
 pub(crate) struct GmodScopedClassMatch {
     pub global_name: String,
     pub class_name: String,
+    pub is_global_singleton: bool,
+    pub aliases: Vec<String>,
+    pub super_types: Vec<String>,
     /// The scope's `classNamePrefix` (if any). Used to derive the stripped
     /// short name for parent-alias synthesis (e.g. `gamemode_sandbox` →
     /// `sandbox` → `Sandbox`).
@@ -2241,7 +2268,12 @@ fn collect_scripted_scope_type_bindings_with(
         };
 
         for decl in decl_tree.get_decls().values() {
-            if decl.get_name() != scope_match.global_name {
+            if decl.get_name() != scope_match.global_name
+                && !scope_match
+                    .aliases
+                    .iter()
+                    .any(|alias| alias == decl.get_name())
+            {
                 continue;
             }
 
@@ -2262,6 +2294,7 @@ fn collect_scripted_scope_type_bindings_with(
         file_id,
         &scope_match.class_name,
         &scope_match.global_name,
+        &scope_match.super_types,
         decls[0].1,
     );
 
@@ -2277,6 +2310,7 @@ fn collect_scripted_scope_type_bindings_with(
             LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
             TypeCacheWriteMode::ForceOverwrite,
         );
+        migrate_global_members_when_type_resolve(db, decl_id.into());
 
         if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
             let table_member_owner = LuaMemberOwner::Element(table_range);
@@ -2306,6 +2340,7 @@ fn ensure_scoped_class_type_decl(
     file_id: FileId,
     class_name: &str,
     global_name: &str,
+    configured_super_types: &[String],
     range: rowan::TextRange,
 ) -> LuaTypeDeclId {
     let class_decl_id = get_scripted_class_type_decl_id(global_name, class_name);
@@ -2342,7 +2377,7 @@ fn ensure_scoped_class_type_decl(
         );
     }
 
-    for super_type in scoped_class_super_types(global_name) {
+    for super_type in scoped_class_super_types(global_name, class_name, configured_super_types) {
         db.get_type_index_mut().add_super_type_if_missing(
             class_decl_id.clone(),
             file_id,
@@ -2373,7 +2408,9 @@ pub(crate) fn resolve_scoped_authoring_type(
     }
 
     let info = db.get_gmod_infer_index().get_scoped_class_info(&file_id)?;
-    (info.global_name == name || (info.global_name == "GM" && name == "GAMEMODE"))
+    (info.global_name == name
+        || info.aliases.iter().any(|alias| alias == name)
+        || (info.global_name == "GM" && name == "GAMEMODE"))
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
 }
 
@@ -3020,7 +3057,11 @@ pub(crate) fn scoped_class_authored_as_local(global_name: &str) -> bool {
     matches!(global_name, "PLUGIN" | "PLAYER")
 }
 
-fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
+fn scoped_class_super_types(
+    global_name: &str,
+    class_name: &str,
+    configured: &[String],
+) -> Vec<LuaType> {
     // PLAYER is special: the runtime authoring table is named `PLAYER`, but that
     // identifier is already a GMod enum alias (`PLAYER_IDLE`, ... in enums.lua),
     // so the authoring-class annotation cannot use it. The shared player-class
@@ -3031,13 +3072,23 @@ fn scoped_class_super_types(global_name: &str) -> Vec<LuaType> {
         return vec![LuaType::Ref(LuaTypeDeclId::global("PlayerClass"))];
     }
 
-    let mut super_types = vec![LuaType::Ref(LuaTypeDeclId::global(global_name))];
+    let mut super_types = Vec::new();
+    if class_name != global_name {
+        super_types.push(LuaType::Ref(LuaTypeDeclId::global(global_name)));
+    }
     match global_name {
         "TOOL" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Tool"))),
         "SWEP" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Weapon"))),
         "ENT" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("Entity"))),
         "PLUGIN" => super_types.push(LuaType::Ref(LuaTypeDeclId::global("GM"))),
         _ => {}
+    }
+
+    for super_type in configured {
+        let super_type = LuaType::Ref(LuaTypeDeclId::global(super_type));
+        if !super_types.contains(&super_type) {
+            super_types.push(super_type);
+        }
     }
 
     super_types
@@ -3049,18 +3100,27 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
     range: rowan::TextRange,
 ) -> Option<LuaTypeDeclId> {
     // Use cached info if available, otherwise detect from path
-    let (class_name, global_name) =
+    let (class_name, global_name, super_types) =
         if let Some(info) = db.get_gmod_infer_index().get_scoped_class_info(&file_id) {
-            (info.class_name.clone(), info.global_name.clone())
+            (
+                info.class_name.clone(),
+                info.global_name.clone(),
+                info.super_types.clone(),
+            )
         } else {
             let scope_match = detect_scoped_class_from_path(db, file_id)?;
-            (scope_match.class_name, scope_match.global_name)
+            (
+                scope_match.class_name,
+                scope_match.global_name,
+                scope_match.super_types,
+            )
         };
     Some(ensure_scoped_class_type_decl(
         db,
         file_id,
         &class_name,
         &global_name,
+        &super_types,
         range,
     ))
 }
@@ -4154,6 +4214,7 @@ fn synthesize_scoped_base_assignments_with(
         file_id,
         &scope_match.class_name,
         &scope_match.global_name,
+        &scope_match.super_types,
         root.syntax().text_range(),
     );
     let expected_base_path = format!("{}.Base", scope_match.global_name);
@@ -4720,7 +4781,7 @@ fn materialize_scoped_gamemode_base(
     }
 
     let range = rowan::TextRange::default();
-    ensure_scoped_class_type_decl(db, file_id, base_name, "GM", range);
+    ensure_scoped_class_type_decl(db, file_id, base_name, "GM", &[], range);
 }
 
 fn resolve_effective_inheritance_call(
@@ -6394,6 +6455,9 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
         .map(|scope_match| GmodScopedClassMatch {
             global_name: scope_match.definition.class_global,
             class_name: scope_match.class_name,
+            is_global_singleton: scope_match.definition.is_global_singleton,
+            aliases: scope_match.definition.aliases,
+            super_types: scope_match.definition.super_types,
             class_name_prefix: scope_match.definition.class_name_prefix,
         })
 }
@@ -8854,9 +8918,8 @@ fn is_builtin_method_hook_prefix(prefix_name: &str) -> bool {
 }
 
 fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
-    db.get_emmyrc()
-        .gmod
-        .hook_mappings
+    let gmod = &db.get_emmyrc().gmod;
+    gmod.hook_mappings
         .method_prefixes
         .iter()
         .any(|configured_prefix| {
@@ -8865,6 +8928,22 @@ fn is_configured_method_hook_prefix(db: &DbIndex, prefix_name: &str) -> bool {
                 .trim_end_matches([':', '.'])
                 .eq_ignore_ascii_case(prefix_name)
         })
+        || gmod
+            .scripted_class_scopes
+            .resolved_definitions_slice()
+            .iter()
+            .any(|definition| {
+                (definition.hook_owner
+                    || definition
+                        .super_types
+                        .iter()
+                        .any(|super_type| super_type.eq_ignore_ascii_case("GM")))
+                    && (definition.class_global.eq_ignore_ascii_case(prefix_name)
+                        || definition
+                            .aliases
+                            .iter()
+                            .any(|alias| alias.eq_ignore_ascii_case(prefix_name)))
+            })
 }
 
 #[derive(Debug, Clone)]

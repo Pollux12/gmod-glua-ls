@@ -11043,6 +11043,102 @@ mod test {
         );
     }
 
+    #[test]
+    fn dynamic_index_initialized_with_or_is_not_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local stored = {}
+            local class = "combine"
+            local key = "zero"
+            stored[class] = stored[class] or {}
+            stored[class][key] = true
+            "#,
+        ));
+    }
+
+    #[test]
+    fn schema_dynamic_index_initialized_with_or_is_not_unchecked_nil_access() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+            ---@class stringlib
+            string = {}
+            ---@param value string
+            ---@return string
+            function string.lower(value) end
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+        let file_id = ws.def_file(
+            "gamemodes/example-rp/schema/libs/sh_voices.lua",
+            r#"
+            Schema.voices = {}
+            Schema.voices.stored = {}
+            function Schema.voices.Add(class, key, text, sound, global)
+                class = string.lower(class)
+                key = string.lower(key)
+                Schema.voices.stored[class] = Schema.voices.stored[class] or {}
+                Schema.voices.stored[class][key] = {
+                    text = text,
+                    sound = sound,
+                    global = global
+                }
+            end
+
+            function Schema.voices.Get(class, key)
+                class = string.lower(class)
+                key = string.lower(key)
+                if (Schema.voices.stored[class]) then
+                    return Schema.voices.stored[class][key]
+                end
+            end
+
+            function Schema.voices.AddClass(class, condition)
+                class = string.lower(class)
+                Schema.voices.classes[class] = { condition = condition }
+            end
+
+            function Schema.voices.GetClass(client)
+                local classes = {}
+                for k, v in pairs(Schema.voices.classes) do
+                    if (v.condition(client)) then
+                        classes[#classes + 1] = k
+                    end
+                end
+                return classes
+            end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_voices.lua",
+            r#"
+            Schema.voices.Add("Combine", "ZERO", "Zero", "zero.wav")
+            Schema.voices.Add("Dispatch", "ALERT", "Alert", "alert.wav", true)
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let need_check_nil = Some(NumberOrString::String(
+            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != need_check_nil),
+            "unexpected NeedCheckNil diagnostics: {diagnostics:#?}"
+        );
+    }
+
     #[gtest]
     fn test_istable_short_circuit_guards_indexed_table_access() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

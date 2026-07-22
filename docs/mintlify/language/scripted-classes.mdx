@@ -27,8 +27,11 @@ GLuaLS detects the standard class table from the file's project folder. For exam
 | `lua/effects/**/` | `EFFECT` | (none) |
 | `lua/weapons/gmod_tool/stools/` | `TOOL` | Tool |
 | `gamemode/` | `GM` | Gamemode |
+| `gamemodes/*/schema/**/` | `SCHEMA` / `Schema` | Gamemode |
 
 GLuaLS types the detected class table with the base class's methods and fields, so you get completions and type checking without annotations.
+
+Schemas work automatically for any framework or gamemode. GLuaLS treats `SCHEMA` and `Schema` as aliases for one global schema table, merges members declared across schema files, and exposes gamemode hooks inherited from `GM`. The schema remains available to files outside the `schema/` directory, matching the usual runtime behavior of global schema systems.
 
 Player classes, plugins, and custom project layouts are also supported through the scripted class settings.
 
@@ -188,6 +191,11 @@ If you use a non-standard directory structure or custom class types, configure G
 | `id` | Unique identifier for this class scope |
 | `label` | Display name in the Class Explorer sidebar |
 | `classGlobal` | The global table name used in scripts (e.g., `ENT`, `SWEP`, `PANEL`) |
+| `fixedClassName` | A single class name shared by every matching authoring file |
+| `isGlobalSingleton` | Makes the class global and its aliases resolve throughout the project, not only in matching authoring files |
+| `aliases` | Additional global names that resolve to the same class |
+| `superTypes` | Classes whose members and hooks this class inherits |
+| `hookOwner` | Treats methods on the class global and its aliases as gamemode hook implementations |
 | `path` | Path segments used for display grouping in the Class Explorer |
 | `include` | Glob patterns matching files that belong to this class type |
 | `rootDir` | Root directory for scaffolded files |

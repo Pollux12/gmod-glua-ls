@@ -5493,4 +5493,71 @@ owner:CompletelyMadeUpMethod()
         let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
         assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
     }
+
+    #[test]
+    fn schema_members_merge_across_files_and_aliases() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            function Schema:IsPrivilegedRank(text, rank) return true end
+            function Schema:SaveAccessRules() end
+            "#,
+        );
+        let schema_consumer = ws.def_file(
+            "gamemodes/example-rp/schema/cl_hooks.lua",
+            r#"
+            print(SCHEMA.name)
+            print(Schema:IsPrivilegedRank("USER-01", "01"))
+            "#,
+        );
+        let external_consumer = ws.def_file(
+            "gamemodes/example-rp/entities/entities/example_access_control.lua",
+            r#"
+            function ENT:OnRemove()
+                print(Schema.SaveAccessRules)
+                Schema:SaveAccessRules()
+            end
+            "#,
+        );
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        for consumer in [schema_consumer, external_consumer] {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(consumer, CancellationToken::new())
+                .unwrap_or_default();
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != undefined_field),
+                "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+            );
+        }
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(external_consumer, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_method),
+            "unexpected UndefinedMethod diagnostics: {diagnostics:#?}"
+        );
+    }
 }
