@@ -1748,6 +1748,87 @@ mod test {
     }
 
     #[test]
+    fn partial_class_optional_field_refinement_is_optional_in_structural_check() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers? table
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn partial_class_required_duplicate_field_remains_required() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers table
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn partial_class_optional_field_refinement_still_checks_present_value_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers? table
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid", headers = 1 })
+            "#
+        ));
+    }
+
+    #[test]
     fn test_function_union_meta() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.analysis.emmyrc.as_ref().clone();

@@ -330,19 +330,38 @@ fn check_ref_type_compact_table(
         })
         .unwrap_or_default();
 
-    let source_type_members =
-        member_index.get_members(&LuaMemberOwner::Type(source_type_id.clone()));
+    let source_owner = LuaMemberOwner::Type(source_type_id.clone());
+    let source_type_members = member_index.get_members(&source_owner);
     let Some(source_type_members) = source_type_members else {
         return Ok(()); // empty member donot need check
     };
 
+    let mut resolved_duplicate_types = HashMap::new();
+
     for source_member in source_type_members {
-        let source_member_type = context
+        let raw_source_member_type = context
             .db
             .get_type_index()
             .get_type_cache(&source_member.get_id().into())
             .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
             .as_type();
+        let key = source_member.get_key();
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            resolved_duplicate_types.entry(key.clone())
+            && let Some(item) = member_index.get_member_item(&source_owner, key)
+            && !item.is_one()
+            && item.get_member_ids().iter().all(|member_id| {
+                member_index.get_member(member_id).is_some_and(|member| {
+                    member.get_feature() == crate::LuaMemberFeature::MetaFieldDecl
+                })
+            })
+            && let Ok(typ) = context.resolve_member_item_type(item)
+        {
+            entry.insert(typ);
+        }
+        let source_member_type = resolved_duplicate_types
+            .get(key)
+            .unwrap_or(raw_source_member_type);
         let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
         if !is_required_structural_member(
             context.db,
