@@ -28,6 +28,7 @@ pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
 use infer_name::infer_name_expr;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
+pub(crate) use infer_name::type_decl_is_vgui_panel;
 pub use infer_name::{find_self_decl_or_member_id, infer_param, infer_param_with_cache};
 use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};

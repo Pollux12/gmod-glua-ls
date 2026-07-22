@@ -5543,7 +5543,7 @@ fn lua_expr_string_literal(expr: &LuaExpr) -> Option<String> {
     }
 }
 
-fn vgui_register_table_type_decl_id(
+pub(crate) fn vgui_register_table_type_decl_id(
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,
 ) -> LuaTypeDeclId {
@@ -5708,7 +5708,7 @@ fn write_position_contains_register(
 /// kind and land in `vgui_register_table_calls`, but only `RegisterTable`
 /// actually registers a panel class. `CreateFromTable` instantiates from
 /// an already-registered table and should not populate the dedup set.
-fn is_vgui_register_table_call(
+pub(crate) fn is_vgui_register_table_call(
     db: &DbIndex,
     file_id: FileId,
     call: &GmodScriptedClassCallMetadata,

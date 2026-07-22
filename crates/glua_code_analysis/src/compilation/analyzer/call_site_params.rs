@@ -8,18 +8,20 @@ use crate::{
     DbIndex, FileId, InFiled, LuaDeclExtra, LuaDeclId, LuaDependencyKind, LuaInferCache,
     LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
     LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeFact, WorkspaceId,
+    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, WorkspaceId,
     find_signature_attribute_use, get_member_map, get_member_value_expr,
     get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
-    LuaIfStat, LuaIndexKey, LuaLocalStat, LuaNameExpr, LuaReturnStat, LuaVarExpr, PathTrait,
+    LuaIfStat, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaReturnStat,
+    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::{TextRange, TextSize};
 
 use super::{
     AnalysisPipeline, AnalyzeContext,
+    gmod::{is_vgui_register_table_call, vgui_register_table_type_decl_id},
     unresolve::{UnResolve, UnResolveDecl, UnResolveMember},
 };
 
@@ -141,6 +143,13 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                     &mut receiver_consumers,
                 );
             }
+            collect_vgui_named_callback_receiver_types(
+                db,
+                &mut cache,
+                file_id,
+                &root,
+                &mut contributions,
+            );
             (
                 file_id,
                 contributions,
@@ -203,6 +212,297 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
             requeued_returns,
             requeued_consumers,
         );
+    }
+}
+
+#[derive(Debug, Clone)]
+struct VguiNamedCallbackCandidate {
+    signature_id: LuaSignatureId,
+    member_key: LuaMemberKey,
+    receiver_id: LuaTypeDeclId,
+}
+
+fn collect_vgui_named_callback_receiver_types(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    root: &glua_parser::LuaChunk,
+    contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
+) {
+    let Some(metadata) = db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&file_id)
+    else {
+        return;
+    };
+    if metadata.vgui_register_table_calls.is_empty() {
+        return;
+    }
+    let red_root = root.syntax().clone();
+    let mut candidates: HashMap<LuaDeclId, Option<VguiNamedCallbackCandidate>> = HashMap::new();
+    let mut candidate_names = HashSet::new();
+
+    for field in root.syntax().descendants().filter_map(LuaTableField::cast) {
+        let Some(LuaExpr::NameExpr(name_expr)) = field.get_value_expr() else {
+            continue;
+        };
+        let Some(index_key) = field.get_field_key() else {
+            continue;
+        };
+        let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
+            continue;
+        };
+        let Some((receiver_type, _)) =
+            vgui_named_callback_binding(db, cache, file_id, metadata, &name_expr, &member_key)
+        else {
+            continue;
+        };
+        let Some(receiver_id) = concrete_vgui_receiver_id(db, &receiver_type) else {
+            continue;
+        };
+
+        let Some(LuaSemanticDeclId::LuaDecl(decl_id)) = infer_expr_semantic_decl(
+            db,
+            cache,
+            LuaExpr::NameExpr(name_expr.clone()),
+            Default::default(),
+            Default::default(),
+        ) else {
+            continue;
+        };
+        let Some(signature_id) = named_callback_signature_id(db, &red_root, decl_id) else {
+            continue;
+        };
+        let candidate = VguiNamedCallbackCandidate {
+            signature_id,
+            member_key,
+            receiver_id,
+        };
+        if let Some(name) = name_expr.get_name_text() {
+            candidate_names.insert(name);
+        }
+        candidates
+            .entry(decl_id)
+            .and_modify(|current| {
+                if current.as_ref().is_some_and(|current| {
+                    current.member_key != candidate.member_key
+                        || current.receiver_id != candidate.receiver_id
+                }) {
+                    *current = None;
+                }
+            })
+            .or_insert(Some(candidate));
+    }
+
+    let mut references_by_decl: HashMap<LuaDeclId, Vec<LuaNameExpr>> = HashMap::new();
+    for name_expr in root.syntax().descendants().filter_map(LuaNameExpr::cast) {
+        if !name_expr
+            .get_name_text()
+            .is_some_and(|name| candidate_names.contains(&name))
+        {
+            continue;
+        }
+        let Some(LuaSemanticDeclId::LuaDecl(decl_id)) = infer_expr_semantic_decl(
+            db,
+            cache,
+            LuaExpr::NameExpr(name_expr.clone()),
+            Default::default(),
+            Default::default(),
+        ) else {
+            continue;
+        };
+        if candidates.contains_key(&decl_id) {
+            references_by_decl
+                .entry(decl_id)
+                .or_default()
+                .push(name_expr);
+        }
+    }
+
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_unstable_by_key(|(decl_id, _)| decl_id.position);
+    for (decl_id, candidate) in candidates {
+        let Some(candidate) = candidate else {
+            continue;
+        };
+        let Some(signature) = db.get_signature_index().get(&candidate.signature_id) else {
+            continue;
+        };
+        if signature.is_colon_define
+            || signature.params.is_empty()
+            || signature.param_docs.contains_key(&0)
+            || db
+                .get_call_site_param_index()
+                .is_param_mutated(&candidate.signature_id, 0)
+        {
+            continue;
+        }
+        let Some(references) = references_by_decl.remove(&decl_id) else {
+            continue;
+        };
+
+        let mut bindings = Vec::new();
+        let mut eligible = true;
+        for name_expr in references {
+            let Some((receiver_type, source)) = vgui_named_callback_binding(
+                db,
+                cache,
+                file_id,
+                metadata,
+                &name_expr,
+                &candidate.member_key,
+            ) else {
+                eligible = false;
+                break;
+            };
+            let Some(receiver_id) = concrete_vgui_receiver_id(db, &receiver_type) else {
+                eligible = false;
+                break;
+            };
+            if receiver_id != candidate.receiver_id {
+                eligible = false;
+                break;
+            }
+            bindings.push(source);
+        }
+        if !eligible || bindings.is_empty() {
+            continue;
+        }
+
+        for source in bindings {
+            let node = LuaInferenceNodeId::SignatureParam {
+                signature_id: candidate.signature_id,
+                param_idx: 0,
+            };
+            let event = LuaInferenceEventId {
+                node,
+                kind: LuaInferenceProvenanceKind::ConcreteValue,
+                source,
+            };
+            contributions.push((
+                candidate.signature_id,
+                0,
+                LuaTypeFact::new(
+                    LuaType::Def(candidate.receiver_id.clone()),
+                    LuaInferenceConfidence::Certain,
+                    Arc::from([LuaInferenceStep {
+                        event,
+                        support: Arc::from([]),
+                        found_type: None,
+                    }]),
+                ),
+            ));
+        }
+    }
+}
+
+fn named_callback_signature_id(
+    db: &DbIndex,
+    root: &glua_parser::LuaSyntaxNode,
+    decl_id: LuaDeclId,
+) -> Option<LuaSignatureId> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    if !matches!(decl.extra, LuaDeclExtra::Local { .. }) {
+        return None;
+    }
+    let closure = if let Some(value_syntax_id) = decl.get_value_syntax_id() {
+        let value_expr = value_syntax_id
+            .to_node_from_root(root)
+            .and_then(LuaExpr::cast)?;
+        let LuaExpr::ClosureExpr(closure) = value_expr else {
+            return None;
+        };
+        closure
+    } else {
+        root.descendants()
+            .filter_map(LuaLocalFuncStat::cast)
+            .find(|stat| {
+                stat.get_local_name()
+                    .is_some_and(|name| name.get_range() == decl.get_range())
+            })?
+            .get_closure()?
+    };
+    Some(LuaSignatureId::from_closure(decl_id.file_id, &closure))
+}
+
+fn vgui_named_callback_binding(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    metadata: &crate::db_index::GmodScriptedClassFileMetadata,
+    name_expr: &LuaNameExpr,
+    expected_key: &LuaMemberKey,
+) -> Option<(LuaType, InFiled<glua_parser::LuaSyntaxId>)> {
+    if let Some(field) = name_expr.get_parent::<LuaTableField>()
+        && field
+            .get_value_expr()
+            .is_some_and(|value| value.syntax() == name_expr.syntax())
+    {
+        let key = LuaMemberKey::from_index_key(db, cache, &field.get_field_key()?).ok()?;
+        if &key != expected_key {
+            return None;
+        }
+        let table_expr = field.get_parent::<LuaTableExpr>()?;
+        let table_range = table_expr.get_range();
+        let registration = metadata.vgui_register_table_calls.iter().find(|call| {
+            call.args
+                .get(call.vgui_panel_table_arg_idx(0))
+                .is_some_and(|arg| arg.syntax_id.get_range() == table_range)
+        })?;
+        if !is_vgui_register_table_call(db, file_id, registration) {
+            return None;
+        }
+        let receiver_type = LuaType::Def(vgui_register_table_type_decl_id(file_id, registration));
+        return Some((
+            receiver_type,
+            InFiled::new(file_id, table_expr.get_syntax_id()),
+        ));
+    }
+
+    let assign = name_expr.ancestors::<LuaAssignStat>().next()?;
+    let (vars, exprs) = assign.get_var_and_expr_list();
+    let value_idx = exprs
+        .iter()
+        .position(|expr| expr.syntax() == name_expr.syntax())?;
+    let LuaVarExpr::IndexExpr(index_expr) = vars.get(value_idx)? else {
+        return None;
+    };
+    let key = LuaMemberKey::from_index_key(db, cache, &index_expr.get_index_key()?).ok()?;
+    if &key != expected_key {
+        return None;
+    }
+    let receiver_expr = index_expr.get_prefix_expr()?;
+    let receiver_type = infer_expr(db, cache, receiver_expr.clone()).ok()?;
+    Some((
+        receiver_type,
+        InFiled::new(file_id, receiver_expr.get_syntax_id()),
+    ))
+}
+
+fn concrete_vgui_receiver_id(db: &DbIndex, typ: &LuaType) -> Option<LuaTypeDeclId> {
+    match typ {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            crate::semantic::type_decl_is_vgui_panel(db, type_id, 0).then(|| type_id.clone())
+        }
+        LuaType::Instance(instance) => concrete_vgui_receiver_id(db, instance.get_base()),
+        LuaType::Union(union) => {
+            let mut receiver_id = None;
+            for typ in union.types() {
+                if matches!(typ, LuaType::Nil) {
+                    continue;
+                }
+                let candidate_id = concrete_vgui_receiver_id(db, typ)?;
+                if receiver_id
+                    .as_ref()
+                    .is_some_and(|receiver_id| receiver_id != &candidate_id)
+                {
+                    return None;
+                }
+                receiver_id = Some(candidate_id);
+            }
+            receiver_id
+        }
+        _ => None,
     }
 }
 

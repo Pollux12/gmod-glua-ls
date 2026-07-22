@@ -377,6 +377,92 @@ mod tests {
     }
 
     #[test]
+    fn named_vgui_callback_uses_all_concrete_receiver_bindings() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "annotations/vgui_buttons.lua",
+            r#"
+            ---@class DButton: Panel
+            local DButton = {}
+            function DButton:IsDown() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/starfall/editor/named_button.lua",
+            r#"
+            local function PaintFlatButton(panel)
+                panel:IsDown()
+            end
+
+            local ButtonTable = vgui.RegisterTable({
+                Paint = PaintFlatButton,
+            }, "DButton")
+            local first = vgui.CreateFromTable(ButtonTable)
+            local second = vgui.CreateFromTable(ButtonTable)
+            first.Paint = PaintFlatButton
+            second.Paint = PaintFlatButton
+            "#,
+        );
+
+        assert!(only_closure_has_inferred_first_param(&ws, file_id));
+        assert!(!has_undefined_method(&ws, file_id));
+    }
+
+    #[test]
+    fn named_vgui_callback_rejects_incompatible_receiver_binding() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "annotations/vgui_buttons.lua",
+            r#"
+            ---@class DButton: Panel
+            local DButton = {}
+            function DButton:IsDown() end
+            ---@class DPanel: Panel
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/starfall/editor/mixed_button.lua",
+            r#"
+            local function PaintFlatButton(panel)
+                panel:IsDown()
+            end
+
+            vgui.RegisterTable({
+                Paint = PaintFlatButton,
+            }, "DButton")
+            local other = vgui.Create("DPanel")
+            other.Paint = PaintFlatButton
+            "#,
+        );
+
+        assert!(!only_closure_has_inferred_first_param(&ws, file_id));
+    }
+
+    #[test]
+    fn named_vgui_callback_rejects_non_binding_escape() {
+        let mut ws = gmod_workspace();
+        ws.def_file(
+            "annotations/vgui_buttons.lua",
+            r#"
+            ---@class DButton: Panel
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/starfall/editor/escaped_button.lua",
+            r#"
+            local function PaintFlatButton(panel) end
+
+            vgui.RegisterTable({
+                Paint = PaintFlatButton,
+            }, "DButton")
+            consume(PaintFlatButton)
+            "#,
+        );
+
+        assert!(!only_closure_has_inferred_first_param(&ws, file_id));
+    }
+
+    #[test]
     fn unregistered_panel_shaped_table_keeps_table_member_owners() {
         let mut ws = gmod_workspace();
         let source_file_id = ws.def_file(
