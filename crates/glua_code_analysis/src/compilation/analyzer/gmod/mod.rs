@@ -2764,12 +2764,11 @@ fn resolve_vgui_parent_source(
     match source {
         GmodVguiParentSource::LiteralName(name) => {
             let type_id = LuaTypeDeclId::global(name);
-            let type_ids = db
-                .get_type_index()
-                .get_type_decl(&type_id)
-                .is_some()
-                .then(|| resolve_type_ids(LuaType::Ref(type_id)))
-                .unwrap_or_default();
+            let type_ids = if db.get_type_index().get_type_decl(&type_id).is_some() {
+                resolve_type_ids(LuaType::Ref(type_id))
+            } else {
+                Vec::new()
+            };
             ResolvedVguiParentSource::Direct(type_ids)
         }
         GmodVguiParentSource::Expr(syntax_id) => {

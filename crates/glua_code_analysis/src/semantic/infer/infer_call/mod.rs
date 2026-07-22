@@ -964,9 +964,7 @@ fn specialize_class_name_param_return_alias_for_call(
     let arg = call_arg_for_param(call_expr, func_ty, &args, param_idx)?;
     let class_name = resolve_class_name_string_from_arg(db, cache, &arg)?;
     let type_id = LuaTypeDeclId::global(&class_name);
-    if db.get_type_index().get_type_decl(&type_id).is_none() {
-        return None;
-    }
+    db.get_type_index().get_type_decl(&type_id)?;
 
     let range = InFiled {
         file_id: cache.get_file_id(),
