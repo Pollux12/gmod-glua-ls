@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
@@ -8,7 +8,7 @@ use crate::{
     DbIndex, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
     LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey,
     LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    ReturnTypeKind, SignatureReturnStatus, TypeOps, get_real_type, humanize_type,
+    ReturnTypeKind, SignatureReturnStatus, TypeOps, VariadicType, get_real_type, humanize_type,
     infer_call_expr_func, infer_expr, infer_table_should_be,
 };
 
@@ -683,6 +683,15 @@ fn resolve_doc_function(
     }
 
     let doc_return = doc_func.get_ret();
+    let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
+        .then(|| {
+            inferred_return_tail_matching_documented_first(
+                doc_return,
+                &signature.get_return_type(),
+                |slot| signature.return_correlation_implies(0, slot),
+            )
+        })
+        .flatten();
     let should_apply_return = match signature.resolve_return {
         SignatureReturnStatus::UnResolve => true,
         SignatureReturnStatus::InferResolve => {
@@ -691,7 +700,28 @@ fn resolve_doc_function(
         SignatureReturnStatus::DocResolve => false,
     };
 
-    if should_apply_return {
+    if let Some(inferred_tail) = inferred_tail {
+        signature.resolve_return = SignatureReturnStatus::DocResolve;
+        signature.return_docs.clear();
+        signature.return_docs.push(LuaDocReturnInfo {
+            name: None,
+            type_ref: doc_return.clone(),
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: ReturnTypeKind::default(),
+        });
+        signature
+            .return_docs
+            .extend(inferred_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                name: None,
+                type_ref,
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            }));
+    } else if should_apply_return {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
         signature.return_docs.clear();
         signature.return_docs.push(LuaDocReturnInfo {
@@ -707,10 +737,129 @@ fn resolve_doc_function(
     Ok(())
 }
 
+/// Retains body-inferred extra Lua results when a contextual function contract
+/// describes only the same first result. Exact first-slot agreement prevents a
+/// different contract from widening the documented return, while informative
+/// tail checks keep unresolved inference from leaking into callers.
+pub(super) fn inferred_return_tail_matching_documented_first<F>(
+    documented_first: &LuaType,
+    inferred_return: &LuaType,
+    correlation_implies_non_nil: F,
+) -> Option<Vec<LuaType>>
+where
+    F: Fn(usize) -> bool,
+{
+    if documented_first.is_variadic() {
+        return None;
+    }
+
+    let LuaType::Variadic(variadic) = inferred_return else {
+        return None;
+    };
+    let VariadicType::Multi(inferred_slots) = variadic.deref() else {
+        return None;
+    };
+    if inferred_slots.len() <= 1
+        || inferred_slots
+            .iter()
+            .skip(1)
+            .any(|typ| typ.is_any() || typ.is_unknown())
+    {
+        return None;
+    }
+
+    let inferred_first = exact_non_nil_type(inferred_slots.first()?);
+    let documented_first_non_nil = exact_non_nil_type(documented_first);
+    if inferred_first != documented_first_non_nil {
+        return None;
+    }
+
+    let mut inferred_tail = inferred_slots[1..].to_vec();
+    if documented_first.is_always_truthy() {
+        for (tail_idx, typ) in inferred_tail.iter_mut().enumerate() {
+            if correlation_implies_non_nil(tail_idx + 1) {
+                *typ = exact_non_nil_type(typ);
+            }
+        }
+    }
+    Some(inferred_tail)
+}
+
+fn exact_non_nil_type(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .types()
+                .filter(|component| !component.is_nil())
+                .cloned()
+                .collect(),
+        ),
+        _ => typ.clone(),
+    }
+}
+
 fn should_doc_return_override_inferred(doc_return: &LuaType, inferred_return: &LuaType) -> bool {
     !(doc_return.is_any() || doc_return.is_unknown())
         || inferred_return.is_any()
         || inferred_return.is_unknown()
+}
+
+#[cfg(test)]
+mod inferred_return_tail_tests {
+    use super::inferred_return_tail_matching_documented_first;
+    use crate::{LuaType, VariadicType};
+
+    #[test]
+    fn matching_documented_first_preserves_only_informative_tail_slots() {
+        let inferred = LuaType::Variadic(
+            VariadicType::Multi(vec![
+                LuaType::from_vec(vec![LuaType::String, LuaType::Nil]),
+                LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]),
+            ])
+            .into(),
+        );
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| true),
+            Some(vec![LuaType::Number])
+        );
+    }
+
+    #[test]
+    fn incompatible_documented_first_rejects_inferred_tail() {
+        let inferred =
+            LuaType::Variadic(VariadicType::Multi(vec![LuaType::Number, LuaType::Boolean]).into());
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn uninformative_inferred_tail_is_not_exposed() {
+        let inferred =
+            LuaType::Variadic(VariadicType::Multi(vec![LuaType::String, LuaType::Unknown]).into());
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn nullable_documented_first_does_not_make_correlated_tail_non_nil() {
+        let nullable_string = LuaType::from_vec(vec![LuaType::String, LuaType::Nil]);
+        let nullable_number = LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]);
+        let inferred = LuaType::Variadic(
+            VariadicType::Multi(vec![nullable_string.clone(), nullable_number.clone()]).into(),
+        );
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&nullable_string, &inferred, |_| true),
+            Some(vec![nullable_number])
+        );
+    }
 }
 
 fn filter_signature_type(

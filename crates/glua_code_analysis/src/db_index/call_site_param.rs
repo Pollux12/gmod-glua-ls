@@ -18,6 +18,9 @@ pub(crate) struct CallSiteReturnConsumer {
     pub ret_idx: usize,
     pub target: CallSiteReturnConsumerTarget,
     pub definition: Option<LuaDefinitionId>,
+    /// The actual call result has a proven informative later slot, while this
+    /// target still holds the earlier single-result cache.
+    pub needs_result_refresh: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,6 +97,7 @@ pub struct CallSiteParamIndex {
     pending_previous_params: HashMap<(LuaSignatureId, usize), LuaTypeFact>,
     file_return_consumers: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
     return_consumers: HashMap<LuaSignatureId, Vec<CallSiteReturnConsumer>>,
+    return_consumers_by_signature_file: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
     /// Files owning callback parameters inferred from concrete structural table values.
     concrete_structural_callback_files: HashSet<FileId>,
     inference_events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
@@ -277,6 +281,27 @@ impl CallSiteParamIndex {
         consumers
     }
 
+    pub(crate) fn get_return_consumers_for_signature_files(
+        &self,
+        signature_file_ids: &HashSet<FileId>,
+    ) -> Vec<CallSiteReturnConsumer> {
+        let mut consumers = signature_file_ids
+            .iter()
+            .filter_map(|file_id| self.return_consumers_by_signature_file.get(file_id))
+            .flatten()
+            .cloned()
+            .collect::<Vec<_>>();
+        consumers.sort_unstable_by_key(|consumer| {
+            (
+                consumer.file_id,
+                consumer.call_syntax_id.get_range().start(),
+                consumer.ret_idx,
+            )
+        });
+        consumers.dedup();
+        consumers
+    }
+
     pub fn collect_contribution_signature_files(
         &self,
         source_files: &HashSet<FileId>,
@@ -431,12 +456,21 @@ impl CallSiteParamIndex {
     }
 
     fn current_file_source_dependencies(&self, file_id: FileId) -> HashSet<FileId> {
-        self.file_contributions
+        let contribution_sources = self
+            .file_contributions
             .get(&file_id)
             .into_iter()
             .flatten()
             .flat_map(|contribution| contribution.param_fact.provenance())
-            .map(|step| step.event.source.file_id)
+            .map(|step| step.event.source.file_id);
+        let return_sources = self
+            .file_return_consumers
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+            .map(|consumer| consumer.signature_id.get_file_id());
+        contribution_sources
+            .chain(return_sources)
             .filter(|source_file_id| *source_file_id != file_id)
             .collect()
     }
@@ -482,16 +516,29 @@ impl CallSiteParamIndex {
 
     fn rebuild_return_consumers(&mut self) {
         self.return_consumers.clear();
+        self.return_consumers_by_signature_file.clear();
         for file_id in sorted_file_ids(&self.file_return_consumers) {
             if let Some(consumers) = self.file_return_consumers.get(&file_id) {
                 for consumer in consumers {
+                    let signature_file_id = consumer.signature_id.get_file_id();
                     self.return_consumers
                         .entry(consumer.signature_id)
                         .or_default()
                         .push(consumer.clone());
+                    self.return_consumers_by_signature_file
+                        .entry(signature_file_id)
+                        .or_default()
+                        .push(consumer.clone());
+                    if signature_file_id != consumer.file_id {
+                        self.file_source_dependencies
+                            .entry(consumer.file_id)
+                            .or_default()
+                            .insert(signature_file_id);
+                    }
                 }
             }
         }
+        self.rebuild_source_dependents();
     }
 }
 
@@ -536,6 +583,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.pending_previous_params.clear();
         self.file_return_consumers.clear();
         self.return_consumers.clear();
+        self.return_consumers_by_signature_file.clear();
         self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
         self.file_source_dependencies.clear();

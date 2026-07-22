@@ -349,6 +349,191 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_inferred_nullable_multi_return_slots_keep_their_types() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/inherited_multi_return.lua",
+            r#"
+            local owner = {}
+
+            ---@return number
+            ---@return number
+            local function get_size() end
+
+            ---@type fun(self: table, enabled: boolean): string
+            owner.GetFont = function(self, enabled)
+                if not enabled then return end
+                local name = "font"
+                local width, height = get_size()
+                return name, width, height
+            end
+
+            owner.CurrentFont, owner.FontWidth, owner.FontHeight = owner:GetFont(true)
+
+            ---@param value number
+            local function takes_number(value) end
+
+            takes_number(owner.FontWidth)
+            takes_number(owner.FontHeight)
+            "#,
+        );
+
+        let font_width = latest_member_type(&ws, file_id, "FontWidth");
+        let font_width_desc = ws.humanize_type(font_width);
+        assert!(
+            font_width_desc.contains("number"),
+            "expected FontWidth to retain the second return slot, got {font_width_desc}"
+        );
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::AssignTypeMismatch),
+            is_empty()
+        )
+    }
+
+    #[gtest]
+    fn test_dynamic_field_direct_return_doc_keeps_undeclared_tail_unavailable() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/client/direct_doc_multi_return.lua",
+            r#"
+            ---@return string
+            local function get_font()
+                return "font", 8
+            end
+
+            local owner = {}
+            owner.CurrentFont, owner.FontWidth = get_font()
+            "#,
+        );
+
+        let font_width = latest_member_type(&ws, file_id, "FontWidth");
+        let font_width_desc = ws.humanize_type(font_width);
+        assert!(
+            !font_width_desc.contains("number"),
+            "direct return documentation must remain authoritative, got {font_width_desc}"
+        );
+    }
+
+    #[gtest]
+    fn test_inherited_return_doc_preserves_cross_file_inferred_tail_consumers() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            ---@return string
+            function Panel:GetFont() end
+            ---@class DFrame : Panel
+            "#,
+        );
+        let producer_path = "lua/vgui/editor_frame.lua";
+        let producer_source = r#"
+            local PANEL = {}
+
+            ---@return number
+            ---@return number
+            local function get_size() end
+
+            function PANEL:GetFont(enabled)
+                if not enabled then return end
+                local name = "font"
+                local width, height = get_size()
+                return name, width, height
+            end
+
+            vgui.Register("EditorFrame", PANEL, "DFrame")
+            "#;
+        let producer_file = ws.def_file(producer_path, producer_source);
+        let consumer_file = ws.def_file(
+            "lua/autorun/client/editor.lua",
+            r#"
+            SF = { Editor = {} }
+            SF.Editor.editor = vgui.Create("EditorFrame")
+
+            local owner = {}
+            owner.CurrentFont, owner.FontWidth, owner.FontHeight = SF.Editor.editor:GetFont(true)
+
+            ---@param value number
+            local function takes_number(value) end
+
+            takes_number(owner.FontWidth)
+            takes_number(owner.FontHeight)
+            "#,
+        );
+
+        let font_width = latest_member_type(&ws, consumer_file, "FontWidth");
+        let font_width_desc = ws.humanize_type(font_width);
+        assert!(
+            font_width_desc.contains("number"),
+            "expected the cross-file second return slot to refresh, got {font_width_desc}"
+        );
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, consumer_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        )?;
+        verify_that!(
+            diagnostic_messages_for_file(
+                &mut ws,
+                consumer_file,
+                DiagnosticCode::AssignTypeMismatch
+            ),
+            is_empty()
+        )?;
+        verify_that!(
+            nil_diagnostic_messages_for_file(&mut ws, consumer_file),
+            is_empty()
+        )?;
+
+        let producer_uri = ws.virtual_url_generator.new_uri(producer_path);
+        let updated_producer_source =
+            producer_source.replace("---@return number", "---@return boolean");
+        ws.analysis
+            .update_file_text_only(&producer_uri, updated_producer_source);
+        ws.analysis.reindex_files(vec![producer_file]);
+
+        let updated_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
+        let updated_font_width_desc = ws.humanize_type(updated_font_width);
+        assert!(
+            updated_font_width_desc.contains("boolean"),
+            "expected producer reindex to refresh the second return slot, got {updated_font_width_desc}"
+        );
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, consumer_file, DiagnosticCode::ParamTypeMismatch),
+            len(eq(2))
+        )?;
+
+        ws.analysis
+            .remove_file_by_uri(&producer_uri)
+            .expect("producer must be removable");
+        let removed_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
+        let removed_font_width_desc = ws.humanize_type(removed_font_width);
+        assert!(
+            removed_font_width_desc == "any",
+            "expected producer deletion to invalidate the later return slot, got {removed_font_width_desc}"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&producer_uri, Some(producer_source.to_string()))
+            .expect("producer must reopen");
+        let reopened_font_width = latest_member_type(&ws, consumer_file, "FontWidth");
+        let reopened_font_width_desc = ws.humanize_type(reopened_font_width);
+        assert!(
+            reopened_font_width_desc.contains("number"),
+            "expected producer reopen to restore the second return slot, got {reopened_font_width_desc}"
+        );
+        verify_that!(
+            diagnostic_messages_for_file(&mut ws, consumer_file, DiagnosticCode::ParamTypeMismatch),
+            is_empty()
+        )
+    }
+
+    #[gtest]
     fn test_dynamic_field_later_assignment_slot_keeps_one_to_one_rhs_type() -> Result<()> {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def_file(

@@ -778,6 +778,10 @@ impl AnalyzeContext {
         self.inferred_return_candidates.push(return_);
     }
 
+    pub(crate) fn analyzed_file_ids(&self) -> HashSet<FileId> {
+        self.tree_list.iter().map(|tree| tree.file_id).collect()
+    }
+
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
         self.inferred_guard_candidates.push(candidate);
     }
@@ -859,6 +863,21 @@ impl AnalyzeContext {
 
         self.call_site_return_invalidation_changed |= count != 0 || requeued_consumers != 0;
         (count, requeued_consumers)
+    }
+
+    pub(crate) fn queue_call_site_return_consumers(
+        &mut self,
+        consumers: Vec<(UnResolve, Option<(LuaDefinitionId, LuaTypeOwner)>)>,
+    ) -> usize {
+        let count = consumers.len();
+        for (consumer, definition_refresh) in consumers {
+            self.pending_call_site_return_consumers.push(consumer);
+            if let Some(definition_refresh) = definition_refresh {
+                self.pending_call_site_definition_refreshes
+                    .push(definition_refresh);
+            }
+        }
+        count
     }
 
     fn resolve_call_site_return_consumers(&mut self, db: &mut DbIndex) -> usize {

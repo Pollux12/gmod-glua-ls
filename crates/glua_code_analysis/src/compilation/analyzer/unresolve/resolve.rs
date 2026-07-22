@@ -15,8 +15,8 @@ use crate::{
     DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
     LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, SemanticDeclLevel,
-    SignatureReturnStatus, TypeOps, VariadicType,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
+    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
         lua::{
@@ -38,6 +38,7 @@ use smol_str::SmolStr;
 use super::{
     ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
     UnResolveModuleRef, UnResolveReturn, UnResolveTableField,
+    resolve_closure::inferred_return_tail_matching_documented_first,
 };
 
 pub fn try_resolve_decl(
@@ -348,10 +349,46 @@ pub fn try_resolve_return_point(
     let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
     let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
 
+    let inferred_return = return_docs_to_type(&return_docs);
+    let inherited_tail = db
+        .get_signature_index()
+        .get(&return_.signature_id)
+        .filter(|signature| {
+            signature.resolve_return == SignatureReturnStatus::DocResolve
+                && signature.return_docs.len() == 1
+        })
+        .and_then(|signature| {
+            inferred_return_tail_matching_documented_first(
+                &signature.return_docs[0].type_ref,
+                &inferred_return,
+                |slot| {
+                    return_correlations.iter().any(|correlation| {
+                        correlation.discriminant_slot == 0
+                            && correlation.implied_non_nil_slots.contains(&slot)
+                    })
+                },
+            )
+        });
+
     let signature = db
         .get_signature_index_mut()
         .get_mut(&return_.signature_id)
         .ok_or(InferFailReason::None)?;
+
+    if let Some(inherited_tail) = inherited_tail {
+        signature
+            .return_docs
+            .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                name: None,
+                type_ref,
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            }));
+        signature.set_return_correlations(return_correlations);
+        return Ok(());
+    }
 
     if should_apply_resolved_return_docs(signature, &return_docs) {
         signature.resolve_return = SignatureReturnStatus::InferResolve;
