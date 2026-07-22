@@ -226,11 +226,27 @@ pub struct GmodScriptedClassFileMetadata {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GmodVguiParentSource {
+    LiteralName(String),
+    Expr(LuaSyntaxId),
+    Receiver,
+    ReceiverField(Vec<String>),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodVguiParentRelation {
+    pub child_type_id: LuaTypeDeclId,
+    pub parent_chain: Vec<LuaTypeDeclId>,
+    pub parent_chain_complete: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodVguiParentCallMetadata {
     pub syntax_id: LuaSyntaxId,
-    pub child_name: String,
-    pub parent_syntax_id: LuaSyntaxId,
-    pub parent_type_ids: Vec<LuaTypeDeclId>,
+    pub child: GmodVguiParentSource,
+    pub parent: GmodVguiParentSource,
+    pub relations: Vec<GmodVguiParentRelation>,
 }
 
 impl GmodScriptedClassFileMetadata {
@@ -270,8 +286,8 @@ pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
     derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
-    vgui_panel_parents: HashMap<String, HashSet<LuaTypeDeclId>>,
-    incomplete_vgui_panel_parents: HashSet<String>,
+    vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
+    incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -293,8 +309,8 @@ impl GmodClassMetadataIndex {
             file_metadata: HashMap::new(),
             vgui_panels: HashMap::new(),
             derma_skins: HashMap::new(),
-            vgui_panel_parents: HashMap::new(),
-            incomplete_vgui_panel_parents: HashSet::new(),
+            vgui_panel_parent_chains: HashMap::new(),
+            incomplete_vgui_panel_parent_chains: HashSet::new(),
         }
     }
 
@@ -504,7 +520,7 @@ impl GmodClassMetadataIndex {
 
         self.vgui_panels = vgui_panels;
         self.derma_skins = derma_skins;
-        self.recompute_vgui_panel_parents();
+        self.recompute_vgui_panel_parent_chains();
     }
 
     pub fn add_call(
@@ -566,52 +582,70 @@ impl GmodClassMetadataIndex {
             .unwrap_or_default()
     }
 
-    pub fn set_vgui_parent_types(
+    pub fn set_vgui_parent_relations(
         &mut self,
-        resolved_by_file: Vec<(FileId, Vec<(LuaSyntaxId, Vec<LuaTypeDeclId>)>)>,
+        resolved_by_file: Vec<(FileId, Vec<(LuaSyntaxId, Vec<GmodVguiParentRelation>)>)>,
     ) {
         for (file_id, resolved) in resolved_by_file {
             let Some(metadata) = self.file_metadata.get_mut(&file_id) else {
                 continue;
             };
             for call in &mut metadata.vgui_parent_calls {
-                call.parent_type_ids = resolved
+                call.relations = resolved
                     .iter()
                     .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
-                    .map(|(_, type_ids)| type_ids.clone())
+                    .map(|(_, relations)| relations.clone())
                     .unwrap_or_default();
             }
         }
-        self.recompute_vgui_panel_parents();
+        self.recompute_vgui_panel_parent_chains();
     }
 
-    pub fn get_vgui_panel_parents(&self, child_name: &str) -> impl Iterator<Item = &LuaTypeDeclId> {
-        self.vgui_panel_parents
-            .get(child_name)
-            .into_iter()
-            .flatten()
+    pub fn get_vgui_panel_parent_chain(
+        &self,
+        child_type_id: &LuaTypeDeclId,
+    ) -> Option<&[LuaTypeDeclId]> {
+        self.vgui_panel_parent_chains
+            .get(child_type_id)
+            .map(Vec::as_slice)
     }
 
-    pub fn vgui_panel_parents_are_complete(&self, child_name: &str) -> bool {
-        !self.incomplete_vgui_panel_parents.contains(child_name)
+    pub fn vgui_panel_parent_chain_is_complete(&self, child_type_id: &LuaTypeDeclId) -> bool {
+        !self
+            .incomplete_vgui_panel_parent_chains
+            .contains(child_type_id)
     }
 
-    fn recompute_vgui_panel_parents(&mut self) {
-        let mut parents = HashMap::<String, HashSet<LuaTypeDeclId>>::new();
+    fn recompute_vgui_panel_parent_chains(&mut self) {
+        let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::new();
         let mut incomplete = HashSet::new();
         for metadata in self.file_metadata.values() {
             for call in &metadata.vgui_parent_calls {
-                if call.parent_type_ids.is_empty() {
-                    incomplete.insert(call.child_name.clone());
+                for relation in &call.relations {
+                    if !relation.parent_chain_complete || relation.parent_chain.is_empty() {
+                        incomplete.insert(relation.child_type_id.clone());
+                        continue;
+                    }
+                    match parent_chains.get(&relation.child_type_id) {
+                        Some(existing) if existing != &relation.parent_chain => {
+                            incomplete.insert(relation.child_type_id.clone());
+                        }
+                        Some(_) => {}
+                        None => {
+                            parent_chains.insert(
+                                relation.child_type_id.clone(),
+                                relation.parent_chain.clone(),
+                            );
+                        }
+                    }
                 }
-                parents
-                    .entry(call.child_name.clone())
-                    .or_default()
-                    .extend(call.parent_type_ids.iter().cloned());
             }
         }
-        self.vgui_panel_parents = parents;
-        self.incomplete_vgui_panel_parents = incomplete;
+        for type_id in &incomplete {
+            parent_chains.remove(type_id);
+        }
+        self.vgui_panel_parent_chains = parent_chains;
+        self.incomplete_vgui_panel_parent_chains = incomplete;
     }
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
@@ -714,8 +748,8 @@ impl LuaIndex for GmodClassMetadataIndex {
         self.file_metadata.clear();
         self.vgui_panels.clear();
         self.derma_skins.clear();
-        self.vgui_panel_parents.clear();
-        self.incomplete_vgui_panel_parents.clear();
+        self.vgui_panel_parent_chains.clear();
+        self.incomplete_vgui_panel_parent_chains.clear();
     }
 }
 

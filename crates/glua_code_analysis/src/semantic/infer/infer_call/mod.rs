@@ -266,7 +266,30 @@ fn refine_known_vgui_parent_return(
     let Some(receiver) = index_expr.get_prefix_expr() else {
         return return_type;
     };
-    let Ok(receiver_type) = infer_expr(db, cache, receiver) else {
+    let mut depth = 1;
+    let mut root_receiver = receiver;
+    while let LuaExpr::CallExpr(parent_call) = root_receiver.clone() {
+        let Some(LuaExpr::IndexExpr(parent_index)) = parent_call.get_prefix_expr() else {
+            break;
+        };
+        if !parent_call.is_colon_call()
+            || !parent_index.get_index_key().is_some_and(|key| {
+                key.get_name()
+                    .is_some_and(|name| name.get_name_text() == "GetParent")
+            })
+            || parent_call
+                .get_args_list()
+                .is_some_and(|args| args.get_args().next().is_some())
+        {
+            break;
+        }
+        let Some(parent_receiver) = parent_index.get_prefix_expr() else {
+            break;
+        };
+        depth += 1;
+        root_receiver = parent_receiver;
+    }
+    let Ok(receiver_type) = infer_expr(db, cache, root_receiver) else {
         return return_type;
     };
     let mut child_ids = Vec::new();
@@ -278,24 +301,24 @@ fn refine_known_vgui_parent_return(
     }
 
     let metadata = db.get_gmod_class_metadata_index();
-    let mut parent_ids = Vec::new();
+    let mut parent_id = None;
     for child_id in child_ids {
-        if !metadata.vgui_panel_parents_are_complete(child_id.get_name()) {
+        if !metadata.vgui_panel_parent_chain_is_complete(&child_id) {
             return return_type;
         }
-        parent_ids.extend(
-            metadata
-                .get_vgui_panel_parents(child_id.get_name())
-                .cloned(),
-        );
+        let Some(chain) = metadata.get_vgui_panel_parent_chain(&child_id) else {
+            return return_type;
+        };
+        let Some(candidate) = chain.get(depth - 1) else {
+            return return_type;
+        };
+        match &parent_id {
+            Some(existing) if existing != candidate => return return_type,
+            Some(_) => {}
+            None => parent_id = Some(candidate.clone()),
+        }
     }
-    parent_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
-    parent_ids.dedup();
-    if parent_ids.is_empty() {
-        return return_type;
-    }
-
-    LuaType::from_vec(parent_ids.into_iter().map(LuaType::Ref).collect())
+    parent_id.map(LuaType::Ref).unwrap_or(return_type)
 }
 
 fn single_non_nil_instance_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
@@ -430,7 +453,8 @@ fn should_prefer_signature_for_call(
                     || !signature.overloads.is_empty()
                     || !signature.out_params.is_empty()
                     || !signature.nil_return_guard_params().is_empty()
-                    || (signature.direct_param_return_alias().is_some() || signature.class_name_param_return_alias().is_some())
+                    || (signature.direct_param_return_alias().is_some()
+                        || signature.class_name_param_return_alias().is_some())
                     || !signature.falsy_param_nil_free_return_slots().is_empty()
                     || !signature.falsy_param_return_aliases().is_empty()
             }
@@ -578,7 +602,8 @@ fn infer_doc_function(
 
     if let Some(signature_id) = prefix_signature_id
         && let Some(signature) = db.get_signature_index().get(&signature_id)
-        && ((signature.direct_param_return_alias().is_some() || signature.class_name_param_return_alias().is_some())
+        && ((signature.direct_param_return_alias().is_some()
+            || signature.class_name_param_return_alias().is_some())
             || !signature.falsy_param_nil_free_return_slots().is_empty()
             || !signature.falsy_param_return_aliases().is_empty())
     {
@@ -910,14 +935,9 @@ fn infer_signature_doc_function(
             resolved.as_ref(),
             &call_expr,
         );
-        let resolved = specialize_return_aliases_for_call(
-            db,
-            cache,
-            signature,
-            resolved.as_ref(),
-            &call_expr,
-        )
-        .unwrap_or(resolved);
+        let resolved =
+            specialize_return_aliases_for_call(db, cache, signature, resolved.as_ref(), &call_expr)
+                .unwrap_or(resolved);
         Ok(specialize_registered_convar_return_for_call(
             db,
             cache,
@@ -928,7 +948,6 @@ fn infer_signature_doc_function(
         ))
     }
 }
-
 
 fn specialize_class_name_param_return_alias_for_call(
     db: &DbIndex,
@@ -994,10 +1013,13 @@ fn specialize_return_aliases_for_call(
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
 ) -> Option<Arc<LuaFunctionType>> {
-    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
-        .or_else(|| {
-            specialize_class_name_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
-        })
+    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr).or_else(
+        || {
+            specialize_class_name_param_return_alias_for_call(
+                db, cache, signature, func_ty, call_expr,
+            )
+        },
+    )
 }
 
 fn specialize_direct_param_return_alias_for_call(

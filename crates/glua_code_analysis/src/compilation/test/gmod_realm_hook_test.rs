@@ -675,6 +675,31 @@ mod test {
     }
 
     #[gtest]
+    fn test_gmod_system_detection_rejects_reassigned_builtin_aliases() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            local net = net
+            net = my_api
+            net.Start("reassigned.alias")
+            "#,
+        );
+
+        let system_metadata = ws
+            .get_db_mut()
+            .get_gmod_infer_index()
+            .get_system_file_metadata(&file_id)
+            .cloned();
+        assert!(system_metadata.is_none_or(|metadata| {
+            metadata
+                .net_start_calls
+                .iter()
+                .all(|site| site.name.as_deref() != Some("reassigned.alias"))
+        }));
+    }
+
+    #[gtest]
     fn test_gmod_system_detection_keeps_global_owner_prefixed_builtin_paths() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);

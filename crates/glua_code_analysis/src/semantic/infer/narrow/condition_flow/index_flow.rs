@@ -224,9 +224,9 @@ fn maybe_field_exist_narrow(
                     antecedent_arms
                         .into_iter()
                         .filter(|arm| {
-                            !result.iter().any(|owner| {
-                                arm == owner || is_strict_sub_type_of(db, arm, owner)
-                            })
+                            !result
+                                .iter()
+                                .any(|owner| arm == owner || is_strict_sub_type_of(db, arm, owner))
                         })
                         .collect::<Vec<_>>()
                 };
@@ -376,7 +376,10 @@ fn collect_antecedent_nominal_arms_into(
 fn collect_reverse_member_owner_types(db: &DbIndex, member_key: &LuaMemberKey) -> Vec<LuaType> {
     let mut owners = Vec::new();
     let mut seen = HashSet::new();
-    for member in db.get_member_index().get_current_members_for_key(member_key) {
+    for member in db
+        .get_member_index()
+        .get_current_members_for_key(member_key)
+    {
         let Some(owner) = db.get_member_index().get_current_owner(&member.get_id()) else {
             continue;
         };
@@ -410,7 +413,15 @@ fn owner_fits_antecedent(db: &DbIndex, owner: &LuaType, antecedent_arms: &[LuaTy
 fn is_open_base_type(type_id: &LuaTypeDeclId) -> bool {
     matches!(
         type_id.get_name(),
-        "Entity" | "Player" | "Vehicle" | "Weapon" | "NPC" | "NextBot" | "Panel" | "Vector" | "Angle"
+        "Entity"
+            | "Player"
+            | "Vehicle"
+            | "Weapon"
+            | "NPC"
+            | "NextBot"
+            | "Panel"
+            | "Vector"
+            | "Angle"
     )
 }
 
@@ -423,9 +434,9 @@ fn collapse_to_most_generic_types(db: &DbIndex, candidates: Vec<LuaType>) -> Vec
     candidates
         .iter()
         .filter(|candidate| {
-            !candidates.iter().any(|other| {
-                other != *candidate && is_strict_sub_type_of(db, candidate, other)
-            })
+            !candidates
+                .iter()
+                .any(|other| other != *candidate && is_strict_sub_type_of(db, candidate, other))
         })
         .cloned()
         .collect()
@@ -500,9 +511,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
             }
             match infer_member_by_member_key(db, cache, &sub_ty, index.clone(), &InferGuard::new())
             {
-                Ok(member_type)
-                    if !member_type.is_always_falsy() && !member_type.is_never() =>
-                {
+                Ok(member_type) if !member_type.is_always_falsy() && !member_type.is_never() => {
                     expanded.push(sub_ty);
                     added_subtype = true;
                 }
@@ -651,8 +660,7 @@ fn filter_candidates_by_caller_realm(
             let global_owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new(type_id.get_name()));
             let mut decls = direct_members_for_owner_key(db, &owner, &key);
             decls.extend(direct_members_for_owner_key(db, &global_owner, &key));
-            !decls.is_empty()
-                && !type_member_usable_at_caller_mask(db, type_id, &key, caller_mask)
+            !decls.is_empty() && !type_member_usable_at_caller_mask(db, type_id, &key, caller_mask)
         });
         if had_direct_incompatible {
             Vec::new()
@@ -701,7 +709,10 @@ fn type_member_usable_at_caller_mask(
     let gmod_infer = db.get_gmod_infer_index();
     decls.iter().any(|member| {
         let member_realm = gmod_infer
-            .get_member_annotation_realm_at_offset(&member.get_file_id(), member.get_range().start())
+            .get_member_annotation_realm_at_offset(
+                &member.get_file_id(),
+                member.get_range().start(),
+            )
             .unwrap_or_else(|| {
                 gmod_infer.get_realm_at_offset(&member.get_file_id(), member.get_range().start())
             });

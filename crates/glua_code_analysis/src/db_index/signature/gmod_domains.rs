@@ -86,6 +86,9 @@ pub const GMOD_ROLE_EXISTS: &str = "exists";
 /// Explicit runtime parent argument for a constructed VGUI panel.
 pub const GMOD_ROLE_VGUI_PARENT: &str = "parent";
 
+/// The call receiver is the VGUI panel whose parent is being set.
+pub const GMOD_ROLE_VGUI_CHILD_SELF: &str = "child_self";
+
 /// The call receiver is the runtime parent of the constructed VGUI panel.
 pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
 

@@ -183,6 +183,23 @@ function vgui.Create(className, parent, name) end
 ---@return (instance) T
 function Panel:Add(className) end
 
+-- Panel is intentionally caller-provided: declaring it here changes generic
+-- vgui.Create return resolution for every test workspace.
+---@[call_arg("gmod.vgui_panel", "child_self")]
+---@[call_arg("gmod.vgui_panel", "parent")]
+---@param parent Panel
+function Panel:SetParent(parent) end
+
+---@class DDragBase: Panel
+---@field GetParent fun(self: DDragBase): Panel
+---@class DHorizontalScroller: Panel
+---@field GetParent fun(self: DHorizontalScroller): Panel
+---@field pnlCanvas DDragBase
+---@[call_arg_field("gmod.vgui_panel", "parent_self", "pnlCanvas")]
+---@[call_arg("gmod.vgui_panel", "reference")]
+---@param panel Panel
+function DHorizontalScroller:AddPanel(panel) end
+
 ---@generic T: table
 ---@[call_arg("gmod.vgui_panel", "register_table")]
 ---@[call_arg_field("gmod.vgui_panel", "base", "Base")]

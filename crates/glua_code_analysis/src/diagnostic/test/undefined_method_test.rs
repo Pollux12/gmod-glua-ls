@@ -380,10 +380,9 @@ mod tests {
 
         let annotations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
             .join("../../../annotations-gmod-glua-ls/output");
-        let vehicle_base = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../cityrp-vehicle-base");
-        let stool = vehicle_base
-            .join("lua/weapons/gmod_tool/stools/glide_transmission_editor.lua");
+        let vehicle_base =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cityrp-vehicle-base");
+        let stool = vehicle_base.join("lua/weapons/gmod_tool/stools/glide_transmission_editor.lua");
         let glide_autorun = vehicle_base.join("lua/autorun/sh_glide.lua");
         if !annotations.is_dir() || !stool.is_file() || !glide_autorun.is_file() {
             // Adjacent checkouts are optional on CI; unit fixtures cover the rule.
@@ -420,10 +419,8 @@ mod tests {
         }
 
         let glide_text = std::fs::read_to_string(&glide_autorun).expect("read glide");
-        let glide_uri =
-            lsp_types::Uri::parse_from_file_path(&glide_autorun).expect("glide uri");
-        ws.analysis
-            .update_file_by_uri(&glide_uri, Some(glide_text));
+        let glide_uri = lsp_types::Uri::parse_from_file_path(&glide_autorun).expect("glide uri");
+        ws.analysis.update_file_by_uri(&glide_uri, Some(glide_text));
 
         let stool_text = std::fs::read_to_string(&stool).expect("read stool");
         let stool_uri = lsp_types::Uri::parse_from_file_path(&stool).expect("stool uri");
@@ -483,7 +480,8 @@ mod tests {
                 == Some(NumberOrString::String(
                     DiagnosticCode::UndefinedMethod.get_name().to_string(),
                 ))
-                && diagnostic.message.contains("For more information on a specific command, type HELP command-name
+                && diagnostic.message.contains(
+                    "For more information on a specific command, type HELP command-name
 ASSOC          Displays or modifies file extension associations.
 ATTRIB         Displays or changes file attributes.
 BREAK          Sets or clears extended CTRL+C checking.
@@ -578,7 +576,8 @@ VOL            Displays a disk volume label and serial number.
 XCOPY          Copies files and directory trees.
 WMIC           Displays WMI information inside interactive command shell.
 
-For more information on tools see the command-line reference in the online help.")
+For more information on tools see the command-line reference in the online help.",
+                )
         });
         assert!(
             !help_undefined,
@@ -591,7 +590,7 @@ For more information on tools see the command-line reference in the online help.
     }
 
     #[test]
-fn later_class_global_field_assign_from_buildcpanel_types_earlier_read() {
+    fn later_class_global_field_assign_from_buildcpanel_types_earlier_read() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -789,5 +788,449 @@ fn later_class_global_field_assign_from_buildcpanel_types_earlier_read() {
             undefined_methods,
             ["Undefined method `DefinitelyMissing`. "]
         );
+    }
+
+    #[test]
+    fn vgui_parent_chain_resolves_add_panel_canvas_to_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class PANEL: Panel
+            PANEL = Panel
+            local PANEL = {}
+            function PANEL:EditorMethod() end
+            function PANEL:Init()
+                self.tabContainer = vgui.Create("DHorizontalScroller", self)
+            end
+            function PANEL:AddTab()
+                local tab = {}
+                tab.button = vgui.Create("StreamTabButton")
+                self.tabContainer:AddPanel(tab.button)
+            end
+            vgui.Register("StreamEditor", PANEL, "Panel")
+
+            ---@class StreamTab
+            ---@field button StreamTabButton
+            ---@class StreamTabButton: Panel
+            ---@field GetParent fun(self: StreamTabButton): Panel
+            local StreamTabButton = {}
+            function StreamTabButton:UseEditor()
+                self:GetParent():GetParent():GetParent():EditorMethod()
+                self:GetParent():GetParent():GetParent():Missing()
+            end
+
+            vgui.Register("StreamTabButton", StreamTabButton, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("StreamTabButton")),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DDragBase"),
+                    crate::LuaTypeDeclId::global("DHorizontalScroller"),
+                    crate::LuaTypeDeclId::global("StreamEditor"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
+    fn vgui_parent_chain_resolves_create_parent_field_assignment() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DPanel: Panel
+
+            ---@class TabButton: Panel
+            local TabButton = {}
+            function TabButton:Click()
+                self:GetParent():GetParent():SetActiveTab()
+                self:GetParent():GetParent():Missing()
+            end
+            vgui.Register("TabButton", TabButton, "Panel")
+
+            ---@class TabbedFrame: Panel
+            local TabbedFrame = {}
+            function TabbedFrame:SetActiveTab() end
+            function TabbedFrame:Init()
+                self.tabList = vgui.Create("DPanel", self)
+            end
+            function TabbedFrame:AddTab()
+                local button = vgui.Create("TabButton", self.tabList)
+            end
+            vgui.Register("TabbedFrame", TabbedFrame, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("TabButton")),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DPanel"),
+                    crate::LuaTypeDeclId::global("TabbedFrame"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
+    fn vgui_parent_chain_rejects_disagreeing_create_parent_field_owners() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+
+            ---@class TabButton: Panel
+            local TabButton = {}
+            vgui.Register("TabButton", TabButton, "Panel")
+
+            ---@class OwnerA: Panel
+            local OwnerA = {}
+            function OwnerA:Init()
+                self.tabList = vgui.Create("DPanel", self)
+            end
+            function OwnerA:AddTab()
+                local button = vgui.Create("TabButton", self.tabList)
+            end
+            vgui.Register("OwnerA", OwnerA, "Panel")
+
+            ---@class OwnerB: Panel
+            local OwnerB = {}
+            function OwnerB:Init()
+                self.tabList = vgui.Create("DPanel", self)
+            end
+            function OwnerB:AddTab()
+                local button = vgui.Create("TabButton", self.tabList)
+            end
+            vgui.Register("OwnerB", OwnerB, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("TabButton"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn vgui_parent_chain_does_not_use_another_scroller_owner() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let _file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class OwnerA: Panel
+            local OwnerA = {}
+            function OwnerA:OwnerAMethod() end
+            ---@param externalOwner Panel
+            function OwnerA:Init(externalOwner)
+                self.tabContainer = vgui.Create("DHorizontalScroller", externalOwner)
+                self.otherScroller = vgui.Create("DHorizontalScroller", self)
+            end
+            ---@param child Child
+            function OwnerA:AddChild(child)
+                self.tabContainer:AddPanel(child)
+            end
+
+            ---@class Child: Panel
+            local Child = {}
+            function Child:UseParent()
+                self:GetParent():GetParent():GetParent():OwnerAMethod()
+            end
+            vgui.Register("Child", Child, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        let child = crate::LuaTypeDeclId::global("Child");
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&child),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DDragBase"),
+                    crate::LuaTypeDeclId::global("DHorizontalScroller"),
+                    crate::LuaTypeDeclId::global("Panel"),
+                ]
+                .as_slice()
+            )
+        );
+    }
+
+    #[test]
+    fn stream_editor_tab_button_resolves_parent_chain() {
+        use std::path::PathBuf;
+
+        let annotations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("../../../annotations-gmod-glua-ls/output");
+        let vehicle_base =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cityrp-vehicle-base");
+        let stream_editor = vehicle_base.join("lua/glide/client/vgui/stream_editor.lua");
+        if !annotations.is_dir() || !stream_editor.is_file() {
+            return;
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis.add_library_workspace(annotations.clone());
+        ws.analysis.add_main_workspace(vehicle_base.clone());
+
+        let mut files = Vec::new();
+        for entry in std::fs::read_dir(&annotations).expect("read annotations") {
+            let path = entry.expect("read annotation entry").path();
+            if path.extension().is_none_or(|extension| extension != "lua") {
+                continue;
+            }
+            let text = std::fs::read_to_string(&path).expect("read annotation");
+            files.push((path, Some(text)));
+        }
+        files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+        let vehicle_files =
+            crate::load_workspace_files(&vehicle_base, &["**/*.lua".to_string()], &[], &[], None)
+                .expect("read vehicle base");
+        files.extend(
+            vehicle_files
+                .into_iter()
+                .map(crate::LuaFileInfo::into_tuple),
+        );
+        ws.analysis.update_files_by_path(files);
+        let uri = lsp_types::Uri::parse_from_file_path(&stream_editor).expect("stream editor uri");
+        let file_id = ws
+            .analysis
+            .get_file_id(&uri)
+            .expect("stream editor file id");
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global(
+                "Styled_StreamEditorTabButton",
+            )),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DDragBase"),
+                    crate::LuaTypeDeclId::global("DHorizontalScroller"),
+                    crate::LuaTypeDeclId::global("Glide_EngineStreamEditor"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            !undefined_methods.iter().any(|message| {
+                message.contains("SetActiveTabById") || message.contains("CloseTabById")
+            }),
+            "expected the tab button parent chain to reach Glide_EngineStreamEditor, got {undefined_methods:?}"
+        );
+    }
+
+    #[test]
+    fn vgui_parent_chain_rejects_disagreeing_owners() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let _file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class OwnerA: Panel
+            local OwnerA = {}
+            function OwnerA:OnlyOwnerA() end
+            function OwnerA:MakeChild()
+                return vgui.Create("SharedChild", self)
+            end
+
+            ---@class OwnerB: Panel
+            local OwnerB = {}
+            function OwnerB:MakeChild()
+                return vgui.Create("SharedChild", self)
+            end
+
+            ---@class SharedChild: Panel
+            local SharedChild = {}
+            function SharedChild:UseParent()
+                self:GetParent():OnlyOwnerA()
+            end
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("SharedChild"))
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn vgui_parent_chain_supports_typed_set_parent_and_fails_closed_at_depth() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let _file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class TypedOwner: Panel
+            ---@field GetParent fun(self: TypedOwner): Panel
+            local TypedOwner = {}
+            function TypedOwner:OwnerMethod() end
+
+            ---@class TypedChild: Panel
+            ---@field GetParent fun(self: TypedChild): Panel
+            local TypedChild = {}
+            ---@param owner TypedOwner
+            function TypedChild:Attach(owner)
+                local child = self
+                child:SetParent(owner)
+            end
+            function TypedChild:UseOwner()
+                self:GetParent():OwnerMethod()
+                self:GetParent():GetParent():OwnerMethod()
+            end
+
+            vgui.Register("TypedChild", TypedChild, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("TypedChild")),
+            Some([crate::LuaTypeDeclId::global("TypedOwner")].as_slice())
+        );
+    }
+
+    #[test]
+    fn vgui_parent_chain_marks_omitted_set_parent_incomplete() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let _file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class Child: Panel
+            local Child = {}
+            function Child:Detach()
+                self:SetParent()
+            end
+            vgui.Register("Child", Child, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        let child = crate::LuaTypeDeclId::global("Child");
+        assert!(metadata.get_vgui_panel_parent_chain(&child).is_none());
+        assert!(!metadata.vgui_panel_parent_chain_is_complete(&child));
     }
 }

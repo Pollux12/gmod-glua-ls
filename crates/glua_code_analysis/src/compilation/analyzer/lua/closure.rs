@@ -3,9 +3,8 @@ use std::ops::Deref;
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallArgList,
     LuaCallExpr, LuaClosureExpr, LuaComment, LuaDocTagReturn, LuaExpr, LuaFuncStat, LuaIfStat,
-    LuaIndexExpr,
-    LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaVarExpr,
-    PathTrait, UnaryOperator,
+    LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaStat,
+    LuaSyntaxKind, LuaVarExpr, PathTrait, UnaryOperator,
 };
 use rowan::{TextRange, TextSize};
 
@@ -114,7 +113,6 @@ fn analyze_direct_param_return_alias(
     Some(())
 }
 
-
 fn analyze_class_name_param_return_alias(
     analyzer: &mut LuaAnalyzer,
     signature_id: &LuaSignatureId,
@@ -158,9 +156,7 @@ fn analyze_class_name_param_return_alias(
     let block = closure.get_block()?;
     if block
         .descendants::<LuaReturnStat>()
-        .filter(|returned| {
-            returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
-        })
+        .filter(|returned| returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure))
         .count()
         != 1
     {
@@ -317,9 +313,7 @@ fn class_name_create_call_info(
     if method != "Create" {
         return None;
     }
-    let owner = index
-        .get_prefix_expr()
-        .and_then(|p| expr_name_text(&p))?;
+    let owner = index.get_prefix_expr().and_then(|p| expr_name_text(&p))?;
     if owner != "vgui" && owner != "ents" {
         return None;
     }

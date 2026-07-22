@@ -16,13 +16,14 @@ use glua_parser::{
 };
 
 use crate::{
-    EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArgSource, GmodClassCallLiteral,
-    GmodDermaSkinCallRoles, GmodNamedStringCallRoles, GmodNetworkVarCallRoles,
-    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, GmodScriptedClassFileMetadata,
-    GmodVguiPanelCallRoles, GmodVguiParentCallMetadata, InFiled, LuaCallArgRole, LuaDecl,
-    LuaDeclExtra, LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache,
-    LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    EmmyrcGmodRealm, FileId, GlobalId, GmodClassCallArg, GmodClassCallArgSource,
+    GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
+    GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
+    GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, GmodVguiParentCallMetadata,
+    GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
+    LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
+    LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalysisPipeline, AnalyzeContext,
         common::{TypeCacheWriteMode, add_member, write_type_cache},
@@ -480,7 +481,9 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
 
         let _p = Profile::cond_new("gmod post-analyze", context.tree_list.len() > 1);
         let file_ids: Vec<FileId> = context.tree_list.iter().map(|x| x.file_id).collect();
-        let do_profile = context.tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
+        let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+        let do_profile = context.tree_list.len() > 100
+            && (log::log_enabled!(log::Level::Info) || stderr_profile_enabled);
 
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
 
@@ -512,7 +515,16 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
+        let t_parent = do_profile.then(std::time::Instant::now);
         resolve_vgui_parent_relations(db, context, &file_ids);
+        if let Some(t_parent) = t_parent {
+            let elapsed = t_parent.elapsed();
+            if log::log_enabled!(log::Level::Info) {
+                log::info!("gmod post: vgui_parent_relations cost {elapsed:?}");
+            } else {
+                eprintln!("gmod post: vgui_parent_relations cost {elapsed:?}");
+            }
+        }
 
         let t_local_register = do_profile.then(std::time::Instant::now);
         synthesize_scripted_ent_registrations(db, &file_ids);
@@ -2365,13 +2377,54 @@ pub(crate) fn resolve_scoped_authoring_type(
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
 }
 
+#[derive(Clone)]
+enum ResolvedVguiParentSource {
+    Direct(Vec<LuaTypeDeclId>),
+    AssignedField {
+        field_type_ids: Vec<LuaTypeDeclId>,
+        assignment_parent_type_ids: Vec<LuaTypeDeclId>,
+    },
+    ReceiverField {
+        field_type_ids: Vec<LuaTypeDeclId>,
+        receiver_type_ids: Vec<LuaTypeDeclId>,
+        receiver_field_parent_type_ids: Option<Vec<LuaTypeDeclId>>,
+    },
+}
+
+#[derive(Clone)]
+struct ResolvedVguiParentRelation {
+    syntax_id: LuaSyntaxId,
+    child_type_ids: Vec<LuaTypeDeclId>,
+    parent: ResolvedVguiParentSource,
+}
+
+#[derive(Clone)]
+enum VguiParentChainResolution {
+    None,
+    Complete(Vec<LuaTypeDeclId>),
+    Incomplete,
+}
+
+struct VguiFieldAssignmentParent {
+    owner_type_ids: Vec<LuaTypeDeclId>,
+    parent_type_ids: Vec<LuaTypeDeclId>,
+}
+
 fn resolve_vgui_parent_relations(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
-    file_ids: &[FileId],
+    _file_ids: &[FileId],
 ) {
-    let mut resolved_by_file = Vec::new();
-    for &file_id in file_ids {
+    let mut file_ids = db
+        .get_gmod_class_metadata_index()
+        .iter_file_metadata()
+        .filter_map(|(file_id, metadata)| {
+            (!metadata.vgui_parent_calls.is_empty()).then_some(*file_id)
+        })
+        .collect::<Vec<_>>();
+    file_ids.sort_by_key(|file_id| file_id.id);
+    let mut relations_by_file = Vec::new();
+    for file_id in file_ids {
         let calls = db
             .get_gmod_class_metadata_index()
             .get_vgui_parent_calls(&file_id)
@@ -2386,29 +2439,493 @@ fn resolve_vgui_parent_relations(
         else {
             continue;
         };
-        let mut resolved = Vec::with_capacity(calls.len());
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let field_assignment_parents = index_vgui_field_assignment_parents(db, cache, &root);
+        let mut relations = Vec::with_capacity(calls.len());
         for call in calls {
-            let type_ids = call
-                .parent_syntax_id
+            let Some(call_expr) = call
+                .syntax_id
                 .to_node_from_root(&root)
-                .and_then(LuaExpr::cast)
-                .and_then(|expr| {
-                    infer_expr(db, context.infer_manager.get_infer_cache(file_id), expr).ok()
+                .and_then(LuaCallExpr::cast)
+            else {
+                continue;
+            };
+            let child_type_ids = resolve_vgui_parent_source_type_ids(
+                db,
+                cache,
+                &root,
+                &field_assignment_parents,
+                &call_expr,
+                &call.child,
+            );
+            let parent = resolve_vgui_parent_source(
+                db,
+                cache,
+                &root,
+                &field_assignment_parents,
+                &call_expr,
+                &call.parent,
+            );
+            relations.push(ResolvedVguiParentRelation {
+                syntax_id: call.syntax_id,
+                child_type_ids,
+                parent,
+            });
+        }
+        relations_by_file.push((file_id, relations));
+    }
+
+    let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::new();
+    let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::new();
+    for (_, relations) in &relations_by_file {
+        for relation in relations {
+            for child_type_id in &relation.child_type_ids {
+                if let ResolvedVguiParentSource::Direct(parent_type_ids) = &relation.parent {
+                    direct_parents_by_child
+                        .entry(child_type_id.clone())
+                        .or_default()
+                        .push(parent_type_ids.clone());
+                }
+                relations_by_child
+                    .entry(child_type_id.clone())
+                    .or_default()
+                    .push(relation.parent.clone());
+            }
+        }
+    }
+
+    let mut direct_chain_memo = HashMap::new();
+    let mut resolved_by_file = Vec::new();
+    for (file_id, relations) in relations_by_file {
+        let mut resolved = Vec::with_capacity(relations.len());
+        for relation in relations {
+            let child_relations = relation
+                .child_type_ids
+                .into_iter()
+                .map(|child_type_id| {
+                    let resolution = resolve_vgui_parent_chain(
+                        &child_type_id,
+                        &relations_by_child,
+                        &direct_parents_by_child,
+                        &mut direct_chain_memo,
+                    );
+                    let (parent_chain, parent_chain_complete) = match resolution {
+                        VguiParentChainResolution::Complete(chain) => (chain, true),
+                        VguiParentChainResolution::None | VguiParentChainResolution::Incomplete => {
+                            (Vec::new(), false)
+                        }
+                    };
+                    crate::GmodVguiParentRelation {
+                        child_type_id,
+                        parent_chain,
+                        parent_chain_complete,
+                    }
                 })
-                .map(|typ| {
-                    let mut type_ids = Vec::new();
-                    collect_panel_type_ids(db, &typ, &mut type_ids);
-                    type_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
-                    type_ids.dedup();
-                    type_ids
-                })
-                .unwrap_or_default();
-            resolved.push((call.syntax_id, type_ids));
+                .collect();
+            resolved.push((relation.syntax_id, child_relations));
         }
         resolved_by_file.push((file_id, resolved));
     }
     db.get_gmod_class_metadata_index_mut()
-        .set_vgui_parent_types(resolved_by_file);
+        .set_vgui_parent_relations(resolved_by_file);
+}
+
+fn resolve_vgui_parent_chain(
+    type_id: &LuaTypeDeclId,
+    relations_by_child: &HashMap<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>,
+    direct_parents_by_child: &HashMap<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>,
+    direct_chain_memo: &mut HashMap<LuaTypeDeclId, VguiParentChainResolution>,
+) -> VguiParentChainResolution {
+    let Some(parents) = relations_by_child.get(type_id) else {
+        return VguiParentChainResolution::None;
+    };
+
+    let mut chain = None;
+    for parent in parents {
+        let parent_chain = match parent {
+            ResolvedVguiParentSource::Direct(type_ids) => {
+                let Some(parent_chain) = resolve_vgui_direct_parent_chain(
+                    type_ids,
+                    direct_parents_by_child,
+                    direct_chain_memo,
+                ) else {
+                    return VguiParentChainResolution::Incomplete;
+                };
+                parent_chain
+            }
+            ResolvedVguiParentSource::AssignedField {
+                field_type_ids,
+                assignment_parent_type_ids,
+            } => {
+                let [field_type_id] = field_type_ids.as_slice() else {
+                    return VguiParentChainResolution::Incomplete;
+                };
+                let Some(mut parent_chain) = resolve_vgui_direct_parent_chain(
+                    assignment_parent_type_ids,
+                    direct_parents_by_child,
+                    direct_chain_memo,
+                ) else {
+                    return VguiParentChainResolution::Incomplete;
+                };
+                // The field assignment identifies this edge's owner. Do not walk
+                // type-level direct relations for the intermediate field panel.
+                parent_chain.insert(0, field_type_id.clone());
+                parent_chain
+            }
+            ResolvedVguiParentSource::ReceiverField {
+                field_type_ids,
+                receiver_type_ids,
+                receiver_field_parent_type_ids,
+            } => {
+                let ([field_type_id], [receiver_type_id]) =
+                    (field_type_ids.as_slice(), receiver_type_ids.as_slice())
+                else {
+                    return VguiParentChainResolution::Incomplete;
+                };
+                let Some(assignment_parent_chain) = resolve_vgui_direct_parent_chain(
+                    receiver_field_parent_type_ids
+                        .as_deref()
+                        .unwrap_or_default(),
+                    direct_parents_by_child,
+                    direct_chain_memo,
+                ) else {
+                    return VguiParentChainResolution::Incomplete;
+                };
+                // Receiver-field ownership is edge-specific. Only follow the field's
+                // assigned vgui.Create parent through type-level direct relations.
+                let mut parent_chain = vec![field_type_id.clone(), receiver_type_id.clone()];
+                parent_chain.extend(assignment_parent_chain);
+                parent_chain
+            }
+        };
+        match &chain {
+            Some(existing) if existing != &parent_chain => {
+                return VguiParentChainResolution::Incomplete;
+            }
+            Some(_) => {}
+            None => chain = Some(parent_chain),
+        }
+    }
+    chain
+        .map(VguiParentChainResolution::Complete)
+        .unwrap_or(VguiParentChainResolution::Incomplete)
+}
+
+fn resolve_vgui_direct_parent_chain(
+    type_ids: &[LuaTypeDeclId],
+    direct_parents_by_child: &HashMap<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>,
+    memo: &mut HashMap<LuaTypeDeclId, VguiParentChainResolution>,
+) -> Option<Vec<LuaTypeDeclId>> {
+    resolve_vgui_direct_parent_chain_with_visiting(
+        type_ids,
+        direct_parents_by_child,
+        memo,
+        &mut HashSet::new(),
+    )
+}
+
+fn resolve_vgui_direct_parent_chain_with_visiting(
+    type_ids: &[LuaTypeDeclId],
+    direct_parents_by_child: &HashMap<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>,
+    memo: &mut HashMap<LuaTypeDeclId, VguiParentChainResolution>,
+    visiting: &mut HashSet<LuaTypeDeclId>,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let [type_id] = type_ids else {
+        return None;
+    };
+    match resolve_vgui_direct_parent_chain_for_type(
+        type_id,
+        direct_parents_by_child,
+        memo,
+        visiting,
+    ) {
+        VguiParentChainResolution::None => Some(vec![type_id.clone()]),
+        VguiParentChainResolution::Complete(mut chain) => {
+            chain.insert(0, type_id.clone());
+            Some(chain)
+        }
+        VguiParentChainResolution::Incomplete => None,
+    }
+}
+
+fn resolve_vgui_direct_parent_chain_for_type(
+    type_id: &LuaTypeDeclId,
+    direct_parents_by_child: &HashMap<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>,
+    memo: &mut HashMap<LuaTypeDeclId, VguiParentChainResolution>,
+    visiting: &mut HashSet<LuaTypeDeclId>,
+) -> VguiParentChainResolution {
+    if let Some(resolution) = memo.get(type_id) {
+        return resolution.clone();
+    }
+    let Some(parents) = direct_parents_by_child.get(type_id) else {
+        return VguiParentChainResolution::None;
+    };
+    if !visiting.insert(type_id.clone()) {
+        return VguiParentChainResolution::Incomplete;
+    }
+
+    let mut chain = None;
+    for parent_type_ids in parents {
+        let Some(parent_chain) = resolve_vgui_direct_parent_chain_with_visiting(
+            parent_type_ids,
+            direct_parents_by_child,
+            memo,
+            visiting,
+        ) else {
+            visiting.remove(type_id);
+            memo.insert(type_id.clone(), VguiParentChainResolution::Incomplete);
+            return VguiParentChainResolution::Incomplete;
+        };
+        match &chain {
+            Some(existing) if existing != &parent_chain => {
+                visiting.remove(type_id);
+                memo.insert(type_id.clone(), VguiParentChainResolution::Incomplete);
+                return VguiParentChainResolution::Incomplete;
+            }
+            Some(_) => {}
+            None => chain = Some(parent_chain),
+        }
+    }
+    visiting.remove(type_id);
+    let resolution = chain
+        .map(VguiParentChainResolution::Complete)
+        .unwrap_or(VguiParentChainResolution::Incomplete);
+    memo.insert(type_id.clone(), resolution.clone());
+    resolution
+}
+
+fn resolve_vgui_parent_source_type_ids(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaSyntaxNode,
+    field_assignment_parents: &HashMap<String, Vec<VguiFieldAssignmentParent>>,
+    call_expr: &LuaCallExpr,
+    source: &GmodVguiParentSource,
+) -> Vec<LuaTypeDeclId> {
+    match resolve_vgui_parent_source(db, cache, root, field_assignment_parents, call_expr, source) {
+        ResolvedVguiParentSource::Direct(type_ids) => type_ids,
+        ResolvedVguiParentSource::AssignedField { field_type_ids, .. }
+        | ResolvedVguiParentSource::ReceiverField { field_type_ids, .. } => field_type_ids,
+    }
+}
+
+fn resolve_vgui_parent_source(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaSyntaxNode,
+    field_assignment_parents: &HashMap<String, Vec<VguiFieldAssignmentParent>>,
+    call_expr: &LuaCallExpr,
+    source: &GmodVguiParentSource,
+) -> ResolvedVguiParentSource {
+    let resolve_type_ids = |typ: LuaType| {
+        let mut type_ids = Vec::new();
+        collect_panel_type_ids(db, &typ, &mut type_ids);
+        type_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+        type_ids.dedup();
+        type_ids
+    };
+    match source {
+        GmodVguiParentSource::LiteralName(name) => {
+            let type_id = LuaTypeDeclId::global(name);
+            let type_ids = db
+                .get_type_index()
+                .get_type_decl(&type_id)
+                .is_some()
+                .then(|| resolve_type_ids(LuaType::Ref(type_id)))
+                .unwrap_or_default();
+            ResolvedVguiParentSource::Direct(type_ids)
+        }
+        GmodVguiParentSource::Expr(syntax_id) => {
+            let Some(expr) = syntax_id.to_node_from_root(root).and_then(LuaExpr::cast) else {
+                return ResolvedVguiParentSource::Direct(Vec::new());
+            };
+            let field_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, expr.clone());
+            if matches!(expr, LuaExpr::IndexExpr(_))
+                && let Some(assignment_parent_type_ids) =
+                    resolve_vgui_field_assignment_parent_type_ids(
+                        db,
+                        cache,
+                        &expr,
+                        &field_type_ids,
+                        field_assignment_parents,
+                    )
+            {
+                return ResolvedVguiParentSource::AssignedField {
+                    field_type_ids,
+                    assignment_parent_type_ids,
+                };
+            }
+            ResolvedVguiParentSource::Direct(field_type_ids)
+        }
+        GmodVguiParentSource::Unknown => ResolvedVguiParentSource::Direct(Vec::new()),
+        GmodVguiParentSource::Receiver | GmodVguiParentSource::ReceiverField(_) => {
+            let receiver = call_expr.get_prefix_expr().and_then(|prefix| match prefix {
+                LuaExpr::IndexExpr(index_expr) => index_expr.get_prefix_expr(),
+                _ => None,
+            });
+            let receiver_type_ids = receiver
+                .clone()
+                .map(|expr| resolve_vgui_parent_expr_type_ids(db, cache, expr))
+                .unwrap_or_default();
+            let receiver_type = match receiver_type_ids.as_slice() {
+                [type_id] => Some(LuaType::Ref(type_id.clone())),
+                _ => receiver
+                    .clone()
+                    .and_then(|expr| infer_expr(db, cache, expr).ok()),
+            };
+            match source {
+                GmodVguiParentSource::Receiver => {
+                    ResolvedVguiParentSource::Direct(receiver_type_ids)
+                }
+                GmodVguiParentSource::ReceiverField(field_path) => {
+                    let field_type = receiver_type.and_then(|initial| {
+                        field_path.iter().try_fold(initial, |typ, field| {
+                            crate::semantic::infer_raw_member_type_with_cache(
+                                db,
+                                cache,
+                                &typ,
+                                &LuaMemberKey::Name(field.as_str().into()),
+                            )
+                            .ok()
+                        })
+                    });
+                    let field_type_ids = field_type.map(resolve_type_ids).unwrap_or_default();
+                    let receiver_field_parent_type_ids = receiver.as_ref().and_then(|receiver| {
+                        resolve_vgui_field_assignment_parent_type_ids(
+                            db,
+                            cache,
+                            receiver,
+                            &receiver_type_ids,
+                            field_assignment_parents,
+                        )
+                    });
+                    ResolvedVguiParentSource::ReceiverField {
+                        field_type_ids,
+                        receiver_type_ids,
+                        receiver_field_parent_type_ids,
+                    }
+                }
+                _ => unreachable!(),
+            }
+        }
+    }
+}
+
+fn resolve_vgui_field_assignment_parent_type_ids(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    field_expr: &LuaExpr,
+    field_type_ids: &[LuaTypeDeclId],
+    field_assignment_parents: &HashMap<String, Vec<VguiFieldAssignmentParent>>,
+) -> Option<Vec<LuaTypeDeclId>> {
+    let LuaExpr::IndexExpr(field_expr) = field_expr else {
+        return None;
+    };
+    let field_path = field_expr.get_access_path()?;
+    let owner = field_expr.get_prefix_expr()?;
+    let owner_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, owner);
+    let mut candidates = field_assignment_parents
+        .get(&field_path)?
+        .iter()
+        .filter(|assignment| {
+            !field_type_ids.is_empty() && assignment.owner_type_ids == owner_type_ids
+        });
+    let parent_type_ids = candidates.next()?;
+    if candidates.next().is_some() {
+        return None;
+    }
+    Some(parent_type_ids.parent_type_ids.clone())
+}
+
+fn index_vgui_field_assignment_parents(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaSyntaxNode,
+) -> HashMap<String, Vec<VguiFieldAssignmentParent>> {
+    let mut assignments = HashMap::new();
+    for assign in root.descendants().filter_map(LuaAssignStat::cast) {
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        for (target, value) in vars.iter().zip(exprs) {
+            let LuaVarExpr::IndexExpr(target) = target else {
+                continue;
+            };
+            let Some(field_path) = target.get_access_path() else {
+                continue;
+            };
+            let Some(owner) = target.get_prefix_expr() else {
+                continue;
+            };
+            let LuaExpr::CallExpr(create_call) = value else {
+                continue;
+            };
+            if create_call.get_access_path().as_deref() != Some("vgui.Create") {
+                continue;
+            }
+            let Some(parent) = create_call
+                .get_args_list()
+                .and_then(|args| args.get_args().nth(1))
+            else {
+                continue;
+            };
+            let parent_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, parent);
+            if parent_type_ids.is_empty() {
+                continue;
+            }
+            assignments.entry(field_path).or_insert_with(Vec::new).push(
+                VguiFieldAssignmentParent {
+                    owner_type_ids: resolve_vgui_parent_expr_type_ids(db, cache, owner),
+                    parent_type_ids,
+                },
+            );
+        }
+    }
+    assignments
+}
+
+fn resolve_vgui_parent_expr_type_ids(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> Vec<LuaTypeDeclId> {
+    if let LuaExpr::NameExpr(name_expr) = &expr
+        && name_expr.get_name_text().as_deref() == Some("self")
+    {
+        if let Some(context) =
+            crate::semantic::resolve_registered_vgui_method_context(db, cache, name_expr)
+        {
+            // A resolved vgui.Register/derma.DefineControl table is necessarily
+            // a Panel even while its inherited base class is still stabilizing.
+            return vec![LuaTypeDeclId::global(&context.panel_name)];
+        }
+        for function in name_expr.ancestors::<LuaFuncStat>() {
+            let Some(LuaVarExpr::IndexExpr(index_expr)) = function.get_func_name() else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(class_name)) = index_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(class_name) = class_name.get_name_text() else {
+                continue;
+            };
+            let type_id = LuaTypeDeclId::global(&class_name);
+            if db.get_type_index().get_type_decl(&type_id).is_some() {
+                let mut type_ids = Vec::new();
+                collect_panel_type_ids(db, &LuaType::Ref(type_id), &mut type_ids);
+                if !type_ids.is_empty() {
+                    return type_ids;
+                }
+            }
+        }
+    }
+    infer_expr(db, cache, expr)
+        .map(|typ| {
+            let mut type_ids = Vec::new();
+            collect_panel_type_ids(db, &typ, &mut type_ids);
+            type_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+            type_ids.dedup();
+            type_ids
+        })
+        .unwrap_or_default()
 }
 
 fn collect_panel_type_ids(db: &DbIndex, typ: &LuaType, type_ids: &mut Vec<LuaTypeDeclId>) {
@@ -5950,11 +6467,14 @@ struct AnnotatedGmodCallArgRole {
 
 enum AnnotatedVguiParentSource {
     Arg(GmodClassCallArgSource),
-    SelfExpr,
+    Receiver {
+        field_path: Vec<String>,
+        dot_source: GmodClassCallArgSource,
+    },
 }
 
 struct AnnotatedVguiParentCallRoles {
-    child: GmodClassCallArgSource,
+    child: AnnotatedVguiParentSource,
     parent: AnnotatedVguiParentSource,
 }
 
@@ -6009,6 +6529,7 @@ struct AnnotatedGmodCallRoles {
     vgui_panel_table_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_base_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_reference_roles: Vec<AnnotatedGmodCallArgRole>,
+    vgui_panel_child_self_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_parent_roles: Vec<AnnotatedGmodCallArgRole>,
     vgui_panel_parent_self_roles: Vec<AnnotatedGmodCallArgRole>,
     derma_skin_define_roles: Vec<AnnotatedGmodCallArgRole>,
@@ -6159,6 +6680,9 @@ impl AnnotatedGmodCallRoles {
             ("gmod.vgui_panel", crate::GMOD_ROLE_REFERENCE) => {
                 self.vgui_panel_reference_roles.push(arg_role);
             }
+            ("gmod.vgui_panel", crate::GMOD_ROLE_VGUI_CHILD_SELF) => {
+                self.vgui_panel_child_self_roles.push(arg_role);
+            }
             ("gmod.vgui_panel", crate::GMOD_ROLE_VGUI_PARENT) => {
                 self.vgui_panel_parent_roles.push(arg_role);
             }
@@ -6204,6 +6728,8 @@ impl AnnotatedGmodCallRoles {
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_reference_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
+        self.vgui_panel_child_self_roles
+            .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_parent_roles
             .sort_by_key(AnnotatedGmodCallArgRole::sort_key);
         self.vgui_panel_parent_self_roles
@@ -6227,6 +6753,9 @@ impl AnnotatedGmodCallRoles {
             || !self.network_var_define_roles.is_empty()
             || !self.vgui_panel_define_roles.is_empty()
             || (!self.vgui_panel_reference_roles.is_empty()
+                && (!self.vgui_panel_parent_roles.is_empty()
+                    || !self.vgui_panel_parent_self_roles.is_empty()))
+            || (!self.vgui_panel_child_self_roles.is_empty()
                 && (!self.vgui_panel_parent_roles.is_empty()
                     || !self.vgui_panel_parent_self_roles.is_empty()))
             || matches!(
@@ -6359,6 +6888,9 @@ impl AnnotatedGmodCallRoles {
                 || !self.network_var_define_roles.is_empty()
                 || !self.vgui_panel_define_roles.is_empty()
                 || (!self.vgui_panel_reference_roles.is_empty()
+                    && (!self.vgui_panel_parent_roles.is_empty()
+                        || !self.vgui_panel_parent_self_roles.is_empty()))
+                || (!self.vgui_panel_child_self_roles.is_empty()
                     && (!self.vgui_panel_parent_roles.is_empty()
                         || !self.vgui_panel_parent_self_roles.is_empty()))
                 || matches!(
@@ -6500,16 +7032,23 @@ impl AnnotatedGmodCallRoles {
     }
 
     fn vgui_parent_call(&self, is_colon_call: bool) -> Option<AnnotatedVguiParentCallRoles> {
-        let child = self
-            .vgui_panel_reference_roles
-            .first()?
-            .to_arg_source(is_colon_call, self.is_colon_define)?;
+        let child = if let Some(role) = self.vgui_panel_reference_roles.first() {
+            AnnotatedVguiParentSource::Arg(role.to_arg_source(is_colon_call, self.is_colon_define)?)
+        } else {
+            let role = self.vgui_panel_child_self_roles.first()?;
+            AnnotatedVguiParentSource::Receiver {
+                field_path: role.field_path.clone(),
+                dot_source: role.to_arg_source(false, self.is_colon_define)?,
+            }
+        };
         let parent = if let Some(role) = self.vgui_panel_parent_roles.first() {
             AnnotatedVguiParentSource::Arg(role.to_arg_source(is_colon_call, self.is_colon_define)?)
-        } else if !self.vgui_panel_parent_self_roles.is_empty() && is_colon_call {
-            AnnotatedVguiParentSource::SelfExpr
         } else {
-            return None;
+            let role = self.vgui_panel_parent_self_roles.first()?;
+            AnnotatedVguiParentSource::Receiver {
+                field_path: role.field_path.clone(),
+                dot_source: role.to_arg_source(false, self.is_colon_define)?,
+            }
         };
         Some(AnnotatedVguiParentCallRoles { child, parent })
     }
@@ -7071,27 +7610,27 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                 .get_decl_references(&file_id, &decl_id)
                 .is_some_and(|references| references.mutable)
         }) {
-            return None;
+            return roles_from_inferred_receiver_method(db, file_id, call_expr, call_path);
         }
 
-        if let Some(local_path_roles) =
+        if let Some(Some(local_path_roles)) =
             annotated_roles_from_local_call_path(self, db, file_id, call_expr, call_path)
         {
-            return local_path_roles.and_then(|roles| roles.select_for_call(call_expr));
+            return local_path_roles.select_for_call(call_expr);
         }
 
         if self.global_roles.contains(call_path) {
-            if let Some(local_roles) = annotated_roles_from_local_call_prefix(
+            if let Some(Some(local_roles)) = annotated_roles_from_local_call_prefix(
                 self,
                 db,
                 file_id,
                 call_expr.get_prefix_expr(),
             ) {
-                return local_roles.and_then(|roles| roles.select_for_call(call_expr));
+                return local_roles.select_for_call(call_expr);
             }
 
             if call_expr_has_shadowing_local_root(db, file_id, call_expr) {
-                return None;
+                return roles_from_inferred_receiver_method(db, file_id, call_expr, call_path);
             }
 
             return self
@@ -7100,12 +7639,18 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
                 .and_then(|roles| roles.select_for_call(call_expr));
         }
 
-        if !self.local_candidate_names.contains(call_path) {
-            return None;
+        if self.local_candidate_names.contains(call_path)
+            && let Some(Some(local_roles)) = annotated_roles_from_local_call_prefix(
+                self,
+                db,
+                file_id,
+                call_expr.get_prefix_expr(),
+            )
+        {
+            return local_roles.select_for_call(call_expr);
         }
 
-        annotated_roles_from_local_call_prefix(self, db, file_id, call_expr.get_prefix_expr())?
-            .and_then(|roles| roles.select_for_call(call_expr))
+        roles_from_inferred_receiver_method(db, file_id, call_expr, call_path)
     }
 }
 
@@ -7120,6 +7665,28 @@ fn call_expr_local_root_decl_id(
             .and_then(|name_expr| name_expr_local_decl_id(db, file_id, &name_expr)),
         _ => None,
     }
+}
+
+fn roles_from_inferred_receiver_method(
+    db: &DbIndex,
+    file_id: FileId,
+    call_expr: &LuaCallExpr,
+    call_path: &str,
+) -> Option<AnnotatedGmodCallRoles> {
+    // A local access path such as self.tabContainer:AddPanel cannot match the
+    // annotated DHorizontalScroller.AddPanel path, but its member signature can.
+    // Most calls have no VGUI parent role, so avoid semantic inference for them.
+    if !matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
+        || !matches!(
+            call_path.rsplit('.').next(),
+            Some("Add" | "AddPanel" | "SetParent")
+        )
+    {
+        return None;
+    }
+    let mut cache = LuaInferCache::new(file_id, Default::default());
+    let signature_id = crate::semantic::get_prefix_expr_signature_id(db, &mut cache, call_expr)?;
+    roles_from_signature(db, signature_id)?.select_for_call(call_expr)
 }
 
 fn roles_from_signature(
@@ -7507,34 +8074,30 @@ fn collect_annotated_scripted_class_call_metadata(
     let call_path = call_expr.get_access_path()?;
 
     if let Some(roles) = annotated_roles.vgui_parent_call(db, file_id, &call_expr, &call_path) {
-        let (literal_args, args, _) = extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
-        let child_name = literal_args
-            .get(roles.child.arg_idx)
-            .and_then(Option::as_ref)
-            .and_then(|literal| match literal {
-                GmodClassCallLiteral::String(name) if !name.is_empty() => Some(name.clone()),
-                _ => None,
-            });
-        let parent_syntax_id = match roles.parent {
-            AnnotatedVguiParentSource::Arg(source) => {
-                args.get(source.arg_idx).map(|arg| arg.syntax_id)
-            }
-            AnnotatedVguiParentSource::SelfExpr => call_expr
-                .get_prefix_expr()
-                .and_then(|prefix| match prefix {
-                    LuaExpr::IndexExpr(index) => index.get_prefix_expr(),
-                    _ => None,
-                })
-                .map(|expr| expr.get_syntax_id()),
-        };
-        if let (Some(child_name), Some(parent_syntax_id)) = (child_name, parent_syntax_id) {
+        let field_sources = vgui_parent_field_sources(&roles);
+        let (_, args, field_args) =
+            extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
+        let child =
+            vgui_parent_call_source(&roles.child, call_expr.is_colon_call(), &args, &field_args);
+        let parent =
+            vgui_parent_call_source(&roles.parent, call_expr.is_colon_call(), &args, &field_args)
+                .or_else(|| {
+                    matches!(
+                        child,
+                        Some(
+                            GmodVguiParentSource::Receiver | GmodVguiParentSource::ReceiverField(_)
+                        )
+                    )
+                    .then_some(GmodVguiParentSource::Unknown)
+                });
+        if let (Some(child), Some(parent)) = (child, parent) {
             db.get_gmod_class_metadata_index_mut().add_vgui_parent_call(
                 file_id,
                 GmodVguiParentCallMetadata {
                     syntax_id: call_expr.get_syntax_id(),
-                    child_name,
-                    parent_syntax_id,
-                    parent_type_ids: Vec::new(),
+                    child,
+                    parent,
+                    relations: Vec::new(),
                 },
             );
         }
@@ -7630,6 +8193,62 @@ fn collect_annotated_scripted_class_call_metadata(
     }
 
     None
+}
+
+fn vgui_parent_field_sources(roles: &AnnotatedVguiParentCallRoles) -> Vec<GmodClassCallArgSource> {
+    let mut sources = Vec::new();
+    for source in [&roles.child, &roles.parent] {
+        let AnnotatedVguiParentSource::Arg(source) = source else {
+            continue;
+        };
+        if !source.field_path.is_empty() && !sources.iter().any(|existing| existing == source) {
+            sources.push(source.clone());
+        }
+    }
+    sources
+}
+
+fn vgui_parent_call_source(
+    source: &AnnotatedVguiParentSource,
+    is_colon_call: bool,
+    args: &[GmodClassCallArg],
+    field_args: &[crate::GmodClassCallFieldArg],
+) -> Option<GmodVguiParentSource> {
+    match source {
+        AnnotatedVguiParentSource::Arg(source) => {
+            let arg = if source.field_path.is_empty() {
+                args.get(source.arg_idx)
+                    .map(|arg| (arg.syntax_id, arg.value.as_ref()))
+            } else {
+                field_args
+                    .iter()
+                    .find(|arg| arg.source == *source)
+                    .map(|arg| (arg.syntax_id, arg.value.as_ref()))
+            }?;
+            match arg.1 {
+                Some(GmodClassCallLiteral::String(name)) if !name.is_empty() => {
+                    Some(GmodVguiParentSource::LiteralName(name.clone()))
+                }
+                _ => Some(GmodVguiParentSource::Expr(arg.0)),
+            }
+        }
+        AnnotatedVguiParentSource::Receiver {
+            field_path,
+            dot_source,
+        } if is_colon_call => {
+            if field_path.is_empty() {
+                Some(GmodVguiParentSource::Receiver)
+            } else {
+                Some(GmodVguiParentSource::ReceiverField(field_path.clone()))
+            }
+        }
+        AnnotatedVguiParentSource::Receiver { dot_source, .. } => vgui_parent_call_source(
+            &AnnotatedVguiParentSource::Arg(dot_source.clone()),
+            false,
+            args,
+            field_args,
+        ),
+    }
 }
 
 fn matches_configured_call_path(path: &str, target: &str) -> bool {

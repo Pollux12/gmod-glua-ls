@@ -363,12 +363,9 @@ pub(super) fn stabilize_unguarded_children(
                 // Prefer a stabilized initializer type (e.g. a later same-file
                 // field assignment) over heuristic child-union refinement when
                 // that initializer already owns the used member.
-                if let Some(initializer_type) = refined_initializer_type_for_decl(
-                    db,
-                    context,
-                    decl_id,
-                    file_id,
-                ) {
+                if let Some(initializer_type) =
+                    refined_initializer_type_for_decl(db, context, decl_id, file_id)
+                {
                     if type_has_visible_static_member_at_use(
                         db,
                         &initializer_type,
