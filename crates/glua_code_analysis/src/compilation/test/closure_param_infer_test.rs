@@ -935,6 +935,64 @@ mod test {
     }
 
     #[test]
+    fn gmod_hook_callback_uses_realm_compatible_populate_signature() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "annotations/populate_hooks.lua",
+            r#"
+            ---@class DTree_Node
+            local DTree_Node = {}
+
+            ---@class SpawnmenuContentPanel
+            local SpawnmenuContentPanel = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@realm server
+            ---@param unexpected string
+            ---@param ignored number
+            ---@param node string
+            function GM:PopulateContent(unexpected, ignored, node) end
+
+            ---@realm client
+            ---@param content SpawnmenuContentPanel
+            ---@param node DTree_Node
+            function GM:PopulateContent(content, node) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/populate_hooks.lua",
+            r#"
+            hook.Add("PopulateContent", "test", function(content, node)
+                inferred_populate_content = content
+                inferred_populate_node = node
+            end)
+
+            hook.Add("UnregisteredPopulate", "test", function(node)
+                unregistered_populate_node = node
+            end)
+            "#,
+        );
+
+        let content = ws.expr_ty("inferred_populate_content");
+        let expected_content = ws.ty("SpawnmenuContentPanel");
+        assert_eq!(
+            ws.humanize_type(content),
+            ws.humanize_type(expected_content)
+        );
+        let node = ws.expr_ty("inferred_populate_node");
+        let expected_node = ws.ty("DTree_Node");
+        assert_eq!(ws.humanize_type(node), ws.humanize_type(expected_node));
+        assert_eq!(ws.expr_ty("unregistered_populate_node"), LuaType::Unknown);
+    }
+
+    #[test]
     fn test_gmod_hook_callback_params_infer_from_annotated_wrapper() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

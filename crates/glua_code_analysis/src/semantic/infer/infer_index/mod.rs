@@ -1671,11 +1671,20 @@ fn infer_custom_type_member(
     let access_position = index_expr.get_position();
 
     if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
-        return member_item.resolve_type_with_realm_at_offset(
+        let visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
             db,
             &cache.get_file_id(),
             access_position,
         );
+        if !visible_member_ids.is_empty() {
+            let visible_item = match visible_member_ids.as_slice() {
+                [member_id] => LuaMemberIndexItem::One(*member_id),
+                _ => LuaMemberIndexItem::Many(visible_member_ids),
+            };
+            return visible_item.resolve_type(db);
+        }
+        // A realm-incompatible override must not hide a compatible inherited
+        // member. Continue through the normal owner hierarchy.
     }
     let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(prefix_type_id.get_name()));
     if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, &key) {
@@ -1715,11 +1724,18 @@ fn infer_custom_type_member(
             [member_id] => LuaMemberIndexItem::One(*member_id),
             _ => LuaMemberIndexItem::Many(local_class_member_ids),
         };
-        return member_item.resolve_type_with_realm_at_offset(
+        let visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
             db,
             &cache.get_file_id(),
             access_position,
         );
+        if !visible_member_ids.is_empty() {
+            let visible_item = match visible_member_ids.as_slice() {
+                [member_id] => LuaMemberIndexItem::One(*member_id),
+                _ => LuaMemberIndexItem::Many(visible_member_ids),
+            };
+            return visible_item.resolve_type(db);
+        }
     }
 
     if let Some(dynamic_field) = resolve_dynamic_field_member(
@@ -3162,10 +3178,11 @@ fn infer_tpl_ref_member(
 
 #[cfg(test)]
 mod union_member_tests {
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
     use rowan::TextSize;
 
     use super::finish_union_member_inference;
-    use crate::{FileId, InferFailReason, LuaDeclId, LuaType};
+    use crate::{Emmyrc, FileId, InferFailReason, LuaDeclId, LuaType, VirtualWorkspace};
 
     #[test]
     fn successful_union_arm_does_not_materialize_deferred_failure_as_nil() {
@@ -3189,6 +3206,69 @@ mod union_member_tests {
         assert_eq!(
             finish_union_member_inference(Vec::new(), false, Some(reason.clone())),
             Err(reason)
+        );
+    }
+
+    #[test]
+    fn realm_incompatible_override_falls_back_to_inherited_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "annotations/player.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            local Entity = {}
+
+            ---@class Player: Entity
+            local Player = {}
+
+            ---@return boolean
+            function Player:KeyDown() end
+
+            ---@class DerivedPlayer: Player
+            local DerivedPlayer = {}
+
+            ---@realm server
+            ---@return string
+            function DerivedPlayer:KeyDown() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/player_input.lua",
+            r#"
+            ---@type DerivedPlayer
+            local player = nil
+            local inherited_key_down = player:KeyDown()
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let key_down = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == "player:KeyDown")
+            .expect("expected KeyDown expression");
+        let key_down_type = semantic_model
+            .infer_expr(LuaExpr::IndexExpr(key_down))
+            .expect("expected inherited KeyDown type");
+        let LuaType::Signature(signature_id) = key_down_type else {
+            panic!("expected inherited KeyDown signature, got {key_down_type:?}");
+        };
+        assert_eq!(
+            ws.get_db_mut()
+                .get_signature_index()
+                .get(&signature_id)
+                .expect("expected KeyDown signature")
+                .get_return_type(),
+            LuaType::Boolean
         );
     }
 }

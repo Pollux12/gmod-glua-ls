@@ -6,7 +6,7 @@ use glua_parser::{
 
 use crate::{
     DbIndex, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
-    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey,
+    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey,
     LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
     ReturnTypeKind, SignatureReturnStatus, TypeOps, VariadicType, get_real_type, humanize_type,
     infer_call_expr_func, infer_expr, infer_table_should_be,
@@ -275,10 +275,6 @@ pub fn resolve_gmod_hook_callback_doc_function(
         })?;
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
-    let infer_index = db.get_gmod_infer_index();
-    let call_mask =
-        infer_index.get_state_mask_at_offset(&call_file_id, call_expr.get_range().start());
-
     let mut candidates = Vec::new();
     for owner_name in iter_hook_owner_names(db) {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name));
@@ -286,7 +282,11 @@ pub fn resolve_gmod_hook_callback_doc_function(
             continue;
         };
 
-        for member_id in member_ids_from_item(item) {
+        for member_id in item.visible_member_ids_with_realm_at_offset(
+            db,
+            &call_file_id,
+            call_expr.get_range().start(),
+        ) {
             let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
                 continue;
             };
@@ -299,30 +299,15 @@ pub fn resolve_gmod_hook_callback_doc_function(
             ) else {
                 continue;
             };
-            let member_mask =
-                infer_index.get_state_mask_at_offset(&member_id.file_id, member_id.get_position());
-            let is_compatible = call_mask.is_compatible_with(member_mask);
 
             for func in function_types {
-                candidates.push((is_compatible, func));
+                candidates.push(func);
             }
         }
     }
 
-    candidates.sort_by(
-        |(left_compatible, left_func), (right_compatible, right_func)| {
-            right_compatible.cmp(left_compatible).then_with(|| {
-                right_func
-                    .get_params()
-                    .len()
-                    .cmp(&left_func.get_params().len())
-            })
-        },
-    );
-    let function = candidates
-        .into_iter()
-        .map(|(_, function)| function)
-        .next()?;
+    candidates.sort_by_key(|function| std::cmp::Reverse(function.get_params().len()));
+    let function = candidates.into_iter().next()?;
     Some(GmodHookCallbackDocFunction {
         hook_name,
         function,
@@ -367,13 +352,6 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
     }
 
     names
-}
-
-fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<crate::LuaMemberId> {
-    match item {
-        LuaMemberIndexItem::One(id) => vec![*id],
-        LuaMemberIndexItem::Many(ids) => ids.clone(),
-    }
 }
 
 pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
