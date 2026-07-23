@@ -1103,15 +1103,38 @@ fn collect_all_member_ids_for_type_key(
     let mut result = Vec::new();
     let mut seen = std::collections::HashSet::new();
 
-    for owner in owners {
+    for owner in &owners {
         push_cached_member_ids_for_owner_key(
             member_index,
-            &owner,
+            owner,
             member_key,
             owner_key_member_candidate_cache,
             &mut result,
             &mut seen,
         );
+    }
+
+    // Realm-aware semantic lookup deliberately excludes incompatible subtype
+    // members. The diagnostic still needs those raw candidates when the
+    // declared owner has no member of its own; otherwise an Entity-typed value
+    // can hide a client-only Player method from a server-realm warning.
+    if result.is_empty() && !include_inherited_members {
+        for owner in &owners {
+            let LuaMemberOwner::Type(type_id) = owner else {
+                continue;
+            };
+            for subtype in db.get_type_index().get_all_sub_types(type_id) {
+                let subtype_owner = LuaMemberOwner::Type(subtype.get_id().clone());
+                push_cached_member_ids_for_owner_key(
+                    member_index,
+                    &subtype_owner,
+                    member_key,
+                    owner_key_member_candidate_cache,
+                    &mut result,
+                    &mut seen,
+                );
+            }
+        }
     }
 
     member_candidate_cache.insert(cache_key, result.clone());
@@ -1227,14 +1250,12 @@ fn owner_type_to_member_owners_inner(
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             expand_type_decl_member_owners(type_decl_id, db, visited, include_inherited_members)
         }
-        LuaType::Generic(generic_type) => {
-            expand_type_decl_member_owners(
-                &generic_type.get_base_type_id(),
-                db,
-                visited,
-                include_inherited_members,
-            )
-        }
+        LuaType::Generic(generic_type) => expand_type_decl_member_owners(
+            &generic_type.get_base_type_id(),
+            db,
+            visited,
+            include_inherited_members,
+        ),
         LuaType::Instance(inst) => {
             let mut owners = Vec::new();
             owners.push(LuaMemberOwner::Element(inst.get_range().clone()));
@@ -1261,14 +1282,12 @@ fn owner_type_to_member_owners_inner(
             }
             owners
         }
-        LuaType::MultiLineUnion(multi_union) => {
-            owner_type_to_member_owners_inner(
-                &multi_union.to_union(),
-                db,
-                visited,
-                include_inherited_members,
-            )
-        }
+        LuaType::MultiLineUnion(multi_union) => owner_type_to_member_owners_inner(
+            &multi_union.to_union(),
+            db,
+            visited,
+            include_inherited_members,
+        ),
         LuaType::Intersection(intersection_type) => {
             let mut owners = Vec::new();
             for sub in intersection_type.get_types().iter() {
