@@ -3847,6 +3847,84 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_focus_register_file_defaults_loaded_panel_base_to_panel() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/dpanel.lua",
+            r#"
+            ---@meta
+            ---@class DPanel: Panel
+            local DPanel = {}
+
+            function DPanel:OnlyDPanelMethod() end
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            function PANEL:Init()
+                self:Remove()
+                self:OnlyDPanelMethod()
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            vgui = vgui or {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+
+            vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Remove");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("Panel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile without PANEL.Base should use Panel, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `OnlyDPanelMethod`. "]);
+    }
+
+    #[gtest]
     fn test_vgui_register_file_uses_loaded_panel_base_field_for_methods() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

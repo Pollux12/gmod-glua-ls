@@ -1,10 +1,8 @@
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
-    db_index::GmodScriptedClassCallMetadata,
+    DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata,
 };
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaLocalName, LuaLocalStat,
-    LuaNameExpr, LuaTableExpr, LuaVarExpr,
+    LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
 };
 use rowan::TextSize;
 
@@ -44,8 +42,7 @@ pub(crate) fn resolve_registered_vgui_method_context(
         if table_decl_id == receiver_decl_id
             && receiver_position >= region_start
             && receiver_position < register_position
-            && let Some(panel_name) =
-                synthesized_panel_name_for_registration(db, file_id, region_start, call)
+            && let Some(panel_name) = registered_panel_name(call)
         {
             return Some(RegisteredVguiMethodContext {
                 panel_name,
@@ -90,73 +87,11 @@ fn find_enclosing_panel_receiver_context(
     None
 }
 
-fn synthesized_panel_name_for_registration(
-    db: &DbIndex,
-    file_id: FileId,
-    region_start: TextSize,
-    call: &GmodScriptedClassCallMetadata,
-) -> Option<String> {
-    let table_expr = find_table_expr_at_write_position(db, file_id, region_start)?;
-    let owner = LuaTypeOwner::SyntaxId(InFiled::new(file_id, table_expr.get_syntax_id()));
-    let type_cache = db.get_type_index().get_type_cache(&owner)?;
-    if !type_cache.is_infer() {
-        return None;
-    }
-    let LuaType::Def(type_id) = type_cache.as_type() else {
-        return None;
-    };
-    let call_range = call.syntax_id.get_range();
-    let type_decl = db.get_type_index().get_type_decl(type_id)?;
-    type_decl
-        .get_locations()
-        .iter()
-        .any(|location| location.file_id == file_id && location.range == call_range)
-        .then(|| type_id.get_name().to_string())
-}
-
-fn find_table_expr_at_write_position(
-    db: &DbIndex,
-    file_id: FileId,
-    write_position: TextSize,
-) -> Option<LuaTableExpr> {
-    let chunk = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
-    let name_token = chunk
-        .syntax()
-        .token_at_offset(write_position)
-        .right_biased()?;
-
-    for ancestor in name_token.parent_ancestors() {
-        if let Some(local_stat) = LuaLocalStat::cast(ancestor.clone()) {
-            let names = local_stat
-                .get_local_name_list()
-                .collect::<Vec<LuaLocalName>>();
-            let values = local_stat.get_value_exprs().collect::<Vec<LuaExpr>>();
-            let index = names.iter().position(|name| {
-                name.get_name_token()
-                    .is_some_and(|token| token.syntax().text_range().start() == write_position)
-            })?;
-            return value_expr_as_table(values.get(index)?);
-        }
-
-        if let Some(assign_stat) = LuaAssignStat::cast(ancestor) {
-            let (vars, exprs) = assign_stat.get_var_and_expr_list();
-            let index = vars
-                .iter()
-                .position(|var| var.syntax().text_range().start() == write_position)?;
-            return value_expr_as_table(exprs.get(index)?);
-        }
-    }
-    None
-}
-
-fn value_expr_as_table(expr: &LuaExpr) -> Option<LuaTableExpr> {
-    let mut current = expr.clone();
-    loop {
-        match current {
-            LuaExpr::TableExpr(table) => return Some(table),
-            LuaExpr::ParenExpr(paren) => current = paren.get_expr()?,
-            _ => return None,
-        }
+fn registered_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<String> {
+    let source = call.vgui_panel_define_arg_source();
+    match call.value_for_arg_source(&source) {
+        Some(crate::GmodClassCallLiteral::String(name)) if !name.is_empty() => Some(name.clone()),
+        _ => None,
     }
 }
 

@@ -1966,9 +1966,10 @@ mod test {
     }
 
     #[gtest]
-    fn test_vgui_panel_ref_infers_class_from_enclosing_method() {
-        // `PANEL:GenerateExample(ClassName)` with `vgui.Create(ClassName)` should
-        // infer ClassName as the registered panel class name.
+    fn test_vgui_focus_registered_control_methods_and_returns() {
+        // `PANEL:GenerateExample(ClassName)` uses the registered control name
+        // for vgui.Create. That concrete control type must then retain its
+        // annotated methods and return types.
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -1979,12 +1980,27 @@ mod test {
             r#"
                 ---@class Panel
                 ---@class DScrollPanel: Panel
+                ---@class DCategoryList: DScrollPanel
+                ---@class DCollapsibleCategory: Panel
+
+                ---@param categoryName string
+                ---@return (instance) DCollapsibleCategory
+                function DCategoryList:Add(categoryName) end
+
+                ---@param height number
+                function DCollapsibleCategory:SetTall(height) end
+
+                ---@param contents Panel
+                function DCollapsibleCategory:SetContents(contents) end
 
                 local PANEL = {}
 
                 function PANEL:GenerateExample(ClassName, PropertySheet, Width, Height)
-                    local ctrl = vgui.Create(ClassName)
-                    a = ctrl
+                    local Cat = vgui.Create(ClassName)
+                    local Cat2 = Cat:Add("Test category")
+                    Cat2:SetTall(Height)
+                    Cat2:SetContents(Cat)
+                    a = Cat2
                 end
 
                 derma.DefineControl("DCategoryList", "", PANEL, "DScrollPanel")
@@ -1992,10 +2008,10 @@ mod test {
         );
 
         let a_ty = ws.expr_ty("a");
-        // The return type is Instance-wrapped due to `---@return (instance) T`.
-        // Unwrap to check the base panel class.
+        // The return type is Instance-wrapped; unwrap it to check the
+        // DCategoryList:Add return class.
         let base = unwrap_instance(&a_ty).clone();
-        let expected = ws.ty("DCategoryList");
+        let expected = ws.ty("DCollapsibleCategory");
         assert_eq!(base, expected);
     }
 

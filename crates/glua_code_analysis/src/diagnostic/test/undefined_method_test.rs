@@ -863,6 +863,78 @@ For more information on tools see the command-line reference in the online help.
     }
 
     #[test]
+    fn test_vgui_focus_parent_chain_preserves_drag_base_methods_for_content_container() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DDragBase: Panel
+            ---@field GetParent fun(self: DDragBase): Panel
+            ---@field GetReadOnly fun(self: DDragBase): boolean
+            ---@class DHorizontalScroller: Panel
+            ---@field GetParent fun(self: DHorizontalScroller): Panel
+            ---@field pnlCanvas DDragBase
+
+            ---@class ContentContainer: Panel
+            local ContentContainer = {}
+            function ContentContainer:CanModifyContents()
+                self:GetParent():GetReadOnly()
+                self:GetParent():Missing()
+            end
+            vgui.Register("ContentContainer", ContentContainer, "Panel")
+
+            ---@class ContentOwner: Panel
+            local ContentOwner = {}
+            function ContentOwner:Init()
+                self.contentContainer = vgui.Create("DHorizontalScroller", self)
+            end
+            function ContentOwner:AddContent()
+                local content = vgui.Create("ContentContainer")
+                self.contentContainer:AddPanel(content)
+            end
+            vgui.Register("ContentOwner", ContentOwner, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentContainer")),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DDragBase"),
+                    crate::LuaTypeDeclId::global("DHorizontalScroller"),
+                    crate::LuaTypeDeclId::global("ContentOwner"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
     fn vgui_parent_chain_resolves_create_parent_field_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

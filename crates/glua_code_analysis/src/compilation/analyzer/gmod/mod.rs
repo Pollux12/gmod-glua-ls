@@ -5370,7 +5370,10 @@ fn synthesize_vgui_register_file_target(
     };
     let target_file_id =
         resolve_load_dependency_target(db, source_file_id, LuaDependencyKind::Include, path)?;
-    let base_panel = find_target_panel_base_assignment(db, target_file_id)?;
+    // `vgui.RegisterFile` gives a temporary PANEL table the same runtime
+    // default as `vgui.Register`: without an explicit Base it derives Panel.
+    let base_panel = find_target_panel_base_assignment(db, target_file_id)
+        .unwrap_or_else(|| "Panel".to_string());
 
     let class_decl_id = LuaTypeDeclId::local(
         target_file_id,
