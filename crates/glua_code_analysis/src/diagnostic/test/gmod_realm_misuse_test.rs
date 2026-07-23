@@ -1,8 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{
-        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace,
-    };
+    use crate::{DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -1469,16 +1467,11 @@ mod tests {
 
         let diagnostics = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
         assert!(
-            !diagnostics
-                .iter()
-                .any(|diagnostic| {
-                    diagnostic
-                        .code
-                        .as_deref()
-                        .is_some_and(|code| {
-                            code == DiagnosticCode::GmodRealmMismatchHeuristic.get_name()
-                        })
-                }),
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_deref().is_some_and(|code| {
+                    code == DiagnosticCode::GmodRealmMismatchHeuristic.get_name()
+                })
+            }),
             "Expected inherited shared Think to suppress the client override mismatch, got: {diagnostics:?}"
         );
     }

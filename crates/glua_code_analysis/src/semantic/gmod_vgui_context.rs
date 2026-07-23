@@ -1,9 +1,5 @@
-use crate::{
-    DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata,
-};
-use glua_parser::{
-    LuaAstNode, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
-};
+use crate::{DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata};
+use glua_parser::{LuaAstNode, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr};
 use rowan::TextSize;
 
 use super::LuaInferCache;

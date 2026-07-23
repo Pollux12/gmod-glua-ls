@@ -7,10 +7,10 @@ use std::collections::HashSet;
 
 use crate::{
     DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
-    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey,
-    LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    ReturnTypeKind, SignatureReturnStatus, TypeOps, VariadicType, get_real_type, humanize_type,
-    infer_call_expr_func, infer_expr, infer_table_should_be,
+    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
+    TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
+    infer_table_should_be,
 };
 
 use super::{
