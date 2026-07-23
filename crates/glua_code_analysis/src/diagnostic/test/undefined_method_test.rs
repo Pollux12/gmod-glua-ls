@@ -935,6 +935,119 @@ For more information on tools see the command-line reference in the online help.
     }
 
     #[test]
+    fn vgui_parent_chain_resolves_content_container_add_through_tile_layout() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/vgui.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DDragBase: Panel
+            ---@field GetReadOnly fun(self: DDragBase): boolean
+            ---@class DTileLayout: DDragBase
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentcontainer.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.IconList = vgui.Create("DTileLayout")
+            end
+
+            function PANEL:Add(pnl)
+                self.IconList:Add(pnl)
+            end
+
+            vgui.Register("ContentContainer", PANEL, "Panel")
+        "#,
+        );
+        let header_file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentheader.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:OpenMenu()
+                if self:GetParent().GetReadOnly then
+                    self:GetParent():GetReadOnly()
+                end
+                self:GetParent():Missing()
+            end
+
+            vgui.Register("ContentHeader", PANEL, "Panel")
+        "#,
+        );
+        let icon_file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contenticon.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:OpenGenericSpawnmenuRightClickMenu()
+                if self:GetParent().GetReadOnly then
+                    self:GetParent():GetReadOnly()
+                end
+                self:GetParent():Missing()
+            end
+
+            vgui.Register("ContentIcon", PANEL, "Panel")
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content.lua",
+            r#"
+            local container = vgui.Create("ContentContainer")
+            local header = vgui.Create("ContentHeader")
+            local icon = vgui.Create("ContentIcon")
+            container:Add(header)
+            container:Add(icon)
+        "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+
+        let undefined_methods = [header_file_id, icon_file_id]
+            .into_iter()
+            .flat_map(|file_id| {
+                ws.analysis
+                    .diagnose_file(file_id, CancellationToken::new())
+                    .unwrap_or_default()
+            })
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            undefined_methods,
+            [
+                "Undefined method `Missing`. ",
+                "Undefined method `Missing`. "
+            ]
+        );
+    }
+
+    #[test]
     fn vgui_parent_chain_resolves_create_parent_field_assignment() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

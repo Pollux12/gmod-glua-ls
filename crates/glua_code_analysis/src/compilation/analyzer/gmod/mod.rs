@@ -2460,6 +2460,41 @@ fn resolve_vgui_parent_relations(
         })
         .collect::<Vec<_>>();
     file_ids.sort_by_key(|file_id| file_id.id);
+    let mut forwarding_parent_candidates =
+        HashMap::<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>::new();
+    for file_id in &file_ids {
+        let calls = db
+            .get_gmod_class_metadata_index()
+            .get_vgui_parent_calls(file_id)
+            .to_vec();
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            continue;
+        };
+        let cache = context.infer_manager.get_infer_cache(*file_id);
+        index_vgui_forwarding_parent_candidates(
+            db,
+            cache,
+            *file_id,
+            &root,
+            &calls,
+            &mut forwarding_parent_candidates,
+        );
+    }
+    let forwarding_parents =
+        finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
+    collect_vgui_forwarding_parent_calls(db, context, &forwarding_parents);
+    file_ids = db
+        .get_gmod_class_metadata_index()
+        .iter_file_metadata()
+        .filter_map(|(file_id, metadata)| {
+            (!metadata.vgui_parent_calls.is_empty()).then_some(*file_id)
+        })
+        .collect();
+    file_ids.sort_by_key(|file_id| file_id.id);
     let mut relations_by_file = Vec::new();
     for file_id in file_ids {
         let calls = db
@@ -2565,6 +2600,191 @@ fn resolve_vgui_parent_relations(
     }
     db.get_gmod_class_metadata_index_mut()
         .set_vgui_parent_relations(resolved_by_file);
+}
+
+fn index_vgui_forwarding_parent_candidates(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    root: &LuaSyntaxNode,
+    calls: &[GmodVguiParentCallMetadata],
+    candidates: &mut HashMap<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>,
+) {
+    for call in calls {
+        let GmodVguiParentSource::Expr(child_syntax_id) = &call.child else {
+            continue;
+        };
+        let Some(LuaExpr::NameExpr(child_name)) = child_syntax_id
+            .to_node_from_root(root)
+            .and_then(LuaExpr::cast)
+        else {
+            continue;
+        };
+        let Some(child_decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .and_then(|references| references.get_decl_id(&child_name.get_range()))
+        else {
+            continue;
+        };
+        if !db
+            .get_decl_index()
+            .get_decl(&child_decl_id)
+            .is_some_and(crate::LuaDecl::is_param)
+        {
+            continue;
+        }
+        let Some(call_expr) = call
+            .syntax_id
+            .to_node_from_root(root)
+            .and_then(LuaCallExpr::cast)
+        else {
+            continue;
+        };
+        let Some(function) = call_expr.ancestors::<LuaFuncStat>().next() else {
+            continue;
+        };
+        let Some(LuaVarExpr::IndexExpr(function_name)) = function.get_func_name() else {
+            continue;
+        };
+        let Some(method_name) = function_name
+            .get_index_key()
+            .map(|key| key.get_path_part().to_string())
+        else {
+            continue;
+        };
+        let Some(LuaExpr::IndexExpr(method_index)) = call_expr.get_prefix_expr() else {
+            continue;
+        };
+        let Some(LuaExpr::IndexExpr(field_index)) = method_index.get_prefix_expr() else {
+            continue;
+        };
+        let Some(owner) = field_index.get_prefix_expr() else {
+            continue;
+        };
+        let owner_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, owner);
+        let [owner_type_id] = owner_type_ids.as_slice() else {
+            continue;
+        };
+        let parent_type_ids = resolve_vgui_parent_source_type_ids(
+            db,
+            cache,
+            root,
+            &HashMap::new(),
+            &call_expr,
+            &call.parent,
+        );
+        if parent_type_ids.is_empty() {
+            continue;
+        }
+        candidates
+            .entry((owner_type_id.clone(), method_name))
+            .or_default()
+            .push(parent_type_ids);
+    }
+}
+
+fn finalize_vgui_forwarding_parent_candidates(
+    candidates: HashMap<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>,
+) -> HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>> {
+    candidates
+        .into_iter()
+        .filter_map(|(key, parent_candidates)| {
+            let parent_type_ids = parent_candidates.first()?.clone();
+            parent_candidates
+                .iter()
+                .all(|candidate| candidate == &parent_type_ids)
+                .then_some((key, parent_type_ids))
+        })
+        .collect()
+}
+
+fn collect_vgui_forwarding_parent_calls(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
+) {
+    if forwarding_parents.is_empty() {
+        return;
+    }
+    // Source overrides are not reverse-indexed, so only inspect files that
+    // mention a method proven to forward its panel argument to a VGUI parent.
+    let forwarding_method_names = forwarding_parents
+        .keys()
+        .map(|(_, method_name)| method_name.as_str())
+        .collect::<HashSet<_>>();
+    let files = context
+        .tree_list
+        .iter()
+        .filter(|tree| {
+            db.get_vfs()
+                .get_file_content(&tree.file_id)
+                .is_some_and(|content| {
+                    forwarding_method_names
+                        .iter()
+                        .any(|method_name| content.contains(&format!(":{method_name}")))
+                })
+        })
+        .map(|tree| (tree.file_id, tree.value.get_root()))
+        .collect::<Vec<_>>();
+    for (file_id, root) in files {
+        let existing_call_syntax_ids = db
+            .get_gmod_class_metadata_index()
+            .get_vgui_parent_calls(&file_id)
+            .iter()
+            .map(|call| call.syntax_id)
+            .collect::<HashSet<_>>();
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let mut calls = Vec::new();
+        for call_expr in root.descendants().filter_map(LuaCallExpr::cast) {
+            if existing_call_syntax_ids.contains(&call_expr.get_syntax_id()) {
+                continue;
+            }
+            if !call_expr.is_colon_call() {
+                continue;
+            }
+            let Some(LuaExpr::IndexExpr(method_index)) = call_expr.get_prefix_expr() else {
+                continue;
+            };
+            let Some(receiver) = method_index.get_prefix_expr() else {
+                continue;
+            };
+            let Some(method_name) = method_index
+                .get_index_key()
+                .map(|key| key.get_path_part().to_string())
+            else {
+                continue;
+            };
+            let receiver_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, receiver);
+            let [receiver_type_id] = receiver_type_ids.as_slice() else {
+                continue;
+            };
+            let Some(parent_type_ids) =
+                forwarding_parents.get(&(receiver_type_id.clone(), method_name))
+            else {
+                continue;
+            };
+            let [parent_type_id] = parent_type_ids.as_slice() else {
+                continue;
+            };
+            let Some(child) = call_expr
+                .get_args_list()
+                .and_then(|args| args.get_args().next())
+            else {
+                continue;
+            };
+            calls.push(GmodVguiParentCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                child: GmodVguiParentSource::Expr(child.get_syntax_id()),
+                parent: GmodVguiParentSource::LiteralName(parent_type_id.get_name().to_string()),
+                relations: Vec::new(),
+            });
+        }
+        let metadata = db.get_gmod_class_metadata_index_mut();
+        for call in calls {
+            metadata.add_vgui_parent_call(file_id, call);
+        }
+    }
 }
 
 fn resolve_vgui_parent_chain(
