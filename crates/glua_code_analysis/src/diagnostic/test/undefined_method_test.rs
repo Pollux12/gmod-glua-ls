@@ -83,6 +83,33 @@ mod tests {
     }
 
     #[test]
+    fn explicit_table_key_type_allows_pairs_receiver_method() {
+        let diagnostics = diagnostics(
+            &mut VirtualWorkspace::new(),
+            r#"
+            ---@class Entity
+            local Entity = {}
+            function Entity:Remove() end
+
+            ---@class RefundData
+            ---@field units number
+            ---@field cost number?
+            ---@field reason number
+            ---@field pumpType string|number
+            ---@type table<Entity, RefundData>
+            Registry = Registry or {}
+
+            local registry = Registry
+            for pump in pairs(registry) do
+                pump:Remove()
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
     fn short_circuit_guarded_optional_method_does_not_report() {
         let diagnostics = diagnostics(
             &mut VirtualWorkspace::new(),

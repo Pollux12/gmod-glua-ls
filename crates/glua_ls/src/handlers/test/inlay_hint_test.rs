@@ -463,7 +463,6 @@ mod tests {
             r#"
                 ---@class PanelHolder
                 ---@field panel (instance) OldPanel
-                ---@type PanelHolder
                 local holder
                 ---@return (instance) NewPanel
                 local function make_new_panel() end
@@ -471,7 +470,7 @@ mod tests {
             "#,
             vec![VirtualInlayHint {
                 label: ": VGUI Panel (NewPanel : Panel)".to_string(),
-                line: 7,
+                line: 6,
                 pos: 28,
                 ref_file: None,
             }]

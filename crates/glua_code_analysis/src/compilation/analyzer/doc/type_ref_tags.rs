@@ -615,7 +615,10 @@ pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Optio
         .get_module_index()
         .find_module_for_file(&module_path, analyzer.file_id)?;
     let module_file_id = module_info.file_id;
-    let owner_id = get_owner_id_or_report(analyzer, &tag)?;
+    let owner_id = get_owner_id(analyzer, None, true).or_else(|| {
+        report_orphan_tag(analyzer, &tag);
+        None
+    })?;
     let module_ref = LuaType::ModuleRef(module_file_id);
     match &owner_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {

@@ -60,6 +60,80 @@ mod test {
     }
 
     #[test]
+    fn explicit_table_type_overrides_implicit_class_type_for_pairs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class RefundData
+            ---@field units number
+            ---@field cost number?
+            ---@field reason number
+            ---@field pumpType string|number
+            ---@type table<Entity, RefundData>
+            Registry = Registry or {}
+
+            local registry = Registry
+            for pump, refund_data in pairs(registry) do
+                pump_out = pump
+                refund_data_out = refund_data
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("pump_out"), ws.ty("Entity"));
+        assert_eq!(ws.expr_ty("refund_data_out"), ws.ty("RefundData"));
+    }
+
+    #[test]
+    fn implicit_class_type_still_binds_owner_without_explicit_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class ImplicitData
+            data = {}
+            "#,
+        );
+
+        let data_type = ws.expr_ty("data");
+        assert_eq!(ws.humanize_type(data_type), "ImplicitData");
+    }
+
+    #[test]
+    fn explicit_type_overrides_implicit_enum_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@enum Flags
+            ---@type table<string, integer>
+            flags = {}
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("flags"), ws.ty("table<string, integer>"));
+    }
+
+    #[test]
+    fn schema_tag_skips_implicit_class_owner_type_before_resolution() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class SchemaShape
+            ---@schema "not a URL"
+            local value = {}
+            "#,
+        );
+
+        assert_ne!(ws.expr_ty("value"), ws.ty("SchemaShape"));
+    }
+
+    #[test]
     fn test_issue_321() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

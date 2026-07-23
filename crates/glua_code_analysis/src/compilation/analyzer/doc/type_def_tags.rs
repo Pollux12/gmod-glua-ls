@@ -1,6 +1,6 @@
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocDescription,
-    LuaDocDescriptionOwner, LuaDocGenericDeclList, LuaDocTagAlias, LuaDocTagAttribute,
+    LuaDocDescriptionOwner, LuaDocGenericDeclList, LuaDocTag, LuaDocTagAlias, LuaDocTagAttribute,
     LuaDocTagClass, LuaDocTagEnum, LuaDocTagGeneric, LuaFuncStat, LuaLocalName, LuaLocalStat,
     LuaNameExpr, LuaSyntaxId, LuaSyntaxKind, LuaTokenKind, LuaVarExpr,
 };
@@ -61,7 +61,9 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
 
     add_description_for_type_decl(analyzer, &class_decl_id, tag.get_descriptions());
 
-    bind_def_type(analyzer, LuaType::Def(class_decl_id.clone()));
+    if !comment_has_explicit_owner_type(analyzer) {
+        bind_def_type(analyzer, LuaType::Def(class_decl_id.clone()));
+    }
     Some(())
 }
 
@@ -121,9 +123,20 @@ pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()
 
     add_description_for_type_decl(analyzer, &enum_decl_id, tag.get_descriptions());
 
-    bind_def_type(analyzer, LuaType::Def(enum_decl_id.clone()));
+    if !comment_has_explicit_owner_type(analyzer) {
+        bind_def_type(analyzer, LuaType::Def(enum_decl_id.clone()));
+    }
 
     Some(())
+}
+
+fn comment_has_explicit_owner_type(analyzer: &DocAnalyzer) -> bool {
+    analyzer.comment.get_doc_tags().any(|tag| {
+        matches!(
+            tag,
+            LuaDocTag::Type(_) | LuaDocTag::Module(_) | LuaDocTag::Schema(_)
+        )
+    })
 }
 
 pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<()> {
