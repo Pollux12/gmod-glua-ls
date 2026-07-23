@@ -5382,6 +5382,24 @@ fn synthesize_vgui_register_file_target(
     let panel_name = class_decl_id.get_simple_name().to_string();
     let class_type = LuaType::Def(class_decl_id.clone());
 
+    // `vgui.RegisterFile` returns the temporary PANEL table it loaded. Bind
+    // that call expression to the synthesized class so a subsequent
+    // `vgui.CreateFromTable(result)` preserves the file's PANEL members.
+    write_type_cache(
+        db,
+        LuaTypeOwner::SyntaxId(InFiled::new(source_file_id, call.syntax_id)),
+        LuaTypeCache::InferType(class_type.clone()),
+        TypeCacheWriteMode::ForceOverwrite,
+    );
+    if let Some(decl_id) = local_decl_for_call_result(db, source_file_id, call.syntax_id) {
+        write_type_cache(
+            db,
+            decl_id.into(),
+            LuaTypeCache::InferType(class_type.clone()),
+            TypeCacheWriteMode::ForceOverwrite,
+        );
+    }
+
     if db.get_type_index().get_type_decl(&class_decl_id).is_none() {
         let range = db
             .get_vfs()
@@ -5454,6 +5472,27 @@ fn synthesize_vgui_register_file_target(
         range.start(),
         range.end(),
     ))
+}
+
+fn local_decl_for_call_result(
+    db: &DbIndex,
+    file_id: FileId,
+    call_syntax_id: LuaSyntaxId,
+) -> Option<LuaDeclId> {
+    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_chunk_node();
+    let call_range = call_syntax_id.get_range();
+    for local_stat in root.descendants::<LuaLocalStat>() {
+        let Some(value_idx) = local_stat
+            .get_value_exprs()
+            .position(|value| value.get_range() == call_range)
+        else {
+            continue;
+        };
+        if let Some(local_name) = local_stat.get_local_name_list().nth(value_idx) {
+            return Some(LuaDeclId::new(file_id, local_name.get_position()));
+        }
+    }
+    None
 }
 
 fn ensure_register_file_panel_decls(db: &mut DbIndex, file_id: FileId) -> Option<Vec<LuaDeclId>> {

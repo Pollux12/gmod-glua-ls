@@ -3925,6 +3925,73 @@ mod test {
     }
 
     #[gtest]
+    fn vgui_register_file_return_preserves_loaded_panel_methods_for_create_from_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentsearch.lua",
+            r#"
+            PANEL.Base = "Panel"
+
+            function PANEL:SetSearchType(stype, hook_name) end
+        "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentsidebar.lua",
+            r#"
+            ---@generic T: table
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            ---@return T
+            function vgui.RegisterFile(file) end
+
+            local pnlSearch = vgui.RegisterFile("contentsearch.lua")
+            local PANEL = {}
+
+            function PANEL:EnableSearch(stype, hook_name)
+                self.Search = vgui.CreateFromTable(pnlSearch, self)
+                self.Search:SetSearchType(stype, hook_name or "PopulateContent")
+            end
+
+            vgui.Register("ContentSidebar", PANEL, "Panel")
+        "#,
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            undefined_methods.is_empty(),
+            "RegisterFile panel methods should survive CreateFromTable, got {undefined_methods:?}"
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_file_uses_loaded_panel_base_field_for_methods() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
