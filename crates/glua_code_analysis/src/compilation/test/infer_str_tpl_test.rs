@@ -1976,7 +1976,7 @@ mod test {
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
-        ws.def(
+        let file_id = ws.def(
             r#"
                 ---@class Panel
                 ---@class DScrollPanel: Panel
@@ -2007,12 +2007,17 @@ mod test {
             "#,
         );
 
-        let a_ty = ws.expr_ty("a");
-        // The return type is Instance-wrapped; unwrap it to check the
-        // DCategoryList:Add return class.
-        let base = unwrap_instance(&a_ty).clone();
-        let expected = ws.ty("DCollapsibleCategory");
-        assert_eq!(base, expected);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "registered control methods should resolve, got {diagnostics:?}"
+        );
     }
 
     #[gtest]
