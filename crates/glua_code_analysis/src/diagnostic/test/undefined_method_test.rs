@@ -979,9 +979,9 @@ For more information on tools see the command-line reference in the online help.
             ---@class DTileLayout: DDragBase
         "#,
         );
-        ws.def_file(
-            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentcontainer.lua",
-            r#"
+        let content_container_path =
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentcontainer.lua";
+        let forwarding_helper = r#"
             local PANEL = {}
 
             function PANEL:Init()
@@ -993,8 +993,8 @@ For more information on tools see the command-line reference in the online help.
             end
 
             vgui.Register("ContentContainer", PANEL, "Panel")
-        "#,
-        );
+        "#;
+        ws.def_file(content_container_path, forwarding_helper);
         let header_file_id = ws.def_file(
             "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentheader.lua",
             r#"
@@ -1029,10 +1029,29 @@ For more information on tools see the command-line reference in the online help.
             "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content.lua",
             r#"
             local container = vgui.Create("ContentContainer")
-            local header = vgui.Create("ContentHeader")
             local icon = vgui.Create("ContentIcon")
-            container:Add(header)
             container:Add(icon)
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content_whitespace.lua",
+            r#"
+            local container = vgui.Create("ContentContainer")
+            local header = vgui.Create("ContentHeader")
+            container : Add(header)
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/content_decoy.lua",
+            r#"
+            local PANEL = {}
+            local unrelated = {}
+            local decoy = vgui.Create("ForwardingDecoy")
+            local marker = ":Add"
+            -- A matching comment may trigger the text prefilter but must not
+            -- create a forwarding relation for an unrelated receiver.
+            unrelated:Add(decoy)
+            vgui.Register("ForwardingDecoy", PANEL, "Panel")
         "#,
         );
 
@@ -1048,6 +1067,11 @@ For more information on tools see the command-line reference in the online help.
         assert_eq!(
             metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon")),
             Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ForwardingDecoy"))
+                .is_none()
         );
 
         let undefined_methods = [header_file_id, icon_file_id]
@@ -1071,6 +1095,71 @@ For more information on tools see the command-line reference in the online help.
                 "Undefined method `Missing`. ",
                 "Undefined method `Missing`. "
             ]
+        );
+
+        ws.def_file(
+            content_container_path,
+            r#"
+            local PANEL = {}
+
+            function PANEL:Add(pnl) end
+
+            vgui.Register("ContentContainer", PANEL, "Panel")
+        "#,
+        );
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader"))
+                .is_none(),
+            "forwarded parent metadata must be invalidated when the forwarding helper changes"
+        );
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon"))
+                .is_none(),
+            "all callers of the changed forwarding helper must be invalidated"
+        );
+
+        ws.def_file(content_container_path, forwarding_helper);
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice()),
+            "forwarded parent metadata must be restored when the helper is reopened"
+        );
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon")),
+            Some([crate::LuaTypeDeclId::global("DTileLayout")].as_slice())
+        );
+
+        let content_container_uri = ws.virtual_url_generator.new_uri(content_container_path);
+        ws.analysis
+            .update_file_by_uri(&content_container_uri, None)
+            .expect("forwarding helper file should exist");
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentHeader"))
+                .is_none(),
+            "forwarded parent metadata must be invalidated when the helper is deleted"
+        );
+        assert!(
+            metadata
+                .get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("ContentIcon"))
+                .is_none()
         );
     }
 

@@ -1159,6 +1159,7 @@ mod tests {
             r#"
                 ---@class Entity
                 ---@class Player : Entity
+                ---@class NPC : Entity
                 ---@class SWEP
 
                 ---@generic T : table
@@ -1176,6 +1177,15 @@ mod tests {
                 function playerMeta:GetLocalVar(key, default)
                     return default
                 end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/server/sv_unrelated.lua",
+            r#"
+                local npcMeta = FindMetaTable("NPC")
+
+                function npcMeta:UnrelatedServerMethod() end
             "#,
         );
 

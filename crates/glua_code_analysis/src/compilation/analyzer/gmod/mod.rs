@@ -20,10 +20,10 @@ use crate::{
     GmodClassCallLiteral, GmodDermaSkinCallRoles, GmodNamedStringCallRoles,
     GmodNetworkVarCallRoles, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata,
     GmodScriptedClassFileMetadata, GmodVguiPanelCallRoles, GmodVguiParentCallMetadata,
-    GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra, LuaDeclId,
-    LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember, LuaMemberFeature,
-    LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
+    GmodVguiParentCallOrigin, GmodVguiParentSource, InFiled, LuaCallArgRole, LuaDecl, LuaDeclExtra,
+    LuaDeclId, LuaDeclLocation, LuaDeclTypeKind, LuaFunctionType, LuaInferCache, LuaMember,
+    LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaSignature, LuaSignatureId, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalysisPipeline, AnalyzeContext,
         common::{
@@ -2447,6 +2447,11 @@ struct VguiFieldAssignmentParent {
     parent_type_ids: Vec<LuaTypeDeclId>,
 }
 
+enum ForwardingParentCandidate {
+    Consistent(Vec<LuaTypeDeclId>),
+    Conflicted,
+}
+
 fn resolve_vgui_parent_relations(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
@@ -2461,12 +2466,11 @@ fn resolve_vgui_parent_relations(
         .collect::<Vec<_>>();
     file_ids.sort_by_key(|file_id| file_id.id);
     let mut forwarding_parent_candidates =
-        HashMap::<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>::new();
+        HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::new();
     for file_id in &file_ids {
         let calls = db
             .get_gmod_class_metadata_index()
-            .get_vgui_parent_calls(file_id)
-            .to_vec();
+            .get_vgui_parent_calls(file_id);
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(file_id)
@@ -2486,21 +2490,34 @@ fn resolve_vgui_parent_relations(
     }
     let forwarding_parents =
         finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
-    collect_vgui_forwarding_parent_calls(db, context, &forwarding_parents);
-    file_ids = db
-        .get_gmod_class_metadata_index()
-        .iter_file_metadata()
-        .filter_map(|(file_id, metadata)| {
-            (!metadata.vgui_parent_calls.is_empty()).then_some(*file_id)
-        })
-        .collect();
+    let forwarding_parents_changed = db
+        .get_gmod_class_metadata_index_mut()
+        .update_vgui_forwarding_parents(&forwarding_parents);
+    let forwarding_scan_file_ids = if forwarding_parents_changed {
+        db.get_vfs().get_all_file_ids()
+    } else {
+        context.tree_list.iter().map(|tree| tree.file_id).collect()
+    };
+    if forwarding_parents_changed {
+        db.get_gmod_class_metadata_index_mut()
+            .clear_forwarded_vgui_parent_calls();
+    } else {
+        db.get_gmod_class_metadata_index_mut()
+            .clear_forwarded_vgui_parent_calls_for_files(&forwarding_scan_file_ids);
+    }
+    file_ids.extend(collect_vgui_forwarding_parent_calls(
+        db,
+        context,
+        &forwarding_parents,
+        &forwarding_scan_file_ids,
+    ));
     file_ids.sort_by_key(|file_id| file_id.id);
+    file_ids.dedup();
     let mut relations_by_file = Vec::new();
     for file_id in file_ids {
         let calls = db
             .get_gmod_class_metadata_index()
-            .get_vgui_parent_calls(&file_id)
-            .to_vec();
+            .get_vgui_parent_calls(&file_id);
         if calls.is_empty() {
             continue;
         }
@@ -2608,9 +2625,12 @@ fn index_vgui_forwarding_parent_candidates(
     file_id: FileId,
     root: &LuaSyntaxNode,
     calls: &[GmodVguiParentCallMetadata],
-    candidates: &mut HashMap<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>,
+    candidates: &mut HashMap<(LuaTypeDeclId, String), ForwardingParentCandidate>,
 ) {
     for call in calls {
+        if call.origin != GmodVguiParentCallOrigin::Annotated {
+            continue;
+        }
         let GmodVguiParentSource::Expr(child_syntax_id) = &call.child else {
             continue;
         };
@@ -2647,10 +2667,7 @@ fn index_vgui_forwarding_parent_candidates(
         let Some(LuaVarExpr::IndexExpr(function_name)) = function.get_func_name() else {
             continue;
         };
-        let Some(method_name) = function_name
-            .get_index_key()
-            .map(|key| key.get_path_part().to_string())
-        else {
+        let Some(method_name) = function_name.get_index_key().map(|key| key.get_path_part()) else {
             continue;
         };
         let Some(LuaExpr::IndexExpr(method_index)) = call_expr.get_prefix_expr() else {
@@ -2677,24 +2694,44 @@ fn index_vgui_forwarding_parent_candidates(
         if parent_type_ids.is_empty() {
             continue;
         }
-        candidates
-            .entry((owner_type_id.clone(), method_name))
-            .or_default()
-            .push(parent_type_ids);
+        record_vgui_forwarding_parent_candidate(
+            candidates,
+            (owner_type_id.clone(), method_name),
+            parent_type_ids,
+        );
+    }
+}
+
+fn record_vgui_forwarding_parent_candidate(
+    candidates: &mut HashMap<(LuaTypeDeclId, String), ForwardingParentCandidate>,
+    key: (LuaTypeDeclId, String),
+    parent_type_ids: Vec<LuaTypeDeclId>,
+) {
+    match candidates.entry(key) {
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            entry.insert(ForwardingParentCandidate::Consistent(parent_type_ids));
+        }
+        std::collections::hash_map::Entry::Occupied(mut entry) => {
+            if matches!(
+                entry.get(),
+                ForwardingParentCandidate::Consistent(existing) if existing != &parent_type_ids
+            ) {
+                entry.insert(ForwardingParentCandidate::Conflicted);
+            }
+        }
     }
 }
 
 fn finalize_vgui_forwarding_parent_candidates(
-    candidates: HashMap<(LuaTypeDeclId, String), Vec<Vec<LuaTypeDeclId>>>,
+    candidates: HashMap<(LuaTypeDeclId, String), ForwardingParentCandidate>,
 ) -> HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>> {
     candidates
         .into_iter()
-        .filter_map(|(key, parent_candidates)| {
-            let parent_type_ids = parent_candidates.first()?.clone();
-            parent_candidates
-                .iter()
-                .all(|candidate| candidate == &parent_type_ids)
-                .then_some((key, parent_type_ids))
+        .filter_map(|(key, candidate)| {
+            let ForwardingParentCandidate::Consistent(parent_type_ids) = candidate else {
+                return None;
+            };
+            Some((key, parent_type_ids))
         })
         .collect()
 }
@@ -2703,9 +2740,10 @@ fn collect_vgui_forwarding_parent_calls(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
-) {
+    file_ids: &[FileId],
+) -> Vec<FileId> {
     if forwarding_parents.is_empty() {
-        return;
+        return Vec::new();
     }
     // Source overrides are not reverse-indexed, so only inspect files that
     // mention a method proven to forward its panel argument to a VGUI parent.
@@ -2713,20 +2751,26 @@ fn collect_vgui_forwarding_parent_calls(
         .keys()
         .map(|(_, method_name)| method_name.as_str())
         .collect::<HashSet<_>>();
-    let files = context
-        .tree_list
+    let mut forwarding_patterns = forwarding_method_names.iter().copied().collect::<Vec<_>>();
+    forwarding_patterns.sort_unstable();
+    let forwarding_matcher = AhoCorasick::new(&forwarding_patterns).ok();
+    let files = file_ids
         .iter()
-        .filter(|tree| {
+        .filter_map(|file_id| {
             db.get_vfs()
-                .get_file_content(&tree.file_id)
-                .is_some_and(|content| {
-                    forwarding_method_names
-                        .iter()
-                        .any(|method_name| content.contains(&format!(":{method_name}")))
+                .get_file_content(file_id)
+                .filter(|content| match &forwarding_matcher {
+                    Some(matcher) => matcher.is_match(content),
+                    None => true,
+                })
+                .and_then(|_| {
+                    db.get_vfs()
+                        .get_syntax_tree(file_id)
+                        .map(|tree| (*file_id, tree.get_red_root()))
                 })
         })
-        .map(|tree| (tree.file_id, tree.value.get_root()))
         .collect::<Vec<_>>();
+    let mut added_file_ids = Vec::new();
     for (file_id, root) in files {
         let existing_call_syntax_ids = db
             .get_gmod_class_metadata_index()
@@ -2749,12 +2793,13 @@ fn collect_vgui_forwarding_parent_calls(
             let Some(receiver) = method_index.get_prefix_expr() else {
                 continue;
             };
-            let Some(method_name) = method_index
-                .get_index_key()
-                .map(|key| key.get_path_part().to_string())
+            let Some(method_name) = method_index.get_index_key().map(|key| key.get_path_part())
             else {
                 continue;
             };
+            if !forwarding_method_names.contains(method_name.as_str()) {
+                continue;
+            }
             let receiver_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, receiver);
             let [receiver_type_id] = receiver_type_ids.as_slice() else {
                 continue;
@@ -2778,12 +2823,77 @@ fn collect_vgui_forwarding_parent_calls(
                 child: GmodVguiParentSource::Expr(child.get_syntax_id()),
                 parent: GmodVguiParentSource::LiteralName(parent_type_id.get_name().to_string()),
                 relations: Vec::new(),
+                origin: GmodVguiParentCallOrigin::Forwarded,
             });
+        }
+        if !calls.is_empty() {
+            added_file_ids.push(file_id);
         }
         let metadata = db.get_gmod_class_metadata_index_mut();
         for call in calls {
             metadata.add_vgui_parent_call(file_id, call);
         }
+    }
+    added_file_ids
+}
+
+#[cfg(test)]
+mod forwarding_parent_candidate_tests {
+    use std::collections::HashMap;
+
+    use super::{
+        ForwardingParentCandidate, finalize_vgui_forwarding_parent_candidates,
+        record_vgui_forwarding_parent_candidate,
+    };
+    use crate::LuaTypeDeclId;
+
+    #[test]
+    fn identical_forwarding_candidates_remain_consistent() {
+        let key = (LuaTypeDeclId::global("Container"), "Add".to_string());
+        let parent_type_ids = vec![LuaTypeDeclId::global("DTileLayout")];
+        let mut candidates = HashMap::new();
+
+        record_vgui_forwarding_parent_candidate(
+            &mut candidates,
+            key.clone(),
+            parent_type_ids.clone(),
+        );
+        record_vgui_forwarding_parent_candidate(
+            &mut candidates,
+            key.clone(),
+            parent_type_ids.clone(),
+        );
+
+        let finalized = finalize_vgui_forwarding_parent_candidates(candidates);
+        assert_eq!(finalized.get(&key), Some(&parent_type_ids));
+    }
+
+    #[test]
+    fn disagreeing_forwarding_candidates_remain_conflicted() {
+        let key = (LuaTypeDeclId::global("Container"), "Add".to_string());
+        let mut candidates = HashMap::new();
+
+        record_vgui_forwarding_parent_candidate(
+            &mut candidates,
+            key.clone(),
+            vec![LuaTypeDeclId::global("DTileLayout")],
+        );
+        record_vgui_forwarding_parent_candidate(
+            &mut candidates,
+            key.clone(),
+            vec![LuaTypeDeclId::global("DIconLayout")],
+        );
+        record_vgui_forwarding_parent_candidate(
+            &mut candidates,
+            key.clone(),
+            vec![LuaTypeDeclId::global("DTileLayout")],
+        );
+
+        assert!(matches!(
+            candidates.get(&key),
+            Some(ForwardingParentCandidate::Conflicted)
+        ));
+        assert!(finalize_vgui_forwarding_parent_candidates(candidates).is_empty());
     }
 }
 
@@ -8423,6 +8533,7 @@ fn collect_annotated_scripted_class_call_metadata(
                     child,
                     parent,
                     relations: Vec::new(),
+                    origin: GmodVguiParentCallOrigin::Annotated,
                 },
             );
         }

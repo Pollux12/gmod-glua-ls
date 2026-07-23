@@ -11,8 +11,8 @@ use rowan::{NodeOrToken, TextRange, TextSize};
 
 use crate::{
     DiagnosticCode, FileId, GmodRealm, GmodRealmFileMetadata, GmodStateMask, LuaDeclarationTree,
-    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, SemanticDeclLevel,
-    SemanticModel, WorkspaceId,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
+    SemanticDeclLevel, SemanticModel, WorkspaceId, semantic::is_sub_type_of,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -1119,26 +1119,65 @@ fn collect_all_member_ids_for_type_key(
     // declared owner has no member of its own; otherwise an Entity-typed value
     // can hide a client-only Player method from a server-realm warning.
     if result.is_empty() && !include_inherited_members {
-        for owner in &owners {
-            let LuaMemberOwner::Type(type_id) = owner else {
-                continue;
-            };
-            for subtype in db.get_type_index().get_all_sub_types(type_id) {
-                let subtype_owner = LuaMemberOwner::Type(subtype.get_id().clone());
-                push_cached_member_ids_for_owner_key(
-                    member_index,
-                    &subtype_owner,
-                    member_key,
-                    owner_key_member_candidate_cache,
-                    &mut result,
-                    &mut seen,
-                );
-            }
+        for subtype_owner in subtype_member_owners_for_key(db, &owners, member_key) {
+            push_cached_member_ids_for_owner_key(
+                member_index,
+                &subtype_owner,
+                member_key,
+                owner_key_member_candidate_cache,
+                &mut result,
+                &mut seen,
+            );
         }
     }
 
     member_candidate_cache.insert(cache_key, result.clone());
     result
+}
+
+fn subtype_member_owners_for_key(
+    db: &crate::DbIndex,
+    owners: &[LuaMemberOwner],
+    member_key: &LuaMemberKey,
+) -> Vec<LuaMemberOwner> {
+    let base_type_ids: Vec<_> = owners
+        .iter()
+        .filter_map(|owner| match owner {
+            LuaMemberOwner::Type(type_id) => Some(type_id),
+            _ => None,
+        })
+        .collect();
+    if base_type_ids.is_empty() {
+        return Vec::new();
+    }
+
+    // Bound the search by the requested key before checking inheritance. This
+    // avoids repeatedly walking and sorting the complete subtype hierarchy for
+    // every missing member name.
+    let member_index = db.get_member_index();
+    let mut subtype_ids = Vec::new();
+    let mut seen = HashSet::new();
+    for member in member_index.get_current_members_for_key(member_key) {
+        let Some(owner) = member_index.get_current_owner(&member.get_id()) else {
+            continue;
+        };
+        let candidate_type_id = match owner {
+            LuaMemberOwner::Type(type_id) => type_id.clone(),
+            LuaMemberOwner::GlobalPath(path) => LuaTypeDeclId::global(path.get_name()),
+            _ => continue,
+        };
+        if !seen.insert(candidate_type_id.clone()) {
+            continue;
+        }
+        if base_type_ids.iter().any(|base_type_id| {
+            candidate_type_id == **base_type_id
+                || is_sub_type_of(db, &candidate_type_id, base_type_id)
+        }) {
+            subtype_ids.push(candidate_type_id);
+        }
+    }
+
+    subtype_ids.into_iter().map(LuaMemberOwner::Type).collect()
 }
 
 fn push_cached_member_ids_for_owner_key(

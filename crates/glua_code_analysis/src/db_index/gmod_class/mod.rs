@@ -241,12 +241,19 @@ pub struct GmodVguiParentRelation {
     pub parent_chain_complete: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmodVguiParentCallOrigin {
+    Annotated,
+    Forwarded,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodVguiParentCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub child: GmodVguiParentSource,
     pub parent: GmodVguiParentSource,
     pub relations: Vec<GmodVguiParentRelation>,
+    pub origin: GmodVguiParentCallOrigin,
 }
 
 impl GmodScriptedClassFileMetadata {
@@ -286,6 +293,7 @@ pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
     derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
+    vgui_forwarding_parents: HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
     vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
     incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
 }
@@ -309,6 +317,7 @@ impl GmodClassMetadataIndex {
             file_metadata: HashMap::new(),
             vgui_panels: HashMap::new(),
             derma_skins: HashMap::new(),
+            vgui_forwarding_parents: HashMap::new(),
             vgui_panel_parent_chains: HashMap::new(),
             incomplete_vgui_panel_parent_chains: HashSet::new(),
         }
@@ -575,6 +584,45 @@ impl GmodClassMetadataIndex {
         }
     }
 
+    pub fn clear_forwarded_vgui_parent_calls(&mut self) {
+        for metadata in self.file_metadata.values_mut() {
+            metadata
+                .vgui_parent_calls
+                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+        }
+    }
+
+    pub fn clear_forwarded_vgui_parent_calls_for_files(&mut self, file_ids: &[FileId]) {
+        for file_id in file_ids {
+            let Some(metadata) = self.file_metadata.get_mut(file_id) else {
+                continue;
+            };
+            metadata
+                .vgui_parent_calls
+                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+        }
+    }
+
+    pub fn has_annotated_vgui_parent_calls(&self, file_id: FileId) -> bool {
+        self.file_metadata.get(&file_id).is_some_and(|metadata| {
+            metadata
+                .vgui_parent_calls
+                .iter()
+                .any(|call| call.origin == GmodVguiParentCallOrigin::Annotated)
+        })
+    }
+
+    pub fn update_vgui_forwarding_parents(
+        &mut self,
+        forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
+    ) -> bool {
+        if &self.vgui_forwarding_parents == forwarding_parents {
+            return false;
+        }
+        self.vgui_forwarding_parents.clone_from(forwarding_parents);
+        true
+    }
+
     pub fn get_vgui_parent_calls(&self, file_id: &FileId) -> &[GmodVguiParentCallMetadata] {
         self.file_metadata
             .get(file_id)
@@ -748,6 +796,7 @@ impl LuaIndex for GmodClassMetadataIndex {
         self.file_metadata.clear();
         self.vgui_panels.clear();
         self.derma_skins.clear();
+        self.vgui_forwarding_parents.clear();
         self.vgui_panel_parent_chains.clear();
         self.incomplete_vgui_panel_parent_chains.clear();
     }

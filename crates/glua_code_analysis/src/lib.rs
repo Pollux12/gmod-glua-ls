@@ -454,8 +454,16 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
-        let existing_reindex_file_ids =
+        let is_removed = text.is_none();
+        let removed_file_ids = existing_file_id
+            .filter(|_| is_removed)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut existing_reindex_file_ids =
             existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+        if let Some(reindex_file_ids) = &mut existing_reindex_file_ids {
+            self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
+        }
         let old_guard_fact_file_ids = existing_reindex_file_ids
             .iter()
             .flatten()
@@ -463,7 +471,6 @@ impl EmmyLuaAnalysis {
             .collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
 
-        let is_removed = text.is_none();
         let file_id = self
             .compilation
             .get_db_mut()
@@ -559,16 +566,30 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
-        let existing_reindex_file_ids =
-            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
-        let old_guard_fact_file_ids = existing_reindex_file_ids
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-
         let is_removed = text.is_none();
+        let (existing_reindex_file_ids, old_guard_facts) = if trigger_reindex {
+            let removed_file_ids = existing_file_id
+                .filter(|_| is_removed)
+                .into_iter()
+                .collect::<HashSet<_>>();
+            let mut reindex_file_ids =
+                existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+            if let Some(reindex_file_ids) = &mut reindex_file_ids {
+                self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
+            }
+            let old_guard_fact_file_ids = reindex_file_ids
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<HashSet<_>>();
+            (
+                reindex_file_ids,
+                self.inferred_guard_snapshot(&old_guard_fact_file_ids),
+            )
+        } else {
+            (None, InferredGuardSnapshot::default())
+        };
+
         let file_id = self
             .compilation
             .get_db_mut()
@@ -682,7 +703,19 @@ impl EmmyLuaAnalysis {
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
         let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let file_ids = self.expand_reindex_file_ids(file_ids);
+        let removed_file_ids = file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_none()
+            })
+            .collect::<HashSet<_>>();
+        let mut file_ids = self.expand_reindex_file_ids(file_ids);
+        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
         self.compilation.remove_index(file_ids.clone());
@@ -758,6 +791,57 @@ impl EmmyLuaAnalysis {
         let mut expanded = expanded.into_iter().collect::<Vec<_>>();
         expanded.sort_unstable();
         expanded
+    }
+
+    fn add_vgui_forwarding_removal_seed(
+        &self,
+        removed_file_ids: &HashSet<FileId>,
+        reindex_file_ids: &mut Vec<FileId>,
+    ) {
+        if removed_file_ids.is_empty() {
+            return;
+        }
+        let db = self.compilation.get_db();
+        let vfs = db.get_vfs();
+        let module_index = db.get_module_index();
+        let gmod_index = db.get_gmod_class_metadata_index();
+        let affected_workspace_id = reindex_file_ids
+            .iter()
+            .filter(|file_id| removed_file_ids.contains(file_id))
+            .find_map(|file_id| {
+                gmod_index
+                    .has_annotated_vgui_parent_calls(*file_id)
+                    .then(|| module_index.get_workspace_id(*file_id))
+                    .flatten()
+            });
+        let Some(affected_workspace_id) = affected_workspace_id else {
+            return;
+        };
+        if reindex_file_ids.iter().any(|file_id| {
+            !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
+        }) {
+            return;
+        }
+
+        let all_file_ids = vfs.get_all_file_ids();
+        let seed_file_id = all_file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
+            })
+            .find(|file_id| module_index.get_workspace_id(*file_id) == Some(affected_workspace_id))
+            .or_else(|| {
+                all_file_ids.iter().copied().find(|file_id| {
+                    !removed_file_ids.contains(file_id) && vfs.get_syntax_tree(file_id).is_some()
+                })
+            });
+        let Some(seed_file_id) = seed_file_id else {
+            return;
+        };
+        reindex_file_ids.push(seed_file_id);
+        reindex_file_ids.sort_unstable();
+        reindex_file_ids.dedup();
     }
 
     fn unresolved_path_dependency_dependents(&self, file_ids: &HashSet<FileId>) -> Vec<FileId> {
@@ -1175,9 +1259,19 @@ impl EmmyLuaAnalysis {
             .get_vfs_mut()
             .set_remote_file_content(uri, text);
 
-        self.compilation.remove_index(vec![fid]);
-        if !is_removed {
-            self.compilation.update_index(vec![fid]);
+        let removed_file_ids = is_removed
+            .then_some(fid)
+            .into_iter()
+            .collect::<HashSet<_>>();
+        let mut reindex_file_ids = vec![fid];
+        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
+        self.compilation.remove_index(reindex_file_ids.clone());
+        let update_file_ids = reindex_file_ids
+            .into_iter()
+            .filter(|file_id| !removed_file_ids.contains(file_id))
+            .collect::<Vec<_>>();
+        if !update_file_ids.is_empty() {
+            self.compilation.update_index(update_file_ids);
         }
         fid
     }
@@ -1200,10 +1294,18 @@ impl EmmyLuaAnalysis {
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
-        let old_guard_fact_file_ids = self
-            .expand_reindex_file_ids(old_source_file_ids.iter().copied().collect())
-            .into_iter()
+        let removed_source_file_ids = files
+            .iter()
+            .filter(|(_, text)| text.is_none())
+            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
+        let mut old_guard_fact_file_ids =
+            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
+        self.add_vgui_forwarding_removal_seed(
+            &removed_source_file_ids,
+            &mut old_guard_fact_file_ids,
+        );
+        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
 
         // Separate files into: unchanged (skip), to-remove, and to-parse
@@ -1325,7 +1427,8 @@ impl EmmyLuaAnalysis {
             return Vec::new();
         }
 
-        let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
         let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
@@ -1369,10 +1472,18 @@ impl EmmyLuaAnalysis {
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
-        let old_guard_fact_file_ids = self
-            .expand_reindex_file_ids(old_source_file_ids.iter().copied().collect())
-            .into_iter()
+        let removed_source_file_ids = files
+            .iter()
+            .filter(|(_, text)| text.is_none())
+            .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
+        let mut old_guard_fact_file_ids =
+            self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
+        self.add_vgui_forwarding_removal_seed(
+            &removed_source_file_ids,
+            &mut old_guard_fact_file_ids,
+        );
+        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
         let mut removed_files = HashSet::new();
         let mut updated_files = HashSet::new();
@@ -1414,7 +1525,8 @@ impl EmmyLuaAnalysis {
             return Vec::new();
         }
 
-        let removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
+        self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
         let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
@@ -1454,6 +1566,8 @@ impl EmmyLuaAnalysis {
             );
             reindex_file_ids.sort_unstable();
             reindex_file_ids.dedup();
+            let removed_file_ids = HashSet::from([file_id]);
+            self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
             let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
             let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
             self.compilation
@@ -1710,11 +1824,13 @@ mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
 
+    use glua_parser::LuaSyntaxId;
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        EmmyLuaAnalysis, FileId, LuaDependencyKind, select_cross_file_stabilization_dependents,
+        EmmyLuaAnalysis, FileId, GmodVguiParentCallMetadata, GmodVguiParentCallOrigin,
+        GmodVguiParentSource, LuaDependencyKind, select_cross_file_stabilization_dependents,
     };
 
     #[test]
@@ -2042,6 +2158,56 @@ mod tests {
             b1_id, b2_id,
             "b.lua file id should be input-order independent"
         );
+    }
+
+    #[test]
+    fn vgui_forwarding_removal_seed_falls_back_to_another_workspace() {
+        let root = std::env::temp_dir().join("gmod_glua_ls_vgui_forwarding_seed_workspace");
+        let main_workspace = root.join("main");
+        let library_workspace = root.join("library");
+        let main_uri = Uri::parse_from_file_path(&main_workspace.join("consumer.lua"))
+            .expect("uri should parse");
+        let helper_uri = Uri::parse_from_file_path(&library_workspace.join("helper.lua"))
+            .expect("uri should parse");
+
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(main_workspace);
+        analysis.add_library_workspace(library_workspace);
+        let main_file_id = analysis
+            .update_file_by_uri(&main_uri, Some("return true".to_string()))
+            .expect("main file should be indexed");
+        let helper_file_id = analysis
+            .update_file_by_uri(&helper_uri, Some("return true".to_string()))
+            .expect("helper file should be indexed");
+        let helper_syntax_id = LuaSyntaxId::from_node(
+            &analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(&helper_file_id)
+                .expect("helper syntax tree should exist")
+                .get_red_root(),
+        );
+        analysis
+            .compilation
+            .get_db_mut()
+            .get_gmod_class_metadata_index_mut()
+            .add_vgui_parent_call(
+                helper_file_id,
+                GmodVguiParentCallMetadata {
+                    syntax_id: helper_syntax_id,
+                    child: GmodVguiParentSource::Unknown,
+                    parent: GmodVguiParentSource::Unknown,
+                    relations: Vec::new(),
+                    origin: GmodVguiParentCallOrigin::Annotated,
+                },
+            );
+
+        let removed_file_ids = HashSet::from([helper_file_id]);
+        let mut reindex_file_ids = vec![helper_file_id];
+        analysis.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
+
+        assert_eq!(reindex_file_ids, vec![main_file_id, helper_file_id]);
     }
 
     #[test]
