@@ -2,7 +2,7 @@ use crate::{
     DbIndex, FileId, LuaDeclId, LuaSignatureId, db_index::GmodScriptedClassCallMetadata,
 };
 use glua_parser::{
-    LuaAstNode, LuaAstToken, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
+    LuaAstNode, LuaExpr, LuaFuncStat, LuaNameExpr, LuaVarExpr,
 };
 use rowan::TextSize;
 
