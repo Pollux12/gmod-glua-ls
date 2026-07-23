@@ -488,14 +488,15 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     let post_if_label = binder.create_branch_label();
     let mut else_label = binder.create_branch_label();
     let then_label = binder.create_branch_label();
+
+    // The outer condition can narrow a value on the path that reaches the
+    // post-if label (for example, `if not isstring(value) then return end`).
+    // Include it in this branch's capability so the merge shortcut does not
+    // discard that proof.
+    let saved = binder.save_modification_counts();
     if let Some(condition_expr) = if_stat.get_condition_expr() {
         bind_condition_expr(binder, condition_expr, current, then_label, else_label);
     }
-
-    // Snapshot modification counters before binding any branch blocks.
-    // Note: the outer if's condition was already bound above (before this
-    // save), so its TrueCondition/FalseCondition are NOT counted.
-    let saved = binder.save_modification_counts();
 
     // We track inner conditions per-block to avoid counting elseif
     // condition expressions (which are structural, not in-block modifications).

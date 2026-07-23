@@ -5927,6 +5927,71 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_gamemode_hook_type_guard_survives_early_return_merge() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_type_predicates();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/gamemode_hook_docs.lua",
+            r#"
+            ---@class GM
+            GM = {}
+
+            ---@hook ChatTextChanged
+            ---@param text string|number
+            function GM:ChatTextChanged(text) end
+            "#,
+        );
+
+        let guarded_file = ws.def_file(
+            "gamemodes/base/gamemode/init.lua",
+            r#"
+            hook.Add("ChatTextChanged", "guarded", function(text)
+                if not isstring(text) then return end
+                text:sub(1)
+                hook_guarded_text_one = text
+                text:sub(2)
+                hook_guarded_text_two = text
+            end)
+
+            function GM:ChatTextChanged(text)
+                if not isstring(text) then return end
+                text:sub(3)
+                gamemode_guarded_text = text
+            end
+            "#,
+        );
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            guarded_file,
+            DiagnosticCode::UndefinedMethod
+        ));
+        let string_type = ws.ty("string");
+        for name in [
+            "hook_guarded_text_one",
+            "hook_guarded_text_two",
+            "gamemode_guarded_text",
+        ] {
+            assert_eq!(ws.expr_ty(name), string_type.clone());
+        }
+
+        let unguarded_file = ws.def_file(
+            "gamemodes/base/gamemode/cl_init.lua",
+            r#"
+            hook.Add("ChatTextChanged", "unguarded", function(text)
+                text:sub(1)
+                unguarded_text = text
+            end)
+            "#,
+        );
+        assert_eq!(
+            nth_name_expr_type_from_end(&mut ws, unguarded_file, "text", 0),
+            ws.ty("string|number")
+        );
+    }
+
+    #[gtest]
     fn test_isnumber_guard_narrows() {
         // isnumber(x) should narrow to remove nil
         let mut ws = VirtualWorkspace::new();
