@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace,
+    };
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
@@ -25,6 +27,10 @@ mod tests {
             }
         }
         ws.update_emmyrc(emmyrc);
+    }
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
     }
 
     #[gtest]
@@ -1407,6 +1413,73 @@ mod tests {
             !diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == risky_code)
+        );
+    }
+
+    #[gtest]
+    fn test_server_baseclass_call_uses_shared_inherited_method_over_client_override() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("**/entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "lua/autorun/sh_entity_defs.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                function Entity:Think() end
+
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+            "#,
+        );
+
+        ws.def_file(
+            "garrysmod/entities/base_gmodentity/cl_init.lua",
+            r#"
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+
+                function base_gmodentity:Think() end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/gamemodes/sandbox/entities/entities/gmod_lamp.lua",
+            r#"
+                ENT.Base = "base_gmodentity"
+
+                if SERVER then
+                    function ENT:Think()
+                        self.BaseClass.Think(self)
+                    end
+                end
+            "#,
+        );
+
+        let diagnostics = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
+        assert!(
+            !diagnostics
+                .iter()
+                .any(|diagnostic| {
+                    diagnostic
+                        .code
+                        .as_deref()
+                        .is_some_and(|code| {
+                            code == DiagnosticCode::GmodRealmMismatchHeuristic.get_name()
+                        })
+                }),
+            "Expected inherited shared Think to suppress the client override mismatch, got: {diagnostics:?}"
         );
     }
 }

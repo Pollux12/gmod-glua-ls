@@ -1169,9 +1169,10 @@ fn push_member_ids_for_owner_key(
 /// Convert a `LuaType` into one or more `LuaMemberOwner` values to look up
 /// members in the index. Mirrors the owner-resolution intent of
 /// `find_members_guard` / `find_*_members` in `semantic::member` but returns
-/// raw owners (no realm/workspace filtering, no alias/generic instantiation,
-/// no member-info construction). Recursion is bounded by `depth` to guard
-/// against pathological self-referential type graphs.
+/// raw owners and follows superclass links (but does no realm/workspace
+/// filtering, alias/generic instantiation, or member-info construction).
+/// Recursion is bounded by `visited` to guard against pathological
+/// self-referential type graphs.
 fn owner_type_to_member_owners(typ: &LuaType, db: &crate::DbIndex) -> Vec<LuaMemberOwner> {
     let mut visited = HashSet::new();
     owner_type_to_member_owners_inner(typ, db, &mut visited)
@@ -1188,10 +1189,10 @@ fn owner_type_to_member_owners_inner(
     match typ {
         LuaType::TableConst(id) => vec![LuaMemberOwner::Element(id.clone())],
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
-            vec![LuaMemberOwner::Type(type_decl_id.clone())]
+            expand_type_decl_member_owners(type_decl_id, db, visited)
         }
         LuaType::Generic(generic_type) => {
-            vec![LuaMemberOwner::Type(generic_type.get_base_type_id())]
+            expand_type_decl_member_owners(&generic_type.get_base_type_id(), db, visited)
         }
         LuaType::Instance(inst) => {
             let mut owners = Vec::new();
@@ -1232,6 +1233,20 @@ fn owner_type_to_member_owners_inner(
         }
         _ => Vec::new(),
     }
+}
+
+fn expand_type_decl_member_owners(
+    type_decl_id: &crate::LuaTypeDeclId,
+    db: &crate::DbIndex,
+    visited: &mut HashSet<LuaType>,
+) -> Vec<LuaMemberOwner> {
+    let mut owners = vec![LuaMemberOwner::Type(type_decl_id.clone())];
+    if let Some(super_types) = db.get_type_index().get_super_types(type_decl_id) {
+        for super_type in super_types {
+            owners.extend(owner_type_to_member_owners_inner(&super_type, db, visited));
+        }
+    }
+    owners
 }
 
 fn collect_annotated_gm_method_realms(
