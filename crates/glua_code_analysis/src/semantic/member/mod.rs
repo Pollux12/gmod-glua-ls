@@ -6,7 +6,7 @@ mod infer_raw_member;
 use std::collections::HashSet;
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+    DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, TypeOps,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::type_check::check_type_compact,
@@ -486,7 +486,7 @@ fn dynamic_field_definitions_for_owner(
     access_position: Option<TextSize>,
 ) -> Vec<VisibleDynamicFieldDefinition> {
     let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
-    let caller_realm = infer_dynamic_field_caller_realm(db, &caller_file_id);
+    let caller_mask = effective_dynamic_field_state_mask(db, caller_file_id, access_position);
     let access_function = access_position.and_then(|position| {
         db.get_member_index()
             .enclosing_function_scope_range(caller_file_id, position)
@@ -495,7 +495,7 @@ fn dynamic_field_definitions_for_owner(
         .get_field_definitions(owner, field_name)
         .into_iter()
         .filter(|definition| dynamic_fields_global || definition.file_id == caller_file_id)
-        .filter(|definition| is_dynamic_field_realm_compatible(db, caller_realm, definition))
+        .filter(|definition| is_dynamic_field_realm_compatible(db, caller_mask, definition))
         .filter_map(|definition| {
             dynamic_field_definition_visibility_at(
                 db,
@@ -567,28 +567,40 @@ fn definition_enclosing_assignment_contains(
         })
 }
 
-fn infer_dynamic_field_caller_realm(db: &DbIndex, caller_file_id: &FileId) -> GmodRealm {
-    db.get_gmod_infer_index()
-        .get_realm_file_metadata(caller_file_id)
-        .map(|metadata| metadata.inferred_realm)
-        .unwrap_or(GmodRealm::Unknown)
+fn effective_dynamic_field_state_mask(
+    db: &DbIndex,
+    file_id: FileId,
+    position: Option<TextSize>,
+) -> GmodStateMask {
+    let infer_index = db.get_gmod_infer_index();
+    let Some(position) = position else {
+        return infer_index
+            .get_realm_file_metadata(&file_id)
+            .map_or(GmodStateMask::empty(), |metadata| {
+                metadata.inferred_realm.state_mask()
+            });
+    };
+
+    infer_index
+        .get_member_annotation_realm_at_offset(&file_id, position)
+        .map(crate::GmodRealm::state_mask)
+        .unwrap_or_else(|| infer_index.get_state_mask_at_offset(&file_id, position))
 }
 
 fn is_dynamic_field_realm_compatible(
     db: &DbIndex,
-    caller_realm: GmodRealm,
+    caller_mask: GmodStateMask,
     definition: &crate::InFiled<TextRange>,
 ) -> bool {
     if !db.get_emmyrc().gmod.enabled {
         return true;
     }
 
-    let definition_mask = db
-        .get_gmod_infer_index()
-        .get_state_mask_at_offset(&definition.file_id, definition.value.start());
-    caller_realm
-        .state_mask()
-        .is_compatible_with(definition_mask)
+    caller_mask.is_compatible_with(effective_dynamic_field_state_mask(
+        db,
+        definition.file_id,
+        Some(definition.value.start()),
+    ))
 }
 
 fn dynamic_field_member_id(db: &DbIndex, file_id: FileId, range: TextRange) -> Option<LuaMemberId> {

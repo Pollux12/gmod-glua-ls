@@ -3,9 +3,10 @@ use std::{ops::Deref, sync::Arc};
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
+use std::collections::HashSet;
 
 use crate::{
-    DbIndex, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
+    DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
     LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey,
     LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
     ReturnTypeKind, SignatureReturnStatus, TypeOps, VariadicType, get_real_type, humanize_type,
@@ -276,32 +277,38 @@ pub fn resolve_gmod_hook_callback_doc_function(
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
     let mut candidates = Vec::new();
+    let mut seen_member_ids = HashSet::new();
     for owner_name in iter_hook_owner_names(db) {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name));
-        let Some(item) = db.get_member_index().get_member_item(&owner, &member_key) else {
-            continue;
-        };
-
-        for member_id in item.visible_member_ids_with_realm_at_offset(
-            db,
-            &call_file_id,
-            call_expr.get_range().start(),
-        ) {
-            let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
+        for owner in [
+            LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name)),
+            LuaMemberOwner::GlobalPath(GlobalId::new(&owner_name)),
+        ] {
+            let Some(item) = db.get_member_index().get_member_item(&owner, &member_key) else {
                 continue;
             };
-            let Some(function_types) = filter_signature_type(
+
+            for member_id in item.visible_member_ids_with_realm_at_offset(
                 db,
-                type_cache.as_type(),
-                origin_signature_id.as_ref(),
-                true,
-                false,
-            ) else {
-                continue;
-            };
+                &call_file_id,
+                call_expr.get_range().start(),
+            ) {
+                if !seen_member_ids.insert(member_id) {
+                    continue;
+                }
+                let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
+                    continue;
+                };
+                let Some(function_types) = filter_signature_type(
+                    db,
+                    type_cache.as_type(),
+                    origin_signature_id.as_ref(),
+                    true,
+                    false,
+                ) else {
+                    continue;
+                };
 
-            for func in function_types {
-                candidates.push(func);
+                candidates.extend(function_types);
             }
         }
     }
