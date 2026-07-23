@@ -410,14 +410,12 @@ pub struct AnnotatedRealmRange {
 pub type GmMethodRealmMap = FxHashMap<String, Vec<ResolvedRealm>>;
 type DeclAnnotationRealmCache = FxHashMap<FileId, Vec<AnnotatedRealmRange>>;
 type CalleeRealmCache = FxHashMap<LuaSemanticDeclId, Vec<ResolvedRealm>>;
-type MemberCandidateCache = FxHashMap<(LuaType, LuaMemberKey), Vec<LuaMemberId>>;
+type MemberCandidateCache = FxHashMap<(LuaType, LuaMemberKey, bool), Vec<LuaMemberId>>;
 type OwnerKeyMemberCandidateCache = FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>;
-type OwnerExpansionCache = FxHashMap<LuaType, Vec<LuaMemberOwner>>;
-/// Cache for the final resolved realm set for member calls, keyed by (owner_type, member_key).
-/// Sound because owner_type + member_key fully determines which member candidates are found
-/// and their realms — independent of call-site syntax. Many different call expressions with
-/// the same receiver type (e.g. `Entity`) and member name share a cached result.
-type MemberRealmsCache = FxHashMap<(LuaType, LuaMemberKey), Vec<ResolvedRealm>>;
+type OwnerExpansionCache = FxHashMap<(LuaType, bool), Vec<LuaMemberOwner>>;
+/// Cache for the final resolved realm set for member calls, keyed by owner type, member key,
+/// and whether the receiver is GMod's `BaseClass`. The latter expands inherited members.
+type MemberRealmsCache = FxHashMap<(LuaType, LuaMemberKey, bool), Vec<ResolvedRealm>>;
 /// Cache for per-decl resolved realm, avoiding repeated file metadata + annotation lookups.
 /// `None` stored as `Option::None` sentinel (use `Option<Option<ResolvedRealm>>`).
 type DeclRealmCache = FxHashMap<LuaSemanticDeclId, Option<ResolvedRealm>>;
@@ -710,6 +708,7 @@ fn resolve_member_candidate_realms(
     let index_key = index_expr.get_index_key()?;
     let member_key = semantic_model.get_member_key(&index_key)?;
     let owner_expr = index_expr.get_prefix_expr()?;
+    let include_inherited_members = is_gmod_baseclass_receiver(semantic_model, &owner_expr);
 
     // Infer the owner type — this is memoized by syntax ID in LuaInferCache, so
     // repeated calls on the same expression node are O(1) after the first.
@@ -719,7 +718,11 @@ fn resolve_member_candidate_realms(
 
     // Check member_realms_cache: many call expressions with the same owner type
     // (e.g. `Entity`) and member key share a single computed realm set.
-    let cache_key = (owner_type.clone(), member_key.clone());
+    let cache_key = (
+        owner_type.clone(),
+        member_key.clone(),
+        include_inherited_members,
+    );
     if let Some(cached) = member_realms_cache.get(&cache_key) {
         if let Some(profile) = profile.as_mut() {
             profile.member_realms_cache_hits += 1;
@@ -735,6 +738,7 @@ fn resolve_member_candidate_realms(
         semantic_model,
         &owner_type,
         &member_key,
+        include_inherited_members,
         member_candidate_cache,
         owner_key_member_candidate_cache,
         owner_expansion_cache,
@@ -784,6 +788,27 @@ fn resolve_member_candidate_realms(
     // Store result in member_realms_cache before returning
     member_realms_cache.insert(cache_key, realms.clone());
     Some(realms)
+}
+
+fn is_gmod_baseclass_receiver(semantic_model: &SemanticModel, owner_expr: &LuaExpr) -> bool {
+    if !semantic_model.get_db().get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    let Some(index_expr) = LuaIndexExpr::cast(owner_expr.syntax().clone()) else {
+        return false;
+    };
+    if !matches!(
+        index_expr.get_index_key(),
+        Some(LuaIndexKey::Name(name)) if name.get_name_text() == "BaseClass"
+    ) {
+        return false;
+    }
+
+    matches!(
+        index_expr.get_prefix_expr(),
+        Some(LuaExpr::NameExpr(name)) if name.get_name_text().as_deref() == Some("self")
+    )
 }
 
 fn resolve_decl_realm(
@@ -1042,12 +1067,17 @@ fn collect_all_member_ids_for_type_key(
     semantic_model: &SemanticModel,
     owner_type: &LuaType,
     member_key: &LuaMemberKey,
+    include_inherited_members: bool,
     member_candidate_cache: &mut MemberCandidateCache,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     owner_expansion_cache: &mut OwnerExpansionCache,
     mut profile: Option<&mut GmodRealmMisuseProfile>,
 ) -> Vec<LuaMemberId> {
-    let cache_key = (owner_type.clone(), member_key.clone());
+    let cache_key = (
+        owner_type.clone(),
+        member_key.clone(),
+        include_inherited_members,
+    );
     if let Some(cached) = member_candidate_cache.get(&cache_key) {
         if let Some(profile) = profile.as_mut() {
             profile.member_candidate_cache_hits += 1;
@@ -1062,11 +1092,12 @@ fn collect_all_member_ids_for_type_key(
     let member_index = db.get_member_index();
 
     // Resolve the LuaMemberOwner from the type, using cached expansion.
-    let owners = if let Some(cached) = owner_expansion_cache.get(owner_type) {
+    let owner_cache_key = (owner_type.clone(), include_inherited_members);
+    let owners = if let Some(cached) = owner_expansion_cache.get(&owner_cache_key) {
         cached.clone()
     } else {
-        let owners = owner_type_to_member_owners(owner_type, db);
-        owner_expansion_cache.insert(owner_type.clone(), owners.clone());
+        let owners = owner_type_to_member_owners(owner_type, db, include_inherited_members);
+        owner_expansion_cache.insert(owner_cache_key, owners.clone());
         owners
     };
     let mut result = Vec::new();
@@ -1169,19 +1200,24 @@ fn push_member_ids_for_owner_key(
 /// Convert a `LuaType` into one or more `LuaMemberOwner` values to look up
 /// members in the index. Mirrors the owner-resolution intent of
 /// `find_members_guard` / `find_*_members` in `semantic::member` but returns
-/// raw owners and follows superclass links (but does no realm/workspace
-/// filtering, alias/generic instantiation, or member-info construction).
+/// raw owners (and, for GMod `BaseClass`, superclass owners) without realm/workspace
+/// filtering, alias/generic instantiation, or member-info construction.
 /// Recursion is bounded by `visited` to guard against pathological
 /// self-referential type graphs.
-fn owner_type_to_member_owners(typ: &LuaType, db: &crate::DbIndex) -> Vec<LuaMemberOwner> {
+fn owner_type_to_member_owners(
+    typ: &LuaType,
+    db: &crate::DbIndex,
+    include_inherited_members: bool,
+) -> Vec<LuaMemberOwner> {
     let mut visited = HashSet::new();
-    owner_type_to_member_owners_inner(typ, db, &mut visited)
+    owner_type_to_member_owners_inner(typ, db, &mut visited, include_inherited_members)
 }
 
 fn owner_type_to_member_owners_inner(
     typ: &LuaType,
     db: &crate::DbIndex,
     visited: &mut HashSet<LuaType>,
+    include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     if !visited.insert(typ.clone()) {
         return Vec::new();
@@ -1189,10 +1225,15 @@ fn owner_type_to_member_owners_inner(
     match typ {
         LuaType::TableConst(id) => vec![LuaMemberOwner::Element(id.clone())],
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
-            expand_type_decl_member_owners(type_decl_id, db, visited)
+            expand_type_decl_member_owners(type_decl_id, db, visited, include_inherited_members)
         }
         LuaType::Generic(generic_type) => {
-            expand_type_decl_member_owners(&generic_type.get_base_type_id(), db, visited)
+            expand_type_decl_member_owners(
+                &generic_type.get_base_type_id(),
+                db,
+                visited,
+                include_inherited_members,
+            )
         }
         LuaType::Instance(inst) => {
             let mut owners = Vec::new();
@@ -1201,24 +1242,42 @@ fn owner_type_to_member_owners_inner(
                 inst.get_base(),
                 db,
                 visited,
+                include_inherited_members,
             ));
             owners
         }
-        LuaType::TableOf(inner) => owner_type_to_member_owners_inner(inner, db, visited),
+        LuaType::TableOf(inner) => {
+            owner_type_to_member_owners_inner(inner, db, visited, include_inherited_members)
+        }
         LuaType::Union(union_type) => {
             let mut owners = Vec::new();
             for sub in union_type.types() {
-                owners.extend(owner_type_to_member_owners_inner(sub, db, visited));
+                owners.extend(owner_type_to_member_owners_inner(
+                    sub,
+                    db,
+                    visited,
+                    include_inherited_members,
+                ));
             }
             owners
         }
         LuaType::MultiLineUnion(multi_union) => {
-            owner_type_to_member_owners_inner(&multi_union.to_union(), db, visited)
+            owner_type_to_member_owners_inner(
+                &multi_union.to_union(),
+                db,
+                visited,
+                include_inherited_members,
+            )
         }
         LuaType::Intersection(intersection_type) => {
             let mut owners = Vec::new();
             for sub in intersection_type.get_types().iter() {
-                owners.extend(owner_type_to_member_owners_inner(sub, db, visited));
+                owners.extend(owner_type_to_member_owners_inner(
+                    sub,
+                    db,
+                    visited,
+                    include_inherited_members,
+                ));
             }
             owners
         }
@@ -1226,7 +1285,12 @@ fn owner_type_to_member_owners_inner(
             if let Some(module_info) = db.get_module_index().get_module(*file_id)
                 && let Some(export_type) = &module_info.export_type
             {
-                owner_type_to_member_owners_inner(export_type, db, visited)
+                owner_type_to_member_owners_inner(
+                    export_type,
+                    db,
+                    visited,
+                    include_inherited_members,
+                )
             } else {
                 Vec::new()
             }
@@ -1239,11 +1303,19 @@ fn expand_type_decl_member_owners(
     type_decl_id: &crate::LuaTypeDeclId,
     db: &crate::DbIndex,
     visited: &mut HashSet<LuaType>,
+    include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     let mut owners = vec![LuaMemberOwner::Type(type_decl_id.clone())];
-    if let Some(super_types) = db.get_type_index().get_super_types(type_decl_id) {
+    if include_inherited_members
+        && let Some(super_types) = db.get_type_index().get_super_types(type_decl_id)
+    {
         for super_type in super_types {
-            owners.extend(owner_type_to_member_owners_inner(&super_type, db, visited));
+            owners.extend(owner_type_to_member_owners_inner(
+                &super_type,
+                db,
+                visited,
+                include_inherited_members,
+            ));
         }
     }
     owners
