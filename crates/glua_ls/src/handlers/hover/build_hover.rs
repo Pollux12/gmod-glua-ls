@@ -714,7 +714,7 @@ fn add_decl_color_preview(
     } else {
         "(global) "
     };
-    let description = format!("{}{}: {}", prefix, decl.get_name(), &color.gmod_display);
+    let description = format!("{}{}: {}", prefix, decl.get_name(), color.gmod_display);
     builder.set_type_description(builder.format_type_description(description));
     builder.add_annotation_description(color_swatch_markdown(
         color.red,
@@ -746,7 +746,7 @@ fn add_member_color_preview(
         LuaMemberKey::Name(name) => humanize_member_key_name(name.as_str()),
         _ => return None,
     };
-    let description = format!("(field) {}: {}", member_name, &color.gmod_display);
+    let description = format!("(field) {}: {}", member_name, color.gmod_display);
     builder.set_type_description(builder.format_type_description(description));
     builder.add_annotation_description(color_swatch_markdown(
         color.red,
