@@ -210,11 +210,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     };
 
     let nullable = tag.is_nullable();
-    let type_ref = if let Some(lua_doc_type) = tag.get_type() {
-        infer_type(analyzer, lua_doc_type)
-    } else {
-        return None;
-    };
+    let type_ref = infer_type(analyzer, tag.get_type()?);
     let default_value = tag.get_default_value().map(convert_doc_default_value);
     let type_ref = apply_nullable_doc_default(analyzer, type_ref, nullable, default_value.as_ref());
 

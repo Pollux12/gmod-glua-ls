@@ -911,7 +911,7 @@ fn find_namespace_members(
                     overload_index: None,
                 });
             } else {
-                let ns_type = LuaType::Namespace(SmolStr::new(format!("{}.{}", ns, &name)).into());
+                let ns_type = LuaType::Namespace(SmolStr::new(format!("{}.{}", ns, name)).into());
                 members.push(LuaMemberInfo {
                     property_owner_id: None,
                     key: member_key,

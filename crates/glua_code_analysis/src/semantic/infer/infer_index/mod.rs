@@ -294,10 +294,8 @@ pub fn get_index_expr_var_ref_id(
         return Some(var_ref_id.clone());
     }
 
-    let access_path = match index_expr.get_access_path() {
-        Some(path) => ArcIntern::new(SmolStr::new(&path)),
-        None => return None,
-    };
+    let path = index_expr.get_access_path()?;
+    let access_path = ArcIntern::new(SmolStr::new(&path));
 
     let mut prefix_expr = index_expr.get_prefix_expr()?;
     while let LuaExpr::IndexExpr(index_expr) = prefix_expr {

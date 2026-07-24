@@ -9075,10 +9075,8 @@ fn collect_hook_call_site(
     let (kind, name_arg_idx, callback_arg_idx, mapped_hook_data) =
         if let Some((kind, name_arg_idx, callback_arg_idx)) = annotated_hook {
             (kind, name_arg_idx, callback_arg_idx, None)
-        } else if let Some(mapped_hook) = mapped_hook {
-            (GmodHookKind::Emit, 0, None, Some(mapped_hook))
         } else {
-            return None;
+            (GmodHookKind::Emit, 0, None, Some(mapped_hook?))
         };
     let (hook_name, name_range, name_issue) = mapped_hook_data.unwrap_or_else(|| {
         extract_static_hook_name(

@@ -55,13 +55,13 @@ impl InferCacheManager {
 
     pub fn set_force(&mut self) {
         self.current_phase = LuaAnalysisPhase::Force;
-        for (_, infer_cache) in self.infer_map.iter_mut() {
+        for infer_cache in self.infer_map.values_mut() {
             infer_cache.set_phase(LuaAnalysisPhase::Force);
         }
     }
 
     pub fn clear(&mut self) {
-        for (_, infer_cache) in self.infer_map.iter_mut() {
+        for infer_cache in self.infer_map.values_mut() {
             infer_cache.clear();
         }
     }

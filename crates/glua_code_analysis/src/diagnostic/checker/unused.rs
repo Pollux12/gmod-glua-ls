@@ -31,7 +31,7 @@ impl Checker for UnusedChecker {
             .values()
             .map(|decl| (decl.get_range(), decl))
             .collect::<HashMap<_, _>>();
-        for (_, decl) in decl_tree.get_decls().iter() {
+        for decl in decl_tree.get_decls().values() {
             if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
                 continue;
             }
