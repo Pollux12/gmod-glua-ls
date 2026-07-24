@@ -12,7 +12,7 @@ use crate::{
     DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
     LuaMemberId, LuaMemberKey, LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
-    semantic::infer::InferFailReason,
+    semantic::infer::{InferFailReason, ParamInferenceSource},
 };
 
 type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
@@ -91,6 +91,7 @@ pub struct LuaInferCache {
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
     pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    pub(crate) param_type_source_cache: FxHashMap<LuaDeclId, CacheEntry<ParamInferenceSource>>,
     pub expr_var_ref_id_cache: FxHashMap<LuaSyntaxId, VarRefId>,
     pub narrow_by_literal_stop_position_cache: HashSet<LuaSyntaxId>,
     pub scripted_global_singleton_type_cache: Option<FxHashMap<String, LuaTypeDeclId>>,
@@ -141,6 +142,7 @@ impl LuaInferCache {
             flow_node_realm_cache: FxHashMap::default(),
             index_ref_origin_type_cache: FxHashMap::default(),
             param_type_cache: FxHashMap::default(),
+            param_type_source_cache: FxHashMap::default(),
             expr_var_ref_id_cache: FxHashMap::default(),
             narrow_by_literal_stop_position_cache: HashSet::new(),
             scripted_global_singleton_type_cache: None,
@@ -217,6 +219,7 @@ impl LuaInferCache {
         self.flow_node_realm_cache.clear();
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
+        self.param_type_source_cache.clear();
         self.expr_var_ref_id_cache.clear();
         self.narrow_by_literal_stop_position_cache.clear();
         self.scripted_global_singleton_type_cache = None;
@@ -252,6 +255,7 @@ impl LuaInferCache {
         self.flow_query_realm = None;
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
+        self.param_type_source_cache.clear();
         // Local reference identities come directly from immutable reference
         // indexes and are safe to retain. Global/member/self roots can be
         // selected through types and overloads that unresolve is about to

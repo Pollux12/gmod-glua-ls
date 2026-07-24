@@ -17,6 +17,63 @@ mod tests {
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
     }
 
+    fn gmod_diagnostics(source: &str) -> Vec<lsp_types::Diagnostic> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        diagnostics(&mut ws, source)
+    }
+
+    #[test]
+    fn gmod_name_fallback_method_reports_undefined_field_warning() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            local function update_panel(panel)
+                panel:MissingMethod()
+            end
+            "#,
+        );
+
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("undefined-field diagnostic: {diagnostics:#?}"));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn explicit_parameter_type_keeps_undefined_method_error() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@param panel Panel
+            local function update_panel(panel)
+                panel:MissingMethod()
+            end
+            "#,
+        );
+
+        let diagnostic = diagnostics
+            .iter()
+            .find(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .expect("undefined-method diagnostic");
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedField));
+    }
+
     #[test]
     fn unknown_colon_call_reports_undefined_method_error_without_undefined_field() {
         let diagnostics = diagnostics(

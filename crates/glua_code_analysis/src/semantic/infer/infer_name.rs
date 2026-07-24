@@ -710,14 +710,28 @@ pub fn get_name_expr_var_ref_id(
 }
 
 pub fn infer_param(db: &DbIndex, decl: &LuaDecl) -> InferResult {
-    infer_param_inner(db, None, decl)
+    infer_param_inner(db, None, decl).map(|(typ, _)| typ)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamInferenceSource {
+    Explicit,
+    Concrete,
+    Contextual,
+    NameFallback,
+}
+
+impl ParamInferenceSource {
+    pub(crate) fn is_weak(self) -> bool {
+        matches!(self, Self::Contextual | Self::NameFallback)
+    }
 }
 
 fn infer_param_inner(
     db: &DbIndex,
     mut cache: Option<&mut LuaInferCache>,
     decl: &LuaDecl,
-) -> InferResult {
+) -> Result<(LuaType, ParamInferenceSource), InferFailReason> {
     let (param_idx, signature_id, member_id) = match &decl.extra {
         LuaDeclExtra::Param {
             idx,
@@ -759,7 +773,7 @@ fn infer_param_inner(
                 typ = TypeOps::Union.apply(db, &typ, &sibling_type);
             }
 
-            return Ok(typ);
+            return Ok((typ, ParamInferenceSource::Explicit));
         }
     }
 
@@ -773,7 +787,7 @@ fn infer_param_inner(
             decl.get_name() == "...",
         );
         if let Some(param_type) = param_type {
-            return Ok(param_type);
+            return Ok((param_type, ParamInferenceSource::Concrete));
         }
 
         if let Some(param_type) = find_param_type_from_sibling_members(
@@ -784,7 +798,7 @@ fn infer_param_inner(
             decl.get_name() == "...",
             None,
         ) {
-            return Ok(param_type);
+            return Ok((param_type, ParamInferenceSource::Concrete));
         }
 
         if let Some(cache) = cache.as_mut()
@@ -798,7 +812,7 @@ fn infer_param_inner(
                 decl.get_name() == "...",
             )
         {
-            return Ok(param_type);
+            return Ok((param_type, ParamInferenceSource::Contextual));
         }
 
         if let Some(param_type) = find_param_type_from_outer_factory_member(
@@ -808,30 +822,40 @@ fn infer_param_inner(
             colon_define,
             decl.get_name() == "...",
         ) {
-            return Ok(param_type);
+            return Ok((param_type, ParamInferenceSource::Concrete));
         }
     }
 
     if let Some(file_hint_type) = infer_param_type_from_file_hint(db, decl) {
-        return Ok(file_hint_type);
+        return Ok((file_hint_type, ParamInferenceSource::Explicit));
     }
 
     if let Some(call_site_type) = db
         .get_call_site_param_index()
         .get_inferred_param(&signature_id, param_idx)
     {
-        return Ok(call_site_type.clone());
+        let source = db
+            .get_call_site_param_index()
+            .get_inferred_param_fact(&signature_id, param_idx)
+            .map_or(ParamInferenceSource::Concrete, |fact| {
+                if fact.confidence() >= crate::LuaInferenceConfidence::Certain {
+                    ParamInferenceSource::Concrete
+                } else {
+                    ParamInferenceSource::Contextual
+                }
+            });
+        return Ok((call_site_type.clone(), source));
     }
 
     if let Some(cache) = cache.as_mut()
         && let Some(call_arg_type) =
             infer_param_type_from_call_sites(db, cache, decl, signature_id, param_idx)
     {
-        return Ok(call_arg_type);
+        return Ok((call_arg_type, ParamInferenceSource::Concrete));
     }
 
     if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
-        return Ok(param_hint_type);
+        return Ok((param_hint_type, ParamInferenceSource::NameFallback));
     }
 
     Err(InferFailReason::UnResolveDeclType(decl.get_id()))
@@ -1400,22 +1424,37 @@ pub fn infer_param_with_cache(
     cache.param_type_cache.insert(decl_id, CacheEntry::Ready);
     let result = infer_param_inner(db, Some(cache), decl);
     match &result {
-        Ok(typ) => {
+        Ok((typ, source)) => {
             cache
                 .param_type_cache
                 .insert(decl_id, CacheEntry::Cache(typ.clone()));
+            cache
+                .param_type_source_cache
+                .insert(decl_id, CacheEntry::Cache(*source));
         }
         Err(reason) if cache.get_config().analysis_phase.is_diagnostics() => {
             cache
                 .param_type_cache
                 .insert(decl_id, CacheEntry::Error(reason.clone()));
+            cache
+                .param_type_source_cache
+                .insert(decl_id, CacheEntry::Error(reason.clone()));
         }
         Err(_) => {
             cache.param_type_cache.remove(&decl_id);
+            cache.param_type_source_cache.remove(&decl_id);
         }
     }
 
-    result
+    result.map(|(typ, _)| typ)
+}
+
+pub(crate) fn infer_param_is_weak(db: &DbIndex, cache: &mut LuaInferCache, decl: &LuaDecl) -> bool {
+    let _ = infer_param_with_cache(db, cache, decl);
+    matches!(
+        cache.param_type_source_cache.get(&decl.get_id()),
+        Some(CacheEntry::Cache(source)) if source.is_weak()
+    )
 }
 
 fn direct_table_field_from_member_id(

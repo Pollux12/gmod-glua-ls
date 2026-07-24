@@ -12,11 +12,12 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel, check_type_compact,
-    enum_variable_is_param, get_keyof_members, get_real_type,
+    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
+    check_type_compact, enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
-        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
-        resolve_decl_backed_global_path_member_type,
+        infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
+        member_key_matches_type, resolve_decl_backed_global_path_member_type,
+        unwrap_paren_to_name_expr,
     },
 };
 
@@ -113,7 +114,10 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
-                    let code = if is_colon_method_call(&index_expr) {
+                    let weak_receiver = index_expr
+                        .get_prefix_expr()
+                        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix));
+                    let code = if is_colon_method_call(&index_expr) && !weak_receiver {
                         DiagnosticCode::UndefinedMethod
                     } else {
                         DiagnosticCode::UndefinedField
@@ -134,6 +138,25 @@ impl Checker for CheckFieldChecker {
             profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
         }
     }
+}
+
+fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
+    let db = semantic_model.get_db();
+    if let Some(name_expr) = unwrap_paren_to_name_expr(prefix_expr)
+        && let Some(decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&semantic_model.get_file_id())
+            .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
+        && decl.is_param()
+    {
+        return infer_param_is_weak(db, &mut semantic_model.get_cache().borrow_mut(), decl);
+    }
+
+    semantic_model
+        .infer_expr_fact(prefix_expr.clone())
+        .confidence()
+        < LuaInferenceConfidence::Certain
 }
 
 fn has_reusable_table_literal_assignment(assignment_prefixes: &AssignmentPrefixEvents) -> bool {
