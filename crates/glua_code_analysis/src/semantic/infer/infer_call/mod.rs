@@ -289,36 +289,96 @@ fn refine_known_vgui_parent_return(
         depth += 1;
         root_receiver = parent_receiver;
     }
-    let Ok(receiver_type) = infer_expr(db, cache, root_receiver) else {
-        return return_type;
-    };
+    let receiver_type = infer_expr(db, cache, root_receiver).unwrap_or(LuaType::Unknown);
     let mut child_ids = Vec::new();
     collect_non_nil_type_ids(&receiver_type, &mut child_ids);
     child_ids.sort_by(|left, right| left.get_name().cmp(right.get_name()));
     child_ids.dedup();
-    if child_ids.is_empty() {
+
+    let metadata = db.get_gmod_class_metadata_index();
+    let is_vgui_receiver = if child_ids.is_empty() {
+        matches!(
+            receiver_type,
+            LuaType::TableConst(_) | LuaType::Table | LuaType::Unknown
+        )
+    } else {
+        child_ids.iter().any(|child_id| {
+            type_decl_is_vgui_panel(db, child_id, 0)
+                || metadata.get_vgui_panel_base(child_id.get_name()).is_some()
+        })
+    };
+    if !is_vgui_receiver {
         return return_type;
     }
 
-    let metadata = db.get_gmod_class_metadata_index();
     let mut parent_id = None;
-    for child_id in child_ids {
-        if !metadata.vgui_panel_parent_chain_is_complete(&child_id) {
+    for child_id in &child_ids {
+        if !metadata.vgui_panel_parent_chain_is_complete(child_id) {
+            if is_broad_panel_type(&return_type) {
+                cache
+                    .vgui_parent_fallback_calls
+                    .insert(call_expr.get_syntax_id());
+            }
             return return_type;
         }
-        let Some(chain) = metadata.get_vgui_panel_parent_chain(&child_id) else {
+        let Some(chain) = metadata.get_vgui_panel_parent_chain(child_id) else {
+            if is_broad_panel_type(&return_type) {
+                cache
+                    .vgui_parent_fallback_calls
+                    .insert(call_expr.get_syntax_id());
+            }
             return return_type;
         };
         let Some(candidate) = chain.get(depth - 1) else {
+            if is_broad_panel_type(&return_type) {
+                cache
+                    .vgui_parent_fallback_calls
+                    .insert(call_expr.get_syntax_id());
+            }
             return return_type;
         };
         match &parent_id {
-            Some(existing) if existing != candidate => return return_type,
+            Some(existing) if existing != candidate => {
+                if is_broad_panel_type(&return_type) {
+                    cache
+                        .vgui_parent_fallback_calls
+                        .insert(call_expr.get_syntax_id());
+                }
+                return return_type;
+            }
             Some(_) => {}
             None => parent_id = Some(candidate.clone()),
         }
     }
-    parent_id.map(LuaType::Ref).unwrap_or(return_type)
+    parent_id.map(LuaType::Ref).unwrap_or_else(|| {
+        if is_broad_panel_type(&return_type) {
+            cache
+                .vgui_parent_fallback_calls
+                .insert(call_expr.get_syntax_id());
+        }
+        return_type
+    })
+}
+
+fn is_broad_panel_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => id.get_name() == "Panel",
+        LuaType::Union(union) => {
+            let mut has_panel = false;
+            for t in union.types() {
+                if t.is_nil() {
+                    continue;
+                }
+                if matches!(t, LuaType::Ref(id) | LuaType::Def(id) if id.get_name() == "Panel") {
+                    has_panel = true;
+                } else {
+                    return false;
+                }
+            }
+            has_panel
+        }
+        _ => false,
+    }
 }
 
 fn single_non_nil_instance_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {

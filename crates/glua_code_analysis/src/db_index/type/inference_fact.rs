@@ -23,6 +23,7 @@ pub enum LuaInferenceProvenanceKind {
     Assignment,
     FlowGuard,
     FlowMerge,
+    UnresolvedVguiParent,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]

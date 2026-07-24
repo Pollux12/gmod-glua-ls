@@ -233,7 +233,7 @@ pub(crate) fn infer_expr_semantic_info(
         Ok(typ) if !typ.is_unknown() => contextual_fact
             .filter(|fact| fact.typ() == &typ)
             .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
-            .unwrap_or_else(|| actual_expr_semantic_info(db, typ, semantic_decl)),
+            .unwrap_or_else(|| actual_expr_semantic_info(db, cache, &expr, typ, semantic_decl)),
         actual_result => infer_bind_value_type(db, cache, expr.clone())
             .filter(|typ| !typ.is_nil())
             .map(|typ| {
@@ -262,7 +262,7 @@ pub(crate) fn infer_expr_semantic_info(
                 SemanticInfo::contextual_expected(fact, semantic_decl.clone())
             })
             .unwrap_or_else(|| match actual_result {
-                Ok(typ) => actual_expr_semantic_info(db, typ, semantic_decl),
+                Ok(typ) => actual_expr_semantic_info(db, cache, &expr, typ, semantic_decl),
                 Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
                     // Lua absent table field reads evaluate to nil when no contextual expected type applies.
                     SemanticInfo::actual(LuaType::Nil, semantic_decl)
@@ -274,15 +274,56 @@ pub(crate) fn infer_expr_semantic_info(
 
 fn actual_expr_semantic_info(
     db: &DbIndex,
+    cache: &LuaInferCache,
+    expr: &LuaExpr,
     typ: LuaType,
     semantic_decl: Option<LuaSemanticDeclId>,
 ) -> SemanticInfo {
-    let fact = semantic_decl
-        .as_ref()
-        .and_then(semantic_decl_inference_node)
-        .and_then(|node| db.get_inference_fact(&node))
-        .unwrap_or_else(|| LuaTypeFact::certain(typ.clone()))
-        .with_runtime_type(typ);
+    let has_vgui_parent_fallback = cache
+        .vgui_parent_fallback_calls
+        .contains(&expr.get_syntax_id())
+        || matches!(
+            &semantic_decl,
+            Some(LuaSemanticDeclId::LuaDecl(decl_id))
+                if db
+                    .get_decl_index()
+                    .get_decl(decl_id)
+                    .and_then(|decl| decl.get_initializer())
+                    .is_some_and(|init| cache.vgui_parent_fallback_calls.contains(&init.get_expr_syntax_id()))
+        );
+
+    let fact = if has_vgui_parent_fallback {
+        let node = semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .unwrap_or_else(|| {
+                LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(InFiled::new(
+                    cache.get_file_id(),
+                    expr.get_syntax_id(),
+                )))
+            });
+        LuaTypeFact::new(
+            typ.clone(),
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node,
+                    kind: LuaInferenceProvenanceKind::UnresolvedVguiParent,
+                    source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
+                },
+                found_type: None,
+                support: Arc::from([]),
+            }]),
+        )
+    } else {
+        semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .and_then(|node| db.get_inference_fact(&node))
+            .unwrap_or_else(|| LuaTypeFact::certain(typ.clone()))
+    }
+    .with_runtime_type(typ);
+
     SemanticInfo::from_fact(fact, semantic_decl, SemanticInfoOrigin::Actual)
 }
 

@@ -868,10 +868,18 @@ For more information on tools see the command-line reference in the online help.
             })
             .map(|diagnostic| diagnostic.message.as_str())
             .collect::<Vec<_>>();
-        assert_eq!(
-            undefined_methods,
-            ["Undefined method `DefinitelyMissing`. "]
-        );
+        assert_eq!(undefined_methods, Vec::<&str>::new());
+        let undefined_fields = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_fields, ["Undefined field `DefinitelyMissing`. "]);
     }
 
     #[test]
@@ -1590,5 +1598,168 @@ For more information on tools see the command-line reference in the online help.
         let child = crate::LuaTypeDeclId::global("Child");
         assert!(metadata.get_vgui_panel_parent_chain(&child).is_none());
         assert!(!metadata.vgui_panel_parent_chain_is_complete(&child));
+    }
+
+    #[test]
+    fn unresolved_vgui_parent_method_reports_undefined_field_warning() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class CustomPanel: Panel
+            local PANEL = {}
+            function PANEL:Test()
+                local parent = self:GetParent()
+                parent:MissingMethod()
+            end
+            "#,
+        );
+
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedField.get_name().to_string(),
+                    ))
+            })
+            .unwrap_or_else(|| panic!("expected undefined-field diagnostic: {diagnostics:#?}"));
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::WARNING));
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn starfall_shaped_unresolved_parent_method_is_warning() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class StarfallEditorTab: Panel
+            local PANEL = {}
+            function PANEL:GetParent()
+                return self.ParentTab
+            end
+            function PANEL:Init()
+                self:GetParent():GetNumTabs()
+                self:GetParent():SetActiveTabIndex(1)
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedField));
+    }
+
+    #[test]
+    fn chained_unresolved_vgui_parent_is_warning() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class CustomSubPanel: Panel
+            local PANEL = {}
+            function PANEL:Test()
+                self:GetParent():GetParent():SomethingMissing()
+            end
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedField));
+    }
+
+    #[test]
+    fn concrete_indexed_vgui_parent_remains_strict_error() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class ParentPanel: Panel
+            local ParentPANEL = {}
+            function ParentPANEL:KnownParentMethod() end
+            vgui.Register("ParentPanel", ParentPANEL, "Panel")
+
+            ---@class ChildPanel: Panel
+            local ChildPANEL = {}
+            function ChildPANEL:Init()
+                local parent = vgui.Create("ParentPanel")
+                self:SetParent(parent)
+                self:GetParent():DefinitelyMissing()
+            end
+            vgui.Register("ChildPanel", ChildPANEL, "Panel")
+            "#,
+        );
+
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .unwrap();
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn explicit_concrete_return_annotation_remains_strict_error() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Panel
+            ---@class StarfallEditorFrame: Panel
+            function StarfallEditorFrame:KnownFrameMethod() end
+
+            ---@class AnnotatedPanel: Panel
+            local PANEL = {}
+            ---@return StarfallEditorFrame
+            function PANEL:GetParent() end
+
+            function PANEL:Test()
+                local parent = self:GetParent()
+                parent:DefinitelyMissing()
+            end
+            "#,
+        );
+
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .unwrap();
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
+    }
+
+    #[test]
+    fn entity_get_parent_is_unaffected() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Entity
+            ---@field GetParent fun(self: Entity): Entity
+            local function test(ent)
+                ---@cast ent Entity
+                local parent = ent:GetParent()
+                parent:MissingEntityMethod()
+            end
+            "#,
+        );
+
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+        let diagnostic = diagnostics
+            .iter()
+            .find(|d| {
+                d.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .unwrap();
+        assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     }
 }

@@ -4,7 +4,7 @@ pub use cache_options::{CacheOptions, LuaAnalysisPhase};
 use glua_parser::LuaSyntaxId;
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
@@ -126,6 +126,7 @@ pub struct LuaInferCache {
         FxHashMap<(LuaTypeDeclId, LuaMemberKey), Arc<Vec<LuaMemberId>>>,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
+    pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
     inferred_guard_dependencies: HashSet<LuaInferredGuardOwner>,
 }
 
@@ -158,6 +159,7 @@ impl LuaInferCache {
             local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
+            vgui_parent_fallback_calls: FxHashSet::default(),
             inferred_guard_dependencies: HashSet::new(),
         }
     }
@@ -235,6 +237,7 @@ impl LuaInferCache {
         self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
+        self.vgui_parent_fallback_calls.clear();
     }
 
     pub fn clear_deferred_inference_results(&mut self) {
@@ -273,6 +276,7 @@ impl LuaInferCache {
         self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
+        self.vgui_parent_fallback_calls.clear();
     }
 
     pub fn get_flow_cache(
