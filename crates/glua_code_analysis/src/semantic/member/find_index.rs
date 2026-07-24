@@ -231,8 +231,8 @@ fn find_index_union(
 ) -> FindMembersResult {
     let mut members = Vec::new();
 
-    for member in union.into_vec() {
-        if let Some(sub_members) = find_index_operations_guard(db, &member, infer_guard) {
+    for member in union.types() {
+        if let Some(sub_members) = find_index_operations_guard(db, member, infer_guard) {
             members.extend(sub_members);
         }
     }

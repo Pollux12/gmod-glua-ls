@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use glua_code_analysis::{
     FileId, GmodHookSiteMetadata, GmodRealm, LuaType, NetSendFlow, NetSendKind, SemanticModel,
-    find_call_arg_role_from_type,
+    find_best_direct_call_arg_role_from_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag,
@@ -384,7 +384,7 @@ fn opposite_realm(realm: GmodRealm) -> Option<GmodRealm> {
     match realm {
         GmodRealm::Client => Some(GmodRealm::Server),
         GmodRealm::Server => Some(GmodRealm::Client),
-        GmodRealm::Shared | GmodRealm::Unknown => None,
+        GmodRealm::Shared | GmodRealm::Menu | GmodRealm::Unknown => None,
     }
 }
 
@@ -393,6 +393,7 @@ fn realm_label(realm: GmodRealm) -> &'static str {
         GmodRealm::Client => "client",
         GmodRealm::Server => "server",
         GmodRealm::Shared => "shared",
+        GmodRealm::Menu => "menu",
         GmodRealm::Unknown => "unknown",
     }
 }
@@ -663,11 +664,11 @@ fn collect_hook_completion_entries(
 ) -> Vec<(String, HookStats, Option<serde_json::Value>)> {
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
     let mut hook_stats: HashMap<String, HookStats> = HashMap::new();
-    let call_realm = infer_index.get_realm_at_offset(
+    let call_mask = infer_index.get_state_mask_at_offset(
         &builder.semantic_model.get_file_id(),
         builder.position_offset,
     );
-    let should_filter_realm = matches!(call_realm, GmodRealm::Client | GmodRealm::Server);
+    let should_filter_realm = !call_mask.is_empty();
 
     for (file_id, metadata) in infer_index.iter_hook_file_metadata() {
         if builder.is_cancelled() {
@@ -677,7 +678,7 @@ fn collect_hook_completion_entries(
             if should_filter_realm {
                 let hook_realm =
                     resolve_hook_site_realm(&builder.semantic_model, file_id, hook_site);
-                if !is_realm_compatible(call_realm, hook_realm) {
+                if !call_mask.is_compatible_with(hook_realm.state_mask()) {
                     continue;
                 }
             }
@@ -776,15 +777,18 @@ fn staged_string_call_kind_from_type(
     db: &glua_code_analysis::DbIndex,
     typ: &LuaType,
 ) -> Option<StagedStringCallKind> {
-    if find_call_arg_role_from_type(db, typ, 0, "gmod.net_message", &["receive"]).is_some() {
+    if find_best_direct_call_arg_role_from_type(db, typ, 0, "gmod.net_message", &["receive"])
+        .is_some()
+    {
         return Some(StagedStringCallKind::NetReceive);
     }
 
-    let hook_role = find_call_arg_role_from_type(db, typ, 0, "gmod.hook", &["add", "emit"])?;
+    let hook_role =
+        find_best_direct_call_arg_role_from_type(db, typ, 0, "gmod.hook", &["add", "emit"])?;
     match hook_role.role.as_str() {
         "add" => Some(StagedStringCallKind::HookAdd),
         "emit" => Some(StagedStringCallKind::HookEmit {
-            include_gamemode_arg: find_call_arg_role_from_type(
+            include_gamemode_arg: find_best_direct_call_arg_role_from_type(
                 db,
                 typ,
                 1,
@@ -829,7 +833,7 @@ fn call_has_hook_gamemode_table_role(
         1,
         call_expr.is_colon_call(),
     );
-    find_call_arg_role_from_type(
+    find_best_direct_call_arg_role_from_type(
         semantic_model.get_db(),
         &callable_type,
         param_idx,
@@ -987,13 +991,6 @@ fn normalize_name(name: Option<&str>) -> Option<&str> {
     } else {
         Some(trimmed)
     }
-}
-
-fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {
-    !matches!(
-        (call_realm, item_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 fn resolve_hook_site_realm(

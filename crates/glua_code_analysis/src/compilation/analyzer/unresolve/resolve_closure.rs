@@ -1,15 +1,16 @@
-use std::sync::Arc;
+use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
+use std::collections::HashSet;
 
 use crate::{
-    DbIndex, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
-    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberIndexItem, LuaMemberKey,
-    LuaMemberOwner, LuaSignature, LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel,
-    ReturnTypeKind, SignatureReturnStatus, TypeOps, get_real_type, humanize_type,
-    infer_call_expr_func, infer_expr, infer_table_should_be,
+    DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
+    LuaDocReturnInfo, LuaFunctionType, LuaInferCache, LuaMemberKey, LuaMemberOwner, LuaSignature,
+    LuaSignatureId, LuaType, LuaTypeDeclId, RenderLevel, ReturnTypeKind, SignatureReturnStatus,
+    TypeOps, VariadicType, get_real_type, humanize_type, infer_call_expr_func, infer_expr,
+    infer_table_should_be,
 };
 
 use super::{
@@ -185,6 +186,7 @@ fn try_convert_to_func_body_infer(
     let mut unresolve = UnResolveReturn {
         file_id: closure_return.file_id,
         signature_id: closure_return.signature_id,
+        body: closure_return.body.clone(),
         return_points: closure_return.return_points.clone(),
     };
 
@@ -205,8 +207,7 @@ fn resolve_call_param_doc_function(
             LuaType::DocFunction(func) => return Some(func.clone()),
             LuaType::Union(union_types) => {
                 if let Some(LuaType::DocFunction(func)) = union_types
-                    .into_vec()
-                    .iter()
+                    .types()
                     .filter(|typ| matches!(typ, LuaType::DocFunction(_)))
                     .min_by_key(|typ| stable_type_selection_key(db, typ))
                 {
@@ -275,51 +276,45 @@ pub fn resolve_gmod_hook_callback_doc_function(
         })?;
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
-    let call_realm = db
-        .get_gmod_infer_index()
-        .get_realm_at_offset(&call_file_id, call_expr.get_range().start());
-
     let mut candidates = Vec::new();
+    let mut seen_member_ids = HashSet::new();
     for owner_name in iter_hook_owner_names(db) {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name));
-        let Some(item) = db.get_member_index().get_member_item(&owner, &member_key) else {
-            continue;
-        };
-
-        for member_id in member_ids_from_item(item) {
-            let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
+        for owner in [
+            LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name)),
+            LuaMemberOwner::GlobalPath(GlobalId::new(&owner_name)),
+        ] {
+            let Some(item) = db.get_member_index().get_member_item(&owner, &member_key) else {
                 continue;
             };
-            let Some(function_types) =
-                filter_signature_type(db, type_cache.as_type(), origin_signature_id.as_ref(), true)
-            else {
-                continue;
-            };
-            let member_realm = db
-                .get_gmod_infer_index()
-                .get_realm_at_offset(&member_id.file_id, member_id.get_position());
-            let is_compatible = is_realm_compatible(call_realm, member_realm);
 
-            for func in function_types {
-                candidates.push((is_compatible, func));
+            for member_id in item.visible_member_ids_with_realm_at_offset(
+                db,
+                &call_file_id,
+                call_expr.get_range().start(),
+            ) {
+                if !seen_member_ids.insert(member_id) {
+                    continue;
+                }
+                let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) else {
+                    continue;
+                };
+                let Some(function_types) = filter_signature_type(
+                    db,
+                    type_cache.as_type(),
+                    origin_signature_id.as_ref(),
+                    true,
+                    false,
+                ) else {
+                    continue;
+                };
+
+                candidates.extend(function_types);
             }
         }
     }
 
-    candidates.sort_by(
-        |(left_compatible, left_func), (right_compatible, right_func)| {
-            right_compatible.cmp(left_compatible).then_with(|| {
-                right_func
-                    .get_params()
-                    .len()
-                    .cmp(&left_func.get_params().len())
-            })
-        },
-    );
-    let function = candidates
-        .into_iter()
-        .map(|(_, function)| function)
-        .next()?;
+    candidates.sort_by_key(|function| std::cmp::Reverse(function.get_params().len()));
+    let function = candidates.into_iter().next()?;
     Some(GmodHookCallbackDocFunction {
         hook_name,
         function,
@@ -333,6 +328,19 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
         "SANDBOX".to_string(),
         "PLUGIN".to_string(),
     ];
+    for scoped_hook_owner in db
+        .get_emmyrc()
+        .gmod
+        .scripted_class_scopes
+        .hook_owner_globals()
+    {
+        if !names
+            .iter()
+            .any(|existing| existing.eq_ignore_ascii_case(&scoped_hook_owner))
+        {
+            names.push(scoped_hook_owner);
+        }
+    }
     for configured_prefix in &db.get_emmyrc().gmod.hook_mappings.method_prefixes {
         let normalized = configured_prefix
             .trim()
@@ -353,13 +361,6 @@ fn iter_hook_owner_names(db: &DbIndex) -> Vec<String> {
     names
 }
 
-fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<crate::LuaMemberId> {
-    match item {
-        LuaMemberIndexItem::One(id) => vec![*id],
-        LuaMemberIndexItem::Many(ids) => ids.clone(),
-    }
-}
-
 pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
     let args = call_expr.get_args_list()?;
     let first_arg = args.get_args().next()?;
@@ -377,14 +378,6 @@ pub fn extract_hook_name(call_expr: &LuaCallExpr) -> Option<String> {
     } else {
         Some(trimmed.to_string())
     }
-}
-
-fn is_realm_compatible(call_realm: crate::GmodRealm, item_realm: crate::GmodRealm) -> bool {
-    !matches!(
-        (call_realm, item_realm),
-        (crate::GmodRealm::Client, crate::GmodRealm::Server)
-            | (crate::GmodRealm::Server, crate::GmodRealm::Client)
-    )
 }
 
 pub fn try_resolve_closure_parent_params(
@@ -675,6 +668,15 @@ fn resolve_doc_function(
     }
 
     let doc_return = doc_func.get_ret();
+    let inferred_tail = (signature.resolve_return == SignatureReturnStatus::InferResolve)
+        .then(|| {
+            inferred_return_tail_matching_documented_first(
+                doc_return,
+                &signature.get_return_type(),
+                |slot| signature.return_correlation_implies(0, slot),
+            )
+        })
+        .flatten();
     let should_apply_return = match signature.resolve_return {
         SignatureReturnStatus::UnResolve => true,
         SignatureReturnStatus::InferResolve => {
@@ -683,7 +685,28 @@ fn resolve_doc_function(
         SignatureReturnStatus::DocResolve => false,
     };
 
-    if should_apply_return {
+    if let Some(inferred_tail) = inferred_tail {
+        signature.resolve_return = SignatureReturnStatus::DocResolve;
+        signature.return_docs.clear();
+        signature.return_docs.push(LuaDocReturnInfo {
+            name: None,
+            type_ref: doc_return.clone(),
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: ReturnTypeKind::default(),
+        });
+        signature
+            .return_docs
+            .extend(inferred_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                name: None,
+                type_ref,
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            }));
+    } else if should_apply_return {
         signature.resolve_return = SignatureReturnStatus::DocResolve;
         signature.return_docs.clear();
         signature.return_docs.push(LuaDocReturnInfo {
@@ -699,10 +722,129 @@ fn resolve_doc_function(
     Ok(())
 }
 
+/// Retains body-inferred extra Lua results when a contextual function contract
+/// describes only the same first result. Exact first-slot agreement prevents a
+/// different contract from widening the documented return, while informative
+/// tail checks keep unresolved inference from leaking into callers.
+pub(super) fn inferred_return_tail_matching_documented_first<F>(
+    documented_first: &LuaType,
+    inferred_return: &LuaType,
+    correlation_implies_non_nil: F,
+) -> Option<Vec<LuaType>>
+where
+    F: Fn(usize) -> bool,
+{
+    if documented_first.is_variadic() {
+        return None;
+    }
+
+    let LuaType::Variadic(variadic) = inferred_return else {
+        return None;
+    };
+    let VariadicType::Multi(inferred_slots) = variadic.deref() else {
+        return None;
+    };
+    if inferred_slots.len() <= 1
+        || inferred_slots
+            .iter()
+            .skip(1)
+            .any(|typ| typ.is_any() || typ.is_unknown())
+    {
+        return None;
+    }
+
+    let inferred_first = exact_non_nil_type(inferred_slots.first()?);
+    let documented_first_non_nil = exact_non_nil_type(documented_first);
+    if inferred_first != documented_first_non_nil {
+        return None;
+    }
+
+    let mut inferred_tail = inferred_slots[1..].to_vec();
+    if documented_first.is_always_truthy() {
+        for (tail_idx, typ) in inferred_tail.iter_mut().enumerate() {
+            if correlation_implies_non_nil(tail_idx + 1) {
+                *typ = exact_non_nil_type(typ);
+            }
+        }
+    }
+    Some(inferred_tail)
+}
+
+fn exact_non_nil_type(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .types()
+                .filter(|component| !component.is_nil())
+                .cloned()
+                .collect(),
+        ),
+        _ => typ.clone(),
+    }
+}
+
 fn should_doc_return_override_inferred(doc_return: &LuaType, inferred_return: &LuaType) -> bool {
     !(doc_return.is_any() || doc_return.is_unknown())
         || inferred_return.is_any()
         || inferred_return.is_unknown()
+}
+
+#[cfg(test)]
+mod inferred_return_tail_tests {
+    use super::inferred_return_tail_matching_documented_first;
+    use crate::{LuaType, VariadicType};
+
+    #[test]
+    fn matching_documented_first_preserves_only_informative_tail_slots() {
+        let inferred = LuaType::Variadic(
+            VariadicType::Multi(vec![
+                LuaType::from_vec(vec![LuaType::String, LuaType::Nil]),
+                LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]),
+            ])
+            .into(),
+        );
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| true),
+            Some(vec![LuaType::Number])
+        );
+    }
+
+    #[test]
+    fn incompatible_documented_first_rejects_inferred_tail() {
+        let inferred =
+            LuaType::Variadic(VariadicType::Multi(vec![LuaType::Number, LuaType::Boolean]).into());
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn uninformative_inferred_tail_is_not_exposed() {
+        let inferred =
+            LuaType::Variadic(VariadicType::Multi(vec![LuaType::String, LuaType::Unknown]).into());
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&LuaType::String, &inferred, |_| false),
+            None
+        );
+    }
+
+    #[test]
+    fn nullable_documented_first_does_not_make_correlated_tail_non_nil() {
+        let nullable_string = LuaType::from_vec(vec![LuaType::String, LuaType::Nil]);
+        let nullable_number = LuaType::from_vec(vec![LuaType::Number, LuaType::Nil]);
+        let inferred = LuaType::Variadic(
+            VariadicType::Multi(vec![nullable_string.clone(), nullable_number.clone()]).into(),
+        );
+
+        assert_eq!(
+            inferred_return_tail_matching_documented_first(&nullable_string, &inferred, |_| true),
+            Some(vec![nullable_number])
+        );
+    }
 }
 
 fn filter_signature_type(
@@ -710,6 +852,7 @@ fn filter_signature_type(
     typ: &LuaType,
     origin_signature_id: Option<&LuaSignatureId>,
     preserve_returns: bool,
+    preserve_implicit_receiver: bool,
 ) -> Option<Vec<Arc<LuaFunctionType>>> {
     let mut result: Vec<Arc<LuaFunctionType>> = Vec::new();
     let mut stack = Vec::new();
@@ -725,9 +868,10 @@ fn filter_signature_type(
                 if origin_signature_id != Some(&sig_id) {
                     if let Some(sig) = db.get_signature_index().get(&sig_id) {
                         // Convert annotated signature to DocFunction for param propagation.
-                        // When preserve_returns is false (monkey-patch path), only emit a
-                        // DocFunction when params are annotated — we want param propagation but
-                        // must NOT force a return constraint (could break os.exit-style patches).
+                        // When preserve_returns is false (monkey-patch path), emit a DocFunction
+                        // for annotated params or an implicit colon receiver. We want parameter
+                        // propagation but must NOT force a return constraint (could break
+                        // os.exit-style patches).
                         // When preserve_returns is true (hook hover path), emit even for return-
                         // only hooks so that `@return`-annotated hooks with no params display
                         // correctly as `function() -> boolean` rather than silently degrading.
@@ -735,6 +879,7 @@ fn filter_signature_type(
                             !sig.param_docs.is_empty() || !sig.get_return_type().is_nil()
                         } else {
                             !sig.param_docs.is_empty()
+                                || (preserve_implicit_receiver && sig.is_colon_define)
                         };
                         if has_useful_info {
                             let params = sig.get_type_params();
@@ -805,25 +950,40 @@ fn find_best_function_type(
 ) -> Option<LuaType> {
     // 寻找非自身定义的签名
     if let Ok(result) = find_decl_function_type(db, cache, prefix_type, index_member_expr) {
-        if result.is_current_owner {
-            // 对应当前类型下的声明, 我们需要过滤掉所有`signature`类型
-            if let Some(filtered_types) =
-                filter_signature_type(db, &result.typ, origin_sig_id, false)
+        let preserve_implicit_receiver = !origin_signature.is_colon_define
+            && origin_signature
+                .params
+                .first()
+                .is_some_and(|param| param != "...");
+        if let Some(filtered_types) = filter_signature_type(
+            db,
+            &result.typ,
+            origin_sig_id,
+            false,
+            preserve_implicit_receiver,
+        ) {
+            // Parent declarations may describe distinct callback and callable forms.
+            if !result.is_current_owner
+                && let Some(parent_type) = filtered_types.first()
             {
-                match filtered_types.len() {
-                    0 => {}
-                    1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),
-                    _ => {
-                        return Some(LuaType::from_vec(
-                            filtered_types
-                                .into_iter()
-                                .map(|func| LuaType::DocFunction(func.clone()))
-                                .collect(),
-                        ));
-                    }
+                return Some(LuaType::DocFunction(parent_type.clone()));
+            }
+
+            match filtered_types.len() {
+                0 => {}
+                1 => return Some(LuaType::DocFunction(filtered_types[0].clone())),
+                _ => {
+                    return Some(LuaType::from_vec(
+                        filtered_types
+                            .into_iter()
+                            .map(|func| LuaType::DocFunction(func.clone()))
+                            .collect(),
+                    ));
                 }
             }
-        } else {
+        }
+
+        if !result.is_current_owner {
             return Some(result.typ);
         }
     }

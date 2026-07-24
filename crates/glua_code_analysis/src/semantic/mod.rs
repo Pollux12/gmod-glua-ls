@@ -1,6 +1,8 @@
 mod cache;
 mod decl;
 mod generic;
+pub(crate) mod gmod_call_effect;
+mod gmod_vgui_context;
 mod guard;
 mod infer;
 mod member;
@@ -16,17 +18,22 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr, LuaIndexExpr, LuaIndexKey,
-    LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken,
-    LuaTableExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr,
+    LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind,
+    LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
+pub(crate) use gmod_vgui_context::resolve_registered_vgui_method_context;
 pub(crate) use infer::check_iter_var_range;
+pub(crate) use infer::get_prefix_expr_signature_id;
+pub(crate) use infer::infer_bind_value_type;
 pub use infer::infer_index_expr;
+pub(crate) use infer::narrow::infer_true_condition_narrowing;
+pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
-use infer::{infer_bind_value_type, infer_call_arg_expr_list_types, infer_expr_list_types};
+use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};
 use lsp_types::Uri;
 pub use member::LuaMemberInfo;
@@ -36,19 +43,22 @@ pub(crate) use member::find_members;
 pub use member::get_member_map;
 pub use member::get_member_value_expr;
 pub(crate) use member::infer_owner_raw_member_type_with_realm;
+pub(crate) use member::infer_raw_member_type_with_cache;
 pub(crate) use member::member_key_matches_type;
 pub(crate) use member::merge_open_table_types;
+pub(crate) use member::resolve_dynamic_field_member;
 use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
-pub use semantic_info::SemanticInfo;
 pub(crate) use semantic_info::{
     SemanticDeclGuard, infer_expr_semantic_decl, infer_node_semantic_decl, resolve_global_decl_id,
 };
+pub use semantic_info::{SemanticInfo, SemanticInfoOrigin};
 use semantic_info::{
-    infer_node_semantic_info, infer_token_semantic_decl, infer_token_semantic_info,
+    infer_expr_semantic_info, infer_node_semantic_info, infer_token_semantic_decl,
+    infer_token_semantic_info,
 };
 pub(crate) use type_check::check_type_compact;
-use type_check::is_sub_type_of;
+pub(crate) use type_check::is_sub_type_of;
 pub use visibility::check_export_visibility;
 use visibility::check_visibility;
 
@@ -57,8 +67,12 @@ pub use crate::semantic::member::{
     find_members_with_key_in_workspace_for_file,
     find_members_with_key_in_workspace_for_file_at_offset,
 };
-use crate::semantic::type_check::check_type_compact_detail;
-use crate::{Emmyrc, LuaDocument, LuaSemanticDeclId, ModuleInfo, db_index::LuaTypeDeclId};
+use crate::semantic::type_check::{
+    check_type_compact_detail, check_type_compact_detail_with_member_facts,
+};
+use crate::{
+    Emmyrc, LuaDocument, LuaSemanticDeclId, LuaTypeFact, ModuleInfo, db_index::LuaTypeDeclId,
+};
 use crate::{
     FileId,
     db_index::{DbIndex, LuaType},
@@ -70,9 +84,13 @@ pub use infer::InferFailReason;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
+pub(crate) use infer::infer_param_is_weak;
 pub(crate) use infer::remove_false_or_nil;
+pub(crate) use infer::type_decl_is_vgui_panel;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
+pub(crate) use infer::{
+    contains_gmod_null_type, expr_may_have_condition_narrowing, get_var_expr_var_ref_id,
+};
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;
@@ -203,6 +221,20 @@ impl<'a> SemanticModel<'a> {
         infer_expr(self.db, &mut self.infer_cache.borrow_mut(), expr)
     }
 
+    pub fn infer_expr_fact(&self, expr: LuaExpr) -> LuaTypeFact {
+        let mut cache = self.infer_cache.borrow_mut();
+        let semantic_decl = infer_expr_semantic_decl(
+            self.db,
+            &mut cache,
+            expr.clone(),
+            SemanticDeclGuard::default(),
+            SemanticDeclLevel::NoTrace,
+        );
+        infer_expr_semantic_info(self.db, &mut cache, expr, semantic_decl)
+            .inference_fact()
+            .clone()
+    }
+
     pub fn infer_table_should_be(&self, table: LuaTableExpr) -> Option<LuaType> {
         infer_table_should_be(self.db, &mut self.infer_cache.borrow_mut(), table).ok()
     }
@@ -328,6 +360,41 @@ impl<'a> SemanticModel<'a> {
         check_type_compact_detail(self.db, source, compact_type)
     }
 
+    pub fn type_check_expr_detail(
+        &self,
+        source: &LuaType,
+        compact_expr: &LuaExpr,
+    ) -> TypeCheckResult {
+        let compact_fact = self.infer_expr_fact(compact_expr.clone());
+        let mut member_facts = HashMap::new();
+        self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
+        check_type_compact_detail_with_member_facts(
+            self.db,
+            source,
+            compact_fact.typ(),
+            member_facts,
+        )
+    }
+
+    fn collect_table_expr_member_facts(
+        &self,
+        expr: &LuaExpr,
+        member_facts: &mut HashMap<LuaMemberId, LuaTypeFact>,
+    ) {
+        let Some(table_expr) = LuaTableExpr::cast(expr.syntax().clone()) else {
+            return;
+        };
+
+        for field in table_expr.get_fields() {
+            let Some(value_expr) = field.get_value_expr() else {
+                continue;
+            };
+            let member_id = LuaMemberId::new(field.get_syntax_id(), self.file_id);
+            member_facts.insert(member_id, self.infer_expr_fact(value_expr.clone()));
+            self.collect_table_expr_member_facts(&value_expr, member_facts);
+        }
+    }
+
     pub fn infer_call_expr_func(
         &self,
         call_expr: LuaCallExpr,
@@ -358,6 +425,40 @@ impl<'a> SemanticModel<'a> {
             Ok(infer_expr(db, cache, expr).unwrap_or(LuaType::Unknown))
         })
         .unwrap_or_default()
+    }
+
+    pub fn infer_expr_list_value_type_at(
+        &self,
+        exprs: &[LuaExpr],
+        value_idx: usize,
+    ) -> Option<LuaType> {
+        infer_expr_list_value_type_at(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            exprs,
+            value_idx,
+        )
+        .ok()
+        .flatten()
+    }
+
+    /// Returns the value assigned to `target` by a plain `=` assignment.
+    ///
+    /// Raw expression inference for an assignment target intentionally observes the incoming
+    /// flow state. Editor features that describe the write itself can use this projection without
+    /// changing that flow contract. Compound assignments are excluded until their operator-result
+    /// semantics can be projected.
+    pub fn infer_plain_assignment_target_value(&self, target: &LuaVarExpr) -> Option<LuaType> {
+        let assign_stat = LuaAssignStat::cast(target.syntax().parent()?)?;
+        if assign_stat.get_assign_op()?.get_token_kind() != LuaTokenKind::TkAssign {
+            return None;
+        }
+
+        let (vars, exprs) = assign_stat.get_var_and_expr_list();
+        let target_idx = vars
+            .iter()
+            .position(|candidate| candidate.syntax() == target.syntax())?;
+        self.infer_expr_list_value_type_at(&exprs, target_idx)
     }
 
     pub fn infer_call_arg_expr_list_types(
@@ -489,7 +590,12 @@ impl<'a> SemanticModel<'a> {
         prefix_type: &LuaType,
         member_key: &LuaMemberKey,
     ) -> Result<LuaType, InferFailReason> {
-        member::infer_raw_member_type(self.db, prefix_type, member_key)
+        member::infer_raw_member_type_with_cache(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            prefix_type,
+            member_key,
+        )
     }
 
     pub(crate) fn infer_index_member_type(

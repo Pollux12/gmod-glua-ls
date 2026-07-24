@@ -168,7 +168,7 @@ foo({})
     fn test_issue_296() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@generic T
                 ---@param table table
@@ -420,6 +420,30 @@ foo({})
     }
 
     #[test]
+    fn test_later_partial_optional_field_suppresses_same_class_required() {
+        let mut ws = VirtualWorkspace::new();
+        // Generated annotations can be followed by custom partial overrides.
+        // A later optional field for the same class should make the field
+        // optional-for-writing without relying on source-order-specific table
+        // construction inference.
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class (partial) DrawTextData
+            ---@field text string
+            ---@field pos table
+
+            ---@class (partial) DrawTextData
+            ---@field text? string
+            ---@field pos? table
+
+            ---@type DrawTextData
+            local text = {}
+            "#
+        ));
+    }
+
+    #[test]
     fn test_child_required_overrides_parent_default() {
         let mut ws = VirtualWorkspace::new();
         // Child redeclares a parent-defaulted field WITHOUT a default;
@@ -454,6 +478,79 @@ foo({})
             ---@type Config
             local cfg = { debug = true }
             "#
+        ));
+    }
+
+    #[test]
+    fn inferred_nullable_api_result_accepts_partial_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class DebugInfo
+            ---@field short_src string
+            ---@field currentline integer
+            ---@field source string
+
+            ---@return DebugInfo?
+            local function getinfo() end
+
+            local info = getinfo()
+            if not info then
+                info = {
+                    short_src = "",
+                    currentline = 0,
+                }
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn explicitly_typed_nullable_local_rejects_partial_fallback_table() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class DebugInfo
+            ---@field short_src string
+            ---@field currentline integer
+            ---@field source string
+
+            ---@return DebugInfo?
+            local function getinfo() end
+
+            ---@type DebugInfo?
+            local info = getinfo()
+            if not info then
+                info = {
+                    short_src = "",
+                    currentline = 0,
+                }
+            end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn table_completed_after_typed_use_still_reports_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Full
+            ---@field required string
+
+            ---@param value Full
+            local function consume_typed(value) end
+
+            local value = {}
+            consume_typed(value)
+            value.required = "ready"
+            "#,
         ));
     }
 }

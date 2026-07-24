@@ -916,7 +916,7 @@ pub fn get_function_remove_nil(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
     match typ {
         LuaType::Union(union_typ) => {
             let mut new_types = Vec::new();
-            for member in union_typ.into_vec().iter() {
+            for member in union_typ.types() {
                 match member {
                     _ if member.is_function() => {
                         new_types.push(member.clone());

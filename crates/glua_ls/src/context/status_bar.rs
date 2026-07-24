@@ -91,6 +91,15 @@ impl StatusBar {
         )
     }
 
+    pub fn update_startup_phase(
+        &self,
+        task: ProgressTask,
+        percentage: Option<u32>,
+        phase: impl AsRef<str>,
+    ) {
+        self.update_progress_task(task, percentage, Some(phase.as_ref().to_string()));
+    }
+
     pub fn finish_progress_task(&self, task: ProgressTask, message: Option<String>) {
         self.client.send_notification(
             "$/progress",

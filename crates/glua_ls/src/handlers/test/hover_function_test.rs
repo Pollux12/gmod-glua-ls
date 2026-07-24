@@ -1531,4 +1531,88 @@ mod tests {
         );
         Ok(())
     }
+
+    fn define_unguarded_child_hover_fixture(ws: &mut ProviderVirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+                ---@class Vector
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class NPC: Entity
+                ---@field GetAimVector fun(self: NPC): Vector
+                ---@class Player: Entity
+                ---@field GetAimVector fun(self: Player): Vector
+
+                ---@return Entity|NULL
+                function GetOwner() end
+            "#,
+        );
+    }
+
+    #[gtest]
+    fn test_hover_unguarded_child_shows_type_before_usage_inference() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        define_unguarded_child_hover_fixture(&mut ws);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local <??>owner = GetOwner()
+                local aim = owner:GetAimVector()
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert_that!(
+            markup.value.as_str(),
+            contains_substring("(infer) local owner: (NPC : Entity|Player : Entity)"),
+        );
+        assert_that!(
+            markup.value.as_str(),
+            contains_substring("Type before usage inference: `(Entity|NULL : Entity)`"),
+        );
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_hover_unguarded_child_method_shows_union_receiver() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        define_unguarded_child_hover_fixture(&mut ws);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local owner = GetOwner()
+                local aim = owner:GetAim<??>Vector()
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let hover = crate::handlers::hover::hover(&ws.analysis, file_id, position, None)
+            .ok_or("expected hover")
+            .or_fail()?;
+
+        let HoverContents::Markup(markup) = hover.contents else {
+            return fail!("expected HoverContents::Markup");
+        };
+
+        assert_that!(
+            markup.value.as_str(),
+            contains_substring("(method) (NPC|Player):GetAimVector() -> Vector"),
+        );
+        assert!(
+            !markup.value.contains("(method) NPC:GetAimVector")
+                && !markup.value.contains("(method) Player:GetAimVector"),
+            "expected the receiver union rather than one arbitrary child owner, got: {}",
+            markup.value
+        );
+        Ok(())
+    }
 }

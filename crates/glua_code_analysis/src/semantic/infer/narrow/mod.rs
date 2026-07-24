@@ -6,23 +6,40 @@ mod var_ref_id;
 
 use crate::{
     CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, InferFailReason,
-    LuaInferCache, LuaType, TypeOps,
+    LuaDefinitionId, LuaInferCache, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaType,
     db_index::LuaTypeDeclId,
     get_real_type, infer_param_with_cache,
+    semantic::cache::FlowOrigin,
     semantic::infer::{
         InferResult,
         infer_name::{find_decl_member_type, infer_global_type},
     },
 };
+pub(crate) use condition_flow::InferConditionFlow;
+pub(crate) use get_type_at_cast_flow::cast_type;
 pub use get_type_at_cast_flow::get_type_at_call_expr_inline_cast;
 pub use get_type_at_flow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr};
-pub use narrow_type::{narrow_down_type, narrow_false_or_nil, remove_false_or_nil};
+pub use narrow_type::{
+    narrow_direct_name_false_or_nil, narrow_down_type, narrow_false_or_nil, remove_false_or_nil,
+};
 pub use var_ref_id::{SelfRefId, VarRefId, VarRefRootId, get_var_expr_var_ref_id};
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
+
+fn unguarded_child_decl_type(db: &DbIndex, decl_id: crate::LuaDeclId) -> Option<LuaType> {
+    db.get_inference_fact(&LuaInferenceNodeId::Definition(
+        LuaDefinitionId::Declaration(decl_id),
+    ))
+    .filter(|fact| {
+        fact.provenance()
+            .iter()
+            .any(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)
+    })
+    .map(|fact| fact.typ().clone())
+}
 
 fn gmod_null_decl_id() -> LuaTypeDeclId {
     LuaTypeDeclId::global(GMOD_NULL_TYPE_NAME)
@@ -51,8 +68,7 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     match real_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|member| contains_gmod_null_type(db, member)),
         LuaType::MultiLineUnion(multi_union) => multi_union
             .get_unions()
@@ -63,31 +79,64 @@ pub(crate) fn contains_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
-pub(crate) fn remove_gmod_null_type(db: &DbIndex, typ: LuaType) -> LuaType {
-    if !db.get_emmyrc().gmod.enabled {
-        return typ;
+/// Whether the backward flow walk could possibly change `var_ref_id`'s type from
+/// its declared/origin type, given the file-wide narrowing capability. When this
+/// returns `false`, the walk is guaranteed to be a no-op and can be skipped.
+fn var_ref_can_be_narrowed(db: &DbIndex, file_id: &crate::FileId, var_ref_id: &VarRefId) -> bool {
+    // Special-call effects can narrow arbitrary var-refs at runtime positions and
+    // are populated after flow binding, so any file with them must not skip.
+    if db.get_flow_index().has_any_special_call_effect(file_id) {
+        return true;
     }
 
-    if is_gmod_null_type(db, &typ) {
-        return LuaType::Never;
-    }
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(file_id) else {
+        return true;
+    };
+    let capability = flow_tree.get_narrowing_capability();
 
-    let removed_ref = TypeOps::Remove.apply(db, &typ, &gmod_null_type());
-    let null_def = LuaType::Def(gmod_null_decl_id());
-    TypeOps::Remove.apply(db, &removed_ref, &null_def)
+    match var_ref_id {
+        // Plain locals, `self`, and globals reach the DeclPosition terminus where
+        // the walk can diverge from `get_var_ref_type` (initializer retry,
+        // uninitialized-local nil handling, branch merges). These divergences are
+        // not fully captured by the file-wide capability sets, so always walk.
+        VarRefId::VarRef(_) | VarRefId::SelfRef(_) | VarRefId::GlobalName(_, _) => true,
+        // Index references resolve their base via `index_ref_origin_type_cache`
+        // and only diverge from the origin type through an actual narrowing site
+        // (assignment / cast / condition) on a matching access path. When no such
+        // site exists in the file, the walk is provably a no-op.
+        VarRefId::IndexRef(root, path) => {
+            capability.index_path_can_be_narrowed(path)
+                || root
+                    .as_decl_id()
+                    .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                    .is_some_and(|decl| {
+                        capability.has_opaque_name_target
+                            || capability
+                                .referenced_names
+                                .iter()
+                                .any(|name| name.as_str() == decl.get_name())
+                    })
+        }
+    }
 }
 
-fn is_gmod_null_type(db: &DbIndex, typ: &LuaType) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
+pub(crate) fn expr_may_have_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> bool {
+    let file_id = cache.get_file_id();
+    let syntax_id = expr.get_syntax_id();
+    let Some(VarRefId::IndexRef(_, path)) = get_var_expr_var_ref_id(db, cache, expr) else {
         return false;
-    }
-
-    let real_type = get_real_type(db, typ).unwrap_or(typ);
-    match real_type {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id == &gmod_null_decl_id(),
-        LuaType::Instance(instance_type) => is_gmod_null_type(db, instance_type.get_base()),
-        _ => false,
-    }
+    };
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
+        return false;
+    };
+    let Some(flow_id) = flow_tree.get_flow_id(syntax_id) else {
+        return false;
+    };
+    flow_tree.has_condition_path_antecedent(flow_id, &path)
 }
 
 pub fn infer_expr_narrow_type(
@@ -97,6 +146,14 @@ pub fn infer_expr_narrow_type(
     var_ref_id: VarRefId,
 ) -> InferResult {
     let file_id = cache.get_file_id();
+
+    // Fast path: if this reference can never be narrowed anywhere in the file,
+    // the backward flow walk is guaranteed to produce the declared/origin type.
+    // Measured at ~95% of top-level narrow queries on real GMod codebases.
+    if !var_ref_can_be_narrowed(db, &file_id, &var_ref_id) {
+        return get_var_ref_type(db, cache, &var_ref_id);
+    }
+
     let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
         return get_var_ref_type(db, cache, &var_ref_id);
     };
@@ -112,6 +169,94 @@ pub fn infer_expr_narrow_type(
     let previous_query_realm = cache.flow_query_realm.replace(query_realm);
     let result =
         get_type_at_flow::get_type_at_flow(db, flow_tree, cache, &root, &var_ref_id, flow_id);
+    cache.flow_query_realm = previous_query_realm;
+    result
+}
+
+pub(crate) fn infer_true_condition_narrowing(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    target_expr: LuaExpr,
+    condition: LuaExpr,
+) -> Option<(LuaType, LuaType)> {
+    let var_ref_id = get_var_expr_var_ref_id(db, cache, target_expr.clone())?;
+    let file_id = cache.get_file_id();
+    let flow_tree = db.get_flow_index().get_flow_tree(&file_id)?;
+    let flow_id = flow_tree.get_flow_id(target_expr.get_syntax_id())?;
+    let root = LuaChunk::cast(condition.get_root())?;
+    let flow_node = FlowNode {
+        id: flow_id,
+        kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+        antecedent: Some(FlowAntecedent::Single(flow_id)),
+    };
+    let policy = get_type_at_flow::FlowWalkPolicy::normal(FlowOrigin::Real);
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, condition.get_position());
+    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let result = (|| {
+        let antecedent = condition_flow::get_condition_antecedent_type(
+            db,
+            flow_tree,
+            cache,
+            &root,
+            &var_ref_id,
+            &flow_node,
+            policy,
+        )
+        .ok()?;
+        let narrowed = match condition_flow::get_type_at_condition_flow(
+            db,
+            flow_tree,
+            cache,
+            &root,
+            &var_ref_id,
+            &flow_node,
+            condition,
+            InferConditionFlow::TrueCondition,
+            policy,
+        )
+        .ok()?
+        {
+            ResultTypeOrContinue::Result(typ) => typ,
+            ResultTypeOrContinue::Continue => return None,
+        };
+        Some((antecedent, narrowed))
+    })();
+    cache.flow_query_realm = previous_query_realm;
+    result
+}
+
+pub fn infer_expr_narrow_type_with_flow_origin(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    var_ref_id: VarRefId,
+    flow_origin: FlowOrigin,
+) -> InferResult {
+    let file_id = cache.get_file_id();
+    let Some(flow_tree) = db.get_flow_index().get_flow_tree(&file_id) else {
+        return get_var_ref_type(db, cache, &var_ref_id);
+    };
+
+    let Some(flow_id) = flow_tree.get_flow_id(expr.get_syntax_id()) else {
+        return get_var_ref_type(db, cache, &var_ref_id);
+    };
+
+    let root = LuaChunk::cast(expr.get_root()).ok_or(InferFailReason::None)?;
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&file_id, expr.get_position());
+    let previous_query_realm = cache.flow_query_realm.replace(query_realm);
+    let result = get_type_at_flow::get_type_at_flow_with_origin(
+        db,
+        flow_tree,
+        cache,
+        &root,
+        &var_ref_id,
+        flow_id,
+        flow_origin,
+    );
     cache.flow_query_realm = previous_query_realm;
     result
 }
@@ -168,10 +313,21 @@ pub fn get_var_ref_type(
             .get_decl(&decl_id)
             .ok_or(InferFailReason::None)?;
 
+        if decl.is_implicit_self()
+            && let Some((seed_ref, seed_type)) = cache.self_base_seed.as_ref()
+            && seed_ref.get_decl_id_ref() == Some(decl.get_id())
+        {
+            return Ok(seed_type.clone());
+        }
+
         // Parameter declarations carry their canonical type in signature metadata.
         // Flow/assignment analysis may also create a decl type cache entry for params,
         // but that inferred cache must not replace the declared parameter type.
         if decl.is_param() {
+            if let Some(child_type) = unguarded_child_decl_type(db, decl.get_id()) {
+                return Ok(child_type);
+            }
+
             if let Ok(param_type) = infer_param_with_cache(db, cache, decl) {
                 return Ok(param_type);
             }
@@ -190,6 +346,19 @@ pub fn get_var_ref_type(
 
             if let Some(type_cache) = db.get_type_index().get_type_cache(&decl.get_id().into()) {
                 let typ = type_cache.as_type();
+                let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
+                if should_fallback
+                    && let Ok(global_type) =
+                        infer_global_type(db, Some(cache.get_file_id()), None, decl.get_name())
+                    && (global_type.is_custom_type()
+                        || (!global_type.is_nil()
+                            && !global_type.is_nullable()
+                            && !global_type.is_unknown()
+                            && !matches!(global_type, LuaType::Any | LuaType::Never)))
+                {
+                    return Ok(global_type);
+                }
+
                 return if typ.contain_tpl() {
                     Ok(LuaType::Unknown)
                 } else {
@@ -206,21 +375,6 @@ pub fn get_var_ref_type(
             // 不要在此阶段展开泛型别名, 必须让后续的泛型匹配阶段基于声明形态完成推断
             return Ok(result);
         }
-
-        // Collect unique UnResolveDeclType decl names for profiling
-        cache.prof_unresolve_decl_sample_count += 1;
-        if cache.prof_unresolve_decl_names.len() < 30 {
-            let name = decl.get_name().to_string();
-            let key = format!("{}:{}", name, u32::from(decl.get_id().position));
-            if !cache.prof_unresolve_decl_names.contains(&key) {
-                cache.prof_unresolve_decl_names.push(key);
-            }
-        }
-        // Track per-decl-id counts
-        *cache
-            .prof_unresolve_decl_ids
-            .entry(u32::from(decl.get_id().position))
-            .or_insert(0) += 1;
 
         Err(InferFailReason::UnResolveDeclType(decl.get_id()))
     } else if let Some(member_id) = var_ref_id.get_member_id_ref() {

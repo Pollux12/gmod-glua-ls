@@ -7,8 +7,9 @@ use crate::{
     DbIndex, GlobalId, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaInstanceType,
     LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaMergedTableType,
     LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType,
+    compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
-        infer::{find_self_decl_or_member_id, resolve_scoped_scripted_global_type_decl_id},
+        infer::find_self_decl_or_member_id,
         member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
         semantic_info::resolve_global_decl_id,
     },
@@ -87,7 +88,9 @@ fn infer_name_expr_semantic_decl(
         return infer_self_semantic_decl(db, cache, name_expr);
     }
 
-    if let Some(type_decl_id) = resolve_scoped_scripted_global_type_decl_id(db, cache, &name) {
+    if let Some(type_decl_id) =
+        name_expr_resolves_to_scoped_authoring_table(db, cache.get_file_id(), &name_expr)
+    {
         return Some(LuaSemanticDeclId::TypeDecl(type_decl_id));
     }
 
@@ -153,13 +156,10 @@ fn infer_require_module_semantic_decl(
     let first_arg = call_expr.get_args_list()?.get_args().next()?;
     let module_path = match first_arg {
         LuaExpr::LiteralExpr(literal_expr) => {
-            if let Some(literal_token) = literal_expr.get_literal() {
-                match literal_token {
-                    LuaLiteralToken::String(string_token) => string_token.get_value(),
-                    _ => return None,
-                }
-            } else {
-                return None;
+            let literal_token = literal_expr.get_literal()?;
+            match literal_token {
+                LuaLiteralToken::String(string_token) => string_token.get_value(),
+                _ => return None,
             }
         }
         _ => return None,
@@ -477,14 +477,19 @@ fn infer_union_member_semantic_info(
     member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> Option<LuaSemanticDeclId> {
-    for typ in union_type.into_vec() {
+    // Fork the guard per arm so a long miss streak (NULL / unrelated Entity
+    // subclasses) cannot exhaust the depth budget and abort the whole union.
+    for typ in union_type.types() {
+        let Some(arm_guard) = semantic_guard.next_level() else {
+            continue;
+        };
         if let Some(property_owner_id) = infer_member_semantic_decl_by_member_key(
             db,
             cache,
-            &typ,
+            typ,
             member_key,
             member_access_position,
-            semantic_guard.next_level()?,
+            arm_guard,
         ) {
             return Some(property_owner_id);
         }

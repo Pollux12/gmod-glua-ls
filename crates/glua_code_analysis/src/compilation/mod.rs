@@ -42,6 +42,12 @@ impl LuaCompilation {
         ))
     }
 
+    /// Updates the index for `file_ids`.
+    ///
+    /// The returned stabilization-candidate list is retained for API
+    /// compatibility. Late facts are now stabilized inside the analyzer, so
+    /// external callers no longer need to schedule another indexing pass and
+    /// this list is always empty.
     pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut need_analyzed_files = vec![];
         for file_id in file_ids {
@@ -58,12 +64,8 @@ impl LuaCompilation {
             });
         }
 
-        let mut stabilization_candidates =
-            analyzer::analyze(&mut self.db, need_analyzed_files, self.emmyrc.clone())
-                .into_iter()
-                .collect::<Vec<_>>();
-        stabilization_candidates.sort_unstable();
-        stabilization_candidates
+        analyzer::analyze(&mut self.db, need_analyzed_files);
+        Vec::new()
     }
 
     pub fn remove_index(&mut self, file_ids: Vec<FileId>) {

@@ -26,6 +26,7 @@ mod gmod_network;
 mod gmod_realm_misuse;
 mod gmod_systems;
 mod incomplete_signature_doc;
+mod inference_trust;
 mod local_const_reassign;
 mod missing_fields;
 mod need_check_nil;
@@ -44,12 +45,11 @@ mod unnecessary_if;
 mod unused;
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaIndexExpr,
-    LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment,
+    LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
-use smol_str::SmolStr;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
@@ -68,21 +68,20 @@ use super::{
 };
 
 pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates};
-pub use check_field::precompute_subclass_fields;
 pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
 pub use gmod_realm_misuse::AnnotatedRealmRange;
 pub use gmod_realm_misuse::GmMethodRealmMap;
 pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
+pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
 pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
-pub use gmod_realm_misuse::precompute_callee_realms_for_workspace;
+pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
 
 pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
-pub type PrecomputedSubclassFields = HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>>;
 pub type AssignmentPrefixKey = (TextSize, TextSize, String);
 pub type AssignmentPrefixEvents = HashMap<AssignmentPrefixKey, Vec<AssignmentPrefixEvent>>;
 
@@ -158,6 +157,7 @@ pub fn check_file(
         cancel_token,
     );
     run_check::<call_non_callable::CallNonCallableChecker>(context, semantic_model, cancel_token);
+    run_check::<inference_trust::InferenceTrustChecker>(context, semantic_model, cancel_token);
     run_check::<missing_fields::MissingFieldsChecker>(context, semantic_model, cancel_token);
     run_check::<param_type_check::ParamTypeCheckChecker>(context, semantic_model, cancel_token);
     run_check::<code_style_check::CodeStyleCheckChecker>(context, semantic_model, cancel_token);
@@ -257,10 +257,11 @@ pub struct SharedDiagnosticData {
     pub gm_method_realms: HashMap<WorkspaceId, Arc<GmMethodRealmMap>>,
     /// Maps workspace_id -> immutable, precomputed callee-declaration realm data.
     pub callee_realms_by_workspace: HashMap<WorkspaceId, Arc<PrecomputedCalleeRealmMap>>,
+    /// Maps workspace_id -> static callee names that may produce realm diagnostics.
+    pub realm_call_candidates_by_workspace:
+        HashMap<WorkspaceId, Arc<PrecomputedRealmCallCandidates>>,
     /// Required non-method fields for each type declaration, including inherited fields.
     pub missing_required_fields: Arc<PrecomputedMissingRequiredFields>,
-    /// Named members declared on subclasses, keyed by every base type they can satisfy.
-    pub subclass_fields: Arc<PrecomputedSubclassFields>,
     /// Whether any indexed signature/type cache can produce an async callable.
     pub await_candidates: Arc<PrecomputedAwaitCandidates>,
     /// Static callee names whose callable metadata has parameter types worth checking.
@@ -323,6 +324,10 @@ impl<'a> DiagnosticContext<'a> {
 
     pub fn get_shared_data_arc(&self) -> Option<Arc<SharedDiagnosticData>> {
         self.shared_data.clone()
+    }
+
+    pub fn get_shared_data(&self) -> Option<&SharedDiagnosticData> {
+        self.shared_data.as_deref()
     }
 
     pub fn get_db(&self) -> &DbIndex {
@@ -501,7 +506,7 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
 
             let is_table_literal = exprs
                 .get(idx)
-                .is_some_and(|expr| matches!(expr, LuaExpr::TableExpr(_)));
+                .is_some_and(|expr| assignment_guarantees_table(var.syntax(), expr));
             events
                 .entry((block_start, block_end, prefix_text))
                 .or_default()
@@ -513,6 +518,25 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
     }
 
     events
+}
+
+fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
+    if matches!(expr, LuaExpr::TableExpr(_)) {
+        return true;
+    }
+
+    let LuaExpr::BinaryExpr(binary) = expr else {
+        return false;
+    };
+    if binary.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpOr) {
+        return false;
+    }
+    let Some((left, right)) = binary.get_exprs() else {
+        return false;
+    };
+
+    matches!(right, LuaExpr::TableExpr(_))
+        && normalized_syntax_text(left.syntax()) == normalized_syntax_text(var)
 }
 
 pub fn is_initialized_assignment_prefix(
@@ -539,6 +563,41 @@ pub fn is_initialized_assignment_prefix(
     };
 
     let current_offset = assign_stat.syntax().text_range().start();
+    let last_event_idx = events.partition_point(|event| event.offset < current_offset);
+    last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
+}
+
+pub fn assignment_prefix_key_for_syntax(
+    stat_syntax: &LuaSyntaxNode,
+    syntax: &LuaSyntaxNode,
+) -> Option<AssignmentPrefixKey> {
+    let (block_start, block_end) = assignment_block_range(stat_syntax)?;
+
+    let access_text = normalized_syntax_text(syntax);
+    if access_text.is_empty() {
+        return None;
+    }
+
+    Some((block_start, block_end, access_text))
+}
+
+pub fn is_initialized_assignment_access(
+    index_expr: &LuaIndexExpr,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> bool {
+    let Some(stat) = index_expr.syntax().ancestors().find_map(LuaStat::cast) else {
+        return false;
+    };
+
+    let Some(key) = assignment_prefix_key_for_syntax(stat.syntax(), index_expr.syntax()) else {
+        return false;
+    };
+
+    let Some(events) = assignment_prefixes.get(&key) else {
+        return false;
+    };
+
+    let current_offset = stat.syntax().text_range().start();
     let last_event_idx = events.partition_point(|event| event.offset < current_offset);
     last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
 }

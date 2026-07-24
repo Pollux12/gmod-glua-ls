@@ -1,6 +1,5 @@
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
     time::Duration,
 };
 
@@ -13,70 +12,39 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, LuaUnionType, SemanticModel,
-    check_type_compact, enum_variable_is_param, get_keyof_members,
+    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
+    check_type_compact, enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
-        infer_owner_raw_member_type_with_realm, is_doc_tag_table_const, member_key_matches_type,
-        resolve_decl_backed_global_path_member_type,
+        infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
+        member_key_matches_type, resolve_decl_backed_global_path_member_type,
+        unwrap_paren_to_name_expr,
     },
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type, is_initialized_assignment_prefix};
+use super::{
+    AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
+    is_initialized_assignment_access, is_initialized_assignment_prefix,
+};
 
 pub struct CheckFieldChecker;
 
-pub fn precompute_subclass_fields(db: &DbIndex) -> HashMap<LuaTypeDeclId, Arc<HashSet<SmolStr>>> {
-    if !db.get_emmyrc().gmod.enabled {
-        return HashMap::new();
-    }
-
-    let mut subclass_fields: HashMap<LuaTypeDeclId, HashSet<SmolStr>> = HashMap::new();
-    let type_index = db.get_type_index();
-    let member_index = db.get_member_index();
-
-    for type_decl in type_index.get_all_types() {
-        let type_id = type_decl.get_id();
-        let owner = LuaMemberOwner::Type(type_id.clone());
-        let Some(members) = member_index.get_members(&owner) else {
-            continue;
-        };
-
-        let member_names = members
-            .iter()
-            .filter_map(|member| match member.get_key() {
-                LuaMemberKey::Name(name) => Some(name.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>();
-        if member_names.is_empty() {
-            continue;
-        }
-
-        let mut super_types = Vec::new();
-        type_id.collect_super_types(db, &mut super_types);
-        for super_type in super_types {
-            if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
-                subclass_fields
-                    .entry(super_id)
-                    .or_default()
-                    .extend(member_names.iter().cloned());
-            }
-        }
-    }
-
-    subclass_fields
-        .into_iter()
-        .map(|(type_id, fields)| (type_id, Arc::new(fields)))
-        .collect()
-}
-
 impl Checker for CheckFieldChecker {
-    const CODES: &[DiagnosticCode] = &[DiagnosticCode::InjectField, DiagnosticCode::UndefinedField];
+    const CODES: &[DiagnosticCode] = &[
+        DiagnosticCode::InjectField,
+        DiagnosticCode::UndefinedField,
+        DiagnosticCode::UndefinedMethod,
+    ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
         let mut checked_index_expr = HashSet::new();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
+        let initialized_assignment_accesses =
+            if has_reusable_table_literal_assignment(&assignment_prefixes) {
+                collect_initialized_assignment_accesses(&root, &assignment_prefixes)
+            } else {
+                HashSet::new()
+            };
         let mut state = CheckFieldState::default();
         let profile_enabled = log::log_enabled!(log::Level::Info);
         let mut profile = profile_enabled.then(CheckFieldProfile::default);
@@ -140,11 +108,25 @@ impl Checker for CheckFieldChecker {
                         }
                         continue;
                     }
+                    if initialized_assignment_accesses.contains(index_expr.syntax()) {
+                        if let Some(profile) = profile.as_mut() {
+                            profile.prechecked_index_skips += 1;
+                        }
+                        continue;
+                    }
+                    let weak_receiver = index_expr
+                        .get_prefix_expr()
+                        .is_some_and(|prefix| is_weak_receiver(semantic_model, &prefix));
+                    let code = if is_colon_method_call(&index_expr) && !weak_receiver {
+                        DiagnosticCode::UndefinedMethod
+                    } else {
+                        DiagnosticCode::UndefinedField
+                    };
                     check_index_expr(
                         context,
                         semantic_model,
                         &index_expr,
-                        DiagnosticCode::UndefinedField,
+                        code,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -156,6 +138,73 @@ impl Checker for CheckFieldChecker {
             profile.log(semantic_model.get_file_id(), state.member_infer_cache.len());
         }
     }
+}
+
+fn is_weak_receiver(semantic_model: &SemanticModel, prefix_expr: &LuaExpr) -> bool {
+    let db = semantic_model.get_db();
+    if let Some(name_expr) = unwrap_paren_to_name_expr(prefix_expr)
+        && let Some(decl_id) = db
+            .get_reference_index()
+            .get_local_reference(&semantic_model.get_file_id())
+            .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
+        && decl.is_param()
+    {
+        return infer_param_is_weak(db, &mut semantic_model.get_cache().borrow_mut(), decl);
+    }
+
+    semantic_model
+        .infer_expr_fact(prefix_expr.clone())
+        .confidence()
+        < LuaInferenceConfidence::Certain
+}
+
+fn has_reusable_table_literal_assignment(assignment_prefixes: &AssignmentPrefixEvents) -> bool {
+    let table_literal_keys = assignment_prefixes
+        .iter()
+        .filter(|(_, events)| events.iter().any(|event| event.is_table_literal))
+        .map(|((block_start, block_end, text), _)| (*block_start, *block_end, text.as_str()));
+
+    for (table_block_start, table_block_end, table_text) in table_literal_keys {
+        for (block_start, block_end, text) in assignment_prefixes.keys() {
+            if *block_start != table_block_start || *block_end != table_block_end {
+                continue;
+            }
+            let Some(rest) = text.strip_prefix(table_text) else {
+                continue;
+            };
+            if rest.starts_with('.') || rest.starts_with('[') {
+                return true;
+            }
+        }
+    }
+
+    false
+}
+
+fn collect_initialized_assignment_accesses(
+    root: &glua_parser::LuaChunk,
+    assignment_prefixes: &AssignmentPrefixEvents,
+) -> HashSet<LuaSyntaxNode> {
+    let mut initialized_accesses = HashSet::new();
+    for assign in root.descendants::<LuaAssignStat>() {
+        let (vars, _) = assign.get_var_and_expr_list();
+        for var in vars {
+            let LuaVarExpr::IndexExpr(index_expr) = var else {
+                continue;
+            };
+            for node in index_expr.syntax().descendants() {
+                let Some(descendant_index_expr) = LuaIndexExpr::cast(node) else {
+                    continue;
+                };
+                if is_initialized_assignment_access(&descendant_index_expr, assignment_prefixes) {
+                    initialized_accesses.insert(descendant_index_expr.syntax().clone());
+                }
+            }
+        }
+    }
+
+    initialized_accesses
 }
 
 #[derive(Default)]
@@ -174,7 +223,6 @@ struct CheckFieldProfile {
     invalid_prefix_skips: usize,
     valid_member_hits: usize,
     dynamic_field_skips: usize,
-    subclass_field_skips: usize,
     diagnostics_emitted: usize,
     prefix_infer_time: Duration,
     valid_member_time: Duration,
@@ -183,7 +231,7 @@ struct CheckFieldProfile {
 impl CheckFieldProfile {
     fn log(&self, file_id: crate::FileId, member_cache_entries: usize) {
         log::info!(
-            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} subclass_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
+            "check field profile: file={:?} nodes={} assignments={} func_names={} index_nodes={} prechecked_skips={} checked={} invalid_prefix_skips={} valid_member_hits={} dynamic_skips={} diagnostics={} prefix_infer_time={:?} valid_member_time={:?} member_cache_entries={}",
             file_id,
             self.nodes_scanned,
             self.assignment_nodes,
@@ -194,7 +242,6 @@ impl CheckFieldProfile {
             self.invalid_prefix_skips,
             self.valid_member_hits,
             self.dynamic_field_skips,
-            self.subclass_field_skips,
             self.diagnostics_emitted,
             self.prefix_infer_time,
             self.valid_member_time,
@@ -258,7 +305,7 @@ fn check_index_expr(
         // GetTable() returns a plain table with fields; colon calls pass the wrong self.
         if is_tableof_colon_access(&prefix_typ, index_expr) {
             context.add_diagnostic(
-                DiagnosticCode::UndefinedField,
+                DiagnosticCode::UndefinedMethod,
                 index_key.get_range()?,
                 format!(
                     "Cannot call methods via `:` on a table returned by GetTable(). Use dot-access `.{field}` instead. ",
@@ -280,19 +327,24 @@ fn check_index_expr(
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && !is_enum_type(db, &prefix_typ)
-        && is_nil_guarded_in_scope(index_expr)
-    {
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && has_unresolved_metatable_index(
+        db,
+        semantic_model,
+        &prefix_typ,
+        Some(index_expr.get_position()),
+    ) {
         return Some(());
     }
 
-    if matches!(code, DiagnosticCode::UndefinedField)
-        && field_exists_on_subclass(context, db, &prefix_typ, &field_name)
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && !is_enum_type(db, &prefix_typ)
+        && is_nil_guarded_in_scope(index_expr)
     {
-        if let Some(profile) = profile.as_mut() {
-            profile.subclass_field_skips += 1;
-        }
         return Some(());
     }
 
@@ -349,6 +401,17 @@ fn check_index_expr(
                 None,
             );
         }
+        DiagnosticCode::UndefinedMethod => {
+            if let Some(profile) = profile.as_mut() {
+                profile.diagnostics_emitted += 1;
+            }
+            context.add_diagnostic(
+                DiagnosticCode::UndefinedMethod,
+                index_key.get_range()?,
+                format!("Undefined method `{field}`. ", field = field_name),
+                None,
+            );
+        }
         _ => {}
     }
 
@@ -392,18 +455,68 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
 fn is_tableof_colon_access(prefix_typ: &LuaType, index_expr: &LuaIndexExpr) -> bool {
     let is_tableof = match prefix_typ {
         LuaType::TableOf(_) => true,
-        LuaType::Union(union) => union
-            .into_vec()
-            .iter()
-            .any(|t| matches!(t, LuaType::TableOf(_))),
+        LuaType::Union(union) => union.types().any(|t| matches!(t, LuaType::TableOf(_))),
         _ => false,
     };
     if !is_tableof {
         return false;
     }
+    is_colon_method_call(index_expr)
+}
+
+fn is_colon_method_call(index_expr: &LuaIndexExpr) -> bool {
     index_expr
         .get_index_token()
         .is_some_and(|token| token.is_colon())
+        && index_expr
+            .syntax()
+            .parent()
+            .and_then(LuaCallExpr::cast)
+            .is_some_and(|call| {
+                call.get_prefix_expr()
+                    .is_some_and(|prefix| prefix.syntax() == index_expr.syntax())
+            })
+}
+
+fn has_unresolved_metatable_index(
+    db: &DbIndex,
+    semantic_model: &SemanticModel,
+    prefix_typ: &LuaType,
+    position: Option<rowan::TextSize>,
+) -> bool {
+    match prefix_typ {
+        LuaType::TableConst(table_range) => {
+            let Some(metatable) = db.get_metatable_index().get(table_range) else {
+                return false;
+            };
+
+            let index_member_key = LuaMemberKey::Name("__index".into());
+            let meta_owner = LuaMemberOwner::Element(metatable.clone());
+            let index_type = infer_owner_raw_member_type_with_realm(
+                db,
+                meta_owner,
+                &index_member_key,
+                semantic_model.get_file_id(),
+                position,
+            );
+
+            // A present but unresolved Lua `__index` can provide fields at runtime, so field
+            // absence cannot be proven. Known `__index` types still flow through normal checks.
+            index_type.is_ok_and(|typ| typ.is_unknown())
+        }
+        LuaType::Instance(instance) => {
+            has_unresolved_metatable_index(db, semantic_model, instance.get_base(), position)
+        }
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(typ) => {
+                has_unresolved_metatable_index(db, semantic_model, typ, position)
+            }
+            LuaUnionType::Multi(types) => types.iter().any(|typ| {
+                !typ.is_nil() && has_unresolved_metatable_index(db, semantic_model, typ, position)
+            }),
+        },
+        _ => false,
+    }
 }
 
 pub(super) fn is_valid_member(
@@ -539,6 +652,14 @@ fn is_valid_member_inner(
         }
         LuaType::TableConst(id) => {
             if code == DiagnosticCode::UndefinedField
+                && !is_table_const_from_doc_tag(semantic_model, id)
+                && table_const_is_empty(semantic_model.get_db(), id)
+                && index_key_is_numeric(semantic_model, index_key)
+            {
+                return Some(());
+            }
+
+            if code == DiagnosticCode::UndefinedField
                 && matches!(index_key, LuaIndexKey::Expr(_))
                 && !is_table_const_from_doc_tag(semantic_model, id)
             {
@@ -567,6 +688,13 @@ fn is_valid_member_inner(
                     return Some(());
                 }
                 Err(_) => {}
+            }
+
+            if code == DiagnosticCode::UndefinedField
+                && table_const_has_only_dynamic_key_members(semantic_model.get_db(), id)
+                && index_key_is_literal_member(index_key)
+            {
+                return Some(());
             }
 
             if is_valid_global_path_table_member(semantic_model, index_expr, &key) {
@@ -612,7 +740,7 @@ fn is_valid_member_inner(
             let db = semantic_model.get_db();
             let field_name = index_key.get_path_part();
             let key = LuaMemberKey::Name(field_name.into());
-            for member in union.into_vec().iter() {
+            for member in union.types() {
                 if member.is_nil() {
                     continue;
                 }
@@ -671,6 +799,12 @@ fn is_valid_member_inner(
         }
     }
 
+    let has_definitely_non_indexable_prefix = matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    )
+        && all_runtime_components_are_non_indexable_primitives(semantic_model.get_db(), prefix_typ);
+
     // Check flow-based semantic info before expensive AST walks like
     // is_nil_safe_expr_context. Many ordinary member hits return above without
     // needing full declaration resolution.
@@ -679,18 +813,25 @@ fn is_valid_member_inner(
         // declaration inference can resolve a non-unknown type from the assignment
         // value and incorrectly suppress legitimate InjectField reports.
         true
+    } else if has_definitely_non_indexable_prefix {
+        true
     } else {
         match semantic_model.get_semantic_info(index_expr.syntax().clone().into()) {
             Some(info) => {
                 let mut need = info.semantic_decl.is_none();
-                if need && code == DiagnosticCode::UndefinedField {
+                if need
+                    && matches!(
+                        code,
+                        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+                    )
+                {
                     // For UndefinedField, if flow analysis resolved the type to a
                     // Signature (func-stat method definitions on Ref-typed variables),
                     // the field is genuinely defined on this variable and no diagnostic
                     // should be reported. This is more targeted than checking for any
                     // non-Unknown type, which would suppress legitimate undefined-field
                     // diagnostics from condition narrowing.
-                    if matches!(info.typ, LuaType::Signature(_)) {
+                    if matches!(info.actual_typ(), Some(LuaType::Signature(_))) {
                         need = false;
                     }
                 }
@@ -713,7 +854,11 @@ fn is_valid_member_inner(
 
     // nil-safe context check (ancestor walk) — only needed when flow analysis
     // didn't already resolve the field above.
-    if matches!(code, DiagnosticCode::UndefinedField) && is_nil_safe_expr_context(index_expr) {
+    if matches!(
+        code,
+        DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
+    ) && is_nil_safe_expr_context(semantic_model, index_expr)
+    {
         if allows_nil_safe_expr_undefined_field_suppression(semantic_model, prefix_typ, &index_key)
         {
             return Some(());
@@ -821,6 +966,75 @@ fn is_valid_member_inner(
     None
 }
 
+fn all_runtime_components_are_non_indexable_primitives(db: &DbIndex, typ: &LuaType) -> bool {
+    let typ = get_real_type(db, typ).unwrap_or(typ);
+    match typ {
+        LuaType::Nil
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::Boolean
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::BooleanConst(_)
+        | LuaType::IntegerConst(_)
+        | LuaType::FloatConst(_)
+        | LuaType::DocFunction(_)
+        | LuaType::Signature(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::DocBooleanConst(_) => true,
+        LuaType::Union(union) => union
+            .types()
+            .all(|typ| all_runtime_components_are_non_indexable_primitives(db, typ)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| all_runtime_components_are_non_indexable_primitives(db, typ)),
+        _ => false,
+    }
+}
+
+fn table_const_is_empty(db: &DbIndex, id: &crate::InFiled<rowan::TextRange>) -> bool {
+    db.get_member_index()
+        .get_member_len(&LuaMemberOwner::Element(id.clone()))
+        == 0
+}
+
+fn table_const_has_only_dynamic_key_members(
+    db: &DbIndex,
+    id: &crate::InFiled<rowan::TextRange>,
+) -> bool {
+    // Literal-key writes fold to `Name`/`Integer` in `LuaMemberKey::from_expr_type`.
+    // An all-`ExprType` owner therefore has a fully dynamic key set, not a closed struct.
+    let owner = LuaMemberOwner::Element(id.clone());
+    let Some(members) = db.get_member_index().get_members(&owner) else {
+        return false;
+    };
+    !members.is_empty()
+        && members
+            .iter()
+            .all(|member| matches!(member.get_key(), LuaMemberKey::ExprType(_)))
+}
+
+fn index_key_is_literal_member(index_key: &LuaIndexKey) -> bool {
+    matches!(
+        index_key,
+        LuaIndexKey::Name(_)
+            | LuaIndexKey::String(_)
+            | LuaIndexKey::Integer(_)
+            | LuaIndexKey::Idx(_)
+    )
+}
+
+fn index_key_is_numeric(semantic_model: &SemanticModel, index_key: &LuaIndexKey) -> bool {
+    match index_key {
+        LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) => true,
+        LuaIndexKey::Expr(expr) => semantic_model
+            .infer_expr(expr.clone())
+            .is_ok_and(|typ| typ.is_integer() || matches!(typ, LuaType::Number | LuaType::Integer)),
+        _ => false,
+    }
+}
+
 fn is_table_const_from_doc_tag(
     semantic_model: &SemanticModel,
     id: &crate::InFiled<rowan::TextRange>,
@@ -842,7 +1056,7 @@ fn check_enum_self_reference(
         && let Some(decl) = semantic_model.get_db().get_type_index().get_type_decl(id)
         && decl.is_enum()
         && key_types.iter().any(|typ| match typ {
-            LuaType::Ref(key_id) | LuaType::Def(key_id) => *id == *key_id,
+            LuaType::Ref(key_id) | LuaType::Def(key_id) => id == key_id,
             _ => false,
         })
     {
@@ -866,7 +1080,7 @@ fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSe
         visited.insert(current_type.clone());
         match &current_type {
             LuaType::Union(union_typ) => {
-                for t in union_typ.into_vec() {
+                for t in union_typ.types() {
                     stack.push(t.clone());
                 }
             }
@@ -900,7 +1114,7 @@ fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> Ha
                 type_set.insert(current_type);
             }
             LuaType::Union(union_typ) => {
-                for t in union_typ.into_vec() {
+                for t in union_typ.types() {
                     stack.push(t.clone());
                 }
             }
@@ -1000,17 +1214,13 @@ fn in_conditional_statement<T: LuaAstNode>(node: &T) -> bool {
     false
 }
 
-fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
-    if in_conditional_statement(node) {
-        return true;
-    }
-
+fn is_nil_safe_expr_context<T: LuaAstNode>(semantic_model: &SemanticModel, node: &T) -> bool {
     for ancestor in node.syntax().ancestors().skip(1) {
         match ancestor.kind().into() {
             LuaSyntaxKind::CallExpr => {
                 if let Some(call_expr) = LuaCallExpr::cast(ancestor.clone()) {
                     let node_range = node.syntax().text_range();
-                    if is_known_member_guard_call_argument(&call_expr, node_range) {
+                    if is_member_guard_call_argument(semantic_model, &call_expr, node_range) {
                         return true;
                     }
 
@@ -1070,10 +1280,16 @@ fn is_nil_safe_expr_context<T: LuaAstNode>(node: &T) -> bool {
         }
     }
 
-    false
+    in_conditional_statement(node)
 }
 
-fn is_known_member_guard_call_argument(
+/// Returns `true` when `node_range` falls inside an argument of `call_expr`
+/// whose resolved callee carries `call_arg("gmod.member_guard", ...)` metadata
+/// on the matching parameter. This replaces the previous hardcoded
+/// member-guard name check so any annotated guard predicate suppresses
+/// undefined-field diagnostics for its member-guard arguments.
+fn is_member_guard_call_argument(
+    semantic_model: &SemanticModel,
     call_expr: &LuaCallExpr,
     node_range: rowan::TextRange,
 ) -> bool {
@@ -1081,20 +1297,66 @@ fn is_known_member_guard_call_argument(
         return false;
     };
 
-    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-        return false;
-    };
-    if name_expr.get_name_text().as_deref() != Some("isfunction") {
-        return false;
-    }
-
     let Some(args_list) = call_expr.get_args_list() else {
         return false;
     };
 
-    args_list
-        .get_args()
-        .any(|arg| arg.get_range().contains_range(node_range))
+    // Find which argument position the node falls in.
+    let mut arg_idx: Option<usize> = None;
+    for (idx, arg) in args_list.get_args().enumerate() {
+        if arg.get_range().contains_range(node_range) {
+            arg_idx = Some(idx);
+            break;
+        }
+    }
+    let Some(arg_idx) = arg_idx else {
+        return false;
+    };
+
+    // Resolve the callee to a signature and check for member_guard metadata
+    // on the matching parameter.
+    let Ok(callee_type) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+
+    callee_type_has_member_guard_param(semantic_model, &callee_type, arg_idx)
+}
+
+fn callee_type_has_member_guard_param(
+    semantic_model: &SemanticModel,
+    typ: &LuaType,
+    arg_idx: usize,
+) -> bool {
+    use crate::{GMOD_DOMAIN_MEMBER_GUARD, find_best_direct_call_arg_role_for_param};
+
+    let db = semantic_model.get_db();
+    match typ {
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = db.get_signature_index().get(signature_id) else {
+                return false;
+            };
+            find_best_direct_call_arg_role_for_param(
+                signature,
+                arg_idx,
+                GMOD_DOMAIN_MEMBER_GUARD,
+                &[],
+            )
+            .is_some()
+        }
+        LuaType::DocFunction(_) => {
+            // DocFunction types cannot carry member-guard call-arg roles in the
+            // current model. Real annotated member guards infer to Signature.
+            false
+        }
+        LuaType::Union(union_type) => union_type
+            .types()
+            .any(|t| callee_type_has_member_guard_param(semantic_model, t, arg_idx)),
+        LuaType::Intersection(intersection_type) => intersection_type
+            .get_types()
+            .iter()
+            .any(|t| callee_type_has_member_guard_param(semantic_model, t, arg_idx)),
+        _ => false,
+    }
 }
 
 fn is_expression_boundary(kind: LuaSyntaxKind) -> bool {
@@ -1146,18 +1408,20 @@ fn allows_nil_safe_expr_undefined_field_suppression(
             index_key,
         ),
         LuaType::Union(union_type) => {
-            let members = union_type.into_vec();
             // Treat `T | nil` as equivalent to `T` for nil-safe context checks:
             // accessing a field on `T?` in an `and`/`or` expression is safe because
             // the surrounding boolean expression guards against the nil case.
-            let non_nil: Vec<_> = members
-                .iter()
-                .filter(|t| !matches!(t, LuaType::Nil))
-                .collect();
-            !non_nil.is_empty()
-                && non_nil.iter().all(|t| {
-                    allows_nil_safe_expr_undefined_field_suppression(semantic_model, t, index_key)
-                })
+            union_type.types().any(|t| !matches!(t, LuaType::Nil))
+                && union_type
+                    .types()
+                    .filter(|t| !matches!(t, LuaType::Nil))
+                    .all(|t| {
+                        allows_nil_safe_expr_undefined_field_suppression(
+                            semantic_model,
+                            t,
+                            index_key,
+                        )
+                    })
         }
         _ => false,
     }
@@ -1589,7 +1853,7 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
             }
         }
         LuaExpr::CallExpr(call) => {
-            // Handle guard calls like IsValid(field), isfunction(field), etc.
+            // Handle predicate guard calls with field arguments.
             if let Some(args) = call.get_args_list() {
                 for arg in args.get_args() {
                     if is_truthy_check_in_condition(&arg, field_text) {
@@ -1604,7 +1868,7 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
 }
 
 /// Check if a condition expression guards a field against nil.
-/// Handles: `field ~= nil`, `field` (truthy), `isfunction(field)`, and compound `and` conditions.
+/// Handles: `field ~= nil`, `field` (truthy), predicate calls, and compound `and` conditions.
 fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
     match condition {
         LuaExpr::BinaryExpr(binary) => {
@@ -1684,7 +1948,7 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
             }
         }
         LuaExpr::CallExpr(call) => {
-            // Handle guard calls like isfunction(obj.field), istable(obj.field), etc.
+            // Handle predicate guard calls with member arguments.
             if let Some(args) = call.get_args_list() {
                 for arg in args.get_args() {
                     if condition_nil_guards_field(&arg, field_text) {
@@ -1851,7 +2115,7 @@ fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
 /// Check if a condition text references a variable name.
 fn condition_references_var(cond_text: &str, var_name: &str) -> bool {
     // Simple text search: the variable appears as a word boundary in the condition
-    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, `IsValid(x)`, etc.
+    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, predicate guards, etc.
     for part in cond_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
         if part == var_name {
             return true;
@@ -1938,8 +2202,7 @@ fn has_dynamic_field_for_type(
         }
         LuaType::TableOf(inner) => has_dynamic_field_for_type(db, index, inner, field_name),
         LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
+            .types()
             .any(|t| has_dynamic_field_for_type(db, index, t, field_name)),
         _ => false,
     }
@@ -1952,51 +2215,4 @@ fn owner_has_named_dynamic_fields(
     index
         .get_fields(owner)
         .is_some_and(|fields| !fields.is_empty())
-}
-
-/// Check if a field exists on any subclass of the given prefix type.
-/// In GMod, entities are commonly passed around as their base type (e.g. Entity)
-/// even though they are actually a specific subclass (e.g. Vehicle, Player).
-fn field_exists_on_subclass(
-    context: &DiagnosticContext,
-    db: &DbIndex,
-    prefix_typ: &LuaType,
-    field_name: &SmolStr,
-) -> bool {
-    if !db.get_emmyrc().gmod.enabled {
-        return false;
-    }
-
-    let type_id = match prefix_typ {
-        LuaType::Ref(id) | LuaType::Def(id) => id,
-        LuaType::TableOf(inner) => return field_exists_on_subclass(context, db, inner, field_name),
-        LuaType::Union(union) => {
-            return union
-                .into_vec()
-                .iter()
-                .any(|t| field_exists_on_subclass(context, db, t, field_name));
-        }
-        _ => return false,
-    };
-
-    if let Some(shared_data) = context.get_shared_data_arc() {
-        return shared_data
-            .subclass_fields
-            .get(type_id)
-            .is_some_and(|fields| fields.contains(field_name));
-    }
-
-    let sub_types = db.get_type_index().get_all_sub_types(type_id);
-    let key = LuaMemberKey::Name(field_name.clone());
-    for sub_decl in sub_types {
-        let owner = LuaMemberOwner::Type(sub_decl.get_id());
-        if db
-            .get_member_index()
-            .get_member_item(&owner, &key)
-            .is_some()
-        {
-            return true;
-        }
-    }
-    false
 }

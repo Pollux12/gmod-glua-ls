@@ -1,13 +1,14 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaLocalName, LuaNameExpr};
+    use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaLocalName, LuaNameExpr};
     use googletest::prelude::*;
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     use crate::{
         DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, GlobalId, GmodClassCallLiteral,
-        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
+        VirtualWorkspace,
     };
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
@@ -39,7 +40,7 @@ mod test {
                 LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -128,7 +129,7 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
     }
 
@@ -295,7 +296,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -340,7 +344,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -362,7 +369,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("plugins/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -426,11 +436,178 @@ mod test {
     }
 
     #[gtest]
+    fn test_schema_scope_binds_aliases_to_global_singleton() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/example_framework/modules/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            function Schema:PlayerSpawn(client) end
+            "#,
+        );
+        let class_id = LuaTypeDeclId::global("SCHEMA");
+
+        let db = ws.get_db_mut();
+        let scope_info = db
+            .get_gmod_infer_index()
+            .get_scoped_class_info(&file_id)
+            .expect("expected schema scope info");
+        assert_eq!(scope_info.class_name, "SCHEMA");
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .expect("expected schema declaration tree");
+        for global_name in ["SCHEMA", "Schema"] {
+            let decl = decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == global_name && decl.is_global())
+                .unwrap_or_else(|| panic!("expected synthetic {global_name} declaration"));
+            let type_cache = db
+                .get_type_index()
+                .get_type_cache(&decl.get_id().into())
+                .unwrap_or_else(|| panic!("expected {global_name} type cache"));
+            assert_eq!(type_cache.as_type(), &LuaType::Def(class_id.clone()));
+        }
+
+        let class_decl = db
+            .get_type_index()
+            .get_type_decl(&class_id)
+            .expect("expected inferred schema singleton class declaration");
+        assert!(class_decl.is_class());
+        let super_types = db
+            .get_type_index()
+            .get_super_types(&class_id)
+            .expect("expected schema singleton super types");
+        assert!(
+            super_types
+                .iter()
+                .any(|typ| typ == &LuaType::Ref(LuaTypeDeclId::global("GM")))
+        );
+    }
+
+    #[gtest]
+    fn test_player_class_scope_binds_player_decl_to_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        // Use the DEFAULT scopes (which include the player_classes definition).
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // The PlayerClass authoring annotation (mirrors custom/class.PlayerClass.lua).
+        // Note the authoring class is named `PlayerClass`, not `PLAYER`, because
+        // `PLAYER` is already a GMod enum alias (PLAYER_IDLE, ...).
+        ws.def_file(
+            "annotations/player.lua",
+            r#"
+            ---@meta
+            ---@class Player
+            local Player = {}
+            function Player:GiveAmmo(amount, name) end
+
+            ---@class PlayerClass
+            ---@field Player Player
+            PlayerClass = {}
+        "#,
+        );
+
+        // The base player class — also authors `local PLAYER` and registers it,
+        // reproducing the real two-file scenario (base + sandbox).
+        ws.def_file(
+            "garrysmod/gamemodes/base/gamemode/player_class/player_default.lua",
+            r#"
+            local PLAYER = {}
+            PLAYER.WalkSpeed = 400
+
+            function PLAYER:SetupDataTables()
+            end
+
+            function PLAYER:Loadout()
+                self.Player:GiveAmmo(1, "Pistol")
+            end
+
+            player_manager.RegisterClass("player_default", PLAYER, nil)
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/gamemodes/sandbox/gamemode/player_class/player_sandbox.lua",
+            r#"
+            DEFINE_BASECLASS("player_default")
+            local PLAYER = {}
+
+            function PLAYER:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+            end
+
+            function PLAYER:Loadout()
+                self.Player:GiveAmmo(1, "Pistol")
+            end
+
+            player_manager.RegisterClass("player_sandbox", PLAYER, "player_default")
+        "#,
+        );
+
+        let player_decl_id = {
+            let db = ws.get_db_mut();
+            let decl_tree = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .expect("expected decl tree");
+            decl_tree
+                .get_decls()
+                .values()
+                .find(|decl| decl.get_name() == "PLAYER" && decl.is_local())
+                .expect("expected local PLAYER declaration")
+                .get_id()
+        };
+
+        let db = ws.get_db_mut();
+        let type_cache = db
+            .get_type_index()
+            .get_type_cache(&player_decl_id.into())
+            .expect("expected PLAYER declaration type cache");
+        assert_eq!(
+            type_cache.as_type(),
+            &LuaType::Def(LuaTypeDeclId::global("player_sandbox"))
+        );
+
+        let player_class_id = LuaTypeDeclId::global("player_sandbox");
+        let super_types = db
+            .get_type_index()
+            .get_super_types(&player_class_id)
+            .expect("expected inferred player class super types");
+        assert!(
+            super_types
+                .iter()
+                .any(|ty| ty == &LuaType::Ref(LuaTypeDeclId::global("PlayerClass"))),
+            "player_sandbox should inherit the PlayerClass authoring class, got {super_types:?}"
+        );
+
+        // `self.Player` inside a PLAYER method must resolve to the Player class
+        // (inherited via the PLAYER authoring class).
+        let self_player_ty = index_expr_type(&mut ws, file_id, "self.Player");
+        assert_eq!(
+            self_player_ty,
+            LuaType::Ref(LuaTypeDeclId::global("Player")),
+            "self.Player should resolve to Player, got {self_player_ty:?}"
+        );
+    }
+
+    #[gtest]
     fn test_plugin_scope_binds_plugin_decl_with_self_reference_initializer() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("plugins/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("plugins/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -481,7 +658,7 @@ mod test {
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info for local PLUGIN name");
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("vehicles"))
         );
     }
@@ -491,7 +668,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -532,7 +712,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -556,7 +739,7 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("vehicles_money"))
         );
     }
@@ -566,7 +749,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -619,7 +805,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -654,7 +843,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -694,7 +886,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -733,7 +928,7 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_inventory"))
         );
     }
@@ -743,7 +938,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -778,9 +976,76 @@ mod test {
             .expect("expected semantic info for self");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_inventory"))
         );
+    }
+
+    fn define_scripted_override_parent_signatures(ws: &mut VirtualWorkspace, multiple: bool) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        let parent = if multiple {
+            r#"
+                ---@meta
+                ---@class Entity
+                local Entity = {}
+                ---@class ENTITY: Entity
+                ENTITY = Entity
+                ---@class ENT: ENTITY
+
+                ---@param value_arg Entity
+                function Entity:Use(value_arg) end
+
+                ---@param value_arg string
+                function Entity:Use(value_arg) end
+            "#
+        } else {
+            r#"
+                ---@meta
+                ---@class Entity
+                local Entity = {}
+                ---@class ENTITY: Entity
+                ENTITY = Entity
+                ---@class ENT: ENTITY
+
+                ---@param value_arg Entity
+                function Entity:Use(value_arg) end
+            "#
+        };
+
+        ws.def_files(vec![
+            ("annotations/entity.lua", parent),
+            (
+                "entities/entities/test_override/shared.lua",
+                r#"
+                    function ENT:Use(value_arg)
+                        inherited_value = value_arg
+                    end
+                "#,
+            ),
+        ]);
+    }
+
+    #[gtest]
+    fn test_scripted_override_inherits_single_parent_signature() {
+        let mut ws = VirtualWorkspace::new();
+        define_scripted_override_parent_signatures(&mut ws, false);
+
+        assert_eq!(ws.expr_ty("inherited_value"), ws.ty("Entity"));
+    }
+
+    #[gtest]
+    fn test_scripted_override_inherits_multiple_parent_signatures() {
+        let mut ws = VirtualWorkspace::new();
+        define_scripted_override_parent_signatures(&mut ws, true);
+
+        assert_eq!(ws.expr_ty("inherited_value"), ws.ty("Entity"));
     }
 
     #[gtest]
@@ -788,7 +1053,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -849,7 +1117,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -881,11 +1152,70 @@ mod test {
     }
 
     #[gtest]
+    fn test_accessor_func_forced_setter_accepts_uncoerced_inputs() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::AssignTypeMismatch);
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+
+        let file_id = ws.def_file(
+            "lua/entities/accessor_input/init.lua",
+            r#"
+            AccessorFunc(ENT, "m_bChecked", "Checked", FORCE_BOOL)
+
+            function ENT:SetValue(val)
+                if (tonumber(val) == 0) then val = 0 end
+                val = tobool(val)
+
+                self:SetChecked(val)
+
+                if (val) then val = "1" else val = "0" end
+                self:SetChecked("1")
+                self:SetChecked(0)
+            end
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let assign_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::AssignTypeMismatch.get_name().to_string(),
+        ));
+        let param_type_mismatch_code = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let mismatch_diags = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == assign_type_mismatch_code
+                    || diagnostic.code == param_type_mismatch_code
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatch_diags.is_empty(),
+            "AccessorFunc forced setters should accept raw values before coercion: {mismatch_diags:?}"
+        );
+    }
+
+    #[gtest]
     fn test_network_var_synthesizes_get_set_members() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -943,7 +1273,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1004,7 +1337,7 @@ mod test {
             .expect("expected semantic info for BaseClass");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("base_glide")),
             "expected BaseClass to resolve to base_glide"
         );
@@ -1030,7 +1363,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedGlobal);
@@ -1072,7 +1408,7 @@ mod test {
             .expect("expected semantic info for BaseClass");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("base_panel")),
             "expected BaseClass to resolve to base_panel"
         );
@@ -1313,7 +1649,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1353,7 +1692,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1399,7 +1741,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1435,7 +1780,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1557,7 +1905,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -1603,29 +1954,190 @@ mod test {
             .expect("expected semantic info for ENT");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("cityrp_money"))
         );
     }
 
     #[gtest]
-    fn test_ent_base_known_gmod_base_maps_to_ent_super_type() {
+    fn test_ent_base_known_gmod_bases_preserve_named_super_type() {
+        for (class_name, base_name) in [
+            ("mapped_anim", "base_anim"),
+            ("mapped_brush", "base_brush"),
+            ("mapped_filter", "base_filter"),
+            ("mapped_gmodentity", "base_gmodentity"),
+            ("mapped_nextbot", "base_nextbot"),
+            ("mapped_point", "base_point"),
+        ] {
+            let mut ws = VirtualWorkspace::new();
+            let mut emmyrc = Emmyrc::default();
+            emmyrc.gmod.enabled = true;
+            emmyrc
+                .gmod
+                .scripted_class_scopes
+                .set_include(vec![legacy_scope("entities/**")]);
+            ws.update_emmyrc(emmyrc);
+            ws.def_gmod_call_arg_builtins();
+
+            ws.def_file(
+                &format!("lua/entities/{class_name}/shared.lua"),
+                &format!(r#"ENT.Base = "{base_name}""#),
+            );
+
+            let db = ws.get_db_mut();
+            let class_id = LuaTypeDeclId::global(class_name);
+            let super_types: Vec<_> = db
+                .get_type_index()
+                .get_super_types_iter(&class_id)
+                .map(|iter| iter.cloned().collect())
+                .unwrap_or_default();
+
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("ENT"))),
+                "expected ENT super type for {class_name}, got {super_types:?}"
+            );
+            assert!(
+                super_types.contains(&LuaType::Ref(LuaTypeDeclId::global(base_name))),
+                "expected named {base_name} super type for {class_name}, got {super_types:?}"
+            );
+        }
+    }
+
+    /// Verifies that `ENT.Type = "nextbot"` injects `NextBot` as a super-type
+    /// on the synthesized entity class. This mirrors C++ metatable injection
+    /// where `NextBot` methods (StartActivity, loco, etc.) become available on
+    /// entities with `Type = "nextbot"`.
+    #[gtest]
+    fn test_ent_type_nextbot_injects_nextbot_super_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        // Legacy assignment form (ENT.Type = "nextbot")
+        ws.def_file(
+            "lua/entities/base_nextbot/shared.lua",
+            r#"
+            ENT.Base = "base_entity"
+            ENT.Type = "nextbot"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("base_nextbot");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "expected NextBot super type for base_nextbot (legacy ENT.Type assignment), got {super_types:?}"
+        );
+    }
+
+    /// Verifies that `ENT.Type = "nextbot"` in a `scripted_ents.Register` table
+    /// literal also injects `NextBot` as a super-type. Uses a non-scoped path so
+    /// the `scripted_ents.Register` synthesis path runs (scoped `ENT` tables
+    /// are handled by `synthesize_scoped_base_assignments_with`).
+    #[gtest]
+    fn test_ent_type_nextbot_in_register_table_injects_nextbot_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
         ws.def_file(
-            "lua/entities/mapped_ent/shared.lua",
+            "lua/my_nextbot_init.lua",
             r#"
-            ENT.Base = "base_gmodentity"
+            local ENT = {
+                Base = "base_entity",
+                Type = "nextbot",
+            }
+
+            scripted_ents.Register(ENT, "my_nextbot")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("my_nextbot");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "expected NextBot super type for my_nextbot (scripted_ents.Register table), got {super_types:?}"
+        );
+    }
+
+    /// Verifies that `SWEP.Type = "nextbot"` does NOT inject `NextBot` as a
+    /// super-type. The `Type` field on non-entity scripted classes has
+    /// different semantics and should not trigger entity framework injection.
+    #[gtest]
+    fn test_sweapon_type_nextbot_does_not_inject_nextbot_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("weapons/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/weapons/my_sweapon/shared.lua",
+            r#"
+            SWEP.Type = "nextbot"
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let class_id = LuaTypeDeclId::global("my_sweapon");
+        let super_types: Vec<_> = db
+            .get_type_index()
+            .get_super_types_iter(&class_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+
+        assert!(
+            !super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("NextBot"))),
+            "NextBot should NOT be a super-type for SWEP.Type='nextbot', got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_ent_base_ai_preserves_named_super_type() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/entities/mapped_npc/shared.lua",
+            r#"
+            ENT.Base = "base_ai"
         "#,
         );
 
         let db = ws.get_db_mut();
-        let class_id = LuaTypeDeclId::global("mapped_ent");
+        let class_id = LuaTypeDeclId::global("mapped_npc");
         let super_types: Vec<_> = db
             .get_type_index()
             .get_super_types_iter(&class_id)
@@ -1637,9 +2149,207 @@ mod test {
             "expected ENT super type, got {super_types:?}"
         );
         assert!(
-            !super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_gmodentity"))),
-            "base_gmodentity should map to ENT super type"
+            super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("base_ai"))),
+            "expected named base_ai super type, got {super_types:?}"
         );
+    }
+
+    #[gtest]
+    fn test_named_gmod_entity_bases_provide_base_specific_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "annotations/custom_classes.lua",
+                r#"
+                ---@class Entity
+                ---@class NPC : Entity
+
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+
+                ---@param ply? Player|NULL
+                function base_gmodentity:SetPlayer(ply) end
+                ---@return Player|NULL
+                function base_gmodentity:GetPlayer() end
+
+                ---@class base_ai : NPC
+                local base_ai = {}
+
+                ---@return number
+                function base_ai:GetNPCClass() end
+                ---@param class number
+                function base_ai:SetNPCClass(class) end
+            "#,
+            ),
+            (
+                "lua/entities/mapped_ent/shared.lua",
+                r#"
+                ENT.Base = "base_gmodentity"
+
+                function ENT:Initialize()
+                    self:SetPlayer(nil)
+                    local ply = self:GetPlayer()
+                end
+            "#,
+            ),
+            (
+                "lua/entities/mapped_npc/shared.lua",
+                r#"
+                ENT.Base = "base_ai"
+
+                function ENT:Initialize()
+                    local class = self:GetNPCClass()
+                    self:SetNPCClass(class)
+                end
+            "#,
+            ),
+        ]);
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        for file_id in file_ids.into_iter().skip(1) {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let undefined_fields: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diagnostic| diagnostic.code == undefined_field_code)
+                .collect();
+            assert!(
+                undefined_fields.is_empty(),
+                "unexpected undefined-field diagnostics: {undefined_fields:?}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_scripted_entity_self_baseclass_calls_are_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/tot_smokenade/cl_init.lua",
+            r#"
+            ---@class Entity
+            ---@class base_anim : Entity
+            local base_anim = {}
+
+            function base_anim:Draw(flags) end
+            function base_anim:DrawTranslucent(flags) end
+
+            ENT.Base = "base_anim"
+
+            function ENT:Draw(flags)
+                self.BaseClass.Draw(self, flags)
+            end
+
+            function ENT:DrawTranslucent(flags)
+                self.BaseClass.DrawTranslucent(self, flags)
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let false_positive_codes = [DiagnosticCode::UndefinedField, DiagnosticCode::NeedCheckNil]
+            .map(|code| Some(NumberOrString::String(code.get_name().to_string())));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diag| !false_positive_codes.contains(&diag.code)),
+            "unexpected self.BaseClass diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_self_baseclass_members_resolve_in_gm_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "garrysmod/gamemodes/base/gamemode/cl_init.lua",
+                r#"
+                ---@class GM
+                function GM:Initialize() end
+                function GM:HUDShouldDraw(name) return true end
+                function GM:UpdateAnimation(ply, vel, maxseqgroundspeed) end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/cl_init.lua",
+                r#"
+                DEFINE_BASECLASS("gamemode_base")
+
+                function GM:Initialize()
+                    self.BaseClass:Initialize()
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/cl_hud.lua",
+                r#"
+                function GM:HUDShouldDraw(name)
+                    return self.BaseClass.HUDShouldDraw(self, name)
+                end
+                "#,
+            ),
+            (
+                "gamemodes/terrortown/gamemode/player_ext_shd.lua",
+                r#"
+                function GM:UpdateAnimation(ply, vel, maxseqgroundspeed)
+                    return self.BaseClass.UpdateAnimation(self, ply, vel, maxseqgroundspeed)
+                end
+                "#,
+            ),
+        ]);
+
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        for file_id in file_ids.into_iter().skip(1) {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            let undefined_fields: Vec<_> = diagnostics
+                .into_iter()
+                .filter(|diag| diag.code == undefined_field_code)
+                .collect();
+            assert!(
+                undefined_fields.is_empty(),
+                "unexpected gamemode BaseClass undefined-field diagnostics: {undefined_fields:?}"
+            );
+        }
     }
 
     #[gtest]
@@ -1647,7 +2357,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::TypeNotFound);
@@ -1967,6 +2680,123 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_accessor_func_with_annotation_is_visible_cross_file() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+            ---@accessorfunc 3
+            ---@param tab table
+            ---@param key any
+            ---@param name string
+            function _G.AccessorFunc(tab, key, name, force) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+        "#,
+        );
+
+        ws.def_file(
+            "library/terrortown/gamemode/vgui/coloredbox.lua",
+            r#"
+            local PANEL = {}
+            AccessorFunc(PANEL, "m_bBorder", "Border")
+            AccessorFunc(PANEL, "m_Color", "Color")
+
+            function PANEL:Init()
+                self:SetBorder(true)
+                self:SetColor(Color(0, 255, 0, 255))
+            end
+
+            derma.DefineControl("ColoredBox", "", PANEL, "DPanel")
+        "#,
+        );
+
+        let usage_file_id = ws.def_file(
+            "gamemodes/terrortown/entities/entities/ttt_c4/cl_init.lua",
+            r#"
+            local box = vgui.Create("ColoredBox")
+            box:SetColor(Color(50, 50, 50))
+        "#,
+        );
+
+        let prefix_type = index_expr_prefix_type(&mut ws, usage_file_id, "box:SetColor");
+        let mut base_type = &prefix_type;
+        while let LuaType::Instance(instance) = base_type {
+            base_type = instance.get_base();
+        }
+        assert_eq!(
+            base_type,
+            &LuaType::Ref(LuaTypeDeclId::global("ColoredBox"))
+        );
+
+        let colored_box_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("ColoredBox"));
+        let db = ws.analysis.compilation.get_db();
+        let colored_box_members = db
+            .get_member_index()
+            .get_members(&colored_box_owner)
+            .expect("expected members on ColoredBox");
+        let member_names = colored_box_members
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(ToString::to_string))
+            .collect::<Vec<_>>();
+        assert_that!(
+            member_names,
+            contains_each![
+                "m_bBorder",
+                "GetBorder",
+                "SetBorder",
+                "m_Color",
+                "GetColor",
+                "SetColor"
+            ]
+        );
+        assert!(!member_names.iter().any(|name| name == "Getm_Color"));
+        assert!(!member_names.iter().any(|name| name == "Setm_Color"));
+
+        let set_color = colored_box_members
+            .iter()
+            .find(|member| {
+                member
+                    .get_key()
+                    .get_name()
+                    .is_some_and(|name| name == "SetColor")
+            })
+            .map(|member| member.get_id())
+            .expect("expected AccessorFunc to synthesize ColoredBox:SetColor");
+        assert_eq!(
+            db.get_member_index().get_current_owner(&set_color),
+            Some(&colored_box_owner)
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(usage_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == undefined_method_code)
+                .collect::<Vec<_>>(),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_vgui_register_reassigned_local_panel_stress_three_panels() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -2171,6 +3001,92 @@ mod test {
     }
 
     #[gtest]
+    fn test_vgui_registration_name_resolves_constant_table_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/vgui/constant_registration_name.lua",
+            r#"
+            ---@class DPanel
+            ---@field Dock fun(self: DPanel, dock: integer)
+
+            local TabHandler = {
+                ControlName = "ConstantFieldPanel",
+                DermaName = "ConstantFieldControl"
+            }
+            local PANEL = {}
+            function PANEL:Init()
+                self:Dock(1)
+            end
+            vgui.Register(TabHandler.ControlName, PANEL, "DPanel")
+
+            local CONTROL = {}
+            function CONTROL:Init()
+                self:Dock(2)
+            end
+            derma.DefineControl(TabHandler.DermaName, "", CONTROL, "DPanel")
+
+            local Mutable = {
+                ControlName = "MutableFieldPanel"
+            }
+            Mutable.ControlName = get_runtime_name()
+            vgui.Register(Mutable.ControlName, {}, "DPanel")
+
+            local NonString = {
+                ControlName = 42
+            }
+            vgui.Register(NonString.ControlName, {}, "DPanel")
+
+            local Unresolved = {}
+            vgui.Register(Unresolved.ControlName, {}, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert_that!(
+            diagnostics
+                .iter()
+                .filter(|diagnostic| diagnostic.code == undefined_method_code)
+                .collect::<Vec<_>>(),
+            is_empty()
+        );
+
+        let type_index = ws.get_db_mut().get_type_index();
+        assert!(
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global("ConstantFieldPanel"))
+                .is_some(),
+            "constant table field should supply the VGUI registration name"
+        );
+        assert!(
+            type_index
+                .get_type_decl(&LuaTypeDeclId::global("ConstantFieldControl"))
+                .is_some(),
+            "constant table field should supply the Derma control name"
+        );
+        for unsupported_name in ["MutableFieldPanel", "42"] {
+            assert!(
+                type_index
+                    .get_type_decl(&LuaTypeDeclId::global(unsupported_name))
+                    .is_none(),
+                "unsafe registration name {unsupported_name:?} should not be synthesized"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_vgui_register_panel_local_name_resolves_to_correct_panel_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -2245,7 +3161,7 @@ mod test {
 
                 let semantic_info =
                     semantic_model.get_semantic_info(token.syntax().clone().into())?;
-                Some((token.get_position(), semantic_info.typ))
+                Some((token.get_position(), semantic_info.display_typ().clone()))
             })
             .collect::<Vec<_>>();
         panel_local_types.sort_by_key(|(position, _)| *position);
@@ -2257,6 +3173,1293 @@ mod test {
         );
         assert_eq!(panel_local_types[0].1, LuaType::Def(first_class_id));
         assert_eq!(panel_local_types[1].1, LuaType::Def(second_class_id));
+    }
+
+    #[gtest]
+    fn test_vgui_register_table_self_uses_base_panel_type_for_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_panel.lua",
+            r#"
+            ---@class Panel
+            ---@field SetTitle fun(self: Panel, title: string)
+            ---@class DFrame: Panel
+
+            vgui = {}
+
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param className string
+            ---@param parent Panel?
+            ---@return Panel
+            function vgui.Create(className, parent) end
+
+            local PANEL = {}
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+                self.child = vgui.Create("Panel", self)
+            end
+
+            local panelType = vgui.RegisterTable(PANEL, "DFrame")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.RegisterTable should infer PANEL self as a DFrame/Panel-compatible type, got {diagnostics:?}"
+        );
+    }
+
+    /// Regression test for the **reassigned local** registration form:
+    ///
+    /// ```text
+    /// local PANEL = { Init = function(self) ... end }
+    /// PANEL = vgui.RegisterTable(PANEL, "DPanel")
+    /// ```
+    ///
+    /// Before the fix, `find_latest_decl_write_before_position` returned the
+    /// reassignment position (the second `PANEL =`), whose RHS is a `CallExpr`
+    /// (`vgui.RegisterTable(...)`). `value_expr_as_table` could not unwrap a
+    /// `CallExpr`, so the table literal at the original `local PANEL = {...}`
+    /// declaration was never bound to the synthesized panel class. `self` then
+    /// resolved to `Unknown`, `self.Field` to `FieldNotFound`, and the nil
+    /// checker mapped that to `Nil` → false-positive `unchecked-nil-access`.
+    ///
+    /// This pattern is used by the shipped `cl_scoreboard.lua` and many addons.
+    #[gtest]
+    fn test_vgui_register_table_reassigned_local_binds_table_literal() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_reassigned.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let need_check_nil = Some(NumberOrString::String(
+            DiagnosticCode::NeedCheckNil.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != unchecked_nil_access
+                    && diagnostic.code != need_check_nil),
+            "reassigned-local RegisterTable should bind the table literal so self resolves to the synthesized panel class; got false-positive nil diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Verifies that `find_registered_table_expr` does NOT fall back to the
+    /// original local initializer when the latest write is an unrelated
+    /// reassignment (not the registration call). This is a regression guard
+    /// for the narrowed fallback in `find_registered_table_expr`: only when
+    /// the registration call IS the reassignment RHS (e.g.
+    /// `PANEL = vgui.RegisterTable(PANEL, ...)`) should the original local
+    /// initializer be used. An unrelated `PANEL = MakePanel()` should NOT
+    /// trigger the fallback.
+    #[gtest]
+    fn test_vgui_register_table_unrelated_reassignment_does_not_bind_stale_initializer() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        // Case 1: Valid self-assignment registration — PANEL = vgui.RegisterTable(PANEL, ...)
+        // This SHOULD bind the table literal and NOT produce nil diagnostics.
+        let valid_file_id = ws.def_file(
+            "lua/vgui/register_table_self_assign.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let valid_diagnostics = ws
+            .analysis
+            .diagnose_file(valid_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+        ];
+        assert!(
+            valid_diagnostics
+                .iter()
+                .all(|d| !nil_codes.contains(&d.code)),
+            "self-assignment RegisterTable should bind the table literal; got nil diagnostics: {valid_diagnostics:?}"
+        );
+
+        // Case 2: Unrelated reassignment — PANEL = MakePanel(), then separate vgui.RegisterTable(PANEL, ...)
+        // The stale initializer should NOT be used, so the `Init` function's
+        // `self.Btn` access should produce diagnostics (since self resolves to
+        // Unknown instead of the synthesized panel class).
+        let _unrelated_file_id = ws.def_file(
+            "lua/vgui/register_table_unrelated_reassign.lua",
+            r#"
+            local function MakePanel() return {} end
+
+            local PANEL2 = {
+                Init = function(self)
+                    self.Btn2 = self:Add("DButton")
+                    self.Btn2:Dock(1)
+                end,
+            }
+
+            PANEL2 = MakePanel()
+
+            vgui.RegisterTable(PANEL2, "DPanel")
+            "#,
+        );
+
+        let unrelated_diagnostics = ws
+            .analysis
+            .diagnose_file(_unrelated_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        // With the narrowed fallback, the stale initializer is NOT bound, so
+        // `self.Btn2` should produce `unchecked-nil-access` because `self`
+        // resolves to Unknown (no table expr found).
+        let has_nil_diag = unrelated_diagnostics
+            .iter()
+            .any(|d| nil_codes.contains(&d.code));
+        assert!(
+            has_nil_diag,
+            "unrelated reassignment should NOT bind the stale initializer; expected nil diagnostics on self.Btn2, got: {unrelated_diagnostics:?}"
+        );
+    }
+
+    /// Regression test for `vgui.CreateFromTable` using the `register_table`
+    /// call_arg kind, which caused the analyzer to synthesize a SECOND panel
+    /// class at every `CreateFromTable(panelVar, ...)` call site. This second
+    /// synthesis overwrote the original `RegisterTable` binding, producing
+    /// false-positive `undefined-field` / `unchecked-nil-access` on the original
+    /// panel's `self.Field` accesses.
+    ///
+    /// The pattern that triggered this (from `cl_scoreboard.lua`):
+    ///
+    /// ```text
+    /// local PANEL_A = { Init = function(self) self.Btn = self:Add("DButton") end }
+    /// PANEL_A = vgui.RegisterTable(PANEL_A, "DPanel")
+    ///
+    /// local PANEL_B = {
+    ///     Think = function(self)
+    ///         vgui.CreateFromTable(PANEL_A, ...)  -- triggered re-registration
+    ///     end,
+    /// }
+    /// ```
+    #[gtest]
+    fn test_vgui_create_from_table_does_not_re_register_panel_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/create_from_table_no_reregister.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            ---@generic T : table
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param metatable T
+            ---@param parent? Panel
+            ---@return Panel
+            function vgui.CreateFromTable(metatable, parent) end
+
+            local PANEL_A = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            PANEL_A = vgui.RegisterTable(PANEL_A, "DPanel")
+
+            local PANEL_B = {
+                Think = function(self)
+                    local inst = vgui.CreateFromTable(PANEL_A)
+                    inst:Dock(1)
+                end,
+            }
+
+            PANEL_B = vgui.RegisterTable(PANEL_B, "DPanel")
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let unchecked_nil_access = Some(NumberOrString::String(
+            DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != unchecked_nil_access
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should not re-register PANEL_A; got false-positive diagnostics: {diagnostics:?}"
+        );
+    }
+
+    /// Regression for Oracle Blocker 3: `CreateFromTable` appearing BEFORE
+    /// `RegisterTable` for the same table must NOT prevent the real
+    /// `RegisterTable` from synthesizing the panel class. Only actual
+    /// `RegisterTable` calls should populate the dedup set.
+    #[gtest]
+    fn test_vgui_create_from_table_before_register_table_does_not_block_registration() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/vgui/create_before_register.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable Panel
+            ---@param parent? Panel
+            ---@return Panel
+            function vgui.CreateFromTable(panelTable, parent) end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            -- CreateFromTable appears BEFORE RegisterTable.
+            -- The CreateFromTable call should NOT insert the decl_id into
+            -- the dedup set, so the later RegisterTable can still synthesize
+            -- the panel class.
+            vgui.CreateFromTable(PANEL)
+            PANEL = vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::UndefinedField.get_name().to_string(),
+            )),
+        ];
+        // The RegisterTable call should still synthesize the panel class,
+        // so `self.Btn` inside Init should NOT produce nil/undefined diagnostics.
+        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
+        assert!(
+            !has_nil_diag,
+            "CreateFromTable before RegisterTable should NOT block the real registration; got false-positive diagnostics: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_table_reused_local_panel_registers_later_region() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_reused_local.lua",
+            r#"
+            local PANEL = {}
+            function PANEL:Alpha() end
+            PANEL = vgui.RegisterTable(PANEL, "DFrame")
+
+            PANEL = {}
+            function PANEL:Beta() end
+            PANEL = vgui.RegisterTable(PANEL, "EditablePanel")
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        let mut resolved_classes: Vec<_> = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter_map(|name_expr| {
+                let token = name_expr.get_name_token()?;
+                if token.get_name_text() != "PANEL" {
+                    return None;
+                }
+                let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
+                match info.display_typ() {
+                    LuaType::Def(id) => {
+                        Some((name_expr.get_position(), id.get_simple_name().to_string()))
+                    }
+                    _ => None,
+                }
+            })
+            .collect();
+        resolved_classes.sort_by_key(|(position, _)| *position);
+
+        let class_names: std::collections::HashSet<&str> = resolved_classes
+            .iter()
+            .map(|(_, name)| name.as_str())
+            .collect();
+
+        assert!(
+            class_names.len() >= 2,
+            "expected reused local PANEL regions to resolve to distinct RegisterTable classes, got {resolved_classes:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_uses_panel_base_field_for_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_panel.lua",
+            r#"
+            ---@class Panel
+            ---@field SetTitle fun(self: Panel, title: string)
+            ---@class DFrame: Panel
+
+            vgui = {}
+
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param className string
+            ---@param parent Panel?
+            ---@return Panel
+            function vgui.Create(className, parent) end
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+                self.child = vgui.Create("Panel", self)
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should infer PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_resolves_base_field_from_enclosing_scope() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::ParamTypeMismatch);
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/editablepanel.lua",
+            r#"
+            ---@meta
+
+            ---@class (partial) EditablePanel: Panel
+            local EditablePanel = {}
+        "#,
+        );
+        ws.def_file(
+            "annotations/dframe.lua",
+            r#"
+            ---@meta
+
+            ---@class DFrame: EditablePanel
+            local DFrame = {}
+
+            ---@param title string
+            function DFrame:SetTitle(title) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/html.lua",
+            r#"
+            ---@meta
+
+            ---@class (partial) HTML: Panel
+            HTML = {}
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_generic_create_parent.lua",
+            r#"
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@param parent Panel?
+            ---@return (instance) T
+            function vgui.Create(classname, parent) end
+
+            ---@type DFrame
+            local frame
+            frame:SetTitle("Title")
+
+            local PANEL_Browser = {}
+            PANEL_Browser.Base = "DFrame"
+
+            function PANEL_Browser:Init()
+                self.HTML = vgui.Create("HTML", self)
+                self:SetTitle("Title")
+            end
+
+            function OpenBrowser()
+                vgui.CreateFromTable(PANEL_Browser)
+            end
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self.Label = vgui.Create("HTML", self)
+                self:Remove()
+            end
+
+            function OpenPanel()
+                vgui.CreateFromTable(PANEL)
+            end
+        "#,
+        );
+
+        {
+            let db = ws.get_db_mut();
+            let metadata = db
+                .get_gmod_class_metadata_index()
+                .get_file_metadata(&file_id)
+                .expect("expected gmod metadata for CreateFromTable test file");
+            assert_eq!(
+                metadata.vgui_register_table_calls.len(),
+                2,
+                "expected two CreateFromTable calls"
+            );
+            for call in &metadata.vgui_register_table_calls {
+                let base_source = call
+                    .vgui_panel_base_arg_source(None)
+                    .expect("CreateFromTable metadata should use PANEL.Base as base source");
+                assert!(
+                    matches!(
+                        call.value_for_arg_source(&base_source),
+                        Some(GmodClassCallLiteral::String(name)) if name == "DFrame"
+                    ),
+                    "CreateFromTable should extract DFrame from PANEL.Base, got call metadata {call:?}"
+                );
+            }
+        }
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let param_type_mismatch = Some(NumberOrString::String(
+            DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+        ));
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != param_type_mismatch
+                    && diagnostic.code != undefined_field),
+            "vgui.CreateFromTable should infer self as Panel-compatible for vgui.Create parent, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_focus_register_file_defaults_loaded_panel_base_to_panel() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/dpanel.lua",
+            r#"
+            ---@meta
+            ---@class DPanel: Panel
+            local DPanel = {}
+
+            function DPanel:OnlyDPanelMethod() end
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            function PANEL:Init()
+                self:Remove()
+                self:OnlyDPanelMethod()
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            vgui = vgui or {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+
+            vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Remove");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("Panel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile without PANEL.Base should use Panel, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `OnlyDPanelMethod`. "]);
+    }
+
+    #[gtest]
+    fn vgui_register_file_return_preserves_loaded_panel_methods_for_create_from_table() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+        "#,
+        );
+        ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentsearch.lua",
+            r#"
+            PANEL.Base = "Panel"
+
+            function PANEL:SetSearchType(stype, hook_name) end
+        "#,
+        );
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/gamemode/spawnmenu/creationmenu/content/contentsidebar.lua",
+            r#"
+            ---@generic T: table
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            ---@return T
+            function vgui.RegisterFile(file) end
+
+            local pnlSearch = vgui.RegisterFile("contentsearch.lua")
+            local PANEL = {}
+
+            function PANEL:EnableSearch(stype, hook_name)
+                self.Search = vgui.CreateFromTable(pnlSearch, self)
+                self.Search:SetSearchType(stype, hook_name or "PopulateContent")
+            end
+
+            vgui.Register("ContentSidebar", PANEL, "Panel")
+        "#,
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert!(
+            undefined_methods.is_empty(),
+            "RegisterFile panel methods should survive CreateFromTable, got {undefined_methods:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_file_uses_loaded_panel_base_field_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            local Panel = {}
+
+            function Panel:Remove() end
+        "#,
+        );
+        ws.def_file(
+            "annotations/dpanel.lua",
+            r#"
+            ---@meta
+
+            ---@class DPanel: Panel
+            local DPanel = {}
+
+            ---@return Panel
+            function DPanel:Add(class_name) end
+
+            ---@param width number
+            ---@param height number
+            function DPanel:SetSize(width, height) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/accessor_func.lua",
+            r#"
+            ---@meta
+            ---@param tab table
+            ---@param varName string
+            ---@param name string
+            ---@accessorfunc 2
+            function AccessorFunc(tab, varName, name, force) end
+            FORCE_BOOL = 1
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            PANEL.Base = "DPanel"
+            AccessorFunc(PANEL, "m_bDrawProgress", "DrawProgress", FORCE_BOOL)
+
+            function PANEL:Init()
+                self:Add("DLabel")
+                self:SetDrawProgress(false)
+                self:SetSize(500, 80)
+            end
+        "#,
+        );
+        let source_id = ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            vgui = vgui or {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+
+            vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let db = ws.get_db_mut();
+        let metadata = db
+            .get_gmod_class_metadata_index()
+            .get_file_metadata(&source_id)
+            .expect("expected RegisterFile caller metadata");
+        assert_eq!(
+            metadata.vgui_register_file_calls.len(),
+            1,
+            "vgui.RegisterFile annotation should be collected as VGUI register-file metadata"
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Add");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("DPanel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile should infer loaded PANEL self as DPanel-compatible from PANEL.Base, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "vgui.RegisterFile should infer loaded PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_register_file_annotation_loads_nested_panel_base_for_methods() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@generic T : Panel
+            ---@param className `T`
+            ---@return (instance) T
+            function Panel:Add(class_name) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/derma.lua",
+            r#"
+            ---@meta
+            derma = {}
+
+            ---@[call_arg("gmod.vgui_panel", "define_control")]
+            ---@param name string
+            ---@param description string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param tab table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function derma.DefineControl(name, description, tab, base) end
+        "#,
+        );
+        ws.def_file(
+            "annotations/vgui.lua",
+            r#"
+            ---@meta
+            vgui = {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@[call_arg("gmod.vgui_panel", "register_file")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+        "#,
+        );
+        ws.def_file(
+            "lua/vgui/dpanel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+            end
+
+            derma.DefineControl("DPanel", "", PANEL, "Panel")
+        "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/menu/mount/vgui/workshop.lua",
+            r#"
+            PANEL.Base = "DPanel"
+
+            function PANEL:Init()
+                self:Add("DLabel")
+            end
+        "#,
+        );
+        ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            local pnlWorkshop = vgui.RegisterFile("vgui/workshop.lua")
+        "#,
+        );
+
+        let self_type = index_expr_prefix_type(&mut ws, file_id, "self:Add");
+        let expected_base = LuaType::Ref(LuaTypeDeclId::global("DPanel"));
+        assert!(
+            ws.check_type(&self_type, &expected_base),
+            "vgui.RegisterFile should infer nested loaded PANEL self as DPanel-compatible from PANEL.Base, got {}",
+            ws.humanize_type_detailed(self_type.clone())
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_field),
+            "vgui.RegisterFile should infer nested loaded PANEL self from PANEL.Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_stale_base_after_dynamic_table_overwrite() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_dynamic_overwrite.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local function make_panel()
+                return {}
+            end
+
+            local PANEL = { Base = "DFrame" }
+            PANEL = make_panel()
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_method),
+            "vgui.CreateFromTable must not infer stale Base after dynamic table overwrite, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_stale_base_after_table_overwrite_without_base() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_table_overwrite.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = { Base = "DFrame" }
+            PANEL = {}
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_method),
+            "vgui.CreateFromTable must not infer stale Base after table overwrite without Base, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_ignores_prior_base_assignment_for_shadowed_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_shadowed_local.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = {}
+            PANEL.Base = "DFrame"
+
+            local PANEL = {}
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_method),
+            "vgui.CreateFromTable must not use Base from a shadowed local PANEL, got {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_create_from_table_missing_multi_assign_rhs_does_not_reuse_previous_rhs() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        let file_id = ws.def_file(
+            "lua/menu/create_from_table_missing_multi_assign_rhs.lua",
+            r#"
+            ---@class Panel
+            ---@class DFrame: Panel
+            ---@field SetTitle fun(self: DFrame, title: string)
+
+            local PANEL = {}
+            local other
+            other, PANEL.Base = "DFrame"
+
+            function PANEL:Init()
+                self:SetTitle("Title")
+            end
+
+            vgui.CreateFromTable(PANEL)
+        "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+
+        assert!(
+            diagnostics
+                .iter()
+                .any(|diagnostic| diagnostic.code == undefined_method),
+            "vgui.CreateFromTable must not reuse the previous RHS for a missing multi-assign value, got {diagnostics:?}"
+        );
+    }
+
+    /// Regression for Oracle Blocker 2: `write_position_contains_register`
+    /// must check the specific RHS expression for the matching LHS variable,
+    /// not the entire assignment statement range. In a multi-assignment like
+    /// `PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")`,
+    /// the registration call is inside the statement range but PANEL's RHS is
+    /// `MakePanel()`, so the stale initializer fallback must NOT fire.
+    #[gtest]
+    fn test_vgui_register_table_multi_assign_does_not_bind_stale_initializer() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = false;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UncheckedNilAccess);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def_file(
+            "lua/vgui/register_table_multi_assign.lua",
+            r#"
+            ---@class Panel
+            ---@field Add fun(self: Panel, className: string): Panel
+            ---@field Dock fun(self: Panel, dock: integer)
+            ---@class DPanel: Panel
+
+            vgui = {}
+
+            ---@generic T : Panel
+            ---@[call_arg("gmod.vgui_panel", "register_table")]
+            ---@param panelTable T
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param baseName? string
+            ---@return T
+            function vgui.RegisterTable(panelTable, baseName) end
+
+            local function MakePanel() return {} end
+
+            local PANEL = {
+                Init = function(self)
+                    self.Btn = self:Add("DButton")
+                    self.Btn:Dock(1)
+                end,
+            }
+
+            local OTHER
+            -- Multi-assignment: PANEL's RHS is MakePanel(), not RegisterTable.
+            -- The RegisterTable call is on OTHER's RHS, not PANEL's.
+            -- The stale initializer fallback must NOT fire for PANEL.
+            PANEL, OTHER = MakePanel(), vgui.RegisterTable(PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let nil_codes = [
+            Some(NumberOrString::String(
+                DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+            )),
+            Some(NumberOrString::String(
+                DiagnosticCode::NeedCheckNil.get_name().to_string(),
+            )),
+        ];
+        // Since PANEL's RHS is MakePanel() (not the registration call),
+        // the stale initializer fallback should NOT bind. `self.Btn` inside
+        // Init should produce nil diagnostics because self resolves to Unknown.
+        let has_nil_diag = diagnostics.iter().any(|d| nil_codes.contains(&d.code));
+        assert!(
+            has_nil_diag,
+            "multi-assignment with RegisterTable on a different LHS should NOT bind the stale initializer; expected nil diagnostics, got: {diagnostics:?}"
+        );
     }
 
     /// Regression: PANEL reassignment (`PANEL = {}`) should create distinct classes
@@ -2302,7 +4505,7 @@ mod test {
                     return None;
                 }
                 let info = semantic_model.get_semantic_info(token.syntax().clone().into())?;
-                match &info.typ {
+                match info.display_typ() {
                     LuaType::Def(id) => {
                         Some((name_expr.get_position(), id.get_simple_name().to_string()))
                     }
@@ -2379,7 +4582,7 @@ mod test {
             .expect("expected semantic info for local PANEL");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("ReFrame")),
             "local PANEL should resolve to first region class ReFrame"
         );
@@ -2434,17 +4637,17 @@ mod test {
     }
 
     /// Negative control: calling a method that exists on NO region should still
-    /// produce an undefined-field diagnostic. Guards against an over-broad fix
+    /// produce an undefined-method diagnostic. Guards against an over-broad fix
     /// that suppresses all field checks on reassigned PANEL.
     #[gtest]
-    fn test_vgui_reassigned_panel_wrong_method_still_flags_undefined_field() {
+    fn test_vgui_reassigned_panel_wrong_method_still_flags_undefined_method() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = false;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
-        ws.enable_check(DiagnosticCode::UndefinedField);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
 
         let file_id = ws.def_file(
             "lua/vgui/reassigned_panel_wrong_method.lua",
@@ -2466,14 +4669,14 @@ mod test {
             .diagnose_file(file_id, CancellationToken::new())
             .unwrap_or_default();
 
-        let undefined_field_code = Some(NumberOrString::String(
-            DiagnosticCode::UndefinedField.get_name().to_string(),
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
         ));
         assert!(
             diagnostics
                 .iter()
-                .any(|diag| diag.code == undefined_field_code),
-            "self:DoesNotExistAnywhere() should produce an undefined-field diagnostic, got {diagnostics:?}"
+                .any(|diag| diag.code == undefined_method_code),
+            "self:DoesNotExistAnywhere() should produce an undefined-method diagnostic, got {diagnostics:?}"
         );
     }
 
@@ -2715,7 +4918,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -2764,7 +4970,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -2828,7 +5037,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -2868,7 +5080,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -2935,7 +5150,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -3183,7 +5401,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3237,7 +5458,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -3288,7 +5512,7 @@ mod test {
             .expect("expected semantic info for self");
 
         assert_eq!(
-            semantic_info.typ,
+            semantic_info.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("multi_file_ent"))
         );
     }
@@ -3298,7 +5522,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3358,7 +5585,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -3411,7 +5641,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3465,7 +5698,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3602,7 +5838,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3652,7 +5891,10 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -3703,22 +5945,138 @@ mod test {
     }
 
     #[gtest]
+    fn test_scripted_ent_register_local_table_synthesizes_class_and_networkvar_members() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.enable_check(DiagnosticCode::UndefinedField);
+
+        ws.def(
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:NetworkVar(type, slot, name) end
+
+            ---@return widget_base
+            function Entity:GetParent() end
+
+            ---@class widget_arrow : Entity
+            local widget_arrow = {}
+            function widget_arrow:SetupDataTables() end
+
+            ---@class widget_disc : Entity
+            local widget_disc = {}
+            function widget_disc:SetupDataTables() end
+
+            ---@class widget_base : Entity
+            local widget_base = {}
+            function widget_base:OnArrowDragged(axis, dist, pl, mv) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/entities/widget_axis/shared.lua",
+            r#"
+            DEFINE_BASECLASS("widget_arrow")
+            local widget_axis_arrow = { Base = "widget_arrow" }
+
+            function widget_axis_arrow:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+                self:NetworkVar("Int", 0, "AxisIndex")
+            end
+
+            function widget_axis_arrow:ArrowDragged(pl, mv, dist)
+                self:GetParent():OnArrowDragged(self:GetAxisIndex(), dist, pl, mv)
+            end
+
+            scripted_ents.Register(widget_axis_arrow, "widget_axis_arrow")
+
+            DEFINE_BASECLASS("widget_disc")
+            local widget_axis_disc = { Base = "widget_disc" }
+
+            function widget_axis_disc:SetupDataTables()
+                BaseClass.SetupDataTables(self)
+                self:NetworkVar("Int", 0, "AxisIndex")
+            end
+
+            function widget_axis_disc:ArrowDragged(pl, mv, dist)
+                self:GetParent():OnArrowDragged(self:GetAxisIndex(), dist, pl, mv)
+            end
+
+            scripted_ents.Register(widget_axis_disc, "widget_axis_disc")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_field_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
+        assert!(
+            undefined_field_diags.is_empty(),
+            "unexpected undefined-field diagnostics for local scripted_ents.Register class: {undefined_field_diags:?}"
+        );
+
+        for class_name in ["widget_axis_arrow", "widget_axis_disc"] {
+            let owner = LuaMemberOwner::Type(LuaTypeDeclId::global(class_name));
+            let members = ws
+                .get_db_mut()
+                .get_member_index()
+                .get_members(&owner)
+                .unwrap_or_else(|| panic!("expected synthesized members on {class_name}"));
+            let member_names: Vec<_> = members
+                .iter()
+                .filter_map(|member| member.get_key().get_name().map(|name| name.to_string()))
+                .collect();
+
+            assert!(
+                member_names.contains(&"GetAxisIndex".to_string()),
+                "missing GetAxisIndex on {class_name} in {member_names:?}"
+            );
+            assert!(
+                member_names.contains(&"SetAxisIndex".to_string()),
+                "missing SetAxisIndex on {class_name} in {member_names:?}"
+            );
+        }
+    }
+
+    #[gtest]
     fn test_network_var_same_function_usage_with_real_config() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = legacy_scopes(&[
-            "entities/**",
-            "weapons/**",
-            "effects/**",
-            "weapons/gmod_tool/stools/**",
-            "plugins/**",
-        ]);
-        emmyrc.gmod.scripted_class_scopes.legacy_exclude = vec![
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(legacy_scopes(&[
+                "entities/**",
+                "weapons/**",
+                "effects/**",
+                "weapons/gmod_tool/stools/**",
+                "plugins/**",
+            ]));
+        emmyrc.gmod.scripted_class_scopes.set_legacy_exclude(vec![
             "**/tests/**".to_string(),
             "**/test/**".to_string(),
             "**/docs/**".to_string(),
-        ];
+        ]);
         ws.update_emmyrc(emmyrc);
         ws.enable_check(DiagnosticCode::UndefinedField);
 
@@ -3889,6 +6247,9 @@ mod test {
         let missing_parameter_code = Some(NumberOrString::String(
             DiagnosticCode::MissingParameter.get_name().to_string(),
         ));
+        let undefined_method_code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
         let undefined_field_code = Some(NumberOrString::String(
             DiagnosticCode::UndefinedField.get_name().to_string(),
         ));
@@ -3905,36 +6266,55 @@ mod test {
             "unexpected param diagnostics for synthesized NetworkVar accessors: {param_diagnostics:?}"
         );
 
-        let undefined_field_diags: Vec<_> = diagnostics
+        let undefined_method_diags: Vec<_> = diagnostics
             .iter()
-            .filter(|diag| diag.code == undefined_field_code)
+            .filter(|diag| diag.code == undefined_method_code)
             .collect();
 
-        let extract_undefined_field_name = |message: &str| {
-            let prefix = "Undefined field `";
+        let extract_undefined_method_name = |message: &str| {
+            let prefix = "Undefined method `";
             message
                 .strip_prefix(prefix)
                 .and_then(|rest| rest.split_once('`'))
                 .map(|(name, _)| name.to_string())
         };
 
+        let mut undefined_method_names: Vec<String> = undefined_method_diags
+            .iter()
+            .filter_map(|diag| extract_undefined_method_name(&diag.message))
+            .collect();
+        undefined_method_names.sort();
+
+        let undefined_field_diags: Vec<_> = diagnostics
+            .iter()
+            .filter(|diag| diag.code == undefined_field_code)
+            .collect();
         let mut undefined_field_names: Vec<String> = undefined_field_diags
             .iter()
-            .filter_map(|diag| extract_undefined_field_name(&diag.message))
+            .filter_map(|diag| {
+                diag.message
+                    .strip_prefix("Undefined field `")
+                    .and_then(|rest| rest.split_once('`'))
+                    .map(|(name, _)| name.to_string())
+            })
             .collect();
         undefined_field_names.sort();
 
+        let allowed_undefined_method_names = ["NetworkVar", "NetworkVarNotify", "GetTable"];
         let allowed_undefined_field_names = [
-            "NetworkVar",
-            "NetworkVarNotify",
             "OnWaterStateChange",
             "OnEngineStateChange",
             "OnEngineStateChangePhoton",
             "OnHeadlightStateChangePhoton",
             "OnTurnSignalStateChangePhoton",
-            "GetTable",
         ];
 
+        assert!(
+            undefined_method_names
+                .iter()
+                .all(|name| allowed_undefined_method_names.contains(&name.as_str())),
+            "unexpected undefined-method diagnostics in same file: {undefined_method_diags:?}; undefined_method_names={undefined_method_names:?}; member_names={member_names:?}"
+        );
         assert!(
             undefined_field_names
                 .iter()
@@ -3943,7 +6323,7 @@ mod test {
         );
 
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "NetworkVar")
                 .count(),
@@ -3951,7 +6331,7 @@ mod test {
             "expected 16 undefined NetworkVar members"
         );
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "NetworkVarNotify")
                 .count(),
@@ -3959,7 +6339,7 @@ mod test {
             "expected 5 undefined NetworkVarNotify members"
         );
         assert_eq!(
-            undefined_field_names
+            undefined_method_names
                 .iter()
                 .filter(|name| name.as_str() == "GetTable")
                 .count(),
@@ -4013,7 +6393,10 @@ mod test {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -4698,7 +7081,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -4782,7 +7168,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UncheckedNilAccess);
@@ -4939,7 +7328,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -5001,7 +7393,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UncheckedNilAccess);
@@ -5096,7 +7491,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -5709,7 +8107,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.analysis
@@ -5890,7 +8291,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.analysis
@@ -6076,6 +8480,364 @@ mod test {
             unchecked_nil_diagnostics,
             is_empty(),
             "guarded sounds.startTail call should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_guarded_turbo_call_has_no_unchecked_nil_and_non_any_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:ChangeVolume(volume) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:Initialize()
+                self.BaseClass.Initialize(self)
+                self:CreateLoopingSound("turbo", "turbo.wav", 70, self)
+            end
+
+            function ENT:OnUpdateSounds()
+                local sounds = self.sounds
+
+                if sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo:ChangeVolume(0.5)
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let turbo_type = index_expr_type(&mut ws, file_id, "sounds.turbo");
+        let turbo_display = ws.humanize_type_detailed(turbo_type);
+        assert_that!(
+            turbo_display.as_str(),
+            contains_substring("CSoundPatch"),
+            "guarded sounds.turbo access should use inferred dynamic sound patch type"
+        );
+        assert_that!(
+            turbo_display.contains("any"),
+            eq(false),
+            "guarded sounds.turbo access should not widen to any"
+        );
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.turbo calls should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_turbo_parameter_from_self_sounds_has_no_unchecked_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+            function CSoundPatch:SetSoundLevel(level) end
+            function CSoundPatch:PlayEx(volume, pitch) end
+            function CSoundPatch:ChangeVolume(volume) end
+            function CSoundPatch:ChangePitch(pitch) end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    snd:SetSoundLevel(level)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                local dt = 0
+                self:UpdateTurboSound(self.sounds, dt)
+            end
+
+            function ENT:UpdateTurboSound(sounds, dt)
+                local hasBoost = true
+                local volume = 0.5
+                local pitch = 120
+
+                if sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo = nil
+                end
+
+                if hasBoost then
+                    if sounds.turbo then
+                        local guardedTurbo = sounds.turbo
+                        sounds.turbo:ChangeVolume(volume)
+                        sounds.turbo:ChangePitch(pitch)
+                    elseif self.TurboLoopSound ~= "" then
+                        local snd = self:CreateLoopingSound("turbo", "turbo.wav", 80, self)
+                        snd:PlayEx(volume, pitch)
+                    end
+                elseif sounds.turbo then
+                    sounds.turbo:Stop()
+                    sounds.turbo = nil
+                end
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide"
+                ENT.TurboLoopSound = "turbo.wav""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let guarded_turbo_type = local_name_type(&mut ws, file_id, "guardedTurbo");
+        let guarded_turbo_display = ws.humanize_type_detailed(guarded_turbo_type);
+        assert_that!(
+            guarded_turbo_display.as_str(),
+            not(eq("nil")),
+            "guarded sounds.turbo should not narrow to only nil"
+        );
+        assert_that!(
+            guarded_turbo_display.contains("nil"),
+            eq(false),
+            "guarded sounds.turbo should be non-nullable inside the if body"
+        );
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            is_empty(),
+            "guarded sounds.turbo calls in UpdateTurboSound should not report unchecked-nil-access"
+        );
+    }
+
+    #[gtest]
+    fn test_gmod_vehicle_sound_unguarded_turbo_parameter_field_reports_unchecked_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UncheckedNilAccess);
+
+        let annotations_code = r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@class CSoundPatch
+            local CSoundPatch = {}
+
+            function CSoundPatch:Stop() end
+
+            ---@return CSoundPatch
+            function CreateSound(parent, path) end
+        "#;
+
+        let base_cl_init_code = r#"
+            function ENT:Initialize()
+                self.sounds = {}
+            end
+
+            function ENT:CreateLoopingSound(id, path, level, parent)
+                local snd = self.sounds[id]
+
+                if not snd then
+                    snd = CreateSound(parent or self, path)
+                    self.sounds[id] = snd
+                end
+
+                return snd
+            end
+        "#;
+
+        let car_path = "lua/entities/base_glide_car/cl_init.lua";
+        let car_code = r#"
+            function ENT:OnUpdateSounds()
+                self:StopTurboSound(self.sounds)
+            end
+
+            function ENT:StopTurboSound(sounds)
+                sounds.turbo = nil
+                sounds.turbo:Stop()
+            end
+        "#;
+
+        ws.def_files(vec![
+            ("annotations/sound.lua", annotations_code),
+            ("lua/entities/base_glide/shared.lua", r#"ENT.Type = "anim""#),
+            ("lua/entities/base_glide/cl_init.lua", base_cl_init_code),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                r#"ENT.Type = "anim"
+                ENT.Base = "base_glide""#,
+            ),
+            (car_path, car_code),
+        ]);
+
+        let car_uri = ws.virtual_url_generator.new_uri(car_path);
+        let file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&car_uri)
+            .expect("expected car cl_init file id");
+
+        let unchecked_nil_diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UncheckedNilAccess.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+
+        assert_that!(
+            unchecked_nil_diagnostics,
+            contains_each![contains_substring("sounds.turbo may be nil")],
+            "unguarded param-rooted sounds.turbo receiver should still report unchecked-nil-access"
         );
     }
 
@@ -6586,12 +9348,26 @@ mod test {
     }
 
     #[test]
-    fn test_isvalid_guard_promotes_hard_nil_local_to_any_after_early_return() {
+    fn test_isvalid_guard_does_not_promote_hard_nil_local_to_any_after_early_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
 
         let file_id = ws.def(
             r#"
@@ -6603,21 +9379,35 @@ mod test {
             "#,
         );
 
-        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        let narrowed_type = local_assignment_value_type(&mut ws, file_id, "narrowed");
         assert_eq!(
             narrowed_type,
-            LuaType::Any,
-            "a successful IsValid guard proves even a previously hard-nil local is usable"
+            LuaType::Unknown,
+            "an annotated IsValid guard follows truthy-branch narrowing for a hard-nil local without promoting it to any"
         );
     }
 
     #[test]
-    fn test_isvalid_alias_guard_promotes_hard_nil_local_to_any_after_early_return() {
+    fn test_isvalid_alias_guard_does_not_promote_hard_nil_local_to_any_after_early_return() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
 
         let file_id = ws.def(
             r#"
@@ -6630,11 +9420,11 @@ mod test {
             "#,
         );
 
-        let narrowed_type = local_name_type(&mut ws, file_id, "narrowed");
+        let narrowed_type = local_assignment_value_type(&mut ws, file_id, "narrowed");
         assert_eq!(
             narrowed_type,
-            LuaType::Any,
-            "an aliased successful IsValid guard should also promote a hard-nil local"
+            LuaType::Unknown,
+            "an aliased annotated IsValid guard should also avoid promoting a hard-nil local to any"
         );
     }
 
@@ -6644,7 +9434,10 @@ mod test {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("lua/entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("lua/entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -6805,7 +9598,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -7051,7 +9847,7 @@ mod test {
             .get_semantic_info(swep_token.syntax().clone().into())
             .expect("expected semantic info for SWEP");
         assert_eq!(
-            swep_semantic.typ,
+            swep_semantic.display_typ().clone(),
             LuaType::Def(LuaTypeDeclId::global("weapon_mad_deagle")),
             "expected SWEP to resolve to the scoped weapon class"
         );
@@ -7190,6 +9986,234 @@ mod test {
             .expect("expected scoped-class info for nested entity file");
         assert_eq!(info.class_name, "my_ent");
         assert_eq!(info.global_name, "ENT");
+    }
+
+    #[gtest]
+    fn issue_38_first_token_in_scoped_class_file_keeps_its_own_semantic_decl() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"AddCSLuaFile("shared.lua")"#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let add_cs_lua_file_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "AddCSLuaFile")
+            })
+            .expect("expected AddCSLuaFile name expression");
+        let add_cs_lua_file_token = add_cs_lua_file_expr
+            .get_name_token()
+            .expect("expected AddCSLuaFile token");
+        let semantic_info = semantic_model
+            .get_semantic_info(add_cs_lua_file_token.syntax().clone().into())
+            .expect("expected AddCSLuaFile semantic info");
+
+        let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_info
+            .semantic_decl
+            .expect("expected AddCSLuaFile semantic decl")
+        else {
+            panic!("expected AddCSLuaFile to resolve to a Lua declaration");
+        };
+        let decl = semantic_model
+            .get_db()
+            .get_decl_index()
+            .get_decl(&decl_id)
+            .expect("expected AddCSLuaFile declaration");
+        assert_eq!(decl.get_name(), "AddCSLuaFile");
+
+        let local_ref = semantic_model
+            .get_db()
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .expect("expected file references");
+        let mapped_decl = local_ref.get_decl_id(&add_cs_lua_file_token.get_range());
+        if let Some(mapped_decl) = mapped_decl
+            && let Some(mapped_decl) = semantic_model
+                .get_db()
+                .get_decl_index()
+                .get_decl(&mapped_decl)
+        {
+            assert_ne!(
+                mapped_decl.get_name(),
+                "GM",
+                "AddCSLuaFile token must not be mapped to the scoped GM authoring symbol"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_byte_zero_gm_member_binds_to_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_some(),
+            "GM.TestValue should be owned by the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_byte_zero_method_self_uses_scoped_class() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"function GM:Initialize()
+    self.TestValue = 1
+end"#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "self")
+            })
+            .expect("expected self name expression");
+        let self_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(self_expr))
+            .expect("expected self type");
+        assert_eq!(
+            self_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "method self should resolve to the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_local_gm_shadow_does_not_bind_scoped_class_member() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"local GM = 0
+GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_none(),
+            "a real local GM shadow must not bind members to the scoped gamemode class"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let shadowed_gm_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "GM")
+            })
+            .last()
+            .expect("expected shadowed GM reference");
+        let shadowed_gm_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(shadowed_gm_expr))
+            .expect("expected shadowed GM type");
+        assert_ne!(
+            shadowed_gm_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "a real local GM shadow must not infer as the scoped gamemode class"
+        );
+    }
+
+    #[gtest]
+    fn test_gamemode_scope_local_gm_alias_preserves_scoped_class_binding() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def_file(
+            "gamemodes/tunnel_defense/gamemode/init.lua",
+            r#"local GM = GM
+GM.TestValue = 1"#,
+        );
+
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("gamemode_tunnel_defense"));
+        let key = LuaMemberKey::Name("TestValue".into());
+        assert!(
+            ws.get_db_mut()
+                .get_member_index()
+                .get_member_item(&owner, &key)
+                .is_some(),
+            "a local GM alias to the scoped table should still bind scoped gamemode members"
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let aliased_gm_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| {
+                name_expr
+                    .get_name_token()
+                    .is_some_and(|token| token.get_name_text() == "GM")
+            })
+            .last()
+            .expect("expected aliased GM reference");
+        let aliased_gm_type = semantic_model
+            .infer_expr(LuaExpr::NameExpr(aliased_gm_expr))
+            .expect("expected aliased GM type");
+        assert_eq!(
+            aliased_gm_type,
+            LuaType::Def(LuaTypeDeclId::global("gamemode_tunnel_defense")),
+            "local GM = GM should preserve the scoped gamemode class type"
+        );
     }
 
     #[gtest]
@@ -7736,7 +10760,7 @@ mod test {
             .get_semantic_info(baseclass_token.syntax().clone().into())
             .expect("expected BaseClass semantic info");
         assert_eq!(
-            baseclass_info.typ,
+            baseclass_info.display_typ().clone(),
             LuaType::Ref(LuaTypeDeclId::global("gamemode_other"))
         );
 
@@ -7760,7 +10784,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -7831,7 +10858,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
         ws.enable_check(DiagnosticCode::UndefinedField);
@@ -7893,7 +10923,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -7944,7 +10977,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -8009,7 +11045,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -8060,7 +11099,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -8118,7 +11160,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -8185,7 +11230,10 @@ mod test {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
         ws.def_gmod_call_arg_builtins();
 
@@ -8289,6 +11337,70 @@ mod test {
         );
     }
 
+    #[gtest]
+    fn test_vgui_self_field_assigned_class_return_keeps_methods_for_diagnostics() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "lua/derma/derma_animation.lua",
+            r#"
+            local DermaAnimation = {}
+            DermaAnimation.__index = DermaAnimation
+
+            function DermaAnimation:Run() end
+
+            function Derma_Anim(name, panel, func)
+                local anim = {}
+                anim.Name = name
+                anim.Panel = panel
+                anim.Func = func
+                setmetatable(anim, DermaAnimation)
+                return anim
+            end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/anim_panel.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                self.animSlide = Derma_Anim("Anim", self, self.AnimSlide)
+            end
+
+            function PANEL:Think()
+                self.animSlide:Run()
+            end
+
+            function PANEL:AnimSlide(anim, delta, data)
+            end
+
+            derma.DefineControl("AnimPanel", "Description", PANEL, "DPanel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_fields: Vec<_> = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code == Some(NumberOrString::String("undefined-field".to_string()))
+            })
+            .collect();
+
+        assert!(
+            undefined_fields.is_empty(),
+            "unexpected undefined-field diagnostics for self.animSlide: {undefined_fields:?}"
+        );
+    }
+
     /// Regression: when PANEL is aliased (`local OLD = PANEL`), then PANEL is
     /// reassigned (`PANEL = {}`), and a method is added via the OLD alias
     /// (`function OLD:OldOnly() end`), the fallback member transfer must NOT
@@ -8343,6 +11455,392 @@ mod test {
         assert!(
             !new_panel_members.contains(&"OldOnly".to_string()),
             "NewPanel should NOT inherit OldOnly from the aliased OLD table, got {new_panel_members:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_constructor_field_type_visible_to_earlier_method_body() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class DHTML: DPanel
+            function DHTML:RunJavascript(code) end
+
+            ---@attribute builtin_alias(name: string)
+            ---@[builtin_alias("pairs")]
+            function _G.pairs(value) end
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@param name string?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent, name) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let path = "lua/vgui/constructor_field_order.lua";
+        let finite_source = r#"
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                for method_name in pairs {
+                    UpdateSettings = true,
+                    AddSession = true,
+                } do
+                    self[method_name] = function() end
+                end
+                self.html = vgui.Create("DHTML", self)
+            end
+
+            function Handler:Cleanup()
+                self.html = nil
+            end
+            "#;
+        let file_id = ws.def_file(path, finite_source);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a constructor-assigned field should be available to sibling method bodies regardless of declaration order: {diagnostics:?}"
+        );
+
+        let reassigned_before_source = r#"
+            local Handler = {}
+
+            ---@return string
+            function DynamicMethodName() end
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    method_name = DynamicMethodName()
+                    self[method_name] = function() end
+                end
+            end
+            "#;
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_text_only(&uri, reassigned_before_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a concrete named field assignment is preferred over a same-function wildcard key write: {diagnostics:?}"
+        );
+
+        let reassigned_after_source = r#"
+            local Handler = {}
+
+            ---@return string
+            function DynamicMethodName() end
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                    method_name = DynamicMethodName()
+                end
+                self.html = vgui.Create("DHTML", self)
+            end
+            "#;
+        ws.analysis
+            .update_file_text_only(&uri, reassigned_after_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a reassignment after the indexed write should not make that write a wildcard: {diagnostics:?}"
+        );
+
+        ws.analysis
+            .update_file_text_only(&uri, finite_source.to_string());
+        ws.analysis.reindex_files(vec![file_id]);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "removing the reassignment should remove the wildcard on incremental reindex: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_named_field_preferred_over_global_pairs_override_wildcard() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            ---@class DHTML: DPanel
+            function DHTML:RunJavascript(code) end
+
+            vgui = {}
+
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@param name string?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent, name) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/constructor_field_pairs_override.lua",
+            r#"
+            function _G.pairs(value) end
+
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a concrete named field assignment is preferred even when pairs is not the builtin: {diagnostics:?}"
+        );
+
+        let other_file_id = ws.def_file(
+            "lua/vgui/constructor_field_workspace_pairs_override.lua",
+            r#"
+            local Handler = {}
+
+            function Handler:Refresh()
+                self.html:RunJavascript("refresh()")
+            end
+
+            function Handler:Init()
+                self.html = vgui.Create("DHTML", self)
+                for method_name in pairs({
+                    UpdateSettings = true,
+                    AddSession = true,
+                }) do
+                    self[method_name] = function() end
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(other_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a concrete named field assignment is preferred even when pairs is overridden in another file: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_registered_panel_field_preserves_constructor_subclass() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.enable_check(DiagnosticCode::UndefinedMethod);
+
+        ws.def(
+            r#"
+            ---@class Panel
+            ---@class DPanel: Panel
+            function DPanel:SetPaintBackground(enabled) end
+            ---@class DDragBase: DPanel
+            ---@class DListLayout: DDragBase
+            ---@class DVScrollBar: Panel
+            function DVScrollBar:SetUp(bar_size, canvas_size) end
+            ---@class EditablePanel: Panel
+            ---@class DFrame: EditablePanel
+            function DFrame:ShowCloseButton(show) end
+            function DFrame:Close() end
+            ---@class (partial) DDrawer: Panel
+            local DDrawer = {}
+            function DDrawer:Close() end
+
+            vgui = {}
+            ---@generic T: Panel
+            ---@overload fun(classname: string, parent?: Panel, name?: string): Panel?
+            ---@[call_arg("gmod.vgui_panel", "reference")]
+            ---@param classname `T`
+            ---@[call_arg("gmod.vgui_panel", "parent")]
+            ---@param parent Panel?
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+
+            ---@[call_arg("gmod.vgui_panel", "define")]
+            ---@param name string
+            ---@[call_arg("gmod.vgui_panel", "table")]
+            ---@param panel table
+            ---@[call_arg("gmod.vgui_panel", "base")]
+            ---@param base string
+            function vgui.Register(name, panel, base) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/vgui/registered_panel_field.lua",
+            r#"
+            local PANEL = {}
+
+            function PANEL:Init()
+                local left_menu = vgui.Create("DListLayout", self)
+                self.left_menu = left_menu
+                self.scroll_bar = vgui.Create("DVScrollBar", self)
+            end
+
+            function PANEL:OnThemeChange()
+                self.left_menu:SetPaintBackground(true)
+                self.scroll_bar:SetUp(10, 20)
+            end
+
+            function PANEL:CreateFindWindow()
+                self.find_window = vgui.Create("DFrame", self)
+                local pnl = self.find_window
+                pnl:ShowCloseButton(true)
+                local old = pnl.Close
+                function pnl.Close()
+                    old(pnl)
+                end
+            end
+
+            vgui.Register(TabHandler.ControlName, PANEL, "Panel")
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code
+                != Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a registered panel field should retain the vgui.Create subclass: {diagnostics:?}"
+        );
+
+        let mutable_file_id = ws.def_file(
+            "lua/vgui/mutable_panel_alias.lua",
+            r#"
+            local panel = vgui.Create("DFrame")
+            panel = vgui.Create("DDrawer")
+            panel:ShowCloseButton(true)
+            "#,
+        );
+        let mutable_diagnostics = ws
+            .analysis
+            .diagnose_file(mutable_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            mutable_diagnostics.iter().any(|diagnostic| diagnostic.code
+                == Some(NumberOrString::String(
+                    DiagnosticCode::UndefinedMethod.get_name().to_string()
+                ))),
+            "a later incompatible assignment must not be replaced by the initializer subtype: {mutable_diagnostics:?}"
         );
     }
 }

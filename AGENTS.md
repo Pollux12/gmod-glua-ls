@@ -1,51 +1,61 @@
-# Project Guidelines
+# GLuaLS Repository Instructions
 
-## Project Context
-- This repository is a **Garry's Mod Language Server** fork of EmmyLua Analyzer Rust modified for Garry's Mod specific behaviour.
-- Default behavior should optimize for GLua/GMod workflows first, not generic Lua LS behavior.
-- When requirements are ambiguous, choose GMod-aware behavior and config defaults unless a task explicitly requests otherwise.
-- GitHub Repository: [@Pollux12/gmod-glua-ls](https://github.com/Pollux12/gmod-glua-ls)
+## Repository Scope
 
-## GMod-Specific Logic
-- This is a Garry's Mod specific language server with no backwards compatibility requirements for use outside of Garry's Mod. All GMod behaviour needs to be treated as first-class, such as non-standard operators, hook/realm behavior, scripted class patterns, Garry's Mod annotation library treated same as stdlib, etc.
-- We have realm awareness based on various indicators such as realm annotations, but also automatic file path inference, to try and accurately best detect the realm of all functions, methods and variables. You need to make sure all features are realm aware where applicable, such as autocomplete which shouldn't suggest things from another realm, etc.
-- Always prefer to do things at the annotation level rather than hardcoding. Always look to see if something can be done at the annotation level, as this increases accuracy (since it'll be attached to the actual function/method), reduces repetition of code and helps add better generic support for user defined annotations.
-- Annotations are loaded by the extension, which is why annotations are not available to the language server directly, although they can be loaded manually. You are allowed to and encouraged to make annotation level changes where required by editing the annotation repo, which can likely be found in a folder adjacent to this project, or can be found via the $BENCH_ANNOTATIONS env var which would contain the path for the output folder where annotations are generated.
+- This repository is the Rust backend for GLuaLS, a Garry's Mod GLua language server forked from EmmyLua Analyzer Rust.
+- Garry's Mod correctness and large-workspace performance take priority. Generic Lua language-server compatibility is out of scope unless a task explicitly requires it.
+- The language server used by the VSCode extension is the primary product. `glua_check` and other tools must reuse the same analyzer behavior rather than grow separate rules.
+- Editor UI and shipped annotations live in adjacent repositories, usually `vscode-gmod-glua-ls` and `annotations-gmod-glua-ls`. Locate annotations through the adjacent checkout or `BENCH_ANNOTATIONS` when cross-repository validation is needed.
+- If expected GLua behavior is unclear, confirm the Garry's Mod semantics before implementing generic Lua behavior.
 
-## Config and Schema Rules
-- Configuration entry points are `.gluarc.json` (exclusive priority when present), otherwise `.luarc.json` → `.emmyrc.json` → `.emmyrc.lua`.
-- VSCode extension provides schema and custom settings menu for editing `.gluarc.json` config files.
-- For new config options, update all of these together:
-  - code: `crates/glua_code_analysis/src/config/**`
-  - schema: `crates/glua_code_analysis/resources/schema.json`
-  - docs (if applicable)
-- Run schema generation after any config changes: `cargo run --bin schema_json_gen`
+## Workspace Map
 
-## Build, Test, and Validation Commands
-- Build all: `cargo build --release`
-- Build one crate: `cargo build --release -p glua_ls` (or `glua_check`, `glua_doc_cli`)
-- Run benchmark: `cargo run --release -p benchmark` (requires `BENCH_CODEBASE` and `BENCH_ANNOTATIONS` env vars)
-- Test all: `cargo test`
-- Focused loop (common): `cargo test -p glua_code_analysis`
-- Lint (CI-equivalent): `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- Format: `cargo fmt --all`
-- Pre-commit checks: `pre-commit run --all --hook-stage manual`
-- Cargo is installed in local system and is within path. If you get an error stating it is missing, try use direct path workaround e.g: `& "$env:CARGO_HOME\bin\cargo.exe"` but ONLY if cargo does not work by itself.
+- `crates/glua_code_analysis`: VFS, indexes, analyzer, semantic model, diagnostics, configuration, embedded resources, and most tests.
+- `crates/glua_ls`: LSP server and editor-facing handlers. Handlers should consume analyzer APIs and indexes, not reproduce semantic analysis.
+- `crates/glua_parser`: parser, AST, and syntax APIs.
+- `crates/glua_check`: CLI diagnostics runner and the preferred corpus-diagnostics entry point.
+- `crates/glua_doc_cli`, `crates/schema_to_glua`, and `tools/schema_json_gen`: documentation and schema tooling.
+- `tools/benchmark`: large-workspace benchmark. It requires `BENCH_CODEBASE` and `BENCH_ANNOTATIONS`.
+- `docs/mintlify`: user documentation. Follow its nested `AGENTS.md` for changes under that tree.
 
-## Testing Patterns (How This Repo Verifies Behavior)
-- We use the standard Rust testing harness with [googletest-rust](https://github.com/google/googletest-rust/). Prefer `#[gtest]` over `#[test]` in repository test modules.
-- In test modules, import `googletest::prelude::*` and prefer matcher-style assertions (`assert_that!`, `expect_that!`, `verify_that!`) instead of introducing new `assert_eq!`/`assert!` where practical.
-- Use the `check!` helper where available to convert `Result`/`Option` into `googletest::Result` with useful location context.
-- Many semantic/diagnostic tests use `VirtualWorkspace` from `crates/glua_code_analysis/src/test_lib/mod.rs`.
-- When changing analysis behavior, add/adjust tests near the affected subsystem in:
-  - `crates/glua_code_analysis/src/compilation/test/`
-  - `crates/glua_code_analysis/src/diagnostic/test/`
-  - `crates/glua_code_analysis/src/semantic/**/test.rs`
-- For GMod-specific changes, prioritize extending existing `gmod_*` tests rather than adding isolated ad-hoc coverage.
-- For GMod realm/path-sensitive tests, use realistic addon or gamemode style paths.
+## Analysis Architecture
 
-**IMPORTANT**
-- Performance is extremely important. This language server is designed to run in large workspaces with potentially thousands of files. Always consider the performance implications of your changes, and prefer efficient algorithms and data structures. We do not want performance hacks like flow budgets - instead, we want proper optimisations such as more efficient algorithms, better data structures, reducing repetition of work, etc...
-- You shouldn't read files unless you're confident that file is relevant - use semantic search and other search tools to narrow down relevant files before any read operation. If you think you'll need to read a file multiple times, read the entire file once to save on tool calls. If you already have a file or relevant code in context, you don't need to read it again unless it has been modified.
-- Do not use your terminal tool unless no other tool can accomplish the same task. Specialised tools will always be more effective than generic terminal commands. Especially for search, always prefer semantic search tools first.
-- Always start by loading the `rust-best-practices` skill.
+- `EmmyLuaAnalysis` in `crates/glua_code_analysis/src/lib.rs` is the top-level owner of workspace state, configuration, VFS, compilation, diagnostics, and incremental updates.
+- `glua_code_analysis` is the single source of semantic behavior. The LSP and `glua_check` should consume its indexes and APIs rather than implement their own versions of analysis rules.
+- GLuaLS assumes `gmod.enabled` is on; disabling it is unsupported. Do not treat Garry's Mod behavior as an optional compatibility layer.
+- Extensible Garry's Mod API behavior is annotation-driven. Call roles, wrapper behavior, and guard metadata are shared through signature metadata; check `crates/glua_code_analysis/src/db_index/signature/gmod_domains.rs` before adding a name-based recognizer.
+- Realm and load-order analysis are first-class. Consider them when changing semantic or editor behavior, and reuse the shared analyzer/index support rather than adding feature-local heuristics.
+- Realm evidence is not path-only: annotations, branches, load edges, filename conventions, and defaults can all contribute. Identically named declarations may legitimately coexist in different realms.
+- Analyzer phase ordering is intentional. Use `crates/glua_code_analysis/src/compilation/analyzer/mod.rs` as the authority instead of relying on a copied phase list.
+- Cross-file analysis should be indexed or precomputed. Diagnostics already provide shared batch data through `SharedDiagnosticData`; reuse it instead of scanning the workspace per file or request.
+
+## Change Requirements
+
+- Fix incorrect inference, realm, load, or member evidence at its source. Suppressing a diagnostic or adding a downstream special case usually hides the real bug.
+- Incremental edits can invalidate dependent files and cross-file caches. Test edit, deletion, and reopen behavior when changing indexes or cached inference.
+- Dynamic fields and flow narrowing are sensitive to ownership, source range, scope, realm visibility, and edit stability; preserve all of those dimensions.
+- VGUI/scripted classes and helpers such as `AccessorFunc` and `NetworkVar` often use indexed metadata or synthesized members rather than ordinary declarations. Extend the shared model instead of recognizing them separately in each feature.
+- Network diagnostics compare send/receive flows and operation order. Treat dynamic message names, payload branches, and read/write loops conservatively to avoid false positives.
+- Annotation metadata changes need both ingestion coverage and a downstream behavior test. Use the existing Garry's Mod builtins and fixtures rather than recreating behavior in the test.
+- Output derived from hash maps or parallel collection must be sorted before it reaches diagnostics, completions, code lenses, or snapshots.
+- Do not address performance problems with arbitrary budgets, caps, or broad work-skipping flags. Profile first, then prefilter, index, cache, or parallelize safe read-only work.
+- Configuration changes must update the config structs, `crates/glua_code_analysis/resources/schema.json`, generated schema output, and user documentation together. Run `cargo run --bin schema_json_gen` and inspect the resulting diff.
+- `.gluarc.json` is exclusive when present; otherwise configs are considered in order: `.luarc.json`, `.emmyrc.json`, `.emmyrc.lua`. Gamemode-base detection scans workspace roots, not the config-file directory.
+- Annotations are external library workspaces, not server-bundled files. Loading may come from `glua_check --gmod-annotations`, `glua_ls --gmod-annotations-path`, or the `gmod.annotationsPath` / `gmod.autoLoadAnnotations` settings.
+
+## Testing and Performance
+
+- Use `VirtualWorkspace` and realistic addon or gamemode paths when behavior depends on workspace layout, load order, or realm. Prefer the established Garry's Mod test modules and fixtures over isolated ad hoc cases.
+- Call-role and annotation-driven tests should load the relevant builtins; otherwise they may pass while bypassing the real metadata path.
+- Typical test commands are `cargo test -p glua_code_analysis <test_name>`, `cargo test -p glua_code_analysis`, and `cargo test`.
+- Use `glua_check` JSON output for before/after corpus diagnostic comparisons. The benchmark measures performance; it is not a diagnostics oracle.
+- Performance changes require profiling or a targeted before/after benchmark. Use `GLUALS_PROFILE=1` for phase timings and `cargo run --release -p benchmark` for the large-workspace harness.
+
+## Commands
+
+- Format: `cargo fmt --all`.
+- CI-equivalent lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
+- Pre-commit hygiene: `pre-commit run --all --hook-stage manual`.
+- Local release build: `cargo build --release`, optionally with `-p glua_ls`, `-p glua_check`, or `-p glua_doc_cli`.
+- Shipped/CI optimized build: `cargo build --profile dist`.
+- Docs commands run from `docs/mintlify`: `mint dev` and `mint broken-links`.

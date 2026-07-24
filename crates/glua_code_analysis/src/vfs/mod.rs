@@ -31,6 +31,12 @@ pub struct Vfs {
     tree_map: HashMap<FileId, LuaSyntaxTree>,
     emmyrc: Option<Arc<Emmyrc>>,
     node_cache: NodeCache,
+    /// Monotonic counter bumped whenever file *content* (or existence) changes.
+    /// Lets workspace-wide derived caches (e.g. the gmod helper registry) detect
+    /// that their inputs are unchanged and skip a full rescan. It is deliberately
+    /// NOT bumped by analysis/index updates, so the cold-index main pass and its
+    /// stabilization re-run share a revision and the second build is a cache hit.
+    content_revision: u64,
 }
 
 #[derive(Default)]
@@ -57,7 +63,13 @@ impl Vfs {
             tree_map: HashMap::new(),
             emmyrc: None,
             node_cache: NodeCache::default(),
+            content_revision: 0,
         }
+    }
+
+    /// Current content revision. Increases on every file content/existence change.
+    pub fn content_revision(&self) -> u64 {
+        self.content_revision
     }
 
     pub fn file_id(&mut self, uri: &Uri) -> FileId {
@@ -107,6 +119,7 @@ impl Vfs {
     }
 
     pub fn set_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
+        self.content_revision += 1;
         let fid = self.file_id(uri);
         log::debug!("file_id: {:?}, uri: {}", fid, uri.as_str());
 
@@ -159,6 +172,8 @@ impl Vfs {
             return None;
         }
 
+        self.content_revision += 1;
+
         match text {
             Some(content) => {
                 self.tree_map.insert(fid, tree);
@@ -188,6 +203,7 @@ impl Vfs {
         tree: LuaSyntaxTree,
         line_index: LineIndex,
     ) {
+        self.content_revision += 1;
         self.tree_map.insert(fid, tree);
         self.line_index_map.insert(fid, line_index);
         self.file_data[fid.id as usize] = Some(FileContent {
@@ -228,6 +244,8 @@ impl Vfs {
             return None;
         }
 
+        self.content_revision += 1;
+
         let mut deferred_drop = DeferredVfsDrop::default();
 
         match text {
@@ -252,6 +270,7 @@ impl Vfs {
     }
 
     pub fn set_remote_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
+        self.content_revision += 1;
         let fid = self.virtual_file_id(&uri);
         log::debug!("virtual file_id: {:?}, uri: {}", fid, uri.as_str());
 
@@ -279,6 +298,7 @@ impl Vfs {
 
     pub fn remove_file(&mut self, uri: &Uri) -> Option<FileId> {
         let fid = self.get_file_id(uri)?;
+        self.content_revision += 1;
         if let Some(path) = self.file_path_map.remove(&fid.id) {
             self.file_id_map.remove(&path);
         }
@@ -397,4 +417,90 @@ struct FileContent {
     content: String,
     is_remote: bool,
     version: Option<i32>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use glua_parser::{LineIndex, LuaParser};
+    use lsp_types::Uri;
+    use rowan::NodeCache;
+
+    use crate::Emmyrc;
+
+    use super::Vfs;
+
+    fn parse_lua(text: &str) -> (glua_parser::LuaSyntaxTree, LineIndex) {
+        let mut node_cache = NodeCache::default();
+        let emmyrc = Emmyrc::default();
+        let parse_config = emmyrc.get_parse_config(&mut node_cache);
+        (LuaParser::parse(text, parse_config), LineIndex::parse(text))
+    }
+
+    fn file_uri() -> Uri {
+        "file:///test.lua".parse().expect("valid test uri")
+    }
+
+    fn new_vfs() -> Vfs {
+        let mut vfs = Vfs::new();
+        vfs.update_config(Arc::new(Emmyrc::default()));
+        vfs
+    }
+
+    #[test]
+    fn stale_preparsed_update_does_not_bump_content_revision() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let (tree, line_index) = parse_lua("local a = 1");
+        vfs.set_file_content_preparsed(
+            &uri,
+            Some("local a = 1".to_string()),
+            tree,
+            line_index,
+            Some(2),
+        )
+        .expect("initial update should be accepted");
+        let revision = vfs.content_revision();
+
+        let (tree, line_index) = parse_lua("local a = 0");
+        let result = vfs.set_file_content_preparsed(
+            &uri,
+            Some("local a = 0".to_string()),
+            tree,
+            line_index,
+            Some(1),
+        );
+
+        assert!(result.is_none(), "stale update should be rejected");
+        assert_eq!(vfs.content_revision(), revision);
+    }
+
+    #[test]
+    fn stale_deferred_preparsed_update_does_not_bump_content_revision() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let (tree, line_index) = parse_lua("local a = 1");
+        vfs.set_file_content_preparsed_deferred(
+            &uri,
+            Some("local a = 1".to_string()),
+            tree,
+            line_index,
+            Some(2),
+        )
+        .expect("initial update should be accepted");
+        let revision = vfs.content_revision();
+
+        let (tree, line_index) = parse_lua("local a = 0");
+        let result = vfs.set_file_content_preparsed_deferred(
+            &uri,
+            Some("local a = 0".to_string()),
+            tree,
+            line_index,
+            Some(1),
+        );
+
+        assert!(result.is_none(), "stale update should be rejected");
+        assert_eq!(vfs.content_revision(), revision);
+    }
 }

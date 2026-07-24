@@ -6,7 +6,7 @@ use std::{
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 
-use super::LuaIndex;
+use super::{GmodLoadIndex, GmodLoadStatus, GmodStateMask, LuaIndex};
 use crate::FileId;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -14,7 +14,23 @@ pub enum GmodRealm {
     Client,
     Server,
     Shared,
+    Menu,
     Unknown,
+}
+
+impl GmodRealm {
+    pub fn state_mask(self) -> GmodStateMask {
+        GmodStateMask::from_realm(self)
+    }
+
+    pub fn is_compatible_with(self, other: Self) -> bool {
+        self.state_mask().is_compatible_with(other.state_mask())
+    }
+
+    pub fn is_strictly_incompatible_with(self, other: Self) -> bool {
+        self.state_mask()
+            .is_strictly_incompatible_with(other.state_mask())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +136,24 @@ pub struct GmodSystemAggregate {
     net_registration_count: HashMap<String, usize>,
     concommand_registration_count: HashMap<String, usize>,
     convar_registration_count: HashMap<String, usize>,
+    duplicate_registrations:
+        HashMap<(GmodSystemRegistrationKind, String), Vec<GmodSystemRegistration>>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum GmodSystemRegistrationKind {
+    NetMessage,
+    Concommand,
+    Convar,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodSystemRegistration {
+    pub kind: GmodSystemRegistrationKind,
+    pub convar_kind: Option<GmodConVarKind>,
+    pub name: String,
+    pub file_id: FileId,
+    pub name_range: TextRange,
 }
 
 impl GmodSystemAggregate {
@@ -144,6 +178,41 @@ impl GmodSystemAggregate {
             .copied()
             .unwrap_or(0)
     }
+
+    pub fn convar_registrations(&self, name: &str) -> &[GmodSystemRegistration] {
+        self.registrations(GmodSystemRegistrationKind::Convar, name)
+    }
+
+    fn add_registration(
+        &mut self,
+        kind: GmodSystemRegistrationKind,
+        convar_kind: Option<GmodConVarKind>,
+        name: &str,
+        file_id: FileId,
+        name_range: TextRange,
+    ) {
+        self.duplicate_registrations
+            .entry((kind, name.to_string()))
+            .or_default()
+            .push(GmodSystemRegistration {
+                kind,
+                convar_kind,
+                name: name.to_string(),
+                file_id,
+                name_range,
+            });
+    }
+
+    pub fn registrations(
+        &self,
+        kind: GmodSystemRegistrationKind,
+        name: &str,
+    ) -> &[GmodSystemRegistration] {
+        self.duplicate_registrations
+            .get(&(kind, name.to_string()))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
 }
 
 /// A range within a file that has a narrowed realm (from `if CLIENT then` etc).
@@ -156,6 +225,9 @@ pub struct GmodRealmRange {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodRealmFileMetadata {
     pub inferred_realm: GmodRealm,
+    pub load_realm: Option<GmodRealm>,
+    pub load_status: Option<GmodLoadStatus>,
+    pub load_state_mask: GmodStateMask,
     pub filename_hint: Option<GmodRealm>,
     pub dependency_hints: Vec<GmodRealm>,
     /// Realm set explicitly via `---@realm client|server|shared`.
@@ -168,6 +240,9 @@ impl Default for GmodRealmFileMetadata {
     fn default() -> Self {
         Self {
             inferred_realm: GmodRealm::Unknown,
+            load_realm: None,
+            load_status: None,
+            load_state_mask: GmodStateMask::empty(),
             filename_hint: None,
             dependency_hints: Vec::new(),
             annotation_realm: None,
@@ -176,11 +251,14 @@ impl Default for GmodRealmFileMetadata {
     }
 }
 
-/// Cached scoped class detection result: (class_name, global_name).
+/// Cached scoped class detection result and its configured semantic metadata.
 #[derive(Debug, Clone)]
 pub struct GmodScopedClassInfo {
     pub class_name: String,
     pub global_name: String,
+    pub is_global_singleton: bool,
+    pub aliases: Vec<String>,
+    pub super_types: Vec<String>,
     /// The scope's `classNamePrefix` (if any), cached so downstream synthesis
     /// (e.g. parent-name alias for gamemodes) can strip it back off without a
     /// second path scan.
@@ -234,7 +312,7 @@ impl GmodInferIndex {
     fn build_system_aggregate(&self) -> GmodSystemAggregate {
         let mut aggregate = GmodSystemAggregate::default();
 
-        for metadata in self.system_file_metadata.values() {
+        for (file_id, metadata) in &self.system_file_metadata {
             for site in &metadata.net_add_string_calls {
                 if let Some(name) = normalize_system_name(site.name.as_deref()) {
                     aggregate.known_net_messages.insert(name.to_string());
@@ -242,6 +320,15 @@ impl GmodInferIndex {
                         .net_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::NetMessage,
+                            None,
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
 
@@ -251,6 +338,15 @@ impl GmodInferIndex {
                         .concommand_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::Concommand,
+                            None,
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
 
@@ -260,6 +356,15 @@ impl GmodInferIndex {
                         .convar_registration_count
                         .entry(name.to_string())
                         .or_insert(0) += 1;
+                    if let Some(name_range) = site.name_range {
+                        aggregate.add_registration(
+                            GmodSystemRegistrationKind::Convar,
+                            Some(site.kind),
+                            name,
+                            *file_id,
+                            name_range,
+                        );
+                    }
                 }
             }
         }
@@ -273,6 +378,34 @@ impl GmodInferIndex {
             .or_default()
             .sites
             .push(site);
+    }
+
+    /// Bulk-add hook sites collected for a file (preserving order). Used by the
+    /// parallel gmod-pre collection, which gathers a file's sites off-thread and
+    /// merges them sequentially. No-op when `sites` is empty.
+    pub fn add_hook_sites(&mut self, file_id: FileId, sites: Vec<GmodHookSiteMetadata>) {
+        if sites.is_empty() {
+            return;
+        }
+        self.hook_file_metadata
+            .entry(file_id)
+            .or_default()
+            .sites
+            .extend(sites);
+    }
+
+    /// Replace a file's collected system metadata (net/concommand/convar/timer
+    /// sites) wholesale. Used by the parallel gmod-pre collection. Invalidates
+    /// the system aggregate cache since registration counts may change.
+    pub fn set_system_file_metadata(&mut self, file_id: FileId, metadata: GmodSystemFileMetadata) {
+        if metadata == GmodSystemFileMetadata::default() {
+            if self.system_file_metadata.remove(&file_id).is_some() {
+                self.invalidate_system_aggregate_cache();
+            }
+            return;
+        }
+        self.invalidate_system_aggregate_cache();
+        self.system_file_metadata.insert(file_id, metadata);
     }
 
     pub fn get_hook_file_metadata(&self, file_id: &FileId) -> Option<&GmodHookFileMetadata> {
@@ -351,6 +484,32 @@ impl GmodInferIndex {
             .get_or_init(|| self.build_system_aggregate())
     }
 
+    pub fn has_compatible_duplicate_registration(
+        &self,
+        load_index: &GmodLoadIndex,
+        kind: GmodSystemRegistrationKind,
+        name: &str,
+        file_id: &FileId,
+        name_range: TextRange,
+    ) -> bool {
+        self.get_system_aggregate()
+            .registrations(kind, name)
+            .iter()
+            .any(|registration| {
+                (registration.file_id != *file_id || registration.name_range != name_range)
+                    && !load_index.files_are_mutually_exclusive_by_load_shadowing(
+                        *file_id,
+                        registration.file_id,
+                    )
+                    && self.are_offsets_compatible(
+                        file_id,
+                        name_range.start(),
+                        &registration.file_id,
+                        registration.name_range.start(),
+                    )
+            })
+    }
+
     pub fn get_realm_file_metadata(&self, file_id: &FileId) -> Option<&GmodRealmFileMetadata> {
         self.realm_file_metadata.get(file_id)
     }
@@ -374,6 +533,51 @@ impl GmodInferIndex {
         }
         // Fall back to annotation realm (for meta/annotation files)
         metadata.annotation_realm.unwrap_or(GmodRealm::Unknown)
+    }
+
+    pub fn get_state_mask_at_offset(
+        &self,
+        file_id: &FileId,
+        offset: rowan::TextSize,
+    ) -> GmodStateMask {
+        let Some(metadata) = self.realm_file_metadata.get(file_id) else {
+            return GmodStateMask::empty();
+        };
+        let file_mask = file_state_mask(metadata);
+
+        for range in &metadata.branch_realm_ranges {
+            if range.range.contains(offset) {
+                let branch_mask = range.realm.state_mask();
+                if file_mask.is_empty() {
+                    return branch_mask;
+                }
+
+                return branch_mask.intersection(file_mask);
+            }
+        }
+
+        file_mask
+    }
+
+    pub fn are_state_masks_compatible(left: GmodStateMask, right: GmodStateMask) -> bool {
+        left.is_compatible_with(right)
+    }
+
+    pub fn are_realms_compatible(left: GmodRealm, right: GmodRealm) -> bool {
+        left.is_compatible_with(right)
+    }
+
+    pub fn are_offsets_compatible(
+        &self,
+        left_file_id: &FileId,
+        left_offset: rowan::TextSize,
+        right_file_id: &FileId,
+        right_offset: rowan::TextSize,
+    ) -> bool {
+        Self::are_state_masks_compatible(
+            self.get_state_mask_at_offset(left_file_id, left_offset),
+            self.get_state_mask_at_offset(right_file_id, right_offset),
+        )
     }
 
     pub fn set_all_realm_file_metadata(
@@ -411,6 +615,13 @@ impl GmodInferIndex {
         }
         ranges.sort_by_key(|r| r.range.start());
         self.member_realm_ranges.insert(file_id, ranges);
+    }
+
+    /// Returns `true` if gmod_pre already populated member realm ranges for this file.
+    /// Use as a guard before calling `get_member_annotation_realm_at_offset` to distinguish
+    /// "no ranges for this file" (pre ran, file had none) from "pre not yet run" (fall back).
+    pub fn has_member_realm_ranges(&self, file_id: &FileId) -> bool {
+        self.member_realm_ranges.contains_key(file_id)
     }
 
     /// `---@realm` covering decl at `offset`. O(log n).
@@ -480,6 +691,20 @@ impl LuaIndex for GmodInferIndex {
         self.fileparam_index.clear();
         self.scoped_class_info.clear();
     }
+}
+
+fn file_state_mask(metadata: &GmodRealmFileMetadata) -> GmodStateMask {
+    if let Some(annotation_realm) = metadata.annotation_realm {
+        return annotation_realm.state_mask();
+    }
+    if !metadata.load_state_mask.is_empty() {
+        return metadata.load_state_mask;
+    }
+    if metadata.inferred_realm != GmodRealm::Unknown {
+        return metadata.inferred_realm.state_mask();
+    }
+
+    GmodStateMask::empty()
 }
 
 fn normalize_system_name(name: Option<&str>) -> Option<&str> {

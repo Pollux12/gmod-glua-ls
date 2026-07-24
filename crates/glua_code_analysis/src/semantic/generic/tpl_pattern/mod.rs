@@ -10,8 +10,8 @@ use smol_str::SmolStr;
 
 use crate::{
     InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaTupleType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, TypeOps,
-    VariadicType, check_type_compact,
+    LuaSemanticDeclId, LuaStringTplType, LuaTupleType, LuaTypeDeclId, LuaUnionType,
+    SemanticDeclLevel, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
     semantic::{
@@ -159,9 +159,40 @@ fn get_str_tpl_infer_type(
     }
 }
 
-fn get_str_tpl_infer_type_from_value(
+fn infer_str_tpl_target_type(
     context: &mut TplContext,
-    str_tpl: &crate::LuaStringTplType,
+    str_tpl: &LuaStringTplType,
+    target: &LuaType,
+) -> Option<LuaType> {
+    match target {
+        LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
+            Some(infer_str_tpl_member_type(context, str_tpl, s.as_str()))
+        }
+        LuaType::Union(union) => {
+            let mut inferred = Vec::new();
+            for member in union.types() {
+                let member = escape_alias(context.db, member);
+                match member {
+                    LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
+                        inferred.push(infer_str_tpl_member_type(context, str_tpl, s.as_str()));
+                    }
+                    _ => return None,
+                }
+            }
+
+            match inferred.len() {
+                0 => None,
+                1 => inferred.into_iter().next(),
+                _ => Some(LuaType::Union(LuaUnionType::from_vec(inferred).into())),
+            }
+        }
+        _ => None,
+    }
+}
+
+fn infer_str_tpl_member_type(
+    context: &mut TplContext,
+    str_tpl: &LuaStringTplType,
     value: &str,
 ) -> LuaType {
     let type_name = SmolStr::new(format!(
@@ -199,39 +230,13 @@ pub fn tpl_pattern_match(
                     .insert_type(tpl.get_tpl_id(), target, false);
             }
         }
-        LuaType::StrTplRef(str_tpl) => match target {
-            LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
-                let inferred_type = get_str_tpl_infer_type_from_value(context, str_tpl, &s);
+        LuaType::StrTplRef(str_tpl) => {
+            if let Some(inferred_type) = infer_str_tpl_target_type(context, str_tpl, &target) {
                 context
                     .substitutor
                     .insert_type(str_tpl.get_tpl_id(), inferred_type, true);
             }
-            LuaType::Union(union) => {
-                let mut inferred_type: Option<LuaType> = None;
-                for target_type in union.into_vec() {
-                    let next_type = match target_type {
-                        LuaType::StringConst(s) | LuaType::DocStringConst(s) => {
-                            get_str_tpl_infer_type_from_value(context, str_tpl, &s)
-                        }
-                        _ => return Ok(()),
-                    };
-
-                    inferred_type = Some(match inferred_type {
-                        Some(current_type) => {
-                            TypeOps::Union.apply(context.db, &current_type, &next_type)
-                        }
-                        None => next_type,
-                    });
-                }
-
-                if let Some(inferred_type) = inferred_type {
-                    context
-                        .substitutor
-                        .insert_type(str_tpl.get_tpl_id(), inferred_type, true);
-                }
-            }
-            _ => {}
-        },
+        }
         LuaType::Array(array_type) => {
             array_tpl_pattern_match(context, array_type.get_base(), &target)?;
         }
@@ -606,8 +611,8 @@ fn union_tpl_pattern_match(
 ) -> TplPatternMatchResult {
     let mut error_count = 0;
     let mut last_error = InferFailReason::None;
-    for u in union.into_vec() {
-        match tpl_pattern_match(context, &u, target) {
+    for u in union.types() {
+        match tpl_pattern_match(context, u, target) {
             // 返回 ok 时并不一定匹配成功, 仅表示没有发生错误
             Ok(_) => {}
             Err(e) => {
@@ -617,7 +622,7 @@ fn union_tpl_pattern_match(
         }
     }
 
-    if error_count == union.into_vec().len() {
+    if error_count == union.types().count() {
         Err(last_error)
     } else {
         Ok(())

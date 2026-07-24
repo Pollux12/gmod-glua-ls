@@ -29,7 +29,8 @@ mod test {
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("expected semantic info")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     fn index_expr_type_by_text(
@@ -57,7 +58,8 @@ mod test {
         semantic_model
             .get_semantic_info(index_expr.syntax().clone().into())
             .expect("expected semantic info")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     /// Returns the `SemanticInfo` for the index-key NAME TOKEN of the index expression
@@ -481,7 +483,7 @@ mod test {
 
         let rendered = humanize_type(
             ws.analysis.compilation.get_db(),
-            &info.typ,
+            info.display_typ(),
             RenderLevel::Detailed,
         );
         assert_ne!(
@@ -725,9 +727,9 @@ mod test {
             .expect("expected semantic info");
 
         assert!(
-            matches!(&info.typ, LuaType::Namespace(name) if name.as_str() == "tc"),
+            matches!(info.display_typ(), LuaType::Namespace(name) if name.as_str() == "tc"),
             "self-reference to module name in-module must infer as Namespace(\"tc\"), got {:?}",
-            info.typ
+            info.display_typ().clone()
         );
     }
 
@@ -884,7 +886,7 @@ local _ = tc
         assert!(
             info.semantic_decl.is_some(),
             "semantic_decl via name token must be Some for includes.File, got type: {:?}",
-            info.typ
+            info.display_typ().clone()
         );
     }
 

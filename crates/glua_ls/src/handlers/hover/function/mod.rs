@@ -371,7 +371,9 @@ fn merge_docless_realms(
     }
 
     let merged = match caller_realm {
-        glua_code_analysis::GmodRealm::Server | glua_code_analysis::GmodRealm::Client => {
+        glua_code_analysis::GmodRealm::Server
+        | glua_code_analysis::GmodRealm::Client
+        | glua_code_analysis::GmodRealm::Menu => {
             if incoming_realm == glua_code_analysis::GmodRealm::Shared {
                 glua_code_analysis::GmodRealm::Shared
             } else {
@@ -481,11 +483,11 @@ fn process_function_type(
         }
         LuaType::Union(union) => {
             let mut contents = Vec::new();
-            for typ in union.into_vec() {
+            for typ in union.types() {
                 if let Some(content) = process_function_type(
                     builder,
                     db,
-                    &typ,
+                    typ,
                     function_member,
                     function_name,
                     is_local,
@@ -550,7 +552,7 @@ fn hover_doc_function_type(
             match parent_owner {
                 LuaMemberOwner::Type(type_decl_id) => {
                     if let Some(owner_ty) = concrete_owner_type.cloned() {
-                        if let Some(prefix) = owner_type_display_name(&owner_ty) {
+                        if let Some(prefix) = owner_type_display_name(db, &owner_ty) {
                             push_typed_owner_prefix(&prefix, owner_ty);
                         } else {
                             let prefix =
@@ -610,23 +612,27 @@ fn infer_call_owner_type(
     db: &DbIndex,
     call_expr: &glua_parser::LuaCallExpr,
 ) -> Option<LuaType> {
-    if !matches!(
-        call_expr.get_prefix_expr()?,
-        glua_parser::LuaExpr::NameExpr(_)
-    ) {
-        return None;
-    }
-
+    let prefix_expr = call_expr.get_prefix_expr()?;
     let mut cache = builder.semantic_model.get_cache().borrow_mut();
-    infer_self_type(db, &mut cache, call_expr)
+    let owner_type = infer_self_type(db, &mut cache, call_expr)?;
+    match prefix_expr {
+        glua_parser::LuaExpr::NameExpr(_) => Some(owner_type),
+        // Ordinary index calls keep the member declaration's owner because
+        // replacing it can change field/method classification or hide an
+        // intersection member's defining type. A union has no single truthful
+        // owner, so render the receiver union instead of an arbitrary member.
+        glua_parser::LuaExpr::IndexExpr(_) if owner_type.is_union() => Some(owner_type),
+        _ => None,
+    }
 }
 
-fn owner_type_display_name(owner_type: &LuaType) -> Option<String> {
+fn owner_type_display_name(db: &DbIndex, owner_type: &LuaType) -> Option<String> {
     match owner_type {
         LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id) => {
             Some(type_decl_id.get_simple_name().to_string())
         }
         LuaType::Generic(generic) => Some(generic.get_base_type_id().get_simple_name().to_string()),
+        LuaType::Union(_) => Some(humanize_type(db, owner_type, RenderLevel::Simple)),
         _ => None,
     }
 }
@@ -770,6 +776,7 @@ pub(crate) fn format_doc_default_value(default_value: &LuaDocDefaultValue) -> St
         LuaDocDefaultValue::Boolean(value) => value.to_string(),
         LuaDocDefaultValue::Number(value) => value.clone(),
         LuaDocDefaultValue::String(value) => format!("{value:?}"),
+        LuaDocDefaultValue::Expression(value) => value.clone(),
     }
 }
 
@@ -933,8 +940,7 @@ pub fn is_function(typ: &LuaType) -> bool {
     typ.is_function()
         || match &typ {
             LuaType::Union(union) => union
-                .into_vec()
-                .iter()
+                .types()
                 .all(|t| matches!(t, LuaType::DocFunction(_) | LuaType::Signature(_))),
             _ => false,
         }

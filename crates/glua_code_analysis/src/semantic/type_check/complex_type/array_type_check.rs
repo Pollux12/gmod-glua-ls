@@ -1,6 +1,6 @@
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaType, TypeCheckFailReason, TypeCheckResult, TypeOps,
-    find_index_operations,
+    VariadicType, find_index_operations,
     semantic::type_check::{
         check_general_type_compact, type_check_context::TypeCheckContext,
         type_check_guard::TypeCheckGuard,
@@ -30,6 +30,13 @@ pub fn check_array_type_compact(
         }
         LuaType::Tuple(tuple_type) => {
             for element_type in tuple_type.get_types() {
+                let element_type = match element_type {
+                    LuaType::Variadic(variadic) => match variadic.as_ref() {
+                        VariadicType::Base(base) => base,
+                        VariadicType::Multi(_) => element_type,
+                    },
+                    _ => element_type,
+                };
                 check_general_type_compact(
                     context,
                     &source_base,
@@ -62,18 +69,22 @@ pub fn check_array_type_compact(
         }
         LuaType::Table => return Ok(()),
         LuaType::TableGeneric(compact_types) => {
-            if compact_types.len() == 2 {
-                for typ in compact_types.iter() {
-                    check_general_type_compact(
-                        context,
-                        &source_base,
-                        typ,
-                        check_guard.next_level()?,
-                    )?;
-                }
-
-                return Ok(());
-            }
+            let (compact_key, compact_value) = match compact_types.as_slice() {
+                [key, value] => (key, value),
+                _ => return Err(TypeCheckFailReason::DonotCheck),
+            };
+            check_general_type_compact(
+                context,
+                &LuaType::Integer,
+                compact_key,
+                check_guard.next_level()?,
+            )?;
+            return check_general_type_compact(
+                context,
+                &source_base,
+                compact_value,
+                check_guard.next_level()?,
+            );
         }
         LuaType::Any => return Ok(()),
         LuaType::Ref(_) | LuaType::Def(_) => {

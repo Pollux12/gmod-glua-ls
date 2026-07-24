@@ -27,6 +27,7 @@ pub(super) fn convert_doc_default_value(default: ParsedDocDefaultValue) -> LuaDo
         ParsedDocDefaultValue::Boolean(value) => LuaDocDefaultValue::Boolean(value),
         ParsedDocDefaultValue::Number(value) => LuaDocDefaultValue::Number(value),
         ParsedDocDefaultValue::String(value) => LuaDocDefaultValue::String(value),
+        ParsedDocDefaultValue::Expression(value) => LuaDocDefaultValue::Expression(value),
     }
 }
 

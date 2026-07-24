@@ -1,0 +1,61 @@
+---
+title: Command-line checks
+description: Run GLuaLS diagnostics from a terminal or a continuous integration job.
+---
+
+## Install
+
+`glua_check` runs the same analyzer and diagnostics as the language server. Use it when you want to check a project without opening an editor.
+
+```bash
+cargo install glua_check
+```
+
+## Check a project
+
+Run the command with one or more addon or gamemode folders:
+
+```bash
+glua_check .
+```
+
+The command finds `.gluarc.json` in the workspace and prints diagnostics to the terminal. It exits with code `1` when it finds an error.
+
+To make warnings fail the command too, add `--warnings-as-errors`:
+
+```bash
+glua_check . --warnings-as-errors
+```
+
+## Load Garry's Mod API definitions
+
+Pass the generated annotations folder when you run `glua_check` outside the VS Code extension:
+
+```bash
+glua_check . --gmod-annotations /path/to/gmod/annotations
+```
+
+The API definitions load before your configured libraries, so those libraries can use Garry's Mod types and wrapper behavior.
+
+## Output formats
+
+The default `text` output is easy to read in a terminal. Use `json` for scripts or `sarif` for code scanning tools:
+
+```bash
+glua_check . --output-format json --output diagnostics.json
+glua_check . --output-format sarif --output diagnostics.sarif
+```
+
+## Useful options
+
+| Option | Description |
+|---|---|
+| `-c, --config <PATHS>` | Use specific config files. Separate multiple paths with commas |
+| `-i, --ignore <PATTERNS>` | Ignore comma-separated glob patterns |
+| `-f, --output-format <FORMAT>` | Use `text`, `json`, or `sarif` output |
+| `--output <DESTINATION>` | Write JSON or SARIF output to a file; the default is standard output |
+| `--warnings-as-errors` | Exit with code `1` for warnings as well as errors |
+| `--gmod-annotations <PATH>` | Load Garry's Mod API definitions from a folder |
+| `--verbose` | Print additional loading information |
+
+Run `glua_check --help` for the complete command reference.

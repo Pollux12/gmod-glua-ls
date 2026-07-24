@@ -7,7 +7,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 ## Overview
 
-GLuaLS supports VGUI, GMod's panel GUI system. It understands `vgui.Create()` calls and the panel inheritance hierarchy, and it provides IDE features for VGUI development.
+GLuaLS understands VGUI panel creation, registration, and inheritance. A created panel keeps both its registered type and the standard panel methods inherited from its parent.
 
 ---
 
@@ -77,7 +77,7 @@ vgui.Register("MyPanel", PANEL, "DPanel")
 -- that inherits from DPanel
 ```
 
-After `vgui.Register(name, PANEL, base)`, GLuaLS recognizes `"MyPanel"` in later `vgui.Create("MyPanel")` calls. The panel type includes all methods from the `PANEL` table plus inherited `DPanel` methods.
+After `vgui.Register(name, PANEL, base)`, GLuaLS recognizes `"MyPanel"` in later constructors. The panel type includes methods from the `PANEL` table and inherited `DPanel` methods.
 
 ---
 
@@ -118,13 +118,13 @@ end
 
 ---
 
-## Scripted Entity Explorer
+## Class Explorer
 
 The Scripted Class Explorer lists VGUI panels for navigation. Click a panel class in the explorer to open its definition.
 
-## VSCode integration
+## VS Code integration
 
-VGUI features work after the extension starts. The Class Explorer sidebar shows registered panel types under the Classes section. Configure VGUI support in the [settings panel](/configuration/overview#settings-panel-recommended). See [GMod settings](/configuration/gmod#vgui) for the full reference.
+VGUI features work after the extension starts. The Class Explorer sidebar shows registered panel types under the Classes section. Configure VGUI support in the [settings panel](/configuration/overview#settings-panel-recommended). See [Garry's Mod settings](/configuration/gmod#vgui) for the full reference.
 
 ## Configuration
 

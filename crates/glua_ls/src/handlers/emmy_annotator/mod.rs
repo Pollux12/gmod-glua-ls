@@ -26,7 +26,7 @@ pub async fn on_emmy_annotator_handler(
     // new didChange fires cancel_all_requests().
     if !context
         .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
+        .wait_until_fresh_for(&cancel_token, "gluals/emmyAnnotator")
         .await
     {
         return None;

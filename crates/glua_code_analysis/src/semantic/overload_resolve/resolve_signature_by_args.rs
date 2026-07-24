@@ -99,6 +99,8 @@ pub fn resolve_signature_by_args(
                 ParamMatchResult::Exact
             } else if check_type_compact(db, &param_type, expr_type).is_ok() {
                 ParamMatchResult::Type
+            } else if has_union_component_param_match(db, &param_type, expr_type) {
+                ParamMatchResult::UnionComponent
             } else {
                 ParamMatchResult::Not
             };
@@ -254,10 +256,26 @@ fn is_exact_param_match(param_type: &LuaType, expr_type: &LuaType) -> bool {
     )
 }
 
+fn has_union_component_param_match(
+    db: &DbIndex,
+    param_type: &LuaType,
+    expr_type: &LuaType,
+) -> bool {
+    let LuaType::Union(union) = expr_type else {
+        return false;
+    };
+
+    union.types().any(|component| {
+        is_exact_param_match(param_type, component)
+            || check_type_compact(db, param_type, component).is_ok()
+    })
+}
+
 #[derive(Debug, PartialEq, Eq, PartialOrd, Ord, Clone, Copy)]
 enum ParamMatchResult {
     Not,
     Any,
+    UnionComponent,
     Type,
     Exact,
 }

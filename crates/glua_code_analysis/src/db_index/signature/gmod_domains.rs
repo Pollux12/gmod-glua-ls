@@ -1,0 +1,979 @@
+//! Centralized Garry's Mod metadata domains and roles.
+//!
+//! This module provides typed/shared constants for the GMod metadata domains
+//! currently consumed by call-arg roles (`@call_arg`, `@call_arg_field`,
+//! `@overload_call_arg`, `@overload_call_arg_field`), plus a small set of
+//! Phase 1 metadata names reserved for future annotation-driven recognizer
+//! phases (`gmod.member_guard`, `gmod.self_guard`, `gmod.valid_guard`,
+//! `gmod.net_payload`).
+//!
+//! It also exposes cheap, general-purpose helpers built on top of the existing
+//! `LuaSignature::visit_call_arg_roles_for_param` /
+//! `find_call_arg_role_from_type` infrastructure and the existing
+//! `LuaPropertyIndex` standalone-attribute storage keyed by
+//! `LuaSemanticDeclId::Signature`. No class/type-level `---@class` attribute
+//! support is added here; signature-level standalone attributes only.
+//!
+//! These helpers are intentionally mechanical: they centralize raw domain/role
+//! strings and selection logic so analyzer and LSP code can consume them
+//! without duplicating literals, and without introducing broad per-call
+//! semantic inference or whole-workspace scans.
+
+use crate::{
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberKey, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, db_index::declaration::LuaDeclExtra,
+};
+
+use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_type};
+
+// ---------------------------------------------------------------------------
+// Domain constants.
+// ---------------------------------------------------------------------------
+
+/// Load/path discovery domain (e.g. `include`, `AddCSLuaFile`, `require`).
+pub const GMOD_DOMAIN_LOAD: &str = "gmod.load";
+
+/// Execution-environment assignment domain (e.g. `setfenv`).
+pub const GMOD_DOMAIN_ENVIRONMENT: &str = "gmod.environment";
+
+/// Document-color domain (e.g. `Color(r, g, b, a)` channel roles).
+pub const GMOD_DOMAIN_COLOR: &str = "gmod.color";
+
+/// Scripted-class base reference domain (e.g. `DEFINE_BASECLASS`).
+pub const GMOD_DOMAIN_CLASS_BASE: &str = "gmod.class_base";
+
+/// Gamemode derivation domain (e.g. `DeriveGamemode`).
+pub const GMOD_DOMAIN_GAMEMODE: &str = "gmod.gamemode";
+
+/// Network variable definition domain (e.g. `Entity:NetworkVar`).
+pub const GMOD_DOMAIN_NETWORK_VAR: &str = "gmod.network_var";
+
+/// VGUI panel definition/registration domain.
+pub const GMOD_DOMAIN_VGUI_PANEL: &str = "gmod.vgui_panel";
+
+/// Derma skin definition/reference domain.
+pub const GMOD_DOMAIN_DERMA_SKIN: &str = "gmod.derma_skin";
+
+/// Net message definition/start/receive domain.
+pub const GMOD_DOMAIN_NET_MESSAGE: &str = "gmod.net_message";
+
+/// Hook registration/emission/removal domain.
+pub const GMOD_DOMAIN_HOOK: &str = "gmod.hook";
+
+/// Concommand definition/callback domain.
+pub const GMOD_DOMAIN_CONCOMMAND: &str = "gmod.concommand";
+
+/// ConVar definition domain (server/client).
+pub const GMOD_DOMAIN_CONVAR: &str = "gmod.convar";
+
+/// Timer definition/callback domain.
+pub const GMOD_DOMAIN_TIMER: &str = "gmod.timer";
+
+/// File discovery (`file.Find`) domain.
+pub const GMOD_DOMAIN_FILE_FIND: &str = "gmod.file_find";
+
+/// Generic string-registry lookup/reference role, domain-scoped.
+///
+/// A true-branch call carrying [`GMOD_ROLE_EXISTS`] may prove a direct call carrying this role
+/// non-nil when both roles share the same domain and static string key.
+pub const GMOD_ROLE_REFERENCE: &str = "reference";
+
+/// Generic string-registry existence predicate role, domain-scoped.
+///
+/// See [`GMOD_ROLE_REFERENCE`] for the diagnostic-layer existence guard contract.
+pub const GMOD_ROLE_EXISTS: &str = "exists";
+
+/// Explicit runtime parent argument for a constructed VGUI panel.
+pub const GMOD_ROLE_VGUI_PARENT: &str = "parent";
+
+/// The call receiver is the VGUI panel whose parent is being set.
+pub const GMOD_ROLE_VGUI_CHILD_SELF: &str = "child_self";
+
+/// The call receiver is the runtime parent of the constructed VGUI panel.
+pub const GMOD_ROLE_VGUI_PARENT_SELF: &str = "parent_self";
+
+// ---------------------------------------------------------------------------
+// Phase 1 reserved metadata names.
+// ---------------------------------------------------------------------------
+
+/// Reserved for future member-guard call-argument roles: a guard predicate
+/// parameter that intentionally accepts an index/member expression whose
+/// existence or callable shape is being tested.
+pub const GMOD_DOMAIN_MEMBER_GUARD: &str = "gmod.member_guard";
+
+/// Reserved for future self-guard markers: a signature that establishes a
+/// guarded `self` parameter contract. Modeled as a signature-level standalone
+/// attribute.
+pub const GMOD_DOMAIN_SELF_GUARD: &str = "gmod.self_guard";
+
+/// Signature-level standalone attribute name for self/receiver guard metadata.
+///
+/// The domain value above is carried as an argument to this attribute; the
+/// attribute id itself intentionally stays a single name so it resolves through
+/// the current attribute storage path (`---@[self_guard("gmod.entity")]`).
+pub const GMOD_ATTR_SELF_GUARD: &str = "self_guard";
+
+/// Signature-level standalone attribute name for callbacks where calling a
+/// named method on callback `self` is guaranteed to return a valid value.
+///
+/// Example: `---@[self_call_valid("GetOwner")]` on weapon fire callbacks means
+/// `self:GetOwner()` is valid inside that callback, without changing the global
+/// `Weapon:GetOwner()` return type.
+pub const GMOD_ATTR_SELF_CALL_VALID: &str = "self_call_valid";
+
+/// Reserved for validity guards: predicates that prove the guarded value is a
+/// valid/truthy runtime object without reclassifying it to the guard return's
+/// inner type.
+pub const GMOD_DOMAIN_VALID_GUARD: &str = "gmod.valid_guard";
+
+/// Signature-level standalone attribute name for validity-guard metadata.
+///
+/// Example: `---@[valid_guard]` on global `IsValid` means the true branch should
+/// remove false/nil/NULL from the guarded expression while preserving its known
+/// static type when one exists.
+pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
+
+/// Signature-level standalone attribute name for calls whose write effects are
+/// bounded to the listed global/root identities.
+///
+/// Example: `---@[writes_global("ConVarCache")]` on `GetConVar` means the call
+/// may mutate `_G.ConVarCache`, but should be rejected by consumers whose proof
+/// depends on that root. This is not purity; unknown writes outside the listed
+/// roots are not permitted by the metadata contract.
+pub const GMOD_ATTR_WRITES_GLOBAL: &str = "writes_global";
+
+/// Reserved for future net-payload markers: a signature carrying or consuming a
+/// typed net payload. Modeled as a signature-level standalone attribute.
+pub const GMOD_DOMAIN_NET_PAYLOAD: &str = "gmod.net_payload";
+
+/// All currently-active GMod call-arg domains, sorted for stable, deterministic
+/// iteration. Callers must never assume any domain-specific precedence from the
+/// order here; role priority comes from each role's `priority` field.
+pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
+    GMOD_DOMAIN_CLASS_BASE,
+    GMOD_DOMAIN_COLOR,
+    GMOD_DOMAIN_CONCOMMAND,
+    GMOD_DOMAIN_CONVAR,
+    GMOD_DOMAIN_DERMA_SKIN,
+    GMOD_DOMAIN_ENVIRONMENT,
+    GMOD_DOMAIN_FILE_FIND,
+    GMOD_DOMAIN_GAMEMODE,
+    GMOD_DOMAIN_HOOK,
+    GMOD_DOMAIN_LOAD,
+    GMOD_DOMAIN_NET_MESSAGE,
+    GMOD_DOMAIN_NETWORK_VAR,
+    GMOD_DOMAIN_TIMER,
+    GMOD_DOMAIN_VGUI_PANEL,
+];
+
+/// Phase 1 reserved signature-level metadata domains (no call-arg roles yet).
+pub const GMOD_SIGNATURE_METADATA_DOMAINS: &[&str] = &[
+    GMOD_DOMAIN_SELF_GUARD,
+    GMOD_DOMAIN_VALID_GUARD,
+    GMOD_DOMAIN_NET_PAYLOAD,
+];
+
+// ---------------------------------------------------------------------------
+// Call-arg role selection helpers.
+// ---------------------------------------------------------------------------
+
+/// Returns the highest-priority call-arg role attached to `param_idx` of
+/// `signature` whose `domain` matches and whose `role` is listed in `roles`.
+///
+/// This is a thin, cheap selector over [`LuaSignature::visit_call_arg_roles_for_param`]:
+/// it visits only the roles already attached to the given signature/param (plus
+/// its overloads) and picks the one with the largest `priority` (missing
+/// priorities are treated as `0`). It performs no per-call semantic inference
+/// and does not scan other signatures.
+///
+/// Pass `&[]` for `roles` to match any role within `domain`.
+pub fn find_best_call_arg_role_for_param(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_for_param_by(signature, param_idx, domain, roles, |_| true)
+}
+
+pub fn find_best_direct_call_arg_role_for_param(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_for_param_by(signature, param_idx, domain, roles, |role| {
+        role.is_direct_arg()
+    })
+}
+
+fn find_best_call_arg_role_for_param_by(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+    mut predicate: impl FnMut(&LuaCallArgRole) -> bool,
+) -> Option<LuaCallArgRole> {
+    let mut best: Option<LuaCallArgRole> = None;
+    let mut consider = |role: &LuaCallArgRole| {
+        if !predicate(role) {
+            return;
+        }
+        if role.domain != domain {
+            return;
+        }
+        if !roles.is_empty() && !roles.iter().any(|candidate| *candidate == role.role) {
+            return;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| role.priority.unwrap_or(0) > current.priority.unwrap_or(0))
+        {
+            best = Some(role.clone());
+        }
+    };
+    signature.visit_call_arg_roles_for_param(param_idx, &mut consider);
+    best
+}
+
+/// Like [`find_best_call_arg_role_for_param`] but resolves roles from a
+/// `LuaType` (typically a callee's resolved type) via the existing
+/// [`visit_call_arg_roles_from_type`] traversal. Useful for callers that
+/// already hold the resolved callee type rather than a `LuaSignature` handle.
+///
+/// Pass `&[]` for `roles` to match any role within `domain`, matching
+/// [`find_best_call_arg_role_for_param`].
+pub fn find_best_call_arg_role_from_type(
+    db: &DbIndex,
+    typ: &crate::LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_from_type_by(db, typ, arg_idx, domain, roles, |_| true)
+}
+
+pub fn find_best_direct_call_arg_role_from_type(
+    db: &DbIndex,
+    typ: &crate::LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Option<LuaCallArgRole> {
+    find_best_call_arg_role_from_type_by(db, typ, arg_idx, domain, roles, |role| {
+        role.is_direct_arg()
+    })
+}
+
+fn find_best_call_arg_role_from_type_by(
+    db: &DbIndex,
+    typ: &crate::LuaType,
+    arg_idx: usize,
+    domain: &str,
+    roles: &[&str],
+    mut predicate: impl FnMut(&LuaCallArgRole) -> bool,
+) -> Option<LuaCallArgRole> {
+    let mut best: Option<LuaCallArgRole> = None;
+    visit_call_arg_roles_from_type(db, typ, arg_idx, &mut |role| {
+        if !predicate(role) {
+            return;
+        }
+        if role.domain != domain {
+            return;
+        }
+        if !roles.is_empty() && !roles.iter().any(|candidate| *candidate == role.role) {
+            return;
+        }
+        if best
+            .as_ref()
+            .is_none_or(|current| role.priority.unwrap_or(0) > current.priority.unwrap_or(0))
+        {
+            best = Some(role.clone());
+        }
+    });
+    best
+}
+
+/// Collects *all* call-arg roles for `param_idx` whose domain matches (and
+/// whose role is in `roles`, when non-empty), sorted by descending priority
+/// then by param index. This is the non-selective counterpart to
+/// [`find_best_call_arg_role_for_param`] for callers that need every matching
+/// role rather than just the best.
+pub fn collect_call_arg_roles_for_param(
+    signature: &LuaSignature,
+    param_idx: usize,
+    domain: &str,
+    roles: &[&str],
+) -> Vec<LuaCallArgRole> {
+    let mut roles_out = Vec::new();
+    signature.visit_call_arg_roles_for_param(param_idx, &mut |role| {
+        if role.domain != domain {
+            return;
+        }
+        if !roles.is_empty() && !roles.iter().any(|candidate| *candidate == role.role) {
+            return;
+        }
+        roles_out.push(role.clone());
+    });
+    roles_out.sort_by_key(|role| {
+        (
+            role.param_idx,
+            std::cmp::Reverse(role.priority.unwrap_or(0)),
+        )
+    });
+    roles_out
+}
+
+// ---------------------------------------------------------------------------
+// Signature-level standalone attribute helpers.
+// ---------------------------------------------------------------------------
+
+/// Returns the standalone attribute uses attached directly to a signature
+/// (i.e. attributes stored against `LuaSemanticDeclId::Signature(signature_id)`
+/// in the property index), if any.
+///
+/// This reads existing storage only; it does not synthesize or scan
+/// class/type-level attributes. Use [`find_signature_attribute_use`] for a
+/// single-name lookup.
+pub fn signature_attribute_uses(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<&[crate::LuaAttributeUse]> {
+    let property = db
+        .get_property_index()
+        .get_property(&crate::LuaSemanticDeclId::Signature(signature_id))?;
+    property.attribute_uses().map(|uses| uses.as_slice())
+}
+
+/// Finds a standalone attribute use attached directly to a signature by name.
+///
+/// Convenience wrapper over [`signature_attribute_uses`] +
+/// [`LuaCommonProperty::find_attribute_use`]. Returns `None` when the
+/// signature has no standalone attributes or none match `attribute_name`.
+pub fn find_signature_attribute_use<'a>(
+    db: &'a DbIndex,
+    signature_id: LuaSignatureId,
+    attribute_name: &str,
+) -> Option<&'a crate::LuaAttributeUse> {
+    db.get_property_index()
+        .get_property(&crate::LuaSemanticDeclId::Signature(signature_id))?
+        .find_attribute_use(attribute_name)
+}
+
+pub fn signature_is_valid_guard_in_realm(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    call_realm: GmodRealm,
+) -> bool {
+    if signature_has_valid_guard_attribute(db, signature_id)
+        && signature_realm_mask(db, signature_id).is_compatible_with(call_realm.state_mask())
+    {
+        return true;
+    }
+
+    db.get_signature_index()
+        .effective_valid_guard_signature_mask(&signature_id)
+        .is_some_and(|guard_mask| guard_mask.is_compatible_with(call_realm.state_mask()))
+}
+
+pub fn signature_writes_global_roots(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<Vec<String>> {
+    let mut roots = Vec::new();
+    let uses = signature_attribute_uses(db, signature_id)?;
+    for attribute_use in uses {
+        if attribute_use.id.get_name() != GMOD_ATTR_WRITES_GLOBAL {
+            continue;
+        }
+        let root = attribute_use_write_global_root(attribute_use)?;
+        roots.push(root);
+    }
+    if roots.is_empty() { None } else { Some(roots) }
+}
+
+pub fn attribute_use_write_global_root(attribute_use: &crate::LuaAttributeUse) -> Option<String> {
+    for param_name in ["global", "name", "root", ""] {
+        if let Some(root) = attribute_string_param(attribute_use, param_name) {
+            return Some(root);
+        }
+    }
+    if attribute_use.args.len() == 1
+        && let Some(LuaType::DocStringConst(root) | LuaType::StringConst(root)) =
+            attribute_use.args[0].1.as_ref()
+    {
+        return Some(root.to_string());
+    }
+    None
+}
+
+fn attribute_string_param(attribute_use: &crate::LuaAttributeUse, name: &str) -> Option<String> {
+    match attribute_use.get_param_by_name(name)? {
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
+        _ => None,
+    }
+}
+
+fn signature_has_valid_guard_attribute(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    find_signature_attribute_use(db, signature_id, GMOD_ATTR_VALID_GUARD).is_some()
+}
+
+/// Rebuilds the effective valid-guard signature set consumed by hot flow paths.
+///
+/// Source functions can shadow metadata-bearing annotation declarations of the
+/// same global/member identity. Resolve that identity once after declarations
+/// and docs are indexed, before flow/lua analysis, so call narrowing remains an
+/// O(1) signature lookup instead of re-inferring semantic declarations per call.
+pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
+    db.get_signature_index_mut()
+        .clear_effective_valid_guard_signatures();
+
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+
+    let mut effective_signatures = Vec::new();
+
+    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+        let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+            continue;
+        };
+        if !matches!(decl.extra, LuaDeclExtra::Global { .. }) {
+            continue;
+        }
+        let semantic_decl = LuaSemanticDeclId::from(decl_id);
+        let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+            continue;
+        };
+        let state_mask = union_valid_guard_masks(
+            global_identity_direct_valid_guard_mask(db, decl_id.file_id, decl.get_name()),
+            global_member_identity_direct_valid_guard_mask(db, decl.get_name()),
+        );
+        if let Some(state_mask) = state_mask
+            && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+        {
+            effective_signatures.push((signature_id, state_mask));
+        }
+    }
+
+    for file_id in db.get_vfs().get_all_file_ids() {
+        let member_ids = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        for member_id in member_ids {
+            let semantic_decl = LuaSemanticDeclId::from(member_id);
+            let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+                continue;
+            };
+            if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
+                && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+            {
+                effective_signatures.push((signature_id, state_mask));
+            }
+        }
+    }
+
+    let signature_index = db.get_signature_index_mut();
+    for (signature_id, state_mask) in effective_signatures {
+        signature_index.mark_effective_valid_guard_signature(signature_id, state_mask);
+    }
+}
+
+pub fn signature_is_valid_guard_or_base_runtime_isvalid_in_realm(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    call_realm: GmodRealm,
+) -> bool {
+    if signature_is_valid_guard_in_realm(db, signature_id, call_realm) {
+        return true;
+    }
+
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+
+    db.get_vfs()
+        .get_file_path(&signature_id.get_file_id())
+        .and_then(|path| path.to_str())
+        .map(|path| path.replace('\\', "/"))
+        .is_some_and(|path| path.ends_with("/lua/includes/util.lua"))
+}
+
+fn global_identity_direct_valid_guard_mask(
+    db: &DbIndex,
+    current_file_id: FileId,
+    name: &str,
+) -> Option<GmodStateMask> {
+    let global_index = db.get_global_index();
+    let module_index = db.get_module_index();
+    let decl_ids = module_index
+        .get_workspace_id(current_file_id)
+        .and_then(|workspace_id| {
+            global_index.get_global_decl_ids_in_workspace(name, module_index, workspace_id)
+        })
+        .or_else(|| global_index.get_global_decl_ids(name).cloned());
+
+    let mut state_mask = None;
+    if let Some(decl_ids) = decl_ids {
+        for decl_id in decl_ids {
+            state_mask = union_valid_guard_masks(
+                state_mask,
+                semantic_decl_direct_valid_guard_mask(db, &decl_id.into()),
+            );
+        }
+    }
+    state_mask
+}
+
+fn global_member_identity_direct_valid_guard_mask(
+    db: &DbIndex,
+    name: &str,
+) -> Option<GmodStateMask> {
+    let key = LuaMemberKey::Name(name.into());
+    let mut state_mask = None;
+    for member in db
+        .get_member_index()
+        .get_current_members_for_key(&key)
+        .into_iter()
+        .filter(|member| {
+            member
+                .get_global_id()
+                .is_some_and(|global_id| global_id.get_name().rsplit('.').next() == Some(name))
+        })
+    {
+        state_mask = union_valid_guard_masks(
+            state_mask,
+            semantic_decl_direct_valid_guard_mask(db, &member.get_id().into()),
+        );
+    }
+    state_mask
+}
+
+fn member_identity_direct_valid_guard_mask(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+) -> Option<GmodStateMask> {
+    let member_index = db.get_member_index();
+    let owner = member_index.get_member_owner(&member_id).cloned()?;
+    let member = member_index.get_member(&member_id)?;
+    let mut state_mask = None;
+    for member in member_index
+        .get_current_owner_members_for_key(&owner, member.get_key())
+        .into_iter()
+    {
+        state_mask = union_valid_guard_masks(
+            state_mask,
+            semantic_decl_direct_valid_guard_mask(db, &member.get_id().into()),
+        );
+    }
+    state_mask
+}
+
+fn semantic_decl_direct_valid_guard_mask(
+    db: &DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+) -> Option<GmodStateMask> {
+    let signature_id = signature_id_for_semantic_decl(db, semantic_decl)?;
+    if !signature_has_valid_guard_attribute(db, signature_id) {
+        return None;
+    }
+    Some(signature_realm_mask(db, signature_id))
+}
+
+fn signature_realm_mask(db: &DbIndex, signature_id: LuaSignatureId) -> GmodStateMask {
+    let realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&signature_id.get_file_id(), signature_id.get_position());
+    realm.state_mask()
+}
+
+fn union_valid_guard_masks(
+    left: Option<GmodStateMask>,
+    right: Option<GmodStateMask>,
+) -> Option<GmodStateMask> {
+    match (left, right) {
+        (Some(left), Some(right)) => Some(left.union(right)),
+        (Some(mask), None) | (None, Some(mask)) => Some(mask),
+        (None, None) => None,
+    }
+}
+
+fn signature_id_for_semantic_decl(
+    db: &DbIndex,
+    semantic_decl: &LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    if let Some(signature_id) = db.get_property_index().get_signature_owner(&semantic_decl) {
+        return Some(signature_id);
+    }
+
+    match *semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .and_then(|type_cache| match type_cache.as_type() {
+                crate::LuaType::Signature(signature_id) => Some(*signature_id),
+                _ => None,
+            }),
+        LuaSemanticDeclId::Member(member_id) => db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .and_then(|type_cache| match type_cache.as_type() {
+                crate::LuaType::Signature(signature_id) => Some(*signature_id),
+                _ => None,
+            }),
+        LuaSemanticDeclId::Signature(signature_id) => Some(signature_id),
+        LuaSemanticDeclId::TypeDecl(_) => None,
+    }
+}
+
+/// Returns the signature id that owns the standalone attributes attached to
+/// the given semantic-decl owner, when the owner resolves back to a signature
+/// via the property index's signature-owner map.
+///
+/// This bridges `LuaSemanticDeclId::Signature(...)` aliases added through
+/// [`LuaPropertyIndex::add_owner_map`] back to the canonical signature, so
+/// callers that hold an alias owner id can still reach the owning signature.
+pub fn signature_owner_for(
+    db: &DbIndex,
+    owner_id: &crate::LuaSemanticDeclId,
+) -> Option<LuaSignatureId> {
+    db.get_property_index().get_signature_owner(owner_id)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::{
+        LuaAttributeUse, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        db_index::signature::{CALL_ARG_ATTRIBUTE, LuaDocParamInfo, LuaSignature},
+    };
+    use smol_str::SmolStr;
+
+    fn call_arg_attribute(domain: &str, role: &str, priority: Option<i64>) -> LuaAttributeUse {
+        let mut args = vec![
+            (
+                "domain".to_string(),
+                Some(LuaType::DocStringConst(SmolStr::new(domain).into())),
+            ),
+            (
+                "role".to_string(),
+                Some(LuaType::DocStringConst(SmolStr::new(role).into())),
+            ),
+        ];
+        if let Some(priority) = priority {
+            args.push((
+                "priority".to_string(),
+                Some(LuaType::DocIntegerConst(priority)),
+            ));
+        }
+        LuaAttributeUse::new(LuaTypeDeclId::global(CALL_ARG_ATTRIBUTE), args)
+    }
+
+    fn signature_with_param_roles(param_name: &str, roles: Vec<LuaAttributeUse>) -> LuaSignature {
+        let mut signature = LuaSignature::new();
+        signature.params.push(param_name.to_string());
+        signature.param_docs.insert(
+            0,
+            LuaDocParamInfo {
+                name: param_name.to_string(),
+                type_ref: LuaType::String,
+                default_value: None,
+                nullable: false,
+                description: None,
+                attributes: Some(roles),
+            },
+        );
+        signature
+    }
+
+    #[test]
+    fn find_best_call_arg_role_picks_highest_priority() {
+        let signature = signature_with_param_roles(
+            "name",
+            vec![
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "define", Some(1)),
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "table", Some(5)),
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "base", Some(3)),
+            ],
+        );
+
+        let best = find_best_call_arg_role_for_param(
+            &signature,
+            0,
+            GMOD_DOMAIN_VGUI_PANEL,
+            &["define", "table", "base"],
+        );
+        let best = best.expect("a matching role exists");
+        assert_eq!(best.role, "table");
+        assert_eq!(best.priority, Some(5));
+    }
+
+    #[test]
+    fn find_best_call_arg_role_filters_by_domain_and_role() {
+        let signature = signature_with_param_roles(
+            "name",
+            vec![
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "define", Some(5)),
+                call_arg_attribute(GMOD_DOMAIN_DERMA_SKIN, "define", Some(99)),
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "base", Some(2)),
+            ],
+        );
+
+        // Wrong domain ignored even with higher priority.
+        let best =
+            find_best_call_arg_role_for_param(&signature, 0, GMOD_DOMAIN_VGUI_PANEL, &["define"]);
+        let best = best.expect("a matching role exists");
+        assert_eq!(best.role, "define");
+        assert_eq!(best.priority, Some(5));
+
+        // Wrong role ignored.
+        let none = find_best_call_arg_role_for_param(
+            &signature,
+            0,
+            GMOD_DOMAIN_VGUI_PANEL,
+            &["nonexistent"],
+        );
+        assert!(none.is_none(), "no role matches the role filter");
+    }
+
+    #[test]
+    fn find_best_call_arg_role_empty_roles_matches_any_role_in_domain() {
+        let signature = signature_with_param_roles(
+            "name",
+            vec![
+                call_arg_attribute(GMOD_DOMAIN_HOOK, "add", Some(1)),
+                call_arg_attribute(GMOD_DOMAIN_HOOK, "remove", Some(4)),
+            ],
+        );
+
+        let best = find_best_call_arg_role_for_param(&signature, 0, GMOD_DOMAIN_HOOK, &[]);
+        let best = best.expect("a matching role exists");
+        assert_eq!(best.role, "remove");
+        assert_eq!(best.priority, Some(4));
+    }
+
+    #[test]
+    fn find_best_call_arg_role_treats_missing_priority_as_zero() {
+        let signature = signature_with_param_roles(
+            "name",
+            vec![
+                call_arg_attribute(GMOD_DOMAIN_LOAD, "include", None),
+                call_arg_attribute(GMOD_DOMAIN_LOAD, "require", Some(-1)),
+            ],
+        );
+
+        // Missing priority (0) beats explicit -1.
+        let best = find_best_call_arg_role_for_param(&signature, 0, GMOD_DOMAIN_LOAD, &[]);
+        let best = best.expect("a matching role exists");
+        assert_eq!(best.role, "include");
+        assert_eq!(best.priority, None);
+    }
+
+    #[test]
+    fn collect_call_arg_roles_returns_all_sorted_by_priority() {
+        let signature = signature_with_param_roles(
+            "name",
+            vec![
+                call_arg_attribute(GMOD_DOMAIN_COLOR, "r", Some(1)),
+                call_arg_attribute(GMOD_DOMAIN_COLOR, "b", Some(9)),
+                call_arg_attribute(GMOD_DOMAIN_COLOR, "g", Some(3)),
+                call_arg_attribute(GMOD_DOMAIN_VGUI_PANEL, "define", Some(100)),
+            ],
+        );
+
+        let roles = collect_call_arg_roles_for_param(&signature, 0, GMOD_DOMAIN_COLOR, &[]);
+        assert_eq!(roles.len(), 3);
+        // Descending priority.
+        assert_eq!(roles[0].role, "b");
+        assert_eq!(roles[1].role, "g");
+        assert_eq!(roles[2].role, "r");
+    }
+
+    #[test]
+    fn find_best_call_arg_role_from_type_filters_by_domain_and_role() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.load", "include", 3)]
+            ---@param path string
+            function LoadPath(path) end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let (signature_id, _signature) = db
+            .get_signature_index()
+            .iter()
+            .next()
+            .expect("at least one signature is defined");
+        let callee_type = LuaType::Signature(*signature_id);
+
+        let best =
+            find_best_call_arg_role_from_type(db, &callee_type, 0, GMOD_DOMAIN_LOAD, &["include"]);
+        let best = best.expect("matching role exists on the signature type");
+        assert_eq!(best.role, "include");
+        assert_eq!(best.priority, Some(3));
+
+        let none =
+            find_best_call_arg_role_from_type(db, &callee_type, 0, GMOD_DOMAIN_COLOR, &["include"]);
+        assert!(none.is_none(), "wrong domain must not match");
+    }
+
+    #[test]
+    fn find_best_call_arg_role_from_type_empty_roles_matches_any_role_in_domain() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.hook", "add", 1)]
+            ---@[call_arg("gmod.hook", "remove", 7)]
+            ---@param name string
+            function HookName(name) end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let (signature_id, _signature) = db
+            .get_signature_index()
+            .iter()
+            .next()
+            .expect("at least one signature is defined");
+        let callee_type = LuaType::Signature(*signature_id);
+
+        let best = find_best_call_arg_role_from_type(db, &callee_type, 0, GMOD_DOMAIN_HOOK, &[]);
+        let best = best.expect("empty role filter matches any role in the domain");
+        assert_eq!(best.role, "remove");
+        assert_eq!(best.priority, Some(7));
+    }
+
+    // -----------------------------------------------------------------------
+    // Signature standalone attribute helpers (via VirtualWorkspace so the
+    // property index is populated through the real analyzer pipeline).
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn signature_attribute_helpers_find_standalone_attribute() {
+        // Signature-level standalone attributes follow the same convention as
+        // the existing `call_arg` attribute: a single-name attribute declared
+        // via `---@attribute <name>(...)` and referenced via `---@[<name>(...)]`
+        // attached to the function (not to a `---@param`/`---@return` tag, which
+        // routes to param/return attribute storage instead). The GMod domain
+        // constant is passed as a string argument value, matching how
+        // `@call_arg("gmod.load", "include")` carries the `gmod.load` domain.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute self_guard(member: string)
+
+            ---@param member string
+            ---@[self_guard("gmod.self_guard")]
+            function GuardSpawn(member) end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let signature_index = db.get_signature_index();
+        // Exactly one signature should be defined in the workspace.
+        let (signature_id, _signature) = signature_index
+            .iter()
+            .next()
+            .expect("at least one signature is defined");
+
+        let uses = signature_attribute_uses(db, *signature_id);
+        let uses = uses.expect("signature has standalone attributes");
+        // The attribute id resolves to the single declared name `self_guard`.
+        assert_eq!(uses.len(), 1);
+        assert_eq!(uses[0].id.get_name(), "self_guard");
+        // The GMod domain is carried as a string argument value.
+        let domain_arg = uses[0].get_param_by_name("member");
+        let domain_arg = domain_arg.expect("member arg is present");
+        match domain_arg {
+            crate::LuaType::DocStringConst(value) | crate::LuaType::StringConst(value) => {
+                assert_eq!(value.as_str(), GMOD_DOMAIN_SELF_GUARD);
+            }
+            other => panic!("expected string const domain arg, got {other:?}"),
+        }
+
+        // The helper locates the attribute by its resolved name.
+        let found = find_signature_attribute_use(db, *signature_id, "self_guard");
+        let found = found.expect("find_signature_attribute_use locates the attribute");
+        assert_eq!(found.id.get_name(), "self_guard");
+    }
+
+    #[test]
+    fn signature_attribute_helpers_return_none_when_absent() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param member string
+            function NoAttributes(member) end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let (signature_id, _signature) = db
+            .get_signature_index()
+            .iter()
+            .next()
+            .expect("at least one signature is defined");
+
+        assert!(signature_attribute_uses(db, *signature_id).is_none());
+        assert!(find_signature_attribute_use(db, *signature_id, GMOD_DOMAIN_SELF_GUARD).is_none());
+    }
+
+    #[test]
+    fn class_level_attributes_are_not_surfaced_by_signature_helpers() {
+        // A ---@class with an attribute must not be returned by the
+        // signature-level helpers, confirming Phase 1 only models
+        // signature standalone attributes.
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute gmod.member_guard(member: string)
+
+            ---@[gmod.member_guard("Spawn")]
+            ---@class SpawnGuard
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        // No function signatures are defined.
+        assert!(
+            db.get_signature_index().iter().next().is_none(),
+            "no signatures defined in this fixture"
+        );
+        // Therefore no signature-level attribute can be resolved.
+        for (signature_id, _) in db.get_signature_index().iter() {
+            assert!(
+                signature_attribute_uses(db, *signature_id).is_none(),
+                "class attribute must not leak into signature storage"
+            );
+        }
+    }
+
+    #[test]
+    fn gmod_call_arg_domains_are_unique_and_sorted() {
+        let mut copied: Vec<&str> = GMOD_CALL_ARG_DOMAINS.to_vec();
+        let mut sorted = copied.clone();
+        sorted.sort_unstable();
+        // Already sorted.
+        assert_eq!(copied, sorted, "GMOD_CALL_ARG_DOMAINS is sorted");
+        copied.sort_unstable();
+        copied.dedup();
+        assert_eq!(
+            copied.len(),
+            GMOD_CALL_ARG_DOMAINS.len(),
+            "GMOD_CALL_ARG_DOMAINS has no duplicates"
+        );
+    }
+}

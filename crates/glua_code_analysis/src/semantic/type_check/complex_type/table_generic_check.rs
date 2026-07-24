@@ -1,5 +1,5 @@
 use crate::{
-    LuaMemberKey, LuaMemberOwner, LuaType, LuaTypeCache, TypeCheckFailReason, TypeCheckResult,
+    LuaMemberKey, LuaMemberOwner, LuaType, TypeCheckFailReason, TypeCheckResult,
     semantic::type_check::{
         check_general_type_compact, type_check_context::TypeCheckContext,
         type_check_guard::TypeCheckGuard,
@@ -15,18 +15,18 @@ pub fn check_table_generic_type_compact(
     match compact_type {
         LuaType::Table | LuaType::Global => return Ok(()),
         LuaType::TableGeneric(compact_generic_param) => {
-            if source_generic_param.len() == 2 && compact_generic_param.len() == 2 {
-                let source_key = &source_generic_param[0];
-                let source_value = &source_generic_param[1];
-                let compact_key = &compact_generic_param[0];
-                let compact_value = &compact_generic_param[1];
-
-                check_general_type_compact(
-                    context,
-                    source_key,
-                    compact_key,
-                    check_guard.next_level()?,
-                )?;
+            if let (Some((source_key, source_value)), Some((compact_key, compact_value))) = (
+                table_generic_key_value(source_generic_param),
+                table_generic_key_value(compact_generic_param),
+            ) {
+                if let (Some(source_key), Some(compact_key)) = (source_key, compact_key) {
+                    check_general_type_compact(
+                        context,
+                        source_key,
+                        compact_key,
+                        check_guard.next_level()?,
+                    )?;
+                }
                 check_general_type_compact(
                     context,
                     source_value,
@@ -46,10 +46,8 @@ pub fn check_table_generic_type_compact(
             );
         }
         LuaType::Array(array_type) => {
-            if source_generic_param.len() == 2 {
-                let key = &source_generic_param[0];
-                let value = &source_generic_param[1];
-                if key.is_any() || key.is_integer() {
+            if let Some((key, value)) = table_generic_key_value(source_generic_param) {
+                if key.is_none_or(|key| key.is_any() || key.is_integer()) {
                     return check_general_type_compact(
                         context,
                         value,
@@ -107,11 +105,11 @@ pub fn check_table_generic_type_compact(
             return Ok(());
         }
         LuaType::Union(union) => {
-            for union_type in union.into_vec() {
+            for union_type in union.types() {
                 check_table_generic_type_compact(
                     context,
                     source_generic_param,
-                    &union_type,
+                    union_type,
                     check_guard,
                 )?;
             }
@@ -130,18 +128,15 @@ fn check_table_generic_compact_member_owner(
     member_owner: LuaMemberOwner,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    if source_generic_params.len() != 2 {
+    let Some((source_key, source_value)) = table_generic_key_value(source_generic_params) else {
         return Err(TypeCheckFailReason::TypeNotMatch);
-    }
+    };
 
     let member_index = context.db.get_member_index();
     let members = match member_index.get_members(&member_owner) {
         Some(members) => members,
         None => return Ok(()),
     };
-
-    let source_key = &source_generic_params[0];
-    let source_value = &source_generic_params[1];
 
     for member in members {
         let key = member.get_key();
@@ -152,19 +147,26 @@ fn check_table_generic_compact_member_owner(
         };
 
         let member_type = context
-            .db
-            .get_type_index()
-            .get_type_cache(&member.get_id().into())
-            .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
-            .as_type();
-        check_general_type_compact(context, source_key, &key_type, check_guard.next_level()?)?;
+            .member_type(member.get_id())
+            .unwrap_or(LuaType::Unknown);
+        if let Some(source_key) = source_key {
+            check_general_type_compact(context, source_key, &key_type, check_guard.next_level()?)?;
+        }
         check_general_type_compact(
             context,
             source_value,
-            member_type,
+            &member_type,
             check_guard.next_level()?,
         )?;
     }
 
     Ok(())
+}
+
+fn table_generic_key_value(params: &[LuaType]) -> Option<(Option<&LuaType>, &LuaType)> {
+    match params {
+        [value] => Some((None, value)),
+        [key, value] => Some((Some(key), value)),
+        _ => None,
+    }
 }

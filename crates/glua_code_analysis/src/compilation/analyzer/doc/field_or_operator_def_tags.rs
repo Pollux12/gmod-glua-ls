@@ -8,7 +8,10 @@ use glua_parser::{
 use crate::{
     AnalyzeError, AsyncState, DiagnosticCode, LuaFunctionType, LuaMemberFeature, LuaMemberId,
     LuaSignatureId, LuaTypeCache, OperatorFunction,
-    compilation::analyzer::doc::preprocess_description,
+    compilation::analyzer::{
+        common::{TypeCacheWriteMode, write_type_cache},
+        doc::preprocess_description,
+    },
     db_index::{
         LuaMember, LuaMemberKey, LuaMemberOwner, LuaOperator, LuaOperatorMetaMethod,
         LuaSemanticDeclId, LuaType,
@@ -132,10 +135,12 @@ pub fn analyze_field(analyzer: &mut DocAnalyzer, tag: LuaDocTagField) -> Option<
         .get_member_index_mut()
         .add_member(owner_id, member);
 
-    analyzer
-        .db
-        .get_type_index_mut()
-        .bind_type(member_id.into(), LuaTypeCache::DocType(field_type.clone()));
+    write_type_cache(
+        analyzer.db,
+        member_id.into(),
+        LuaTypeCache::DocType(field_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
+    );
 
     if let Some(visibility_kind) = visibility_kind {
         analyzer.db.get_property_index_mut().add_visibility(

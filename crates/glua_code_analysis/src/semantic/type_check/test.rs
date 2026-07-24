@@ -280,6 +280,29 @@ mod test {
     }
 
     #[test]
+    fn test_table_generic_accepts_array_of_subtype() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class Vector
+            "#,
+        );
+
+        let entity_table_ty = ws.ty("table<Entity>");
+        let indexed_entity_table_ty = ws.ty("table<integer, Entity>");
+        let named_entity_table_ty = ws.ty("table<string, Entity>");
+        let player_array_ty = ws.ty("Player[]");
+        let vector_array_ty = ws.ty("Vector[]");
+
+        assert!(ws.check_type(&entity_table_ty, &player_array_ty));
+        assert!(ws.check_type(&indexed_entity_table_ty, &player_array_ty));
+        assert!(!ws.check_type(&named_entity_table_ty, &player_array_ty));
+        assert!(!ws.check_type(&entity_table_ty, &vector_array_ty));
+    }
+
+    #[test]
     fn test_tuple_types() {
         let mut ws = VirtualWorkspace::new();
 

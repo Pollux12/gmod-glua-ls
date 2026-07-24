@@ -424,10 +424,7 @@ pub(crate) fn resolve_hook_property_owner(
 }
 
 fn is_realm_compatible(call_realm: GmodRealm, item_realm: GmodRealm) -> bool {
-    !matches!(
-        (call_realm, item_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+    call_realm.is_compatible_with(item_realm)
 }
 
 pub struct HoverCapabilities;

@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace};
     use googletest::prelude::*;
-    use lsp_types::{DiagnosticSeverity, NumberOrString};
+    use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
     fn enable_only_realm_mismatch_diagnostics(ws: &mut VirtualWorkspace) {
@@ -25,6 +25,10 @@ mod tests {
             }
         }
         ws.update_emmyrc(emmyrc);
+    }
+
+    fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
+        EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
     }
 
     #[gtest]
@@ -280,7 +284,7 @@ mod tests {
     }
 
     #[gtest]
-    fn test_reports_unknown_realm_when_callsite_realm_is_unresolved() {
+    fn test_does_not_report_unknown_realm_when_callsite_has_default_menu_realm() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -315,13 +319,13 @@ mod tests {
         let unknown_code = Some(NumberOrString::String(
             DiagnosticCode::GmodUnknownRealm.get_name().to_string(),
         ));
-        let diagnostic = diagnostics
+        let diagnostic_count = diagnostics
             .iter()
-            .find(|diagnostic| diagnostic.code == unknown_code);
-        assert!(diagnostic.is_some());
+            .filter(|diagnostic| diagnostic.code == unknown_code)
+            .count();
         assert_eq!(
-            diagnostic.and_then(|diagnostic| diagnostic.severity),
-            Some(DiagnosticSeverity::HINT)
+            diagnostic_count, 0,
+            "file-level realm indexing assigns Menu instead of leaving the callsite Unknown"
         );
     }
 
@@ -1155,6 +1159,7 @@ mod tests {
             r#"
                 ---@class Entity
                 ---@class Player : Entity
+                ---@class NPC : Entity
                 ---@class SWEP
 
                 ---@generic T : table
@@ -1172,6 +1177,15 @@ mod tests {
                 function playerMeta:GetLocalVar(key, default)
                     return default
                 end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/server/sv_unrelated.lua",
+            r#"
+                local npcMeta = FindMetaTable("NPC")
+
+                function npcMeta:UnrelatedServerMethod() end
             "#,
         );
 
@@ -1407,6 +1421,68 @@ mod tests {
             !diagnostics
                 .iter()
                 .any(|diagnostic| diagnostic.code == risky_code)
+        );
+    }
+
+    #[gtest]
+    fn test_server_baseclass_call_uses_shared_inherited_method_over_client_override() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("**/entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
+
+        ws.def_file(
+            "lua/autorun/sh_entity_defs.lua",
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                function Entity:Think() end
+
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+            "#,
+        );
+
+        ws.def_file(
+            "garrysmod/entities/base_gmodentity/cl_init.lua",
+            r#"
+                ---@class base_gmodentity : Entity
+                local base_gmodentity = {}
+
+                function base_gmodentity:Think() end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/gamemodes/sandbox/entities/entities/gmod_lamp.lua",
+            r#"
+                ENT.Base = "base_gmodentity"
+
+                if SERVER then
+                    function ENT:Think()
+                        self.BaseClass.Think(self)
+                    end
+                end
+            "#,
+        );
+
+        let diagnostics = ws.run_diagnostics_with_shared_snapshots(&[file_id]);
+        assert!(
+            !diagnostics.iter().any(|diagnostic| {
+                diagnostic.code.as_deref().is_some_and(|code| {
+                    code == DiagnosticCode::GmodRealmMismatchHeuristic.get_name()
+                })
+            }),
+            "Expected inherited shared Think to suppress the client override mismatch, got: {diagnostics:?}"
         );
     }
 }

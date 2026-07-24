@@ -1,11 +1,44 @@
 #[cfg(test)]
 mod tests {
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, VirtualLocation, check};
-    use glua_code_analysis::{DocSyntax, Emmyrc};
+    use glua_code_analysis::{
+        DocSyntax, Emmyrc, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaTypeDeclId,
+    };
+    use glua_parser::LuaAstNode;
     use googletest::prelude::*;
     use lsp_types::GotoDefinitionResponse;
 
     type Expected = VirtualLocation;
+
+    fn setup_sf_alias_collision_workspace() -> (ProviderVirtualWorkspace, glua_code_analysis::FileId)
+    {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/includes/sf_enum.lua",
+                r#"
+                ---@alias SF
+                ---| number
+                ---| 1
+                "#,
+            ),
+            ("lua/autorun/server/sf_init.lua", "SF = {}\n"),
+            ("lua/autorun/client/sf_init.lua", "SF = {}\n"),
+            (
+                "lua/starfall/transfer.lua",
+                r#"if SERVER then
+    function SF.SendStarfall(msg, data, recipient) end
+else
+                    function SF.SendStarfall(msg, data, target) end
+end
+"#,
+            ),
+        ]);
+        (ws, file_ids[3])
+    }
 
     #[gtest]
     fn test_basic_definition() -> Result<()> {
@@ -29,6 +62,119 @@ mod tests {
             }]
         ));
         Ok(())
+    }
+
+    #[gtest]
+    fn server_member_definition_ignores_same_named_numeric_alias() -> Result<()> {
+        let (mut ws, _) = setup_sf_alias_collision_workspace();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            "SF.SendStar<??>fall(\"download\", {}, player.GetAll())\n",
+        )?;
+        let file_id = ws.def_file("lua/entities/starfall_processor/init.lua", &content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position)
+            .ok_or("failed to get server definition response")
+            .or_fail()?;
+
+        ProviderVirtualWorkspace::assert_locations(
+            match result {
+                GotoDefinitionResponse::Scalar(location) => vec![location],
+                GotoDefinitionResponse::Array(locations) => locations,
+                GotoDefinitionResponse::Link(_) => return fail!("unexpected location links"),
+            },
+            vec![Expected {
+                file: "transfer.lua".to_string(),
+                line: 1,
+            }],
+        )
+    }
+
+    #[gtest]
+    fn client_member_definition_ignores_same_named_numeric_alias() -> Result<()> {
+        let (mut ws, _) = setup_sf_alias_collision_workspace();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            "SF.SendStar<??>fall(\"upload\", {}, nil)\n",
+        )?;
+        let file_id = ws.def_file("lua/entities/starfall_processor/cl_init.lua", &content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position)
+            .ok_or("failed to get client definition response")
+            .or_fail()?;
+
+        ProviderVirtualWorkspace::assert_locations(
+            match result {
+                GotoDefinitionResponse::Scalar(location) => vec![location],
+                GotoDefinitionResponse::Array(locations) => locations,
+                GotoDefinitionResponse::Link(_) => return fail!("unexpected location links"),
+            },
+            vec![Expected {
+                file: "transfer.lua".to_string(),
+                line: 3,
+            }],
+        )
+    }
+
+    #[gtest]
+    fn member_definition_uses_exact_member_when_same_named_expansion_fails() -> Result<()> {
+        let (mut ws, transfer_file) = setup_sf_alias_collision_workspace();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            "SF.SendStar<??>fall(\"download\", {}, player.GetAll())\n",
+        )?;
+        let caller_file = ws.def_file("lua/entities/starfall_processor/init.lua", &content);
+        let key = LuaMemberKey::Name("SendStarfall".into());
+        let member_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_current_members_for_key(&key)
+            .into_iter()
+            .filter(|member| member.get_file_id() == transfer_file)
+            .min_by_key(|member| member.get_id().get_position())
+            .map(|member| member.get_id())
+            .ok_or("missing server SendStarfall member")
+            .or_fail()?;
+        let alias_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SF"));
+        {
+            let member_index = ws.analysis.compilation.get_db_mut().get_member_index_mut();
+            let _ = member_index.set_member_owner(alias_owner.clone(), transfer_file, member_id);
+            let _ = member_index.add_member_to_owner(alias_owner, member_id);
+        }
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(caller_file)
+            .ok_or("missing caller semantic model")
+            .or_fail()?;
+        let offset = semantic_model
+            .get_document()
+            .get_offset(position.line as usize, position.character as usize)
+            .ok_or("invalid caller position")
+            .or_fail()?;
+        let token = match semantic_model.get_root().syntax().token_at_offset(offset) {
+            rowan::TokenAtOffset::Single(token) => token,
+            rowan::TokenAtOffset::Between(_, right) => right,
+            rowan::TokenAtOffset::None => return fail!("missing caller token"),
+        };
+        let result = crate::handlers::definition::goto_def_definition(
+            &semantic_model,
+            &ws.analysis.compilation,
+            LuaSemanticDeclId::Member(member_id),
+            &token,
+        )
+        .ok_or("failed to use exact member fallback")
+        .or_fail()?;
+
+        ProviderVirtualWorkspace::assert_locations(
+            match result {
+                GotoDefinitionResponse::Scalar(location) => vec![location],
+                GotoDefinitionResponse::Array(locations) => locations,
+                GotoDefinitionResponse::Link(_) => return fail!("unexpected location links"),
+            },
+            vec![Expected {
+                file: "transfer.lua".to_string(),
+                line: 1,
+            }],
+        )
     }
 
     #[gtest]
@@ -924,7 +1070,7 @@ mod tests {
 
     #[gtest]
     fn test_goto_inferred_dynamic_field_definition_through_table_alias() -> Result<()> {
-        let mut ws = ProviderVirtualWorkspace::new();
+        let mut ws = ProviderVirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.infer_dynamic_fields = true;
@@ -1370,6 +1516,34 @@ mod tests {
                 line: 2,
             }],
         ));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_goto_vgui_panel_definition_ignores_call_arg_field_direct_string() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "panels.lua",
+            r#"
+                local PANEL = {}
+                vgui.Register("MyPanel", PANEL, "DPanel")
+            "#,
+        );
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local pnl = vgui.CreateFromTable("MyPa<??>nel")
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        let result = crate::handlers::definition::definition(&ws.analysis, file_id, position);
+        verify_that!(result, none())?;
 
         Ok(())
     }

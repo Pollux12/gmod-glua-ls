@@ -14,7 +14,10 @@ use crate::{
     infer_index_expr,
 };
 
-use super::{Checker, DiagnosticContext, humanize_lint_type};
+use super::{
+    AssignmentPrefixEvents, Checker, DiagnosticContext, humanize_lint_type,
+    is_initialized_assignment_prefix,
+};
 
 pub struct AssignTypeMismatchChecker;
 
@@ -22,10 +25,13 @@ impl Checker for AssignTypeMismatchChecker {
     const CODES: &[DiagnosticCode] = &[DiagnosticCode::AssignTypeMismatch];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        for node in semantic_model.get_root().descendants::<LuaAst>() {
+        let root = semantic_model.get_root().clone();
+        let assignment_prefixes = context.get_assignment_prefix_events(&root);
+
+        for node in root.descendants::<LuaAst>() {
             match node {
                 LuaAst::LuaAssignStat(assign) => {
-                    check_assign_stat(context, semantic_model, &assign);
+                    check_assign_stat(context, semantic_model, &assign, &assignment_prefixes);
                 }
                 LuaAst::LuaLocalStat(local) => {
                     check_local_stat(context, semantic_model, &local);
@@ -40,9 +46,9 @@ fn check_assign_stat(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     assign: &LuaAssignStat,
+    assignment_prefixes: &AssignmentPrefixEvents,
 ) -> Option<()> {
     let (vars, exprs) = assign.get_var_and_expr_list();
-    let value_types = semantic_model.infer_expr_list_types(&exprs, Some(vars.len()));
 
     for (idx, var) in vars.iter().enumerate() {
         match var {
@@ -51,18 +57,22 @@ fn check_assign_stat(
                     context,
                     semantic_model,
                     index_expr,
-                    exprs.get(idx).cloned(),
-                    value_types.get(idx)?.0.clone(),
+                    &exprs,
+                    idx,
+                    is_initialized_assignment_prefix(index_expr, assign, assignment_prefixes),
                 );
             }
             LuaVarExpr::NameExpr(name_expr) => {
-                check_name_expr(
-                    context,
-                    semantic_model,
-                    name_expr,
-                    exprs.get(idx).cloned(),
-                    value_types.get(idx)?.0.clone(),
-                );
+                if let Some(value_type) = semantic_model.infer_expr_list_value_type_at(&exprs, idx)
+                {
+                    check_name_expr(
+                        context,
+                        semantic_model,
+                        name_expr,
+                        exprs.get(idx).cloned(),
+                        value_type,
+                    );
+                }
             }
         }
     }
@@ -126,6 +136,7 @@ fn check_name_expr(
         &value_type,
         false,
         source_is_inferred,
+        true,
     );
     let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
@@ -150,12 +161,29 @@ fn check_index_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
-    expr: Option<LuaExpr>,
-    value_type: LuaType,
+    exprs: &[LuaExpr],
+    value_idx: usize,
+    is_initialized_assignment_prefix: bool,
 ) -> Option<()> {
     let inferred_append_collection_target =
         is_inferred_member_collection_append_target(semantic_model, index_expr).unwrap_or(false);
     if inferred_append_collection_target {
+        return Some(());
+    }
+
+    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
+    let expr = exprs.get(value_idx).cloned();
+
+    if !strict_inferred_mismatch
+        && is_initialized_assignment_prefix
+        && !expr
+            .as_ref()
+            .is_some_and(|expr| expr_blocks_initialized_assignment_fast_path(expr, index_expr))
+        && !expr
+            .as_ref()
+            .is_some_and(inferred_target_requires_explicit_table_field_checks)
+        && is_only_current_inferred_member_assignment(semantic_model, index_expr)
+    {
         return Some(());
     }
 
@@ -175,6 +203,7 @@ fn check_index_expr(
         .ok()
     });
 
+    let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
     check_assign_type_mismatch(
         context,
         semantic_model,
@@ -183,8 +212,8 @@ fn check_index_expr(
         &value_type,
         true,
         source_is_inferred,
+        false,
     );
-    let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
     if let Some(expr) = expr {
         if !source_is_inferred
             || strict_inferred_mismatch
@@ -200,6 +229,79 @@ fn check_index_expr(
         }
     }
     Some(())
+}
+
+fn expr_blocks_initialized_assignment_fast_path(expr: &LuaExpr, index_expr: &LuaIndexExpr) -> bool {
+    match expr {
+        LuaExpr::ClosureExpr(_) => true,
+        LuaExpr::TableExpr(table_expr) if table_expr.get_fields().next().is_none() => {
+            matches!(index_expr.get_index_key(), Some(LuaIndexKey::Name(_)))
+        }
+        _ => false,
+    }
+}
+
+fn is_only_current_inferred_member_assignment(
+    semantic_model: &SemanticModel,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let member_index = semantic_model.get_db().get_member_index();
+    let Some(member) = member_index.get_member(&member_id) else {
+        return false;
+    };
+    let Some(type_cache) = semantic_model
+        .get_db()
+        .get_type_index()
+        .get_type_cache(&member_id.into())
+    else {
+        return false;
+    };
+    if !type_cache.is_infer() {
+        return false;
+    }
+
+    let Some(owner) = member_index.get_member_owner(&member_id) else {
+        return false;
+    };
+    !has_visible_prior_member_for_owner_key(
+        semantic_model,
+        owner,
+        member.get_key(),
+        member_id,
+        index_expr.get_range().start(),
+    )
+}
+
+fn has_visible_prior_member_for_owner_key(
+    semantic_model: &SemanticModel,
+    owner: &crate::LuaMemberOwner,
+    member_key: &LuaMemberKey,
+    current_member_id: crate::LuaMemberId,
+    position: rowan::TextSize,
+) -> bool {
+    let member_ids = semantic_model
+        .get_db()
+        .get_member_index()
+        .get_current_owner_members_for_key(owner, member_key)
+        .into_iter()
+        .filter(|member| {
+            let member_id = member.get_id();
+            member_id != current_member_id
+                && (member_id.file_id != semantic_model.get_file_id()
+                    || member_id.get_position() < position)
+        })
+        .map(|member| member.get_id())
+        .collect();
+
+    !crate::LuaMemberIndexItem::Many(member_ids)
+        .visible_member_ids_with_realm_at_offset_from_history(
+            semantic_model.get_db(),
+            &semantic_model.get_file_id(),
+            position,
+        )
+        .is_empty()
 }
 
 /// Resolve the **pre-write** source type for an indexed assignment target by
@@ -566,19 +668,76 @@ fn is_inferred_collection_member_type(db: &DbIndex, typ: &LuaType) -> bool {
         LuaType::Array(_) => true,
         LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         LuaType::TableConst(range) => crate::table_const_array_base(db, range).is_some(),
+        LuaType::TypeGuard(inner) => is_inferred_collection_member_type(db, inner),
+        LuaType::Union(union) => {
+            union.types().next().is_some()
+                && union
+                    .types()
+                    .all(|typ| typ.is_never() || is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::Intersection(intersection) => {
+            let types = intersection.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::MergedTable(merged_table) => {
+            let types = merged_table.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_inferred_collection_member_type(db, typ))
+        }
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|(typ, _)| typ.is_never() || is_inferred_collection_member_type(db, typ))
+        }
         _ => false,
     }
 }
 
 fn is_lenient_inferred_member_type(db: &DbIndex, typ: &LuaType) -> bool {
-    matches!(
-        typ,
-        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_)
-    ) || matches!(typ, LuaType::Tuple(tuple) if tuple.is_infer_resolve())
+    match typ {
+        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_) => true,
+        LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         // Shaped sequential literals infer as TableConst and are mutable dynamic
         // tables, so later modification must not be flagged. Object/keyed
         // TableConst literals are excluded so their fields stay strictly checked.
-        || matches!(typ, LuaType::TableConst(range) if crate::table_const_array_base(db, range).is_some())
+        LuaType::TableConst(range) => crate::table_const_array_base(db, range).is_some(),
+        LuaType::TypeGuard(inner) => is_lenient_inferred_member_type(db, inner),
+        LuaType::Union(union) => {
+            union.types().next().is_some()
+                && union
+                    .types()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::Intersection(intersection) => {
+            let types = intersection.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::MergedTable(merged_table) => {
+            let types = merged_table.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|typ| is_lenient_inferred_member_type(db, typ))
+        }
+        LuaType::MultiLineUnion(union) => {
+            let types = union.get_unions();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|(typ, _)| is_lenient_inferred_member_type(db, typ))
+        }
+        _ => false,
+    }
 }
 
 fn check_local_stat(
@@ -618,6 +777,7 @@ fn check_local_stat(
             &value_type,
             false,
             source_is_inferred,
+            true,
         );
         let strict_inferred_mismatch = semantic_model.get_emmyrc().strict.inferred_type_mismatch;
         if let Some(expr) = value_exprs.get(idx)
@@ -678,24 +838,17 @@ fn check_table_expr_content(
     table_type: &LuaType,
     table_expr: &LuaTableExpr,
 ) -> Option<bool> {
-    const MAX_CHECK_COUNT: usize = 250;
-    let mut check_count = 0;
     let mut has_diagnostic = false;
 
     let fields = table_expr.get_fields().collect::<Vec<_>>();
 
     for (idx, field) in fields.iter().enumerate() {
-        check_count += 1;
-        if check_count > MAX_CHECK_COUNT {
-            return Some(has_diagnostic);
-        }
         let Some(value_expr) = field.get_value_expr() else {
             continue;
         };
 
-        let expr_type = semantic_model
-            .infer_expr(value_expr.clone())
-            .unwrap_or(LuaType::Any);
+        let expr_fact = semantic_model.infer_expr_fact(value_expr.clone());
+        let expr_type = expr_fact.typ().clone();
 
         // 位于的最后的 TableFieldValue 允许接受函数调用返回的多值, 而且返回的值必然会从下标 1 开始覆盖掉所有索引字段.
         if field.is_value_field()
@@ -762,6 +915,7 @@ fn check_table_expr_content(
             &expr_type,
             allow_nil,
             source_is_inferred,
+            false,
         ) {
             has_diagnostic = has_diagnostic || result;
         }
@@ -776,10 +930,7 @@ fn should_check_nested_table_fields(source_type: &LuaType) -> bool {
     }
 
     match source_type {
-        LuaType::Union(union_type) => union_type
-            .into_vec()
-            .iter()
-            .any(should_check_nested_table_fields),
+        LuaType::Union(union_type) => union_type.types().any(should_check_nested_table_fields),
         LuaType::MultiLineUnion(multi_union) => multi_union
             .get_unions()
             .iter()
@@ -821,6 +972,7 @@ fn check_table_last_variadic_type(
                     expr_type,
                     false,
                     false,
+                    false,
                 ) && result
                 {
                     return Some(true);
@@ -840,6 +992,7 @@ fn check_assign_type_mismatch(
     value_type: &LuaType,
     allow_nil: bool,
     source_is_inferred: bool,
+    source_is_direct_target: bool,
 ) -> Option<bool> {
     let source_type = source_type.unwrap_or(&LuaType::Any);
     // 如果一致, 则不进行类型检查
@@ -851,8 +1004,13 @@ fn check_assign_type_mismatch(
         return Some(false);
     }
 
-    // `never` indicates a type inference limitation, not an actual error
-    if matches!(source_type, LuaType::Never) || matches!(value_type, LuaType::Never) {
+    let source_is_explicit = source_is_direct_target && !source_is_inferred;
+
+    // Derived `never` is an inference limitation, and a `never` value is assignable to any target.
+    // An explicitly annotated direct target is a declared constraint and must be checked.
+    if matches!(value_type, LuaType::Never)
+        || (matches!(source_type, LuaType::Never) && !source_is_explicit)
+    {
         return Some(false);
     }
 
@@ -867,7 +1025,8 @@ fn check_assign_type_mismatch(
         (LuaType::Def(_), _) => return Some(false),
         // 此时检查交给 table_field
         (LuaType::Ref(_) | LuaType::Tuple(_), LuaType::TableConst(_)) => return Some(false),
-        (LuaType::Nil, _) => return Some(false),
+        // Inferred/derived nil is a sentinel. Explicit nil/void direct targets remain authoritative.
+        (LuaType::Nil, _) if !source_is_explicit => return Some(false),
         // Allow nil assignment to reference/class types (common Lua cleanup pattern)
         (LuaType::Ref(_), LuaType::Nil) => return Some(false),
         (LuaType::Ref(_), LuaType::Instance(instance)) => {

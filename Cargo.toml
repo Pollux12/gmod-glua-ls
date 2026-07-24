@@ -4,6 +4,19 @@ members = ["crates/*",
     "tools/*",
 ]
 
+# Default release profile stays fast to compile for active development and
+# testing (no whole-program optimization). Iteration rebuilds are ~40s.
+[profile.release]
+
+# Optimized profile for CI / shipped binaries only. Whole-program optimization
+# (thin LTO + single codegen unit) trades a much slower build (~3min) for a
+# small runtime win (~0.4s indexing on the CityRP benchmark). Build with
+# `cargo build --profile dist`.
+[profile.dist]
+inherits = "release"
+lto = "thin"
+codegen-units = 1
+
 [workspace.package]
 description = "gmod-glua-ls — Garry's Mod Lua Language Server, a fork of EmmyLua Analyzer Rust optimized for GLua development"
 license = "MIT"
@@ -67,6 +80,11 @@ rustc-hash = "2"
 
 [patch.crates-io]
 emmylua_codestyle = { path = "vendor/emmylua_codestyle" }
+
+[profile.profiling]
+inherits = "release"
+debug = 1
+strip = "none"
 
 # Lint configuration for the entire workspace
 [workspace.lints.clippy]

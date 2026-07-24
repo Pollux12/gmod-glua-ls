@@ -85,8 +85,10 @@ pub async fn on_notification_handler(
                 .await;
             // Mark analysis dirty BEFORE handing the update to the coalescer so
             // follow-up requests see the stale state immediately.
-            snapshot.debounced_analysis().mark_dirty();
-            server_context.did_change_coalescer().enqueue(params);
+            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            server_context
+                .did_change_coalescer()
+                .enqueue(params, in_flight);
         }
         return Ok(());
     }
@@ -111,14 +113,17 @@ pub async fn on_notification_handler(
             server_context
                 .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
                 .await;
-            snapshot.debounced_analysis().mark_dirty();
+            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
-                on_did_open_text_document(task_snapshot.clone(), params).await;
-                task_snapshot
-                    .debounced_analysis()
-                    .finish_in_flight_changes(1)
-                    .await;
+                let handler_snapshot = task_snapshot.clone();
+                let handle = tokio::spawn(async move {
+                    on_did_open_text_document(handler_snapshot, params).await;
+                });
+                if let Err(err) = handle.await {
+                    log::error!("LS_DID_OPEN_PANIC didOpen handler failed: {}", err);
+                }
+                in_flight.finish().await;
             });
         }
         return Ok(());
@@ -142,14 +147,17 @@ pub async fn on_notification_handler(
             server_context
                 .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
                 .await;
-            snapshot.debounced_analysis().mark_dirty();
+            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
-                on_did_close_document(task_snapshot.clone(), params).await;
-                task_snapshot
-                    .debounced_analysis()
-                    .finish_in_flight_changes(1)
-                    .await;
+                let handler_snapshot = task_snapshot.clone();
+                let handle = tokio::spawn(async move {
+                    on_did_close_document(handler_snapshot, params).await;
+                });
+                if let Err(err) = handle.await {
+                    log::error!("LS_DID_CLOSE_PANIC didClose handler failed: {}", err);
+                }
+                in_flight.finish().await;
             });
         }
         return Ok(());

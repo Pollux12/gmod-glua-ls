@@ -16,7 +16,10 @@ mod test {
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include = vec![legacy_scope("entities/**")];
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
         ws.update_emmyrc(emmyrc);
     }
 

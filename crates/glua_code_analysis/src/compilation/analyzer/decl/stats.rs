@@ -8,7 +8,9 @@ use crate::{
     LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeCache,
     compilation::analyzer::common::bind_type,
-    db_index::{LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey},
+    db_index::{
+        LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey, LuaMemberOwner,
+    },
 };
 
 use super::{DeclAnalyzer, members::find_index_owner};
@@ -151,7 +153,7 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 let (owner, global_id) = find_index_owner(analyzer, index_expr.clone());
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
 
-                analyzer.db.get_member_index_mut().add_member(owner, member);
+                analyzer.add_member(owner, member);
                 if let LuaMemberKey::Name(name) = &key {
                     analyze_maybe_global_index_expr(analyzer, index_expr, name, value_expr_id);
                 }
@@ -338,11 +340,29 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
             };
 
             let (owner_id, global_id) = find_index_owner(analyzer, index_expr.clone());
+            let early_owner_decl = if matches!(owner_id, LuaMemberOwner::LocalUnresolve) {
+                index_expr
+                    .get_prefix_expr()
+                    .and_then(|prefix| match prefix {
+                        LuaExpr::NameExpr(name_expr) => {
+                            let name = name_expr.get_name_text()?;
+                            analyzer
+                                .find_decl(&name, name_expr.get_position())
+                                .map(|decl| decl.get_id())
+                        }
+                        _ => None,
+                    })
+            } else {
+                None
+            };
             let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
-            let member_id = analyzer
-                .db
-                .get_member_index_mut()
-                .add_member(owner_id, member);
+            let member_id = analyzer.add_member(owner_id, member);
+
+            if let Some(decl_id) = early_owner_decl {
+                analyzer
+                    .context
+                    .add_early_member_owner_candidate(member_id, decl_id);
+            }
 
             if let LuaMemberKey::Name(name) = &key {
                 analyze_maybe_global_index_expr(analyzer, &index_expr, name, None);
@@ -356,10 +376,18 @@ pub fn analyze_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaFuncStat) -> Opti
     let closure_owner_id =
         LuaSemanticDeclId::Signature(LuaSignatureId::from_closure(file_id, &closure));
     analyzer.db.get_property_index_mut().add_owner_map(
-        property_owner_id,
+        property_owner_id.clone(),
         closure_owner_id,
         file_id,
     );
+    let type_owner = match property_owner_id {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
+        LuaSemanticDeclId::Member(member_id) => member_id.into(),
+        _ => return Some(()),
+    };
+    analyzer
+        .context
+        .add_early_callable_signature(type_owner, LuaSignatureId::from_closure(file_id, &closure));
 
     Some(())
 }
@@ -383,13 +411,20 @@ pub fn analyze_local_func_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalFuncSt
 
     let decl_id = analyzer.add_decl(decl);
     let closure = stat.get_closure()?;
-    let closure_owner_id =
-        LuaSemanticDeclId::Signature(LuaSignatureId::from_closure(file_id, &closure));
+    let signature_id = LuaSignatureId::from_closure(file_id, &closure);
+    let closure_owner_id = LuaSemanticDeclId::Signature(signature_id);
     let property_decl_id = LuaSemanticDeclId::LuaDecl(decl_id);
     analyzer
         .db
         .get_property_index_mut()
         .add_owner_map(property_decl_id, closure_owner_id, file_id);
+    analyzer
+        .db
+        .get_signature_index_mut()
+        .bind_local_func_decl(signature_id, decl_id);
+    analyzer
+        .context
+        .add_early_callable_signature(decl_id.into(), signature_id);
 
     Some(())
 }

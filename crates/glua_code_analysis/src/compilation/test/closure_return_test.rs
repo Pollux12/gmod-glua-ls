@@ -1,6 +1,31 @@
 #[cfg(test)]
 mod test {
+    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use tokio_util::sync::CancellationToken;
+
     use crate::{DiagnosticCode, VirtualWorkspace};
+
+    fn local_name_type(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> crate::LuaType {
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let name_expr = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some(name))
+            .expect("local name");
+        model
+            .get_semantic_info(name_expr.syntax().clone().into())
+            .expect("semantic info")
+            .display_typ()
+            .clone()
+    }
 
     #[test]
     fn test_flow() {
@@ -79,5 +104,110 @@ mod test {
                 }
         "#,
         ));
+    }
+
+    #[test]
+    fn unresolved_multi_return_is_stable_after_consumer_edit() {
+        let mut ws = VirtualWorkspace::new();
+        let consumer = r#"
+            local ok, instance = API.Compile()
+            observed = instance
+        "#;
+
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/api.lua",
+                r#"
+                    API = {}
+
+                    function API.Compile()
+                        return API.Compile()
+                    end
+                "#,
+            ),
+            ("lua/autorun/consumer.lua", consumer),
+        ]);
+        let (consumer_file_id, consumer_uri) = file_ids
+            .into_iter()
+            .find_map(|file_id| {
+                let db = ws.analysis.compilation.get_db();
+                db.get_vfs()
+                    .get_file_path(&file_id)
+                    .is_some_and(|path| path.ends_with("lua/autorun/consumer.lua"))
+                    .then(|| db.get_vfs().get_uri(&file_id).map(|uri| (file_id, uri)))
+                    .flatten()
+            })
+            .expect("consumer URI");
+
+        let initial = local_name_type(&ws, consumer_file_id, "instance");
+        assert_eq!(initial, ws.ty("unknown"));
+        ws.analysis
+            .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .expect("edited consumer");
+        let incremental = local_name_type(&ws, consumer_file_id, "instance");
+
+        assert_eq!(initial, incremental);
+    }
+
+    #[test]
+    fn deferred_multi_return_correlation_is_stable_after_consumer_edit() {
+        let mut ws = VirtualWorkspace::new();
+        let consumer = r#"
+            local function run()
+                local ok, instance = API.Compile()
+                if not ok then return end
+                observed = instance.value
+            end
+        "#;
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/api.lua",
+                r#"
+                    API = {}
+
+                    function API.Compile()
+                        if maybe then return false, API.Failure() end
+                        return true, { value = "ok" }
+                    end
+
+                    function API.Failure()
+                        return nil
+                    end
+                "#,
+            ),
+            ("lua/autorun/consumer.lua", consumer),
+        ]);
+        let (consumer_file_id, consumer_uri) = file_ids
+            .into_iter()
+            .find_map(|file_id| {
+                let db = ws.analysis.compilation.get_db();
+                if !db
+                    .get_vfs()
+                    .get_file_path(&file_id)
+                    .is_some_and(|path| path.ends_with("lua/autorun/consumer.lua"))
+                {
+                    return None;
+                }
+                Some((file_id, db.get_vfs().get_uri(&file_id)?))
+            })
+            .expect("consumer file");
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::NeedCheckNil);
+
+        let before = ws
+            .analysis
+            .diagnose_file(consumer_file_id, CancellationToken::new())
+            .unwrap_or_default();
+        ws.analysis
+            .update_file_by_uri(&consumer_uri, Some(format!("{consumer}\n")))
+            .expect("edited consumer");
+        let after = ws
+            .analysis
+            .diagnose_file(consumer_file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(before.is_empty(), "unexpected diagnostics: {before:?}");
+        assert_eq!(before, after);
     }
 }

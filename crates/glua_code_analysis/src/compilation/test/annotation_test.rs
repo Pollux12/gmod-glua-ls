@@ -33,7 +33,7 @@ mod test {
                 && let Some(info) =
                     semantic_model.get_semantic_info(index_expr.syntax().clone().into())
             {
-                return info.typ;
+                return info.display_typ().clone();
             } else if text == expr_text {
                 seen_occurrence += 1;
             }
@@ -293,6 +293,79 @@ mod test {
         assert_eq!(
             flags_default,
             Some(LuaDocDefaultValue::Number("0xFF".to_string()))
+        );
+    }
+
+    #[test]
+    fn test_inline_default_expression_in_param_context() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@param entity Entity=NULL
+        ---@param origin Vector=Vector( 0, 0, 0 )
+        ---@param angle Angle=Angle( 0, 0, 0 )
+        function Example:SetDefaults(entity, origin, angle)
+        end
+        "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let db = semantic_model.get_db();
+
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .next()
+            .expect("expected closure");
+        let signature_id = crate::LuaSignatureId::from_closure(file_id, &closure);
+        let signature = db
+            .get_signature_index()
+            .get(&signature_id)
+            .expect("expected function signature");
+
+        let entity_idx = signature
+            .find_param_idx("entity")
+            .expect("missing entity param");
+        let entity_default = signature
+            .param_docs
+            .get(&entity_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            entity_default,
+            Some(LuaDocDefaultValue::Expression("NULL".to_string()))
+        );
+
+        let origin_idx = signature
+            .find_param_idx("origin")
+            .expect("missing origin param");
+        let origin_default = signature
+            .param_docs
+            .get(&origin_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            origin_default,
+            Some(LuaDocDefaultValue::Expression(
+                "Vector( 0, 0, 0 )".to_string()
+            ))
+        );
+
+        let angle_idx = signature
+            .find_param_idx("angle")
+            .expect("missing angle param");
+        let angle_default = signature
+            .param_docs
+            .get(&angle_idx)
+            .and_then(|doc| doc.default_value.clone());
+        assert_eq!(
+            angle_default,
+            Some(LuaDocDefaultValue::Expression(
+                "Angle( 0, 0, 0 )".to_string()
+            ))
         );
     }
 
@@ -1343,5 +1416,126 @@ mod test {
             index_expr_ty(&ws, file_id, "data.output.Value"),
             ws.ty("string")
         );
+    }
+
+    #[test]
+    fn test_outparam_self_receiver_updates_field_after_colon_call() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@type Node
+                local node = {}
+
+                node:CreateChildNodes()
+                local children = node.ChildNodes
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "node.ChildNodes"),
+            ws.ty("Panel")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_receiver_updates_explicit_dot_call_receiver() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@type Node
+                local node = {}
+
+                node.CreateChildNodes(node)
+                local children = node.ChildNodes
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "node.ChildNodes"),
+            ws.ty("Panel")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_receiver_does_not_override_later_field_write() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lib.lua",
+            r#"
+                ---@class Panel
+                ---@field Add fun(self: Panel)
+
+                ---@class Node
+                ---@field ChildNodes? Panel
+                local Node = {}
+
+                ---@outparam self.ChildNodes Panel
+                function Node:CreateChildNodes() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                ---@param maybeChildren Panel?
+                local function reset(maybeChildren)
+                    ---@type Node
+                    local node = {}
+
+                    node:CreateChildNodes()
+                    node.ChildNodes = maybeChildren
+                    local children = node.ChildNodes
+                end
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_ty_at_occurrence(&ws, file_id, "node.ChildNodes", 1),
+            ws.ty("Panel?")
+        );
+    }
+
+    #[test]
+    fn test_outparam_self_root_requires_colon_method() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AnnotationUsageError,
+            r#"
+            ---@class Panel
+
+            ---@outparam self.ChildNodes Panel
+            function CreateChildNodes() end
+            "#,
+        ));
     }
 }

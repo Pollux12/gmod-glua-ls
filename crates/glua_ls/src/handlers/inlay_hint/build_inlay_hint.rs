@@ -3,9 +3,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use glua_code_analysis::{
-    AsyncState, FileId, GmodRealm, InferGuard, LuaFunctionType, LuaMember, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDecl, SemanticModel, WorkspaceId, resolve_alias_type,
+    AsyncState, FileId, InferGuard, LuaFunctionType, LuaMember, LuaMemberId, LuaMemberKey,
+    LuaMemberOwner, LuaOperatorId, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId,
+    LuaType, LuaTypeDecl, SemanticModel, WorkspaceId, resolve_alias_type,
 };
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
@@ -176,7 +176,7 @@ fn get_call_signature_param_location(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
     let mut document = None;
-    let closure = if let LuaType::Signature(signature_id) = &semantic_info.typ {
+    let closure = if let LuaType::Signature(signature_id) = semantic_info.display_typ() {
         let sig_file_id = signature_id.get_file_id();
         let sig_position = signature_id.get_position();
         document = semantic_model.get_document_by_file_id(sig_file_id);
@@ -235,7 +235,7 @@ fn build_call_expr_await_hint(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
 
-    match semantic_info.typ {
+    match semantic_info.display_typ().clone() {
         LuaType::DocFunction(f) => {
             if f.get_async_state() == AsyncState::Async {
                 let range = call_expr.get_range();
@@ -424,7 +424,8 @@ fn build_local_name_hint(
         .get_semantic_info(NodeOrToken::Token(
             local_name.get_name_token()?.syntax().clone(),
         ))?
-        .typ;
+        .display_typ()
+        .clone();
 
     let vgui_panel_name = if enable_vgui_inlay_hint {
         get_vgui_panel_name(semantic_model, &typ)
@@ -503,14 +504,17 @@ fn build_assign_stat_hint(
     let document = semantic_model.get_document();
 
     for var in vars {
-        let Some(semantic_info) =
+        let assigned_type = semantic_model.infer_plain_assignment_target_value(&var);
+        let semantic_info = if assigned_type.is_none() {
             semantic_model.get_semantic_info(NodeOrToken::Node(var.syntax().clone()))
-        else {
-            continue;
+        } else {
+            None
         };
+        let typ = assigned_type
+            .as_ref()
+            .or_else(|| semantic_info.as_ref().map(|info| info.display_typ()))?;
 
-        let Some((panel_name, base_name)) = get_vgui_panel_name(semantic_model, &semantic_info.typ)
-        else {
+        let Some((panel_name, base_name)) = get_vgui_panel_name(semantic_model, typ) else {
             continue;
         };
 
@@ -567,8 +571,8 @@ fn get_vgui_panel_name(
         }
         LuaType::Instance(instance) => get_vgui_panel_name(semantic_model, instance.get_base()),
         LuaType::Union(union_type) => {
-            for union_member in union_type.into_vec() {
-                if let Some(panel_info) = get_vgui_panel_name(semantic_model, &union_member) {
+            for union_member in union_type.types() {
+                if let Some(panel_info) = get_vgui_panel_name(semantic_model, union_member) {
                     return Some(panel_info);
                 }
             }
@@ -707,7 +711,7 @@ fn build_call_expr_meta_call_hint(
     let semantic_info =
         semantic_model.get_semantic_info(NodeOrToken::Node(prefix_expr.syntax().clone()))?;
 
-    match &semantic_info.typ {
+    match semantic_info.display_typ() {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let decl = semantic_model.get_db().get_type_index().get_type_decl(id)?;
             if !decl.is_class() {
@@ -725,7 +729,7 @@ fn build_call_expr_meta_call_hint(
                 result,
                 &call_operator_ids,
                 call_expr,
-                semantic_info.typ,
+                semantic_info.display_typ().clone(),
             )?;
         }
         _ => {}
@@ -893,14 +897,14 @@ fn get_visible_call_operator_ids(
     }
 
     let infer_index = semantic_model.get_db().get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
     for (_, tier_operator_ids) in priority_tiers {
         let compatible_operator_ids = tier_operator_ids
             .into_iter()
             .filter(|operator_id| {
-                let operator_realm =
-                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
-                is_operator_realm_compatible(caller_realm, operator_realm)
+                let operator_mask = infer_index
+                    .get_state_mask_at_offset(&operator_id.file_id, operator_id.position);
+                caller_mask.is_compatible_with(operator_mask)
             })
             .collect::<Vec<_>>();
         if !compatible_operator_ids.is_empty() {
@@ -909,13 +913,6 @@ fn get_visible_call_operator_ids(
     }
 
     Some(fallback_operator_ids)
-}
-
-fn is_operator_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 fn build_index_expr_hint(

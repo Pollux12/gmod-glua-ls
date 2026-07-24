@@ -376,6 +376,19 @@ impl LuaType {
         matches!(self, LuaType::Object(_))
     }
 
+    pub fn contains_object_type(&self) -> bool {
+        match self {
+            LuaType::Object(_) => true,
+            LuaType::Union(union) => union.types().any(LuaType::contains_object_type),
+            LuaType::MultiLineUnion(union) => union
+                .get_unions()
+                .iter()
+                .any(|(typ, _)| typ.contains_object_type()),
+            LuaType::TypeGuard(inner) => inner.contains_object_type(),
+            _ => false,
+        }
+    }
+
     pub fn is_union(&self) -> bool {
         matches!(self, LuaType::Union(_))
     }
@@ -688,8 +701,7 @@ pub fn is_table_const_shaped_array(db: &DbIndex, range: &InFiled<TextRange>) -> 
 /// (`IntegerConst` → `DocIntegerConst`, `FloatConst` → `number`, `StringConst` →
 /// `DocStringConst`). Returns `None` when the table has no integer members or
 /// when the provenance check (`is_table_const_shaped_array`) fails, so callers
-/// can fall back to their existing behavior. Bounded by the shaped-literal
-/// member cap, so this stays cheap.
+/// can fall back to their existing behavior.
 pub fn table_const_array_base(db: &DbIndex, range: &InFiled<TextRange>) -> Option<LuaType> {
     if !is_table_const_shaped_array(db, range) {
         return None;
@@ -1076,6 +1088,19 @@ impl LuaUnionType {
         }
     }
 
+    /// Borrowing iterator over the union members. Zero-allocation alternative to
+    /// [`into_vec`](Self::into_vec) for the common case of iterating the members
+    /// without needing to own them. For `Nullable(T)` it yields `T` then `nil`.
+    pub fn types(&self) -> UnionTypeIter<'_> {
+        match self {
+            LuaUnionType::Nullable(ty) => UnionTypeIter::Nullable {
+                ty: Some(ty),
+                nil_yielded: false,
+            },
+            LuaUnionType::Multi(types) => UnionTypeIter::Multi(types.iter()),
+        }
+    }
+
     #[allow(unused, clippy::wrong_self_convention)]
     pub(crate) fn into_set(&self) -> HashSet<LuaType> {
         match self {
@@ -1121,6 +1146,38 @@ impl LuaUnionType {
         match self {
             LuaUnionType::Nullable(f) => f.is_always_falsy(),
             LuaUnionType::Multi(types) => types.iter().all(|t| t.is_always_falsy()),
+        }
+    }
+}
+
+/// Borrowing iterator over the members of a [`LuaUnionType`], produced by
+/// [`LuaUnionType::types`]. Avoids the `into_vec` clone in hot inference and
+/// dynamic-field scans.
+pub enum UnionTypeIter<'a> {
+    Nullable {
+        ty: Option<&'a LuaType>,
+        nil_yielded: bool,
+    },
+    Multi(std::slice::Iter<'a, LuaType>),
+}
+
+impl<'a> Iterator for UnionTypeIter<'a> {
+    type Item = &'a LuaType;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self {
+            UnionTypeIter::Nullable { ty, nil_yielded } => {
+                if let Some(t) = ty.take() {
+                    Some(t)
+                } else if !*nil_yielded {
+                    *nil_yielded = true;
+                    const NIL: LuaType = LuaType::Nil;
+                    Some(&NIL)
+                } else {
+                    None
+                }
+            }
+            UnionTypeIter::Multi(iter) => iter.next(),
         }
     }
 }

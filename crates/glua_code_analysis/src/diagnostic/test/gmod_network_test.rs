@@ -450,6 +450,51 @@ mod tests {
         );
     }
 
+    #[gtest]
+    fn test_table_literal_wrapped_start_suppresses_missing_sender_counterpart() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            local meta = {
+                MsgStart = function(self)
+                    net.Start("properties")
+                    net.WriteString(self.InternalName)
+                end,
+                MsgEnd = function(self)
+                    net.SendToServer()
+                end,
+            }
+
+            meta:MsgStart()
+            meta:MsgEnd()
+            "#,
+        );
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("properties")
+            net.Receive("properties", function()
+                local name = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(0usize)
+        );
+    }
+
     // ---- Dynamic read/write tests (writes/reads inside if/for/while/repeat
     // are treated as 0..N occurrences of their kind, eliminating false
     // positives when one side uses a runtime-decided loop or branch).
@@ -1881,6 +1926,39 @@ mod tests {
         let diagnostics = file_diagnostics(&mut ws, client_file_id);
         assert_that!(
             count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteBitsMismatch),
+            eq(0usize)
+        );
+    }
+
+    #[gtest]
+    fn test_nested_read_argument_evaluates_before_outer_read() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("NestedReadOrder")
+            net.Start("NestedReadOrder")
+            net.WriteUInt(#payload, 16)
+            net.WriteData(payload, #payload)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("NestedReadOrder", function()
+                local payload = net.ReadData(net.ReadUInt(16))
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        assert_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
             eq(0usize)
         );
     }

@@ -7,7 +7,8 @@ use smol_str::SmolStr;
 
 use crate::{
     AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DbIndex, FileId,
-    FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree, LuaClosureId, LuaDeclId,
+    FileNarrowingCapability, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
+    LuaClosureId, LuaDeclId,
 };
 
 /// Snapshot of the modification counters, used to detect what was created
@@ -18,12 +19,26 @@ pub struct ModificationSnapshot {
     pub index_assign_count: u32,
     pub cast_or_implfunc_count: u32,
     pub condition_count: u32,
+    pub narrowing_event_count: usize,
+}
+
+#[derive(Debug, Clone)]
+enum NarrowingEvent {
+    Name(ArcIntern<SmolStr>),
+    IndexPath(ArcIntern<SmolStr>),
+    OpaqueName,
+    OpaqueIndex,
 }
 
 #[derive(Debug)]
 pub struct FlowBinder<'a> {
-    pub db: &'a mut DbIndex,
+    pub db: &'a DbIndex,
     pub file_id: FileId,
+    /// Errors accumulated during binding. Collected here (rather than written
+    /// straight to the diagnostic index) so flow binding can run with only an
+    /// immutable `&DbIndex`, enabling parallel per-file binding. The pipeline
+    /// drains these into the diagnostic index sequentially afterward.
+    pub errors: Vec<AnalyzeError>,
     pub decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     pub start: FlowId,
     pub unreachable: FlowId,
@@ -43,13 +58,17 @@ pub struct FlowBinder<'a> {
     index_assign_count: u32,
     cast_or_implfunc_count: u32,
     condition_count: u32,
+    // File-wide narrowing capability (which names/paths can be narrowed).
+    narrowing_capability: FileNarrowingCapability,
+    narrowing_events: Vec<NarrowingEvent>,
 }
 
 impl<'a> FlowBinder<'a> {
-    pub fn new(db: &'a mut DbIndex, file_id: FileId) -> Self {
+    pub fn new(db: &'a DbIndex, file_id: FileId) -> Self {
         let mut binder = FlowBinder {
             db,
             file_id,
+            errors: Vec::new(),
             flow_nodes: Vec::new(),
             multiple_antecedents: Vec::new(),
             decl_bind_expr_ref: HashMap::new(),
@@ -68,6 +87,8 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: 0,
             cast_or_implfunc_count: 0,
             condition_count: 0,
+            narrowing_capability: FileNarrowingCapability::default(),
+            narrowing_events: Vec::new(),
         };
 
         binder.start = binder.create_start();
@@ -232,6 +253,7 @@ impl<'a> FlowBinder<'a> {
             index_assign_count: self.index_assign_count,
             cast_or_implfunc_count: self.cast_or_implfunc_count,
             condition_count: self.condition_count,
+            narrowing_event_count: self.narrowing_events.len(),
         }
     }
 
@@ -244,6 +266,34 @@ impl<'a> FlowBinder<'a> {
             self.cast_or_implfunc_count > snap.cast_or_implfunc_count,
             self.condition_count > snap.condition_count,
         )
+    }
+
+    pub fn narrowing_capability_since(
+        &self,
+        snap: ModificationSnapshot,
+    ) -> FileNarrowingCapability {
+        let mut capability = FileNarrowingCapability::default();
+        for event in self
+            .narrowing_events
+            .iter()
+            .skip(snap.narrowing_event_count)
+        {
+            match event {
+                NarrowingEvent::Name(name) => {
+                    capability.referenced_names.insert(name.clone());
+                }
+                NarrowingEvent::IndexPath(path) => {
+                    capability.referenced_index_paths.insert(path.clone());
+                }
+                NarrowingEvent::OpaqueName => {
+                    capability.has_opaque_name_target = true;
+                }
+                NarrowingEvent::OpaqueIndex => {
+                    capability.has_opaque_index_target = true;
+                }
+            }
+        }
+        capability
     }
 
     /// Record merge-skip metadata for a BranchLabel created by an if/elseif/else.
@@ -260,13 +310,97 @@ impl<'a> FlowBinder<'a> {
     }
 
     pub fn report_error(&mut self, error: AnalyzeError) {
-        self.db
-            .get_diagnostic_index_mut()
-            .add_diagnostic(self.file_id, error);
+        self.errors.push(error);
     }
 
-    pub fn finish(self) -> FlowTree {
-        FlowTree::new(
+    /// Record a bare name that can be narrowed at some site (assignment target,
+    /// cast, or condition expression).
+    pub fn record_narrowable_name(&mut self, name: &str) {
+        let name = ArcIntern::from(SmolStr::new(name));
+        self.narrowing_capability
+            .referenced_names
+            .insert(name.clone());
+        self.narrowing_events.push(NarrowingEvent::Name(name));
+    }
+
+    /// Record an index access path that can be narrowed.
+    pub fn record_narrowable_index_path(&mut self, path: &str) {
+        let path = ArcIntern::from(SmolStr::new(path));
+        self.narrowing_capability
+            .referenced_index_paths
+            .insert(path.clone());
+        self.narrowing_events.push(NarrowingEvent::IndexPath(path));
+    }
+
+    pub fn mark_opaque_name_target(&mut self) {
+        self.narrowing_capability.has_opaque_name_target = true;
+        self.narrowing_events.push(NarrowingEvent::OpaqueName);
+    }
+
+    pub fn mark_opaque_index_target(&mut self) {
+        self.narrowing_capability.has_opaque_index_target = true;
+        self.narrowing_events.push(NarrowingEvent::OpaqueIndex);
+    }
+
+    /// Walk an expression subtree and record every name / index access path it
+    /// references as narrowable. Used for cast expressions.
+    pub fn record_narrowable_refs_in_expr(&mut self, expr: &LuaExpr) {
+        self.record_narrowable_refs(expr);
+    }
+
+    /// Record condition references separately from assignment and cast targets.
+    pub fn record_condition_refs_in_expr(&mut self, expr: &LuaExpr) {
+        self.record_narrowable_refs(expr);
+    }
+
+    pub fn record_condition_flow_paths(&mut self, flow_id: FlowId, expr: &LuaExpr) {
+        use glua_parser::{LuaAstNode, LuaIndexExpr, PathTrait};
+
+        for index_expr in expr.syntax().descendants().filter_map(LuaIndexExpr::cast) {
+            let dynamic = matches!(
+                index_expr.get_index_key(),
+                Some(glua_parser::LuaIndexKey::Expr(_))
+            );
+            if let Some(path) = index_expr.get_access_path().filter(|_| !dynamic) {
+                self.narrowing_capability
+                    .condition_flows_by_path
+                    .entry(ArcIntern::from(SmolStr::new(path)))
+                    .or_default()
+                    .insert(flow_id);
+            }
+        }
+    }
+
+    fn record_narrowable_refs(&mut self, expr: &LuaExpr) {
+        use glua_parser::{LuaAstNode, LuaIndexExpr, LuaNameExpr, PathTrait};
+        // Record the expr itself if it is a name or index, then recurse into
+        // descendants to cover nested references (e.g. `a.b and c(d.e)`).
+        for node in expr.syntax().descendants() {
+            if let Some(name_expr) = LuaNameExpr::cast(node.clone()) {
+                if let Some(name) = name_expr.get_name_text() {
+                    self.record_narrowable_name(&name);
+                } else {
+                    self.mark_opaque_name_target();
+                }
+            } else if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+                let dynamic = matches!(
+                    index_expr.get_index_key(),
+                    Some(glua_parser::LuaIndexKey::Expr(_))
+                );
+                match index_expr.get_access_path() {
+                    Some(path) if !dynamic => {
+                        self.record_narrowable_index_path(&path);
+                    }
+                    _ => {
+                        self.mark_opaque_index_target();
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn finish(self) -> (FlowTree, Vec<AnalyzeError>) {
+        let flow_tree = FlowTree::new(
             self.decl_bind_expr_ref,
             self.flow_nodes,
             self.multiple_antecedents,
@@ -274,7 +408,9 @@ impl<'a> FlowBinder<'a> {
             self.bindings,
             self.branch_label_info,
             self.assignment_flow_info,
-        )
+            self.narrowing_capability,
+        );
+        (flow_tree, self.errors)
     }
 }
 

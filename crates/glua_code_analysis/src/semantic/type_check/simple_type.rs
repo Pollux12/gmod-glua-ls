@@ -296,11 +296,11 @@ pub fn check_simple_type_compact(
 
     match compact_type {
         LuaType::Union(union) => {
-            for sub_compact in union.into_vec() {
+            for sub_compact in union.types() {
                 match check_simple_type_compact(
                     context,
                     source,
-                    &sub_compact,
+                    sub_compact,
                     check_guard.next_level()?,
                 ) {
                     Ok(_) => {}
@@ -420,8 +420,8 @@ fn check_enum_fields_match_source(
     if let Some(decl) = context.db.get_type_index().get_type_decl(enum_type_decl_id)
         && let Some(LuaType::Union(enum_fields)) = decl.get_enum_field_type(context.db)
     {
-        for field in enum_fields.into_vec() {
-            check_general_type_compact(context, source, &field, check_guard.next_level()?)?;
+        for field in enum_fields.types() {
+            check_general_type_compact(context, source, field, check_guard.next_level()?)?;
         }
 
         return Ok(());

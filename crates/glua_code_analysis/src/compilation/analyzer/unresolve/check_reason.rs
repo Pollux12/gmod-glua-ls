@@ -5,7 +5,11 @@ use glua_parser::LuaAstNode;
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaDocReturnInfo, LuaSemanticDeclId, LuaType, LuaTypeCache,
     ReturnTypeKind, SignatureReturnStatus,
-    compilation::analyzer::infer_cache_manager::InferCacheManager, infer_expr, infer_param,
+    compilation::analyzer::{
+        common::{TypeCacheWriteMode, write_type_cache},
+        infer_cache_manager::InferCacheManager,
+    },
+    infer_expr, infer_param,
 };
 
 use super::UnResolve;
@@ -81,8 +85,12 @@ pub fn resolve_as_unknown(
             return Some(());
         }
         InferFailReason::UnResolveDeclType(decl_id) => {
-            db.get_type_index_mut()
-                .bind_type((*decl_id).into(), LuaTypeCache::InferType(LuaType::Unknown));
+            write_type_cache(
+                db,
+                (*decl_id).into(),
+                LuaTypeCache::InferType(LuaType::Unknown),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         InferFailReason::UnResolveMemberType(member_id) => {
             // 第一次循环不处理, 或许需要判断`unresolves`是否全为取值再跳过?
@@ -97,15 +105,23 @@ pub fn resolve_as_unknown(
             if opt_type.is_none() {
                 let semantic_member_id = member_item.resolve_semantic_decl(db)?;
                 if let LuaSemanticDeclId::Member(member_id) = semantic_member_id {
-                    db.get_type_index_mut()
-                        .bind_type(member_id.into(), LuaTypeCache::InferType(LuaType::Unknown));
+                    write_type_cache(
+                        db,
+                        member_id.into(),
+                        LuaTypeCache::InferType(LuaType::Unknown),
+                        TypeCacheWriteMode::InsertOnly,
+                    );
                 }
             }
         }
         InferFailReason::UnResolveExpr(expr) => {
             let key = InFiled::new(expr.file_id, expr.value.get_syntax_id());
-            db.get_type_index_mut()
-                .bind_type(key.into(), LuaTypeCache::InferType(LuaType::Unknown));
+            write_type_cache(
+                db,
+                key.into(),
+                LuaTypeCache::InferType(LuaType::Unknown),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
             let signature = db.get_signature_index_mut().get_mut(signature_id)?;

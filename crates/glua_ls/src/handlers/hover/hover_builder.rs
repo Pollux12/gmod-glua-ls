@@ -1,6 +1,6 @@
 use glua_code_analysis::{
     GenericTplId, GmodRealm, LuaCompilation, LuaMember, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    RenderLevel, SemanticModel, TypeSubstitutor,
+    RenderLevel, SemanticInfoOrigin, SemanticModel, TypeSubstitutor,
 };
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaLocalName, LuaLocalStat, LuaSyntaxKind, LuaSyntaxToken,
@@ -13,6 +13,34 @@ use crate::handlers::hover::humanize_types::{
 
 use super::build_hover::{add_signature_param_description, add_signature_ret_description};
 use super::realm_badge::{badge_header_markdown, badge_markdown};
+
+const INFER_HOVER_PREFIX: &str = "(infer) ";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HoverTypeLabel {
+    Plain,
+    Inferred,
+}
+
+impl HoverTypeLabel {
+    pub(super) fn from_semantic_origin(origin: SemanticInfoOrigin) -> Self {
+        match origin {
+            SemanticInfoOrigin::Actual => Self::Plain,
+            SemanticInfoOrigin::ContextualExpected => Self::Inferred,
+        }
+    }
+
+    pub(super) fn is_inferred(self) -> bool {
+        matches!(self, Self::Inferred)
+    }
+
+    pub(super) fn format(self, type_text: String) -> String {
+        match self {
+            Self::Plain => type_text,
+            Self::Inferred => format!("{INFER_HOVER_PREFIX}{type_text}"),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct HoverBuilder<'a> {
@@ -32,6 +60,7 @@ pub struct HoverBuilder<'a> {
     tag_content: Option<Vec<(String, String)>>,
     realm: Option<GmodRealm>,
     realm_is_explicit: bool,
+    type_label: HoverTypeLabel,
 
     trigger_token: Option<LuaSyntaxToken>,
     pub semantic_model: &'a SemanticModel<'a>,
@@ -84,9 +113,22 @@ impl<'a> HoverBuilder<'a> {
             tag_content: None,
             realm: None,
             realm_is_explicit: false,
+            type_label: HoverTypeLabel::Plain,
             detail_render_level,
             substitutor,
         }
+    }
+
+    pub(super) fn set_type_label(&mut self, type_label: HoverTypeLabel) {
+        self.type_label = type_label;
+    }
+
+    pub(super) fn type_label(&self) -> HoverTypeLabel {
+        self.type_label
+    }
+
+    pub fn format_type_description(&self, description: String) -> String {
+        self.type_label.format(description)
     }
 
     pub fn set_type_description(&mut self, type_description: String) {

@@ -1,15 +1,15 @@
 ---
 title: "@call_arg"
-description: Mark string and callback parameters so GLuaLS can understand custom GMod wrappers.
+description: Tell GLuaLS what each parameter of a custom wrapper means.
 ---
 
 ## Overview
 
-`@call_arg` marks a function parameter that requires special handling. Use it when you write a wrapper around base gmod functions and still want GLuaLS to understand the names, callbacks, colors, panels, skins, or scripted-class metadata passed through that wrapper. This system was implemented to replace previously hardcoded handling of special base gmod functions / methods / classes to instead implement a more generic system that can be used for other advanced use cases.
+Use `@call_arg` when your function wraps a Garry's Mod API. It lets completion, navigation, type checking, and other editor features treat the wrapper like the original function.
 
-Most addons do not need this annotation. The official GMod annotations already apply it to built-in functions like `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
+Most addons do not need this annotation. The official annotations already apply it to built-in functions like `include`, `AddCSLuaFile`, `file.Find`, `util.AddNetworkString`, `net.Start`, `hook.Add`, `vgui.Register`, and `derma.DefineSkin`.
 
-It is expected that you know what you are doing if you use this annotation.
+Only add it when the wrapper has the same behavior as the API it represents.
 
 ---
 
@@ -32,7 +32,7 @@ local function StartMessage(messageName, ply)
 end
 ```
 
-After this, `StartMessage("...")` gets the same net message lookup, completion, hover, and navigation as `net.Start("...")`. While the net system already does try to detect cases similar to the above code, this is more of an example of how it could be used to add detection for wrappers that aren't currently autodetected.
+After this, `StartMessage("...")` gets net message completion, hover, and navigation like `net.Start("...")`.
 
 For overloaded signatures, use `@overload_call_arg` directly above the `@overload` it describes:
 
@@ -61,14 +61,17 @@ The first argument is the zero-based parameter index inside that overload.
 | `gmod.concommand` | `define`, `callback` | Console command registration and callback tracking |
 | `gmod.convar` | `define`, `define_server`, `define_client` | Server and client ConVar registration |
 | `gmod.timer` | `define`, `callback`, `simple` | Timer creation and callback tracking |
+| `gmod.load` | `include`, `addcsluafile`, `add_cs_lua_file`, `includecs`, `include_cs`, `require` | File loading and realm detection for wrappers |
+| `gmod.file_find` | `glob`, `search_path`, `path` | Files found by `file.Find` loader loops |
 | `gmod.vgui_panel` | `define`, `define_control`, `table`, `base`, `reference` | VGUI panel registration, inheritance, and panel name lookup |
 | `gmod.derma_skin` | `define`, `reference` | Derma skin registration and skin name lookup |
 | `gmod.network_var` | `type`, `define`, `define_element` | Entity `NetworkVar` and `NetworkVarElement` accessor generation |
-| `gmod.class_base` | `reference` | `DEFINE_BASECLASS` inheritance metadata |
-| `gmod.gamemode` | `reference` | `DeriveGamemode` inheritance metadata |
+| `gmod.class_base` | `reference` | Base class names passed to `DEFINE_BASECLASS` wrappers |
+| `gmod.gamemode` | `reference` | Parent gamemode names passed to `DeriveGamemode` wrappers |
+| `gmod.member_guard` | `function` | Member-name guard wrappers |
 | `gmod.color` | `r`, `g`, `b`, `a` | Color previews for custom color constructors |
 
-Unknown domains and roles are stored as metadata but ignored by GMod-specific features until GLuaLS adds a consumer for them. This is intentional to prevent errors for outdated clients.
+Guard metadata such as `valid_guard`, `self_guard`, and `self_call_valid` belongs on functions and callbacks, not parameters. Use [Guard metadata](/annotations/guard-metadata) for functions and callbacks that prove values are valid.
 
 ---
 
@@ -104,6 +107,54 @@ local function RunHook(eventName, ...)
     return hook.Run(eventName, ...)
 end
 ```
+
+---
+
+## Lua loading
+
+Use `gmod.load` for wrappers around Lua file and module loading:
+
+```lua
+---@[call_arg("gmod.load", "include")]
+---@param path string
+local function IncludeShared(path)
+    include(path)
+end
+
+---@[call_arg("gmod.load", "addcsluafile")]
+---@param path string
+local function SendToClient(path)
+    AddCSLuaFile(path)
+end
+
+---@[call_arg("gmod.load", "includecs")]
+---@param path string
+local function IncludeClient(path)
+    IncludeCS(path)
+end
+
+---@[call_arg("gmod.load", "require")]
+---@param module string
+local function LoadModule(module)
+    return require(module)
+end
+```
+
+Calls through these wrappers affect file loading and realm detection like direct `include`, `AddCSLuaFile`, `IncludeCS`, and `require` calls. GLuaLS follows fixed paths and `file.Find` loops when it can identify the matching files.
+
+Use `gmod.file_find` when wrapping `file.Find` itself:
+
+```lua
+---@[call_arg("gmod.file_find", "glob")]
+---@param pattern string
+---@[call_arg("gmod.file_find", "search_path")]
+---@param searchPath string
+local function FindLuaFiles(pattern, searchPath)
+    return file.Find(pattern, searchPath)
+end
+```
+
+When `FindLuaFiles("myaddon/*.lua", "LUA")` is used in a loop and the loop body calls annotated load wrappers, GLuaLS can infer which matching files are loaded server-side, sent to the client, or shared.
 
 ---
 
@@ -190,12 +241,14 @@ An optional third argument breaks ties when one parameter can inherit multiple r
 ---@param name string
 ```
 
-Higher priority wins. You normally do not need this unless you are annotating a generic wrapper that can behave like several GMod APIs.
+Higher priority wins. You normally do not need this unless you are annotating a generic wrapper that can behave like several APIs.
 
 ---
 
 ## See also
 
+- [Realm awareness](/language/realm-awareness): realm inference from file loading
 - [Network analysis](/language/network-analysis): net message tracking
 - [Hook intelligence](/language/hook-intelligence): hook completion and callback inference
 - [VGUI support](/language/vgui-support): panels and Derma skins
+- [Guard metadata](/annotations/guard-metadata): validity guards for nil and NULL checks

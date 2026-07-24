@@ -462,15 +462,49 @@ fn parse_doc_default_value(p: &mut LuaDocParser) -> DocParseResult {
                 }
             }
         }
+        LuaTokenKind::TkName => {
+            p.bump();
+            if p.current_token() == LuaTokenKind::TkLeftParen {
+                parse_doc_default_call_value(p)?;
+            }
+        }
         _ => {
             return Err(LuaParseError::doc_error_from(
-                "expect default literal value",
+                "expect default literal or expression value",
                 p.current_token_range(),
             ));
         }
     }
 
     Ok(m.complete(p))
+}
+
+fn parse_doc_default_call_value(p: &mut LuaDocParser) -> Result<(), LuaParseError> {
+    let mut paren_depth = 0;
+    loop {
+        match p.current_token() {
+            LuaTokenKind::TkLeftParen => {
+                paren_depth += 1;
+                p.bump();
+            }
+            LuaTokenKind::TkRightParen => {
+                p.bump();
+                paren_depth -= 1;
+                if paren_depth == 0 {
+                    break;
+                }
+            }
+            LuaTokenKind::TkEof => {
+                return Err(LuaParseError::doc_error_from(
+                    "expect ')' to close default expression",
+                    p.current_token_range(),
+                ));
+            }
+            _ => p.bump(),
+        }
+    }
+
+    Ok(())
 }
 
 // ---@return_cast <param name> <type>

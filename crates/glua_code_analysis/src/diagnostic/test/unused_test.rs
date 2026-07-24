@@ -69,9 +69,10 @@ mod test {
     }
 
     #[test]
-    fn test_scripted_class_seeded_var_no_unused_diagnostic() {
+    fn test_scripted_class_virtual_authoring_var_no_unused_diagnostic() {
         // A gamemode file with no GM method definitions must NOT trigger
-        // "GM is never used" — the GM variable is injected by the LS, not written by the user.
+        // "GM is never used" — the virtual GM authoring table is analyzer metadata,
+        // not a user-written local declaration.
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
@@ -84,25 +85,6 @@ mod test {
             r#"
                 local spawnIconFile = file.Open("test.png", "rb", "GAME")
                 if spawnIconFile then end
-            "#,
-        ));
-    }
-
-    #[test]
-    fn test_scripted_class_seeded_var_no_redefined_local_diagnostic() {
-        // A gamemode file that declares `local GM = {}` must NOT trigger
-        // "redefined local" against the LS-injected GM seed decl.
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = ws.get_emmyrc();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-
-        assert!(ws.check_file_for(
-            DiagnosticCode::RedefinedLocal,
-            "gamemodes/test/gamemode/init.lua",
-            r#"
-                local GM = {}
-                function GM:PlayerSpawn(ply) end
             "#,
         ));
     }
@@ -125,6 +107,112 @@ mod test {
                 end
 
                 foo(1)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_generic_for_placeholder_before_used_value_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                for k, v in pairs({ 1, 2, 3 }) do
+                    consume(v)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_generic_for_placeholder_after_used_key_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function consume(v)
+                    return v
+                end
+
+                for k, v in pairs({ 1, 2, 3 }) do
+                    consume(k)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_generic_for_all_unused_values_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                for k, v in pairs({ 1, 2, 3 }) do
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_numeric_for_unused_counter_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                for i = 1, 3 do
+                    print("tick")
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_placeholder_before_used_value_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function pos()
+                    return 1, 2
+                end
+
+                local x, y = pos()
+                return y
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_placeholder_after_used_values_is_not_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function hsv()
+                    return 1, 2, 3
+                end
+
+                local h, s, v = hsv()
+                return h + s
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_multireturn_all_unused_values_still_reports_unused() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::Unused,
+            r#"
+                local function pos()
+                    return 1, 2
+                end
+
+                local x, y = pos()
             "#,
         ));
     }

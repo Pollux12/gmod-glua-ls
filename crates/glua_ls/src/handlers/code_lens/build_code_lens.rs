@@ -122,7 +122,8 @@ fn add_func_stat_code_lens(
             if enable_vgui_code_lens
                 && let Some(semantic_info) =
                     semantic_model.get_semantic_info(NodeOrToken::Node(name_expr.syntax().clone()))
-                && let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ)
+                && let Some(info) =
+                    find_gmod_class_from_type(semantic_model, semantic_info.display_typ())
             {
                 push_gmod_class_code_lens(result, range, &info);
             }
@@ -157,7 +158,7 @@ fn add_local_func_stat_code_lens(
     if enable_vgui_code_lens
         && let Some(semantic_info) =
             semantic_model.get_semantic_info(NodeOrToken::Node(func_name.syntax().clone()))
-        && let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ)
+        && let Some(info) = find_gmod_class_from_type(semantic_model, semantic_info.display_typ())
     {
         push_gmod_class_code_lens(result, range, &info);
     }
@@ -187,7 +188,8 @@ fn add_local_stat_code_lens(
         else {
             continue;
         };
-        let Some(info) = find_gmod_class_from_type(semantic_model, &semantic_info.typ) else {
+        let Some(info) = find_gmod_class_from_type(semantic_model, semantic_info.display_typ())
+        else {
             continue;
         };
 

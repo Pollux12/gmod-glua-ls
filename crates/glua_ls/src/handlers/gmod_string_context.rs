@@ -1,6 +1,7 @@
 use glua_code_analysis::{
     DbIndex, LuaCallArgRole, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    LuaTypeOwner, SemanticDeclLevel, SemanticModel, find_call_arg_role_from_type,
+    LuaTypeOwner, SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_for_param,
+    find_best_direct_call_arg_role_from_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaLiteralExpr,
@@ -93,7 +94,7 @@ pub(crate) fn find_string_call_arg_role(
         arg_index,
         is_colon_call,
     );
-    find_call_arg_role_from_type(
+    find_best_direct_call_arg_role_from_type(
         semantic_model.get_db(),
         &callable_type,
         param_idx,
@@ -139,7 +140,7 @@ pub(crate) fn find_call_arg_roles(
 
     (0..arg_count)
         .filter_map(|arg_index| {
-            find_call_arg_role_from_type(
+            find_best_direct_call_arg_role_from_type(
                 semantic_model.get_db(),
                 &callable_type,
                 call_arg_to_param_idx_for_type(
@@ -309,19 +310,7 @@ fn find_call_arg_role_from_signature_id(
         .get_signature_index()
         .get(&signature_id)?;
     let param_idx = call_arg_to_param_idx(arg_index, is_colon_call, signature.is_colon_define);
-    let mut best = None;
-    signature.visit_call_arg_roles_for_param(param_idx, &mut |role| {
-        if role.domain != domain || !roles.iter().any(|candidate| *candidate == role.role) {
-            return;
-        }
-
-        if best.as_ref().is_none_or(|current: &LuaCallArgRole| {
-            role.priority.unwrap_or(0) > current.priority.unwrap_or(0)
-        }) {
-            best = Some(role.clone());
-        }
-    });
-    best
+    find_best_direct_call_arg_role_for_param(signature, param_idx, domain, roles)
 }
 
 fn find_call_arg_role_from_decl_id(
@@ -348,7 +337,13 @@ fn find_call_arg_role_from_decl_id(
     let typ = semantic_model.get_type(decl_id.into());
     let param_idx =
         call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
-    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
+    find_best_direct_call_arg_role_from_type(
+        semantic_model.get_db(),
+        &typ,
+        param_idx,
+        domain,
+        roles,
+    )
 }
 
 fn find_call_arg_role_from_member_id(
@@ -362,7 +357,13 @@ fn find_call_arg_role_from_member_id(
     let typ = semantic_model.get_type(LuaTypeOwner::Member(member_id));
     let param_idx =
         call_arg_to_param_idx_for_type(semantic_model.get_db(), &typ, arg_index, is_colon_call);
-    find_call_arg_role_from_type(semantic_model.get_db(), &typ, param_idx, domain, roles)
+    find_best_direct_call_arg_role_from_type(
+        semantic_model.get_db(),
+        &typ,
+        param_idx,
+        domain,
+        roles,
+    )
 }
 
 fn signature_id_from_decl_value(

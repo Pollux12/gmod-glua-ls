@@ -1,8 +1,8 @@
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaCommentOwner, LuaDocDescription,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocDescription,
     LuaDocDescriptionOwner, LuaDocGenericDeclList, LuaDocTagAlias, LuaDocTagAttribute,
-    LuaDocTagClass, LuaDocTagEnum, LuaDocTagGeneric, LuaFuncStat, LuaLocalName, LuaLocalStat,
-    LuaNameExpr, LuaSyntaxId, LuaSyntaxKind, LuaTokenKind, LuaVarExpr,
+    LuaDocTagClass, LuaDocTagEnum, LuaDocTagGeneric, LuaFuncStat, LuaKind, LuaLocalName,
+    LuaLocalStat, LuaNameExpr, LuaSyntaxId, LuaSyntaxKind, LuaTokenKind, LuaVarExpr,
 };
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -61,7 +61,9 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
 
     add_description_for_type_decl(analyzer, &class_decl_id, tag.get_descriptions());
 
-    bind_def_type(analyzer, LuaType::Def(class_decl_id.clone()));
+    if !comment_has_explicit_owner_type(&analyzer.comment) {
+        bind_def_type(analyzer, LuaType::Def(class_decl_id.clone()));
+    }
     Some(())
 }
 
@@ -121,9 +123,24 @@ pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()
 
     add_description_for_type_decl(analyzer, &enum_decl_id, tag.get_descriptions());
 
-    bind_def_type(analyzer, LuaType::Def(enum_decl_id.clone()));
+    if !comment_has_explicit_owner_type(&analyzer.comment) {
+        bind_def_type(analyzer, LuaType::Def(enum_decl_id.clone()));
+    }
 
     Some(())
+}
+
+fn comment_has_explicit_owner_type(comment: &LuaComment) -> bool {
+    comment.syntax().children().any(|child| {
+        matches!(
+            child.kind(),
+            LuaKind::Syntax(
+                LuaSyntaxKind::DocTagType
+                    | LuaSyntaxKind::DocTagModule
+                    | LuaSyntaxKind::DocTagSchema
+            )
+        )
+    })
 }
 
 pub fn analyze_alias(analyzer: &mut DocAnalyzer, tag: LuaDocTagAlias) -> Option<()> {
@@ -419,4 +436,38 @@ fn bind_def_type(analyzer: &mut DocAnalyzer, type_def: LuaType) -> Option<()> {
         _ => {}
     }
     Some(())
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaAstNode, LuaComment, LuaParser, ParserConfig};
+
+    use super::comment_has_explicit_owner_type;
+
+    fn parse_comment(source: &str) -> LuaComment {
+        LuaParser::parse(source, ParserConfig::default())
+            .get_red_root()
+            .descendants()
+            .find_map(LuaComment::cast)
+            .expect("doc comment")
+    }
+
+    #[test]
+    fn explicit_owner_type_recognizes_only_type_module_and_schema_tags() {
+        for source in [
+            "---@class Shape\n---@type table<string, Shape>\nlocal value",
+            "---@class Shape\n---@module \"shape\"\nlocal value",
+            "---@class Shape\n---@schema \"shape.json\"\nlocal value",
+        ] {
+            assert!(comment_has_explicit_owner_type(&parse_comment(source)));
+        }
+
+        for source in [
+            "---@class Shape\nlocal value",
+            "---@enum Shape\nlocal value",
+            "---@alias Shape string\nlocal value",
+        ] {
+            assert!(!comment_has_explicit_owner_type(&parse_comment(source)));
+        }
+    }
 }

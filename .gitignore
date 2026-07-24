@@ -9,8 +9,16 @@ dhat-heap.json
 .pommelignore
 .grepai/
 .context-engine/
+.cortexkit/
 .slim/deepwork/
+.codex-artifacts/
+docs/superpowers/
 
 benchmark_*.log
 .bench-*.log
 100
+
+# Perf work artifacts
+*.log
+diag_*.json
+prof.json.gz

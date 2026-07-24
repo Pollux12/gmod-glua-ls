@@ -396,7 +396,7 @@ fn get_type_async_state(semantic_model: &SemanticModel, typ: &LuaType) -> Direct
         }
         LuaType::Union(union) => {
             let mut saw_unknown = false;
-            for member_type in union.into_vec().iter() {
+            for member_type in union.types() {
                 match get_type_async_state(semantic_model, member_type) {
                     DirectCallAsyncState::Known(AsyncState::Async) => {
                         return DirectCallAsyncState::Known(AsyncState::Async);

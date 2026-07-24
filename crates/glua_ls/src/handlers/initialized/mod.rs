@@ -11,7 +11,7 @@ use crate::{
     cmd_args::CmdArgs,
     context::{
         FileDiagnostic, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
-        WorkspaceFileMatcher, get_client_id, load_emmy_config,
+        WorkspaceFileMatcher, get_client_id, load_emmy_config, validate_gmod_annotations_for_ls,
     },
     handlers::text_document::register_files_watch,
     logger::init_logger,
@@ -23,14 +23,21 @@ use glua_code_analysis::{
     EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
     collect_workspace_files, fetch_schema_urls, uri_to_file_path,
 };
-use lsp_types::InitializeParams;
+use lsp_types::{InitializeParams, MessageType, ShowMessageParams};
 use tokio::sync::RwLock;
 
+/// Initialize the workspace.
+///
+/// Returns `Ok(())` on success, or `Err(reason)` with a user-facing reason
+/// string when the language server cannot start meaningfully (currently: GMod
+/// mode is enabled but required annotations could not be resolved). The caller
+/// in `server/main_loop` is expected to surface the reason to the client via
+/// `window/showMessage` and then abort/exit the server.
 pub async fn initialized_handler(
     context: ServerContextSnapshot,
     params: InitializeParams,
     cmd_args: CmdArgs,
-) -> Option<()> {
+) -> Result<(), String> {
     log::info!("initialized handler started");
     let workspace_folders = get_workspace_folders(&params);
     let main_root: Option<&str> = match workspace_folders.first() {
@@ -52,8 +59,8 @@ pub async fn initialized_handler(
     let supports_config_request = params
         .capabilities
         .workspace
-        .as_ref()?
-        .configuration
+        .as_ref()
+        .and_then(|ws| ws.configuration)
         .unwrap_or_default();
     log::info!("client_id: {:?}", client_id);
 
@@ -133,6 +140,26 @@ pub async fn initialized_handler(
     load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
     log::info!("configuration loaded");
 
+    // LS-only fail-fast: when GMod mode is enabled, require a resolved,
+    // existing, non-empty GMod annotations set. This guards against silently
+    // launching the language server without API metadata, which would dark
+    // out metadata-driven behavior (completions, hovers, diagnostics, realm
+    // inference, etc.). `glua_check`, `VirtualWorkspace`, and analysis tests
+    // never enter this path and remain exempt. Explicit annotation opt-outs
+    // (`--gmod-annotations-path none` / `gmod.autoLoadAnnotations: false`) are
+    // allowed; this only rejects accidental missing or unusable annotation sets.
+    if let Err(reason) = validate_gmod_annotations_for_ls(&client_config, &emmyrc) {
+        log::error!("GMod annotations validation failed: {reason}");
+        // Surface the reason to the client before aborting. The initialize
+        // handshake is already complete, so `window/showMessage` is the
+        // appropriate channel (per LSP 3.17).
+        context.client().show_message(ShowMessageParams {
+            typ: MessageType::ERROR,
+            message: reason.clone(),
+        });
+        return Err(reason);
+    }
+
     // init std lib
     if cmd_args.load_stdlib.0 {
         watchdog_status.set_phase("Loading standard libraries");
@@ -170,7 +197,7 @@ pub async fn initialized_handler(
     register_files_watch(context.clone(), &params.capabilities).await;
     log::info!("initialized handler completed; notifying workspace loaded");
     context.file_diagnostic().notify_workspace_loaded();
-    Some(())
+    Ok(())
 }
 
 pub async fn init_analysis(
@@ -192,12 +219,12 @@ pub async fn init_analysis(
     status_bar
         .create_progress_task(ProgressTask::LoadWorkspace)
         .await;
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Preparing workspace folders");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some("Loading folders".to_string()),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Preparing workspace folders");
     log::info!("preparing workspace folders for initial indexing");
 
     let workspace_roots = workspace_folders
@@ -224,12 +251,12 @@ pub async fn init_analysis(
         }
     }
 
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Collecting Lua files");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Scanning Lua files")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Collecting Lua files");
     log::info!("collecting workspace files for initial indexing");
 
     // load files with per-workspace configs
@@ -260,12 +287,12 @@ pub async fn init_analysis(
 
     let file_count = files.len();
     if file_count != 0 {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Indexing Lua files", 0, file_count);
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Indexing {} files", file_count)),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Indexing Lua files", 0, file_count);
         log::info!("indexing {} Lua files", file_count);
     } else {
         log::info!("no Lua files found during initial indexing");
@@ -273,12 +300,12 @@ pub async fn init_analysis(
 
     // Hold the write lock only for analysis state mutations.
     let mut mut_analysis = analysis.write().await;
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Applying workspace configuration");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Applying config")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Applying workspace configuration");
     log::info!("applying workspace configuration to analysis");
 
     // update config
@@ -319,15 +346,20 @@ pub async fn init_analysis(
     }
 
     if file_count != 0 {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Analyzing {} files", file_count)),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Analyzing Lua files", 0, file_count);
         log::info!("analyzing {} Lua files", file_count);
         mut_analysis.update_files_by_path(files);
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
+        status_bar.update_startup_phase(
+            ProgressTask::LoadWorkspace,
+            Some(100),
+            watchdog_status.describe(),
+        );
     }
 
     let schema_urls = if mut_analysis.check_schema_update() {
@@ -339,27 +371,32 @@ pub async fn init_analysis(
     file_diagnostic.invalidate_shared_diagnostic_data();
     drop(mut_analysis);
 
-    status_bar.update_progress_task(
+    watchdog_status.set_phase("Workspace index ready");
+    status_bar.update_startup_phase(
         ProgressTask::LoadWorkspace,
         None,
-        Some(String::from("Workspace ready")),
+        watchdog_status.describe(),
     );
-    watchdog_status.set_phase("Workspace index ready");
     log::info!("workspace index ready");
 
     if !schema_urls.is_empty() {
-        status_bar.update_progress_task(
+        watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());
+        status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
             None,
-            Some(format!("Fetching {} schemas", schema_urls.len())),
+            watchdog_status.describe(),
         );
-        watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());
         log::info!("fetching {} JSON schemas", schema_urls.len());
         let url_contents = fetch_schema_urls(schema_urls).await;
         let mut mut_analysis = analysis.write().await;
         mut_analysis.apply_fetched_schemas(url_contents);
         file_diagnostic.invalidate_shared_diagnostic_data();
         watchdog_status.set_phase("JSON schema fetch/apply complete");
+        status_bar.update_startup_phase(
+            ProgressTask::LoadWorkspace,
+            None,
+            watchdog_status.describe(),
+        );
         log::info!("JSON schema fetch/apply complete");
     }
 

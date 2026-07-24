@@ -9,8 +9,8 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaMemberId, LuaMemberOwner, LuaType, LuaUnionType,
-        VirtualWorkspace,
+        DiagnosticCode, Emmyrc, GlobalId, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaType,
+        LuaTypeDeclId, LuaUnionType, VirtualWorkspace,
     };
 
     fn file_has_diagnostic(
@@ -71,7 +71,7 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
     }
 
@@ -326,7 +326,7 @@ mod test {
                 LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -356,6 +356,74 @@ mod test {
                 _ => None,
             })
             .expect("expected inferred type for index expr")
+    }
+
+    fn cached_index_expr_type(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr) if index_expr.syntax().text() == expr_text => {
+                    Some(index_expr)
+                }
+                _ => None,
+            })
+            .expect("expected index expr");
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+        let owner: crate::LuaTypeOwner = member_id.into();
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_type_index()
+            .get_type_cache(&owner)
+            .map(|cache| cache.as_type().clone())
+            .expect("expected cached type for index expr")
+    }
+
+    fn inferred_binary_expr_type(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        expr_text: &str,
+    ) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaBinaryExpr(binary_expr) if binary_expr.syntax().text() == expr_text => {
+                    semantic_model
+                        .infer_expr(LuaExpr::BinaryExpr(binary_expr))
+                        .ok()
+                }
+                _ => None,
+            })
+            .expect("expected inferred type for binary expr")
+    }
+
+    fn class_union_type(names: &[&str]) -> LuaType {
+        LuaType::Union(
+            LuaUnionType::from_vec(
+                names
+                    .iter()
+                    .map(|name| LuaType::Def(LuaTypeDeclId::global(name)))
+                    .collect(),
+            )
+            .into(),
+        )
     }
 
     fn first_index_expr_member_owner(
@@ -1126,6 +1194,120 @@ mod test {
     }
 
     #[gtest]
+    fn test_member_collection_variable_key_append_preserves_element_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        local holder = {}
+        holder.items = {}
+
+        local nextIndex = #holder.items + 1
+        holder.items[nextIndex] = "created"
+
+        local appended = holder.items[nextIndex]
+        local numericRead = holder.items[1]
+        "#,
+        );
+
+        let appended_ty = local_name_type(&mut ws, file_id, "appended");
+        assert_that!(
+            ws.check_type(&appended_ty, &LuaType::String),
+            eq(true),
+            "expected variable-key append read to preserve string element type, got {}",
+            ws.humanize_type(appended_ty)
+        );
+
+        let numeric_read_ty = local_name_type(&mut ws, file_id, "numericRead");
+        assert_that!(
+            ws.check_type(&numeric_read_ty, &LuaType::String),
+            eq(true),
+            "expected numeric collection read after variable-key append to preserve string element type, got {}",
+            ws.humanize_type(numeric_read_ty)
+        );
+    }
+
+    #[gtest]
+    fn test_member_collection_reset_and_append_includes_appended_type() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@class Seat
+        local Seat = {}
+
+        ---@class Vehicle
+        local Vehicle = {}
+
+        ---@param seat Seat
+        function Vehicle:test(seat)
+            local selfTbl = self
+
+            self.wheelTraceFilter = { self, "player", "npc_*" }
+            selfTbl.wheelTraceFilter = { self, "player" }
+            selfTbl.wheelTraceFilter[#selfTbl.wheelTraceFilter + 1] = seat
+
+            local appended = selfTbl.wheelTraceFilter[3]
+        end
+        "#,
+        );
+
+        let ty = local_name_type(&mut ws, file_id, "appended");
+        let display = ws.humanize_type(ty.clone());
+        assert_that!(
+            !ty.is_nil() && !ty.is_unknown() && display.contains("Seat"),
+            eq(true),
+            "expected appended collection element to include Seat, got {}",
+            display
+        );
+    }
+
+    #[gtest]
+    fn test_member_nullable_collection_append_preserves_existing_and_appended_elements() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@class Player
+        local Player = {}
+
+        ---@class Weapon
+        local Weapon = {}
+
+        ---@param ply Player
+        ---@param weapon Weapon
+        local function rememberLoadout(ply, weapon)
+            ply.loadout = ply.loadout or { "fallback" }
+            ply.loadout[#ply.loadout + 1] = weapon
+
+            local first = ply.loadout[1]
+            local appended = ply.loadout[2]
+        end
+        "#,
+        );
+
+        let first_ty = local_name_type(&mut ws, file_id, "first");
+        let first_display = ws.humanize_type(first_ty.clone());
+        assert_that!(
+            first_display.contains("fallback") && first_display.contains("Weapon"),
+            eq(true),
+            "expected nullable collection element union to preserve existing and appended elements, got {}",
+            first_display
+        );
+
+        let appended_ty = local_name_type(&mut ws, file_id, "appended");
+        let appended_display = ws.humanize_type(appended_ty.clone());
+        assert_that!(
+            !appended_ty.is_nil()
+                && !appended_ty.is_unknown()
+                && appended_display.contains("Weapon"),
+            eq(true),
+            "expected nullable collection append to include Weapon element, got {}",
+            appended_display
+        );
+    }
+
+    #[gtest]
     fn test_flow_fallback_prefers_latest_dynamic_field_assignment() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1298,6 +1480,366 @@ mod test {
         assert_eq!(ws.humanize_type(ty), "integer");
     }
 
+    fn defib_like_target_source(order: &str) -> String {
+        format!(
+            r#"
+        ---@class Entity
+        ---@class Player: Entity
+        ---@class Ragdoll: Entity
+
+        ---@class SWEP
+        local SWEP = {{}}
+
+        {order}
+
+        ---@type SWEP
+        local obj
+        A = obj.Target
+        "#
+        )
+    }
+
+    fn defib_like_write_policy_source(setup: &str) -> String {
+        defib_like_target_source(&format!(
+            r#"
+        SWEP.Target = nil
+
+        ---@param body Ragdoll
+        ---@param ply Player
+        function SWEP:SetTarget(body, ply)
+            {setup}
+        end
+
+        function SWEP:ClearTarget()
+            self.Target = nil
+        end
+        "#
+        ))
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_initial_nil_preserves_body_player_union() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        // The declared assignment set is nil | Ragdoll | Player. Member writes
+        // must use the full top-level `or` source union instead of losing the
+        // fallback arm before member widening/cache writes.
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "(Player|Ragdoll)?");
+
+        // Direct assignment-target cache probing shows the incoming member write
+        // type includes both arms before the read-side nil widening is applied.
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_rhs_order_preserves_body_player_union() {
+        let mut body_first_ws = VirtualWorkspace::new();
+        body_first_ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let mut player_first_ws = VirtualWorkspace::new();
+        player_first_ws.def(&defib_like_write_policy_source("self.Target = ply or body"));
+
+        // Swapping only the RHS `or` order must converge to the same indexed/read
+        // Player | Ragdoll | nil union.
+        let body_first_ty = body_first_ws.expr_ty("A");
+        let player_first_ty = player_first_ws.expr_ty("A");
+        assert_eq!(
+            body_first_ws.humanize_type(body_first_ty),
+            "(Player|Ragdoll)?"
+        );
+        assert_eq!(
+            player_first_ws.humanize_type(player_first_ty),
+            "(Player|Ragdoll)?"
+        );
+    }
+
+    #[gtest]
+    fn phase_f2a_member_write_policy_cached_and_inferred_paths_match_nilable_union() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        let cached_rendered = ws.humanize_type(cached_ty);
+        assert_eq!(cached_rendered, "(Player|Ragdoll)?");
+
+        let inferred_ty = inferred_index_expr_type(&mut ws, file_id, "self.Target");
+        let inferred_rendered = ws.humanize_type(inferred_ty);
+        assert_eq!(inferred_rendered, "(Player|Ragdoll)?");
+        assert_eq!(cached_rendered, inferred_rendered);
+
+        let read_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(read_ty), "(Player|Ragdoll)?");
+    }
+
+    #[gtest]
+    fn multifile_member_write_order_preserves_union() {
+        let base_source = r#"
+        ---@class Entity
+        ---@class Player: Entity
+        ---@class Ragdoll: Entity
+
+        ---@class SWEP
+        SWEP = {}
+        "#;
+        let set_body_source = r#"
+        ---@param body Ragdoll
+        function SWEP:SetBody(body)
+            self.Target = body
+        end
+        "#;
+        let set_player_source = r#"
+        ---@param ply Player
+        function SWEP:SetPlayer(ply)
+            self.Target = ply
+        end
+        "#;
+        let consumer_source = r#"
+        ---@type SWEP
+        local obj
+        A = obj.Target
+        "#;
+
+        let mut body_then_player_ws = VirtualWorkspace::new();
+        body_then_player_ws.def_file("lua/weapons/test/shared.lua", base_source);
+        body_then_player_ws.def_file("lua/weapons/test/body.lua", set_body_source);
+        body_then_player_ws.def_file("lua/weapons/test/player.lua", set_player_source);
+        body_then_player_ws.def_file("lua/weapons/test/consumer.lua", consumer_source);
+        let body_then_player_ty = body_then_player_ws.expr_ty("A");
+        assert_eq!(
+            body_then_player_ws.humanize_type(body_then_player_ty),
+            "(Player|Ragdoll)"
+        );
+
+        let mut player_then_body_ws = VirtualWorkspace::new();
+        player_then_body_ws.def_file("lua/weapons/test/shared.lua", base_source);
+        player_then_body_ws.def_file("lua/weapons/test/player.lua", set_player_source);
+        player_then_body_ws.def_file("lua/weapons/test/body.lua", set_body_source);
+        player_then_body_ws.def_file("lua/weapons/test/consumer.lua", consumer_source);
+        let player_then_body_ty = player_then_body_ws.expr_ty("A");
+        assert_eq!(
+            player_then_body_ws.humanize_type(player_then_body_ty),
+            "(Player|Ragdoll)"
+        );
+    }
+
+    #[gtest]
+    fn member_write_union_survives_touch_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let path = "lua/weapons/test/shared.lua";
+        let source = defib_like_write_policy_source("self.Target = body or ply");
+        let file_id = ws.def_file(path, &source);
+
+        let baseline_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(baseline_ty), "(Player|Ragdoll)?");
+
+        let uri = ws.virtual_url_generator.new_uri(path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{source}\n"));
+        ws.analysis.reindex_files(vec![file_id]);
+
+        let post_touch_ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(post_touch_ty), "(Player|Ragdoll)?");
+
+        let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_chained_rhs_uses_all_arms() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@class A: Entity
+        ---@class B: Entity
+        ---@class C: Entity
+        ---@param a A
+        ---@param b B
+        ---@param c C
+        function SWEP:SetTarget(a, b, c)
+            self.Target = a or b or c
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        assert!(ws.check_type(&ty, &class_union_type(&["A", "B", "C"])));
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_nilable_left_preserves_single_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@param maybe_body Ragdoll?
+        ---@param ply Player
+        function SWEP:SetTarget(maybe_body, ply)
+            self.Target = maybe_body or ply
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        let rendered = ws.humanize_type(ty);
+        assert!(rendered.contains("Player"), "got {rendered}");
+        assert!(rendered.contains("Ragdoll"), "got {rendered}");
+        assert!(!rendered.contains('?'), "got {rendered}");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_table_fallback_does_not_keep_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@class Holder
+        local Holder = {}
+
+        ---@class Payload
+
+        ---@param x Payload?
+        function Holder:Set(x)
+            self.X = x or {}
+        end
+
+        ---@type Holder
+        local obj
+        A = obj.X
+        "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let rendered = ws.humanize_type(ty);
+        assert!(rendered.contains("Payload"), "got {rendered}");
+        assert!(rendered.contains("table"), "got {rendered}");
+        assert!(!rendered.contains('?'), "got {rendered}");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_does_not_change_expression_level_or_type() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(&defib_like_write_policy_source("self.Target = body or ply"));
+
+        let binary_ty = inferred_binary_expr_type(&mut ws, file_id, "body or ply");
+        assert_eq!(ws.humanize_type(binary_ty), "Ragdoll");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_any_arm_falls_back_to_expression_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(&defib_like_target_source(
+            r#"
+        ---@param anything any
+        ---@param ply Player
+        function SWEP:SetTarget(anything, ply)
+            self.Target = anything or ply
+        end
+        "#,
+        ));
+
+        let ty = ws.expr_ty("A");
+        assert_eq!(ws.humanize_type(ty), "any");
+    }
+
+    #[gtest]
+    fn phase_c0_member_or_write_respects_realm_split_state_masks() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/weapons/test/shared.lua",
+            r#"
+            ---@class ServerA
+            ---@class ServerB
+            ---@class ClientA
+            ---@class ClientB
+
+            SWEP = {}
+
+            if SERVER then
+                ---@param a ServerA
+                ---@param b ServerB
+                function SWEP:SetServer(a, b)
+                    self.Target = a or b
+                end
+
+                ServerRead = SWEP.Target
+            end
+
+            if CLIENT then
+                ---@param a ClientA
+                ---@param b ClientB
+                function SWEP:SetClient(a, b)
+                    self.Target = a or b
+                end
+
+                ClientRead = SWEP.Target
+            end
+            "#,
+        );
+
+        let server_ty = ws.expr_ty("ServerRead");
+        let client_ty = ws.expr_ty("ClientRead");
+        assert_eq!(ws.humanize_type(server_ty), "(ServerA|ServerB)");
+        assert_eq!(ws.humanize_type(client_ty), "(ClientA|ClientB)");
+    }
+
+    #[gtest]
+    fn assignment_widening_cache_respects_realm_split_state_masks() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/weapons/test/shared.lua",
+            r#"
+            ---@class ServerA
+            ---@class ServerB
+            ---@class ClientA
+            ---@class ClientB
+
+            SWEP = {}
+
+            if SERVER then
+                ---@param value ServerA
+                function SWEP:SetServerA(value)
+                    self.Target = value
+                end
+
+                ---@param value ServerB
+                function SWEP:SetServerB(value)
+                    self.Target = value
+                end
+
+                ServerRead = SWEP.Target
+            end
+
+            if CLIENT then
+                ---@param value ClientA
+                function SWEP:SetClientA(value)
+                    self.Target = value
+                end
+
+                ---@param value ClientB
+                function SWEP:SetClientB(value)
+                    self.Target = value
+                end
+
+                ClientRead = SWEP.Target
+            end
+            "#,
+        );
+
+        let server_ty = ws.expr_ty("ServerRead");
+        let client_ty = ws.expr_ty("ClientRead");
+        assert_eq!(ws.humanize_type(server_ty), "(ServerA|ServerB)");
+        assert_eq!(ws.humanize_type(client_ty), "(ClientA|ClientB)");
+    }
+
     #[gtest]
     fn test_assignment_side_dynamic_field_type_for_class_typed_variables() {
         let mut ws = VirtualWorkspace::new();
@@ -1409,7 +1951,10 @@ mod test {
                 let semantic_info = semantic_model
                     .get_semantic_info(index_expr.syntax().clone().into())
                     .expect("expected semantic info for assignment field");
-                assignment_types.push((index_expr.syntax().text().to_string(), semantic_info.typ));
+                assignment_types.push((
+                    index_expr.syntax().text().to_string(),
+                    semantic_info.display_typ().clone(),
+                ));
             }
         }
 
@@ -1484,7 +2029,7 @@ mod test {
                 {
                     semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -1498,7 +2043,7 @@ mod test {
                 LuaAst::LuaNameExpr(name_expr) if name_expr.syntax().text() == "FuelModule" => {
                     semantic_model
                         .get_semantic_info(name_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -1534,7 +2079,7 @@ mod test {
                 {
                     client_semantic_model
                         .get_semantic_info(index_expr.syntax().clone().into())
-                        .map(|info| info.typ)
+                        .map(|info| info.display_typ().clone())
                 }
                 _ => None,
             })
@@ -1544,6 +2089,236 @@ mod test {
             !client_get_profile_type.is_unknown(),
             "client FuelModule.GetProfile should not infer as unknown, got {client_get_profile_type:?}"
         );
+    }
+
+    #[test]
+    fn numeric_alias_name_does_not_replace_runtime_table_member_owner() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/sf_enum.lua",
+            r#"
+            ---@alias SF
+            ---| number
+            ---| 1
+            "#,
+        );
+        ws.def_file("lua/autorun/server/sf_init.lua", "SF = {}\n");
+        ws.def_file("lua/autorun/client/sf_init.lua", "SF = {}\n");
+        let transfer_file = ws.def_file(
+            "lua/starfall/transfer.lua",
+            r#"
+            if SERVER then
+                function SF.SendStarfall(msg, data, recipient) end
+            else
+                function SF.SendStarfall(msg, data) end
+            end
+            "#,
+        );
+        let usage_file = ws.def_file(
+            "lua/starfall/type_usage.lua",
+            r#"
+            ---@type SF
+            local flags
+            "#,
+        );
+
+        let owner = first_index_expr_member_owner(&ws, transfer_file, "SF.SendStarfall");
+
+        assert!(
+            matches!(
+                owner,
+                LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+            ),
+            "numeric alias captured runtime member as {owner:?}"
+        );
+
+        let flags_type = local_name_type(&mut ws, usage_file, "flags");
+        assert!(
+            ws.check_type(&flags_type, &LuaType::Number),
+            "numeric alias should remain number-compatible, got {flags_type:?}"
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(usage_file)
+            .expect("expected usage semantic model");
+        assert!(
+            semantic_model
+                .get_member_info_with_key(
+                    &LuaType::Def(LuaTypeDeclId::global("SF")),
+                    LuaMemberKey::Name("SendStarfall".into()),
+                    true,
+                )
+                .is_none_or(|members| members.is_empty()),
+            "numeric alias should not expose the runtime SendStarfall member"
+        );
+    }
+
+    #[test]
+    fn enum_name_does_not_replace_runtime_table_member_owner() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/includes/collision_enum.lua",
+            r#"
+            ---@enum Collision
+            local CollisionValues = { Value = 1 }
+            "#,
+        );
+        ws.def_file("lua/autorun/server/collision_init.lua", "Collision = {}\n");
+        ws.def_file("lua/autorun/client/collision_init.lua", "Collision = {}\n");
+        let member_file = ws.def_file(
+            "lua/collision/member.lua",
+            "function Collision.Method() end\n",
+        );
+
+        let owner = first_index_expr_member_owner(&ws, member_file, "Collision.Method");
+        assert!(
+            matches!(
+                owner,
+                LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+            ),
+            "enum captured runtime member as {owner:?}"
+        );
+    }
+
+    #[test]
+    fn named_class_lookup_preserves_runtime_owner() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/includes/bridge_class.lua", "---@class BridgeClass\n");
+        let member_file = ws.def_file(
+            "lua/includes/bridge_method.lua",
+            "function BridgeClass.Method() end\n",
+        );
+
+        let owner = first_index_expr_member_owner(&ws, member_file, "BridgeClass.Method");
+        assert_eq!(
+            owner,
+            LuaMemberOwner::GlobalPath(GlobalId::new("BridgeClass")),
+        );
+
+        let method_key = LuaMemberKey::Name("Method".into());
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(member_file)
+            .expect("expected semantic model");
+        assert!(
+            semantic_model
+                .get_member_info_with_key(
+                    &LuaType::Def(LuaTypeDeclId::global("BridgeClass")),
+                    method_key,
+                    true,
+                )
+                .is_some(),
+            "class lookup should expose the runtime method"
+        );
+    }
+
+    #[test]
+    fn type_alias_to_class_keeps_origin_members_visible() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class AliasBase
+            local AliasBase = {}
+            function AliasBase:Method() end
+
+            ---@alias AliasDerived AliasBase
+            ---@type AliasDerived
+            local value
+            value:Method()
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        ));
+    }
+
+    #[test]
+    fn numeric_alias_collision_owner_survives_delete_and_reopen() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let alias_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/sf_lifecycle_alias.lua");
+        let alias_source = r#"
+        ---@alias SF
+        ---| number
+        ---| 1
+        "#;
+        ws.analysis
+            .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .expect("expected alias file");
+        ws.def_file("lua/autorun/server/sf_lifecycle_init.lua", "SF = {}\n");
+        ws.def_file("lua/autorun/client/sf_lifecycle_init.lua", "SF = {}\n");
+        let member_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/starfall/lifecycle.lua");
+        let member_source = "function SF.SendStarfall() end\n";
+        let member_file = ws
+            .analysis
+            .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .expect("expected runtime member file");
+
+        let assert_runtime_owner = |ws: &VirtualWorkspace, file_id| {
+            let owner = first_index_expr_member_owner(ws, file_id, "SF.SendStarfall");
+            assert!(
+                matches!(
+                    owner,
+                    LuaMemberOwner::Element(_) | LuaMemberOwner::GlobalPath(_)
+                ),
+                "numeric alias captured runtime member as {owner:?}"
+            );
+        };
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .update_file_by_uri(
+                &alias_uri,
+                Some(
+                    r#"
+                    ---@alias SF
+                    ---| number
+                    ---| 2
+                    "#
+                    .to_string(),
+                ),
+            )
+            .expect("expected alias origin edit");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .remove_file_by_uri(&alias_uri)
+            .expect("expected alias removal");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .update_file_by_uri(&alias_uri, Some(alias_source.to_string()))
+            .expect("expected reopened alias file");
+        assert_runtime_owner(&ws, member_file);
+
+        ws.analysis
+            .remove_file_by_uri(&member_uri)
+            .expect("expected runtime member removal");
+        let reopened_member_file = ws
+            .analysis
+            .update_file_by_uri(&member_uri, Some(member_source.to_string()))
+            .expect("expected reopened runtime member file");
+        assert_runtime_owner(&ws, reopened_member_file);
     }
 
     #[gtest]
@@ -2048,11 +2823,11 @@ Editor:MissingMethod()
         );
 
         let has_undef_missing =
-            file_has_diagnostic(&mut ws, file_c, DiagnosticCode::UndefinedField);
+            file_has_diagnostic(&mut ws, file_c, DiagnosticCode::UndefinedMethod);
         assert_that!(
             has_undef_missing,
             eq(true),
-            "Method missing from Editor should trigger UndefinedField"
+            "Method missing from Editor should trigger UndefinedMethod"
         );
 
         let editor_type_a = local_name_type(&mut ws, file_a, "Editor");

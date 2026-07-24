@@ -20,6 +20,7 @@ use crate::{
 use super::type_substitutor::{SubstitutorValue, TypeSubstitutor};
 use crate::TypeVisitTrait;
 use crate::semantic::member::find_members_with_key;
+pub(crate) use instantiate_func_generic::check_vgui_panel_ref_role;
 pub use instantiate_func_generic::{build_self_type, infer_self_type, instantiate_func_generic};
 pub use instantiate_special_generic::get_keyof_members;
 pub use instantiate_special_generic::instantiate_alias_call;
@@ -348,13 +349,23 @@ pub fn instantiate_generic(
         return LuaType::Unknown;
     };
 
-    if !substitutor.check_recursion(&type_decl_id)
-        && let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id)
+    if let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id)
         && type_decl.is_alias()
     {
-        let new_substitutor = TypeSubstitutor::from_alias(new_params.clone(), type_decl_id.clone());
-        if let Some(origin) = type_decl.get_alias_origin(db, Some(&new_substitutor)) {
-            return origin;
+        if substitutor.check_recursion(&type_decl_id) {
+            log::debug!(
+                "LS_ALIAS_CYCLE_GUARD cut alias expansion for {}",
+                type_decl_id.get_name()
+            );
+        } else {
+            let new_substitutor = TypeSubstitutor::from_alias_with_parent(
+                new_params.clone(),
+                type_decl_id.clone(),
+                Some(substitutor),
+            );
+            if let Some(origin) = type_decl.get_alias_origin(db, Some(&new_substitutor)) {
+                return origin;
+            }
         }
     }
 
@@ -1082,8 +1093,8 @@ pub(super) fn key_type_to_member_key(key_ty: &LuaType) -> Option<LuaMemberKey> {
 fn collect_mapped_key_atoms(key_ty: &LuaType, acc: &mut Vec<LuaType>) {
     match key_ty {
         LuaType::Union(union) => {
-            for member in union.into_vec() {
-                collect_mapped_key_atoms(&member, acc);
+            for member in union.types() {
+                collect_mapped_key_atoms(member, acc);
             }
         }
         LuaType::MultiLineUnion(multi) => {

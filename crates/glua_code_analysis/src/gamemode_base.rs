@@ -20,9 +20,6 @@
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
-/// Maximum number of ancestors to walk to defend against pathological setups.
-const MAX_DERIVE_DEPTH: usize = 16;
-
 /// Validate that `name` is a plausible gamemode folder name.
 ///
 /// gmod gamemodes use simple identifiers (lowercase ASCII letters, digits,
@@ -141,7 +138,7 @@ fn walk_chain(
         visited_names.insert(name.to_string());
     }
 
-    for _ in 0..MAX_DERIVE_DEPTH {
+    loop {
         let Some(name) = current
             .file_name()
             .and_then(|s| s.to_str())

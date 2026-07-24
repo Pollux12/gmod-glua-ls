@@ -47,7 +47,11 @@ pub async fn on_pull_document_diagnostic(
     }
 
     // Wait for fresh analysis data before computing diagnostics.
-    if !context.debounced_analysis().wait_until_fresh(&token).await {
+    if !context
+        .debounced_analysis()
+        .wait_until_fresh_for(&token, "textDocument/diagnostic")
+        .await
+    {
         // Cancellation — return cached diagnostics if available.
         // If no cache exists, return empty (we have no data to show).
         let cached = context

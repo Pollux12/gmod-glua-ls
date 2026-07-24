@@ -16,6 +16,7 @@ use glua_parser::{
     LuaTableExpr, LuaVarExpr, NumberResult,
 };
 use infer_binary::infer_binary_expr;
+pub(crate) use infer_call::get_prefix_expr_signature_id;
 use infer_call::infer_call_expr;
 pub use infer_call::infer_call_expr_func;
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
@@ -26,14 +27,18 @@ pub(crate) use infer_index::infer_member_by_member_key;
 pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer_name::infer_enclosing_self_type;
 use infer_name::infer_name_expr;
-pub(crate) use infer_name::resolve_scoped_scripted_global_type_decl_id;
 pub(crate) use infer_name::try_local_decl_initializer_fallback_type;
+pub(crate) use infer_name::type_decl_is_vgui_panel;
+pub(crate) use infer_name::{ParamInferenceSource, infer_param_is_weak};
 pub use infer_name::{find_self_decl_or_member_id, infer_param, infer_param_with_cache};
 use infer_table::infer_table_expr;
 pub use infer_table::{infer_table_field_value_should_be, infer_table_should_be};
 use infer_unary::infer_unary_expr;
 pub use narrow::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use narrow::{contains_gmod_null_type, get_var_expr_var_ref_id, remove_false_or_nil};
+pub(crate) use narrow::{
+    contains_gmod_null_type, expr_may_have_condition_narrowing, get_var_expr_var_ref_id,
+    remove_false_or_nil,
+};
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -43,17 +48,15 @@ use crate::{
     db_index::{DbIndex, LuaOperator, LuaOperatorMetaMethod, LuaSignatureId, LuaType},
 };
 
-use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type};
+use super::{CacheEntry, LuaInferCache, member::infer_raw_member_type_with_cache};
 
 pub type InferResult = Result<LuaType, InferFailReason>;
 pub use infer_call::InferCallFuncResult;
 
 pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> InferResult {
-    cache.prof_infer_expr_calls += 1;
     let syntax_id = expr.get_syntax_id();
     let key = syntax_id;
     if let Some(cache_entry) = cache.expr_cache.get(&key) {
-        cache.prof_infer_expr_hits += 1;
         match cache_entry {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             CacheEntry::Error(reason) => {
@@ -68,7 +71,6 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                         .is_some()
                     {
                         cache.expr_cache.remove(&key);
-                        cache.prof_infer_expr_hits -= 1; // not a real hit
                     // Fall through to re-infer below
                     } else {
                         return Err(reason.clone());
@@ -94,21 +96,7 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         return Ok(bind_type_cache.as_type().clone());
     }
 
-    // Track recursion depth (manual decrement at each return after this point)
-    cache.prof_infer_expr_depth += 1;
-    if cache.prof_infer_expr_depth > 1 {
-        cache.prof_infer_expr_recursive_calls += 1;
-    }
-    if cache.prof_infer_expr_depth > cache.prof_infer_expr_max_depth {
-        cache.prof_infer_expr_max_depth = cache.prof_infer_expr_depth;
-    }
-
     cache.expr_cache.insert(key, CacheEntry::Ready);
-    cache.prof_unique_inferred += 1;
-
-    // Profile sub-type timing (only when info logging is enabled)
-    let profile_enabled = log::log_enabled!(log::Level::Info);
-    let prof_start = profile_enabled.then(std::time::Instant::now);
 
     let result_type = match expr {
         LuaExpr::CallExpr(call_expr) => infer_call_expr(db, cache, call_expr),
@@ -126,36 +114,6 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
         LuaExpr::IndexExpr(index_expr) => infer_index_expr(db, cache, index_expr, true),
     };
 
-    if let Some(start) = prof_start {
-        let elapsed_ns = start.elapsed().as_nanos() as u64;
-        use glua_parser::LuaSyntaxKind;
-        let node_kind = key.get_kind();
-        if node_kind == LuaSyntaxKind::IndexExpr {
-            cache.prof_infer_index_time_ns += elapsed_ns;
-            cache.prof_infer_index_calls += 1;
-        } else if node_kind == LuaSyntaxKind::CallExpr
-            || node_kind == LuaSyntaxKind::RequireCallExpr
-            || node_kind == LuaSyntaxKind::ErrorCallExpr
-            || node_kind == LuaSyntaxKind::AssertCallExpr
-            || node_kind == LuaSyntaxKind::TypeCallExpr
-            || node_kind == LuaSyntaxKind::SetmetatableCallExpr
-        {
-            cache.prof_infer_call_time_ns += elapsed_ns;
-            cache.prof_infer_call_calls += 1;
-        } else if node_kind == LuaSyntaxKind::NameExpr {
-            cache.prof_infer_name_time_ns += elapsed_ns;
-            cache.prof_infer_name_calls += 1;
-        } else if node_kind == LuaSyntaxKind::TableArrayExpr
-            || node_kind == LuaSyntaxKind::TableObjectExpr
-            || node_kind == LuaSyntaxKind::TableEmptyExpr
-        {
-            cache.prof_infer_table_time_ns += elapsed_ns;
-            cache.prof_infer_table_calls += 1;
-        } else {
-            cache.prof_infer_other_time_ns += elapsed_ns;
-        }
-    }
-
     // During diagnostics, types are final — cache everything (including errors) to avoid
     // recomputation across diagnostic checkers. During analysis, unresolved errors are
     // removed so the unresolve phase can retry them.
@@ -168,16 +126,13 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                 .insert(key, CacheEntry::Cache(result_type.clone()));
         }
         Err(InferFailReason::None) | Err(InferFailReason::RecursiveInfer) => {
-            cache.prof_infer_expr_depth -= 1;
             cache
                 .expr_cache
                 .insert(key, CacheEntry::Cache(LuaType::Unknown));
             return Ok(LuaType::Unknown);
         }
         Err(InferFailReason::FieldNotFound) => {
-            cache.prof_err_field_not_found += 1;
             if cache.get_config().analysis_phase.is_force() {
-                cache.prof_infer_expr_depth -= 1;
                 cache
                     .expr_cache
                     .insert(key, CacheEntry::Cache(LuaType::Nil));
@@ -187,26 +142,10 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                     .expr_cache
                     .insert(key, CacheEntry::Error(InferFailReason::FieldNotFound));
             } else {
-                cache.prof_expr_cache_removals += 1;
                 cache.expr_cache.remove(&key);
             }
         }
         Err(reason) => {
-            cache.prof_err_other += 1;
-            match reason {
-                InferFailReason::UnResolveExpr(_) => cache.prof_err_unresolve_expr += 1,
-                InferFailReason::UnResolveDeclType(_) => cache.prof_err_unresolve_decl_type += 1,
-                InferFailReason::UnResolveMemberType(_) => {
-                    cache.prof_err_unresolve_member_type += 1
-                }
-                InferFailReason::UnResolveTypeDecl(_) => cache.prof_err_unresolve_type_decl += 1,
-                InferFailReason::UnResolveOperatorCall => cache.prof_err_unresolve_operator += 1,
-                InferFailReason::UnResolveModuleExport(_) => cache.prof_err_unresolve_module += 1,
-                InferFailReason::UnResolveSignatureReturn(_) => {
-                    cache.prof_err_unresolve_sig_return += 1
-                }
-                _ => {}
-            }
             if is_diagnostics {
                 cache
                     .expr_cache
@@ -222,13 +161,11 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
                     .expr_cache
                     .insert(key, CacheEntry::Error(reason.clone()));
             } else {
-                cache.prof_expr_cache_removals += 1;
                 cache.expr_cache.remove(&key);
             }
         }
     }
 
-    cache.prof_infer_expr_depth -= 1;
     result_type
 }
 
@@ -408,6 +345,16 @@ where
 
                 break;
             }
+            LuaType::Unknown if matches!(expr, LuaExpr::CallExpr(_)) && var_count.is_some() => {
+                let remaining = var_count
+                    .unwrap_or(value_types.len())
+                    .saturating_sub(value_types.len());
+                value_types.extend(std::iter::repeat_n(
+                    (LuaType::Unknown, expr.get_range()),
+                    remaining,
+                ));
+                break;
+            }
             _ => value_types.push((expr_type, expr.get_range())),
         }
     }
@@ -478,7 +425,7 @@ pub fn infer_bind_value_type(
                 Ok(key) => key,
                 Err(_) => return None,
             };
-            match infer_raw_member_type(db, &table_type, &member_key) {
+            match infer_raw_member_type_with_cache(db, cache, &table_type, &member_key) {
                 Ok(typ) => Some(typ),
                 Err(InferFailReason::FieldNotFound) => None,
                 Err(_) => Some(LuaType::Unknown),
