@@ -197,6 +197,22 @@
 --- - `return_self`: Whether the constructor is forced to return `self`, defaults to `true`
 ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
 
+--- Marks a function whose first return value is the exact value passed in one
+--- of its arguments. This is stronger than a generic parameter/return type
+--- correlation because it preserves runtime value identity.
+---
+--- Parameters:
+--- - `param`: Zero-based argument index returned by the function.
+---@attribute return_alias(param: integer)
+
+--- Marks an external declaration as preserving the semantics of a named Lua
+--- built-in. The declaration must still be the highest-priority visible
+--- global, so a project override takes precedence.
+---
+--- Parameters:
+--- - `name`: The built-in whose runtime semantics are preserved.
+---@attribute builtin_alias(name: string)
+
 ---
 --- Marks a function parameter as carrying call-site metadata. Language server features can use
 --- the `domain` and `role` pair to classify string literals and other arguments without matching
@@ -208,6 +224,16 @@
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
 
+--- Marks a static field on a function parameter as carrying call-site metadata. This is useful
+--- when APIs read configuration from a table field instead of a separate argument.
+---
+--- Parameters:
+--- - `domain`: Stable namespace for the metadata, such as `gmod.vgui_panel`.
+--- - `role`: Meaning of this field in that domain, such as `base`.
+--- - `field_path`: Dot-separated field path rooted at the annotated parameter.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
+
 --- Marks a parameter inside the following `@overload` function type as carrying call-site
 --- metadata.
 ---
@@ -217,6 +243,38 @@
 --- - `role`: Meaning of this parameter in that domain, such as `define`.
 --- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
 ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+
+--- Marks a static field on a parameter inside the following `@overload` function type as
+--- carrying call-site metadata.
+---
+--- Parameters:
+--- - `param`: Zero-based overload parameter index.
+--- - `domain`: Stable namespace for the metadata, such as `gmod.vgui_panel`.
+--- - `role`: Meaning of this field in that domain, such as `base`.
+--- - `field_path`: Dot-separated field path rooted at the overload parameter.
+--- - `priority`: Optional tie-breaker when a union exposes multiple roles for the same argument.
+---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
+
+--- Marks a callback where calling a named method on callback `self` is guaranteed to return
+--- a valid value for the duration of the callback body.
+---
+--- This is intentionally narrower than changing the named method's global return type. For
+--- example, `self_call_valid("GetOwner")` on held-weapon callbacks means `self:GetOwner()` is
+--- valid in that callback, while `Weapon:GetOwner()` can still return NULL elsewhere.
+---
+--- Parameters:
+--- - `method`: Method name that is valid when called on callback `self`.
+---@attribute self_call_valid(method: string)
+
+--- Marks a predicate that proves the guarded value is a valid/truthy runtime
+--- object without changing the value's static type to the predicate's return
+--- TypeGuard inner type.
+---
+--- This is intended for functions such as `IsValid`: `---@return TypeGuard<Entity>`
+--- still carries the entity/null-check shape, while `valid_guard` tells flow
+--- narrowing that an already-known `PhysObj`, `Panel`, or other valid object
+--- should remain that type after the guard.
+---@attribute valid_guard()
 
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,

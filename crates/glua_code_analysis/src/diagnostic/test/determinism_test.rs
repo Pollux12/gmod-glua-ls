@@ -4,7 +4,8 @@ mod tests {
 
     use crate::test_lib::DiagnosticSnapshot;
     use crate::{
-        DiagnosticCode, Emmyrc, FileId, RenderLevel, VirtualWorkspace, WorkspaceId, humanize_type,
+        DiagnosticCode, Emmyrc, FileId, LuaSemanticDeclId, RenderLevel, VirtualWorkspace,
+        WorkspaceId, humanize_type,
     };
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
     use googletest::prelude::*;
@@ -286,6 +287,18 @@ mod tests {
             .diagnostic
             .enable_only(DiagnosticCode::GmodRealmMismatchHeuristic);
 
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        let library_id = ws.def_file(
+            "library/sh_api.lua",
+            r#"
+            ---@realm shared
+            function SharedLibraryApi()
+                return true
+            end
+            "#,
+        );
+
         let server_id = ws.def_file(
             "lua/autorun/server/sv_api.lua",
             r#"
@@ -320,6 +333,23 @@ mod tests {
             .cloned()
             .unwrap_or_default();
         assert_that!(precomputed.is_empty(), eq(false));
+        let library_decl_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_decl_index()
+            .get_decl_tree(&library_id)
+            .and_then(|tree| {
+                tree.get_decls()
+                    .values()
+                    .find(|decl| decl.get_name() == "SharedLibraryApi")
+                    .map(|decl| decl.get_id())
+            })
+            .expect("expected library declaration");
+        assert_that!(
+            precomputed.contains_key(&LuaSemanticDeclId::LuaDecl(library_decl_id)),
+            eq(true)
+        );
     }
 
     #[gtest]
@@ -447,6 +477,87 @@ mod tests {
             assert_that!(engine_type.contains("text"), eq(false));
             assert_that!(engine_type.contains('1'), eq(false));
         }
+    }
+
+    #[gtest]
+    fn setmetatable_factory_field_transfer_survives_noop_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let uri = ws.virtual_url_generator.new_uri("lua/derma/animation.lua");
+        let original = r#"
+            local Animation = {}
+            Animation.__index = Animation
+
+            function Animation:Run()
+                self.Func()
+                self.Fnc()
+            end
+
+            function MakeAnimation(func)
+                local anim = {}
+                anim.Func = func
+                return setmetatable(anim, Animation)
+            end
+            "#;
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(original.to_string()))
+            .expect("animation file id");
+
+        fn undefined_snapshots(
+            ws: &VirtualWorkspace,
+            file_id: FileId,
+        ) -> BTreeSet<DiagnosticSnapshot> {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(file_id, CancellationToken::new())
+                .unwrap_or_default();
+            ws.diagnostic_snapshots_for_file(file_id, diagnostics)
+                .into_iter()
+                .filter(|snapshot| {
+                    snapshot.code == Some(DiagnosticCode::UndefinedField.get_name().to_string())
+                })
+                .collect()
+        }
+
+        fn line_independent_messages(
+            snapshots: &BTreeSet<DiagnosticSnapshot>,
+        ) -> BTreeSet<(u32, u32, Option<i32>, Option<String>, String)> {
+            snapshots
+                .iter()
+                .map(|snapshot| {
+                    (
+                        snapshot.range_start_character,
+                        snapshot.range_end_character,
+                        snapshot.severity,
+                        snapshot.code.clone(),
+                        snapshot.message.clone(),
+                    )
+                })
+                .collect()
+        }
+
+        let baseline = undefined_snapshots(&ws, file_id);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(format!("\n{original}")));
+        let after_add = undefined_snapshots(&ws, file_id);
+        ws.analysis
+            .update_file_by_uri(&uri, Some(original.to_string()));
+        let after_remove = undefined_snapshots(&ws, file_id);
+
+        assert_that!(baseline.len(), eq(1));
+        assert_that!(
+            baseline.iter().next().unwrap().message.contains("Fnc"),
+            eq(true)
+        );
+        assert_eq!(baseline, after_remove);
+        assert_eq!(
+            line_independent_messages(&baseline),
+            line_independent_messages(&after_add)
+        );
     }
 
     #[gtest]

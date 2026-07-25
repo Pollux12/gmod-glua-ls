@@ -3,10 +3,10 @@ mod test {
     use std::{ops::Deref, sync::Arc};
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, VirtualWorkspace,
-        humanize_type,
+        DiagnosticCode, Emmyrc, LuaMemberOwner, LuaType, RenderLevel, SemanticInfoOrigin,
+        VirtualWorkspace, humanize_type,
     };
-    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName};
+    use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalName, LuaNameExpr};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
@@ -69,8 +69,14 @@ mod test {
 
         semantic_model
             .get_semantic_info(token.syntax().clone().into())
-            .map(|info| info.typ)
+            .map(|info| info.display_typ().clone())
             .expect("expected semantic info for local name")
+    }
+
+    fn semantic_info_type_and_origin(
+        info: crate::semantic::SemanticInfo,
+    ) -> (LuaType, SemanticInfoOrigin) {
+        (info.display_typ().clone(), info.origin)
     }
 
     fn index_expr_type(
@@ -118,6 +124,105 @@ mod test {
             .collect()
     }
 
+    fn diagnostics_for_code(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
+    fn diagnostics_for_code_with_shared(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let diagnostics = ws
+            .analysis
+            .diagnose_file_with_shared(file_id, CancellationToken::new(), shared)
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
+    fn default_diagnostics_for_code_with_shared(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<lsp_types::Diagnostic> {
+        let shared = ws.analysis.precompute_diagnostic_shared_data();
+        let diagnostics = ws
+            .analysis
+            .diagnose_file_with_shared(file_id, CancellationToken::new(), shared)
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .into_iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .collect()
+    }
+
+    fn enable_gmod(ws: &mut VirtualWorkspace) {
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.analysis.update_config(Arc::new(emmyrc));
+    }
+
+    fn name_expr_types(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        name: &str,
+    ) -> Vec<(String, String, SemanticInfoOrigin)> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+
+        semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .filter(|name_expr| name_expr.get_name_text().as_deref() == Some(name))
+            .map(|name_expr| {
+                let infer_type = semantic_model
+                    .infer_expr(LuaExpr::NameExpr(name_expr.clone()))
+                    .unwrap_or(LuaType::Unknown);
+                let semantic_info = name_expr
+                    .get_name_token()
+                    .and_then(|token| {
+                        semantic_model.get_semantic_info(token.syntax().clone().into())
+                    })
+                    .expect("expected semantic info for name expression");
+
+                (
+                    ws.humanize_type(infer_type),
+                    ws.humanize_type(semantic_info.display_typ().clone()),
+                    semantic_info.origin,
+                )
+            })
+            .collect()
+    }
+
     fn contains_empty_table_bootstrap(db: &crate::DbIndex, typ: &LuaType) -> bool {
         match typ {
             LuaType::Table => true,
@@ -152,6 +257,196 @@ mod test {
     }
 
     #[test]
+    fn fangs_member_on_subtype_stabilizes_spos_for_all_consumers() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/fangs.lua",
+            r#"
+            ---@meta
+
+            ---@class Vector
+            ---@operator add(Vector): Vector
+            ---@operator mul(number): Vector
+
+            ---@return Vector
+            function Vector() end
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@field GetShootPos fun(self: Player): Vector
+            ---@field GetAimVector fun(self: Player): Vector
+
+            ---@class HullTrace
+            ---@field start Vector
+            ---@field endpos Vector
+            ---@field filter any
+            ---@field mins Vector
+            ---@field maxs Vector
+
+            util = {}
+
+            ---@param trace HullTrace
+            function util.TraceHull(trace) end
+
+            ---@param ... any
+            function print(...) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/fangs_shape.lua",
+            r#"
+            ---@type Entity
+            local owner
+            local spos = owner:GetShootPos()
+            print(spos)
+            local sdest = spos + (owner:GetAimVector() * 70)
+            local tr = util.TraceHull({ start = spos, endpos = sdest, filter = owner, mins = Vector(), maxs = Vector() })
+            "#,
+        );
+
+        let local_spos_type = local_name_type(&mut ws, file_id, "spos");
+        assert_eq!(
+            ws.humanize_type(local_spos_type),
+            "Vector",
+            "indexed local type uses the shared contextual fact"
+        );
+
+        let spos_types = name_expr_types(&ws, file_id, "spos");
+        assert_eq!(
+            spos_types,
+            vec![
+                (
+                    "Vector".to_string(),
+                    "Vector".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
+                ),
+                (
+                    "Vector".to_string(),
+                    "Vector".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
+                ),
+                (
+                    "Vector".to_string(),
+                    "Vector".to_string(),
+                    SemanticInfoOrigin::ContextualExpected,
+                ),
+            ],
+            "all uses consume the same stabilized fact while retaining inferred provenance"
+        );
+
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedField,
+        );
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
+        let child_inference = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
+        assert_eq!(child_inference.len(), 1, "{child_inference:?}");
+        assert_eq!(child_inference[0].range.start.line, 3);
+    }
+
+    #[test]
+    fn recursive_descendant_member_reports_undefined_method() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/recursive_descendant.lua",
+            r#"
+            ---@meta
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class CustomPlayer : Player
+            ---@field OnlyOnCustom fun(self: CustomPlayer)
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/recursive_descendant.lua",
+            r#"
+            ---@type Entity
+            local ent
+            ent:OnlyOnCustom()
+            "#,
+        );
+
+        let undefined_methods =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+    }
+
+    #[test]
+    fn semantic_info_exposes_actual_type_origin() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def("local value = 1");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let local_name = semantic_model
+            .get_root()
+            .descendants::<LuaLocalName>()
+            .next()
+            .expect("expected local name");
+        let token = local_name
+            .get_name_token()
+            .expect("expected local name token");
+        let info = semantic_model
+            .get_semantic_info(token.syntax().clone().into())
+            .expect("expected semantic info");
+        let (actual_type, origin) = semantic_info_type_and_origin(info);
+
+        assert_eq!(origin, SemanticInfoOrigin::Actual);
+        assert_eq!(actual_type, LuaType::IntegerConst(1));
+        assert_eq!(ws.humanize_type(actual_type), "1");
+    }
+
+    #[test]
+    fn absent_field_read_without_context_semantic_info_is_actual_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class D1aAbsentFieldTable
+            local value = {}
+            local missing = value.absent
+            "#,
+        );
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|index_expr| index_expr.syntax().text() == "value.absent")
+            .expect("expected absent field index expression");
+        let info = semantic_model
+            .get_semantic_info(index_expr.syntax().clone().into())
+            .expect("expected semantic info for absent field read");
+        let (actual_type, origin) = semantic_info_type_and_origin(info);
+
+        assert_eq!(origin, SemanticInfoOrigin::Actual);
+        assert_eq!(actual_type, LuaType::Nil);
+        assert_eq!(ws.humanize_type(actual_type), "nil");
+
+        let undefined_fields =
+            diagnostics_for_code_with_shared(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(undefined_fields.len(), 1, "{undefined_fields:?}");
+        assert!(
+            undefined_fields[0]
+                .message
+                .contains("Undefined field `absent`")
+        );
+    }
+
+    #[test]
     fn test_dynamic_table_param_return_or_empty_branch_keeps_fields_allowed() {
         let mut ws = VirtualWorkspace::new();
 
@@ -174,6 +469,109 @@ mod test {
             print(data.carVolume)
         "#
         ));
+    }
+
+    #[test]
+    fn metatable_overload_parameter_type_is_visible_inside_function_body_guards() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@meta
+
+            ---@param value any
+            ---@return TypeGuard<table>
+            function _G.istable(value) end
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function _G.FindMetaTable(metaName) end
+            "#,
+        );
+        ws.def_file(
+            "annotations/color.lua",
+            r#"
+            ---@meta
+
+            ---@class Color
+            ---@field r number The red component of the color.
+            ---@field g number The green component of the color.
+            ---@field b number The blue component of the color.
+            ---@field a number The alpha component of the color.
+            local Color = {}
+            "#,
+        );
+        ws.def_file(
+            "annotations/panel.lua",
+            r#"
+            ---@meta
+
+            ---@class Panel
+            Panel = Panel or {}
+
+            ---@overload fun(color: Color)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetFGColor(r, g, b, a) end
+
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetFGColorEx(r, g, b, a) end
+
+            ---@overload fun(color: Color)
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetBGColor(r, g, b, a) end
+
+            ---@param r number
+            ---@param g number
+            ---@param b number
+            ---@param a number
+            function Panel:SetBGColorEx(r, g, b, a) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/includes/extensions/client/panel.lua",
+            r#"
+            local meta = FindMetaTable("Panel")
+
+            meta.SetFGColorEx = meta.SetFGColor
+            meta.SetBGColorEx = meta.SetBGColor
+
+            function meta:SetFGColor(r, g, b, a)
+                if istable(r) then
+                    return self:SetFGColorEx(r.r, r.g, r.b, r.a)
+                end
+            end
+
+            function meta:SetBGColor(r, g, b, a)
+                if istable(r) then
+                    return self:SetBGColorEx(r.r, r.g, r.b, r.a)
+                end
+            end
+            "#,
+        );
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -267,6 +665,193 @@ mod test {
                     self.rfMisc:Update()
                     self.rfMisc:Think()
                     self.rfMisc:Draw()
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_visible_to_class_methods() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local DermaAnimation = {}
+                DermaAnimation.__index = DermaAnimation
+
+                function DermaAnimation:Run()
+                    self.Func(self.Panel, self)
+                end
+
+                function Derma_Anim(panel, func)
+                    local anim = {}
+                    anim.Panel = panel
+                    anim.Func = func
+                    return setmetatable(anim, DermaAnimation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_do_not_hide_method_typos() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local DermaAnimation = {}
+                DermaAnimation.__index = DermaAnimation
+
+                function DermaAnimation:Run()
+                    self.Fnc(self.Panel, self)
+                end
+
+                function Derma_Anim(panel, func)
+                    local anim = {}
+                    anim.Panel = panel
+                    anim.Func = func
+                    return setmetatable(anim, DermaAnimation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_do_not_leak_to_other_classes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                local Other = {}
+                Other.__index = Other
+
+                function Other:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_alias_writes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    local alias = anim
+                    alias.Func = func
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_nested_closure_writes() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    local function assign()
+                        anim.Func = func
+                    end
+                    assign()
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_ignore_reassigned_factory_local() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                Animation.__index = Animation
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    anim = {}
+                    return setmetatable(anim, Animation)
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_require_self_referential_index() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                local Other = {}
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, { __index = Other })
+                end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_setmetatable_factory_fields_require_named_self_referential_index() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local Animation = {}
+                local Other = {}
+                Animation.__index = Other
+
+                function Animation:Run()
+                    self.Func()
+                end
+
+                function MakeAnimation(func)
+                    local anim = {}
+                    anim.Func = func
+                    return setmetatable(anim, Animation)
                 end
             "#
         ));
@@ -822,6 +1407,288 @@ mod test {
             empty_table_bootstrap_branch_count(ws.analysis.compilation.get_db(), &ty),
             1,
             "expected repeated empty guarded bootstraps to collapse to one table branch, got {display}"
+        );
+    }
+
+    #[test]
+    fn test_repeated_initialized_index_prefixes_do_not_report_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");
+        for i in 0..40 {
+            body.push_str(&format!(
+                r#"
+                    WepHolster.defData["weapon_{i}"] = {{}}
+                    WepHolster.defData["weapon_{i}"].Model = "models/weapons/w_{i}.mdl"
+                    WepHolster.defData["weapon_{i}"].Bone = "ValveBiped.Bip01_Spine"
+"#
+            ));
+        }
+
+        let file_id = ws.def(&body);
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+
+        assert!(
+            diags.is_empty(),
+            "initialized table prefixes should not produce undefined-field diagnostics: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn meta_global_path_members_extend_std_backed_global_tables() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let library_root = ws.virtual_url_generator.new_path("annotations");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "annotations/math.lua",
+            r#"
+            ---@meta
+
+            math.ease = {}
+            math = {}
+
+            ---@param input number
+            ---@param min number
+            ---@param max number
+            ---@return number
+            function math.Clamp(input, min, max) end
+
+            ---@param input number
+            ---@return number
+            function math.ease.InQuad(input) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/client/cl_math.lua",
+            r#"
+            local clamped = math.Clamp(5, 0, 10)
+            local eased = math.ease.InQuad(clamped)
+            print(eased)
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+
+        assert!(
+            diags.is_empty(),
+            "meta global-path members should extend std-backed global table types: {diags:#?}"
+        );
+    }
+
+    #[test]
+    fn test_repeated_initialized_index_prefixes_diagnose_quick_smoke() {
+        let mut ws = VirtualWorkspace::new();
+        let mut body = String::from("WepHolster = {}\nWepHolster.defData = {}\n");
+        for i in 0..250 {
+            body.push_str(&format!(
+                r#"
+                    WepHolster.defData["weapon_{i}"] = {{}}
+                    WepHolster.defData["weapon_{i}"].Model = "models/weapons/w_{i}.mdl"
+                    WepHolster.defData["weapon_{i}"].Bone = "ValveBiped.Bip01_Spine"
+"#
+            ));
+        }
+
+        let file_id = ws.def(&body);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+
+        assert!(
+            diagnostics.is_empty(),
+            "unexpected undefined-field diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
+    fn test_guarded_empty_table_bootstrap_keeps_typed_member_access_valid() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class (partial) WorkshopFileInfoEntry
+                ---@field file string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class (partial) WorkshopUserContentEntry
+                ---@field file? string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopUserContentEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|WorkshopUserContentEntry|nil>
+
+                ---@param results WorkshopFileInfoResults
+                ---@param isUGC? boolean
+                function WorkshopFileBase:FillFileInfo(results, isUGC) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                function WorkshopFileBase(namespace, requiredtags)
+                    local ret = {}
+                    ret.HTML = nil
+
+                    function ret:FillFileInfo(results, isUGC)
+                        local k = 1
+                        local extra = results.extraresults[k]
+                        if not extra then
+                            extra = {}
+                        end
+                        extra.ownername = "Local"
+                        extra.description = "Non workshop .gma addon. (" .. extra.file .. ")"
+                        local missing = extra.missing
+                    end
+
+                    return ret
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        let results_types = index_expr_type_displays(&ws, file_id, "results.extraresults[k]");
+        assert_eq!(diags.len(), 1);
+        assert!(
+            diags[0].message.contains("`missing`"),
+            "expected only extra.missing to remain, got {diags:?}"
+        );
+        assert!(
+            results_types
+                .iter()
+                .any(|display| display.contains("WorkshopFileInfoEntry")
+                    && display.contains("WorkshopUserContentEntry")),
+            "expected typed union on results.extraresults[k], got {results_types:?}"
+        );
+    }
+
+    #[test]
+    fn test_fallback_table_union_still_reports_truly_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class (partial) WorkshopFileInfoEntry
+                ---@field file string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class (partial) WorkshopUserContentEntry
+                ---@field file? string Local addon file path when available.
+                ---@field ownername string
+                ---@field description string
+                local WorkshopUserContentEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|WorkshopUserContentEntry|nil>
+
+                ---@param results WorkshopFileInfoResults
+                ---@param isUGC? boolean
+                function WorkshopFileBase:FillFileInfo(results, isUGC) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                function WorkshopFileBase(namespace, requiredtags)
+                    local ret = {}
+                    ret.HTML = nil
+
+                    function ret:FillFileInfo(results, isUGC)
+                        local k = 1
+                        local extra = results.extraresults[k]
+                        if not extra then
+                            extra = {}
+                        end
+                        extra.ownername = "Local"
+                        local missing = extra.missing
+                    end
+
+                    return ret
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(diags.len(), 1);
+    }
+
+    #[test]
+    fn test_missing_member_probe_does_not_nil_poison_later_valid_member_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+
+        ws.def_file(
+            "annotations/workshopfilebase.FillFileInfo.lua",
+            r#"
+                ---@meta
+                ---@class WorkshopFileInfoEntry
+                ---@field file string
+                ---@field ownername string
+                local WorkshopFileInfoEntry = {}
+
+                ---@class WorkshopFileInfoResults
+                ---@field extraresults table<integer, WorkshopFileInfoEntry|nil>
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "garrysmod/lua/includes/util/workshop_files.lua",
+            r#"
+                ---@param results WorkshopFileInfoResults
+                local function FillFileInfo(results)
+                    local k = 1
+                    local extra = results.extraresults[k]
+                    local missing = extra.missing
+                    local path = extra.file
+                    local len = #extra.file
+                    local again = extra.file
+                end
+            "#,
+        );
+
+        let diags = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        let file_types = index_expr_type_displays(&ws, file_id, "extra.file");
+
+        assert_eq!(diags.len(), 1, "expected only extra.missing, got {diags:?}");
+        assert!(
+            diags[0].message.contains("`missing`"),
+            "expected missing-field diagnostic for extra.missing, got {diags:?}"
+        );
+        assert!(
+            file_types.iter().all(|display| display == "string"),
+            "valid member inference should remain stable after missing-member probe"
         );
     }
 
@@ -1654,9 +2521,9 @@ mod test {
     }
 
     #[test]
-    fn test_unknown_dynamic_key_does_not_suppress_exact_undefined_field() {
+    fn test_dynamic_key_only_table_suppresses_exact_undefined_field() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
+        assert!(ws.check_code_for(
             DiagnosticCode::UndefinedField,
             r#"
                 local test = {}
@@ -1668,6 +2535,88 @@ mod test {
                 print(test.meow)
             "#
         ));
+    }
+
+    #[test]
+    fn test_literal_key_table_still_reports_exact_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+
+                test.known = true
+
+                print(test.meow)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_integer_literal_key_table_still_reports_exact_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local test = {}
+
+                test[1] = true
+
+                print(test.meow)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_module_function_does_not_take_call_site_params_from_shadowed_global_constructor() {
+        let mut ws = VirtualWorkspace::new();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        ws.def(
+            r#"
+                ---@meta
+
+                ---@class Color
+                ---@field r number
+                ---@field g number
+                ---@field b number
+                ---@field a number
+
+                ---@param r number
+                ---@param g number
+                ---@param b number
+                ---@param a? number
+                ---@return Color
+                function Color(r, g, b, a) end
+            "#,
+        );
+        let file_id = ws.def(
+            r#"
+                local _Color = Color
+
+                module("markup")
+
+                function Color(col)
+                    return col.r + col.g + col.b + (col.a or 0)
+                end
+
+                local Color = _Color
+                local white = Color(255, 255, 255)
+            "#,
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics.iter().all(|diagnostic| diagnostic.code != code),
+            "expected no undefined-field diagnostics, got {diagnostics:#?}"
+        );
     }
 
     #[test]
@@ -2024,6 +2973,7 @@ mod test {
     #[test]
     fn test_isfunction_member_guard_suppresses_undefined_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
         ws.def(
             r#"
                 ---@class VehicleGuardLike
@@ -2154,6 +3104,210 @@ mod test {
 
                 local sprite = SPRITES[idx]
             "#
+        ));
+    }
+
+    #[test]
+    fn test_table_insert_array_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local queuedSearch = {}
+
+                local function Queue(tab, folder, extension, path)
+                    table.insert(queuedSearch, { tab, folder, extension, path })
+                end
+
+                Queue("models", "props/", "*.mdl", "GAME")
+                local call = queuedSearch[1]
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_or_empty_table_field_numeric_index_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class WheelEntity
+                local wheelEnt = {}
+
+                wheelEnt.KeyBinds = wheelEnt.KeyBinds or {}
+                numpad.Remove(wheelEnt.KeyBinds[1])
+                wheelEnt.KeyBinds[1] = 123
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_closed_table_named_missing_field_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class ClosedConfig
+                ---@field known string
+                local cfg = {}
+
+                local missing = cfg.unknown
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_union_typeguard_on_any_still_reports_unknown_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Panel
+                local Panel = {}
+                function Panel:SetVisible(visible) end
+
+                ---@class PhysObj
+                local PhysObj = {}
+                function PhysObj:Wake() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity|Panel|PhysObj>
+                function IsValid(value) end
+
+                ---@param ent any
+                local function use(ent)
+                    if IsValid(ent) then
+                        ent.someTypo()
+                    end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_union_typeguard_on_object_still_reports_unknown_field() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@class Panel
+                local Panel = {}
+                function Panel:SetVisible(visible) end
+
+                ---@class PhysObj
+                local PhysObj = {}
+                function PhysObj:Wake() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity|Panel|PhysObj>
+                function IsValid(value) end
+
+                ---@param ent { known: string }
+                local function use(ent)
+                    if IsValid(ent) then
+                        ent.someTypo()
+                    end
+                end
+            "#,
+        ));
+    }
+
+    fn def_valid_guard_fixture(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute valid_guard()
+
+                ---@class Entity
+                function Entity:SetHealth(health) end
+
+                ---@class PhysObj
+                function PhysObj:SetMass(mass) end
+
+                ---@class DTree_Node
+                function DTree_Node:InternalDoClick() end
+
+                ---@param value any
+                ---@return TypeGuard<Entity>
+                ---@[valid_guard]
+                function IsValid(value) end
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_valid_guard_unknown_physobj_source_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function use(ent)
+                    local phys = ent:GetPhysicsObject()
+                    if not IsValid(phys) then return end
+
+                    phys:SetMass(100)
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_unknown_dtree_chain_no_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function use(tree)
+                    local node = tree:Root():GetChildNode(0)
+                    if not IsValid(node) then return end
+
+                    node:InternalDoClick()
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_typed_physobj_preserves_type_and_reports_bogus_field() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param phys PhysObj
+                local function use(phys)
+                    if not IsValid(phys) then return end
+
+                    phys:SetMass(100)
+                    local typo = phys.EntityOnlyTypo
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_plain_entity_typo_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param ent Entity
+                local function use(ent)
+                    if not IsValid(ent) then return end
+
+                    ent:SetHealth(100)
+                    local typo = ent.EntityTypo
+                end
+            "#,
         ));
     }
 
@@ -2313,30 +3467,132 @@ mod test {
     }
 
     #[test]
-    fn test_field_on_subclass_suppressed() {
+    fn gmod_parent_receiver_member_defined_only_on_child_reports_child_inference() {
         let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/entity.lua",
+            r#"---@meta
+
+---@class Entity
+---@class Player : Entity
+---@field GetShootPos fun(self: Player)
+"#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_child_only_member.lua",
+            r#"---@type Entity
+local owner
+owner:GetShootPos()
+"#,
+        );
+
+        let undefined_fields = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
             DiagnosticCode::UndefinedField,
-            r#"
-                ---@class SubclassTest.BaseEntity
-                local BaseEntity = {}
+        );
+        assert!(undefined_fields.is_empty(), "{undefined_fields:?}");
 
-                ---@class SubclassTest.Vehicle : SubclassTest.BaseEntity
-                local Vehicle = {}
-                function Vehicle:GetDriver() end
-
-                ---@type SubclassTest.BaseEntity
-                local ent = nil
-                ent:GetDriver()
-            "#,
-        ));
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::InferUnguardedChild,
+        );
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                DiagnosticCode::InferUnguardedChild.get_name().to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostic.message,
+            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+        );
+        assert_eq!(diagnostic.range.start.line, 2);
+        assert_eq!(diagnostic.range.start.character, 0);
+        assert_eq!(diagnostic.range.end.line, 2);
+        assert_eq!(diagnostic.range.end.character, 17);
     }
 
     #[test]
-    fn test_field_on_deep_subclass_suppressed() {
+    fn test_direct_subtype_member_in_incompatible_realm_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
-        assert!(ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeDirect.Base
+                local Base = {}
+
+                ---@class RealmSubtypeDirect.ClientChild : RealmSubtypeDirect.Base
+                local ClientChild = {}
+
+                ---@realm client
+                function ClientChild:ClientOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeDirect.Base
+                local ent = nil
+                ent:ClientOnly()
+            "#,
+        );
+
+        let undefined_methods = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        );
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+    }
+
+    #[test]
+    fn test_transitive_subtype_member_in_incompatible_realm_reports_undefined_method() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "lua/autorun/sh_transitive_subtype_realms.lua",
+            r#"
+                ---@class RealmSubtypeTransitive.Base
+                local Base = {}
+
+                ---@class RealmSubtypeTransitive.Middle : RealmSubtypeTransitive.Base
+                local Middle = {}
+
+                ---@class RealmSubtypeTransitive.ClientLeaf : RealmSubtypeTransitive.Middle
+                local ClientLeaf = {}
+
+                ---@realm client
+                function ClientLeaf:ClientOnly() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_transitive_subtype_realms.lua",
+            r#"
+                ---@type RealmSubtypeTransitive.Base
+                local ent = nil
+                ent:ClientOnly()
+            "#,
+        );
+
+        let undefined_methods = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        );
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+    }
+
+    #[test]
+    fn test_method_on_deep_subclass_reports_undefined_method() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
             r#"
                 ---@class DeepSubTest.Entity
                 local Entity = {}
@@ -2352,27 +3608,88 @@ mod test {
                 local ent = nil
                 ent:GetSpecialField()
             "#,
-        ));
+        );
+        let undefined_methods = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        );
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
     }
 
     #[test]
-    fn test_field_not_on_any_subclass_still_reported() {
+    fn test_panel_method_on_deep_custom_panel_reports_undefined_method() {
         let mut ws = VirtualWorkspace::new();
-        assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
             r#"
-                ---@class NoSubField.BaseEntity
-                local BaseEntity = {}
+                ---@class Panel
+                local Panel = {}
 
-                ---@class NoSubField.Vehicle : NoSubField.BaseEntity
-                local Vehicle = {}
-                function Vehicle:GetDriver() end
+                ---@class DPanel : Panel
+                local DPanel = {}
 
-                ---@type NoSubField.BaseEntity
-                local ent = nil
-                ent:CompletelyMadeUpMethod()
+                ---@class MyCustomPanel : DPanel
+                local MyCustomPanel = {}
+                function MyCustomPanel:OnlyOnCustomPanel() end
+
+                ---@type Panel
+                local pnl = nil
+                pnl:OnlyOnCustomPanel()
             "#,
-        ));
+        );
+
+        let undefined_methods = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        );
+        assert_eq!(undefined_methods.len(), 1, "{undefined_methods:?}");
+    }
+
+    #[test]
+    fn gmod_truly_absent_parent_method_reports_undefined_method() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        ws.def_file(
+            "annotations/absent_member.lua",
+            r#"---@meta
+
+---@class Entity
+---@class Player : Entity
+---@field GetShootPos fun(self: Player)
+"#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/server/sv_absent_member.lua",
+            r#"---@type Entity
+local owner
+owner:CompletelyMadeUpMethod()
+"#,
+        );
+
+        let diagnostics = default_diagnostics_for_code_with_shared(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UndefinedMethod,
+        );
+
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        let diagnostic = &diagnostics[0];
+        assert_eq!(
+            diagnostic.code,
+            Some(NumberOrString::String(
+                DiagnosticCode::UndefinedMethod.get_name().to_string()
+            ))
+        );
+        assert_eq!(
+            diagnostic.message,
+            "Undefined method `CompletelyMadeUpMethod`. "
+        );
+        assert_eq!(diagnostic.range.start.line, 2);
+        assert_eq!(diagnostic.range.start.character, 6);
+        assert_eq!(diagnostic.range.end.line, 2);
+        assert_eq!(diagnostic.range.end.character, 28);
     }
 
     #[test]
@@ -2628,9 +3945,9 @@ mod test {
     #[test]
     fn test_tableof_colon_call_flags_diagnostic() {
         let mut ws = VirtualWorkspace::new();
-        // Colon calls on tableof should trigger undefined-field diagnostic
+        // Colon calls on tableof should trigger undefined-method diagnostic
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class MyEntity
                 local MyEntity = {}
@@ -2643,6 +3960,64 @@ mod test {
                 function MyEntity:Test()
                     local tbl = self:GetTable()
                     tbl:DoSomething()
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_tableof_colon_method_definition_does_not_flag_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                ---@class Entity
+                local Entity = {}
+
+                ---@return tableof<self>
+                function Entity:GetTable() end
+
+                local ent_tbl = Entity:GetTable()
+
+                function ent_tbl:PhysicsCollide(data, collider) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_valid_guard_preserves_receiver_subtype_members() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+                ---@meta
+                ---@attribute self_guard(member: string)
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@return boolean
+                ---@return_cast self Entity
+                ---@[self_guard("gmod.entity")]
+                function Entity:IsValid() end
+            "#,
+        );
+        ws.def(
+            r#"
+                ---@meta
+                ---@class (partial) Player : Entity
+                local Player = {}
+
+                ---@return boolean
+                function Player:IsSuperAdmin() end
+            "#,
+        );
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                ---@type Player
+                local ply
+                if ply:IsValid() and not ply:IsSuperAdmin() then
+                    return
                 end
             "#,
         ));
@@ -2914,6 +4289,8 @@ mod test {
 
     #[test]
     fn test_dynamic_field_setter_helper_call_no_undefined_field() {
+        // Proves a real helper discovered from another file still suppresses
+        // undefined-field after the helper-call fast-path guards.
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = crate::Emmyrc::default();
         emmyrc.gmod.enabled = true;
@@ -3429,7 +4806,7 @@ mod test {
         // Regression test: a method defined via func-stat on a Ref-typed local
         // must NOT leak to other instances of the same class.
         assert!(!ws.check_code_for(
-            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedMethod,
             r#"
                 ---@class FuncStatPollutionPanel
                 ---@field name string
@@ -3856,6 +5233,331 @@ mod test {
         assert!(
             display.contains("ixCombineDisplay"),
             "expected cross-file ix.gui.combine to be typed as ixCombineDisplay, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_boolean_union_narrowing_undefined_field_bug() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+
+        let file_id = ws.def(
+            r#"
+            ---@return any
+            local function get_any() return end
+            local function test_narrow(a)
+                if not a then return false end
+                return a
+            end
+            local function test_main()
+                local x = test_narrow(get_any())
+                -- The analyzer bug incorrectly drops 'any' and infers 'x' as strictly 'boolean',
+                -- causing 'GetTranslation' to emit an undefined-field error.
+                x:GetTranslation()
+            end
+            "#,
+        );
+        let x_type = local_name_type(&mut ws, file_id, "x");
+        assert!(
+            x_type.is_any(),
+            "the narrowed helper return must preserve any, got {}",
+            ws.humanize_type(x_type)
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.is_empty(),
+            "VMatrix/GetTranslation-style any-or-false narrowing must preserve any and not report undefined-field"
+        );
+    }
+
+    #[test]
+    fn test_false_or_vmatrix_multi_return_guard_undefined_field_bug() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws.virtual_url_generator.new_path("__test_gmod_annotations");
+        ws.analysis.add_library_workspace(library_root.clone());
+        let library_uri =
+            lsp_types::Uri::parse_from_file_path(&library_root.join("annotations.lua")).unwrap();
+        ws.analysis.update_file_by_uri(
+            &library_uri,
+            Some(
+                r#"
+            ---@class VMatrix
+            local VMatrix = {}
+            function VMatrix:GetTranslation() end
+
+            ---@class Entity
+            local Entity = {}
+            ---@return VMatrix?
+            function Entity:GetBoneMatrix(bone) end
+            ---@return integer?
+            function Entity:LookupBone(name) end
+            ---@return boolean
+            function Entity:IsWorld() end
+
+            function TOOL:HandEntity() end
+            function TOOL:HandNum() end
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#
+                .to_string(),
+            ),
+        );
+
+        let file_id = ws.def_file(
+            "gamemodes/sandbox/entities/weapons/gmod_tool/stools/finger.lua",
+            r#"
+            function TOOL:GetHandPositions(pEntity)
+                local LeftHand = pEntity:LookupBone("ValveBiped.Bip01_L_Hand")
+                local RightHand = pEntity:LookupBone("ValveBiped.Bip01_R_Hand")
+
+                if (!LeftHand || !RightHand) then return false end
+
+                local LeftHandMatrix = pEntity:GetBoneMatrix(LeftHand)
+                local RightHandMatrix = pEntity:GetBoneMatrix(RightHand)
+                if (!LeftHandMatrix || !RightHandMatrix) then return false end
+
+                return LeftHandMatrix, RightHandMatrix
+            end
+
+            function TOOL:DrawHUD()
+                local selected = self:HandEntity()
+                local hand = self:HandNum()
+
+                if (!IsValid(selected)) then return end
+                if (selected:IsWorld()) then return end
+
+                local lefthand, righthand = self:GetHandPositions(selected)
+
+                local BoneMatrix = lefthand
+                if hand == 1 then BoneMatrix = righthand end
+                if (!BoneMatrix) then return end
+
+                BoneMatrix:GetTranslation()
+            end
+            "#,
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(
+            diagnostics.is_empty(),
+            "false-or-VMatrix guard should remove the false path before method lookup, got: {diagnostics:?}"
+        );
+    }
+
+    // -----------------------------------------------------------------------
+    // Metadata-driven member guard tests (Phase 2)
+    // -----------------------------------------------------------------------
+
+    /// A custom guard function (not named `isfunction`) with `call_arg("gmod.member_guard", ...)`
+    /// metadata should suppress undefined-field for its member-access argument.
+    #[test]
+    fn test_custom_annotated_member_guard_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+
+            ---@[call_arg("gmod.member_guard", "function")]
+            ---@param value any
+            ---@return boolean
+            function isCallable(value) end
+
+            ---@class MyVehicle
+            MyVehicle = {}
+            "#,
+        );
+
+        // Use a non-conditional assignment context so that `in_conditional_statement` does NOT
+        // fire.  The suppression must come from the `is_member_guard_call_argument` metadata
+        // path, making this a load-bearing test for `call_arg("gmod.member_guard", ...)`.
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle
+                local vehicle
+                local result = isCallable(vehicle.GetFreeSeat)
+            "#
+        ));
+    }
+
+    /// `call_arg_field` scopes metadata to a field inside the argument table;
+    /// it must not suppress diagnostics for the direct argument expression.
+    #[test]
+    fn test_call_arg_field_member_guard_does_not_suppress_direct_argument() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
+
+            ---@[call_arg_field("gmod.member_guard", "function", "callback")]
+            ---@param config table
+            ---@return boolean
+            function hasCallback(config) end
+
+            ---@class MyVehicle3
+            MyVehicle3 = {}
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle3
+                local vehicle
+                local result = hasCallback(vehicle.GetFreeSeat)
+            "#
+        ));
+    }
+
+    /// An unannotated `isfunction` spelling (without `gmod.member_guard` metadata)
+    /// should NOT suppress undefined-field when the member access is not in
+    /// a conditional context.
+    #[test]
+    fn test_unannotated_isfunction_does_not_suppress_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return boolean
+            function isfunction(value) end
+
+            ---@class MyVehicle2
+            MyVehicle2 = {}
+            "#,
+        );
+
+        // Without member_guard metadata, isfunction should NOT suppress.
+        // Use an assignment context (not conditional) to test the member guard path.
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@type MyVehicle2
+                local vehicle
+                local result = isfunction(vehicle.GetFreeSeat)
+            "#
+        ));
+    }
+
+    #[test]
+    fn falsy_unknown_reassigned_callback_parameter_reports_index_access() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param value unknown
+            ---@return unknown
+            ---@return boolean
+            local function find(value) end
+
+            ---@param callback fun(target: unknown)
+            local function register(callback) end
+
+            ---@param value any
+            local function use(value) end
+
+            register(function(target)
+                local more
+                target, more = find(target[1])
+                if target then
+                    use(target)
+                elseif more then
+                    use(target[1])
+                else
+                    use(target[1])
+                end
+            end)
+            "#,
+        );
+
+        let diagnostics = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(diagnostics.len(), 2, "{diagnostics:#?}");
+    }
+
+    #[test]
+    fn schema_members_merge_across_files_and_aliases() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedField);
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_schema.lua",
+            r#"
+            Schema.name = "Example RP"
+            function Schema:IsPrivilegedRank(text, rank) return true end
+            function Schema:SaveAccessRules() end
+            "#,
+        );
+        let schema_consumer = ws.def_file(
+            "gamemodes/example-rp/schema/cl_hooks.lua",
+            r#"
+            print(SCHEMA.name)
+            print(Schema:IsPrivilegedRank("USER-01", "01"))
+            "#,
+        );
+        let external_consumer = ws.def_file(
+            "gamemodes/example-rp/entities/entities/example_access_control.lua",
+            r#"
+            function ENT:OnRemove()
+                print(Schema.SaveAccessRules)
+                Schema:SaveAccessRules()
+            end
+            "#,
+        );
+        let undefined_field = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedField.get_name().to_string(),
+        ));
+        for consumer in [schema_consumer, external_consumer] {
+            let diagnostics = ws
+                .analysis
+                .diagnose_file(consumer, CancellationToken::new())
+                .unwrap_or_default();
+            assert!(
+                diagnostics
+                    .iter()
+                    .all(|diagnostic| diagnostic.code != undefined_field),
+                "unexpected UndefinedField diagnostics: {diagnostics:#?}"
+            );
+        }
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::UndefinedMethod);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(external_consumer, CancellationToken::new())
+            .unwrap_or_default();
+        let undefined_method = Some(NumberOrString::String(
+            DiagnosticCode::UndefinedMethod.get_name().to_string(),
+        ));
+        assert!(
+            diagnostics
+                .iter()
+                .all(|diagnostic| diagnostic.code != undefined_method),
+            "unexpected UndefinedMethod diagnostics: {diagnostics:#?}"
         );
     }
 }

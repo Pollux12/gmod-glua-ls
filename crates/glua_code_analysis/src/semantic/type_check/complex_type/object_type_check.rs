@@ -301,7 +301,7 @@ fn check_object_type_compact_table_const(
                 }
             }
         };
-        let member_type = match member_item.resolve_type(db) {
+        let member_type = match context.resolve_member_item_type(member_item) {
             Ok(t) => t,
             _ => {
                 continue;
@@ -347,12 +347,8 @@ fn check_object_type_compact_table_const(
                 continue;
             }
 
-            let member_type = match context
-                .db
-                .get_type_index()
-                .get_type_cache(&member.get_id().into())
-            {
-                Some(cache) => cache.as_type(),
+            let member_type = match context.member_type(member.get_id()) {
+                Some(typ) => typ,
                 None => continue,
             };
 
@@ -361,7 +357,7 @@ fn check_object_type_compact_table_const(
                 member.get_key(),
                 Some(&member_key_type),
                 source_type,
-                member_type,
+                &member_type,
                 check_guard,
             )?;
             break;

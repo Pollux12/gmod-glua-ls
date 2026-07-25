@@ -1,14 +1,431 @@
 #[cfg(test)]
 mod test {
+    use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+
+    use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
     use rowan::TextRange;
 
     use crate::db_index::traits::LuaIndex;
     use crate::db_index::r#type::LuaTypeIndex;
     use crate::db_index::{LuaDeclTypeKind, LuaTypeFlag};
-    use crate::{DbIndex, FileId, LuaType, LuaTypeDecl, LuaTypeDeclId, resolve_alias_type};
+    use crate::{
+        DbIndex, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaInferenceConfidence,
+        LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
+        LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata,
+        LuaTypeOwner, resolve_alias_type,
+    };
 
     fn create_type_index() -> LuaTypeIndex {
         LuaTypeIndex::new()
+    }
+
+    fn file_id() -> FileId {
+        FileId::new(1)
+    }
+
+    fn owner() -> LuaTypeOwner {
+        LuaTypeOwner::Decl(LuaDeclId::new(file_id(), 10.into()))
+    }
+
+    fn owner_in(file_id: FileId, position: u32) -> LuaTypeOwner {
+        LuaTypeOwner::Decl(LuaDeclId::new(file_id, position.into()))
+    }
+
+    fn source(position: u32) -> InFiled<LuaSyntaxId> {
+        source_in(file_id(), position)
+    }
+
+    fn source_in(file_id: FileId, position: u32) -> InFiled<LuaSyntaxId> {
+        InFiled::new(
+            file_id,
+            LuaSyntaxId::new(
+                LuaKind::Syntax(LuaSyntaxKind::LocalName),
+                TextRange::new(position.into(), (position + 1).into()),
+            ),
+        )
+    }
+
+    fn anchored_metadata() -> LuaTypeFactMetadata {
+        let event = LuaInferenceEventId {
+            node: LuaInferenceNodeId::TypeOwner(owner()),
+            kind: LuaInferenceProvenanceKind::ContextualUnknown,
+            source: source(20),
+        };
+        LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Anchored,
+            base_provenance_kind: None,
+            provenance: Arc::from([LuaInferenceStep {
+                event,
+                support: Arc::from([]),
+                found_type: None,
+            }]),
+        }
+    }
+
+    #[test]
+    fn inference_fact_runtime_type_change_preserves_epistemic_metadata() {
+        let fact = LuaTypeFact::new(
+            LuaType::from_vec(vec![LuaType::Nil, LuaType::String]),
+            anchored_metadata().confidence,
+            anchored_metadata().provenance,
+        );
+
+        let narrowed = fact.with_runtime_type(LuaType::String);
+
+        assert_eq!(narrowed.typ(), &LuaType::String);
+        assert_eq!(narrowed.confidence(), LuaInferenceConfidence::Anchored);
+        assert_eq!(narrowed.base_provenance_kind(), fact.base_provenance_kind());
+        assert_eq!(narrowed.provenance(), fact.provenance());
+    }
+
+    #[test]
+    fn inference_fact_stable_order_and_deduplication_are_deterministic() {
+        let first = LuaInferenceEventId {
+            node: LuaInferenceNodeId::TypeOwner(owner()),
+            kind: LuaInferenceProvenanceKind::ContextualUnknown,
+            source: source(20),
+        };
+        let second = LuaInferenceEventId {
+            node: LuaInferenceNodeId::TypeOwner(owner()),
+            kind: LuaInferenceProvenanceKind::UnguardedChild,
+            source: source(30),
+        };
+        let fact = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            Arc::from([
+                LuaInferenceStep {
+                    event: second.clone(),
+                    found_type: None,
+                    support: Arc::from([]),
+                },
+                LuaInferenceStep {
+                    event: first.clone(),
+                    found_type: None,
+                    support: Arc::from([]),
+                },
+                LuaInferenceStep {
+                    event: second.clone(),
+                    found_type: None,
+                    support: Arc::from([]),
+                },
+            ]),
+        );
+
+        assert_eq!(
+            fact.diagnostic_events().collect::<Vec<_>>(),
+            vec![&second, &first]
+        );
+        assert_eq!(first.stable_cmp(&second), Ordering::Less);
+        assert_eq!(second.stable_cmp(&first), Ordering::Greater);
+    }
+
+    #[test]
+    fn inference_fact_index_force_plain_replacement_clears_uncertain_metadata() {
+        let mut index = LuaTypeIndex::new();
+        index.force_bind_type_fact(
+            owner(),
+            LuaTypeCache::InferType(LuaType::String),
+            anchored_metadata(),
+        );
+        index.force_bind_type(owner(), LuaTypeCache::InferType(LuaType::Number));
+
+        let fact = index.get_type_fact(&owner()).unwrap();
+        assert_eq!(fact.typ(), &LuaType::Number);
+        assert_eq!(fact.confidence(), LuaInferenceConfidence::Certain);
+        assert!(fact.provenance().is_empty());
+        assert!(index.get_inference_events_for_file(file_id()).is_empty());
+    }
+
+    #[test]
+    fn inference_fact_index_insert_only_preserves_existing_fact() {
+        let mut index = LuaTypeIndex::new();
+        index.bind_type_fact(
+            owner(),
+            LuaTypeCache::InferType(LuaType::String),
+            anchored_metadata(),
+        );
+        index.bind_type(owner(), LuaTypeCache::InferType(LuaType::Number));
+
+        let fact = index.get_type_fact(&owner()).unwrap();
+        assert_eq!(fact.typ(), &LuaType::String);
+        assert_eq!(fact.confidence(), LuaInferenceConfidence::Anchored);
+    }
+
+    #[test]
+    fn inference_fact_plain_caches_expose_base_provenance_without_synthetic_events() {
+        let mut index = LuaTypeIndex::new();
+        let doc_owner = owner_in(file_id(), 10);
+        let infer_owner = owner_in(file_id(), 20);
+        index.bind_type(doc_owner.clone(), LuaTypeCache::DocType(LuaType::String));
+        index.bind_type(
+            infer_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Number),
+        );
+
+        let doc_fact = index.get_type_fact(&doc_owner).unwrap();
+        let infer_fact = index.get_type_fact(&infer_owner).unwrap();
+
+        assert_eq!(doc_fact.confidence(), LuaInferenceConfidence::Certain);
+        assert_eq!(
+            doc_fact.base_provenance_kind(),
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation)
+        );
+        assert!(doc_fact.provenance().is_empty());
+        assert_eq!(infer_fact.confidence(), LuaInferenceConfidence::Certain);
+        assert_eq!(
+            infer_fact.base_provenance_kind(),
+            Some(LuaInferenceProvenanceKind::ConcreteValue)
+        );
+        assert!(infer_fact.provenance().is_empty());
+    }
+
+    #[test]
+    fn inference_fact_plain_inferred_any_is_uncertain_but_nil_and_never_are_runtime_facts() {
+        let mut index = LuaTypeIndex::new();
+        let any_owner = owner_in(file_id(), 10);
+        let nil_owner = owner_in(file_id(), 20);
+        let never_owner = owner_in(file_id(), 30);
+        let unknown_owner = owner_in(file_id(), 40);
+        index.bind_type(any_owner.clone(), LuaTypeCache::InferType(LuaType::Any));
+        index.bind_type(nil_owner.clone(), LuaTypeCache::InferType(LuaType::Nil));
+        index.bind_type(never_owner.clone(), LuaTypeCache::InferType(LuaType::Never));
+        index.bind_type(
+            unknown_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Unknown),
+        );
+
+        let any_fact = index.get_type_fact(&any_owner).unwrap();
+        let nil_fact = index.get_type_fact(&nil_owner).unwrap();
+        let never_fact = index.get_type_fact(&never_owner).unwrap();
+        let unknown_fact = index.get_type_fact(&unknown_owner).unwrap();
+
+        assert_eq!(any_fact.typ(), &LuaType::Any);
+        assert_eq!(any_fact.confidence(), LuaInferenceConfidence::Unknown);
+        assert_eq!(any_fact.base_provenance_kind(), None);
+        assert_eq!(nil_fact.typ(), &LuaType::Nil);
+        assert_eq!(nil_fact.confidence(), LuaInferenceConfidence::Certain);
+        assert_eq!(
+            nil_fact.base_provenance_kind(),
+            Some(LuaInferenceProvenanceKind::ConcreteValue)
+        );
+        assert_eq!(never_fact.typ(), &LuaType::Never);
+        assert_eq!(never_fact.confidence(), LuaInferenceConfidence::Certain);
+        assert_eq!(
+            never_fact.base_provenance_kind(),
+            Some(LuaInferenceProvenanceKind::ConcreteValue)
+        );
+        assert_eq!(unknown_fact, LuaTypeFact::unknown());
+    }
+
+    #[test]
+    fn inference_fact_cross_file_events_are_buckets_by_source_and_invalidated_by_owner() {
+        let mut index = LuaTypeIndex::new();
+        let owner_file = FileId::new(1);
+        let source_file = FileId::new(2);
+        let owner = owner_in(owner_file, 10);
+        let event = LuaInferenceEventId {
+            node: LuaInferenceNodeId::TypeOwner(owner.clone()),
+            kind: LuaInferenceProvenanceKind::ContextualUnknown,
+            source: source_in(source_file, 20),
+        };
+        let metadata = LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Anchored,
+            base_provenance_kind: None,
+            provenance: Arc::from([LuaInferenceStep {
+                event,
+                support: Arc::from([]),
+                found_type: None,
+            }]),
+        };
+
+        index.force_bind_type_fact(
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            metadata.clone(),
+        );
+        assert!(index.get_inference_events_for_file(owner_file).is_empty());
+        assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
+
+        index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::Number));
+        assert!(index.get_inference_events_for_file(source_file).is_empty());
+
+        index.force_bind_type_fact(owner, LuaTypeCache::InferType(LuaType::String), metadata);
+        assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
+        index.remove(owner_file);
+        assert!(index.get_inference_events_for_file(source_file).is_empty());
+    }
+
+    #[test]
+    fn inference_fact_cross_file_rebuild_preserves_other_owner_events_in_same_source_bucket() {
+        let source_file = FileId::new(3);
+        let first_owner = owner_in(FileId::new(1), 10);
+        let second_owner = owner_in(FileId::new(2), 20);
+        let metadata_for = |owner: LuaTypeOwner, position| LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Anchored,
+            base_provenance_kind: None,
+            provenance: Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::TypeOwner(owner),
+                    kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                    source: source_in(source_file, position),
+                },
+                found_type: None,
+                support: Arc::from([]),
+            }]),
+        };
+        let mut index = LuaTypeIndex::new();
+        index.force_bind_type_fact(
+            first_owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            metadata_for(first_owner.clone(), 30),
+        );
+        index.force_bind_type_fact(
+            second_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Number),
+            metadata_for(second_owner.clone(), 40),
+        );
+
+        index.force_bind_type(first_owner, LuaTypeCache::InferType(LuaType::Boolean));
+
+        let remaining = index.get_inference_events_for_file(source_file);
+        assert_eq!(remaining.len(), 1);
+        assert_eq!(
+            remaining[0].event.node,
+            LuaInferenceNodeId::TypeOwner(second_owner)
+        );
+    }
+
+    #[test]
+    fn inference_fact_conflicting_duplicate_publications_are_rejected_independently_of_order() {
+        let node = LuaInferenceNodeId::TypeOwner(owner());
+        let anchored = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            anchored_metadata().provenance,
+        );
+        let heuristic = LuaTypeFact::new(
+            LuaType::Number,
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([]),
+        );
+
+        let mut forward = DbIndex::new();
+        let mut reverse = DbIndex::new();
+        assert!(
+            forward
+                .publish_inference_facts(vec![
+                    (node.clone(), anchored.clone()),
+                    (node.clone(), heuristic.clone())
+                ])
+                .is_empty()
+        );
+        assert!(
+            reverse
+                .publish_inference_facts(vec![(node.clone(), heuristic), (node.clone(), anchored)])
+                .is_empty()
+        );
+        assert_eq!(forward.get_inference_fact(&node), None);
+        assert_eq!(reverse.get_inference_fact(&node), None);
+    }
+
+    #[test]
+    fn inference_fact_definition_storage_and_reverse_support_are_file_scoped() {
+        let mut index = LuaTypeIndex::new();
+        let definition = LuaDefinitionId::Declaration(LuaDeclId::new(file_id(), 10.into()));
+        let support_file = FileId::new(2);
+        let fact = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::Definition(definition),
+                    kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                    source: InFiled::new(
+                        support_file,
+                        LuaSyntaxId::new(
+                            LuaKind::Syntax(LuaSyntaxKind::NameExpr),
+                            TextRange::new(5.into(), 6.into()),
+                        ),
+                    ),
+                },
+                found_type: None,
+                support: Arc::from([LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(
+                    InFiled::new(
+                        support_file,
+                        LuaSyntaxId::new(
+                            LuaKind::Syntax(LuaSyntaxKind::NameExpr),
+                            TextRange::new(5.into(), 6.into()),
+                        ),
+                    ),
+                ))]),
+            }]),
+        );
+
+        index.bind_definition_fact(definition, fact.clone());
+
+        assert_eq!(index.get_definition_fact(&definition), Some(&fact));
+        assert_eq!(
+            index.files_depending_on_inference_support(&HashSet::from([support_file])),
+            HashSet::from([file_id()])
+        );
+    }
+
+    #[test]
+    fn inference_fact_file_removal_clears_all_sparse_fact_state() {
+        let mut index = LuaTypeIndex::new();
+        let definition = LuaDefinitionId::Declaration(LuaDeclId::new(file_id(), 10.into()));
+        index.force_bind_type_fact(
+            owner(),
+            LuaTypeCache::InferType(LuaType::String),
+            anchored_metadata(),
+        );
+        index.bind_definition_fact(definition, LuaTypeFact::certain(LuaType::Number));
+
+        index.remove(file_id());
+
+        assert!(index.get_type_fact(&owner()).is_none());
+        assert!(index.get_definition_fact(&definition).is_none());
+        assert!(index.get_inference_events_for_file(file_id()).is_empty());
+    }
+
+    #[test]
+    fn inference_fact_table_const_replacement_keeps_event_fact_in_sync() {
+        let mut index = LuaTypeIndex::new();
+        let table_range = InFiled::new(file_id(), TextRange::new(30.into(), 32.into()));
+        index.force_bind_type_fact(
+            owner(),
+            LuaTypeCache::InferType(LuaType::TableConst(table_range.clone())),
+            anchored_metadata(),
+        );
+
+        index.replace_table_const_type(&table_range, &LuaType::Table);
+
+        assert_eq!(
+            index.get_type_fact(&owner()).unwrap().typ(),
+            &LuaType::Table
+        );
+        assert_eq!(
+            index.get_inference_events_for_file(file_id())[0].fact.typ(),
+            &LuaType::Table
+        );
+    }
+
+    #[test]
+    fn inference_fact_db_publish_uses_the_canonical_owner_fact() {
+        let mut db = DbIndex::new();
+        let fact = LuaTypeFact::new(
+            LuaType::String,
+            LuaInferenceConfidence::Anchored,
+            anchored_metadata().provenance,
+        );
+        let node = LuaInferenceNodeId::TypeOwner(owner());
+
+        assert_eq!(
+            db.publish_inference_facts(vec![(node.clone(), fact.clone())]),
+            HashSet::from([file_id()])
+        );
+        assert_eq!(db.get_inference_fact(&node), Some(fact));
     }
 
     #[test]

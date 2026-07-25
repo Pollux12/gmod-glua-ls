@@ -1,8 +1,9 @@
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast,
-    LuaDocTagModule, LuaDocTagOther, LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam,
-    LuaDocTagReturn, LuaDocTagReturnCast, LuaDocTagSchema, LuaDocTagSee, LuaDocTagType,
-    LuaDocTypeFlag, LuaExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaClosureExpr,
+    LuaDocDescriptionOwner, LuaDocTagAs, LuaDocTagCast, LuaDocTagModule, LuaDocTagOther,
+    LuaDocTagOutparam, LuaDocTagOverload, LuaDocTagParam, LuaDocTagReturn, LuaDocTagReturnCast,
+    LuaDocTagSchema, LuaDocTagSee, LuaDocTagType, LuaDocTypeFlag, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaIndexKey, LuaLocalName, LuaTokenKind, LuaVarExpr,
 };
 use std::sync::Arc;
 
@@ -22,10 +23,11 @@ use crate::{
 use crate::{
     InFiled, JsonSchemaFile, LuaCallArgRole, LuaOperatorMetaMethod, LuaTypeCache, LuaTypeOwner,
     OVERLOAD_CALL_ARG_ATTRIBUTE, OperatorFunction, ReturnTypeKind, SignatureReturnStatus,
-    compilation::analyzer::common::bind_type,
+    compilation::analyzer::common::{TypeCacheWriteMode, bind_type, write_type_cache},
     db_index::{
         AccessorFuncAnnotation, LuaDeclId, LuaDocParamInfo, LuaDocReturnInfo, LuaInstanceType,
-        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaMemberId, LuaOperator, LuaOutParamInfo, LuaOutParamRoot, LuaSemanticDeclId,
+        LuaSignatureId, LuaType,
     },
 };
 
@@ -82,10 +84,12 @@ fn bind_type_to_owner(
                         let position = name_token.get_position();
                         let file_id = analyzer.file_id;
                         let decl_id = LuaDeclId::new(file_id, position);
-                        analyzer
-                            .db
-                            .get_type_index_mut()
-                            .bind_type(decl_id.into(), LuaTypeCache::DocType(type_ref.clone()));
+                        write_type_cache(
+                            analyzer.db,
+                            decl_id.into(),
+                            LuaTypeCache::DocType(type_ref.clone()),
+                            TypeCacheWriteMode::InsertOnly,
+                        );
 
                         // bind description
                         if let Some(ref desc) = description
@@ -101,10 +105,12 @@ fn bind_type_to_owner(
                     LuaVarExpr::IndexExpr(index_expr) => {
                         let member_id =
                             LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
-                        analyzer
-                            .db
-                            .get_type_index_mut()
-                            .bind_type(member_id.into(), LuaTypeCache::DocType(type_ref.clone()));
+                        write_type_cache(
+                            analyzer.db,
+                            member_id.into(),
+                            LuaTypeCache::DocType(type_ref.clone()),
+                            TypeCacheWriteMode::InsertOnly,
+                        );
 
                         // bind description
                         if let Some(ref desc) = description
@@ -131,10 +137,12 @@ fn bind_type_to_owner(
                 let file_id = analyzer.file_id;
                 let decl_id = LuaDeclId::new(file_id, position);
 
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::DocType(type_ref.clone()));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::DocType(type_ref.clone()),
+                    TypeCacheWriteMode::InsertOnly,
+                );
 
                 // bind description
                 if let Some(ref desc) = description
@@ -152,10 +160,12 @@ fn bind_type_to_owner(
             if let Some(first_type) = type_list.first() {
                 let member_id = LuaMemberId::new(table_field.get_syntax_id(), analyzer.file_id);
 
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(member_id.into(), LuaTypeCache::DocType(first_type.clone()));
+                write_type_cache(
+                    analyzer.db,
+                    member_id.into(),
+                    LuaTypeCache::DocType(first_type.clone()),
+                    TypeCacheWriteMode::InsertOnly,
+                );
 
                 // bind description
                 if let Some(ref desc) = description
@@ -174,9 +184,11 @@ fn bind_type_to_owner(
                 let file_id = analyzer.file_id;
                 let syntax_id = return_stat.get_syntax_id();
                 let in_file_syntax_id = InFiled::new(file_id, syntax_id);
-                analyzer.db.get_type_index_mut().bind_type(
+                write_type_cache(
+                    analyzer.db,
                     in_file_syntax_id.into(),
                     LuaTypeCache::DocType(first_type.clone()),
+                    TypeCacheWriteMode::InsertOnly,
                 );
             }
         }
@@ -198,11 +210,7 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
     };
 
     let nullable = tag.is_nullable();
-    let type_ref = if let Some(lua_doc_type) = tag.get_type() {
-        infer_type(analyzer, lua_doc_type)
-    } else {
-        return None;
-    };
+    let type_ref = infer_type(analyzer, tag.get_type()?);
     let default_value = tag.get_default_value().map(convert_doc_default_value);
     let type_ref = apply_nullable_doc_default(analyzer, type_ref, nullable, default_value.as_ref());
 
@@ -244,10 +252,12 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
             if it_name == name {
                 let decl_id = LuaDeclId::new(analyzer.file_id, it_name_token.get_position());
 
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::DocType(type_ref));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::DocType(type_ref),
+                    TypeCacheWriteMode::InsertOnly,
+                );
                 break;
             }
         }
@@ -291,29 +301,83 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         .db
         .get_signature_index_mut()
         .get_or_create(signature_id);
-    let Some(param_idx) = signature.find_param_idx(&param_name) else {
-        report_invalid_outparam(
-            analyzer,
-            &tag,
-            format!("outparam root `{param_name}` does not match any parameter"),
-        );
-        return None;
+    let root = if param_name == "self"
+        && (signature.is_colon_define || closure_is_colon_define(&closure))
+    {
+        LuaOutParamRoot::SelfReceiver
+    } else {
+        let Some(param_idx) = signature.find_param_idx(&param_name) else {
+            report_invalid_outparam(
+                analyzer,
+                &tag,
+                format!("outparam root `{param_name}` does not match any parameter"),
+            );
+            return None;
+        };
+        LuaOutParamRoot::Param(param_idx)
     };
 
     if let Some(existing) = signature
         .out_params
         .iter_mut()
-        .find(|p| p.param_idx == param_idx && p.field_path == field_path)
+        .find(|p| p.root == root && p.field_path == field_path)
     {
         existing.type_ref = type_ref;
     } else {
         signature.out_params.push(LuaOutParamInfo {
-            param_idx,
+            root: root.clone(),
             field_path,
             type_ref,
         });
     }
+    if matches!(root, LuaOutParamRoot::SelfReceiver)
+        && let Some(member_name) = receiver_member_name_for_closure(&closure)
+    {
+        analyzer
+            .db
+            .get_signature_index_mut()
+            .add_receiver_out_param_member_name(analyzer.file_id, member_name);
+    }
     Some(())
+}
+
+fn closure_is_colon_define(closure: &LuaClosureExpr) -> bool {
+    let Some(func_stat) = closure.get_parent::<LuaFuncStat>() else {
+        return false;
+    };
+    let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+        return false;
+    };
+    index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
+}
+
+fn receiver_member_name_for_closure(closure: &LuaClosureExpr) -> Option<String> {
+    if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
+        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
+            return None;
+        };
+        return static_member_name(&index_expr);
+    }
+
+    let assign_stat = closure.get_parent::<LuaAssignStat>()?;
+    let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+    let value_idx = value_exprs
+        .iter()
+        .position(|expr| expr.get_position() == closure.get_position())?;
+    let Some(LuaVarExpr::IndexExpr(index_expr)) = vars.get(value_idx) else {
+        return None;
+    };
+    static_member_name(index_expr)
+}
+
+fn static_member_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+        LuaIndexKey::String(name) => Some(name.get_value().to_string()),
+        _ => None,
+    }
 }
 
 fn report_invalid_outparam(
@@ -476,10 +540,18 @@ fn overload_call_arg_roles(
     let attributes = find_attach_attribute(LuaAst::LuaDocTagOverload(tag.clone()))?;
     for tag_use in attributes {
         for attribute_use in infer_attribute_uses(analyzer, tag_use)? {
-            if attribute_use.id.get_name() != OVERLOAD_CALL_ARG_ATTRIBUTE {
-                continue;
-            }
-
+            let attribute_name = attribute_use.id.get_name();
+            let field_path = match attribute_name {
+                OVERLOAD_CALL_ARG_ATTRIBUTE => Vec::new(),
+                crate::db_index::OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE => {
+                    let Some(field_path) = attribute_field_path_param(&attribute_use, "field_path")
+                    else {
+                        continue;
+                    };
+                    field_path
+                }
+                _ => continue,
+            };
             let Some(LuaType::DocIntegerConst(param_idx) | LuaType::IntegerConst(param_idx)) =
                 attribute_use.get_param_by_name("param")
             else {
@@ -506,6 +578,7 @@ fn overload_call_arg_roles(
                 param_idx,
                 domain,
                 role,
+                field_path,
                 priority,
             });
         }
@@ -521,6 +594,16 @@ fn attribute_string_param(attribute_use: &LuaAttributeUse, name: &str) -> Option
     }
 }
 
+fn attribute_field_path_param(attribute_use: &LuaAttributeUse, name: &str) -> Option<Vec<String>> {
+    let path = attribute_string_param(attribute_use, name)?;
+    let field_path = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!field_path.is_empty()).then_some(field_path)
+}
+
 pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Option<()> {
     let module_path = tag.get_module_path()?;
     let module_info = analyzer
@@ -528,20 +611,27 @@ pub fn analyze_module(analyzer: &mut DocAnalyzer, tag: LuaDocTagModule) -> Optio
         .get_module_index()
         .find_module_for_file(&module_path, analyzer.file_id)?;
     let module_file_id = module_info.file_id;
-    let owner_id = get_owner_id_or_report(analyzer, &tag)?;
+    let owner_id = get_owner_id(analyzer, None, true).or_else(|| {
+        report_orphan_tag(analyzer, &tag);
+        None
+    })?;
     let module_ref = LuaType::ModuleRef(module_file_id);
     match &owner_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
-            analyzer
-                .db
-                .get_type_index_mut()
-                .bind_type((*decl_id).into(), LuaTypeCache::DocType(module_ref));
+            write_type_cache(
+                analyzer.db,
+                (*decl_id).into(),
+                LuaTypeCache::DocType(module_ref),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         LuaSemanticDeclId::Member(member_id) => {
-            analyzer
-                .db
-                .get_type_index_mut()
-                .bind_type((*member_id).into(), LuaTypeCache::DocType(module_ref));
+            write_type_cache(
+                analyzer.db,
+                (*member_id).into(),
+                LuaTypeCache::DocType(module_ref),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         _ => {}
     }
@@ -586,10 +676,12 @@ pub fn analyze_cast(analyzer: &mut DocAnalyzer, tag: LuaDocTagCast) -> Option<()
             let typ = infer_type(analyzer, doc_type.clone());
             let type_owner =
                 LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, doc_type.get_syntax_id()));
-            analyzer
-                .db
-                .get_type_index_mut()
-                .bind_type(type_owner, LuaTypeCache::DocType(typ));
+            write_type_cache(
+                analyzer.db,
+                type_owner,
+                LuaTypeCache::DocType(typ),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
     }
     Some(())

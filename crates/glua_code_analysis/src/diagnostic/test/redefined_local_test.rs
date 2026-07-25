@@ -151,4 +151,131 @@ mod tests {
         ws.analysis.update_config(Arc::new(emmyrc));
         assert!(!ws.check_code_for(DiagnosticCode::RedefinedLocal, code));
     }
+
+    #[test]
+    fn test_gmod_vgui_panel_registration_allows_panel_reuse() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+                derma.DefineControl("FirstPanel", "", PANEL, "Panel")
+
+                local PANEL = {}
+                function PANEL:Init() end
+                derma.DefineControl("SecondPanel", "", PANEL, "Panel")
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_gmod_vgui_panel_registration_initializer_allows_panel_reuse() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+
+                local PANEL = derma.DefineControl("Button", "", PANEL, "DLabel")
+                PANEL = table.Copy(PANEL)
+        "#
+        ));
+    }
+
+    #[test]
+    fn test_scoped_gamemode_local_table_override_reports_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/test/gamemode/init.lua",
+            r#"
+                local GM = {}
+                function GM:PlayerSpawn(ply) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_scoped_gamemode_local_alias_does_not_report_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "gamemodes/test/gamemode/init.lua",
+            r#"
+                local GM = GM
+                function GM:PlayerSpawn(ply) end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_scoped_plugin_local_table_authoring_does_not_report_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedefinedLocal,
+            "plugins/example/sh_plugin.lua",
+            r#"
+                local PLUGIN = {}
+                function PLUGIN:Initialize() end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_unregistered_panel_reuse_still_reports_redefined_local() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::RedefinedLocal,
+            r#"
+                local PANEL = {}
+                function PANEL:Init() end
+
+                local PANEL = {}
+                function PANEL:Init() end
+        "#
+        ));
+    }
+    #[test]
+    fn repeated_scopes_with_many_visible_locals_diagnose_quick_smoke() {
+        let mut code = String::new();
+        for i in 0..300 {
+            code.push_str(&format!(
+                "local visible_{i} = {i}\ndo\n    local scoped_{i} = visible_{i}\nend\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
+
+        assert!(no_redefined_local);
+    }
+
+    #[test]
+    fn repeated_syntax_vgui_registration_reuse_diagnose_quick_smoke() {
+        let mut code = String::new();
+        for i in 0..80 {
+            code.push_str(&format!(
+                "local PANEL = {{}}\nfunction PANEL:Init() end\nvgui.Register(\"Panel{i}\", PANEL, \"Panel\")\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let no_redefined_local = ws.check_code_for(DiagnosticCode::RedefinedLocal, &code);
+
+        assert!(no_redefined_local);
+    }
 }

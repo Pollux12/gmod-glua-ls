@@ -242,10 +242,86 @@ impl LuaIndex for LuaReferenceIndex {
         }
     }
 
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        self.file_references
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.string_references
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.type_references
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
+
+        self.index_reference.retain(|_, references| {
+            references.retain(|file_id, _| !removed_file_ids.contains(file_id));
+            !references.is_empty()
+        });
+        self.global_references.retain(|_, references| {
+            references.retain(|file_id, _| !removed_file_ids.contains(file_id));
+            !references.is_empty()
+        });
+    }
+
     fn clear(&mut self) {
         self.file_references.clear();
         self.string_references.clear();
+        self.type_references.clear();
         self.index_reference.clear();
         self.global_references.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
+    use rowan::{TextRange, TextSize};
+
+    use super::{LuaIndex, LuaReferenceIndex};
+    use crate::{FileId, LuaMemberKey, db_index::LuaTypeDeclId};
+
+    #[test]
+    fn batch_removal_keeps_references_from_surviving_files() {
+        let first = FileId::new(1);
+        let second = FileId::new(2);
+        let surviving = FileId::new(3);
+        let range = TextRange::new(TextSize::new(0), TextSize::new(1));
+        let mut index = LuaReferenceIndex::new();
+
+        index.create_local_reference(first);
+        index.create_local_reference(surviving);
+        index.add_string_reference(first, "removed", range);
+        index.add_string_reference(surviving, "surviving", range);
+        let first_type = LuaTypeDeclId::local(first, "First");
+        let surviving_type = LuaTypeDeclId::local(surviving, "Surviving");
+        index.add_type_reference(first, first_type.clone(), range);
+        index.add_type_reference(surviving, surviving_type.clone(), range);
+        let syntax_id = LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range);
+        let member_key = LuaMemberKey::Name("field".into());
+        index.add_global_reference("GLOBAL", first, syntax_id);
+        index.add_global_reference("GLOBAL", surviving, syntax_id);
+        index.add_index_reference(member_key.clone(), first, syntax_id);
+        index.add_index_reference(member_key.clone(), surviving, syntax_id);
+
+        index.remove_files(&[second, first, second]);
+
+        assert!(index.get_local_reference(&first).is_none());
+        assert!(index.get_local_reference(&surviving).is_some());
+        assert!(index.get_string_references("removed").is_empty());
+        assert_eq!(index.get_string_references("surviving").len(), 1);
+        assert!(
+            index
+                .get_type_references(&first_type)
+                .is_none_or(|references| references.is_empty())
+        );
+        assert_eq!(index.get_type_references(&surviving_type).unwrap().len(), 1);
+        assert_eq!(index.get_global_references("GLOBAL").unwrap().len(), 1);
+        assert_eq!(index.get_index_references(&member_key).unwrap().len(), 1);
+
+        index.clear();
+        assert!(
+            index
+                .get_type_references(&surviving_type)
+                .unwrap()
+                .is_empty()
+        );
     }
 }

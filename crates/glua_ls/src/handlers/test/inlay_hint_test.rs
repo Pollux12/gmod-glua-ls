@@ -438,4 +438,43 @@ mod tests {
         ));
         Ok(())
     }
+    #[gtest]
+    fn vgui_assignment_hint_uses_assigned_value_type() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.vgui.inlay_hint_enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        ws.def(
+            r#"
+                ---@class Panel
+                local PANEL = {}
+                ---@class OldPanel : Panel
+                local OLD = {}
+                vgui.Register("OldPanel", OLD, "Panel")
+                ---@class NewPanel : Panel
+                local NEW = {}
+                vgui.Register("NewPanel", NEW, "Panel")
+            "#,
+        );
+
+        check!(ws.check_inlay_hint(
+            r#"
+                ---@class PanelHolder
+                ---@field panel (instance) OldPanel
+                local holder
+                ---@return (instance) NewPanel
+                local function make_new_panel() end
+                holder.panel = make_new_panel()
+            "#,
+            vec![VirtualInlayHint {
+                label: ": VGUI Panel (NewPanel : Panel)".to_string(),
+                line: 6,
+                pos: 28,
+                ref_file: None,
+            }]
+        ));
+        Ok(())
+    }
 }

@@ -9,12 +9,72 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, LuaAliasCallKind, LuaDeclId, LuaDeclOrMemberId, LuaInferCache, LuaMemberId, LuaType,
-    infer_expr,
+    DbIndex, LuaAliasCallKind, LuaDeclExtra, LuaDeclId, LuaDeclOrMemberId, LuaInferCache,
+    LuaMemberId, LuaType, infer_expr,
     semantic::infer::{
         infer_index::get_index_expr_var_ref_id, infer_name::get_name_expr_var_ref_id,
     },
 };
+
+/// Returns whether this reference is an immutable direct lexical binding.
+///
+/// This deliberately excludes roots whose identity can outlive or differ from
+/// one local binding. Missing reference metadata also fails closed.
+pub(super) fn is_immutable_direct_lexical_decl(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let VarRefId::VarRef(decl_id) = var_ref_id else {
+        return false;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+        return false;
+    };
+    if !matches!(
+        &decl.extra,
+        LuaDeclExtra::Local { .. } | LuaDeclExtra::Param { .. }
+    ) {
+        return false;
+    }
+
+    db.get_reference_index()
+        .get_decl_references(&decl_id.file_id, decl_id)
+        .is_some_and(|references| !references.mutable)
+}
+
+/// Returns true when a successfully-indexed `Unknown` prefix is authoritative
+/// and may widen to `Any`.
+pub fn unknown_prefix_should_widen_to_any(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    // Only authoritative unknowns should be promoted after successful indexing:
+    // unresolved globals and locals explicitly documented as `unknown` are truly
+    // opaque to the analyzer. Inferred unknown aliases can still have concrete
+    // dynamic member origins (for example `local sounds = self.sounds`), so
+    // widening those aliases to `any` would erase the guarded member type.
+    if matches!(var_ref_id, VarRefId::GlobalName(_, _)) {
+        return true;
+    }
+
+    var_ref_id
+        .get_decl_id_ref()
+        .and_then(|decl_id| db.get_type_index().get_type_cache(&decl_id.into()))
+        .is_some_and(|type_cache| type_cache.is_doc())
+}
+
+/// Identifies member refs rooted in unannotated parameters, where nil cleanup
+/// writes are not authoritative typed member facts.
+pub fn is_untyped_param_rooted_index(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
+    let VarRefId::IndexRef(root, _) = var_ref_id else {
+        return false;
+    };
+    let Some(decl_id) = root.as_decl_id() else {
+        return false;
+    };
+
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.is_param())
+        && db
+            .get_type_index()
+            .get_type_cache(&decl_id.into())
+            .is_none_or(|type_cache| !type_cache.is_doc())
+}
 
 /// Identity for an implicit `self` reference inside a colon method.
 ///

@@ -14,11 +14,6 @@ pub struct LuaDecl {
     expr_id: Option<LuaSyntaxId>,
     initializer: Option<LuaDeclInitializer>,
     pub extra: LuaDeclExtra,
-    /// True when this declaration was synthetically injected by the language server
-    /// (e.g. the scoped-class variable `GM`/`ENT`/`SWEP` seeded into gamemode/entity files).
-    /// Such decls are not present in the user's source and must be excluded from
-    /// diagnostics that rely on user-written variable declarations (e.g. `unused`, `redefined-local`).
-    is_seeded_class_local: bool,
 }
 
 #[derive(Eq, PartialEq, Hash, Debug, Clone, Copy)]
@@ -79,7 +74,6 @@ impl LuaDecl {
             expr_id,
             initializer: expr_id.map(|expr_id| LuaDeclInitializer::new(expr_id, 0)),
             extra,
-            is_seeded_class_local: false,
         }
     }
 
@@ -162,18 +156,6 @@ impl LuaDecl {
 
     pub fn is_implicit_self(&self) -> bool {
         matches!(&self.extra, LuaDeclExtra::ImplicitSelf { .. })
-    }
-
-    /// Returns `true` when this declaration was synthetically injected by the LS
-    /// (e.g. the scoped-class variable `GM` seeded into gamemode files).
-    /// Such decls have no corresponding source text and must be skipped by
-    /// diagnostics that inspect user-written variable declarations.
-    pub fn is_seeded_class_local(&self) -> bool {
-        self.is_seeded_class_local
-    }
-
-    pub fn mark_seeded_class_local(&mut self) {
-        self.is_seeded_class_local = true;
     }
 }
 

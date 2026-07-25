@@ -129,4 +129,42 @@ mod test {
         assert_eq!(infos.len(), 1);
         assert_eq!(infos[0].2, Some(LuaDocTagDefaultValue::Boolean(false)));
     }
+
+    #[test]
+    fn test_inline_default_accessors_for_named_and_call_defaults() {
+        let code = r#"
+        ---@param entity Entity=NULL
+        ---@param origin Vector=Vector( 0, 0, 0 )
+        ---@param angle Angle=Angle( 0, 0, 0 )
+        function f(entity, origin, angle) end
+        "#;
+
+        let tree = LuaParser::parse(code, ParserConfig::default());
+        assert!(tree.get_errors().is_empty(), "{:?}", tree.get_errors());
+
+        let root = tree.get_chunk_node();
+        let mut param_tags = root.descendants::<LuaDocTagParam>();
+
+        let entity = param_tags.next().unwrap();
+        assert_eq!(
+            entity.get_default_value(),
+            Some(LuaDocTagDefaultValue::Expression("NULL".to_string()))
+        );
+
+        let origin = param_tags.next().unwrap();
+        assert_eq!(
+            origin.get_default_value(),
+            Some(LuaDocTagDefaultValue::Expression(
+                "Vector( 0, 0, 0 )".to_string()
+            ))
+        );
+
+        let angle = param_tags.next().unwrap();
+        assert_eq!(
+            angle.get_default_value(),
+            Some(LuaDocTagDefaultValue::Expression(
+                "Angle( 0, 0, 0 )".to_string()
+            ))
+        );
+    }
 }

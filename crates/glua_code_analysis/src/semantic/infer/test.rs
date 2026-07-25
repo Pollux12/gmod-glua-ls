@@ -64,6 +64,27 @@ mod test {
             .unwrap_or(crate::LuaType::Unknown)
     }
 
+    fn infer_index_expr_type_by_text_in_file(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        text: &str,
+    ) -> crate::LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("Semantic model must exist");
+        let target = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == text)
+            .expect("Target index expr must exist");
+
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(target))
+            .unwrap_or(crate::LuaType::Unknown)
+    }
+
     #[test]
     fn test_custom_binary() {
         let mut ws = VirtualWorkspace::new();
@@ -146,7 +167,7 @@ mod test {
             ---@field health integer
 
             ---@param obj any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(obj) end
             "#
                 .to_string(),
@@ -201,6 +222,143 @@ mod test {
     }
 
     #[test]
+    fn test_type_guard_return_cast_removes_null_in_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+
+            local ply = GetPlayerOrNULL()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_cross_file_type_guard_return_cast_removes_null_in_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetPlayerOrNULL() end
+
+            local ply = GetPlayerOrNULL()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_detached_entity_isvalid_removes_null_from_first_argument() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@attribute self_guard(member: string)
+
+            ---@class Entity
+            ---@class Player : Entity
+            ---@class NULL : Entity
+
+            ---@return boolean
+            ---@return_cast self Entity
+            ---@[self_guard("gmod.entity")]
+            function Entity:IsValid() end
+
+            ---@generic T
+            ---@param name `T`
+            ---@return T
+            function FindMetaTable(name) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Player|NULL
+            function GetOwner() end
+
+            local IsValid = FindMetaTable("Entity").IsValid
+            local ply = GetOwner()
+            if IsValid(ply) then
+                ply
+            end
+            "#,
+            "ply",
+        );
+
+        assert_eq!(ty, ws.ty("Player"));
+    }
+
+    #[test]
+    fn test_type_guard_any_false_branch_preserves_antecedent() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Entity
+
+            ---@param value any
+            ---@return TypeGuard<any>
+            function IsValid(value) end
+            "#,
+        );
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return Entity?
+            function GetEntityOrNil() end
+
+            local ent = GetEntityOrNil()
+            if not IsValid(ent) then
+                ent
+            end
+            "#,
+            "ent",
+        );
+
+        assert_eq!(ty, ws.ty("Entity?"));
+    }
+
+    #[test]
     fn test_global_call_prefers_function_over_table_decl_collision() {
         let mut ws = VirtualWorkspace::new();
 
@@ -221,7 +379,12 @@ mod test {
         "#,
         );
 
-        assert_eq!(ws.expr_ty("Color(255, 255, 255)"), ws.ty("integer"));
+        // The implementation returns `r` directly, preserving the supplied
+        // literal while the annotated integer contract remains authoritative.
+        assert_eq!(
+            ws.expr_ty("Color(255, 255, 255)"),
+            LuaType::IntegerConst(255)
+        );
     }
 
     #[test]
@@ -344,6 +507,26 @@ mod test {
         );
 
         assert_eq!(ty, ws.ty("string"));
+    }
+
+    #[test]
+    fn test_istable_guard_preserves_unannotated_string_const_initializer() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_gmod_type_predicates();
+
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local value = "x"
+
+            if istable(value) then
+                print(value)
+            end
+        "#,
+            "value",
+        );
+
+        assert_eq!(ty, LuaType::StringConst(smol_str::SmolStr::new("x").into()));
     }
 
     #[test]
@@ -626,6 +809,37 @@ mod test {
     }
 
     #[test]
+    fn test_return_inference_preserves_boolean_branches_over_any() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@return any
+            local function read()
+            end
+
+            local function pick(condition, fallback)
+                if fallback then
+                    return false
+                end
+
+                if condition then
+                    return true
+                end
+
+                return read()
+            end
+
+            local value = pick(a, b)
+            print(value)
+            "#,
+            "value",
+        );
+
+        assert_eq!(ty, ws.ty("boolean"));
+    }
+
+    #[test]
     fn test_pairs_value_preserves_cross_file_indexed_assignment_table_field() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
@@ -789,6 +1003,61 @@ mod test {
         assert!(
             display.contains("Vector") && display.contains("\"not a number\""),
             "A dynamic string-key field read should include the indexed value union, got: {display}"
+        );
+    }
+
+    #[test]
+    fn test_literal_string_key_assignment_preserves_named_field_types() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@type Player
+            local player = {}
+
+            local rec = {}
+            rec["owner"] = player
+            rec["label"] = "main"
+            rec.test = 2
+
+            local owner = rec.owner
+            local label = rec.label
+            local test = rec["test"]
+        "#,
+        );
+
+        let owner_ty = infer_last_index_expr_type_in_file(&ws, file_id, "owner");
+        let label_ty = infer_last_index_expr_type_in_file(&ws, file_id, "label");
+        let test_ty = infer_last_index_expr_type_in_file(&ws, file_id, "test");
+
+        assert_eq!(owner_ty, ws.ty("Player"));
+        assert_eq!(
+            label_ty,
+            LuaType::StringConst(smol_str::SmolStr::new("main").into())
+        );
+        assert_eq!(test_ty, LuaType::IntegerConst(2));
+    }
+
+    #[test]
+    fn test_custom_type_dynamic_index_key_is_guarded_before_recursing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class RecursiveKey
+            ---@field [string] string
+            ---@field key RecursiveKey
+            local rec
+
+            local value = rec[rec.key[rec.key]]
+            "#,
+        );
+
+        let ty = infer_index_expr_type_by_text_in_file(&ws, file_id, "rec[rec.key[rec.key]]");
+        assert!(
+            ty.is_unknown() || matches!(ty, LuaType::String),
+            "recursive dynamic key inference should terminate with a bounded type, got {ty:?}"
         );
     }
 

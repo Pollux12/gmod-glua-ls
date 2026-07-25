@@ -1,6 +1,23 @@
 #[cfg(test)]
 mod test {
-    use crate::{GmodHookKind, LuaType, VirtualWorkspace};
+    use crate::{Emmyrc, GmodHookKind, LuaType, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
+
+    fn index_expr_type(ws: &VirtualWorkspace, file_id: crate::FileId, text: &str) -> LuaType {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let index_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == text)
+            .expect("index expression");
+        semantic_model
+            .infer_expr(LuaExpr::IndexExpr(index_expr))
+            .expect("index expression type")
+    }
 
     #[test]
     fn test_closure_param_infer() {
@@ -25,6 +42,138 @@ mod test {
         let ty = ws.expr_ty("b");
         let expected = ws.ty("EventData");
         assert_eq!(ty, expected);
+    }
+
+    #[test]
+    fn unannotated_function_callback_infers_table_param_from_direct_invocations() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/shared/api.lua",
+                r#"
+                ---@class CallbackEntity
+                CallbackApi = {}
+
+                function CallbackApi.Read(callback)
+                    ---@type CallbackEntity
+                    local proc
+                    local data = { proc = proc }
+                    callback(false, data, "failed")
+                    callback(true, data)
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/shared/consumer.lua",
+                r#"
+                CallbackApi.Read(function(ok, data, err)
+                    callback_ok = ok
+                    callback_proc = data.proc
+                    callback_err = err
+                end)
+                "#,
+            ),
+        ]);
+
+        let expected_entity = ws.ty("CallbackEntity");
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_ids[1])
+            .expect("consumer semantic model");
+        let param_type = |name: &str| {
+            let param = semantic_model
+                .get_root()
+                .descendants::<LuaNameExpr>()
+                .find(|param| param.get_name_text().as_deref() == Some(name))
+                .expect("callback parameter use");
+            semantic_model
+                .get_semantic_info(param.syntax().clone().into())
+                .expect("callback parameter semantic info")
+                .display_typ()
+                .clone()
+        };
+
+        assert_eq!(param_type("ok"), LuaType::Unknown);
+        let proc_expr = semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .find(|expr| expr.syntax().text() == "data.proc")
+            .expect("callback data.proc expression");
+        assert_eq!(
+            semantic_model
+                .infer_expr(LuaExpr::IndexExpr(proc_expr))
+                .expect("callback proc type"),
+            expected_entity
+        );
+        assert_eq!(param_type("err"), LuaType::Unknown);
+    }
+
+    #[test]
+    fn callback_table_param_refreshes_after_callee_edit_and_reopen() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "lua/autorun/shared/types.lua",
+            "---@class CallbackEntityA\n---@class CallbackEntityB\n",
+        );
+        let api_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/callback_api.lua");
+        let api_source = |entity_type: &str| {
+            format!(
+                r#"
+                CallbackApi = {{}}
+                function CallbackApi.Read(callback)
+                    ---@type {entity_type}
+                    local proc
+                    local data = {{}}
+                    data.proc = proc
+                    callback(data)
+                end
+                "#,
+            )
+        };
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .expect("initial callback API");
+        let consumer_file_id = ws.def_file(
+            "lua/autorun/shared/callback_consumer.lua",
+            r#"
+            CallbackApi.Read(function(data)
+                callback_proc = data.proc
+            end)
+            "#,
+        );
+
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityA")
+        );
+
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityB")))
+            .expect("edited callback API");
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityB")
+        );
+
+        ws.analysis
+            .remove_file_by_uri(&api_uri)
+            .expect("removed callback API");
+        ws.analysis
+            .update_file_by_uri(&api_uri, Some(api_source("CallbackEntityA")))
+            .expect("reopened callback API");
+        assert_eq!(
+            index_expr_type(&ws, consumer_file_id, "data.proc"),
+            ws.ty("CallbackEntityA")
+        );
     }
 
     #[test]
@@ -549,6 +698,134 @@ mod test {
     }
 
     #[test]
+    fn test_local_table_field_function_param_infers_from_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            ---@param builder SkeletonConvertor
+            function register(builder) end
+
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            register(Builder)
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_local_table_field_function_param_infers_from_overload_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            list = {}
+
+            ---@overload fun(identifier: "SkeletonConvertor", key: string, item: SkeletonConvertor)
+            ---@param identifier string
+            ---@param key any
+            ---@param item any
+            function list.Set(identifier, key, item) end
+
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            list.Set("SkeletonConvertor", "TF2_engineer", Builder)
+            "#,
+        );
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_local_table_field_function_param_infers_from_cross_file_overload_call_argument_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ModelEntity
+            ---@field GetModel fun(self: ModelEntity): string
+
+            ---@class SkeletonConvertor
+            ---@field IsApplicable fun(self: SkeletonConvertor, ent: ModelEntity): boolean
+
+            list = {}
+
+            ---@overload fun(identifier: "SkeletonConvertor", key: string, item: SkeletonConvertor)
+            ---@param identifier string
+            ---@param key any
+            ---@param item any
+            function list.Set(identifier, key, item) end
+            "#,
+        );
+        ws.def(
+            r#"
+            local Builder = {
+                IsApplicable = function(self, ent)
+                    A = ent
+                    B = ent:GetModel()
+                    local model = ent:GetModel()
+                    C = model
+                    return true
+                end
+            }
+
+            list.Set("SkeletonConvertor", "TF2_engineer", Builder)
+            "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        let expected = ws.ty("ModelEntity");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("B");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+        let ty = ws.expr_ty("C");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
     fn test_dot_function_param_inherit() {
         // Tests that dot-style function definitions inherit param types from
         // annotated Signatures (e.g. TOOL.BuildCPanel pattern in Garry's Mod)
@@ -658,6 +935,64 @@ mod test {
     }
 
     #[test]
+    fn gmod_hook_callback_uses_realm_compatible_populate_signature() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "annotations/populate_hooks.lua",
+            r#"
+            ---@class DTree_Node
+            local DTree_Node = {}
+
+            ---@class SpawnmenuContentPanel
+            local SpawnmenuContentPanel = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@realm server
+            ---@param unexpected string
+            ---@param ignored number
+            ---@param node string
+            function GM:PopulateContent(unexpected, ignored, node) end
+
+            ---@realm client
+            ---@param content SpawnmenuContentPanel
+            ---@param node DTree_Node
+            function GM:PopulateContent(content, node) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/client/populate_hooks.lua",
+            r#"
+            hook.Add("PopulateContent", "test", function(content, node)
+                inferred_populate_content = content
+                inferred_populate_node = node
+            end)
+
+            hook.Add("UnregisteredPopulate", "test", function(node)
+                unregistered_populate_node = node
+            end)
+            "#,
+        );
+
+        let content = ws.expr_ty("inferred_populate_content");
+        let expected_content = ws.ty("SpawnmenuContentPanel");
+        assert_eq!(
+            ws.humanize_type(content),
+            ws.humanize_type(expected_content)
+        );
+        let node = ws.expr_ty("inferred_populate_node");
+        let expected_node = ws.ty("DTree_Node");
+        assert_eq!(ws.humanize_type(node), ws.humanize_type(expected_node));
+        assert_eq!(ws.expr_ty("unregistered_populate_node"), LuaType::Unknown);
+    }
+
+    #[test]
     fn test_gmod_hook_callback_params_infer_from_annotated_wrapper() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -692,5 +1027,38 @@ mod test {
         let hook_ply = ws.expr_ty("gmod_wrapper_hook_ply");
         let player_type = ws.ty("Player");
         assert_eq!(ws.humanize_type(hook_ply), ws.humanize_type(player_type));
+    }
+
+    #[test]
+    fn test_schema_hook_owner_infers_gamemode_hook_params() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def(
+            r#"
+            ---@class Player
+            local Player = {}
+
+            ---@class GM
+            GM = {}
+
+            ---@param client Player
+            function GM:PlayerSpawn(client) end
+            "#,
+        );
+        ws.def_file(
+            "gamemodes/example-rp/schema/sh_hooks.lua",
+            r#"
+            function Schema:PlayerSpawn(client)
+                schema_hook_client = client
+            end
+            "#,
+        );
+
+        let client_type = ws.expr_ty("schema_hook_client");
+        let player_type = ws.ty("Player");
+        assert_eq!(ws.humanize_type(client_type), ws.humanize_type(player_type));
     }
 }

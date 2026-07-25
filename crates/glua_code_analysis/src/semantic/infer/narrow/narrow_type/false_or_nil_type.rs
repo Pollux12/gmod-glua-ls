@@ -22,8 +22,7 @@ pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
         LuaType::Union(u) => {
             // For unions, collect all the falsy parts from each member
             let falsy_types: Vec<_> = u
-                .into_vec()
-                .iter()
+                .types()
                 .map(|member| narrow_false_or_nil(db, member.clone()))
                 .filter(|falsy| !falsy.is_never())
                 .collect();
@@ -37,10 +36,26 @@ pub fn narrow_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
         LuaType::Instance(instance_type) => {
             return narrow_false_or_nil(db, instance_type.get_base().clone());
         }
+        LuaType::Unknown | LuaType::Any => {
+            return t;
+        }
         _ => {}
     }
 
     narrow_down_type(db, t.clone(), LuaType::Nil, None).unwrap_or(LuaType::Never)
+}
+
+/// Narrows a direct name known to be on a false condition branch.
+///
+/// Unlike compound-expression narrowing, a direct name condition proves that
+/// even an otherwise `Unknown` runtime value is exactly `nil` or `false`.
+/// Explicit `Any` remains dynamic and retains its opt-out behavior.
+pub fn narrow_direct_name_false_or_nil(db: &DbIndex, t: LuaType) -> LuaType {
+    if t.is_unknown() {
+        LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)])
+    } else {
+        narrow_false_or_nil(db, t)
+    }
 }
 
 /// Removes falsy values (false and nil) from a type.
@@ -63,9 +78,8 @@ pub fn remove_false_or_nil(t: LuaType) -> LuaType {
         LuaType::Boolean => LuaType::BooleanConst(true),
         LuaType::Unknown => LuaType::Unknown,
         LuaType::Union(u) => {
-            let types = u.into_vec();
             let mut new_types = Vec::new();
-            for it in types.iter() {
+            for it in u.types() {
                 match it {
                     LuaType::Nil => {}
                     LuaType::BooleanConst(false) => {}

@@ -142,7 +142,7 @@ fn add_by_prefix(
     for semantic_info in parent_semantic_infos {
         if let Some(member_info_map) = builder
             .semantic_model
-            .get_member_info_map(&semantic_info.typ)
+            .get_member_info_map(semantic_info.display_typ())
         {
             seen_types.extend(member_info_map.values().flat_map(|members| {
                 members.iter().filter_map(|member| match &member.typ {

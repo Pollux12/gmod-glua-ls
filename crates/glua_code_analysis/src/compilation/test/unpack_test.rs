@@ -50,6 +50,45 @@ mod test {
     }
 
     #[test]
+    fn test_unpack_member_array_literal_preserves_positional_evidence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            local holder = {}
+            holder.args = { 1, 2 }
+
+            a, b = table.unpack(holder.args)
+        "#,
+        );
+
+        assert_eq!(ws.expr_ty("a"), LuaType::IntegerConst(1));
+        assert_eq!(ws.expr_ty("b"), LuaType::IntegerConst(2));
+    }
+
+    #[test]
+    fn test_unpack_class_member_array_literal_preserves_positional_evidence() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            ---@class TestEntity
+            local TestEntity = {}
+
+            ---@type TestEntity
+            local ent
+
+            function TestEntity:Init()
+                self.args = { 1, 2 }
+            end
+
+            a, b = table.unpack(ent.args)
+        "#,
+        );
+
+        assert_eq!(ws.expr_ty("a"), LuaType::IntegerConst(1));
+        assert_eq!(ws.expr_ty("b"), LuaType::IntegerConst(2));
+    }
+
+    #[test]
     fn test_unpack_alias_call_colon_mismatch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         ws.def(
@@ -159,5 +198,21 @@ mod test {
         local s2 = { 'a', unpack(s) }
         "#,
         ));
+    }
+
+    #[test]
+    fn test_unpack_passthrough_vararg() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            local function passthrough(...)
+                local args = { ... }
+                return unpack(args)
+            end
+            n1, n2 = passthrough(1, 2)
+            "#,
+        );
+        assert!(!ws.expr_ty("n1").is_optional());
+        assert!(!ws.expr_ty("n2").is_optional());
     }
 }

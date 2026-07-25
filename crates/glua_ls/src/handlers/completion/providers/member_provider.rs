@@ -564,14 +564,10 @@ fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo)
     }
 
     let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
-    let call_realm = infer_index.get_realm_at_offset(
+    let call_mask = infer_index.get_state_mask_at_offset(
         &builder.semantic_model.get_file_id(),
         builder.position_offset,
     );
-
-    if !matches!(call_realm, GmodRealm::Client | GmodRealm::Server) {
-        return true;
-    }
 
     let Some(property_owner_id) = &info.property_owner_id else {
         return true;
@@ -580,12 +576,10 @@ fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo)
         return true;
     };
 
-    let decl_realm = resolve_decl_realm(&builder.semantic_model, property_owner_id)
-        .unwrap_or_else(|| infer_index.get_realm_at_offset(&decl_file_id, decl_offset));
-    !matches!(
-        (call_realm, decl_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+    let decl_mask = resolve_decl_realm(&builder.semantic_model, property_owner_id)
+        .map(GmodRealm::state_mask)
+        .unwrap_or_else(|| infer_index.get_state_mask_at_offset(&decl_file_id, decl_offset));
+    call_mask.is_compatible_with(decl_mask)
 }
 
 fn semantic_decl_position(property_owner_id: &LuaSemanticDeclId) -> Option<(FileId, TextSize)> {

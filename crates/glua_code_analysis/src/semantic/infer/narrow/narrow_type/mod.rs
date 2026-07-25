@@ -4,7 +4,9 @@ use crate::{
     DbIndex, LuaInstanceType, LuaIntersectionType, LuaType, TypeOps, check_type_compact,
     get_real_type, semantic::type_check::is_sub_type_of,
 };
-pub use false_or_nil_type::{narrow_false_or_nil, remove_false_or_nil};
+pub use false_or_nil_type::{
+    narrow_direct_name_false_or_nil, narrow_false_or_nil, remove_false_or_nil,
+};
 
 fn is_class_def(db: &DbIndex, declared_type: &LuaType) -> bool {
     match declared_type {
@@ -229,6 +231,10 @@ pub fn narrow_down_type(
                 .filter_map(|t| narrow_down_type(db, real_source_ref.clone(), t, declared.clone()))
                 .collect::<Vec<_>>();
 
+            if source_types.is_empty() {
+                return None;
+            }
+
             let mut result_type = LuaType::Unknown;
             for source_type in source_types {
                 result_type = TypeOps::Union.apply(db, &result_type, &source_type);
@@ -238,8 +244,11 @@ pub fn narrow_down_type(
         LuaType::Variadic(_) => return Some(source),
         LuaType::Def(type_id) | LuaType::Ref(type_id) => match real_source_ref {
             LuaType::Def(ref_id) | LuaType::Ref(ref_id) => {
-                if is_sub_type_of(db, ref_id, type_id) || is_sub_type_of(db, type_id, ref_id) {
+                if is_sub_type_of(db, ref_id, type_id) {
                     return Some(source);
+                }
+                if is_sub_type_of(db, type_id, ref_id) {
+                    return Some(target);
                 }
             }
             _ => {}

@@ -1164,10 +1164,9 @@ goto done
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include =
-            vec![EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(
-                "entities/**".to_string(),
-            )];
+        emmyrc.gmod.scripted_class_scopes.set_include(vec![
+            EmmyrcGmodScriptedClassScopeEntry::LegacyGlob("entities/**".to_string()),
+        ]);
         ws.update_emmyrc(emmyrc);
 
         let main = ws.def_file(
@@ -1194,10 +1193,9 @@ end
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.gmod.scripted_class_scopes.include =
-            vec![EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(
-                "entities/**".to_string(),
-            )];
+        emmyrc.gmod.scripted_class_scopes.set_include(vec![
+            EmmyrcGmodScriptedClassScopeEntry::LegacyGlob("entities/**".to_string()),
+        ]);
         ws.update_emmyrc(emmyrc);
 
         let main = ws.def_file(

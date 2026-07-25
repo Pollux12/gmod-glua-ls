@@ -74,6 +74,21 @@ pub struct Emmyrc {
 }
 
 impl Emmyrc {
+    /// Records the active GMod annotations and ensures their metadata is
+    /// analyzed before any library that may consume it.
+    pub fn prioritize_gmod_annotations_library(&mut self, annotations_path: String) {
+        self.gmod.annotations_path = Some(annotations_path.clone());
+
+        let annotations = self
+            .workspace
+            .library
+            .iter()
+            .position(|item| item.get_path() == &annotations_path)
+            .map(|position| self.workspace.library.remove(position))
+            .unwrap_or(EmmyLibraryItem::Path(annotations_path));
+        self.workspace.library.insert(0, annotations);
+    }
+
     pub fn get_parse_config<'cache>(
         &self,
         node_cache: &'cache mut NodeCache,
@@ -116,6 +131,10 @@ impl Emmyrc {
 
         self.workspace.library = context.process_and_dedup_library(self.workspace.library.iter());
 
+        if let Some(annotations_path) = &mut self.gmod.annotations_path {
+            *annotations_path = context.pre_process_path(annotations_path);
+        }
+
         self.workspace.package_dirs =
             context.process_and_dedup_string(self.workspace.package_dirs.iter());
 
@@ -123,5 +142,9 @@ impl Emmyrc {
             context.process_and_dedup_string(self.workspace.ignore_dir.iter());
 
         self.resource.paths = context.process_and_dedup_string(self.resource.paths.iter());
+
+        self.gmod
+            .scripted_class_scopes
+            .refresh_resolved_definitions();
     }
 }

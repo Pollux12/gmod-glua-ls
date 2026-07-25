@@ -57,7 +57,7 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `param-type-mismatch` | On | Warning | Argument type doesn't match declared `@param` type |
 | `missing-parameter` | On | Warning | Required parameter not passed |
 | `redundant-parameter` | On | Information | Extra argument passed beyond declared parameters |
-| `assign-type-mismatch` | On | Warning | Assignment value type doesn't match declared type |
+| `assign-type-mismatch` | On | Hint | Assignment value type doesn't match declared type |
 | `return-type-mismatch` | **Off** | Warning | Returned type doesn't match declared `@return` type |
 | `missing-return` | **Off** | Warning | Function with `@return` annotation missing a return statement |
 | `missing-return-value` | On | Warning | `return` statement missing a required value |
@@ -67,12 +67,17 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `enum-value-mismatch` | On | Warning | Value not part of the declared enum |
 | `need-check-nil` | On | Hint | Potential nil dereference (try `if x then ... end`) |
 | `unchecked-nil-access` | On | Warning | Chained access or call through an opaque table member that may be nil |
+| `infer-unknown` | On | Hint | An otherwise unknown value was stabilized from usage context and may be incorrect |
+| `infer-unguarded-child` | On | Warning | A child value was inferred from an unguarded parent relationship and may be incorrect |
+
+Nil diagnostics understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
 
 ### Fields & access
 
 | Code | Default | Severity | Description |
 |---|---|---|---|
 | `undefined-field` | On | Warning | Field doesn't exist on the type |
+| `undefined-method` | On | Error | Method called with `:` doesn't exist on the type or an inferred child type |
 | `missing-fields` | On | Warning | Required fields not initialised in a table literal |
 | `inject-field` | **Off** | Warning | Field assigned to a type outside its definition |
 | `duplicate-doc-field` | On | Warning | Same field documented multiple times in a class |
@@ -139,13 +144,13 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `attribute-redundant-parameter` | On | Warning | Extra attribute parameter |
 | `call-non-callable` | **Off** | Warning | Calling a value that is not callable |
 
-### GMod-specific
+### Garry's Mod Lua
 
 | Code | Default | Severity | Description |
 |---|---|---|---|
 | `gmod-invalid-hook-name` | On | Warning | Invalid or unknown GMod hook name |
-| `gmod-realm-mismatch` | On | Warning | Definite realm mismatch: client API in server realm (or vice versa) |
-| `gmod-realm-mismatch-heuristic` | On | Warning | Probable realm mismatch based on inferred evidence |
+| `gmod-realm-mismatch` | On | Error | Client-only code used on the server, or server-only code used on the client |
+| `gmod-realm-mismatch-heuristic` | On | Error | Likely realm mismatch when the file realm is not certain |
 | `gmod-unknown-realm` | On | Hint | Realm could not be determined for a realm-sensitive call |
 | `gmod-net-missing-network-counterpart` | On | Warning | `net.Start` block with no `net.Receive` in the opposite realm (or vice versa) |
 | `gmod-net-read-write-order-mismatch` | On | Warning | `net.Read*` order doesn't match `net.Write*` order |
@@ -153,19 +158,19 @@ Codes marked **Off** start disabled. Add them to `enables` to turn them on.
 | `gmod-net-read-write-bits-mismatch` | On | Warning | Literal bit-width differs between a matched write/read pair (e.g. `WriteUInt(8)` vs `ReadUInt(16)`) |
 | `gmod-unknown-net-message` | On | Warning | Unregistered net message identifier |
 | `gmod-duplicate-system-registration` | On | Hint | Duplicate registration for `net.Receive`, `concommand.Add`, `timer.Create`, etc. |
+| `gmod-null-check` | On | Warning | Entity validity checked with truthiness or `nil` instead of `IsValid` |
 
 
 ---
 
-## VSCode extension settings
+## VS Code extension settings
 
 You can also configure these settings in VS Code settings with the `gluals.*` prefix:
 
-| VSCode Setting | .gluarc.json Key | Type | Default | Description |
+| VS Code setting | .gluarc.json key | Type | Default | Description |
 |---|---|---|---|---|
 | `gluals.diagnostics.diagnosticInterval` | `diagnostics.diagnosticInterval` | `integer` | `500` | Scan delay in milliseconds |
 | `gluals.strict.inferredTypeMismatch` | `strict.inferredTypeMismatch` | `boolean` | `false` | Stricter type checking for inferred values |
-| `gluals.strict.strictTypeCoercion` | `strict.strictTypeCoercion` | `boolean` | `false` | Requires exact types in param-type-mismatch and disables GLua-aware coercions (e.g. number/boolean → string, numeric string literal → number/integer) |
 | `gluals.codeAction.insertSpace` | `codeAction.insertSpace` | `boolean` | `false` | Space after --- in diagnostic comments |
 
 ---

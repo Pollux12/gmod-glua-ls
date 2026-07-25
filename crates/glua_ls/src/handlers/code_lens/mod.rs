@@ -36,7 +36,7 @@ pub async fn on_code_lens_handler(
     // instead of clearing them during the dirty window, which causes layout flicker.
     if !context
         .debounced_analysis()
-        .wait_until_fresh(&cancel_token)
+        .wait_until_fresh_for(&cancel_token, "textDocument/codeLens")
         .await
     {
         return None;

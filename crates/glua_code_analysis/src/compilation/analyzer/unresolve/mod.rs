@@ -5,6 +5,7 @@ mod resolve_closure;
 
 use rustc_hash::FxHashMap;
 use std::cmp::Ordering;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::{
@@ -16,8 +17,8 @@ use crate::{
 };
 use check_reason::{check_reach_reason, resolve_all_reason};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaFuncStat, LuaNameToken,
-    LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaExpr, LuaFuncStat,
+    LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
     try_resolve_decl, try_resolve_iter_var, try_resolve_member, try_resolve_module,
@@ -38,6 +39,62 @@ use super::{AnalyzeContext, infer_cache_manager::InferCacheManager, lua::LuaRetu
 
 type ResolveResult = Result<(), InferFailReason>;
 
+pub struct PreDynamicUnResolveAnalysisPipeline;
+impl AnalysisPipeline for PreDynamicUnResolveAnalysisPipeline {
+    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
+        let (ready, deferred) =
+            partition_pre_dynamic_unresolves(std::mem::take(&mut context.unresolves));
+        context.unresolves = ready;
+        UnResolveAnalysisPipeline::analyze(db, context);
+        context.unresolves.extend(deferred);
+    }
+}
+
+fn partition_pre_dynamic_unresolves(
+    candidates: Vec<(UnResolve, InferFailReason)>,
+) -> (
+    Vec<(UnResolve, InferFailReason)>,
+    Vec<(UnResolve, InferFailReason)>,
+) {
+    let mut deferred = Vec::new();
+    let mut ready = Vec::new();
+    for (unresolve, reason) in candidates {
+        let UnResolve::Member(mut member) = unresolve else {
+            ready.push((unresolve, reason));
+            continue;
+        };
+        if !matches!(reason, InferFailReason::FieldNotFound) {
+            ready.push((UnResolve::Member(member), reason));
+            continue;
+        }
+
+        if matches!(member.prefix.as_ref(), Some(LuaExpr::IndexExpr(_))) {
+            deferred.push((UnResolve::Member(member), reason));
+            continue;
+        }
+        if !matches!(member.expr.as_ref(), Some(LuaExpr::IndexExpr(_))) {
+            ready.push((UnResolve::Member(member), reason));
+            continue;
+        }
+
+        if let Some(prefix) = member.prefix.take() {
+            ready.push((
+                UnResolveMember {
+                    file_id: member.file_id,
+                    member_id: member.member_id,
+                    expr: None,
+                    prefix: Some(prefix),
+                    ret_idx: member.ret_idx,
+                }
+                .into(),
+                InferFailReason::FieldNotFound,
+            ));
+        }
+        deferred.push((UnResolve::Member(member), reason));
+    }
+    (ready, deferred)
+}
+
 pub struct UnResolveAnalysisPipeline;
 
 impl AnalysisPipeline for UnResolveAnalysisPipeline {
@@ -55,7 +112,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             );
         }
 
-        infer_manager.clear();
+        infer_manager.clear_for_unresolve(db);
 
         // Use FxHashMap for O(1) reason grouping (matching upstream)
         let had_unresolves = !context.unresolves.is_empty();
@@ -218,6 +275,7 @@ fn try_resolve(
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
+        let mut retry_file_ids = HashSet::new();
 
         // Only re-sort keys when the set of reason groups has changed.
         // This avoids cloning and sorting on every inner loop iteration.
@@ -312,6 +370,7 @@ fn try_resolve(
                     Err(reason) => {
                         if reason != *check_reason {
                             changed = true;
+                            retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
                         }
                     }
@@ -333,6 +392,12 @@ fn try_resolve(
         if !changed || reason_resolve.is_empty() {
             break;
         }
+
+        // Successful deferred resolutions can make cached failures reachable in
+        // the next wave, including across files. Keep syntax-derived cache data,
+        // but discard inference results computed against the previous DB state.
+        materialize_pending_str_tpl_type_decls(db, infer_manager);
+        infer_manager.clear_files_deferred_results(&retry_file_ids);
 
         // Re-use cached sorted keys if no new reason groups were added.
         // When retain_unresolve adds items to new/existing groups, the key
@@ -674,10 +739,11 @@ impl From<UnResolveModule> for UnResolve {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnResolveReturn {
     pub file_id: FileId,
     pub signature_id: LuaSignatureId,
+    pub body: Option<LuaBlock>,
     pub return_points: Vec<LuaReturnPoint>,
 }
 
@@ -720,6 +786,7 @@ pub struct UnResolveClosureReturn {
     pub signature_id: LuaSignatureId,
     pub call_expr: LuaCallExpr,
     pub param_idx: usize,
+    pub body: Option<LuaBlock>,
     pub return_points: Vec<LuaReturnPoint>,
 }
 
@@ -792,11 +859,12 @@ impl From<UnResolveSpecialCall> for UnResolve {
 mod tests {
     use rustc_hash::FxHashMap;
 
+    use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaParser, ParserConfig};
     use rowan::TextSize;
 
-    use crate::{FileId, InferFailReason, LuaDeclId, LuaTypeDeclId};
+    use crate::{FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaTypeDeclId};
 
-    use super::sorted_reason_keys;
+    use super::{UnResolve, UnResolveMember, partition_pre_dynamic_unresolves, sorted_reason_keys};
 
     #[test]
     fn reason_group_order_is_stable_across_hashmap_insertion_order() {
@@ -820,5 +888,42 @@ mod tests {
         }
 
         assert_eq!(sorted_reason_keys(&forward), sorted_reason_keys(&reverse));
+    }
+
+    #[test]
+    fn pre_dynamic_partition_resolves_ordinary_owner_before_deferring_dynamic_rhs() {
+        let tree = LuaParser::parse("owner.field = dynamic.value", ParserConfig::default());
+        let index_exprs = tree
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .collect::<Vec<_>>();
+        let target = &index_exprs[0];
+        let dynamic_rhs = index_exprs[1].clone();
+        let file_id = FileId::new(1);
+        let candidate = UnResolveMember {
+            file_id,
+            member_id: LuaMemberId::new(target.get_syntax_id(), file_id),
+            expr: Some(LuaExpr::IndexExpr(dynamic_rhs)),
+            prefix: target.get_prefix_expr(),
+            ret_idx: 0,
+        };
+
+        let (ready, deferred) = partition_pre_dynamic_unresolves(vec![(
+            candidate.into(),
+            InferFailReason::FieldNotFound,
+        )]);
+
+        assert_eq!(ready.len(), 1);
+        let UnResolve::Member(ready_member) = &ready[0].0 else {
+            panic!("expected ready member owner");
+        };
+        assert!(ready_member.prefix.is_some());
+        assert!(ready_member.expr.is_none());
+        assert_eq!(deferred.len(), 1);
+        let UnResolve::Member(deferred_member) = &deferred[0].0 else {
+            panic!("expected deferred member value");
+        };
+        assert!(deferred_member.prefix.is_none());
+        assert!(matches!(deferred_member.expr, Some(LuaExpr::IndexExpr(_))));
     }
 }

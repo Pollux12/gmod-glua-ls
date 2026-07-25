@@ -40,7 +40,7 @@ local v3 = v1 + v2
 
 ---
 
-## Supported Operators
+## Supported operators
 
 - Arithmetic: `add`, `sub`, `mul`, `div`, `mod`, `pow`, `unm` (unary minus)
 - Bitwise: `band`, `bor`, `bxor`, `shl`, `shr`, `bnot`
@@ -48,4 +48,4 @@ local v3 = v1 + v2
 - Relational: `eq`, `lt`, `le`
 - Other: `len` (length operator `#`), `concat` (concatenation `..`), `call`, `index`
 
-GLuaLS parses `pairs`, but it does not use `pairs` for type inference yet, so this page does not list it as supported.
+`pairs` is accepted in an annotation but does not change the types GLuaLS reports.

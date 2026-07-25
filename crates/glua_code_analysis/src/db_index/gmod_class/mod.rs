@@ -1,10 +1,10 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
 
 use super::LuaIndex;
-use crate::FileId;
+use crate::{FileId, LuaTypeDeclId};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum GmodScriptedClassCallKind {
@@ -13,7 +13,10 @@ pub enum GmodScriptedClassCallKind {
     AccessorFunc,
     NetworkVar,
     NetworkVarElement,
+    ScriptedEntRegister,
     VguiRegister,
+    VguiRegisterFile,
+    VguiRegisterTable,
     DermaDefineControl,
     DermaDefineSkin,
 }
@@ -48,11 +51,34 @@ pub struct GmodClassCallArg {
     pub value: Option<GmodClassCallLiteral>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct GmodClassCallArgSource {
+    pub arg_idx: usize,
+    pub field_path: Vec<String>,
+}
+
+impl GmodClassCallArgSource {
+    pub fn direct(arg_idx: usize) -> Self {
+        Self {
+            arg_idx,
+            field_path: Vec::new(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct GmodClassCallFieldArg {
+    pub source: GmodClassCallArgSource,
+    pub syntax_id: LuaSyntaxId,
+    pub value: Option<GmodClassCallLiteral>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct GmodScriptedClassCallMetadata {
     pub syntax_id: LuaSyntaxId,
     pub literal_args: Vec<Option<GmodClassCallLiteral>>,
     pub args: Vec<GmodClassCallArg>,
+    pub field_args: Vec<GmodClassCallFieldArg>,
     pub inheritance_roles: Option<GmodNamedStringCallRoles>,
     pub network_var_roles: Option<GmodNetworkVarCallRoles>,
     pub vgui_panel_roles: Option<GmodVguiPanelCallRoles>,
@@ -70,11 +96,11 @@ pub struct GmodNetworkVarCallRoles {
     pub name_arg_idx: usize,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GmodVguiPanelCallRoles {
-    pub define_arg_idx: usize,
-    pub table_arg_idx: Option<usize>,
-    pub base_arg_idx: Option<usize>,
+    pub define: GmodClassCallArgSource,
+    pub table: Option<GmodClassCallArgSource>,
+    pub base: Option<GmodClassCallArgSource>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,20 +127,61 @@ impl GmodScriptedClassCallMetadata {
 
     pub fn vgui_panel_define_arg_idx(&self) -> usize {
         self.vgui_panel_roles
-            .map(|roles| roles.define_arg_idx)
+            .as_ref()
+            .map(|roles| roles.define.arg_idx)
             .unwrap_or(0)
     }
 
     pub fn vgui_panel_table_arg_idx(&self, default_arg_idx: usize) -> usize {
         self.vgui_panel_roles
-            .and_then(|roles| roles.table_arg_idx)
+            .as_ref()
+            .and_then(|roles| roles.table.as_ref().map(|source| source.arg_idx))
             .unwrap_or(default_arg_idx)
     }
 
     pub fn vgui_panel_base_arg_idx(&self, default_arg_idx: Option<usize>) -> Option<usize> {
         self.vgui_panel_roles
-            .and_then(|roles| roles.base_arg_idx)
+            .as_ref()
+            .and_then(|roles| roles.base.as_ref().map(|source| source.arg_idx))
             .or(default_arg_idx)
+    }
+
+    pub fn vgui_panel_define_arg_source(&self) -> GmodClassCallArgSource {
+        self.vgui_panel_roles
+            .as_ref()
+            .map(|roles| roles.define.clone())
+            .unwrap_or_else(|| GmodClassCallArgSource::direct(0))
+    }
+
+    pub fn vgui_panel_table_arg_source(&self, default_arg_idx: usize) -> GmodClassCallArgSource {
+        self.vgui_panel_roles
+            .as_ref()
+            .and_then(|roles| roles.table.clone())
+            .unwrap_or_else(|| GmodClassCallArgSource::direct(default_arg_idx))
+    }
+
+    pub fn vgui_panel_base_arg_source(
+        &self,
+        default_arg_idx: Option<usize>,
+    ) -> Option<GmodClassCallArgSource> {
+        self.vgui_panel_roles
+            .as_ref()
+            .and_then(|roles| roles.base.clone())
+            .or_else(|| default_arg_idx.map(GmodClassCallArgSource::direct))
+    }
+
+    pub fn value_for_arg_source(
+        &self,
+        source: &GmodClassCallArgSource,
+    ) -> Option<&GmodClassCallLiteral> {
+        if source.field_path.is_empty() {
+            return self.args.get(source.arg_idx)?.value.as_ref();
+        }
+
+        self.field_args
+            .iter()
+            .find(|arg| &arg.source == source)
+            .and_then(|arg| arg.value.as_ref())
     }
 
     pub fn derma_skin_define_arg_idx(&self) -> usize {
@@ -131,6 +198,7 @@ impl GmodScriptedClassCallMetadata {
             | GmodScriptedClassCallKind::NetworkVarElement => {
                 self.network_var_name_arg_idx().unwrap_or(0)
             }
+            GmodScriptedClassCallKind::ScriptedEntRegister => 1,
             GmodScriptedClassCallKind::DermaDefineSkin => self.derma_skin_define_arg_idx(),
             _ => self.vgui_panel_define_arg_idx(),
         };
@@ -148,9 +216,44 @@ pub struct GmodScriptedClassFileMetadata {
     pub accessor_func_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_calls: Vec<GmodScriptedClassCallMetadata>,
     pub network_var_element_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub scripted_ent_register_calls: Vec<GmodScriptedClassCallMetadata>,
     pub vgui_register_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub vgui_register_file_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub vgui_register_table_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_control_calls: Vec<GmodScriptedClassCallMetadata>,
     pub derma_define_skin_calls: Vec<GmodScriptedClassCallMetadata>,
+    pub vgui_parent_calls: Vec<GmodVguiParentCallMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GmodVguiParentSource {
+    LiteralName(String),
+    Expr(LuaSyntaxId),
+    Receiver,
+    ReceiverField(Vec<String>),
+    Unknown,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodVguiParentRelation {
+    pub child_type_id: LuaTypeDeclId,
+    pub parent_chain: Vec<LuaTypeDeclId>,
+    pub parent_chain_complete: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GmodVguiParentCallOrigin {
+    Annotated,
+    Forwarded,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodVguiParentCallMetadata {
+    pub syntax_id: LuaSyntaxId,
+    pub child: GmodVguiParentSource,
+    pub parent: GmodVguiParentSource,
+    pub relations: Vec<GmodVguiParentRelation>,
+    pub origin: GmodVguiParentCallOrigin,
 }
 
 impl GmodScriptedClassFileMetadata {
@@ -175,7 +278,10 @@ impl GmodScriptedClassFileMetadata {
             GmodScriptedClassCallKind::AccessorFunc => &mut self.accessor_func_calls,
             GmodScriptedClassCallKind::NetworkVar => &mut self.network_var_calls,
             GmodScriptedClassCallKind::NetworkVarElement => &mut self.network_var_element_calls,
+            GmodScriptedClassCallKind::ScriptedEntRegister => &mut self.scripted_ent_register_calls,
             GmodScriptedClassCallKind::VguiRegister => &mut self.vgui_register_calls,
+            GmodScriptedClassCallKind::VguiRegisterFile => &mut self.vgui_register_file_calls,
+            GmodScriptedClassCallKind::VguiRegisterTable => &mut self.vgui_register_table_calls,
             GmodScriptedClassCallKind::DermaDefineControl => &mut self.derma_define_control_calls,
             GmodScriptedClassCallKind::DermaDefineSkin => &mut self.derma_define_skin_calls,
         }
@@ -187,6 +293,9 @@ pub struct GmodClassMetadataIndex {
     file_metadata: HashMap<FileId, GmodScriptedClassFileMetadata>,
     vgui_panels: HashMap<String, Vec<VguiPanelDefinition>>,
     derma_skins: HashMap<String, Vec<DermaSkinDefinition>>,
+    vgui_forwarding_parents: HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
+    vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
+    incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -208,6 +317,9 @@ impl GmodClassMetadataIndex {
             file_metadata: HashMap::new(),
             vgui_panels: HashMap::new(),
             derma_skins: HashMap::new(),
+            vgui_forwarding_parents: HashMap::new(),
+            vgui_panel_parent_chains: HashMap::new(),
+            incomplete_vgui_panel_parent_chains: HashSet::new(),
         }
     }
 
@@ -229,6 +341,15 @@ impl GmodClassMetadataIndex {
             .and_then(Self::extract_non_empty_string_literal)
     }
 
+    fn extract_non_empty_string_arg_source(
+        call_metadata: &GmodScriptedClassCallMetadata,
+        source: &GmodClassCallArgSource,
+    ) -> Option<String> {
+        call_metadata
+            .value_for_arg_source(source)
+            .and_then(Self::extract_non_empty_string_literal)
+    }
+
     fn maybe_extract_vgui_panel(
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
@@ -240,11 +361,12 @@ impl GmodClassMetadataIndex {
         };
 
         let define_arg_index = call_metadata.vgui_panel_define_arg_idx();
-        let base_arg_index = call_metadata.vgui_panel_base_arg_idx(default_base_arg_index);
+        let base_arg_source = call_metadata.vgui_panel_base_arg_source(default_base_arg_index);
 
         let panel_name = Self::extract_non_empty_string_arg(call_metadata, define_arg_index)?;
-        let base_name = base_arg_index
-            .and_then(|arg_index| Self::extract_non_empty_string_arg(call_metadata, arg_index));
+        let base_name = base_arg_source
+            .as_ref()
+            .and_then(|source| Self::extract_non_empty_string_arg_source(call_metadata, source));
         Some((panel_name, base_name))
     }
 
@@ -275,7 +397,12 @@ impl GmodClassMetadataIndex {
         kind: GmodScriptedClassCallKind,
         call_metadata: &GmodScriptedClassCallMetadata,
     ) {
-        Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
+        if matches!(
+            kind,
+            GmodScriptedClassCallKind::VguiRegister | GmodScriptedClassCallKind::DermaDefineControl
+        ) {
+            Self::insert_vgui_panel_from_call(&mut self.vgui_panels, file_id, kind, call_metadata);
+        }
     }
 
     fn insert_derma_skin_from_call(
@@ -374,7 +501,7 @@ impl GmodClassMetadataIndex {
         }
     }
 
-    fn recompute_vgui_panels(&mut self) {
+    fn recompute_derived_caches(&mut self) {
         let mut vgui_panels = HashMap::new();
         let mut derma_skins = HashMap::new();
 
@@ -402,6 +529,7 @@ impl GmodClassMetadataIndex {
 
         self.vgui_panels = vgui_panels;
         self.derma_skins = derma_skins;
+        self.recompute_vgui_panel_parent_chains();
     }
 
     pub fn add_call(
@@ -438,6 +566,134 @@ impl GmodClassMetadataIndex {
             .or_default()
             .calls_by_kind_mut(kind)
             .push(call_metadata);
+    }
+
+    pub fn add_vgui_parent_call(&mut self, file_id: FileId, call: GmodVguiParentCallMetadata) {
+        let calls = &mut self
+            .file_metadata
+            .entry(file_id)
+            .or_default()
+            .vgui_parent_calls;
+        if let Some(existing) = calls
+            .iter_mut()
+            .find(|existing| existing.syntax_id == call.syntax_id)
+        {
+            *existing = call;
+        } else {
+            calls.push(call);
+        }
+    }
+
+    pub fn clear_forwarded_vgui_parent_calls(&mut self) {
+        for metadata in self.file_metadata.values_mut() {
+            metadata
+                .vgui_parent_calls
+                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+        }
+    }
+
+    pub fn clear_forwarded_vgui_parent_calls_for_files(&mut self, file_ids: &[FileId]) {
+        for file_id in file_ids {
+            let Some(metadata) = self.file_metadata.get_mut(file_id) else {
+                continue;
+            };
+            metadata
+                .vgui_parent_calls
+                .retain(|call| call.origin != GmodVguiParentCallOrigin::Forwarded);
+        }
+    }
+
+    pub fn has_annotated_vgui_parent_calls(&self, file_id: FileId) -> bool {
+        self.file_metadata.get(&file_id).is_some_and(|metadata| {
+            metadata
+                .vgui_parent_calls
+                .iter()
+                .any(|call| call.origin == GmodVguiParentCallOrigin::Annotated)
+        })
+    }
+
+    pub fn update_vgui_forwarding_parents(
+        &mut self,
+        forwarding_parents: &HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
+    ) -> bool {
+        if &self.vgui_forwarding_parents == forwarding_parents {
+            return false;
+        }
+        self.vgui_forwarding_parents.clone_from(forwarding_parents);
+        true
+    }
+
+    pub fn get_vgui_parent_calls(&self, file_id: &FileId) -> &[GmodVguiParentCallMetadata] {
+        self.file_metadata
+            .get(file_id)
+            .map(|metadata| metadata.vgui_parent_calls.as_slice())
+            .unwrap_or_default()
+    }
+
+    pub fn set_vgui_parent_relations(
+        &mut self,
+        resolved_by_file: Vec<(FileId, Vec<(LuaSyntaxId, Vec<GmodVguiParentRelation>)>)>,
+    ) {
+        for (file_id, resolved) in resolved_by_file {
+            let Some(metadata) = self.file_metadata.get_mut(&file_id) else {
+                continue;
+            };
+            for call in &mut metadata.vgui_parent_calls {
+                call.relations = resolved
+                    .iter()
+                    .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
+                    .map(|(_, relations)| relations.clone())
+                    .unwrap_or_default();
+            }
+        }
+        self.recompute_vgui_panel_parent_chains();
+    }
+
+    pub fn get_vgui_panel_parent_chain(
+        &self,
+        child_type_id: &LuaTypeDeclId,
+    ) -> Option<&[LuaTypeDeclId]> {
+        self.vgui_panel_parent_chains
+            .get(child_type_id)
+            .map(Vec::as_slice)
+    }
+
+    pub fn vgui_panel_parent_chain_is_complete(&self, child_type_id: &LuaTypeDeclId) -> bool {
+        !self
+            .incomplete_vgui_panel_parent_chains
+            .contains(child_type_id)
+    }
+
+    fn recompute_vgui_panel_parent_chains(&mut self) {
+        let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::new();
+        let mut incomplete = HashSet::new();
+        for metadata in self.file_metadata.values() {
+            for call in &metadata.vgui_parent_calls {
+                for relation in &call.relations {
+                    if !relation.parent_chain_complete || relation.parent_chain.is_empty() {
+                        incomplete.insert(relation.child_type_id.clone());
+                        continue;
+                    }
+                    match parent_chains.get(&relation.child_type_id) {
+                        Some(existing) if existing != &relation.parent_chain => {
+                            incomplete.insert(relation.child_type_id.clone());
+                        }
+                        Some(_) => {}
+                        None => {
+                            parent_chains.insert(
+                                relation.child_type_id.clone(),
+                                relation.parent_chain.clone(),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        for type_id in &incomplete {
+            parent_chains.remove(type_id);
+        }
+        self.vgui_panel_parent_chains = parent_chains;
+        self.incomplete_vgui_panel_parent_chains = incomplete;
     }
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
@@ -526,13 +782,23 @@ impl GmodClassMetadataIndex {
 
 impl LuaIndex for GmodClassMetadataIndex {
     fn remove(&mut self, file_id: FileId) {
-        self.file_metadata.remove(&file_id);
-        self.recompute_vgui_panels();
+        self.remove_files(std::slice::from_ref(&file_id));
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
+            self.file_metadata.remove(&file_id);
+        }
+        self.recompute_derived_caches();
     }
 
     fn clear(&mut self) {
         self.file_metadata.clear();
-        self.recompute_vgui_panels();
+        self.vgui_panels.clear();
+        self.derma_skins.clear();
+        self.vgui_forwarding_parents.clear();
+        self.vgui_panel_parent_chains.clear();
+        self.incomplete_vgui_panel_parent_chains.clear();
     }
 }
 
@@ -541,6 +807,7 @@ mod tests {
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use rowan::{TextRange, TextSize};
 
+    use super::LuaIndex;
     use super::{
         GmodClassCallArg, GmodClassCallLiteral, GmodClassMetadataIndex, GmodScriptedClassCallKind,
         GmodScriptedClassCallMetadata,
@@ -577,6 +844,7 @@ mod tests {
                     Some(GmodClassCallLiteral::String(base.to_string())),
                 ),
             ],
+            field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
             vgui_panel_roles: None,
@@ -657,5 +925,57 @@ mod tests {
             index.get_vgui_panel_base("NewPanel"),
             Some(Some("EditablePanel".to_string()))
         );
+    }
+
+    #[test]
+    fn batch_removal_matches_rebuilding_with_surviving_file_metadata() {
+        let removed_first = FileId::new(1);
+        let surviving = FileId::new(2);
+        let removed_last = FileId::new(3);
+
+        let mut index = GmodClassMetadataIndex::new();
+        index.add_call(
+            removed_first,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("RemovedFirst", "DFrame", 10),
+        );
+        index.add_call(
+            surviving,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Surviving", "EditablePanel", 20),
+        );
+        index.add_call(
+            removed_last,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("RemovedLast", "DPanel", 30),
+        );
+        index.add_call(
+            removed_first,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("RemovedSkin", "", 40),
+        );
+        index.add_call(
+            surviving,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("SurvivingSkin", "", 50),
+        );
+
+        index.remove_files(&[removed_last, removed_first]);
+
+        let mut expected = GmodClassMetadataIndex::new();
+        expected.add_call(
+            surviving,
+            GmodScriptedClassCallKind::VguiRegister,
+            vgui_register_call("Surviving", "EditablePanel", 20),
+        );
+        expected.add_call(
+            surviving,
+            GmodScriptedClassCallKind::DermaDefineSkin,
+            vgui_register_call("SurvivingSkin", "", 50),
+        );
+
+        assert_eq!(index.file_metadata, expected.file_metadata);
+        assert_eq!(index.vgui_panels, expected.vgui_panels);
+        assert_eq!(index.derma_skins, expected.derma_skins);
     }
 }

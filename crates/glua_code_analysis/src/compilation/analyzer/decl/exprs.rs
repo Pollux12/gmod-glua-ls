@@ -10,7 +10,9 @@ use crate::{
     EmmyrcLuaVersion, FileId, InFiled, InferFailReason, LegacyModuleEnv, LuaDeclExtra, LuaDeclId,
     LuaMemberFeature, LuaMemberId, LuaSignatureId,
     compilation::analyzer::unresolve::UnResolveTableField,
-    db_index::{LuaDecl, LuaDependencyKind, LuaMember, LuaMemberKey, LuaMemberOwner},
+    db_index::{
+        LuaDecl, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberKey, LuaMemberOwner,
+    },
 };
 
 use super::DeclAnalyzer;
@@ -103,6 +105,13 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
     let signature_id = LuaSignatureId::from_closure(analyzer.get_file_id(), &expr);
     let file_id = analyzer.get_file_id();
     let member_id = get_closure_member_id(&expr, file_id);
+    if expr.get_parent::<glua_parser::LuaAssignStat>().is_some()
+        && let Some(member_id) = member_id
+    {
+        analyzer
+            .context
+            .add_early_callable_signature(member_id.into(), signature_id);
+    }
     try_add_self_param(analyzer, &expr);
 
     for (idx, param) in params.get_params().enumerate() {
@@ -135,7 +144,49 @@ pub fn analyze_closure_expr(analyzer: &mut DeclAnalyzer, expr: LuaClosureExpr) -
 
     analyze_closure_params(analyzer, &signature_id, &expr);
 
+    if is_structural_inferred_guard_candidate(&expr) {
+        analyzer
+            .context
+            .add_inferred_guard_candidate(InFiled::new(file_id, expr.get_syntax_id()));
+    }
+
     Some(())
+}
+
+fn is_structural_inferred_guard_candidate(closure: &LuaClosureExpr) -> bool {
+    let Some(params) = closure.get_params_list() else {
+        return false;
+    };
+    let param_names = params
+        .get_params()
+        .filter_map(|param| param.get_name_token())
+        .map(|token| token.get_name_text().to_string())
+        .collect::<Vec<_>>();
+    if param_names.is_empty() {
+        return false;
+    }
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+    let return_points = super::super::lua::func_body::analyze_func_body_returns(block);
+    let [super::super::lua::LuaReturnPoint::Expr(return_expr)] = return_points.as_slice() else {
+        return false;
+    };
+    inferred_guard_candidate_references_param(return_expr, &param_names)
+}
+
+fn inferred_guard_candidate_references_param(expr: &LuaExpr, param_names: &[String]) -> bool {
+    if let LuaExpr::ParenExpr(paren) = expr {
+        return paren
+            .get_expr()
+            .is_some_and(|inner| inferred_guard_candidate_references_param(&inner, param_names));
+    }
+    matches!(expr, LuaExpr::BinaryExpr(_) | LuaExpr::CallExpr(_))
+        && expr.descendants::<LuaNameExpr>().any(|name_expr| {
+            name_expr
+                .get_name_text()
+                .is_some_and(|name| param_names.iter().any(|param| param == &name))
+        })
 }
 
 fn try_add_self_param(analyzer: &mut DeclAnalyzer, closure: &LuaClosureExpr) -> Option<()> {
@@ -288,10 +339,7 @@ pub fn analyze_table_expr(analyzer: &mut DeclAnalyzer, table_expr: LuaTableExpr)
                     }
                     _ => LuaMember::new(member_id, key, decl_feature, None),
                 };
-                analyzer
-                    .db
-                    .get_member_index_mut()
-                    .add_member(owner_id.clone(), member);
+                analyzer.add_member(owner_id.clone(), member);
             }
         }
     }
@@ -357,17 +405,32 @@ pub fn analyze_call_expr(analyzer: &mut DeclAnalyzer, expr: LuaCallExpr) -> Opti
 
     let dependency_file_id = if let Some(ref path) = dependency_path {
         resolve_dependency_file_id(analyzer, file_id, dependency_kind, path)
-    } else {
+    } else if dependency_kind == LuaDependencyKind::AddCSLuaFile
+        && dependency_call_has_no_args(&expr)
+    {
         // No-arg AddCSLuaFile() means "send self to client" — self-reference
         Some(file_id)
+    } else {
+        None
     };
+    let dependency_path_keys = dependency_path
+        .as_deref()
+        .map(|path| crate::dependency_site_path_keys(analyzer.db, file_id, path))
+        .unwrap_or_default();
 
-    if let Some(dependency_file_id) = dependency_file_id {
-        analyzer
-            .db
-            .get_file_dependencies_index_mut()
-            .add_dependency_file(file_id, dependency_file_id, dependency_kind);
-    }
+    analyzer
+        .db
+        .get_file_dependencies_index_mut()
+        .add_dependency_site(LuaDependencySite {
+            source_file_id: file_id,
+            target_file_id: dependency_file_id,
+            kind: dependency_kind,
+            path: dependency_path,
+            path_keys: dependency_path_keys,
+            original_expr: expr.syntax().text().to_string(),
+            call_range: expr.get_range(),
+            range: expr.get_range(),
+        });
 
     Some(())
 }
@@ -576,12 +639,15 @@ fn get_dependency_call_info(expr: &LuaCallExpr) -> Option<(LuaDependencyKind, Op
         }
     };
     let dependency_path = get_static_string_arg(expr);
-    // AddCSLuaFile() with no args is valid (sends current file to client).
-    // IncludeCS() requires a filename in GMod's util.lua implementation.
-    if dependency_path.is_none() && dependency_kind != LuaDependencyKind::AddCSLuaFile {
+    if dependency_path.is_none() && dependency_kind == LuaDependencyKind::Require {
         return None;
     }
     Some((dependency_kind, dependency_path))
+}
+
+fn dependency_call_has_no_args(expr: &LuaCallExpr) -> bool {
+    expr.get_args_list()
+        .is_none_or(|args| args.get_args().next().is_none())
 }
 
 fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
@@ -620,6 +686,7 @@ fn resolve_dependency_file_id(
             .find_module_for_file(dependency_path, file_id)
             .map(|it| it.file_id),
         LuaDependencyKind::Include
+        | LuaDependencyKind::CompileFile
         | LuaDependencyKind::AddCSLuaFile
         | LuaDependencyKind::IncludeCS => {
             resolve_gmod_include_file_id(analyzer, file_id, dependency_path).or_else(|| {

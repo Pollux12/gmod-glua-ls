@@ -94,7 +94,7 @@ pub fn compute_max_level_at_position(semantic_model: &SemanticModel, position: P
 
     let semantic_info = semantic_model.get_semantic_info(token.into());
     let typ = match semantic_info {
-        Some(info) => info.typ,
+        Some(info) => info.display_typ().clone(),
         None => return 0,
     };
 

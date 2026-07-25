@@ -121,6 +121,17 @@ impl LuaIndex for LuaGlobalIndex {
         });
     }
 
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed_file_ids = file_ids
+            .iter()
+            .copied()
+            .collect::<std::collections::HashSet<_>>();
+        self.global_decl.retain(|_, decl_ids| {
+            decl_ids.retain(|decl_id| !removed_file_ids.contains(&decl_id.file_id));
+            !decl_ids.is_empty()
+        });
+    }
+
     fn clear(&mut self) {
         self.global_decl.clear();
     }
@@ -140,6 +151,26 @@ mod tests {
     };
 
     use super::{LuaDeclId, LuaGlobalIndex};
+    use crate::db_index::LuaIndex;
+
+    #[test]
+    fn batch_removal_preserves_declarations_from_surviving_files() {
+        let removed = FileId::new(1);
+        let other_removed = FileId::new(2);
+        let surviving = FileId::new(3);
+        let mut global_index = LuaGlobalIndex::new();
+        let removed_decl = LuaDeclId::new(removed, TextSize::new(0));
+        let surviving_decl = LuaDeclId::new(surviving, TextSize::new(1));
+        global_index.add_global_decl("SharedGlobal", removed_decl);
+        global_index.add_global_decl("SharedGlobal", surviving_decl);
+
+        global_index.remove_files(&[other_removed, removed, other_removed]);
+
+        assert_eq!(
+            global_index.get_global_decl_ids("SharedGlobal").unwrap(),
+            &vec![surviving_decl]
+        );
+    }
 
     fn create_module_index() -> LuaModuleIndex {
         let mut module_index = LuaModuleIndex::new();

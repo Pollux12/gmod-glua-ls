@@ -18,7 +18,8 @@
             "pages": [
               "index",
               "getting-started/installation",
-              "getting-started/workspace-setup"
+              "getting-started/workspace-setup",
+              "tools/glua-check"
             ]
           }
         ]
@@ -42,7 +43,7 @@
             ]
           },
           {
-            "group": "GMod",
+            "group": "Garry's Mod",
             "pages": [
               "language/realm-awareness",
               "language/network-analysis",
@@ -109,13 +110,14 @@
             ]
           },
           {
-            "group": "GMod-specific",
+            "group": "Garry's Mod Lua",
             "pages": [
               "annotations/realm",
               "annotations/hook",
               "annotations/fileparam",
               "annotations/accessorfunc",
-              "annotations/call-arg"
+              "annotations/call-arg",
+              "annotations/guard-metadata"
             ]
           },
           {
@@ -156,7 +158,7 @@
     "global": {
       "anchors": [
         {
-          "anchor": "GitHub - VSCode",
+          "anchor": "GitHub - VS Code",
           "href": "https://github.com/Pollux12/vscode-gmod-glua-ls",
           "icon": "github"
         },

@@ -138,15 +138,13 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
 
     if let LuaType::Union(u) = &real_type {
         let types = u
-            .into_vec()
-            .iter()
+            .types()
             .filter_map(|t| remove_type(db, t.clone(), removed_type.clone()))
             .collect::<Vec<_>>();
         return Some(LuaType::from_vec(types));
     } else if let LuaType::Union(u) = &removed_type {
         let types = u
-            .into_vec()
-            .iter()
+            .types()
             .filter_map(|t| remove_type(db, real_type.clone(), t.clone()))
             .collect::<Vec<_>>();
         return Some(LuaType::from_vec(types));

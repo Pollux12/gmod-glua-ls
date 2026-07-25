@@ -4,6 +4,7 @@ use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, Lu
 use internment::ArcIntern;
 use smol_str::SmolStr;
 
+use crate::db_index::find_best_direct_call_arg_role_from_type;
 use crate::{
     DocTypeInferContext, FileId, GenericTpl, GenericTplId, LuaDocDefaultValue, LuaFunctionType,
     LuaGenericType, LuaSemanticDeclId, TypeVisitTrait,
@@ -187,6 +188,133 @@ fn resolve_str_default_from_arg_inner(
     valid_value.map(|v| LuaType::StringConst(v.into()))
 }
 
+/// Check whether the callable expression has a `call_arg("gmod.vgui_panel",
+/// "reference")` annotation on the parameter at `param_idx`.
+///
+/// First tries semantic-declaration resolution (which yields a `Signature` id
+/// carrying the `call_arg` metadata), then falls back to inferring the
+/// expression type and using direct call-arg role metadata.
+pub(crate) fn check_vgui_panel_ref_role(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_expr: &LuaExpr,
+    param_idx: usize,
+    colon_call: bool,
+) -> bool {
+    let mut candidate_param_indices = vec![param_idx];
+    if colon_call && !candidate_param_indices.contains(&(param_idx + 1)) {
+        candidate_param_indices.push(param_idx + 1);
+    }
+
+    // Try semantic declaration first — this yields Signature ids that carry
+    // call_arg attributes directly.
+    if let Some(sem_decl) = infer_node_semantic_decl(
+        db,
+        cache,
+        prefix_expr.syntax().clone(),
+        SemanticDeclLevel::NoTrace,
+    ) {
+        if let LuaSemanticDeclId::Signature(sig_id) = &sem_decl {
+            if let Some(sig) = db.get_signature_index().get(sig_id) {
+                for candidate_idx in &candidate_param_indices {
+                    let mut found = false;
+                    let mut visitor = |role: &crate::LuaCallArgRole| {
+                        if role.is_direct_arg()
+                            && role.domain == "gmod.vgui_panel"
+                            && role.role == "reference"
+                        {
+                            found = true;
+                        }
+                    };
+                    sig.visit_call_arg_roles_for_param(*candidate_idx, &mut visitor);
+                    if found {
+                        return true;
+                    }
+                }
+            }
+        }
+    }
+
+    // Fall back to inferring the expression type.
+    let Ok(callable_type) = infer_expr(db, cache, prefix_expr.clone()) else {
+        return false;
+    };
+    candidate_param_indices.into_iter().any(|candidate_idx| {
+        find_best_direct_call_arg_role_from_type(
+            db,
+            &callable_type,
+            candidate_idx,
+            "gmod.vgui_panel",
+            &["reference"],
+        )
+        .is_some()
+    })
+}
+
+/// Resolve a VGUI panel class name from the enclosing method context.
+///
+/// When a call argument annotated with `call_arg("gmod.vgui_panel", "reference")`
+/// is a function-parameter whose enclosing colon-method belongs to a registered
+/// VGUI panel table, resolve the argument to that panel's class name.
+///
+/// The resolution is **declaration-precise**: the enclosing colon-method's
+/// receiver variable must resolve to the same `LuaDeclId` as the registration
+/// call's table argument.  This correctly handles files with multiple
+/// sequential `local PANEL = {}` blocks.
+fn resolve_vgui_panel_ref_from_arg(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    param_type: &LuaType,
+    arg_expr: &LuaExpr,
+    call_expr: &LuaCallExpr,
+    param_idx: usize,
+) -> Option<LuaType> {
+    // Gate: param must contain a StrTplRef.
+    if !param_type.contain_tpl() {
+        return None;
+    }
+    let mut has_str_tpl = false;
+    param_type.visit_type(&mut |t| {
+        if matches!(t, LuaType::StrTplRef(_)) {
+            has_str_tpl = true;
+        }
+    });
+    if !has_str_tpl {
+        return None;
+    }
+
+    // Check that the call parameter has call_arg("gmod.vgui_panel", "reference").
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    if !check_vgui_panel_ref_role(
+        db,
+        cache,
+        &prefix_expr,
+        param_idx,
+        call_expr.is_colon_call(),
+    ) {
+        return None;
+    }
+
+    // The argument must be a name expression referencing a function parameter.
+    let name_expr = LuaNameExpr::cast(arg_expr.syntax().clone())?;
+    let file_id = cache.get_file_id();
+    let range = name_expr.get_range();
+    let local_ref = db.get_reference_index().get_local_reference(&file_id)?;
+    let arg_decl_id = local_ref.get_decl_id(&range)?;
+    let decl = db.get_decl_index().get_decl(&arg_decl_id)?;
+    let crate::LuaDeclExtra::Param { signature_id, .. } = &decl.extra else {
+        return None;
+    };
+
+    let context = crate::semantic::resolve_registered_vgui_method_context(db, cache, &name_expr)?;
+    if *signature_id != context.receiver_signature_id {
+        return None;
+    }
+    Some(LuaType::StringConst(
+        SmolStr::new(&context.panel_name).into(),
+    ))
+}
+
 pub fn instantiate_func_generic(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -294,6 +422,16 @@ fn infer_generic_types_from_call(
                 func_params.remove(0);
             }
         }
+        (true, true) => {
+            // For colon-define + colon-call: the call args exclude the
+            // implicit self, but `func_params` may still carry an explicit
+            // "self" entry (e.g. from an overload annotation like
+            // `fun(self: Panel, className: \`T\`): T`).  Remove it so that
+            // func_params[i] aligns with arg_exprs[i].
+            if !func_params.is_empty() && func_params[0].0 == "self" {
+                func_params.remove(0);
+            }
+        }
         _ => {}
     }
 
@@ -346,17 +484,42 @@ fn infer_generic_types_from_call(
                 break;
             }
             _ => {
-                // Try to bind from a registered string default when the
-                // inferred arg_type is plain `String` and the param has a
-                // StrTplRef.  This covers `x = x or "literal"` patterns where
-                // the canonical type stays `string` but the declaration carries
-                // an auxiliary default-value metadata.
-                let effective_type = if matches!(arg_type, LuaType::String) {
-                    resolve_str_default_from_arg(db, context.cache, func_param_type, call_arg_expr)
-                        .unwrap_or_else(|| arg_type.clone())
-                } else {
-                    arg_type.clone()
-                };
+                // Try to bind a StrTplRef from context when the arg is not a
+                // literal string constant.  Two resolution paths exist:
+                //
+                // 1. VGUI panel reference: when the param has a StrTplRef and
+                //    the call is annotated with call_arg("gmod.vgui_panel",
+                //    "reference"), resolve from the enclosing PANEL method
+                //    context.  This works for any arg type (String, Unknown,
+                //    Any) because the resolution is purely contextual.
+                //
+                // 2. Inferred string default: when arg_type is plain `String`
+                //    and the variable has a flow-valid `x = x or "literal"`
+                //    default.
+                //
+                // Path 1 is tried first (it is more specific).  Path 2 only
+                // applies to `String` args.
+                let effective_type = resolve_vgui_panel_ref_from_arg(
+                    db,
+                    context.cache,
+                    func_param_type,
+                    call_arg_expr,
+                    call_expr,
+                    i,
+                )
+                .or_else(|| {
+                    if matches!(arg_type, LuaType::String) {
+                        resolve_str_default_from_arg(
+                            db,
+                            context.cache,
+                            func_param_type,
+                            call_arg_expr,
+                        )
+                    } else {
+                        None
+                    }
+                })
+                .unwrap_or_else(|| arg_type.clone());
                 tpl_pattern_match(context, func_param_type, &effective_type)?;
             }
         }

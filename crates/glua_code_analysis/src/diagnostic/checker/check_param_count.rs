@@ -6,8 +6,8 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaSemanticDeclId, LuaSignatureId, LuaType, SemanticDeclLevel,
-    SemanticModel, get_member_value_expr,
+    DbIndex, DiagnosticCode, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
+    LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel, get_member_value_expr,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -452,7 +452,15 @@ fn has_override_callable_accepting_call(
             .is_some_and(|visible_member| visible_member.get_feature().is_meta_decl())
     });
     if !has_meta_decl {
-        return false;
+        return inherited_callable_accepts_call_args(
+            context.db,
+            owner,
+            member.get_key(),
+            &semantic_model.get_file_id(),
+            call_expr.get_position(),
+            min_call_args_count,
+            colon_call,
+        );
     }
 
     visible_member_ids.iter().any(|visible_member_id| {
@@ -477,7 +485,100 @@ fn has_override_callable_accepting_call(
                     colon_call,
                 )
             })
-    })
+    }) || inherited_callable_accepts_call_args(
+        context.db,
+        owner,
+        member.get_key(),
+        &semantic_model.get_file_id(),
+        call_expr.get_position(),
+        min_call_args_count,
+        colon_call,
+    )
+}
+
+fn inherited_callable_accepts_call_args(
+    db: &DbIndex,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    file_id: &crate::FileId,
+    position: rowan::TextSize,
+    min_call_args_count: usize,
+    colon_call: bool,
+) -> bool {
+    let LuaMemberOwner::Type(type_id) = owner else {
+        return false;
+    };
+
+    inherited_type_callable_accepts_call_args(
+        db,
+        type_id,
+        key,
+        file_id,
+        position,
+        min_call_args_count,
+        colon_call,
+        0,
+    )
+}
+
+fn inherited_type_callable_accepts_call_args(
+    db: &DbIndex,
+    type_id: &LuaTypeDeclId,
+    key: &LuaMemberKey,
+    file_id: &crate::FileId,
+    position: rowan::TextSize,
+    min_call_args_count: usize,
+    colon_call: bool,
+    depth: usize,
+) -> bool {
+    if depth > 8 {
+        return false;
+    }
+
+    let Some(super_types) = db.get_type_index().get_super_types_iter(type_id) else {
+        return false;
+    };
+
+    for super_type in super_types {
+        let (LuaType::Def(super_id) | LuaType::Ref(super_id)) = super_type else {
+            continue;
+        };
+
+        let super_owner = LuaMemberOwner::Type(super_id.clone());
+        if let Some(member_item) = db.get_member_index().get_member_item(&super_owner, key) {
+            let visible_member_ids =
+                member_item.visible_member_ids_with_realm_at_offset(db, file_id, position);
+            if visible_member_ids.iter().any(|visible_member_id| {
+                db.get_type_index()
+                    .get_type_cache(&(*visible_member_id).into())
+                    .is_some_and(|cache| {
+                        callable_accepts_call_args(
+                            db,
+                            cache.as_type(),
+                            min_call_args_count,
+                            colon_call,
+                        )
+                    })
+            }) {
+                return true;
+            }
+        }
+
+        if inherited_type_callable_accepts_call_args(
+            db,
+            super_id,
+            key,
+            file_id,
+            position,
+            min_call_args_count,
+            colon_call,
+            depth + 1,
+        ) {
+            return true;
+        }
+    }
+
+    false
 }
 
 fn callable_accepts_call_args(
@@ -516,7 +617,7 @@ fn callable_accepts_call_args(
             }
             effective_min_call_args_count <= expected_params_len
         }
-        LuaType::Union(union_type) => union_type.into_vec().iter().any(|union_member| {
+        LuaType::Union(union_type) => union_type.types().any(|union_member| {
             callable_accepts_call_args(db, union_member, min_call_args_count, colon_call)
         }),
         _ => false,

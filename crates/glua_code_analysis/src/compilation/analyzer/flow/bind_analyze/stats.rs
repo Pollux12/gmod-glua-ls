@@ -6,8 +6,8 @@ use glua_parser::{
 };
 
 use crate::{
-    AnalyzeError, AssignVarHint, AssignmentFlowInfo, BranchLabelInfo, DiagnosticCode, FlowId,
-    FlowNodeKind, LuaClosureId, LuaDeclId,
+    AnalyzeError, AssignVarHint, AssignmentFlowInfo, AssignmentNameTarget, BranchLabelInfo,
+    DiagnosticCode, FlowId, FlowNodeKind, LuaClosureId, LuaDeclId,
     compilation::analyzer::flow::{
         bind_analyze::{
             bind_block, bind_each_child, bind_node,
@@ -86,8 +86,29 @@ pub fn bind_assign_stat(
     let mut has_index = false;
     for var in &vars {
         match var {
-            LuaVarExpr::NameExpr(_) => has_name = true,
-            LuaVarExpr::IndexExpr(_) => has_index = true,
+            LuaVarExpr::NameExpr(name_expr) => {
+                has_name = true;
+                // Record the assigned name as narrowable.
+                match name_expr.get_name_text() {
+                    Some(name) => binder.record_narrowable_name(&name),
+                    None => binder.mark_opaque_name_target(),
+                }
+            }
+            LuaVarExpr::IndexExpr(index_expr) => {
+                has_index = true;
+                // Record the assigned index path as narrowable. The full path
+                // set is also captured in AssignmentFlowInfo; recording here keeps
+                // the file-wide capability authoritative. A computed/dynamic key
+                // (e.g. `t[expr]`) cannot be reduced to a stable path key that
+                // matches the query side, so mark the index space opaque to stay
+                // sound.
+                match index_expr.get_access_path() {
+                    Some(path) if !index_key_is_dynamic(index_expr) => {
+                        binder.record_narrowable_index_path(&path)
+                    }
+                    _ => binder.mark_opaque_index_target(),
+                }
+            }
         }
         if let Some(ast) = LuaAst::cast(var.syntax().clone()) {
             bind_node(binder, ast, current);
@@ -99,7 +120,7 @@ pub fn bind_assign_stat(
         (false, true) => AssignVarHint::IndexOnly,
         _ => AssignVarHint::Mixed,
     };
-    let assignment_flow_info = collect_assignment_flow_info(&vars);
+    let assignment_flow_info = collect_assignment_flow_info(binder, &vars);
     let assignment_kind = FlowNodeKind::Assignment(assign_stat.to_ptr(), hint);
     let flow_id = binder.create_node(assignment_kind);
     binder.set_assignment_flow_info(flow_id, assignment_flow_info);
@@ -108,9 +129,31 @@ pub fn bind_assign_stat(
     flow_id
 }
 
-fn collect_assignment_flow_info(vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
+/// Whether an index expression uses a dynamic/computed key (`t[expr]`) rather
+/// than a static name/integer. Dynamic keys cannot be reduced to a stable path
+/// key that matches the query side, so the narrowing-capability index set must
+/// treat them as opaque.
+pub(crate) fn index_key_is_dynamic(index_expr: &LuaIndexExpr) -> bool {
+    matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
+}
+
+fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> AssignmentFlowInfo {
     let mut info = AssignmentFlowInfo::default();
-    for var in vars {
+    for (target_idx, var) in vars.iter().enumerate() {
+        if let LuaVarExpr::NameExpr(name_expr) = var {
+            if let Some(decl_id) = binder
+                .db
+                .get_reference_index()
+                .get_var_reference_decl(&binder.file_id, name_expr.get_range())
+                && let Ok(target_idx) = u16::try_from(target_idx)
+            {
+                info.name_targets.push(AssignmentNameTarget {
+                    decl_id,
+                    target_idx,
+                });
+            }
+            continue;
+        }
         let LuaVarExpr::IndexExpr(index_expr) = var else {
             continue;
         };
@@ -445,13 +488,14 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     let post_if_label = binder.create_branch_label();
     let mut else_label = binder.create_branch_label();
     let then_label = binder.create_branch_label();
+
     if let Some(condition_expr) = if_stat.get_condition_expr() {
         bind_condition_expr(binder, condition_expr, current, then_label, else_label);
     }
 
     // Snapshot modification counters before binding any branch blocks.
-    // Note: the outer if's condition was already bound above (before this
-    // save), so its TrueCondition/FalseCondition are NOT counted.
+    // The outer condition belongs to the split itself; including it in the
+    // branch capability leaks temporary guards past ordinary non-terminal ifs.
     let saved = binder.save_modification_counts();
 
     // We track inner conditions per-block to avoid counting elseif
@@ -514,6 +558,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
     // Record BranchLabel metadata so the flow walk can skip merges for
     // variables that were not modified inside any branch.
     let (has_name, has_index, has_casts, _) = binder.check_new_modifications(saved);
+    let narrowing_capability = binder.narrowing_capability_since(saved);
     binder.set_branch_label_info(
         post_if_label,
         BranchLabelInfo {
@@ -522,6 +567,7 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
             has_index_assigns: has_index,
             has_casts_or_implfunc: has_casts,
             has_inner_conditions: blocks_have_inner_conditions,
+            narrowing_capability,
         },
     );
 
@@ -535,9 +581,22 @@ pub fn bind_if_stat(binder: &mut FlowBinder, if_stat: LuaIfStat, current: FlowId
 }
 
 pub fn bind_func_stat(binder: &mut FlowBinder, func_stat: LuaFuncStat, current: FlowId) -> FlowId {
-    if func_stat.get_func_name().is_none() {
+    let Some(func_name) = func_stat.get_func_name() else {
         return current;
     };
+
+    // An ImplFunc node narrows the function's name/index reference (the flow walk
+    // resolves it to the closure signature). Record it as narrowable.
+    match &func_name {
+        LuaVarExpr::NameExpr(name_expr) => match name_expr.get_name_text() {
+            Some(name) => binder.record_narrowable_name(&name),
+            None => binder.mark_opaque_name_target(),
+        },
+        LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_access_path() {
+            Some(path) => binder.record_narrowable_index_path(&path),
+            None => binder.mark_opaque_index_target(),
+        },
+    }
 
     bind_each_child(binder, LuaAst::LuaFuncStat(func_stat.clone()), current);
 
@@ -628,7 +687,9 @@ mod tests {
             .expect("expected assignment");
         let (vars, _) = assign_stat.get_var_and_expr_list();
 
-        let info = collect_assignment_flow_info(&vars);
+        let db = crate::DbIndex::new();
+        let binder = FlowBinder::new(&db, crate::FileId::new(0));
+        let info = collect_assignment_flow_info(&binder, &vars);
         let paths = info
             .index_paths
             .iter()
@@ -638,6 +699,40 @@ mod tests {
         assert!(
             paths.contains(&"holder.items"),
             "collection append should mark prefix path as affected: {paths:?}"
+        );
+    }
+
+    #[test]
+    fn assignment_flow_info_tracks_local_decl_and_target_index() {
+        let tree = LuaParser::parse("other, value = 1, 2", ParserConfig::default());
+        let root = tree.get_chunk_node();
+        let assign_stat = root
+            .descendants::<LuaAssignStat>()
+            .next()
+            .expect("expected assignment");
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        let LuaVarExpr::NameExpr(value_name) = &vars[1] else {
+            panic!("expected name target");
+        };
+        let file_id = crate::FileId::new(7);
+        let decl_id = LuaDeclId::new(file_id, rowan::TextSize::new(42));
+        let mut db = crate::DbIndex::new();
+        db.get_reference_index_mut().add_decl_reference(
+            decl_id,
+            file_id,
+            value_name.get_range(),
+            true,
+        );
+        let binder = FlowBinder::new(&db, file_id);
+
+        let info = collect_assignment_flow_info(&binder, &vars);
+
+        assert_eq!(
+            info.name_targets,
+            vec![AssignmentNameTarget {
+                decl_id,
+                target_idx: 1,
+            }]
         );
     }
 }

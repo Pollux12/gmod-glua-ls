@@ -1,15 +1,216 @@
 #[cfg(test)]
 mod test {
+    use std::collections::HashSet;
+
     use crate::{DiagnosticCode, Emmyrc, LuaSemanticDeclId, LuaType, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaNameExpr};
     use googletest::prelude::*;
-    use lsp_types::NumberOrString;
+    use lsp_types::{NumberOrString, Uri};
     use tokio_util::sync::CancellationToken;
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+    }
+
+    fn def_isvalid_guard(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class NULL : Entity
+            "#,
+        );
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<any>
+            ---@return_cast value -NULL
+            function IsValid(value) end
+            "#,
+        );
+    }
+
+    fn define_incremental_alias_guard_workspace(
+        ws: &mut VirtualWorkspace,
+        consumer: String,
+    ) -> (Uri, crate::FileId) {
+        set_gmod_enabled(ws);
+        let guard_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/incremental_alias_guard.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/incremental_alias_consumer.lua");
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/includes/incremental_alias_types.lua"),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (consumer_uri.clone(), Some(consumer)),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("incremental alias consumer file id");
+        (guard_uri, consumer_file_id)
+    }
+
+    fn define_cross_file_predicate_workspace(
+        ws: &mut VirtualWorkspace,
+        predicate: &str,
+    ) -> (Uri, crate::FileId) {
+        set_gmod_enabled(ws);
+        ws.def_gmod_call_arg_builtins();
+        let types_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/predicate_types.lua");
+        let guards_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/predicate_guards.lua");
+        let predicate_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/predicate_incremental.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/z_consumer_incremental.lua");
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                types_uri,
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (
+                guards_uri,
+                Some(
+                    r#"
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (predicate_uri.clone(), Some(predicate.to_string())),
+            (
+                consumer_uri.clone(),
+                Some(
+                    r#"
+                    include("predicate_incremental.lua")
+
+                    ---@return Entity
+                    local function findEntity() end
+
+                    local function findPlayer()
+                        local candidate = findEntity()
+                        return IsPlayer(candidate) and candidate or false
+                    end
+
+                    local narrowed = findPlayer()
+                    print(narrowed)
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        (predicate_uri, consumer_file_id)
+    }
+
+    fn define_assignment_guard_workspace(
+        ws: &mut VirtualWorkspace,
+        guard_source: &str,
+    ) -> (Uri, Uri, crate::FileId) {
+        set_gmod_enabled(ws);
+        let guard_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/assignment_guard.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/assignment_guard_consumer.lua");
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/includes/assignment_guard_types.lua"),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@class NPC: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    ---@return boolean
+                    ---@return_cast self NPC
+                    function Entity:IsNPC() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (guard_uri.clone(), Some(guard_source.to_string())),
+            (
+                consumer_uri.clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if Predicates.IsPlayer(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("assignment guard consumer file id");
+        (guard_uri, consumer_uri, consumer_file_id)
     }
 
     fn file_has_diagnostic(
@@ -53,7 +254,8 @@ mod test {
         semantic_model
             .get_semantic_info(name_expr.syntax().clone().into())
             .expect("expected semantic info for name expression")
-            .typ
+            .display_typ()
+            .clone()
     }
 
     fn nth_name_expr_semantic_decl_from_end(
@@ -132,6 +334,101 @@ mod test {
         );
         let expected = ws.ty("string[]");
         assert_eq!(ty, expected);
+    }
+
+    #[test]
+    fn gmod_zero_delay_timer_initializes_typed_global_for_later_callbacks() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class MenuPanel
+        MenuPanel = {}
+        function MenuPanel:Call(js) end
+
+        ---@type MenuPanel
+        pnlMainMenu = nil
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        timer = {}
+        function timer.Simple(delay, callback) end
+
+        timer.Simple(0, function()
+            pnlMainMenu = MenuPanel
+        end)
+
+        function RefreshMenu()
+            pnlMainMenu:Call("Update()")
+        end
+        "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UncheckedNilAccess
+        ));
+    }
+
+    #[test]
+    fn deferred_closure_keeps_preceding_zero_delay_timer_effect() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+        ---@class MenuPanel
+        MenuPanel = {}
+
+        ---@type MenuPanel
+        pnlMainMenu = nil
+        "#,
+        );
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        timer = {}
+        function timer.Simple(delay, callback) end
+
+        timer.Simple(0, function()
+            pnlMainMenu = MenuPanel
+        end)
+
+        local refresh = function()
+            local captured = pnlMainMenu
+        end
+        "#,
+        );
+
+        let captured = nth_name_expr_type_from_end(&mut ws, file_id, "pnlMainMenu", 0);
+        assert_eq!(ws.humanize_type(captured), "MenuPanel");
+    }
+
+    #[test]
+    fn untyped_global_nil_assignment_still_reports_unchecked_access() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        pnlMainMenu = nil
+
+        function RefreshMenu()
+            pnlMainMenu:Call("Update()")
+        end
+        "#,
+        );
+
+        assert!(file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::UncheckedNilAccess
+        ));
     }
 
     #[test]
@@ -693,7 +990,7 @@ end
     }
 
     #[test]
-    fn test_issue_147() {
+    fn deferred_closure_retains_immutable_local_truthiness_guard() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -709,7 +1006,279 @@ end
         );
 
         let e = ws.expr_ty("e");
-        assert_eq!(e, LuaType::String);
+        assert_eq!(ws.humanize_type(e), "string");
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_parameter_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value string?
+            local function register(value)
+                if value then
+                    local callback = function()
+                        immutable_parameter_capture = value
+                    end
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("immutable_parameter_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_local_explicit_nil_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if value ~= nil then
+                local callback = function()
+                    explicit_nil_capture = value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("explicit_nil_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_exact_nil_guard_preserves_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type boolean?
+            if value == nil then
+                return
+            end
+
+            local callback = function()
+                exact_nil_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("exact_nil_capture");
+        assert_eq!(captured, LuaType::Boolean);
+    }
+
+    #[test]
+    fn deferred_closure_exact_false_guard_preserves_false_literal() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type boolean?
+            if value ~= false then
+                return
+            end
+
+            local callback = function()
+                exact_false_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("exact_false_capture");
+        assert_eq!(captured, LuaType::BooleanConst(false));
+    }
+
+    #[test]
+    fn false_branch_of_unknown_is_limited_to_runtime_falsy_values() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type unknown
+            if value then
+                return
+            end
+            unknown_falsy_capture = value
+            "#,
+        );
+
+        let captured = ws.expr_ty("unknown_falsy_capture");
+        let expected = LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)]);
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_unknown_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type unknown
+            if value then
+                return
+            end
+
+            local callback = function()
+                deferred_unknown_falsy_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("deferred_unknown_falsy_capture");
+        let expected = LuaType::from_vec(vec![LuaType::Nil, LuaType::BooleanConst(false)]);
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_local_parenthesized_early_return_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if not (value) then
+                return
+            end
+
+            local callback = function()
+                early_return_capture = value
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("early_return_capture");
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_local_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local value ---@type string?
+            if value then
+                local callback = function()
+                    mutable_local_capture = value
+                end
+            end
+            value = nil
+            "#,
+        );
+
+        let captured = ws.expr_ty("mutable_local_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_parameter_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value string?
+            local function register(value)
+                if value then
+                    local callback = function()
+                        mutable_parameter_capture = value
+                    end
+                end
+                value = nil
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("mutable_parameter_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_member_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            local state ---@type { value: string? }
+            if state.value then
+                local callback = function()
+                    member_capture = state.value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("member_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_global_truthiness_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@return string?
+            local function maybe_string() end
+
+            GLOBAL_VALUE = maybe_string()
+            if GLOBAL_VALUE then
+                local callback = function()
+                    global_capture = GLOBAL_VALUE
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("global_capture");
+        assert_eq!(ws.humanize_type(captured), "string?");
+    }
+
+    #[test]
+    fn deferred_closure_drops_immutable_entity_isvalid_guard() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        ws.def(
+            r#"
+            local entity ---@type Entity|NULL
+            if IsValid(entity) then
+                local callback = function()
+                    isvalid_capture = entity
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("isvalid_capture");
+        let expected = ws.ty("Entity|NULL");
+        assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_drops_custom_type_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<string>
+            local function is_string(value) end
+
+            local value ---@type string|number
+            if is_string(value) then
+                local callback = function()
+                    custom_guard_capture = value
+                end
+            end
+            "#,
+        );
+
+        let captured = ws.expr_ty("custom_guard_capture");
+        let expected = ws.ty("string|number");
+        assert_eq!(captured, expected);
     }
 
     #[test]
@@ -864,6 +1433,26 @@ end
     }
 
     #[test]
+    fn deferred_closure_keeps_preceding_tag_cast() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+        ---@type string|number
+        local value = 1
+        ---@cast value string
+
+        local callback = function()
+            local captured = value
+        end
+        "#,
+        );
+
+        let captured = nth_name_expr_type_from_end(&mut ws, file_id, "value", 0);
+        assert_eq!(ws.humanize_type(captured), "string");
+    }
+
+    #[test]
     fn test_issue_364() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1007,7 +1596,7 @@ end
     }
 
     #[test]
-    fn test_call_cast2() {
+    fn test_call_cast_preserves_existing_multiple_inheritance_subtype() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -1039,13 +1628,9 @@ end
         "#,
         );
 
-        let a = ws.expr_ty("a");
-        let a_expected = ws.ty("My1");
-        assert_eq!(a, a_expected);
-
-        let b = ws.expr_ty("b");
-        let b_expected = ws.ty("My2");
-        assert_eq!(b, b_expected);
+        let source_type = LuaType::Def(crate::LuaTypeDeclId::global("My3"));
+        assert_eq!(ws.expr_ty("a"), source_type);
+        assert_eq!(ws.expr_ty("b"), source_type);
     }
 
     #[test]
@@ -2151,6 +2736,1747 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Player: Entity
+            ---@field IsFrozen fun(self: Player): boolean
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class TraceResult
+            ---@field Entity Entity?
+
+            function IsPlayer(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@param tr TraceResult
+            local function useTrace(tr)
+                if IsPlayer(tr.Entity) then
+                    local ply = tr.Entity
+                    ply:IsFrozen()
+                else
+                    local other = tr.Entity
+                    print(other)
+                end
+            end
+            "#,
+        );
+
+        let inferred_guards = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .iter()
+            .filter_map(|(signature_id, _)| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_positive_guard(signature_id)
+            })
+            .map(|guard| {
+                (
+                    guard.param_idx,
+                    ws.humanize_type(guard.narrowed_type.clone()),
+                )
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(inferred_guards, vec![(0, "Player".to_string())]);
+
+        let positive_type = nth_name_expr_type_from_end(&mut ws, file_id, "ply", 0);
+        let negative_type = nth_name_expr_type_from_end(&mut ws, file_id, "other", 0);
+        assert_that!(ws.humanize_type(positive_type), eq("Player"));
+        assert_eq!(negative_type, ws.ty("Entity|nil"));
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_cold_batch_ttt_predicate_guard_publishes_consumer_dependency() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_ids = ws.def_files(vec![
+            (
+                "00_types.lua",
+                r#"
+                ---@class Entity
+                ---@field SetNWInt fun(self: Entity, key: string, value: integer)
+
+                ---@class Player: Entity
+                ---@field SteamID64 fun(self: Player): string
+
+                ---@param name string
+                ---@return table
+                function FindMetaTable(name) end
+                "#,
+            ),
+            (
+                "01_guards.lua",
+                r#"
+                ---@class NULL: Entity
+
+                ---@param value any
+                ---@return TypeGuard<any>
+                ---@return_cast value -NULL
+                function IsValid(value) end
+
+                ---@return boolean
+                ---@return_cast self Player
+                function Entity:IsPlayer() end
+                "#,
+            ),
+            (
+                "02_predicate.lua",
+                r#"
+                ---@type (definition) Player
+                local PLAYER = FindMetaTable("Player")
+
+                function PLAYER:IsActive()
+                    return true
+                end
+
+                function IsPlayer(ent)
+                    return IsValid(ent) and ent:IsPlayer()
+                end
+                "#,
+            ),
+            (
+                "03_consumer.lua",
+                r#"
+                ---@return Entity
+                local function findEntity() end
+
+                local function findActivePlayer()
+                    local ent = findEntity()
+                    return IsPlayer(ent) and ent:IsActive() and ent or false
+                end
+
+                local target = findActivePlayer()
+                if target then
+                    target:SetNWInt("state", 1)
+                    target:SteamID64()
+                end
+                "#,
+            ),
+        ]);
+        let file_id = file_ids[3];
+
+        let target_type = nth_name_expr_type_from_end(&mut ws, file_id, "target", 0);
+        assert_eq!(target_type, ws.ty("Player"));
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            eq(false)
+        );
+        assert!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]]))
+                .contains(&file_id)
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_inferred_predicate_guard_addition_reindexes_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (predicate_uri, consumer_file_id) = define_cross_file_predicate_workspace(
+            &mut ws,
+            "function IsPlayer(ent)\n    return true\nend",
+        );
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &predicate_uri,
+                Some(
+                    "function IsPlayer(ent)\n    return IsValid(ent) and ent:IsPlayer()\nend"
+                        .to_string(),
+                ),
+            )
+            .expect("predicate file id after update");
+
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "(Player|false)");
+    }
+
+    #[gtest]
+    fn test_incremental_inferred_guard_addition_reindexes_immutable_alias_calls() {
+        let cases = [
+            ("function IsPlayer(ent) {body} end", "IsPlayer", "global"),
+            (
+                "Predicates = Predicates or {}\nfunction Predicates.IsPlayer(ent) {body} end",
+                "Predicates.IsPlayer",
+                "namespaced",
+            ),
+            (
+                "function _G.IsPlayer(ent) {body} end",
+                "_G.IsPlayer",
+                "global_root",
+            ),
+        ];
+
+        for (definition, predicate, case) in cases {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let guard_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_alias_guard.lua"));
+            let consumer_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_alias_consumer.lua"));
+            ws.analysis.update_files_by_uri_sorted(vec![
+                (
+                    ws.virtual_url_generator
+                        .new_uri(&format!("lua/includes/{case}_alias_types.lua")),
+                    Some(
+                        r#"
+                        ---@class Entity
+                        ---@class NULL: Entity
+                        ---@class Player: Entity
+                        ---@param value any
+                        ---@return TypeGuard<any>
+                        ---@return_cast value -NULL
+                        function IsValid(value) end
+                        ---@return boolean
+                        ---@return_cast self Player
+                        function Entity:IsPlayer() end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+                (
+                    guard_uri.clone(),
+                    Some(definition.replace("{body}", "return true")),
+                ),
+                (
+                    consumer_uri.clone(),
+                    Some(format!(
+                        "---@type Entity\nlocal ent\nlocal Alias = {predicate}\nlocal Alias2 = Alias\nif Alias2(ent) then\n    local narrowed = ent\n    print(narrowed)\nend"
+                    )),
+                ),
+            ]);
+            let consumer_file_id = ws
+                .analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_id(&consumer_uri)
+                .unwrap_or_else(|| panic!("{case} alias consumer file id"));
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Entity", "{case} before edit");
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
+                )
+                .unwrap_or_else(|| panic!("{case} guard addition"));
+
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Player", "{case} after edit");
+            assert_eq!(
+                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+                1
+            );
+            assert_eq!(
+                ws.analysis
+                    .inferred_guard_propagation_stats
+                    .broad_stabilizations,
+                0
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_file_reindexes_existing_immutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("new guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_file_batch_reindexes_existing_immutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis.update_files_by_uri(vec![(
+            guard_uri,
+            Some("function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string()),
+        )]);
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_reindexes_parenthesized_alias_initializers_and_calls() {
+        let cases = [
+            (
+                "---@type Entity\nlocal ent\nlocal Alias = ((IsPlayer))\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized initializer",
+            ),
+            (
+                "---@type Entity\nlocal ent\nlocal Alias = (IsPlayer)\nlocal Alias2 = ((Alias))\nif ((Alias2))(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized alias chain and call",
+            ),
+            (
+                "---@type Entity\nlocal ent\nif ((IsPlayer))(ent) then\n    local narrowed = ent\n    print(narrowed)\nend",
+                "parenthesized direct call",
+            ),
+        ];
+
+        for (consumer, case) in cases {
+            let mut ws = VirtualWorkspace::new();
+            let (guard_uri, consumer_file_id) =
+                define_incremental_alias_guard_workspace(&mut ws, consumer.to_string());
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(
+                        "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end"
+                            .to_string(),
+                    ),
+                )
+                .unwrap_or_else(|| panic!("{case} guard source file id"));
+
+            let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "Player", "{case}");
+            assert_eq!(
+                ws.analysis
+                    .inferred_guard_propagation_stats
+                    .broad_stabilizations,
+                0,
+                "{case}"
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_reindexes_alias_chain_longer_than_eight_declarations() {
+        let mut aliases = "local Alias0 = IsPlayer\n".to_string();
+        for index in 1..12 {
+            aliases.push_str(&format!("local Alias{index} = Alias{}\n", index - 1));
+        }
+        let consumer = format!(
+            "---@type Entity\nlocal ent\n{aliases}if Alias11(ent) then\n    local narrowed = ent\n    print(narrowed)\nend"
+        );
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) =
+            define_incremental_alias_guard_workspace(&mut ws, consumer);
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("deep alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_alias_cycle_terminates_without_narrowing() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nlocal Alias2 = Alias\nAlias = Alias2\nAlias2 = Alias\nif Alias2(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("cyclic alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_new_inferred_guard_does_not_reindex_mutable_alias_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (guard_uri, consumer_file_id) = define_incremental_alias_guard_workspace(
+            &mut ws,
+            "---@type Entity\nlocal ent\nlocal Alias = IsPlayer\nAlias = function() return true end\nif Alias(ent) then\n    local narrowed = ent\n    print(narrowed)\nend".to_string(),
+        );
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(
+                    "function IsPlayer(ent) return IsValid(ent) and ent:IsPlayer() end".to_string(),
+                ),
+            )
+            .expect("mutable alias guard source file id");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_explicit_global_root_inferred_guard_addition_reindexes_all_global_consumers() {
+        let definitions = [
+            ("function _G.IsPlayer(ent) {body} end", "dot_g_function"),
+            ("function _ENV.IsPlayer(ent) {body} end", "dot_env_function"),
+            (
+                "_G[\"IsPlayer\"] = function(ent) {body} end",
+                "indexed_g_assignment",
+            ),
+            (
+                "_ENV[\"IsPlayer\"] = function(ent) {body} end",
+                "indexed_env_assignment",
+            ),
+        ];
+        let consumers = [
+            "IsPlayer(ent)",
+            "_G.IsPlayer(ent)",
+            "_ENV.IsPlayer(ent)",
+            "_G[\"IsPlayer\"](ent)",
+            "_ENV[\"IsPlayer\"](ent)",
+        ];
+
+        for (definition, case) in definitions {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let guard_uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/autorun/server/{case}_guard.lua"));
+            let mut files = vec![
+                (
+                    ws.virtual_url_generator
+                        .new_uri(&format!("lua/includes/{case}_types.lua")),
+                    Some(
+                        r#"
+                        ---@class Entity
+                        ---@class NULL: Entity
+                        ---@class Player: Entity
+                        ---@param value any
+                        ---@return TypeGuard<any>
+                        ---@return_cast value -NULL
+                        function IsValid(value) end
+                        ---@return boolean
+                        ---@return_cast self Player
+                        function Entity:IsPlayer() end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+                (
+                    guard_uri.clone(),
+                    Some(definition.replace("{body}", "return true")),
+                ),
+            ];
+            let mut consumer_uris = Vec::new();
+            for (idx, call) in consumers.iter().enumerate() {
+                let uri = ws
+                    .virtual_url_generator
+                    .new_uri(&format!("lua/autorun/server/{case}_consumer_{idx}.lua"));
+                files.push((
+                    uri.clone(),
+                    Some(format!(
+                        "---@type Entity\nlocal ent\nif {call} then\n    local narrowed = ent\n    print(narrowed)\nend"
+                    )),
+                ));
+                consumer_uris.push(uri);
+            }
+            ws.analysis.update_files_by_uri_sorted(files);
+
+            for consumer_uri in &consumer_uris {
+                let consumer_file_id = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_id(consumer_uri)
+                    .unwrap_or_else(|| panic!("{case} consumer file id"));
+                let narrowed =
+                    nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+                assert_eq!(
+                    ws.humanize_type(narrowed),
+                    "Entity",
+                    "{case}: {consumer_uri:?} before guard addition"
+                );
+            }
+
+            ws.analysis
+                .update_file_by_uri(
+                    &guard_uri,
+                    Some(definition.replace("{body}", "return IsValid(ent) and ent:IsPlayer()")),
+                )
+                .unwrap_or_else(|| panic!("{case} guard file id after update"));
+
+            for consumer_uri in consumer_uris {
+                let consumer_file_id = ws
+                    .analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_id(&consumer_uri)
+                    .unwrap_or_else(|| panic!("{case} consumer file id"));
+                let narrowed =
+                    nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+                assert_eq!(
+                    ws.humanize_type(narrowed),
+                    "Player",
+                    "{case}: {consumer_uri:?} after guard addition"
+                );
+            }
+        }
+    }
+
+    #[gtest]
+    fn test_incremental_inferred_guard_addition_reaches_three_wrapper_levels() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let uris = (0..6)
+            .map(|idx| {
+                ws.virtual_url_generator
+                    .new_uri(&format!("lua/autorun/server/{idx}_guard_chain.lua"))
+            })
+            .collect::<Vec<_>>();
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                uris[0].clone(),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (
+                uris[1].clone(),
+                Some("function GuardA(ent) return true end".to_string()),
+            ),
+            (
+                uris[2].clone(),
+                Some("function GuardB(ent) return GuardA(ent) end".to_string()),
+            ),
+            (
+                uris[3].clone(),
+                Some("function GuardC(ent) return GuardB(ent) end".to_string()),
+            ),
+            (
+                uris[4].clone(),
+                Some("function GuardD(ent) return GuardC(ent) end".to_string()),
+            ),
+            (
+                uris[5].clone(),
+                Some(
+                    r#"
+                    ---@return Entity
+                    local function findEntity() end
+                    local ent = findEntity()
+                    if GuardD(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uris[5])
+            .expect("consumer file id");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &uris[1],
+                Some("function GuardA(ent) return IsValid(ent) and ent:IsPlayer() end".to_string()),
+            )
+            .expect("GuardA file id after update");
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_fact_preserving_guard_reindex_keeps_full_incremental_consumer_chain() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let uris = (0..7)
+            .map(|idx| {
+                ws.virtual_url_generator
+                    .new_uri(&format!("lua/autorun/server/preserved_guard_{idx}.lua"))
+            })
+            .collect::<Vec<_>>();
+        let guard_a = |prefix: &str, predicate: &str| {
+            format!("{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end")
+        };
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                uris[0].clone(),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@class NPC: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    ---@return boolean
+                    ---@return_cast self NPC
+                    function Entity:IsNPC() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (uris[1].clone(), Some(guard_a("", "IsPlayer"))),
+            (
+                uris[2].clone(),
+                Some("function GuardB(ent) return GuardA(ent) end".to_string()),
+            ),
+            (
+                uris[3].clone(),
+                Some("function GuardC(ent) return GuardB(ent) end".to_string()),
+            ),
+            (
+                uris[4].clone(),
+                Some("function GuardD(ent) return GuardC(ent) end".to_string()),
+            ),
+            (
+                uris[5].clone(),
+                Some("function GuardE(ent) return GuardD(ent) end".to_string()),
+            ),
+            (
+                uris[6].clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if GuardE(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uris[6])
+            .expect("preserved guard consumer file id");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+
+        ws.analysis
+            .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsPlayer")))
+            .expect("fact-preserving guard source reindex");
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.changed_facts,
+            0
+        );
+
+        ws.analysis
+            .update_file_by_uri(&uris[1], Some(guard_a("-- unrelated edit\n\n", "IsNPC")))
+            .expect("guard type change");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "NPC");
+        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            5
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+
+        ws.analysis
+            .update_file_by_uri(
+                &uris[1],
+                Some("-- unrelated edit\n\nfunction GuardA(ent) return true end".to_string()),
+            )
+            .expect("guard removal");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 5);
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            5
+        );
+        assert_eq!(
+            ws.analysis
+                .inferred_guard_propagation_stats
+                .broad_stabilizations,
+            0
+        );
+    }
+
+    #[gtest]
+    fn test_fact_preserving_guard_batch_keeps_reindexed_consumer_dependency_replacement() {
+        for equivalent_prefix in ["", "-- shifted guard owner\n\n"] {
+            let mut ws = VirtualWorkspace::new();
+            set_gmod_enabled(&mut ws);
+            let uris = (0..6)
+                .map(|idx| {
+                    ws.virtual_url_generator
+                        .new_uri(&format!("lua/autorun/server/replaced_guard_{idx}.lua"))
+                })
+                .collect::<Vec<_>>();
+            let guard_a = |prefix: &str, predicate: &str| {
+                format!(
+                    "{prefix}function GuardA(ent) return IsValid(ent) and ent:{predicate}() end"
+                )
+            };
+            ws.analysis.update_files_by_uri_sorted(vec![
+                (
+                    uris[0].clone(),
+                    Some(
+                        r#"
+                        ---@class Entity
+                        ---@class NULL: Entity
+                        ---@class Player: Entity
+                        ---@class NPC: Entity
+                        ---@param value any
+                        ---@return TypeGuard<any>
+                        ---@return_cast value -NULL
+                        function IsValid(value) end
+                        ---@return boolean
+                        ---@return_cast self Player
+                        function Entity:IsPlayer() end
+                        ---@return boolean
+                        ---@return_cast self NPC
+                        function Entity:IsNPC() end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+                (uris[1].clone(), Some(guard_a("", "IsPlayer"))),
+                (
+                    uris[2].clone(),
+                    Some("function GuardB(ent) return GuardA(ent) end".to_string()),
+                ),
+                (
+                    uris[3].clone(),
+                    Some("function GuardC(ent) return GuardB(ent) end".to_string()),
+                ),
+                (
+                    uris[4].clone(),
+                    Some("function GuardD(ent) return GuardA(ent) end".to_string()),
+                ),
+                (
+                    uris[5].clone(),
+                    Some(
+                        r#"
+                        ---@type Entity
+                        local ent
+                        if GuardD(ent) then
+                            local narrowed = ent
+                            print(narrowed)
+                        end
+                        "#
+                        .to_string(),
+                    ),
+                ),
+            ]);
+            let file_ids = uris
+                .iter()
+                .map(|uri| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_id(uri)
+                        .expect("guard replacement file id")
+                })
+                .collect::<Vec<_>>();
+
+            ws.analysis.update_files_by_uri_sorted(vec![
+                (
+                    uris[1].clone(),
+                    Some(guard_a(equivalent_prefix, "IsPlayer")),
+                ),
+                (
+                    uris[4].clone(),
+                    Some("function GuardD(ent) return GuardC(ent) end".to_string()),
+                ),
+            ]);
+
+            let signature_index = ws.analysis.compilation.get_db().get_signature_index();
+            assert_eq!(
+                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[1]])),
+                HashSet::from([file_ids[2]])
+            );
+            assert_eq!(
+                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]])),
+                HashSet::from([file_ids[3]])
+            );
+            assert_eq!(
+                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[3]])),
+                HashSet::from([file_ids[4]])
+            );
+
+            ws.analysis
+                .update_file_by_uri(&uris[1], Some(guard_a(equivalent_prefix, "IsNPC")))
+                .expect("guard type change");
+
+            let wrapper_types = {
+                let signature_index = ws.analysis.compilation.get_db().get_signature_index();
+                file_ids[2..=4]
+                    .iter()
+                    .map(|file_id| {
+                        signature_index
+                            .inferred_guard_facts_for_files(&HashSet::from([*file_id]))
+                            .into_values()
+                            .next()
+                            .expect("wrapper inferred guard")
+                            .narrowed_type
+                    })
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                wrapper_types
+                    .into_iter()
+                    .map(|ty| ws.humanize_type(ty))
+                    .collect::<Vec<_>>(),
+                vec!["NPC", "NPC", "NPC"]
+            );
+            let narrowed = nth_name_expr_type_from_end(&mut ws, file_ids[5], "narrowed", 0);
+            assert_eq!(ws.humanize_type(narrowed), "NPC");
+            assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 4);
+            assert_eq!(
+                ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+                4
+            );
+        }
+    }
+
+    #[gtest]
+    fn test_dot_assignment_inferred_guard_cold_index_narrows_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (_, _, consumer_file_id) = define_assignment_guard_workspace(
+            &mut ws,
+            r#"
+            Predicates = {}
+            Predicates.IsPlayer = function(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_static_string_assignment_inferred_guard_cold_index_narrows_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (_, _, consumer_file_id) = define_assignment_guard_workspace(
+            &mut ws,
+            r#"
+            Predicates = {}
+            Predicates["IsPlayer"] = function(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_assignment_inferred_guard_uses_matching_target_and_signature() {
+        let mut ws = VirtualWorkspace::new();
+        let (_, _, consumer_file_id) = define_assignment_guard_workspace(
+            &mut ws,
+            r#"
+            Predicates = {}
+            local unused
+            unused, Predicates.IsPlayer = true, function(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_dot_assignment_inferred_guard_incremental_add_change_remove_and_rename() {
+        let mut ws = VirtualWorkspace::new();
+        let source = |name: &str, body: &str| {
+            format!("Predicates = {{}}\nPredicates.{name} = function(ent) {body} end")
+        };
+        let (guard_uri, _, consumer_file_id) =
+            define_assignment_guard_workspace(&mut ws, &source("IsPlayer", "return true"));
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
+            )
+            .expect("dot assignment guard addition");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(source("IsPlayer", "return IsValid(ent) and ent:IsNPC()")),
+            )
+            .expect("dot assignment guard type change");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "NPC");
+
+        ws.analysis
+            .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .expect("dot assignment guard removal");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
+            )
+            .expect("dot assignment guard rename");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_static_string_assignment_inferred_guard_incremental_move_and_remove() {
+        let mut ws = VirtualWorkspace::new();
+        let guard_source = r#"
+            Predicates = Predicates or {}
+            Predicates["IsPlayer"] = function(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+        "#;
+        let (old_uri, _, consumer_file_id) =
+            define_assignment_guard_workspace(&mut ws, guard_source);
+        let new_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/moved_assignment_guard.lua");
+
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (old_uri, None),
+            (new_uri.clone(), Some(guard_source.to_string())),
+        ]);
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+
+        ws.analysis
+            .update_file_by_uri(
+                &new_uri,
+                Some(
+                    "Predicates = Predicates or {}\nPredicates[\"IsPlayer\"] = function(ent) return true end"
+                        .to_string(),
+                ),
+            )
+            .expect("moved static-string assignment guard removal");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_computed_assignment_inferred_guard_is_not_published() {
+        let mut ws = VirtualWorkspace::new();
+        let (_, _, consumer_file_id) = define_assignment_guard_workspace(
+            &mut ws,
+            r#"
+            Predicates = {}
+            local key = "IsPlayer"
+            Predicates[key] = function(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_reverse_ordered_same_file_guard_chain_stabilizes_without_reindex_frontiers() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let uris = (0..3)
+            .map(|idx| {
+                ws.virtual_url_generator
+                    .new_uri(&format!("lua/autorun/server/reverse_guard_{idx}.lua"))
+            })
+            .collect::<Vec<_>>();
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                uris[0].clone(),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (
+                uris[1].clone(),
+                Some(
+                    r#"
+                    function GuardD(ent) return GuardC(ent) end
+                    function GuardC(ent) return GuardB(ent) end
+                    function GuardB(ent) return GuardA(ent) end
+                    function GuardA(ent) return true end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (
+                uris[2].clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if GuardD(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+
+        ws.analysis
+            .update_file_by_uri(
+                &uris[1],
+                Some(
+                    r#"
+                    function GuardD(ent) return GuardC(ent) end
+                    function GuardC(ent) return GuardB(ent) end
+                    function GuardB(ent) return GuardA(ent) end
+                    function GuardA(ent) return IsValid(ent) and ent:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            )
+            .expect("guard chain file id");
+
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&uris[2])
+            .expect("consumer file id");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reference_edges,
+            1
+        );
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.changed_facts,
+            4
+        );
+    }
+
+    #[gtest]
+    fn test_namespaced_inferred_guard_cold_index_narrows_external_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/includes/namespaced_guard_types.lua",
+                r#"
+                ---@class Entity
+                ---@class NULL: Entity
+                ---@class Player: Entity
+                ---@param value any
+                ---@return TypeGuard<any>
+                ---@return_cast value -NULL
+                function IsValid(value) end
+                ---@return boolean
+                ---@return_cast self Player
+                function Entity:IsPlayer() end
+                "#,
+            ),
+            (
+                "lua/autorun/server/namespaced_guard.lua",
+                r#"
+                Predicates = {}
+                function Predicates.IsPlayer(ent)
+                    return IsValid(ent) and ent:IsPlayer()
+                end
+                "#,
+            ),
+            (
+                "lua/autorun/server/namespaced_guard_consumer.lua",
+                r#"
+                ---@type Entity
+                local ent
+                if Predicates.IsPlayer(ent) then
+                    local narrowed = ent
+                    print(narrowed)
+                end
+                "#,
+            ),
+        ]);
+
+        let consumer_file_id = file_ids
+            .into_iter()
+            .find(|file_id| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_file_content(file_id)
+                    .is_some_and(|content| content.contains("local narrowed"))
+            })
+            .expect("consumer file id");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_namespaced_inferred_guard_incremental_add_remove_and_rename() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let guard_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/namespaced_incremental_guard.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/namespaced_incremental_consumer.lua");
+        let source = |name: &str, body: &str| {
+            format!("Predicates = Predicates or {{}}\nfunction Predicates.{name}(ent) {body} end")
+        };
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/includes/namespaced_incremental_types.lua"),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (guard_uri.clone(), Some(source("IsPlayer", "return true"))),
+            (
+                consumer_uri.clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if Predicates.IsPlayer(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(source("IsPlayer", "return IsValid(ent) and ent:IsPlayer()")),
+            )
+            .expect("guard addition");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+
+        ws.analysis
+            .update_file_by_uri(&guard_uri, Some(source("IsPlayer", "return true")))
+            .expect("guard removal");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guard_uri,
+                Some(source("IsPerson", "return IsValid(ent) and ent:IsPlayer()")),
+            )
+            .expect("guard rename");
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_namespaced_inferred_guard_file_move_rebinds_consumer_dependency() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let old_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/moved_guard_old.lua");
+        let new_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/moved_guard_new.lua");
+        let consumer_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/moved_guard_consumer.lua");
+        let guard_source = r#"
+            Predicates = Predicates or {}
+            function Predicates.IsPlayer(ent)
+                return IsValid(ent) and ent:IsPlayer()
+            end
+        "#;
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                ws.virtual_url_generator
+                    .new_uri("lua/includes/moved_guard_types.lua"),
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (old_uri.clone(), Some(guard_source.to_string())),
+            (
+                consumer_uri.clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if Predicates.IsPlayer(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let consumer_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (old_uri, None),
+            (new_uri.clone(), Some(guard_source.to_string())),
+        ]);
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+        let new_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&new_uri)
+            .expect("moved guard file id");
+        assert!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .inferred_guard_consumers_for_files(&HashSet::from([new_file_id]))
+                .contains(&consumer_file_id)
+        );
+    }
+
+    #[gtest]
+    fn test_parenthesized_inferred_predicate_guard_publishes_and_narrows_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field IsFrozen fun(self: Player): boolean
+            ---@param value any
+            ---@return TypeGuard<Player>
+            function IsValid(value) end
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            function IsPlayer(ent)
+                return (IsValid(ent) and ent:IsPlayer())
+            end
+
+            ---@class TraceResult
+            ---@field Entity Entity?
+            ---@param tr TraceResult
+            local function useTrace(tr)
+                if IsPlayer(tr.Entity) then
+                    local narrowed = tr.Entity
+                    narrowed:IsFrozen()
+                    print(narrowed)
+                end
+            end
+            "#,
+        );
+
+        let inferred_guard_count = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .iter()
+            .filter(|(signature_id, _)| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_positive_guard(signature_id)
+                    .is_some()
+            })
+            .count();
+        assert_eq!(inferred_guard_count, 1);
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Player");
+    }
+
+    #[gtest]
+    fn test_same_name_realm_guards_keep_distinct_incremental_facts() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_call_arg_builtins();
+        let types_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/realm_guard_types.lua");
+        let guards_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/realm_guards.lua");
+        let server_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/server/realm_guard_consumer.lua");
+        let client_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/client/realm_guard_consumer.lua");
+        let guard_source = |server_return: &str| {
+            format!(
+                r#"
+                if SERVER then
+                    function IsPerson(ent)
+                        {server_return}
+                    end
+                end
+                if CLIENT then
+                    function IsPerson(ent)
+                        return IsValid(ent) and ent:IsNPC()
+                    end
+                end
+                "#,
+            )
+        };
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (
+                types_uri,
+                Some(
+                    r#"
+                    ---@class Entity
+                    ---@class NULL: Entity
+                    ---@class Player: Entity
+                    ---@class NPC: Entity
+                    ---@param value any
+                    ---@return TypeGuard<any>
+                    ---@return_cast value -NULL
+                    function IsValid(value) end
+                    ---@return boolean
+                    ---@return_cast self Player
+                    function Entity:IsPlayer() end
+                    ---@return boolean
+                    ---@return_cast self NPC
+                    function Entity:IsNPC() end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (guards_uri.clone(), Some(guard_source("return true"))),
+            (
+                server_uri.clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if IsPerson(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+            (
+                client_uri.clone(),
+                Some(
+                    r#"
+                    ---@type Entity
+                    local ent
+                    if IsPerson(ent) then
+                        local narrowed = ent
+                        print(narrowed)
+                    end
+                    "#
+                    .to_string(),
+                ),
+            ),
+        ]);
+        let server_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&server_uri)
+            .expect("server consumer file id");
+        let client_file_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_id(&client_uri)
+            .expect("client consumer file id");
+        let client_type = nth_name_expr_type_from_end(&mut ws, client_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(client_type), "NPC");
+
+        ws.analysis
+            .update_file_by_uri(
+                &guards_uri,
+                Some(guard_source("return IsValid(ent) and ent:IsPlayer()")),
+            )
+            .expect("realm guard file id after update");
+
+        let server_type = nth_name_expr_type_from_end(&mut ws, server_file_id, "narrowed", 0);
+        let client_type = nth_name_expr_type_from_end(&mut ws, client_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(server_type), "Player");
+        assert_eq!(ws.humanize_type(client_type), "NPC");
+        assert_eq!(ws.analysis.inferred_guard_propagation_stats.frontiers, 1);
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reindexed_files,
+            1
+        );
+        assert_eq!(
+            ws.analysis.inferred_guard_propagation_stats.reference_edges,
+            1
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_inferred_predicate_guard_offset_shift_reindexes_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (predicate_uri, consumer_file_id) = define_cross_file_predicate_workspace(
+            &mut ws,
+            "function IsPlayer(ent)\n    return IsValid(ent) and ent:IsPlayer()\nend",
+        );
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "(Player|false)");
+
+        ws.analysis
+            .update_file_by_uri(
+                &predicate_uri,
+                Some("\n\nfunction IsPlayer(ent)\n    return true\nend".to_string()),
+            )
+            .expect("predicate file id after offset shift");
+
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "Entity");
+    }
+
+    #[gtest]
+    fn test_cross_file_inferred_predicate_guard_rename_reindexes_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (predicate_uri, consumer_file_id) = define_cross_file_predicate_workspace(
+            &mut ws,
+            "function IsPlayer(ent)\n    return IsValid(ent) and ent:IsPlayer()\nend",
+        );
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "(Player|false)");
+
+        ws.analysis
+            .update_file_by_uri(
+                &predicate_uri,
+                Some(
+                    "function IsPerson(ent)\n    return IsValid(ent) and ent:IsPlayer()\nend"
+                        .to_string(),
+                ),
+            )
+            .expect("predicate file id after rename");
+
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "Entity");
+    }
+
+    #[gtest]
+    fn test_cross_file_inferred_predicate_guard_deletion_reindexes_consumer() {
+        let mut ws = VirtualWorkspace::new();
+        let (predicate_uri, consumer_file_id) = define_cross_file_predicate_workspace(
+            &mut ws,
+            "function IsPlayer(ent)\n    return IsValid(ent) and ent:IsPlayer()\nend",
+        );
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "(Player|false)");
+
+        ws.analysis
+            .remove_file_by_uri(&predicate_uri)
+            .expect("removed predicate file id");
+
+        let narrowed_type = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed_type), "Entity");
+    }
+
+    #[gtest]
+    fn test_mutated_predicate_wrapper_parameter_does_not_narrow_caller() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Player: Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@return Entity?
+            local function findEntity() end
+
+            ---@class TraceResult
+            ---@field Entity Entity?
+
+            function IsPlayer(ent)
+                ent = findEntity()
+                return IsValid(ent) and ent:IsPlayer()
+            end
+
+            ---@param tr TraceResult
+            local function useTrace(tr)
+                if IsPlayer(tr.Entity) then
+                    local ply = tr.Entity
+                    print(ply)
+                end
+            end
+            "#,
+        );
+
+        let inferred_guard_count = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_signature_index()
+            .iter()
+            .filter(|(signature_id, _)| {
+                ws.analysis
+                    .compilation
+                    .get_db()
+                    .get_signature_index()
+                    .inferred_positive_guard(signature_id)
+                    .is_some()
+            })
+            .count();
+        let ply_type = nth_name_expr_type_from_end(&mut ws, file_id, "ply", 0);
+        assert_eq!(inferred_guard_count, 0);
+        assert_eq!(ply_type, ws.ty("Entity|nil"));
+    }
+
+    #[gtest]
+    fn test_inferred_predicate_guard_is_removed_after_incremental_edit() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("inferred_guard_incremental.lua");
+        let source = |predicate: &str| {
+            format!(
+                r#"
+                ---@class Player: Entity
+
+                ---@return boolean
+                ---@return_cast self Player
+                function Entity:IsPlayer() end
+
+                ---@class TraceResult
+                ---@field Entity Entity?
+
+                function IsPlayer(ent)
+                    {predicate}
+                end
+
+                ---@param tr TraceResult
+                local function useTrace(tr)
+                    if IsPlayer(tr.Entity) then
+                        local ply = tr.Entity
+                        print(ply)
+                    end
+                end
+                "#,
+            )
+        };
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(source("return IsValid(ent) and ent:IsPlayer()")))
+            .expect("file id");
+
+        let inferred_guard_count = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .iter()
+                .filter(|(signature_id, _)| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_signature_index()
+                        .inferred_positive_guard(signature_id)
+                        .is_some()
+                })
+                .count()
+        };
+        assert_eq!(inferred_guard_count(&ws), 1);
+
+        let updated_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(source("return true")))
+            .expect("file id after update");
+        assert_eq!(updated_file_id, file_id);
+        assert_eq!(inferred_guard_count(&ws), 0);
+    }
+
+    #[gtest]
     fn test_getclass_guard_narrows_entity_to_matching_class() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
@@ -2307,12 +4633,16 @@ _2 = a[1]
     #[test]
     fn test_local_cached_isvalid_narrows_nil() {
         let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
 
         ws.def(
             r#"
+            ---@return Entity?
+            function maybeEntity()
+            end
+
             local IsValid = IsValid
-            ---@type string?
-            local maybe = "string"
+            local maybe = maybeEntity()
             if IsValid(maybe) then
                 a = maybe
             end
@@ -2320,13 +4650,14 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        let expected = ws.ty("string");
+        let expected = ws.ty("Entity");
         assert_eq!(a, expected);
     }
 
     #[test]
-    fn test_local_cached_isvalid_promotes_unknown_to_any() {
+    fn test_local_cached_isvalid_narrows_unknown_to_any() {
         let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
 
         ws.def(
             r#"
@@ -2345,6 +4676,29 @@ _2 = a[1]
 
         let a = ws.expr_ty("a");
         assert_eq!(a, LuaType::Any);
+    }
+
+    #[test]
+    fn test_isvalid_unknown_does_not_force_entity_members() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Panel
+            ---@field Dock fun(self: Panel, mode: any)
+
+            ---@return unknown
+            function getMaybe()
+            end
+
+            local maybe = getMaybe()
+            if IsValid(maybe) then
+                maybe:Dock(0)
+            end
+            "#,
+        ));
     }
 
     #[test]
@@ -3401,8 +5755,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3411,12 +5768,145 @@ _2 = a[1]
         assert!(ws.check_code_for(
             DiagnosticCode::NeedCheckNil,
             r#"
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if not IsValid(maybe) then return end
-            maybe:reverse()
+            maybe:GetClass()
             "#,
         ));
+    }
+
+    #[gtest]
+    fn test_isvalid_conjunction_early_return_narrows_each_operand() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel?
+            local function maybeLabel() end
+
+            local dclock = maybeLabel()
+            local dwires = maybeLabel()
+
+            local function update(val)
+                if not (IsValid(dclock) and IsValid(dwires)) then return end
+
+                dclock:Update(val)
+                dwires:Update(val)
+                _G.afterGuard = dwires
+            end
+            "#,
+        );
+
+        let dwires_after_guard = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 0);
+        let desc = ws.humanize_type(dwires_after_guard.clone());
+        assert_that!(desc.as_str(), not(contains_substring("nil")));
+        assert_that!(desc.as_str(), not(contains_substring("NULL")));
+        let expected = ws.ty("DLabel");
+        assert_that!(ws.check_type(&dwires_after_guard, &expected), eq(true));
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::UncheckedNilAccess),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_generated_isvalid_conjunction_narrows_later_assigned_captured_local() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+
+        ws.def_file(
+            "annotations/global.lua",
+            r#"
+            ---@realm shared
+            ---@param object any
+            ---@return TypeGuard<any>
+            ---@return_cast object -NULL
+            ---@[valid_guard]
+            function _G.IsValid(object) end
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "lua/autorun/client/wire_display.lua",
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel
+            local function createLabel() end
+
+            local dclock = createLabel()
+            local dwires
+
+            local callback
+            callback = function(val)
+                if not (IsValid(dclock) and IsValid(dwires)) then return end
+
+                dwires:Update(val)
+                _G.afterGuard = dwires
+            end
+
+            dwires = createLabel()
+            "#,
+        );
+
+        let dwires_after_guard = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 1);
+        let desc = ws.humanize_type(dwires_after_guard.clone());
+        assert_that!(desc.as_str(), eq("DLabel"));
+        let expected = ws.ty("DLabel");
+        assert_that!(ws.check_type(&dwires_after_guard, &expected), eq(true));
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(false)
+        );
+    }
+
+    #[gtest]
+    fn test_unguarded_later_assigned_captured_local_reports_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_guard(&mut ws);
+        ws.enable_check(DiagnosticCode::NeedCheckNil);
+
+        let file_id = ws.def(
+            r#"
+            ---@class DLabel
+            ---@field Update fun(self: DLabel, value: number)
+
+            ---@return DLabel
+            local function createLabel() end
+
+            local dclock = createLabel()
+            local dwires
+
+            local callback
+            callback = function(val)
+                if not IsValid(dclock) then return end
+                dwires:Update(val)
+            end
+
+            dwires = createLabel()
+            "#,
+        );
+
+        assert_that!(
+            file_has_diagnostic(&mut ws, file_id, DiagnosticCode::NeedCheckNil),
+            eq(true)
+        );
+        let dwires_at_access = nth_name_expr_type_from_end(&mut ws, file_id, "dwires", 1);
+        let desc = ws.humanize_type(dwires_at_access);
+        assert_that!(desc.as_str(), eq("DLabel?"));
     }
 
     #[gtest]
@@ -3434,6 +5924,71 @@ _2 = a[1]
             end
             "#,
         ));
+    }
+
+    #[gtest]
+    fn test_gamemode_hook_type_guard_survives_early_return_merge() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        set_gmod_enabled(&mut ws);
+        ws.def_gmod_type_predicates();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "lua/includes/gamemode_hook_docs.lua",
+            r#"
+            ---@class GM
+            GM = {}
+
+            ---@hook ChatTextChanged
+            ---@param text string|number
+            function GM:ChatTextChanged(text) end
+            "#,
+        );
+
+        let guarded_file = ws.def_file(
+            "gamemodes/base/gamemode/init.lua",
+            r#"
+            hook.Add("ChatTextChanged", "guarded", function(text)
+                if not isstring(text) then return end
+                text:sub(1)
+                hook_guarded_text_one = text
+                text:sub(2)
+                hook_guarded_text_two = text
+            end)
+
+            function GM:ChatTextChanged(text)
+                if not isstring(text) then return end
+                text:sub(3)
+                gamemode_guarded_text = text
+            end
+            "#,
+        );
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            guarded_file,
+            DiagnosticCode::UndefinedMethod
+        ));
+        let string_type = ws.ty("string");
+        for name in [
+            "hook_guarded_text_one",
+            "hook_guarded_text_two",
+            "gamemode_guarded_text",
+        ] {
+            assert_eq!(ws.expr_ty(name), string_type.clone());
+        }
+
+        let unguarded_file = ws.def_file(
+            "gamemodes/base/gamemode/cl_init.lua",
+            r#"
+            hook.Add("ChatTextChanged", "unguarded", function(text)
+                text:sub(1)
+                unguarded_text = text
+            end)
+            "#,
+        );
+        assert_eq!(
+            nth_name_expr_type_from_end(&mut ws, unguarded_file, "text", 0),
+            ws.ty("string|number")
+        );
     }
 
     #[gtest]
@@ -3513,6 +6068,175 @@ _2 = a[1]
             local function test(x)
                 if type(x) ~= "number" then return end
                 RequiresNumber(x)
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_narrows_true_branch() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dog" then
+                    x:Bark()
+                    RequiresDog(x)
+                end
+            end
+            "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, code));
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_not_equals_early_return_narrows_afterward() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) ~= "Dog" then return end
+                x:Bark()
+                RequiresDog(x)
+            end
+            "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::ParamTypeMismatch, code));
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_parent_does_not_widen_child() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+            ---@class Animal
+            local Animal = {}
+
+            ---@class Dog: Animal
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@param x Dog
+            local function test(x)
+                if type(x) == "Animal" then
+                    x:Bark()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_unknown_class_name_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Dog
+            local Dog = {}
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dgo" then
+                    RequiresDog(x)
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_preserves_missing_field_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@class Dog
+            local Dog = {}
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "Dog" then
+                    x:DefinitelyMissing()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_class_name_does_not_narrow_incompatible_primitive() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            function Dog:Bark() end
+
+            ---@param s string
+            local function test(s)
+                if type(s) == "Dog" then
+                    s:Bark()
+                end
+            end
+            "#,
+        ));
+    }
+
+    #[gtest]
+    fn test_type_guard_alias_name_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Dog
+            local Dog = {}
+            ---@alias DogAlias Dog
+
+            ---@class Cat
+            local Cat = {}
+
+            ---@param dog Dog
+            local function RequiresDog(dog) end
+
+            ---@param x Dog|Cat
+            local function test(x)
+                if type(x) == "DogAlias" then
+                    RequiresDog(x)
+                end
             end
             "#,
         ));
@@ -3624,8 +6348,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3635,10 +6362,12 @@ _2 = a[1]
             DiagnosticCode::NeedCheckNil,
             r#"
             local IsValid = IsValid
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if IsValid(maybe) then
-                maybe:reverse()
+                maybe:GetClass()
             end
             "#,
         ));
@@ -3657,8 +6386,11 @@ _2 = a[1]
             &library_uri,
             Some(
                 r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
             ---@param x any
-            ---@return boolean
+            ---@return TypeGuard<any>
             function _G.IsValid(x) end
             "#
                 .to_string(),
@@ -3668,10 +6400,12 @@ _2 = a[1]
             DiagnosticCode::NeedCheckNil,
             r#"
             local iv = IsValid
-            ---@type string?
-            local maybe = "hello"
+            ---@return Entity?
+            function maybeEntity() end
+
+            local maybe = maybeEntity()
             if iv(maybe) then
-                maybe:reverse()
+                maybe:GetClass()
             end
             "#,
         ));
@@ -3803,7 +6537,10 @@ _2 = a[1]
 
         let a = ws.expr_ty("a");
         let desc = ws.humanize_type(a);
+        // BrokenGlide falsy-overrides IsGlideVehicle, so BaseGlide alone is unsafe;
+        // surviving truthy subtypes (GoodGlide) must remain visible.
         assert_that!(desc, contains_substring("GoodGlide"));
+        assert_that!(desc.contains("BrokenGlide"), eq(false));
     }
 
     #[gtest]
@@ -4703,6 +7440,126 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_field_exist_narrow_skips_server_only_base_method_on_client() {
+        // Real pattern: GetNWEntity -> Entity|NULL, Vehicle:GetSteering is server-only,
+        // Glide ENT (Entity subclass, not Vehicle) defines shared NetworkVar GetSteering.
+        // Field-exist must reverse-lookup owners (not fan out every Entity subclass)
+        // and collapse to the most generic realm-compatible definer.
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        ws.def_file(
+            "annotations/vehicle.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Vehicle : Entity
+            local Vehicle = {}
+            ---@realm server
+            function Vehicle:GetSteering() end
+
+            ---@class Player : Entity
+            ---@return Vehicle
+            function Player:GetVehicle() end
+            ---@return Entity|NULL
+            function Entity:GetNWEntity(key, fallback) end
+            ---@return Entity?
+            function Entity:GetParent() end
+            "#,
+        );
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+            ---@class base_glide : Entity
+            ---@field IsGlideVehicle boolean
+            local ENT = {}
+            ENT.Type = "anim"
+            ENT.IsGlideVehicle = true
+            function ENT:GetVisualSteering()
+                return 0
+            end
+
+            ---@class base_glide_car : base_glide
+            local ENT = {}
+            ENT.Base = "base_glide"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Float", "Steering")
+            end
+
+            ---@class base_glide_boat : base_glide
+            local ENT = {}
+            ENT.Base = "base_glide"
+            function ENT:SetupDataTables()
+                self:NetworkVar("Float", "Steering")
+            end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/glide/autoload/steering_indicator.lua",
+            r#"
+            if CLIENT then
+                ---@type Player
+                local ply
+                local veh = ply:GetNWEntity("GlideVehicle")
+                if not IsValid(veh) then
+                    local maybeSeat = ply:GetVehicle()
+                    if IsValid(maybeSeat) then
+                        local parent = maybeSeat:GetParent()
+                        if IsValid(parent) and parent.IsGlideVehicle then
+                            veh = parent
+                        elseif maybeSeat.IsGlideVehicle then
+                            veh = maybeSeat
+                        end
+                    end
+                end
+                if veh.GetVisualSteering then
+                    a = veh
+                    local _ = veh:GetVisualSteering()
+                elseif veh.GetSteering then
+                    b = veh
+                    local steeringNorm = veh:GetSteering() or 0
+                    print(steeringNorm)
+                end
+            end
+            "#,
+        );
+
+        let a_ty = nth_name_expr_type_from_end(&mut ws, file_id, "a", 0);
+        let a_desc = ws.humanize_type(a_ty);
+        assert_that!(
+            a_desc.as_str(),
+            eq("base_glide"),
+            "GetVisualSteering should collapse to most generic definer base_glide, got {a_desc}"
+        );
+
+        let b_ty = nth_name_expr_type_from_end(&mut ws, file_id, "b", 0);
+        let b_desc = ws.humanize_type(b_ty);
+        assert_that!(
+            b_desc.contains("base_glide_car") || b_desc.contains("base_glide_boat"),
+            eq(true),
+            "elseif veh.GetSteering should narrow to realm-compatible NetworkVar owners, got {b_desc}"
+        );
+        assert_that!(
+            b_desc.contains("Vehicle") || b_desc.contains("Entity") || b_desc.contains("NULL"),
+            eq(false),
+            "must not fan out open Entity/Vehicle bases, got {b_desc}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let realm_mismatch = diagnostics.iter().any(|d| {
+            d.message.contains("GetSteering")
+                && (d.message.contains("Realm mismatch") || d.message.contains("realm"))
+        });
+        assert_that!(
+            realm_mismatch,
+            eq(false),
+            "realm-compatible narrow should not report GetSteering mismatch: {diagnostics:?}"
+        );
+    }
+
+    #[gtest]
     fn test_field_narrow_does_not_pick_subclass_when_base_directly_defines_field() {
         // `if x.EndTouch then` on `Entity` must not collapse to `EFFECT`
         // override — the base already defines the field.
@@ -4865,7 +7722,7 @@ _2 = a[1]
     }
 
     #[gtest]
-    fn test_undefined_global_guard_after_truthy_keeps_nil_without_index_evidence() {
+    fn test_undefined_global_guard_after_truthy_stays_unknown_without_index_evidence() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let file_id = ws.def_file(
             "test.lua",
@@ -4877,7 +7734,7 @@ _2 = a[1]
         );
 
         let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "tmysql", 0);
-        assert_eq!(narrowed, LuaType::Nil);
+        assert_eq!(narrowed, LuaType::Unknown);
     }
 
     #[gtest]
@@ -4979,6 +7836,111 @@ _2 = a[1]
 
         let not_narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "x", 0);
         assert_eq!(not_narrowed, LuaType::Unknown);
+    }
+
+    #[gtest]
+    fn test_inferred_unknown_alias_direct_index_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class DynamicValue
+            local DynamicValue = {}
+
+            ---@return DynamicValue
+            local function makeValue() end
+
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.field = makeValue()
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.field then
+                    local guarded = alias.field
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "DynamicValue");
+    }
+
+    #[gtest]
+    fn test_inferred_unknown_alias_deep_index_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ---@class DynamicValue
+            local DynamicValue = {}
+
+            ---@return DynamicValue
+            local function makeValue() end
+
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.a = { b = makeValue() }
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.a.b then
+                    local guarded = alias.a.b
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "DynamicValue");
+    }
+
+    #[gtest]
+    fn test_inferred_unknown_alias_comparison_guard_preserves_dynamic_member_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+            ENT = {}
+
+            function ENT:Init()
+                self.values = {}
+                self.values.field = 1
+            end
+
+            function ENT:Use()
+                local alias = self.values
+                if alias.field < 10 then
+                    local guarded = alias.field
+                    print(guarded)
+                end
+            end
+        "#,
+        );
+
+        let guarded = nth_name_expr_type_from_end(&mut ws, file_id, "guarded", 0);
+        assert_eq!(ws.humanize_type(guarded), "1");
     }
 
     #[gtest]

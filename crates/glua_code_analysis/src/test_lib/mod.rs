@@ -38,7 +38,9 @@ pub struct DiagnosticSnapshot {
 pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
 ---@meta
 ---@attribute call_arg(domain: string, role: string, priority: integer?)
+---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
 ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
+---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
 
 util = util or {}
 net = net or {}
@@ -47,8 +49,44 @@ timer = timer or {}
 concommand = concommand or {}
 vgui = vgui or {}
 derma = derma or {}
+file = file or {}
 
 Entity = Entity or {}
+
+---@[call_arg("gmod.file_find", "glob")]
+---@param name string
+---@[call_arg("gmod.file_find", "search_path")]
+---@param path string
+function file.Find(name, path, sorting) end
+
+---@[call_arg("gmod.load", "include")]
+---@param fileName string
+function include(fileName) end
+
+---@[call_arg("gmod.load", "addcsluafile")]
+---@param fileName string
+function AddCSLuaFile(fileName) end
+
+---@[call_arg("gmod.load", "includecs")]
+---@param fileName string
+function IncludeCS(fileName) end
+
+---@[call_arg("gmod.load", "require")]
+---@param moduleName string
+function require(moduleName) end
+
+---@[call_arg("gmod.load", "compilefile")]
+---@param path string
+---@param showError? boolean
+---@return function?
+function CompileFile(path, showError) end
+
+---@[call_arg("gmod.environment", "target")]
+---@param target function|integer
+---@[call_arg("gmod.environment", "environment")]
+---@param environment table
+---@return function?
+function setfenv(target, environment) end
 
 ---@[call_arg("gmod.net_message", "define")]
 ---@param str string
@@ -130,9 +168,46 @@ function timer.Create(identifier, delay, repetitions, func) end
 ---@param func function
 function timer.Simple(delay, func) end
 
+---@generic T: Panel
 ---@[call_arg("gmod.vgui_panel", "reference")]
----@param className string
+---@param className `T`
+---@[call_arg("gmod.vgui_panel", "parent")]
+---@param parent Panel?
+---@return (instance) T?
 function vgui.Create(className, parent, name) end
+
+---@generic T: Panel
+---@[call_arg("gmod.vgui_panel", "reference")]
+---@[call_arg("gmod.vgui_panel", "parent_self")]
+---@param className `T`
+---@return (instance) T
+function Panel:Add(className) end
+
+-- Panel is intentionally caller-provided: declaring it here changes generic
+-- vgui.Create return resolution for every test workspace.
+---@[call_arg("gmod.vgui_panel", "child_self")]
+---@[call_arg("gmod.vgui_panel", "parent")]
+---@param parent Panel
+function Panel:SetParent(parent) end
+
+---@class DDragBase: Panel
+---@field GetParent fun(self: DDragBase): Panel
+---@class DHorizontalScroller: Panel
+---@field GetParent fun(self: DHorizontalScroller): Panel
+---@field pnlCanvas DDragBase
+---@[call_arg_field("gmod.vgui_panel", "parent_self", "pnlCanvas")]
+---@[call_arg("gmod.vgui_panel", "reference")]
+---@param panel Panel
+function DHorizontalScroller:AddPanel(panel) end
+
+---@generic T: table
+---@[call_arg("gmod.vgui_panel", "register_table")]
+---@[call_arg_field("gmod.vgui_panel", "base", "Base")]
+---@param metatable T
+---@param parent? Panel
+---@param name? string
+---@return (instance) T?
+function vgui.CreateFromTable(metatable, parent, name) end
 
 ---@[call_arg("gmod.vgui_panel", "define")]
 ---@param name string
@@ -141,6 +216,14 @@ function vgui.Create(className, parent, name) end
 ---@[call_arg("gmod.vgui_panel", "base")]
 ---@param base string
 function vgui.Register(name, panel, base) end
+
+---@generic T: table
+---@[call_arg("gmod.vgui_panel", "register_table")]
+---@param panel T
+---@[call_arg("gmod.vgui_panel", "base")]
+---@param base? string
+---@return T
+function vgui.RegisterTable(panel, base) end
 
 ---@[call_arg("gmod.vgui_panel", "define_control")]
 ---@param class string
@@ -291,6 +374,11 @@ impl VirtualWorkspace {
     pub fn def_gmod_type_predicates(&mut self) -> FileId {
         self.def(
             r#"
+            ---@meta
+            ---@attribute call_arg(domain: string, role: string, priority: integer?)
+            ---@attribute self_guard(member: string)
+
+            ---@[call_arg("gmod.member_guard", "function")]
             ---@param value any
             ---@return TypeGuard<function>
             function isfunction(value) end
@@ -346,6 +434,10 @@ impl VirtualWorkspace {
             ---@param value any
             ---@return TypeGuard<Color>
             function IsColor(value) end
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function IsValid(value) end
             "#,
         )
     }
@@ -415,7 +507,7 @@ impl VirtualWorkspace {
         let info = semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("Semantic info must exist");
-        info.typ
+        info.display_typ().clone()
     }
 
     pub fn expr_ty(&mut self, expr: &str) -> LuaType {
@@ -431,7 +523,7 @@ impl VirtualWorkspace {
         let info = semantic_model
             .get_semantic_info(token.syntax().clone().into())
             .expect("Semantic info must exist");
-        info.typ
+        info.display_typ().clone()
     }
 
     pub fn check_type(&self, source: &LuaType, compact_type: &LuaType) -> bool {

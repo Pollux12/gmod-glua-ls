@@ -54,6 +54,9 @@ pub enum FlowNodeKind {
     NamedLabel(ArcIntern<SmolStr>),
     /// Declaration position
     DeclPosition(TextSize),
+    /// Entry to a deferred closure body. Its antecedent preserves persistent
+    /// creation-time flow, while semantic narrowing ignores outer conditions.
+    ClosureEntry(TextSize),
     /// Variable assignment with a hint about what kinds of LHS variables it contains
     Assignment(LuaAstPtr<LuaAssignStat>, AssignVarHint),
     /// Function call expression that may introduce flow-scoped side effects

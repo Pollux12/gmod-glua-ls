@@ -1,5 +1,6 @@
 mod generic_param;
 mod humanize_type;
+mod inference_fact;
 mod test;
 mod type_decl;
 mod type_ops;
@@ -16,8 +17,12 @@ pub use humanize_type::{
     DEFAULT_DETAIL_MEMBER_DISPLAY_COUNT, RenderLevel, format_union_type, humanize_member_key_name,
     humanize_type,
 };
+pub use inference_fact::*;
 use rowan::TextRange;
-use std::collections::{HashMap, HashSet};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner};
@@ -125,6 +130,55 @@ fn replace_table_const_in_type(
     }
 }
 
+fn replace_table_consts_in_type(
+    typ: &LuaType,
+    replacements: &HashMap<InFiled<TextRange>, LuaType>,
+) -> Option<LuaType> {
+    match typ {
+        LuaType::TableConst(existing_range) => replacements.get(existing_range).cloned(),
+        LuaType::Union(union) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(&sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or(sub_type)
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::Intersection(intersection) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = intersection
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::MergedTable(merged) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = merged
+                .get_types()
+                .iter()
+                .map(|sub_type| {
+                    replace_table_consts_in_type(sub_type, replacements)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub_type.clone())
+                })
+                .collect();
+            changed.then(|| LuaMergedTableType::new(new_types).into())
+        }
+        _ => None,
+    }
+}
+
 pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     match typ {
         LuaType::IntegerConst(_) => LuaType::Integer,
@@ -147,6 +201,144 @@ pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
         ),
         _ => typ.clone(),
     }
+}
+
+pub(crate) fn widen_related_assignment_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    if widen_table_literals {
+        return widen_table_literals_for_assignment(typ);
+    }
+
+    widen_literal_type_for_assignment(typ)
+}
+
+fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) => LuaType::Table,
+        LuaType::Union(union) => LuaType::from_vec(
+            union
+                .into_vec()
+                .into_iter()
+                .map(|sub_type| widen_table_literals_for_assignment(&sub_type))
+                .collect(),
+        ),
+        _ => widen_literal_type_for_assignment(typ),
+    }
+}
+
+pub(crate) fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
+    match typ {
+        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
+        _ => widen_literal_type_for_assignment(typ),
+    }
+}
+
+pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
+    matches!(
+        typ,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Object(_)
+            | LuaType::MergedTable(_)
+            | LuaType::TableOf(_)
+    )
+}
+
+pub(crate) fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
+    match typ {
+        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
+        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
+        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
+        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
+        LuaType::Intersection(intersection) => {
+            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
+        }
+        _ => None,
+    }
+}
+
+fn prefer_class_assignment_type_from_iter<'a>(
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    for typ in types {
+        if let Some(class_type) = prefer_class_assignment_type(typ) {
+            return Some(class_type);
+        }
+    }
+
+    None
+}
+
+pub(crate) fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
+    if is_same_class_type(typ, class_type) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
+        LuaType::Instance(instance) => {
+            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
+                || is_table_bootstrap_type(typ)
+        }
+        LuaType::Union(union) => union
+            .types()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
+        _ => is_table_bootstrap_type(typ),
+    }
+}
+
+pub(crate) fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
+    if is_table_bootstrap_type(typ) {
+        return true;
+    }
+
+    match typ {
+        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
+        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .all(is_class_neutral_bootstrap_type),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
+        _ => false,
+    }
+}
+
+pub(crate) fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
+    match (
+        class_decl_id_from_type(left),
+        class_decl_id_from_type(right),
+    ) {
+        (Some(left_id), Some(right_id)) => left_id == right_id,
+        _ => false,
+    }
+}
+
+pub(crate) fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
+    match typ {
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
+        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
+        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
+        _ => None,
+    }
+}
+
+pub(crate) fn is_table_bootstrap_type(typ: &LuaType) -> bool {
+    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
 }
 
 pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: LuaType) -> LuaType {
@@ -289,6 +481,10 @@ pub struct LuaTypeIndex {
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaType>>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
+    definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
+    inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
+    support_file_dependents: HashMap<FileId, HashSet<FileId>>,
 }
 
 impl Default for LuaTypeIndex {
@@ -308,6 +504,10 @@ impl LuaTypeIndex {
             supers: HashMap::new(),
             types: HashMap::new(),
             in_filed_type_owner: HashMap::new(),
+            fact_metadata: HashMap::new(),
+            definition_facts: HashMap::new(),
+            inference_events_by_file: HashMap::new(),
+            support_file_dependents: HashMap::new(),
         }
     }
 
@@ -583,23 +783,175 @@ impl LuaTypeIndex {
         if self.types.contains_key(&owner) {
             return;
         }
+        let file_id = owner.get_file_id();
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
-            .entry(owner.get_file_id())
+            .entry(file_id)
             .or_default()
             .insert(owner);
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
+        let file_id = owner.get_file_id();
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
-            .entry(owner.get_file_id())
+            .entry(file_id)
             .or_default()
-            .insert(owner);
+            .insert(owner.clone());
+        if self.fact_metadata.remove(&owner).is_some() {
+            self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+        }
+    }
+
+    pub fn bind_type_fact(
+        &mut self,
+        owner: LuaTypeOwner,
+        cache: LuaTypeCache,
+        metadata: LuaTypeFactMetadata,
+    ) {
+        if self.types.contains_key(&owner) {
+            return;
+        }
+
+        let file_id = owner.get_file_id();
+        let metadata = metadata.normalized();
+        self.types.insert(owner.clone(), cache);
+        self.in_filed_type_owner
+            .entry(file_id)
+            .or_default()
+            .insert(owner.clone());
+        self.fact_metadata.insert(owner, metadata);
+        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+    }
+
+    pub fn force_bind_type_fact(
+        &mut self,
+        owner: LuaTypeOwner,
+        cache: LuaTypeCache,
+        metadata: LuaTypeFactMetadata,
+    ) {
+        let file_id = self.force_bind_type_fact_unchecked(owner, cache, metadata);
+        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+    }
+
+    pub fn get_type_fact(&self, owner: &LuaTypeOwner) -> Option<LuaTypeFact> {
+        let cache = self.types.get(owner)?;
+        let fact = match self.fact_metadata.get(owner) {
+            Some(metadata) => LuaTypeFact::from_normalized_parts(
+                cache.as_type().clone(),
+                metadata.confidence,
+                metadata.base_provenance_kind,
+                metadata.provenance.clone(),
+            ),
+            None => plain_cache_fact(cache),
+        };
+        Some(fact)
+    }
+
+    pub fn bind_definition_fact(&mut self, definition: LuaDefinitionId, fact: LuaTypeFact) {
+        let file_id = self.bind_definition_fact_unchecked(definition, fact);
+        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+    }
+
+    pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
+        self.definition_facts.get(definition)
+    }
+
+    pub fn get_inference_events_for_file(&self, file_id: FileId) -> &[LuaInferenceDiagnosticEvent] {
+        self.inference_events_by_file
+            .get(&file_id)
+            .map(AsRef::as_ref)
+            .unwrap_or_default()
+    }
+
+    pub fn files_depending_on_inference_support(
+        &self,
+        file_ids: &HashSet<FileId>,
+    ) -> HashSet<FileId> {
+        let mut dependents = HashSet::new();
+        for file_id in file_ids {
+            if let Some(files) = self.support_file_dependents.get(file_id) {
+                dependents.extend(files.iter().copied());
+            }
+        }
+        dependents
     }
 
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         self.types.get(owner)
+    }
+
+    pub(crate) fn force_bind_type_fact_unchecked(
+        &mut self,
+        owner: LuaTypeOwner,
+        cache: LuaTypeCache,
+        metadata: LuaTypeFactMetadata,
+    ) -> FileId {
+        let file_id = owner.get_file_id();
+        let metadata = metadata.normalized();
+        self.types.insert(owner.clone(), cache);
+        self.in_filed_type_owner
+            .entry(file_id)
+            .or_default()
+            .insert(owner.clone());
+        self.fact_metadata.insert(owner, metadata);
+        file_id
+    }
+
+    pub(crate) fn bind_definition_fact_unchecked(
+        &mut self,
+        definition: LuaDefinitionId,
+        fact: LuaTypeFact,
+    ) -> FileId {
+        let file_id = definition.file_id();
+        self.definition_facts.insert(definition, fact);
+        file_id
+    }
+
+    pub(crate) fn rebuild_inference_derived_state(&mut self, changed_files: &HashSet<FileId>) {
+        if changed_files.is_empty() {
+            return;
+        }
+
+        let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> = HashMap::new();
+        let mut support_file_dependents = HashMap::new();
+
+        for (owner, metadata) in &self.fact_metadata {
+            let Some(cache) = self.types.get(owner) else {
+                continue;
+            };
+            let fact = LuaTypeFact::from_normalized_parts(
+                cache.as_type().clone(),
+                metadata.confidence,
+                metadata.base_provenance_kind,
+                metadata.provenance.clone(),
+            );
+            collect_fact_derived_state(
+                owner.get_file_id(),
+                &fact,
+                &mut events_by_file,
+                &mut support_file_dependents,
+            );
+        }
+
+        for (definition, fact) in &self.definition_facts {
+            collect_fact_derived_state(
+                definition.file_id(),
+                fact,
+                &mut events_by_file,
+                &mut support_file_dependents,
+            );
+        }
+
+        self.inference_events_by_file = events_by_file
+            .into_iter()
+            .map(|(file_id, mut events)| {
+                events.sort_by(|left, right| left.event.stable_cmp(&right.event));
+                events.dedup_by(|left, right| left.event == right.event);
+                (file_id, events.into())
+            })
+            .collect();
+        self.support_file_dependents = support_file_dependents;
     }
 
     pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
@@ -627,9 +979,42 @@ impl LuaTypeIndex {
             })
             .collect();
 
+        let mut changed_files = HashSet::new();
         for (owner, new_cache) in updates {
+            changed_files.insert(owner.get_file_id());
             self.types.insert(owner, new_cache);
         }
+        self.rebuild_inference_derived_state(&changed_files);
+    }
+
+    pub fn replace_table_const_types(
+        &mut self,
+        replacements: &HashMap<InFiled<TextRange>, LuaType>,
+    ) {
+        if replacements.is_empty() {
+            return;
+        }
+
+        let updates: Vec<(LuaTypeOwner, LuaTypeCache)> = self
+            .types
+            .iter()
+            .filter_map(|(owner, cache)| {
+                replace_table_consts_in_type(cache.as_type(), replacements).map(|new_type| {
+                    let new_cache = match cache {
+                        LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
+                        LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
+                    };
+                    (owner.clone(), new_cache)
+                })
+            })
+            .collect();
+
+        let mut changed_files = HashSet::new();
+        for (owner, new_cache) in updates {
+            changed_files.insert(owner.get_file_id());
+            self.types.insert(owner, new_cache);
+        }
+        self.rebuild_inference_derived_state(&changed_files);
     }
 
     pub fn files_with_type_caches_referencing_files(
@@ -714,6 +1099,41 @@ fn type_references_other_file(
 
 impl LuaIndex for LuaTypeIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.remove_files(std::slice::from_ref(&file_id));
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let mut changed_files = HashSet::new();
+        for &file_id in file_ids {
+            if changed_files.insert(file_id) {
+                self.remove_file_raw(file_id);
+            }
+        }
+
+        self.definition_facts
+            .retain(|definition, _| !changed_files.contains(&definition.file_id()));
+
+        self.rebuild_inference_derived_state(&changed_files);
+    }
+
+    fn clear(&mut self) {
+        self.file_namespace.clear();
+        self.file_using_namespace.clear();
+        self.file_types.clear();
+        self.full_name_type_map.clear();
+        self.generic_params.clear();
+        self.supers.clear();
+        self.types.clear();
+        self.in_filed_type_owner.clear();
+        self.fact_metadata.clear();
+        self.definition_facts.clear();
+        self.inference_events_by_file.clear();
+        self.support_file_dependents.clear();
+    }
+}
+
+impl LuaTypeIndex {
+    fn remove_file_raw(&mut self, file_id: FileId) {
         self.file_namespace.remove(&file_id);
         self.file_using_namespace.remove(&file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
@@ -749,19 +1169,57 @@ impl LuaIndex for LuaTypeIndex {
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
                 self.types.remove(&type_owner);
+                self.fact_metadata.remove(&type_owner);
             }
         }
     }
+}
 
-    fn clear(&mut self) {
-        self.file_namespace.clear();
-        self.file_using_namespace.clear();
-        self.file_types.clear();
-        self.full_name_type_map.clear();
-        self.generic_params.clear();
-        self.supers.clear();
-        self.types.clear();
-        self.in_filed_type_owner.clear();
+fn collect_fact_derived_state(
+    owner_file_id: FileId,
+    fact: &LuaTypeFact,
+    events_by_file: &mut HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
+    support_file_dependents: &mut HashMap<FileId, HashSet<FileId>>,
+) {
+    for step in fact.provenance() {
+        events_by_file
+            .entry(step.event.source.file_id)
+            .or_default()
+            .push(LuaInferenceDiagnosticEvent {
+                event: step.event.clone(),
+                fact: fact.clone(),
+            });
+        for support in step.support.iter() {
+            support_file_dependents
+                .entry(support.file_id())
+                .or_default()
+                .insert(owner_file_id);
+        }
+    }
+}
+
+fn plain_cache_fact(cache: &LuaTypeCache) -> LuaTypeFact {
+    let typ = cache.as_type().clone();
+    match cache {
+        LuaTypeCache::DocType(_) => LuaTypeFact::from_normalized_parts(
+            typ,
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        ),
+        LuaTypeCache::InferType(LuaType::Unknown) => LuaTypeFact::unknown(),
+        LuaTypeCache::InferType(LuaType::Any) => LuaTypeFact::from_normalized_parts(
+            typ,
+            LuaInferenceConfidence::Unknown,
+            None,
+            Arc::from([]),
+        ),
+        LuaTypeCache::InferType(_) => LuaTypeFact::from_normalized_parts(
+            typ,
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ConcreteValue),
+            Arc::from([]),
+        ),
     }
 }
 
@@ -804,7 +1262,175 @@ pub fn first_param_may_not_self(typ: &LuaType) -> bool {
     }
 
     if let LuaType::Union(u) = typ {
-        return u.into_vec().iter().any(first_param_may_not_self);
+        return u.types().any(first_param_may_not_self);
     }
     false
+}
+
+#[cfg(test)]
+mod batch_removal_tests {
+    use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
+    use rowan::TextRange;
+
+    use super::*;
+    use crate::{LuaDeclId, LuaDefinitionId};
+
+    fn file_id(id: u32) -> FileId {
+        FileId::new(id)
+    }
+
+    fn owner(file_id: FileId, position: u32) -> LuaTypeOwner {
+        LuaTypeOwner::Decl(LuaDeclId::new(file_id, position.into()))
+    }
+
+    fn source(file_id: FileId, position: u32) -> InFiled<LuaSyntaxId> {
+        InFiled::new(
+            file_id,
+            LuaSyntaxId::new(
+                LuaKind::Syntax(LuaSyntaxKind::LocalName),
+                TextRange::new(position.into(), (position + 1).into()),
+            ),
+        )
+    }
+
+    fn metadata(
+        fact_owner: LuaTypeOwner,
+        source_file: FileId,
+        support_file: FileId,
+    ) -> LuaTypeFactMetadata {
+        LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Anchored,
+            base_provenance_kind: None,
+            provenance: Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::TypeOwner(fact_owner),
+                    kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                    source: source(source_file, 20),
+                },
+                found_type: None,
+                support: Arc::from([LuaInferenceNodeId::TypeOwner(owner(support_file, 30))]),
+            }]),
+        }
+    }
+
+    fn add_type(index: &mut LuaTypeIndex, file_id: FileId, name: &str) {
+        index.add_type_decl(
+            file_id,
+            LuaTypeDecl::new(
+                file_id,
+                TextRange::new(0.into(), 1.into()),
+                name.to_owned(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                LuaTypeDeclId::global(name),
+            ),
+        );
+    }
+
+    fn populated_index() -> LuaTypeIndex {
+        let first = file_id(1);
+        let second = file_id(2);
+        let survivor = file_id(3);
+        let source_file = file_id(4);
+        let mut index = LuaTypeIndex::new();
+
+        index.add_file_namespace(first, "first".to_owned());
+        index.add_file_using_namespace(second, "second".to_owned());
+        index.add_file_namespace(survivor, "survivor".to_owned());
+        add_type(&mut index, first, "Removed");
+        add_type(&mut index, second, "Shared");
+        add_type(&mut index, survivor, "Shared");
+        add_type(&mut index, survivor, "Survivor");
+
+        let shared = LuaTypeDeclId::global("Shared");
+        index.add_super_type(shared.clone(), second, LuaType::String);
+        index.add_super_type(shared, survivor, LuaType::Number);
+
+        let first_owner = owner(first, 10);
+        let second_owner = owner(second, 10);
+        let survivor_owner = owner(survivor, 10);
+        index.force_bind_type_fact(
+            first_owner.clone(),
+            LuaTypeCache::InferType(LuaType::String),
+            metadata(first_owner, source_file, first),
+        );
+        index.force_bind_type_fact(
+            second_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Number),
+            metadata(second_owner, source_file, second),
+        );
+        index.force_bind_type_fact(
+            survivor_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Boolean),
+            metadata(survivor_owner, source_file, first),
+        );
+
+        index.bind_definition_fact(
+            LuaDefinitionId::Declaration(LuaDeclId::new(first, 40.into())),
+            LuaTypeFact::certain(LuaType::String),
+        );
+        index.bind_definition_fact(
+            LuaDefinitionId::Declaration(LuaDeclId::new(survivor, 40.into())),
+            LuaTypeFact::certain(LuaType::Number),
+        );
+        index
+    }
+
+    fn type_cache_types(index: &LuaTypeIndex) -> HashMap<LuaTypeOwner, LuaType> {
+        index
+            .types
+            .iter()
+            .map(|(owner, cache)| (owner.clone(), cache.as_type().clone()))
+            .collect()
+    }
+
+    fn assert_same_removal_state(left: &LuaTypeIndex, right: &LuaTypeIndex) {
+        assert_eq!(left.file_namespace, right.file_namespace);
+        assert_eq!(left.file_using_namespace, right.file_using_namespace);
+        assert_eq!(left.file_types, right.file_types);
+        assert_eq!(left.full_name_type_map, right.full_name_type_map);
+        assert_eq!(left.generic_params, right.generic_params);
+        assert_eq!(left.supers, right.supers);
+        assert_eq!(type_cache_types(left), type_cache_types(right));
+        assert_eq!(left.in_filed_type_owner, right.in_filed_type_owner);
+        assert_eq!(left.fact_metadata, right.fact_metadata);
+        assert_eq!(left.definition_facts, right.definition_facts);
+        assert_eq!(
+            left.inference_events_by_file,
+            right.inference_events_by_file
+        );
+        assert_eq!(left.support_file_dependents, right.support_file_dependents);
+    }
+
+    #[test]
+    fn batch_removal_matches_sequential_removal_for_surviving_inference_state() {
+        let first = file_id(1);
+        let second = file_id(2);
+        let survivor = file_id(3);
+        let source_file = file_id(4);
+        let survivor_owner = owner(survivor, 10);
+        let survivor_definition = LuaDefinitionId::Declaration(LuaDeclId::new(survivor, 40.into()));
+
+        let mut sequential = populated_index();
+        sequential.remove(first);
+        sequential.remove(second);
+
+        let mut batched = populated_index();
+        batched.remove_files(&[second, first, second]);
+
+        assert_same_removal_state(&sequential, &batched);
+        assert_eq!(
+            batched.get_type_fact(&survivor_owner).unwrap().typ(),
+            &LuaType::Boolean
+        );
+        assert_eq!(
+            batched.get_definition_fact(&survivor_definition),
+            Some(&LuaTypeFact::certain(LuaType::Number))
+        );
+        assert_eq!(batched.get_inference_events_for_file(source_file).len(), 1);
+        assert_eq!(
+            batched.files_depending_on_inference_support(&HashSet::from([first])),
+            HashSet::from([survivor])
+        );
+    }
 }

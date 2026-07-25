@@ -8,11 +8,12 @@ use rowan::TextSize;
 
 use crate::{
     AccessorFuncCallMetadata, DbIndex, FileId, GlobalId, GmodClassCallArg, GmodClassCallLiteral,
-    GmodRealm, GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
+    GmodScriptedClassCallKind, GmodScriptedClassCallMetadata, InFiled, InferFailReason,
     LuaMemberKey, LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSignatureId, LuaType,
     LuaTypeDeclId,
     compilation::analyzer::{lua::LuaAnalyzer, unresolve::UnResolveSpecialCall},
     get_member_value_expr,
+    semantic::find_members_with_key,
 };
 
 #[derive(Debug, Clone, Copy)]
@@ -26,6 +27,7 @@ pub(in crate::compilation::analyzer) struct SpecialCallDirectMatcher {
     special_signatures: FxHashSet<LuaSignatureId>,
     name_expr_names: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
     access_paths: FxHashMap<String, Vec<SpecialCallDirectBinding>>,
+    receiver_member_names: FxHashSet<String>,
 }
 
 impl SpecialCallDirectMatcher {
@@ -59,6 +61,10 @@ impl SpecialCallDirectMatcher {
             .into_iter()
             .flatten()
             .any(|binding| binding.is_visible_to(db, caller_file_id, caller_position))
+    }
+
+    fn may_have_receiver_member_signature(&self, member_name: &str) -> bool {
+        self.receiver_member_names.contains(member_name)
     }
 }
 
@@ -112,6 +118,11 @@ pub(in crate::compilation::analyzer) fn build_special_call_direct_matcher(
             .filter_map(|(signature_id, signature)| {
                 signature.has_special_call_params().then_some(*signature_id)
             })
+            .collect(),
+        receiver_member_names: db
+            .get_signature_index()
+            .receiver_out_param_member_names()
+            .map(str::to_string)
             .collect(),
         ..Default::default()
     };
@@ -190,6 +201,13 @@ fn add_direct_special_call_var_expr(
             let Some(access_path) = index_expr.get_access_path() else {
                 return;
             };
+            if let Some(member_name) = access_path.rsplit('.').next()
+                && !member_name.is_empty()
+            {
+                matcher
+                    .receiver_member_names
+                    .insert(member_name.to_string());
+            }
             matcher
                 .access_paths
                 .entry(access_path)
@@ -313,6 +331,63 @@ fn get_name_expr_special_call_reason(
     }
 }
 
+fn index_expr_has_receiver_special_call_signature(
+    analyzer: &mut LuaAnalyzer,
+    index_expr: &LuaIndexExpr,
+) -> bool {
+    let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(member_key) = get_static_member_key(index_expr) else {
+        return false;
+    };
+    let LuaMemberKey::Name(member_name) = &member_key else {
+        return false;
+    };
+    if !analyzer
+        .special_call_direct_matcher
+        .may_have_receiver_member_signature(member_name.as_str())
+    {
+        return false;
+    }
+    let Ok(receiver_type) = analyzer.infer_expr(&prefix_expr) else {
+        return false;
+    };
+    find_members_with_key(analyzer.db, &receiver_type, member_key, true).is_some_and(|members| {
+        members.into_iter().any(|member_info| {
+            type_has_special_call_signature(analyzer.special_call_direct_matcher, &member_info.typ)
+                || member_info
+                    .property_owner_id
+                    .as_ref()
+                    .and_then(|semantic_decl| {
+                        type_cache_for_semantic_decl(analyzer.db, semantic_decl)
+                    })
+                    .is_some_and(|typ| {
+                        type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ)
+                    })
+        })
+    })
+}
+
+fn type_cache_for_semantic_decl(
+    db: &DbIndex,
+    semantic_decl: &crate::LuaSemanticDeclId,
+) -> Option<LuaType> {
+    let owner = match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => (*decl_id).into(),
+        crate::LuaSemanticDeclId::Member(member_id) => (*member_id).into(),
+        crate::LuaSemanticDeclId::Signature(signature_id) => {
+            return Some(LuaType::Signature(*signature_id));
+        }
+        crate::LuaSemanticDeclId::TypeDecl(type_decl_id) => {
+            return Some(LuaType::Def(type_decl_id.clone()));
+        }
+    };
+    db.get_type_index()
+        .get_type_cache(&owner)
+        .map(|type_cache| type_cache.as_type().clone())
+}
+
 fn local_decl_special_call_state(analyzer: &LuaAnalyzer, name_expr: &LuaNameExpr) -> Option<bool> {
     let decl_id = analyzer
         .db
@@ -335,6 +410,10 @@ fn get_index_expr_special_call_reason(
     analyzer: &mut LuaAnalyzer,
     index_expr: &LuaIndexExpr,
 ) -> Option<InferFailReason> {
+    if index_expr_has_receiver_special_call_signature(analyzer, index_expr) {
+        return Some(InferFailReason::None);
+    }
+
     match resolve_cached_index_expr_type(analyzer, index_expr) {
         Ok(Some(typ))
             if type_has_special_call_signature(analyzer.special_call_direct_matcher, &typ) =>
@@ -996,8 +1075,7 @@ fn type_has_special_call_signature(matcher: &SpecialCallDirectMatcher, typ: &Lua
         }),
         LuaType::TypeGuard(inner) => type_has_special_call_signature(matcher, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .any(|union_type| type_has_special_call_signature(matcher, union_type)),
         LuaType::Intersection(intersection) => intersection
             .get_types()
@@ -1050,7 +1128,7 @@ fn type_has_special_call_operator_signature(
         LuaType::TypeGuard(inner) => {
             type_has_special_call_operator_signature(db, matcher, file_id, caller_position, inner)
         }
-        LuaType::Union(union) => union.into_vec().iter().any(|union_type| {
+        LuaType::Union(union) => union.types().any(|union_type| {
             type_has_special_call_operator_signature(
                 db,
                 matcher,
@@ -1124,7 +1202,7 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
         LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Union(union) => union.types().any(type_contains_str_tpl_ref),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()
@@ -1149,13 +1227,11 @@ fn is_realm_compatible(
     }
 
     let infer_index = db.get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
-    let candidate_realm = infer_index.get_realm_at_offset(&candidate_file_id, candidate_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
+    let candidate_mask =
+        infer_index.get_state_mask_at_offset(&candidate_file_id, candidate_position);
 
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
+    caller_mask.is_compatible_with(candidate_mask)
 }
 
 fn collect_accessorfunc_annotated_call(
@@ -1291,12 +1367,29 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             .get_name_token()
             .and_then(|t| GmodScriptedClassCallKind::from_call_name(t.get_name_text())),
         Some(LuaExpr::IndexExpr(index_expr)) => {
+            let scripted_ents_register = index_expr
+                .get_prefix_expr()
+                .and_then(|expr| match expr {
+                    LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                    _ => None,
+                })
+                .is_some_and(|name| name == "scripted_ents");
             index_expr.get_index_key().and_then(|key| match &key {
                 LuaIndexKey::Name(name_token) => {
-                    GmodScriptedClassCallKind::from_call_name(name_token.get_name_text())
+                    let name = name_token.get_name_text();
+                    if scripted_ents_register && name == "Register" {
+                        Some(GmodScriptedClassCallKind::ScriptedEntRegister)
+                    } else {
+                        GmodScriptedClassCallKind::from_call_name(name)
+                    }
                 }
                 LuaIndexKey::String(string_token) => {
-                    GmodScriptedClassCallKind::from_call_name(&string_token.get_value())
+                    let name = string_token.get_value();
+                    if scripted_ents_register && name == "Register" {
+                        Some(GmodScriptedClassCallKind::ScriptedEntRegister)
+                    } else {
+                        GmodScriptedClassCallKind::from_call_name(&name)
+                    }
                 }
                 _ => None,
             })
@@ -1314,6 +1407,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
     if kind != GmodScriptedClassCallKind::DefineBaseClass
         && kind != GmodScriptedClassCallKind::DeriveGamemode
         && kind != GmodScriptedClassCallKind::AccessorFunc
+        && kind != GmodScriptedClassCallKind::ScriptedEntRegister
         && !analyzer.is_scripted_class_scope
     {
         return;
@@ -1328,6 +1422,7 @@ fn collect_gmod_scripted_class_call(analyzer: &mut LuaAnalyzer, call_expr: &LuaC
             syntax_id: call_expr.get_syntax_id(),
             literal_args,
             args,
+            field_args: Vec::new(),
             inheritance_roles: None,
             network_var_roles: None,
             vgui_panel_roles: None,

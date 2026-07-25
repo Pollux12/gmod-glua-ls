@@ -14,7 +14,9 @@ use crate::{
 };
 
 pub const CALL_ARG_ATTRIBUTE: &str = "call_arg";
+pub const CALL_ARG_FIELD_ATTRIBUTE: &str = "call_arg_field";
 pub const OVERLOAD_CALL_ARG_ATTRIBUTE: &str = "overload_call_arg";
+pub const OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE: &str = "overload_call_arg_field";
 
 #[derive(Debug)]
 pub struct LuaSignature {
@@ -30,6 +32,33 @@ pub struct LuaSignature {
     pub nodiscard: Option<LuaNoDiscard>,
     pub is_vararg: bool,
     require_guard_param: Option<usize>,
+    nil_return_guard_params: Vec<usize>,
+    return_correlations: Vec<LuaReturnCorrelation>,
+    direct_param_return_alias: Option<usize>,
+    /// Param index of a classname string passed to a class-name factory
+    /// (`vgui.Create` / `ents.Create` / any `` `T` `` create) whose result is returned.
+    class_name_param_return_alias: Option<usize>,
+    falsy_param_nil_free_return_slots: Vec<LuaFalsyParamNilFreeReturnSlot>,
+    falsy_param_return_aliases: Vec<LuaFalsyParamReturnAlias>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaReturnCorrelation {
+    pub discriminant_slot: usize,
+    pub implied_non_nil_slots: Vec<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaFalsyParamNilFreeReturnSlot {
+    pub param_idx: usize,
+    pub return_slot: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LuaFalsyParamReturnAlias {
+    pub falsy_param_idx: usize,
+    pub aliased_param_idx: usize,
+    pub return_slot: usize,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -37,7 +66,14 @@ pub struct LuaCallArgRole {
     pub param_idx: usize,
     pub domain: String,
     pub role: String,
+    pub field_path: Vec<String>,
     pub priority: Option<i64>,
+}
+
+impl LuaCallArgRole {
+    pub fn is_direct_arg(&self) -> bool {
+        self.field_path.is_empty()
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,7 +103,44 @@ impl LuaSignature {
             nodiscard: None,
             is_vararg: false,
             require_guard_param: None,
+            nil_return_guard_params: Vec::new(),
+            return_correlations: Vec::new(),
+            direct_param_return_alias: None,
+            class_name_param_return_alias: None,
+            falsy_param_nil_free_return_slots: Vec::new(),
+            falsy_param_return_aliases: Vec::new(),
         }
+    }
+
+    pub fn set_return_correlations(&mut self, correlations: Vec<LuaReturnCorrelation>) {
+        self.return_correlations = correlations;
+    }
+
+    pub fn return_correlation_implies(
+        &self,
+        discriminant_slot: usize,
+        implied_slot: usize,
+    ) -> bool {
+        self.return_correlations.iter().any(|correlation| {
+            correlation.discriminant_slot == discriminant_slot
+                && correlation.implied_non_nil_slots.contains(&implied_slot)
+        })
+    }
+
+    pub fn set_direct_param_return_alias(&mut self, param_idx: usize) {
+        self.direct_param_return_alias = Some(param_idx);
+    }
+
+    pub fn direct_param_return_alias(&self) -> Option<usize> {
+        self.direct_param_return_alias
+    }
+
+    pub fn set_class_name_param_return_alias(&mut self, param_idx: usize) {
+        self.class_name_param_return_alias = Some(param_idx);
+    }
+
+    pub fn class_name_param_return_alias(&self) -> Option<usize> {
+        self.class_name_param_return_alias
     }
 
     pub fn require_guard_param(&self) -> Option<usize> {
@@ -76,6 +149,50 @@ impl LuaSignature {
 
     pub fn set_require_guard_param(&mut self, param_idx: usize) {
         self.require_guard_param = Some(param_idx);
+    }
+
+    pub fn add_nil_return_guard_param(&mut self, param_idx: usize) {
+        if !self.nil_return_guard_params.contains(&param_idx) {
+            self.nil_return_guard_params.push(param_idx);
+        }
+    }
+
+    pub fn nil_return_guard_params(&self) -> &[usize] {
+        &self.nil_return_guard_params
+    }
+
+    pub fn add_falsy_param_nil_free_return_slot(&mut self, param_idx: usize, return_slot: usize) {
+        let fact = LuaFalsyParamNilFreeReturnSlot {
+            param_idx,
+            return_slot,
+        };
+        if !self.falsy_param_nil_free_return_slots.contains(&fact) {
+            self.falsy_param_nil_free_return_slots.push(fact);
+        }
+    }
+
+    pub fn falsy_param_nil_free_return_slots(&self) -> &[LuaFalsyParamNilFreeReturnSlot] {
+        &self.falsy_param_nil_free_return_slots
+    }
+
+    pub fn add_falsy_param_return_alias(
+        &mut self,
+        falsy_param_idx: usize,
+        aliased_param_idx: usize,
+        return_slot: usize,
+    ) {
+        let fact = LuaFalsyParamReturnAlias {
+            falsy_param_idx,
+            aliased_param_idx,
+            return_slot,
+        };
+        if !self.falsy_param_return_aliases.contains(&fact) {
+            self.falsy_param_return_aliases.push(fact);
+        }
+    }
+
+    pub fn falsy_param_return_aliases(&self) -> &[LuaFalsyParamReturnAlias] {
+        &self.falsy_param_return_aliases
     }
 
     pub fn is_generic(&self) -> bool {
@@ -91,6 +208,8 @@ impl LuaSignature {
             type_contains_str_tpl_ref(&param_info.type_ref)
                 || param_info.get_attribute_by_name("constructor").is_some()
         }) || !self.out_params.is_empty()
+            || self.direct_param_return_alias.is_some()
+            || self.class_name_param_return_alias.is_some()
             || self
                 .overloads
                 .iter()
@@ -102,6 +221,9 @@ impl LuaSignature {
             param_info
                 .get_attribute_by_name(CALL_ARG_ATTRIBUTE)
                 .is_some()
+                || param_info
+                    .get_attribute_by_name(CALL_ARG_FIELD_ATTRIBUTE)
+                    .is_some()
         }) || self
             .overloads
             .iter()
@@ -296,20 +418,38 @@ fn visit_call_arg_roles_from_param_attribute<F>(
     F: FnMut(&LuaCallArgRole),
 {
     for attribute_use in param_info.iter_attributes_by_name(CALL_ARG_ATTRIBUTE) {
-        let Some(domain) = attribute_string_arg(attribute_use, "domain") else {
+        let Some(role) = call_arg_role_from_attribute(param_idx, attribute_use, Vec::new()) else {
             continue;
         };
-        let Some(role) = attribute_string_arg(attribute_use, "role") else {
-            continue;
-        };
-        let priority = attribute_integer_arg(attribute_use, "priority");
-        visitor(&LuaCallArgRole {
-            param_idx,
-            domain,
-            role,
-            priority,
-        });
+        visitor(&role);
     }
+
+    for attribute_use in param_info.iter_attributes_by_name(CALL_ARG_FIELD_ATTRIBUTE) {
+        let Some(field_path) = attribute_field_path_arg(attribute_use, "field_path") else {
+            continue;
+        };
+        let Some(role) = call_arg_role_from_attribute(param_idx, attribute_use, field_path) else {
+            continue;
+        };
+        visitor(&role);
+    }
+}
+
+fn call_arg_role_from_attribute(
+    param_idx: usize,
+    attribute_use: &LuaAttributeUse,
+    field_path: Vec<String>,
+) -> Option<LuaCallArgRole> {
+    let domain = attribute_string_arg(attribute_use, "domain")?;
+    let role = attribute_string_arg(attribute_use, "role")?;
+    let priority = attribute_integer_arg(attribute_use, "priority");
+    Some(LuaCallArgRole {
+        param_idx,
+        domain,
+        role,
+        field_path,
+        priority,
+    })
 }
 
 fn attribute_string_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<String> {
@@ -324,6 +464,16 @@ fn attribute_integer_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<
         LuaType::DocIntegerConst(value) | LuaType::IntegerConst(value) => Some(*value),
         _ => None,
     }
+}
+
+fn attribute_field_path_arg(attribute_use: &LuaAttributeUse, name: &str) -> Option<Vec<String>> {
+    let path = attribute_string_arg(attribute_use, name)?;
+    let field_path = path
+        .split('.')
+        .filter(|segment| !segment.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    (!field_path.is_empty()).then_some(field_path)
 }
 
 pub fn visit_call_arg_roles_from_type<F>(
@@ -400,7 +550,7 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
         LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Union(union) => union.types().any(type_contains_str_tpl_ref),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()
@@ -473,6 +623,26 @@ mod tests {
         )
     }
 
+    fn call_arg_field_attribute(domain: &str, role: &str, field_path: &str) -> LuaAttributeUse {
+        LuaAttributeUse::new(
+            LuaTypeDeclId::global(super::CALL_ARG_FIELD_ATTRIBUTE),
+            vec![
+                (
+                    "domain".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(domain).into())),
+                ),
+                (
+                    "role".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(role).into())),
+                ),
+                (
+                    "field_path".to_string(),
+                    Some(LuaType::DocStringConst(SmolStr::new(field_path).into())),
+                ),
+            ],
+        )
+    }
+
     #[test]
     fn call_arg_roles_for_param_keeps_multiple_attributes() {
         let mut signature = LuaSignature::new();
@@ -498,15 +668,52 @@ mod tests {
         assert_eq!(roles[0].domain, "gmod.vgui_panel");
         assert_eq!(roles[0].role, "define");
         assert_eq!(roles[0].param_idx, 0);
+        assert!(roles[0].field_path.is_empty());
         assert_eq!(roles[1].domain, "gmod.derma_skin");
         assert_eq!(roles[1].role, "reference");
         assert_eq!(roles[1].param_idx, 0);
+        assert!(roles[1].field_path.is_empty());
+    }
+
+    #[test]
+    fn call_arg_roles_for_param_keeps_field_path_attributes() {
+        let mut signature = LuaSignature::new();
+        signature.params.push("panel".to_string());
+        signature.param_docs.insert(
+            0,
+            LuaDocParamInfo {
+                name: "panel".to_string(),
+                type_ref: LuaType::Table,
+                default_value: None,
+                nullable: false,
+                description: None,
+                attributes: Some(vec![call_arg_field_attribute(
+                    "gmod.vgui_panel",
+                    "base",
+                    "Base.Name",
+                )]),
+            },
+        );
+
+        let roles = signature.call_arg_roles_for_param(0);
+
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0].domain, "gmod.vgui_panel");
+        assert_eq!(roles[0].role, "base");
+        assert_eq!(roles[0].param_idx, 0);
+        assert_eq!(roles[0].field_path, vec!["Base", "Name"]);
     }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LuaOutParamRoot {
+    Param(usize),
+    SelfReceiver,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaOutParamInfo {
-    pub param_idx: usize,
+    pub root: LuaOutParamRoot,
     pub field_path: Vec<String>,
     pub type_ref: LuaType,
 }
@@ -525,6 +732,7 @@ pub enum LuaDocDefaultValue {
     Boolean(bool),
     Number(String),
     String(String),
+    Expression(String),
 }
 
 #[derive(Debug, Clone)]
@@ -596,6 +804,11 @@ impl<'de> Deserialize<'de> for LuaSignatureId {
 }
 
 impl LuaSignatureId {
+    #[cfg(test)]
+    pub(crate) fn new(file_id: FileId, position: TextSize) -> Self {
+        Self { file_id, position }
+    }
+
     pub fn from_closure(file_id: FileId, closure: &LuaClosureExpr) -> Self {
         Self {
             file_id,

@@ -2,7 +2,7 @@
 mod test {
     use googletest::prelude::*;
 
-    use crate::{LuaDependencyKind, VirtualWorkspace};
+    use crate::{Emmyrc, LuaDependencyKind, VirtualWorkspace};
 
     #[gtest]
     fn test_dependency_edge_kinds_for_require_include_and_addcsluafile() {
@@ -47,6 +47,40 @@ mod test {
         assert_that!(
             kinds,
             unordered_elements_are![eq(&LuaDependencyKind::Require)]
+        );
+    }
+
+    #[gtest]
+    fn test_annotated_load_call_adds_dependency_edge() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let target_id = ws.def_file("lua/menu/mount/vgui/workshop.lua", "return {}");
+        let source_id = ws.def_file(
+            "lua/menu/mount/mount.lua",
+            r#"
+            vgui = vgui or {}
+
+            ---@[call_arg("gmod.load", "include")]
+            ---@param file string
+            function vgui.RegisterFile(file) end
+
+            vgui.RegisterFile("vgui/workshop.lua")
+            "#,
+        );
+
+        let dependency_index = ws.get_db_mut().get_file_dependencies_index();
+
+        let kinds = dependency_index
+            .get_dependency_kinds(&source_id, &target_id)
+            .cloned()
+            .unwrap_or_default();
+        assert_that!(
+            kinds,
+            unordered_elements_are![eq(&LuaDependencyKind::Include)]
         );
     }
 

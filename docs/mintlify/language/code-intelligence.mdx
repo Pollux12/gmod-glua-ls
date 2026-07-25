@@ -104,13 +104,13 @@ Press `F12` or right-click → **Go to Definition** to jump to where a function 
 - Your own functions and classes
 - `require()`d modules
 
-**Go to references** (`Shift+F12`) finds every use of a symbol across your workspace.
+**Find All References** (`Shift+F12`) finds every use of a symbol across your workspace.
 
 ---
 
 ## Symbol renaming
 
-Press `F2` to rename a variable, function, or field. GLuaLS applies the rename across all files in your workspace, including string-based accesses when `references.fuzzySearch` is enabled.
+Press `F2` to rename a variable, function, or field across your workspace. Set `references.shortStringSearch` to `true` if your project also stores symbol names in short strings.
 
 ---
 
@@ -143,11 +143,12 @@ Enable or disable with `semanticTokens.enable` in `.gluarc.json`.
 
 Code lens annotations appear above functions and class definitions:
 
-- **References count**: how many places call this function
+- **Reference count**: how many places use this symbol
 - **VGUI panel indicator**: links to the panel definition for VGUI components
+- **Network message count**: links to known senders and receivers
 
 Configure with `codeLens.enable` and `gmod.vgui.codeLensEnabled` in `.gluarc.json`.
 
-## VSCode integration
+## VS Code integration
 
 Code intelligence features work in VS Code after the extension starts. Use the [settings panel](/configuration/overview#settings-panel-recommended) or `.gluarc.json` to configure autocomplete, hover documentation, and go-to-definition. See [Completion settings](/configuration/completion) and [Hints & Hover settings](/configuration/hints-and-hover) for the full reference.

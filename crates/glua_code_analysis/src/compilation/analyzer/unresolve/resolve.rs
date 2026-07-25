@@ -12,21 +12,25 @@ use internment::ArcIntern;
 use rowan::TextSize;
 
 use crate::{
-    DbIndex, FileId, GmodRealm, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId,
-    LuaDeclTypeKind, LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey,
-    LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel,
+    DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
+    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
+    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
+    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
     SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
     compilation::analyzer::{
-        common::{add_member, bind_resolved_type},
-        lua::{analyze_return_point, compute_module_semantic_id, infer_for_range_iter_expr_func},
+        common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
+        lua::{
+            analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
+            infer_for_range_iter_expr_func, resolve_index_expr_member_owner_for_file,
+        },
         unresolve::UnResolveSpecialCall,
     },
-    db_index::{LuaFunctionType, LuaMemberOwner, LuaSignature, LuaSignatureId},
+    db_index::{LuaFunctionType, LuaMemberOwner, LuaOutParamRoot, LuaSignature, LuaSignatureId},
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
         get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
+        resolve_dynamic_field_member,
     },
 };
 use smol_str::SmolStr;
@@ -34,6 +38,7 @@ use smol_str::SmolStr;
 use super::{
     ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
     UnResolveModuleRef, UnResolveReturn, UnResolveTableField,
+    resolve_closure::inferred_return_tail_matching_documented_first,
 };
 
 pub fn try_resolve_decl(
@@ -100,8 +105,9 @@ pub fn try_resolve_member(
 ) -> ResolveResult {
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
+        let member_id = unresolve_member.member_id;
         let member_owner = match prefix_type {
-            LuaType::TableConst(in_file_range) => LuaMemberOwner::Element(in_file_range),
+            LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
             LuaType::Def(def_id) => {
                 let type_decl = db
                     .get_type_index()
@@ -111,28 +117,48 @@ pub fn try_resolve_member(
                 if type_decl.is_exact() {
                     return Ok(());
                 }
-                LuaMemberOwner::Type(def_id)
+                Some(LuaMemberOwner::Type(def_id))
             }
-            LuaType::Instance(instance) => LuaMemberOwner::Element(instance.get_range().clone()),
+            LuaType::Instance(instance) => {
+                Some(LuaMemberOwner::Element(instance.get_range().clone()))
+            }
             _ => {
-                // Some annotation bundles define methods as `function TypeName:Method()`
-                // without binding a typed declaration for `TypeName` in scope.
-                // If a global type exists for that name, attach unresolved members there.
-                let LuaExpr::NameExpr(name_expr) = prefix_expr else {
-                    return Ok(());
-                };
-                let Some(name_token) = name_expr.get_name_token() else {
-                    return Ok(());
-                };
-                let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
-                if db.get_type_index().get_type_decl(&type_decl_id).is_none() {
-                    return Ok(());
+                if matches!(prefix_expr, LuaExpr::IndexExpr(_)) {
+                    let dynamic_type = infer_dynamic_index_expr_shape(db, cache, prefix_expr)?;
+                    let Some((owner, _)) = resolve_index_expr_member_owner_for_file(
+                        &dynamic_type,
+                        Some(unresolve_member.file_id),
+                    ) else {
+                        return Err(InferFailReason::FieldNotFound);
+                    };
+                    Some(owner)
+                } else {
+                    // Some annotation bundles define methods as `function TypeName:Method()`
+                    // without binding a typed declaration for `TypeName` in scope. Expose those
+                    // runtime members through a matching class without replacing their real owner.
+                    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+                        return Err(InferFailReason::FieldNotFound);
+                    };
+                    let Some(name_token) = name_expr.get_name_token() else {
+                        return Ok(());
+                    };
+                    let type_decl_id = LuaTypeDeclId::global(name_token.get_name_text());
+                    let Some(type_decl) = db.get_type_index().get_type_decl(&type_decl_id) else {
+                        return Ok(());
+                    };
+                    if type_decl.is_class() {
+                        let _ = db.get_member_index_mut().add_member_alias_to_owner(
+                            LuaMemberOwner::Type(type_decl_id),
+                            member_id,
+                        );
+                    }
+                    None
                 }
-                LuaMemberOwner::Type(type_decl_id)
             }
         };
-        let member_id = unresolve_member.member_id;
-        add_member(db, member_owner, member_id);
+        if let Some(member_owner) = member_owner {
+            add_member(db, member_owner, member_id);
+        }
         unresolve_member.prefix = None;
     }
 
@@ -164,6 +190,26 @@ pub fn try_resolve_member(
 
     Ok(())
 }
+fn infer_dynamic_index_expr_shape(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Result<LuaType, InferFailReason> {
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return Err(InferFailReason::FieldNotFound);
+    };
+    let prefix_expr = index_expr
+        .get_prefix_expr()
+        .ok_or(InferFailReason::FieldNotFound)?;
+    let prefix_type = infer_expr(db, cache, prefix_expr)?;
+    let index_key = index_expr
+        .get_index_key()
+        .ok_or(InferFailReason::FieldNotFound)?;
+    let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
+    resolve_dynamic_field_member(db, cache, &prefix_type, &member_key, None)
+        .map(|resolution| resolution.typ)
+        .ok_or(InferFailReason::FieldNotFound)
+}
 
 fn cached_local_name_expr_type(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<LuaType> {
     let LuaExpr::NameExpr(name_expr) = expr else {
@@ -182,10 +228,7 @@ fn cached_local_name_expr_type(db: &DbIndex, file_id: FileId, expr: &LuaExpr) ->
 fn local_cached_type_is_informative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union
-            .into_vec()
-            .iter()
-            .any(local_cached_type_is_informative),
+        LuaType::Union(union) => union.types().any(local_cached_type_is_informative),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -240,8 +283,12 @@ pub fn try_resolve_table_field(
         None,
     );
     db.get_member_index_mut().add_member(owner_id, member);
-    db.get_type_index_mut()
-        .bind_type(member_id.into(), LuaTypeCache::InferType(decl_type.clone()));
+    write_type_cache(
+        db,
+        member_id.into(),
+        LuaTypeCache::InferType(decl_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
+    );
 
     merge_table_field_to_def(db, cache, table_expr, member_id);
     Ok(())
@@ -299,16 +346,54 @@ pub fn try_resolve_return_point(
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
+    let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
     let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
+
+    let inferred_return = return_docs_to_type(&return_docs);
+    let inherited_tail = db
+        .get_signature_index()
+        .get(&return_.signature_id)
+        .filter(|signature| {
+            signature.resolve_return == SignatureReturnStatus::DocResolve
+                && signature.return_docs.len() == 1
+        })
+        .and_then(|signature| {
+            inferred_return_tail_matching_documented_first(
+                &signature.return_docs[0].type_ref,
+                &inferred_return,
+                |slot| {
+                    return_correlations.iter().any(|correlation| {
+                        correlation.discriminant_slot == 0
+                            && correlation.implied_non_nil_slots.contains(&slot)
+                    })
+                },
+            )
+        });
 
     let signature = db
         .get_signature_index_mut()
         .get_mut(&return_.signature_id)
         .ok_or(InferFailReason::None)?;
 
+    if let Some(inherited_tail) = inherited_tail {
+        signature
+            .return_docs
+            .extend(inherited_tail.into_iter().map(|type_ref| LuaDocReturnInfo {
+                name: None,
+                type_ref,
+                default_value: None,
+                description: None,
+                attributes: None,
+                return_kind: ReturnTypeKind::default(),
+            }));
+        signature.set_return_correlations(return_correlations);
+        return Ok(());
+    }
+
     if should_apply_resolved_return_docs(signature, &return_docs) {
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
+        signature.set_return_correlations(return_correlations);
     }
 
     Ok(())
@@ -368,8 +453,12 @@ pub fn try_resolve_iter_var(
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
-        db.get_type_index_mut()
-            .bind_type(decl_id.into(), LuaTypeCache::InferType(ret_type));
+        write_type_cache(
+            db,
+            decl_id.into(),
+            LuaTypeCache::InferType(ret_type),
+            TypeCacheWriteMode::InsertOnly,
+        );
     }
     Ok(())
 }
@@ -386,12 +475,20 @@ pub fn try_resolve_module_ref(
     let export_type = module.export_type.clone().ok_or(InferFailReason::None)?;
     match &module_ref.owner_id {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
-            db.get_type_index_mut()
-                .bind_type((*decl_id).into(), LuaTypeCache::InferType(export_type));
+            write_type_cache(
+                db,
+                (*decl_id).into(),
+                LuaTypeCache::InferType(export_type),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         LuaSemanticDeclId::Member(member_id) => {
-            db.get_type_index_mut()
-                .bind_type((*member_id).into(), LuaTypeCache::InferType(export_type));
+            write_type_cache(
+                db,
+                (*member_id).into(),
+                LuaTypeCache::InferType(export_type),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         _ => {}
     };
@@ -475,7 +572,7 @@ struct SpecialCallParamInfo {
 
 #[derive(Debug, Clone)]
 struct SpecialCallOutParamInfo {
-    param_idx: usize,
+    root: LuaOutParamRoot,
     field_path: Vec<String>,
     type_ref: LuaType,
     is_colon_define: bool,
@@ -780,7 +877,7 @@ fn collect_special_call_param_infos_from_callable_operators(
             caller_position,
             inner,
         ),
-        LuaType::Union(union) => union.into_vec().iter().fold(
+        LuaType::Union(union) => union.types().fold(
             SpecialCallOperatorCollection::default(),
             |mut collection, union_type| {
                 collection.extend(collect_special_call_param_infos_from_callable_operators(
@@ -928,7 +1025,7 @@ fn collect_special_call_out_param_infos_from_callable_operators(
             caller_position,
             inner,
         ),
-        LuaType::Union(union) => union.into_vec().iter().fold(
+        LuaType::Union(union) => union.types().fold(
             SpecialCallOutParamOperatorCollection::default(),
             |mut collection, union_type| {
                 collection.extend(
@@ -1083,14 +1180,14 @@ fn select_operator_ids_by_workspace_and_realm(
     }
 
     let infer_index = db.get_gmod_infer_index();
-    let caller_realm = infer_index.get_realm_at_offset(&caller_file_id, caller_position);
+    let caller_mask = infer_index.get_state_mask_at_offset(&caller_file_id, caller_position);
     for (_, tier_operator_ids) in priority_tiers {
         let compatible_operator_ids = tier_operator_ids
             .into_iter()
             .filter(|operator_id| {
-                let operator_realm =
-                    infer_index.get_realm_at_offset(&operator_id.file_id, operator_id.position);
-                is_realm_compatible(caller_realm, operator_realm)
+                let operator_mask = infer_index
+                    .get_state_mask_at_offset(&operator_id.file_id, operator_id.position);
+                caller_mask.is_compatible_with(operator_mask)
             })
             .collect::<Vec<_>>();
         if !compatible_operator_ids.is_empty() {
@@ -1103,13 +1200,6 @@ fn select_operator_ids_by_workspace_and_realm(
 
 fn should_strip_first_operator_param(is_colon_define: bool, owner: &LuaOperatorOwner) -> bool {
     matches!(owner, LuaOperatorOwner::Type(_)) && !is_colon_define
-}
-
-fn is_realm_compatible(caller_realm: GmodRealm, candidate_realm: GmodRealm) -> bool {
-    !matches!(
-        (caller_realm, candidate_realm),
-        (GmodRealm::Client, GmodRealm::Server) | (GmodRealm::Server, GmodRealm::Client)
-    )
 }
 
 fn adjust_operator_special_call_param_infos(
@@ -1141,7 +1231,10 @@ fn adjust_operator_special_call_out_param_infos(
     out_param_infos
         .into_iter()
         .filter_map(|mut out_param_info| {
-            out_param_info.param_idx = out_param_info.param_idx.checked_sub(1)?;
+            let LuaOutParamRoot::Param(param_idx) = out_param_info.root else {
+                return Some(out_param_info);
+            };
+            out_param_info.root = LuaOutParamRoot::Param(param_idx.checked_sub(1)?);
             out_param_info.is_colon_define = false;
             Some(out_param_info)
         })
@@ -1245,6 +1338,13 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
                     return Ok(out_params);
                 }
             }
+
+            let fallback_out_params =
+                collect_same_member_key_special_call_out_params(db, member_id);
+            if !fallback_out_params.is_empty() {
+                return Ok(fallback_out_params);
+            }
+
             let type_cache = db
                 .get_type_index()
                 .get_type_cache(&member_id.into())
@@ -1262,6 +1362,28 @@ fn collect_special_call_out_param_infos_from_semantic_decl(
             .unwrap_or_default()),
         LuaSemanticDeclId::TypeDecl(_) => Ok(Vec::new()),
     }
+}
+
+fn collect_same_member_key_special_call_out_params(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+) -> Vec<SpecialCallOutParamInfo> {
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_current_owner(&current_member_id) else {
+        return Vec::new();
+    };
+    let Some(current_member) = member_index.get_member(&current_member_id) else {
+        return Vec::new();
+    };
+    let key = current_member.get_key();
+
+    member_index
+        .get_current_owner_members_for_key(owner, key)
+        .into_iter()
+        .filter(|member| member.get_id() != current_member_id)
+        .filter_map(|member| db.get_type_index().get_type_cache(&member.get_id().into()))
+        .flat_map(|type_cache| collect_special_call_out_param_infos(db, type_cache.as_type()))
+        .collect()
 }
 
 fn get_signature_id_from_semantic_decl_value_expr(
@@ -1294,8 +1416,7 @@ fn collect_special_call_param_infos(
         LuaType::DocFunction(func) => collect_doc_function_special_call_params(func),
         LuaType::TypeGuard(inner) => collect_special_call_param_infos(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .flat_map(|union_type| collect_special_call_param_infos(db, union_type))
             .collect(),
         LuaType::Intersection(intersection) => intersection
@@ -1325,8 +1446,7 @@ fn collect_special_call_out_param_infos(
             .unwrap_or_default(),
         LuaType::TypeGuard(inner) => collect_special_call_out_param_infos(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .flat_map(|union_type| collect_special_call_out_param_infos(db, union_type))
             .collect(),
         LuaType::Intersection(intersection) => intersection
@@ -1377,13 +1497,16 @@ fn collect_signature_special_call_out_params(
         .out_params
         .iter()
         .map(|out_param| SpecialCallOutParamInfo {
-            param_idx: out_param.param_idx,
+            root: out_param.root.clone(),
             field_path: out_param.field_path.clone(),
             type_ref: out_param.type_ref.clone(),
             is_colon_define: signature.is_colon_define,
         })
         .collect::<Vec<_>>();
-    out_params.sort_by_key(|out_param| out_param.param_idx);
+    out_params.sort_by_key(|out_param| match out_param.root {
+        LuaOutParamRoot::Param(param_idx) => (0, param_idx),
+        LuaOutParamRoot::SelfReceiver => (1, 0),
+    });
     out_params
 }
 
@@ -1412,7 +1535,7 @@ fn type_contains_str_tpl_ref(typ: &LuaType) -> bool {
     match typ {
         LuaType::StrTplRef(_) => true,
         LuaType::TypeGuard(inner) => type_contains_str_tpl_ref(inner),
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_str_tpl_ref),
+        LuaType::Union(union) => union.types().any(type_contains_str_tpl_ref),
         LuaType::Intersection(intersection) => intersection
             .get_types()
             .iter()
@@ -1433,12 +1556,7 @@ fn apply_out_param_from_call(
     out_param_info: &SpecialCallOutParamInfo,
     is_colon_call: bool,
 ) -> ResolveResult {
-    let Some(arg_expr) = get_call_arg_expr(
-        call_expr,
-        out_param_info.param_idx,
-        out_param_info.is_colon_define,
-        is_colon_call,
-    ) else {
+    let Some(arg_expr) = get_out_param_root_expr(call_expr, out_param_info, is_colon_call) else {
         return Ok(());
     };
 
@@ -1461,6 +1579,7 @@ fn apply_out_param_from_call(
         arg_expr_for_effects,
         &out_param_info.field_path,
         &target,
+        matches!(out_param_info.root, LuaOutParamRoot::Param(_)),
     );
     for effect_target in effect_targets {
         db.get_flow_index_mut().add_special_call_effect(
@@ -1472,6 +1591,28 @@ fn apply_out_param_from_call(
     }
 
     Ok(())
+}
+
+fn get_out_param_root_expr(
+    call_expr: &LuaCallExpr,
+    out_param_info: &SpecialCallOutParamInfo,
+    is_colon_call: bool,
+) -> Option<LuaExpr> {
+    match out_param_info.root {
+        LuaOutParamRoot::Param(param_idx) => get_call_arg_expr(
+            call_expr,
+            param_idx,
+            out_param_info.is_colon_define,
+            is_colon_call,
+        ),
+        LuaOutParamRoot::SelfReceiver if is_colon_call => {
+            let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+                return None;
+            };
+            index_expr.get_prefix_expr()
+        }
+        LuaOutParamRoot::SelfReceiver => call_expr.get_args_list()?.get_args().next(),
+    }
 }
 
 fn resolve_out_param_target(
@@ -1587,6 +1728,7 @@ fn collect_out_param_effect_targets(
     arg_expr: LuaExpr,
     field_path: &[String],
     target: &ResolvedOutParamTarget,
+    include_resolved_targets: bool,
 ) -> Vec<VarRefId> {
     let mut targets = Vec::new();
     let mut visited_aliases = HashSet::new();
@@ -1602,14 +1744,16 @@ fn collect_out_param_effect_targets(
         &mut visited_aliases,
     );
 
-    if let Some(owner) = target.owner.clone()
+    if include_resolved_targets
+        && let Some(owner) = target.owner.clone()
         && let Some(owner_target) = type_owner_to_var_ref_id(owner)
         && !targets.iter().any(|existing| existing == &owner_target)
     {
         targets.push(owner_target);
     }
 
-    if let Some(value_expr) = target.value_expr.clone()
+    if include_resolved_targets
+        && let Some(value_expr) = target.value_expr.clone()
         && let Some(value_target) = get_var_expr_var_ref_id(db, cache, value_expr)
         && !targets.iter().any(|existing| existing == &value_target)
     {
@@ -2044,8 +2188,7 @@ fn find_str_tpl_ref(db: &DbIndex, typ: &LuaType) -> Option<Arc<crate::LuaStringT
         LuaType::StrTplRef(str_tpl) => Some(str_tpl.clone()),
         LuaType::TypeGuard(inner) => find_str_tpl_ref(db, inner),
         LuaType::Union(union) => union
-            .into_vec()
-            .iter()
+            .types()
             .filter_map(|union_type| find_str_tpl_ref(db, union_type))
             .min_by_key(|str_tpl| str_tpl_selection_key(db, str_tpl)),
         LuaType::Intersection(intersection) => intersection

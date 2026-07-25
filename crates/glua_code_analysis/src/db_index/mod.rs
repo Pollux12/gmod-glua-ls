@@ -1,4 +1,5 @@
 mod accessor_func;
+mod call_site_param;
 mod declaration;
 mod dependency;
 mod diagnostic;
@@ -7,10 +8,12 @@ mod flow;
 mod global;
 mod gmod_class;
 mod gmod_infer;
+mod gmod_load;
 mod gmod_network;
 mod member;
 mod metatable;
 mod module;
+mod numeric_range_population;
 mod operators;
 mod property;
 mod reference;
@@ -20,22 +23,26 @@ mod signature;
 mod traits;
 mod r#type;
 
-use std::{path::PathBuf, sync::Arc};
+use std::{collections::HashSet, path::PathBuf, sync::Arc};
 
-use crate::{Emmyrc, FileId, Vfs};
+use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
+pub use call_site_param::CallSiteParamIndex;
+pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
 pub use declaration::*;
-pub use dependency::{LuaDependencyIndex, LuaDependencyKind};
+pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
 pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner};
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
 pub use gmod_class::*;
 pub use gmod_infer::*;
+pub use gmod_load::*;
 pub use gmod_network::*;
 pub use member::*;
-pub use metatable::LuaMetatableIndex;
+pub use metatable::{LuaMetatableIndex, SetmetatableFactoryBinding};
 pub use module::*;
+pub use numeric_range_population::*;
 pub use operators::*;
 pub use property::*;
 pub use reference::*;
@@ -59,16 +66,37 @@ pub struct DbIndex {
     flow_index: LuaFlowIndex,
     accessor_func_index: AccessorFuncAnnotationIndex,
     accessor_func_call_index: AccessorFuncCallIndex,
+    call_site_param_index: CallSiteParamIndex,
     gmod_class_index: GmodClassMetadataIndex,
     gmod_infer_index: GmodInferIndex,
+    gmod_load_index: GmodLoadIndex,
     gmod_network_index: GmodNetworkIndex,
     dynamic_field_index: DynamicFieldIndex,
     vfs: Vfs,
     file_dependencies_index: LuaDependencyIndex,
+    numeric_range_population_index: NumericRangePopulationIndex,
     metatable_index: LuaMetatableIndex,
     global_index: LuaGlobalIndex,
     json_schema_index: JsonSchemaIndex,
     emmyrc: Arc<Emmyrc>,
+    /// Revision-keyed cache for workspace-wide derived structures that are pure
+    /// functions of VFS content (currently the gmod net-helper registry). Stored
+    /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
+    /// Invalidated automatically by comparing `Vfs::content_revision`.
+    helper_registry_cache: RevisionedCache,
+}
+
+/// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
+#[derive(Default)]
+struct RevisionedCache(Option<(u64, Arc<dyn std::any::Any + Send + Sync>)>);
+
+impl std::fmt::Debug for RevisionedCache {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.0 {
+            Some((rev, _)) => write!(f, "RevisionedCache(rev={rev})"),
+            None => write!(f, "RevisionedCache(empty)"),
+        }
+    }
 }
 
 #[allow(unused)]
@@ -93,21 +121,57 @@ impl DbIndex {
             flow_index: LuaFlowIndex::new(),
             accessor_func_index: AccessorFuncAnnotationIndex::new(),
             accessor_func_call_index: AccessorFuncCallIndex::new(),
+            call_site_param_index: CallSiteParamIndex::new(),
             gmod_class_index: GmodClassMetadataIndex::new(),
             gmod_infer_index: GmodInferIndex::new(),
+            gmod_load_index: GmodLoadIndex::new(),
             gmod_network_index: GmodNetworkIndex::new(),
             dynamic_field_index: DynamicFieldIndex::new(),
             vfs: Vfs::new(),
             file_dependencies_index: LuaDependencyIndex::new(),
+            numeric_range_population_index: NumericRangePopulationIndex::new(),
             metatable_index: LuaMetatableIndex::new(),
             global_index: LuaGlobalIndex::new(),
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
+            helper_registry_cache: RevisionedCache::default(),
         }
     }
 
-    pub fn remove_index(&mut self, file_ids: Vec<FileId>) {
-        for file_id in file_ids {
+    /// Fetch the cached gmod net-helper registry if it was built at `revision`.
+    /// Type-erased so the `db_index` layer need not name the analyzer's registry
+    /// type; the caller downcasts to its concrete `T`.
+    pub fn get_cached_helper_registry<T: std::any::Any + Send + Sync>(
+        &self,
+        revision: u64,
+    ) -> Option<Arc<T>> {
+        match &self.helper_registry_cache.0 {
+            Some((cached_rev, value)) if *cached_rev == revision => {
+                value.clone().downcast::<T>().ok()
+            }
+            _ => None,
+        }
+    }
+
+    /// Store a freshly built gmod net-helper registry keyed by the VFS content
+    /// revision it was derived from.
+    pub fn set_cached_helper_registry<T: std::any::Any + Send + Sync>(
+        &mut self,
+        revision: u64,
+        value: Arc<T>,
+    ) {
+        self.helper_registry_cache.0 = Some((revision, value));
+    }
+
+    pub fn remove_index(&mut self, mut file_ids: Vec<FileId>) {
+        file_ids.sort_by_key(|file_id| file_id.id);
+        file_ids.dedup();
+        if file_ids.is_empty() {
+            return;
+        }
+
+        let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
+        for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
                 log::debug!(
                     "remove_index: file_id={:?} path={}",
@@ -117,8 +181,8 @@ impl DbIndex {
             } else {
                 log::debug!("remove_index: file_id={:?} (no path)", file_id);
             }
-            self.remove(file_id);
         }
+        self.remove_files(&file_ids);
     }
 
     pub fn get_metatable_index_mut(&mut self) -> &mut LuaMetatableIndex {
@@ -139,6 +203,84 @@ impl DbIndex {
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
         &mut self.types_index
+    }
+
+    pub fn get_inference_fact(&self, node: &LuaInferenceNodeId) -> Option<LuaTypeFact> {
+        match node {
+            LuaInferenceNodeId::TypeOwner(owner) => self.types_index.get_type_fact(owner),
+            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id)) => self
+                .types_index
+                .get_type_fact(&LuaTypeOwner::Decl(*decl_id)),
+            LuaInferenceNodeId::Definition(definition) => {
+                self.types_index.get_definition_fact(definition).cloned()
+            }
+            LuaInferenceNodeId::SignatureParam {
+                signature_id,
+                param_idx,
+            } => self
+                .call_site_param_index
+                .get_inferred_param_fact(signature_id, usize::from(*param_idx))
+                .cloned(),
+        }
+    }
+
+    pub fn publish_inference_facts(
+        &mut self,
+        mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
+    ) -> HashSet<FileId> {
+        updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
+
+        let mut conflicting_nodes = HashSet::new();
+        for pair in updates.windows(2) {
+            let [(left_node, left_fact), (right_node, right_fact)] = pair else {
+                unreachable!();
+            };
+            if left_node == right_node && left_fact != right_fact {
+                conflicting_nodes.insert(left_node.clone());
+            }
+        }
+
+        let mut changed_files = HashSet::new();
+        let mut previous_node = None;
+        for (node, fact) in updates {
+            if conflicting_nodes.contains(&node) || previous_node.as_ref() == Some(&node) {
+                continue;
+            }
+            previous_node = Some(node.clone());
+            if self.get_inference_fact(&node).as_ref() == Some(&fact) {
+                continue;
+            }
+
+            match node {
+                LuaInferenceNodeId::TypeOwner(owner) => {
+                    let file_id = self.types_index.force_bind_type_fact_unchecked(
+                        owner,
+                        LuaTypeCache::InferType(fact.typ().clone()),
+                        LuaTypeFactMetadata::from_fact(&fact),
+                    );
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(decl_id)) => {
+                    let file_id = self.types_index.force_bind_type_fact_unchecked(
+                        LuaTypeOwner::Decl(decl_id),
+                        LuaTypeCache::InferType(fact.typ().clone()),
+                        LuaTypeFactMetadata::from_fact(&fact),
+                    );
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::Definition(definition) => {
+                    let file_id = self
+                        .types_index
+                        .bind_definition_fact_unchecked(definition, fact);
+                    changed_files.insert(file_id);
+                }
+                LuaInferenceNodeId::SignatureParam { .. } => {}
+            }
+        }
+
+        self.types_index
+            .rebuild_inference_derived_state(&changed_files);
+        changed_files
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
@@ -225,6 +367,14 @@ impl DbIndex {
         &mut self.accessor_func_call_index
     }
 
+    pub fn get_call_site_param_index(&self) -> &CallSiteParamIndex {
+        &self.call_site_param_index
+    }
+
+    pub fn get_call_site_param_index_mut(&mut self) -> &mut CallSiteParamIndex {
+        &mut self.call_site_param_index
+    }
+
     pub fn get_gmod_class_metadata_index(&self) -> &GmodClassMetadataIndex {
         &self.gmod_class_index
     }
@@ -239,6 +389,14 @@ impl DbIndex {
 
     pub fn get_gmod_infer_index_mut(&mut self) -> &mut GmodInferIndex {
         &mut self.gmod_infer_index
+    }
+
+    pub fn get_gmod_load_index(&self) -> &GmodLoadIndex {
+        &self.gmod_load_index
+    }
+
+    pub fn get_gmod_load_index_mut(&mut self) -> &mut GmodLoadIndex {
+        &mut self.gmod_load_index
     }
 
     pub fn get_gmod_network_index(&self) -> &GmodNetworkIndex {
@@ -271,6 +429,14 @@ impl DbIndex {
 
     pub fn get_file_dependencies_index_mut(&mut self) -> &mut LuaDependencyIndex {
         &mut self.file_dependencies_index
+    }
+
+    pub fn get_numeric_range_population_index(&self) -> &NumericRangePopulationIndex {
+        &self.numeric_range_population_index
+    }
+
+    pub fn get_numeric_range_population_index_mut(&mut self) -> &mut NumericRangePopulationIndex {
+        &mut self.numeric_range_population_index
     }
 
     pub fn get_global_index(&self) -> &LuaGlobalIndex {
@@ -326,14 +492,50 @@ impl LuaIndex for DbIndex {
         self.flow_index.remove(file_id);
         self.accessor_func_index.remove(file_id);
         self.accessor_func_call_index.remove(file_id);
+        self.call_site_param_index.remove(file_id);
         self.gmod_class_index.remove(file_id);
         self.gmod_infer_index.remove(file_id);
+        self.gmod_load_index.remove(file_id);
         self.gmod_network_index.remove(file_id);
         self.dynamic_field_index.remove(file_id);
         self.file_dependencies_index.remove(file_id);
+        self.numeric_range_population_index.remove(file_id);
         self.metatable_index.remove(file_id);
         self.global_index.remove(file_id);
         self.json_schema_index.remove(file_id);
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        if let [file_id] = file_ids {
+            self.remove(*file_id);
+            return;
+        }
+
+        self.decl_index.remove_files(file_ids);
+        self.references_index.remove_files(file_ids);
+        self.types_index.remove_files(file_ids);
+        self.modules_index.remove_files(file_ids);
+        self.members_index.remove_files(file_ids);
+        self.property_index.remove_files(file_ids);
+        self.signature_index.remove_files(file_ids);
+        self.diagnostic_index.remove_files(file_ids);
+        self.operator_index.remove_files(file_ids);
+        self.flow_index.remove_files(file_ids);
+        self.accessor_func_index.remove_files(file_ids);
+        self.accessor_func_call_index.remove_files(file_ids);
+        self.call_site_param_index.remove_files(file_ids);
+        self.gmod_class_index.remove_files(file_ids);
+        self.gmod_infer_index.remove_files(file_ids);
+        self.gmod_load_index.remove_files(file_ids);
+        self.gmod_network_index.remove_files(file_ids);
+        self.dynamic_field_index.remove_files(file_ids);
+        self.file_dependencies_index.remove_files(file_ids);
+        for &file_id in file_ids {
+            self.numeric_range_population_index.remove(file_id);
+        }
+        self.metatable_index.remove_files(file_ids);
+        self.global_index.remove_files(file_ids);
+        self.json_schema_index.remove_files(file_ids);
     }
 
     fn clear(&mut self) {
@@ -349,11 +551,14 @@ impl LuaIndex for DbIndex {
         self.flow_index.clear();
         self.accessor_func_index.clear();
         self.accessor_func_call_index.clear();
+        self.call_site_param_index.clear();
         self.gmod_class_index.clear();
         self.gmod_infer_index.clear();
+        self.gmod_load_index.clear();
         self.gmod_network_index.clear();
         self.dynamic_field_index.clear();
         self.file_dependencies_index.clear();
+        self.numeric_range_population_index.clear();
         self.metatable_index.clear();
         self.global_index.clear();
         self.json_schema_index.clear();

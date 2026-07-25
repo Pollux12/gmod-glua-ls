@@ -164,7 +164,9 @@ mod test {
         );
 
         let a = ws.expr_ty("R");
-        let expected = ws.ty("nil");
+        // `name` returns its parameter unchanged, so `a` aliases `A` and the
+        // subsequent field write is visible through both names.
+        let expected = LuaType::IntegerConst(1);
         assert_eq!(a, expected);
     }
 

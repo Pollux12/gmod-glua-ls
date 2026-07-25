@@ -1,28 +1,70 @@
 use std::{collections::HashSet, ops::Deref};
 
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
+    LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaStat,
+    LuaVarExpr, NumberResult, PathTrait, UnaryOperator,
 };
-use rowan::TextSize;
+use rowan::{TextRange, TextSize};
 
 use crate::{
-    AssignVarHint, CacheEntry, DbIndex, FlowAntecedent, FlowId, FlowNode, FlowNodeKind, FlowTree,
-    GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId,
-    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeOwner,
-    LuaUnionType, TypeOps, infer_expr,
+    AssignVarHint, CacheEntry, DbIndex, FileId, FlowAntecedent, FlowId, FlowNode, FlowNodeKind,
+    FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
+    LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
+    LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
+    semantic::cache::FlowOrigin,
+    semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
-        InferResult, VarRefId, infer_expr_list_value_type_at, infer_param_with_cache,
+        InferResult, VarRefId, infer_expr_list_value_type_at,
+        infer_name::infer_global_type,
+        infer_param_with_cache,
         narrow::{
             ResultTypeOrContinue,
             condition_flow::{InferConditionFlow, get_type_at_condition_flow},
             get_single_antecedent,
             get_type_at_cast_flow::get_type_at_cast_flow,
-            get_var_ref_type, narrow_down_type,
-            var_ref_id::get_var_expr_var_ref_id,
+            get_var_ref_type, narrow_direct_name_false_or_nil, narrow_down_type,
+            remove_false_or_nil,
+            var_ref_id::{
+                get_var_expr_var_ref_id, is_immutable_direct_lexical_decl,
+                is_untyped_param_rooted_index,
+            },
         },
     },
 };
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FlowWalkMode {
+    Normal,
+    ClosureBaseline,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct FlowWalkPolicy {
+    origin: FlowOrigin,
+    mode: FlowWalkMode,
+}
+
+impl FlowWalkPolicy {
+    pub(super) fn normal(origin: FlowOrigin) -> Self {
+        Self {
+            origin,
+            mode: FlowWalkMode::Normal,
+        }
+    }
+
+    fn with_mode(self, mode: FlowWalkMode) -> Self {
+        Self { mode, ..self }
+    }
+
+    fn is_normal(self) -> bool {
+        self.mode == FlowWalkMode::Normal
+    }
+
+    fn is_closure_baseline(self) -> bool {
+        self.mode == FlowWalkMode::ClosureBaseline
+    }
+}
 
 pub fn get_type_at_flow(
     db: &DbIndex,
@@ -32,27 +74,36 @@ pub fn get_type_at_flow(
     var_ref_id: &VarRefId,
     flow_id: FlowId,
 ) -> InferResult {
-    cache.prof_flow_calls += 1;
+    get_type_at_flow_with_origin(db, tree, cache, root, var_ref_id, flow_id, FlowOrigin::Real)
+}
+
+pub fn get_type_at_flow_with_origin(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    flow_origin: FlowOrigin,
+) -> InferResult {
+    let policy = FlowWalkPolicy::normal(flow_origin);
     let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
     // Check cache for both success and error results.
     match cache
-        .get_flow_cache(var_ref_id, flow_id, query_realm)
+        .get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, policy.origin)
         .cloned()
     {
         Some(CacheEntry::Cache(narrow_type)) => {
-            cache.prof_flow_hits += 1;
             return Ok(narrow_type);
         }
         Some(CacheEntry::Error(reason)) => {
-            cache.prof_flow_hits += 1;
             return Err(reason);
         }
         _ => {}
     }
-
     let mut visited_flow_ids = Vec::new();
     let result = get_type_at_flow_walk(
         db,
@@ -63,23 +114,29 @@ pub fn get_type_at_flow(
         query_realm,
         flow_id,
         &mut visited_flow_ids,
+        policy,
     );
-
-    // Track flow walk depth for profiling
-    let walk_depth = visited_flow_ids.len() as u32;
-    cache.prof_flow_walk_depth_sum += walk_depth as u64;
-    if walk_depth > cache.prof_flow_walk_max_depth {
-        cache.prof_flow_walk_max_depth = walk_depth;
-    }
 
     // RecursiveInfer errors are transient (cycle detection) and must NOT be
     // cached — they'd poison future non-recursive queries.
     match &result {
         Ok(ty) => {
             let entry = CacheEntry::Cache(ty.clone());
-            cache.set_flow_cache(var_ref_id, flow_id, query_realm, entry.clone());
+            cache.set_flow_cache_with_origin(
+                var_ref_id,
+                flow_id,
+                query_realm,
+                policy.origin,
+                entry.clone(),
+            );
             for visited_flow_id in visited_flow_ids {
-                cache.set_flow_cache(var_ref_id, visited_flow_id, query_realm, entry.clone());
+                cache.set_flow_cache_with_origin(
+                    var_ref_id,
+                    visited_flow_id,
+                    query_realm,
+                    policy.origin,
+                    entry.clone(),
+                );
             }
         }
         Err(InferFailReason::RecursiveInfer) => {
@@ -95,15 +152,189 @@ pub fn get_type_at_flow(
 
             if should_cache {
                 let entry = CacheEntry::Error(reason.clone());
-                cache.set_flow_cache(var_ref_id, flow_id, query_realm, entry.clone());
+                cache.set_flow_cache_with_origin(
+                    var_ref_id,
+                    flow_id,
+                    query_realm,
+                    policy.origin,
+                    entry.clone(),
+                );
                 for visited_flow_id in visited_flow_ids {
-                    cache.set_flow_cache(var_ref_id, visited_flow_id, query_realm, entry.clone());
+                    cache.set_flow_cache_with_origin(
+                        var_ref_id,
+                        visited_flow_id,
+                        query_realm,
+                        policy.origin,
+                        entry.clone(),
+                    );
                 }
             }
         }
     }
 
     result
+}
+
+pub(super) fn get_type_at_flow_in_mode(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_id: FlowId,
+    policy: FlowWalkPolicy,
+) -> InferResult {
+    match policy.mode {
+        FlowWalkMode::Normal => {
+            get_type_at_flow_with_origin(db, tree, cache, root, var_ref_id, flow_id, policy.origin)
+        }
+        FlowWalkMode::ClosureBaseline => {
+            let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
+                db.get_gmod_infer_index()
+                    .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
+            });
+            let mut visited_flow_ids = Vec::new();
+            get_type_at_flow_walk(
+                db,
+                tree,
+                cache,
+                root,
+                var_ref_id,
+                query_realm,
+                flow_id,
+                &mut visited_flow_ids,
+                policy,
+            )
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn get_type_at_immutable_closure_condition(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    flow_node: &FlowNode,
+    mut condition: LuaExpr,
+    mut condition_flow: InferConditionFlow,
+    policy: FlowWalkPolicy,
+) -> Result<Option<LuaType>, InferFailReason> {
+    if !is_immutable_direct_lexical_decl(db, var_ref_id) {
+        return Ok(None);
+    }
+
+    loop {
+        condition = strip_condition_parens(condition)?;
+        let LuaExpr::UnaryExpr(unary_expr) = condition else {
+            break;
+        };
+        if unary_expr
+            .get_op_token()
+            .is_none_or(|token| token.get_op() != UnaryOperator::OpNot)
+        {
+            return Ok(None);
+        }
+        let Some(inner_expr) = unary_expr.get_expr() else {
+            return Ok(None);
+        };
+        condition = inner_expr;
+        condition_flow = condition_flow.get_negated();
+    }
+
+    match condition {
+        LuaExpr::NameExpr(name_expr) => {
+            if !condition_name_matches_var_ref(db, cache, name_expr, var_ref_id) {
+                return Ok(None);
+            }
+            let antecedent_type = get_antecedent_type_for_flow_node(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
+            Ok(Some(match condition_flow {
+                InferConditionFlow::TrueCondition => remove_false_or_nil(antecedent_type),
+                InferConditionFlow::FalseCondition => {
+                    narrow_direct_name_false_or_nil(db, antecedent_type)
+                }
+            }))
+        }
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let Some(op_token) = binary_expr.get_op_token() else {
+                return Ok(None);
+            };
+            let op = op_token.get_op();
+            if !matches!(op, BinaryOperator::OpEq | BinaryOperator::OpNe) {
+                return Ok(None);
+            }
+            let Some((left, right)) = binary_expr.get_exprs() else {
+                return Ok(None);
+            };
+            let exact_type = if condition_expr_matches_var_ref(db, cache, left.clone(), var_ref_id)
+            {
+                falsey_condition_literal_type(right)
+            } else if condition_expr_matches_var_ref(db, cache, right.clone(), var_ref_id) {
+                falsey_condition_literal_type(left)
+            } else {
+                None
+            };
+            let Some(exact_type) = exact_type else {
+                return Ok(None);
+            };
+
+            let antecedent_type = get_antecedent_type_for_flow_node(
+                db, tree, cache, root, var_ref_id, flow_node, policy,
+            )?;
+            let equality_holds = matches!(condition_flow, InferConditionFlow::TrueCondition)
+                == matches!(op, BinaryOperator::OpEq);
+            let narrowed = if equality_holds {
+                TypeOps::Intersect.apply(db, &antecedent_type, &exact_type)
+            } else {
+                TypeOps::Remove.apply(db, &antecedent_type, &exact_type)
+            };
+            Ok(Some(narrowed))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn strip_condition_parens(mut expr: LuaExpr) -> Result<LuaExpr, InferFailReason> {
+    while let LuaExpr::ParenExpr(paren_expr) = expr {
+        expr = paren_expr.get_expr().ok_or(InferFailReason::None)?;
+    }
+    Ok(expr)
+}
+
+fn condition_name_matches_var_ref(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: glua_parser::LuaNameExpr,
+    var_ref_id: &VarRefId,
+) -> bool {
+    get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr))
+        .is_some_and(|condition_ref| condition_ref == *var_ref_id)
+}
+
+fn condition_expr_matches_var_ref(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let Ok(LuaExpr::NameExpr(name_expr)) = strip_condition_parens(expr) else {
+        return false;
+    };
+    condition_name_matches_var_ref(db, cache, name_expr, var_ref_id)
+}
+
+fn falsey_condition_literal_type(expr: LuaExpr) -> Option<LuaType> {
+    let Ok(LuaExpr::LiteralExpr(literal_expr)) = strip_condition_parens(expr) else {
+        return None;
+    };
+    match literal_expr.get_literal()? {
+        LuaLiteralToken::Nil(_) => Some(LuaType::Nil),
+        LuaLiteralToken::Bool(token) if !token.is_true() => Some(LuaType::BooleanConst(false)),
+        _ => None,
+    }
 }
 
 /// Inner walk loop for `get_type_at_flow`.
@@ -116,34 +347,76 @@ fn get_type_at_flow_walk(
     query_realm: GmodRealm,
     initial_flow_id: FlowId,
     visited_flow_ids: &mut Vec<FlowId>,
+    policy: FlowWalkPolicy,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
+    let pending_branch_types = [];
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
         // share overlapping flow chains.
-        match cache.get_flow_cache(var_ref_id, antecedent_flow_id, query_realm) {
-            Some(CacheEntry::Cache(cached_type)) => return Ok(cached_type.clone()),
-            Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
-            _ => {}
+        if policy.is_normal() {
+            match cache.get_flow_cache_with_origin(
+                var_ref_id,
+                antecedent_flow_id,
+                query_realm,
+                policy.origin,
+            ) {
+                Some(CacheEntry::Cache(cached_type)) => {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(cached_type.clone()),
+                    );
+                }
+                Some(CacheEntry::Error(reason)) => return Err(reason.clone()),
+                _ => {}
+            }
+            visited_flow_ids.push(antecedent_flow_id);
         }
-        visited_flow_ids.push(antecedent_flow_id);
 
-        // Track total flow work for profiling.
-        cache.flow_nodes_visited += 1;
-        cache.prof_flow_nodes_walked += 1;
         let flow_node = tree
             .get_flow_node(antecedent_flow_id)
             .ok_or(InferFailReason::None)?;
         match &flow_node.kind {
             FlowNodeKind::Start | FlowNodeKind::Unreachable => {
-                return get_var_ref_type(db, cache, var_ref_id);
+                return finish_flow_walk_result(
+                    db,
+                    var_ref_id,
+                    &pending_branch_types,
+                    get_var_ref_type(db, cache, var_ref_id),
+                );
+            }
+            FlowNodeKind::ClosureEntry(_) => {
+                let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                return finish_flow_walk_result(
+                    db,
+                    var_ref_id,
+                    &pending_branch_types,
+                    get_type_at_flow_walk(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        var_ref_id,
+                        query_realm,
+                        antecedent_flow_id,
+                        visited_flow_ids,
+                        policy.with_mode(FlowWalkMode::ClosureBaseline),
+                    ),
+                );
             }
             FlowNodeKind::LoopLabel | FlowNodeKind::Break | FlowNodeKind::Return => {
-                if let Some(merged_type) =
-                    try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                {
-                    return Ok(merged_type);
+                if let Some(merged_type) = try_get_multi_antecedent_type(
+                    db, tree, cache, root, var_ref_id, flow_node, policy,
+                )? {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(merged_type),
+                    );
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
@@ -151,18 +424,7 @@ fn get_type_at_flow_walk(
                 if matches!(flow_node.kind, FlowNodeKind::BranchLabel)
                     && let Some(info) = tree.get_branch_label_info(antecedent_flow_id)
                 {
-                    let can_skip = match var_ref_id {
-                        VarRefId::VarRef(_) | VarRefId::SelfRef(_) | VarRefId::GlobalName(_, _) => {
-                            !info.has_name_assigns
-                                && !info.has_casts_or_implfunc
-                                && !info.has_inner_conditions
-                        }
-                        VarRefId::IndexRef(_, _) => {
-                            !info.has_index_assigns
-                                && !info.has_casts_or_implfunc
-                                && !info.has_inner_conditions
-                        }
-                    };
+                    let can_skip = !branch_can_narrow_var_ref(db, info, var_ref_id);
 
                     if can_skip
                         && all_branch_antecedents_alive(tree, flow_node)
@@ -181,72 +443,159 @@ fn get_type_at_flow_walk(
                     }
                 }
 
-                return merge_antecedent_types(db, tree, cache, root, var_ref_id, flow_node);
+                return finish_flow_walk_result(
+                    db,
+                    var_ref_id,
+                    &pending_branch_types,
+                    merge_antecedent_types(db, tree, cache, root, var_ref_id, flow_node, policy),
+                );
             }
             FlowNodeKind::DeclPosition(position) => {
                 if *position <= var_ref_id.get_position() {
                     if let Some(decl_id) = var_ref_id.get_decl_id_ref()
                         && should_defer_uninitialized_local_decl_type(db, decl_id)
                     {
+                        if policy.is_closure_baseline() {
+                            let baseline_type = get_var_ref_type(db, cache, var_ref_id)
+                                .map(|typ| TypeOps::Union.apply(db, &typ, &LuaType::Nil));
+                            return finish_flow_walk_result(
+                                db,
+                                var_ref_id,
+                                &pending_branch_types,
+                                baseline_type,
+                            );
+                        }
                         return Err(InferFailReason::UnResolveDeclType(decl_id));
                     }
 
                     match get_decl_position_var_ref_type(db, cache, var_ref_id) {
                         Ok(var_type) => {
+                            if var_ref_id
+                                .get_decl_id_ref()
+                                .map(|decl_id| decl_id.into())
+                                .and_then(|owner| db.get_type_index().get_type_cache(&owner))
+                                .is_some_and(|type_cache| type_cache.is_doc())
+                            {
+                                return finish_flow_walk_result(
+                                    db,
+                                    var_ref_id,
+                                    &pending_branch_types,
+                                    Ok(var_type),
+                                );
+                            }
+
                             if should_retry_decl_initializer_type(&var_type)
                                 && let Ok(Some(init_type)) =
                                     try_infer_decl_initializer_type(db, cache, root, var_ref_id)
                                 && !should_retry_decl_initializer_type(&init_type)
                             {
-                                return Ok(init_type);
+                                return finish_flow_walk_result(
+                                    db,
+                                    var_ref_id,
+                                    &pending_branch_types,
+                                    Ok(init_type),
+                                );
                             }
 
-                            return Ok(var_type);
+                            return finish_flow_walk_result(
+                                db,
+                                var_ref_id,
+                                &pending_branch_types,
+                                Ok(var_type),
+                            );
                         }
                         Err(err) => {
                             if let Some(init_type) =
                                 try_infer_decl_initializer_type(db, cache, root, var_ref_id)?
                             {
-                                return Ok(init_type);
+                                return finish_flow_walk_result(
+                                    db,
+                                    var_ref_id,
+                                    &pending_branch_types,
+                                    Ok(init_type),
+                                );
                             }
 
                             return Err(err);
                         }
                     }
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
             FlowNodeKind::Assignment(assign_ptr, assign_hint) => {
+                if let Some(decl_id) = var_ref_id.get_decl_id_ref()
+                    && let Some(target) =
+                        tree.get_assignment_flow_info(flow_node.id)
+                            .and_then(|info| {
+                                info.name_targets
+                                    .iter()
+                                    .find(|target| target.decl_id == decl_id)
+                            })
+                    && let Some(fact) = db.get_type_index().get_definition_fact(
+                        &crate::LuaDefinitionId::Assignment {
+                            file_id: decl_id.file_id,
+                            assignment: assign_ptr.get_syntax_id(),
+                            target_idx: target.target_idx,
+                        },
+                    )
+                {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(fact.typ().clone()),
+                    );
+                }
+
                 let can_match_assignment = matches!(
                     (assign_hint, var_ref_id),
                     (AssignVarHint::Mixed, _)
                         | (AssignVarHint::NameOnly, VarRefId::VarRef(_))
                         | (AssignVarHint::NameOnly, VarRefId::GlobalName(_, _))
                         | (AssignVarHint::NameOnly, VarRefId::SelfRef(_))
+                        | (AssignVarHint::NameOnly, VarRefId::IndexRef(_, _))
                         | (AssignVarHint::IndexOnly, VarRefId::IndexRef(_, _))
-                );
+                ) || (matches!(assign_hint, AssignVarHint::IndexOnly)
+                    && numeric_table_index_query(db, cache, root, var_ref_id).is_some());
 
                 if !can_match_assignment {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
                 }
 
-                if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id) {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                if assignment_flow_info_cannot_match(tree, antecedent_flow_id, var_ref_id)
+                    && numeric_table_index_query(db, cache, root, var_ref_id).is_none()
+                {
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -261,15 +610,26 @@ fn get_type_at_flow_walk(
                     var_ref_id,
                     flow_node,
                     assign_stat,
+                    policy,
                 )?;
 
                 if let ResultTypeOrContinue::Result(assign_type) = result_or_continue {
-                    return Ok(assign_type);
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(assign_type),
+                    );
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
@@ -277,7 +637,12 @@ fn get_type_at_flow_walk(
             FlowNodeKind::Call(call_ptr) => {
                 let call_expr = call_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 if call_expr_returns_never(db, cache, call_expr.clone()) {
-                    return Ok(LuaType::Never);
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(LuaType::Never),
+                    );
                 }
 
                 if let Some(effects) = db
@@ -296,34 +661,78 @@ fn get_type_at_flow_walk(
                         }
                     }
                     if let Some(effect_type) = effect_type {
-                        return Ok(effect_type);
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(effect_type),
+                        );
                     }
                 }
 
-                if let Some(merged_type) =
-                    try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                {
-                    return Ok(merged_type);
+                if let Some(populated_type) = try_get_numeric_range_table_arg_population_type(
+                    db,
+                    cache,
+                    root,
+                    var_ref_id,
+                    call_expr.clone(),
+                )? {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(populated_type),
+                    );
+                }
+
+                if numeric_table_index_query(db, cache, root, var_ref_id).is_some() {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        get_var_ref_type(db, cache, var_ref_id),
+                    );
+                }
+
+                if let Some(merged_type) = try_get_multi_antecedent_type(
+                    db, tree, cache, root, var_ref_id, flow_node, policy,
+                )? {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(merged_type),
+                    );
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
             FlowNodeKind::ImplFunc(func_ptr) => {
                 let func_stat = func_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 let Some(func_name) = func_stat.get_func_name() else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
                 };
 
                 let Some(ref_id) = get_var_expr_var_ref_id(db, cache, func_name.to_expr()) else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                     continue;
@@ -335,10 +744,15 @@ fn get_type_at_flow_walk(
                             return Err(InferFailReason::None);
                         };
 
-                        return Ok(LuaType::Signature(LuaSignatureId::from_closure(
-                            cache.get_file_id(),
-                            &closure,
-                        )));
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(LuaType::Signature(LuaSignatureId::from_closure(
+                                cache.get_file_id(),
+                                &closure,
+                            ))),
+                        );
                     }
 
                     // Only use the func-stat's signature when the member isn't
@@ -355,23 +769,68 @@ fn get_type_at_flow_walk(
                             return Err(InferFailReason::None);
                         };
 
-                        return Ok(LuaType::Signature(LuaSignatureId::from_closure(
-                            cache.get_file_id(),
-                            &closure,
-                        )));
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(LuaType::Signature(LuaSignatureId::from_closure(
+                                cache.get_file_id(),
+                                &closure,
+                            ))),
+                        );
                     }
 
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
             FlowNodeKind::TrueCondition(condition_ptr) => {
+                if policy.is_closure_baseline() {
+                    if let Some(condition) = condition_ptr.to_node(root)
+                        && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            condition,
+                            InferConditionFlow::TrueCondition,
+                            policy,
+                        )
+                    {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(condition_type),
+                        );
+                    }
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
+                    }
+                    antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    continue;
+                }
+
                 let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 // Errors in condition evaluation (e.g. method not found) must not
                 // propagate and corrupt the type of unrelated variables.  Treat them
@@ -385,37 +844,69 @@ fn get_type_at_flow_walk(
                     flow_node,
                     condition,
                     InferConditionFlow::TrueCondition,
+                    policy,
                 ) {
                     Ok(r) => r,
-                    Err(e) => {
-                        cache.prof_condition_errors_caught += 1;
-                        match &e {
-                            InferFailReason::None => cache.prof_condition_errors_none += 1,
-                            InferFailReason::RecursiveInfer => {
-                                cache.prof_condition_errors_recursive += 1
-                            }
-                            InferFailReason::UnResolveDeclType(_) => {
-                                cache.prof_condition_errors_unresolved += 1
-                            }
-                            _ => {}
-                        }
-                        ResultTypeOrContinue::Continue
-                    }
+                    Err(_) => ResultTypeOrContinue::Continue,
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
-                    return Ok(condition_type);
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(condition_type),
+                    );
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        cache.prof_multi_ante_from_condition += 1;
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
             FlowNodeKind::FalseCondition(condition_ptr) => {
+                if policy.is_closure_baseline() {
+                    if let Some(condition) = condition_ptr.to_node(root)
+                        && let Ok(Some(condition_type)) = get_type_at_immutable_closure_condition(
+                            db,
+                            tree,
+                            cache,
+                            root,
+                            var_ref_id,
+                            flow_node,
+                            condition,
+                            InferConditionFlow::FalseCondition,
+                            policy,
+                        )
+                    {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(condition_type),
+                        );
+                    }
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
+                    }
+                    antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
+                    continue;
+                }
+
                 let condition = condition_ptr.to_node(root).ok_or(InferFailReason::None)?;
                 // Same defensive handling as TrueCondition above.
                 let result_or_continue = match get_type_at_condition_flow(
@@ -427,62 +918,94 @@ fn get_type_at_flow_walk(
                     flow_node,
                     condition,
                     InferConditionFlow::FalseCondition,
+                    policy,
                 ) {
                     Ok(r) => r,
-                    Err(e) => {
-                        cache.prof_condition_errors_caught += 1;
-                        match &e {
-                            InferFailReason::None => cache.prof_condition_errors_none += 1,
-                            InferFailReason::RecursiveInfer => {
-                                cache.prof_condition_errors_recursive += 1
-                            }
-                            InferFailReason::UnResolveDeclType(_) => {
-                                cache.prof_condition_errors_unresolved += 1
-                            }
-                            _ => {}
-                        }
-                        ResultTypeOrContinue::Continue
-                    }
+                    Err(_) => ResultTypeOrContinue::Continue,
                 };
 
                 if let ResultTypeOrContinue::Result(condition_type) = result_or_continue {
-                    return Ok(condition_type);
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(condition_type),
+                    );
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
             FlowNodeKind::ForIStat(_) => {
                 // todo check for `for i = 1, 10 do end`
-                if let Some(merged_type) =
-                    try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                {
-                    return Ok(merged_type);
+                if let Some(merged_type) = try_get_multi_antecedent_type(
+                    db, tree, cache, root, var_ref_id, flow_node, policy,
+                )? {
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(merged_type),
+                    );
                 }
                 antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
             }
             FlowNodeKind::TagCast(cast_ast_ptr) => {
                 let tag_cast = cast_ast_ptr.to_node(root).ok_or(InferFailReason::None)?;
-                let cast_or_continue =
-                    get_type_at_cast_flow(db, tree, cache, root, var_ref_id, flow_node, tag_cast)?;
+                let cast_or_continue = get_type_at_cast_flow(
+                    db, tree, cache, root, var_ref_id, flow_node, tag_cast, policy,
+                )?;
 
                 if let ResultTypeOrContinue::Result(cast_type) = cast_or_continue {
-                    return Ok(cast_type);
+                    return finish_flow_walk_result(
+                        db,
+                        var_ref_id,
+                        &pending_branch_types,
+                        Ok(cast_type),
+                    );
                 } else {
-                    if let Some(merged_type) =
-                        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
-                    {
-                        return Ok(merged_type);
+                    if let Some(merged_type) = try_get_multi_antecedent_type(
+                        db, tree, cache, root, var_ref_id, flow_node, policy,
+                    )? {
+                        return finish_flow_walk_result(
+                            db,
+                            var_ref_id,
+                            &pending_branch_types,
+                            Ok(merged_type),
+                        );
                     }
                     antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
                 }
             }
         }
     }
+}
+
+fn finish_flow_walk_result(
+    db: &DbIndex,
+    var_ref_id: &VarRefId,
+    pending_branch_types: &[LuaType],
+    result: InferResult,
+) -> InferResult {
+    result.map(|typ| {
+        if pending_branch_types.is_empty() {
+            typ
+        } else {
+            let mut branch_types = Vec::with_capacity(pending_branch_types.len() + 1);
+            branch_types.extend_from_slice(pending_branch_types);
+            branch_types.push(typ);
+            merge_flow_branch_types(db, var_ref_id, branch_types)
+        }
+    })
 }
 
 fn get_decl_position_var_ref_type(
@@ -494,9 +1017,25 @@ fn get_decl_position_var_ref_type(
         && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
     {
         if decl.is_param()
+            && let Some(child_type) = super::unguarded_child_decl_type(db, decl.get_id())
+        {
+            return Ok(child_type);
+        }
+
+        if decl.is_param()
             && let Ok(param_type) = infer_param_with_cache(db, cache, decl)
         {
             return Ok(param_type);
+        }
+
+        if decl.is_global()
+            && db
+                .get_type_index()
+                .get_type_cache(&decl.get_id().into())
+                .is_some_and(|type_cache| type_cache.as_type().is_nil())
+            && let Some(global_type) = typed_global_nil_placeholder_type(db, cache, var_ref_id)
+        {
+            return Ok(global_type);
         }
     }
 
@@ -504,7 +1043,7 @@ fn get_decl_position_var_ref_type(
 }
 
 fn should_retry_decl_initializer_type(typ: &LuaType) -> bool {
-    typ.is_unknown() || typ.contain_tpl()
+    typ.is_unknown() || matches!(typ, LuaType::String) || typ.contain_tpl()
 }
 
 fn with_flow_query_realm<T>(
@@ -585,10 +1124,11 @@ fn try_get_multi_antecedent_type(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
+    policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
     match flow_node.antecedent {
         Some(crate::FlowAntecedent::Multiple(_)) => Ok(Some(merge_antecedent_types(
-            db, tree, cache, root, var_ref_id, flow_node,
+            db, tree, cache, root, var_ref_id, flow_node, policy,
         )?)),
         _ => Ok(None),
     }
@@ -601,15 +1141,24 @@ fn get_antecedent_type_for_flow_node(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
+    policy: FlowWalkPolicy,
 ) -> InferResult {
     if let Some(merged_type) =
-        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node)?
+        try_get_multi_antecedent_type(db, tree, cache, root, var_ref_id, flow_node, policy)?
     {
         return Ok(merged_type);
     }
 
     let antecedent_flow_id = get_single_antecedent(tree, flow_node)?;
-    get_type_at_flow(db, tree, cache, root, var_ref_id, antecedent_flow_id)
+    get_type_at_flow_in_mode(
+        db,
+        tree,
+        cache,
+        root,
+        var_ref_id,
+        antecedent_flow_id,
+        policy,
+    )
 }
 
 fn merge_antecedent_types(
@@ -619,6 +1168,7 @@ fn merge_antecedent_types(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
+    policy: FlowWalkPolicy,
 ) -> InferResult {
     let single_antecedent;
     let antecedents = match &flow_node.antecedent {
@@ -631,8 +1181,6 @@ fn merge_antecedent_types(
             .ok_or(InferFailReason::None)?,
         None => return Err(InferFailReason::None),
     };
-    cache.prof_merge_calls += 1;
-    cache.prof_merge_total_antecedents += antecedents.len() as u32;
     let target_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
@@ -660,7 +1208,7 @@ fn merge_antecedent_types(
 
         accepted_any = true;
         let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
-            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id)
+            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
         })?;
         if branch_type.is_unknown() {
             return Ok(LuaType::Unknown);
@@ -686,7 +1234,7 @@ fn merge_antecedent_types(
         }
 
         let branch_type = with_flow_query_realm(cache, target_realm, |cache| {
-            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id)
+            get_merged_flow_type_or_nil(db, tree, cache, root, var_ref_id, flow_id, policy)
         })?;
         if branch_type.is_unknown() {
             return Ok(LuaType::Unknown);
@@ -880,7 +1428,7 @@ fn var_ref_has_explicit_any(db: &DbIndex, var_ref_id: &VarRefId) -> bool {
 fn type_contains_bare_any(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any => true,
-        LuaType::Union(union) => union.into_vec().iter().any(type_contains_bare_any),
+        LuaType::Union(union) => union.types().any(type_contains_bare_any),
         LuaType::MultiLineUnion(union) => union
             .get_unions()
             .iter()
@@ -899,8 +1447,7 @@ fn is_inferred_any_or_table_shape_branch(typ: &LuaType) -> bool {
         || typ.is_never()
         || is_table_shape_type(typ)
         || matches!(typ, LuaType::Union(union) if union
-            .into_vec()
-            .iter()
+            .types()
             .all(is_inferred_any_or_table_shape_branch))
 }
 
@@ -915,8 +1462,9 @@ fn get_merged_flow_type_or_nil(
     root: &LuaChunk,
     var_ref_id: &VarRefId,
     flow_id: FlowId,
+    policy: FlowWalkPolicy,
 ) -> InferResult {
-    match get_type_at_flow(db, tree, cache, root, var_ref_id, flow_id) {
+    match get_type_at_flow_in_mode(db, tree, cache, root, var_ref_id, flow_id, policy) {
         Ok(t) => Ok(t),
         Err(InferFailReason::UnResolveDeclType(decl_id))
             if should_treat_unresolved_decl_as_nil(db, decl_id) =>
@@ -937,7 +1485,9 @@ fn get_flow_node_realm(
     let file_realm = gmod_infer.get_realm_at_offset(&file_id, TextSize::new(0));
 
     let offset = match &flow_node.kind {
-        FlowNodeKind::DeclPosition(position) => Some(*position),
+        FlowNodeKind::DeclPosition(position) | FlowNodeKind::ClosureEntry(position) => {
+            Some(*position)
+        }
         FlowNodeKind::Assignment(assign_ptr, _) => {
             assign_ptr.to_node(root).map(|node| node.get_position())
         }
@@ -992,6 +1542,7 @@ fn realms_can_reach(target: GmodRealm, source: GmodRealm) -> bool {
             source,
             GmodRealm::Client | GmodRealm::Shared | GmodRealm::Unknown
         ),
+        GmodRealm::Menu => matches!(source, GmodRealm::Menu | GmodRealm::Unknown),
     }
 }
 
@@ -1044,6 +1595,43 @@ fn branch_has_relevant_special_call_effects(
             &mut visited,
         )
     })
+}
+
+fn branch_can_narrow_var_ref(
+    db: &DbIndex,
+    info: &crate::BranchLabelInfo,
+    var_ref_id: &VarRefId,
+) -> bool {
+    if info.has_casts_or_implfunc {
+        return true;
+    }
+
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => {
+            let Some(decl) = db.get_decl_index().get_decl(decl_id) else {
+                return info.has_name_assigns;
+            };
+            branch_name_can_be_narrowed(info, decl.get_name())
+        }
+        VarRefId::SelfRef(_) => branch_name_can_be_narrowed(info, "self"),
+        VarRefId::GlobalName(name, _) => info.narrowing_capability.name_can_be_narrowed(name),
+        VarRefId::IndexRef(root, path) => {
+            info.narrowing_capability.index_path_can_be_narrowed(path)
+                || root
+                    .as_decl_id()
+                    .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+                    .is_some_and(|decl| branch_name_can_be_narrowed(info, decl.get_name()))
+        }
+    }
+}
+
+fn branch_name_can_be_narrowed(info: &crate::BranchLabelInfo, name: &str) -> bool {
+    info.narrowing_capability.has_opaque_name_target
+        || info
+            .narrowing_capability
+            .referenced_names
+            .iter()
+            .any(|narrowable_name| narrowable_name.as_str() == name)
 }
 
 fn antecedent_has_relevant_special_call_effect(
@@ -1110,11 +1698,12 @@ fn get_type_at_assign_stat(
     var_ref_id: &VarRefId,
     flow_node: &FlowNode,
     assign_stat: LuaAssignStat,
+    policy: FlowWalkPolicy,
 ) -> Result<ResultTypeOrContinue, InferFailReason> {
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
     for (i, var) in vars.iter().cloned().enumerate() {
         if let Some(prefix_collection_type) = maybe_get_collection_append_assignment_type(
-            db, tree, cache, root, var_ref_id, flow_node, &var, &exprs, i,
+            db, tree, cache, root, var_ref_id, flow_node, &var, &exprs, i, policy,
         )? {
             return Ok(ResultTypeOrContinue::Result(prefix_collection_type));
         }
@@ -1123,9 +1712,72 @@ fn get_type_at_assign_stat(
             continue;
         };
 
+        if numeric_table_index_query_key_name(var_ref_id)
+            .map(str::to_string)
+            .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
+            .is_some_and(|key_name| var_ref_is_name(db, &maybe_ref_id, &key_name))
+        {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
+        }
+
+        if let Some((query_root, _query_index)) =
+            numeric_table_index_query(db, cache, root, var_ref_id)
+            && var_ref_matches_root(&maybe_ref_id, &query_root)
+        {
+            return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                db, cache, var_ref_id,
+            )?));
+        }
+
+        if let Some((query_root, query_index)) =
+            numeric_table_index_query(db, cache, root, var_ref_id)
+            && let LuaVarExpr::IndexExpr(index_expr) = &var
+            && let VarRefId::IndexRef(assign_root, _) = &maybe_ref_id
+            && *assign_root == query_root
+            && index_expr_numeric_key_value(db, cache, index_expr) == Some(query_index)
+        {
+            if assignment_vars_write_root(db, cache, &vars, &query_root) {
+                return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                    db, cache, var_ref_id,
+                )?));
+            }
+            if numeric_table_index_query_key_name(var_ref_id)
+                .map(str::to_string)
+                .or_else(|| {
+                    numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id)
+                })
+                .is_some_and(|key_name| {
+                    assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
+                })
+            {
+                return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
+            }
+            let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)? else {
+                return Ok(ResultTypeOrContinue::Continue);
+            };
+            return Ok(ResultTypeOrContinue::Result(expr_type));
+        }
+
         if maybe_ref_id != *var_ref_id {
-            // let typ = get_var_ref_type(db, cache, var_ref_id)?;
+            if var_ref_id.start_with(&maybe_ref_id)
+                && let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)?
+                && let Some(member_type) =
+                    assigned_prefix_member_type(db, cache, var_ref_id, &maybe_ref_id, &expr_type)?
+            {
+                return Ok(ResultTypeOrContinue::Result(member_type));
+            }
+
             continue;
+        }
+
+        if numeric_table_index_query_key_name(var_ref_id)
+            .map(str::to_string)
+            .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
+            .is_some_and(|key_name| {
+                assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
+            })
+        {
+            return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
         }
 
         // Check if there's an explicit type annotation (not just inferred type)
@@ -1160,19 +1812,19 @@ fn get_type_at_assign_stat(
             return Ok(ResultTypeOrContinue::Result(expr_type));
         }
 
-        let source_type = if let Some(explicit) = explicit_var_type.clone() {
-            explicit
-        } else {
-            match get_antecedent_type_for_flow_node(db, tree, cache, root, var_ref_id, flow_node) {
-                Ok(ty) => ty,
-                Err(InferFailReason::UnResolveDeclType(decl_id))
-                    if should_treat_unresolved_decl_as_nil(db, decl_id) =>
-                {
-                    LuaType::Nil
-                }
-                Err(err) => return Err(err),
-            }
-        };
+        if explicit_var_type.is_none()
+            && expr_type.is_nil()
+            && typed_global_nil_placeholder_type(db, cache, &maybe_ref_id).is_some()
+        {
+            return Ok(ResultTypeOrContinue::Continue);
+        }
+
+        if explicit_var_type.is_none()
+            && expr_type.is_nil()
+            && is_untyped_param_rooted_index(db, &maybe_ref_id)
+        {
+            return Ok(ResultTypeOrContinue::Continue);
+        }
 
         // Assignment is value REPLACEMENT, not condition refinement. When the RHS is a
         // fresh table-literal constructor, its table identity must replace the
@@ -1186,21 +1838,53 @@ fn get_type_at_assign_stat(
         let rhs_is_fresh_table_literal = explicit_var_type.is_none()
             && matches!(expr_type, LuaType::TableConst(_))
             && exprs.get(i).is_some_and(expr_is_table_constructor);
+        let rhs_is_string_literal = explicit_var_type.is_none()
+            && matches!(
+                expr_type,
+                LuaType::StringConst(_) | LuaType::DocStringConst(_)
+            );
+        let rhs_is_class_instance =
+            explicit_var_type.is_none() && is_class_instance_type(db, &expr_type);
+        let rhs_replaces_special_call_effect = explicit_var_type.is_none()
+            && antecedent_has_relevant_special_call_effect_before_node(
+                db, tree, cache, root, flow_node, var_ref_id,
+            );
 
-        let narrowed = if rhs_is_fresh_table_literal {
+        let narrowed = if rhs_is_fresh_table_literal
+            || rhs_is_string_literal
+            || rhs_is_class_instance
+            || rhs_replaces_special_call_effect
+        {
             Some(expr_type.clone())
-        } else if source_type == LuaType::Nil {
-            None
         } else {
-            let declared =
-                get_var_ref_type(db, cache, var_ref_id)
+            let source_type = if let Some(explicit) = explicit_var_type.clone() {
+                explicit
+            } else {
+                match get_antecedent_type_for_flow_node(
+                    db, tree, cache, root, var_ref_id, flow_node, policy,
+                ) {
+                    Ok(ty) => ty,
+                    Err(InferFailReason::UnResolveDeclType(decl_id))
+                        if should_treat_unresolved_decl_as_nil(db, decl_id) =>
+                    {
+                        LuaType::Nil
+                    }
+                    Err(err) => return Err(err),
+                }
+            };
+
+            if source_type == LuaType::Nil {
+                None
+            } else {
+                let declared = get_var_ref_type(db, cache, var_ref_id)
                     .ok()
                     .and_then(|decl| match decl {
                         LuaType::Def(_) | LuaType::Ref(_) => Some(decl),
                         _ => None,
                     });
 
-            narrow_down_type(db, source_type.clone(), expr_type.clone(), declared)
+                narrow_down_type(db, source_type.clone(), expr_type.clone(), declared)
+            }
         };
 
         let mut result_type = narrowed.unwrap_or(explicit_var_type.unwrap_or(expr_type));
@@ -1215,6 +1899,1174 @@ fn get_type_at_assign_stat(
     }
 
     Ok(ResultTypeOrContinue::Continue)
+}
+
+fn try_get_numeric_range_table_arg_population_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+    call_expr: LuaCallExpr,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some((query_root, access_index)) = numeric_table_index_query(db, cache, root, var_ref_id)
+    else {
+        return Ok(None);
+    };
+    let key_name = numeric_table_index_query_key_name(var_ref_id)
+        .map(str::to_string)
+        .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id));
+
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let Some((arg_index, _)) = args.iter().enumerate().find(|(_, arg)| {
+        matches!(
+            get_var_expr_var_ref_id(db, cache, (*arg).clone()),
+            Some(VarRefId::VarRef(decl_id)) if query_root.as_decl_id() == Some(decl_id)
+        )
+    }) else {
+        return Ok(None);
+    };
+
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, root, &call_expr)
+    else {
+        return Ok(None);
+    };
+    let Some(param_name) = closure
+        .get_params_list()
+        .and_then(|params| params.get_params().nth(arg_index))
+        .and_then(|param| param.get_name_token())
+        .map(|name| name.get_name_text().to_string())
+    else {
+        return Ok(None);
+    };
+
+    let Some(block) = closure.get_block() else {
+        return Ok(None);
+    };
+    let stats = block.get_stats().collect::<Vec<_>>();
+    let [LuaStat::ForStat(for_stat)] = stats.as_slice() else {
+        return Ok(None);
+    };
+    if !numeric_for_bounds_cover_index(db, cache, for_stat, access_index) {
+        return Ok(None);
+    }
+
+    let Some(for_var_name) = for_stat
+        .get_var_name()
+        .map(|name| name.get_name_text().to_string())
+    else {
+        return Ok(None);
+    };
+    let Some(for_block) = for_stat.get_block() else {
+        return Ok(None);
+    };
+    let for_stats = for_block.get_stats().collect::<Vec<_>>();
+    let [LuaStat::AssignStat(assign_stat)] = for_stats.as_slice() else {
+        return Ok(None);
+    };
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let ([LuaVarExpr::IndexExpr(index_expr)], [rhs_expr]) = (vars.as_slice(), exprs.as_slice())
+    else {
+        return Ok(None);
+    };
+    if !index_expr_writes_param_at_for_var(index_expr, &param_name, &for_var_name) {
+        return Ok(None);
+    }
+    if expr_calls_may_write_numeric_population_identity(
+        db,
+        cache,
+        root,
+        rhs_expr,
+        &query_root,
+        key_name.as_deref(),
+        &mut HashSet::new(),
+    ) {
+        return Ok(None);
+    }
+
+    let rhs_type = infer_expr(db, cache, rhs_expr.clone())?;
+    if rhs_type.is_nullable() || rhs_type.is_nil() {
+        return Ok(None);
+    }
+
+    Ok(Some(rhs_type))
+}
+
+fn expr_calls_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    expr: &LuaExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let expr_range = expr.get_range();
+    if let LuaExpr::CallExpr(call_expr) = expr
+        && same_file_call_may_write_numeric_population_identity(
+            db,
+            cache,
+            root,
+            call_expr,
+            query_root,
+            key_name,
+            active_closures,
+        )
+    {
+        return true;
+    }
+    expr.descendants::<LuaCallExpr>().any(|call_expr| {
+        call_is_inside_nested_closure_expr(&call_expr, expr_range)
+            || same_file_call_may_write_numeric_population_identity(
+                db,
+                cache,
+                root,
+                &call_expr,
+                query_root,
+                key_name,
+                active_closures,
+            )
+    })
+}
+
+fn same_file_call_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    call_expr: &LuaCallExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, root, call_expr) else {
+        return false;
+    };
+    let closure_range = closure.get_range();
+    if !active_closures.insert(closure_range) {
+        return true;
+    }
+
+    let may_write = closure_may_write_numeric_population_identity(
+        db,
+        cache,
+        root,
+        &closure,
+        query_root,
+        key_name,
+        active_closures,
+    );
+    active_closures.remove(&closure_range);
+    may_write
+}
+
+fn closure_may_write_numeric_population_identity(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    closure: &LuaClosureExpr,
+    query_root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    key_name: Option<&str>,
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(block) = closure.get_block() else {
+        return false;
+    };
+
+    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if assignment_vars_write_root(db, cache, &vars, query_root)
+            || key_name.is_some_and(|key_name| {
+                assignment_vars_write_dynamic_key_name(db, cache, &vars, key_name)
+            })
+        {
+            return true;
+        }
+    }
+
+    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
+            continue;
+        }
+        if same_file_call_may_write_numeric_population_identity(
+            db,
+            cache,
+            root,
+            &nested_call,
+            query_root,
+            key_name,
+            active_closures,
+        ) {
+            return true;
+        }
+    }
+
+    false
+}
+
+pub(crate) fn try_get_cross_file_numeric_range_population_type_for_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let (table_global, access_index, key_name) =
+        numeric_global_table_index_query(db, cache, index_expr)?;
+    let reader_file_id = cache.get_file_id();
+    let access_position = index_expr.get_position();
+    let query_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&reader_file_id, access_position);
+    for population in db
+        .get_numeric_range_population_index()
+        .get_for_global(&table_global)
+    {
+        if population.file_id == reader_file_id {
+            continue;
+        }
+        if access_index < population.start || access_index > population.end {
+            continue;
+        }
+        if let Some(key_name) = key_name.as_deref()
+            && population.write_roots.iter().any(|root| root == key_name)
+        {
+            continue;
+        }
+        let Some((pop_pos, reader_pos, roots)) =
+            population_load_positions(db, population.file_id, reader_file_id, query_realm)
+        else {
+            continue;
+        };
+        if pop_pos >= reader_pos {
+            continue;
+        }
+        let mut mutation_roots = Vec::with_capacity(1 + population.alias_roots.len());
+        mutation_roots.push(population.table_global.as_str());
+        mutation_roots.extend(population.alias_roots.iter().map(String::as_str));
+        if load_ordered_file_between_has_global_table_uncertainty(
+            db,
+            &roots,
+            pop_pos,
+            reader_pos,
+            &mutation_roots,
+        ) {
+            continue;
+        }
+        if file_has_global_table_uncertainty_after(
+            db,
+            population.file_id,
+            &mutation_roots,
+            population.call_range.end(),
+        ) {
+            continue;
+        }
+        if read_inside_nested_closure(index_expr)
+            && current_file_has_any_top_level_global_table_uncertainty(
+                db,
+                cache,
+                index_expr,
+                &mutation_roots,
+            )
+        {
+            continue;
+        }
+        if current_scope_has_prior_global_table_uncertainty(db, cache, index_expr, &mutation_roots)
+        {
+            continue;
+        }
+        return Some(population.value_type.clone());
+    }
+    None
+}
+
+fn numeric_global_table_index_query(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<(String, i64, Option<String>)> {
+    let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let table_global = table_name.get_name_text()?;
+    if !db
+        .get_numeric_range_population_index()
+        .has_global(&table_global)
+    {
+        return None;
+    }
+    if !name_expr_is_global_root(db, cache, &table_name) {
+        return None;
+    }
+    let access_index = index_expr_numeric_key_value(db, cache, index_expr)?;
+    let key_name = match index_expr.get_index_key()? {
+        LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) => name_expr.get_name_text(),
+        _ => None,
+    };
+    Some((table_global, access_index, key_name))
+}
+
+fn population_load_positions(
+    db: &DbIndex,
+    population_file_id: FileId,
+    reader_file_id: FileId,
+    query_realm: GmodRealm,
+) -> Option<(
+    usize,
+    usize,
+    Vec<(FileId, crate::GmodLoadRootKind, crate::GmodLoadOrderKey)>,
+)> {
+    let state = crate::GmodStateMask::from_realm(query_realm).as_caller_compatibility_mask();
+    let roots = db.get_gmod_load_index().engine_roots_in_load_order(state);
+    let pop_pos = roots
+        .iter()
+        .position(|(file_id, _, _)| *file_id == population_file_id);
+    let reader_pos = roots
+        .iter()
+        .position(|(file_id, _, _)| *file_id == reader_file_id);
+    Some((pop_pos?, reader_pos?, roots))
+}
+
+fn load_ordered_file_between_has_global_table_uncertainty(
+    db: &DbIndex,
+    roots: &[(FileId, crate::GmodLoadRootKind, crate::GmodLoadOrderKey)],
+    pop_pos: usize,
+    reader_pos: usize,
+    mutation_roots: &[&str],
+) -> bool {
+    for (file_id, _, _) in &roots[pop_pos + 1..reader_pos] {
+        let Some(tree) = db.get_vfs().get_syntax_tree(file_id) else {
+            return true;
+        };
+        let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
+            return true;
+        };
+        let mut cache = LuaInferCache::new(*file_id, Default::default());
+        if file_has_top_level_global_table_uncertainty(db, &mut cache, &chunk, mutation_roots) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_has_top_level_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    mutation_roots: &[&str],
+) -> bool {
+    let Some(block) = root.get_block() else {
+        return true;
+    };
+    for stat in block.get_stats() {
+        if top_level_stat_may_mutate_global_table(db, cache, &stat, mutation_roots) {
+            return true;
+        }
+    }
+    false
+}
+
+fn file_has_global_table_uncertainty_after(
+    db: &DbIndex,
+    file_id: FileId,
+    mutation_roots: &[&str],
+    after: TextSize,
+) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return true;
+    };
+    let Some(chunk) = LuaChunk::cast(tree.get_red_root()) else {
+        return true;
+    };
+    let Some(block) = chunk.get_block() else {
+        return true;
+    };
+    for stat in block.get_stats().filter(|stat| stat.get_position() > after) {
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        if top_level_stat_may_mutate_global_table(db, &mut cache, &stat, mutation_roots) {
+            return true;
+        }
+    }
+    false
+}
+
+fn read_inside_nested_closure(index_expr: &LuaIndexExpr) -> bool {
+    index_expr
+        .syntax()
+        .ancestors()
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
+}
+
+fn current_file_has_any_top_level_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    mutation_roots: &[&str],
+) -> bool {
+    let Some(root) = LuaChunk::cast(index_expr.get_root()) else {
+        return true;
+    };
+    file_has_top_level_global_table_uncertainty(db, cache, &root, mutation_roots)
+}
+
+fn current_scope_has_prior_global_table_uncertainty(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    mutation_roots: &[&str],
+) -> bool {
+    let mut before = index_expr.get_position();
+    if enclosing_control_flow_has_prior_call(db, cache, index_expr, before, mutation_roots) {
+        return true;
+    }
+    for block in index_expr.syntax().ancestors().filter_map(LuaBlock::cast) {
+        for stat in block
+            .get_stats()
+            .take_while(|stat| stat.get_position() < before)
+        {
+            if top_level_stat_may_mutate_global_table(db, cache, &stat, mutation_roots) {
+                return true;
+            }
+        }
+        before = block.get_position();
+    }
+    false
+}
+
+fn enclosing_control_flow_has_prior_call(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+    before: TextSize,
+    mutation_roots: &[&str],
+) -> bool {
+    for stat in index_expr.syntax().ancestors().filter_map(LuaStat::cast) {
+        if !matches!(
+            stat,
+            LuaStat::IfStat(_)
+                | LuaStat::WhileStat(_)
+                | LuaStat::RepeatStat(_)
+                | LuaStat::ForStat(_)
+                | LuaStat::ForRangeStat(_)
+        ) {
+            continue;
+        }
+        for call_expr in stat.descendants::<LuaCallExpr>() {
+            if call_expr.get_position() < before
+                && !node_is_inside_nested_closure(call_expr.syntax(), stat.syntax())
+                && call_effect_overlaps_mutation_roots(db, cache, &call_expr, mutation_roots)
+            {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+fn top_level_stat_may_mutate_global_table(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    stat: &LuaStat,
+    mutation_roots: &[&str],
+) -> bool {
+    for call_expr in stat.descendants::<LuaCallExpr>() {
+        if node_is_inside_nested_closure(call_expr.syntax(), stat.syntax()) {
+            continue;
+        }
+        if call_effect_overlaps_mutation_roots(db, cache, &call_expr, mutation_roots) {
+            return true;
+        }
+    }
+    for assign_stat in stat.descendants::<LuaAssignStat>() {
+        if node_is_inside_nested_closure(assign_stat.syntax(), stat.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars
+            .iter()
+            .any(|var| var_expr_may_mutate_global_table(var, mutation_roots))
+        {
+            return true;
+        }
+    }
+    false
+}
+
+fn call_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    mutation_roots: &[&str],
+) -> bool {
+    let call_overlaps = match gmod_call_write_effect(db, cache, call_expr) {
+        GmodCallWriteEffect::Globals(roots) => roots.iter().any(|root| {
+            mutation_roots
+                .iter()
+                .any(|mutation_root| root == mutation_root)
+        }),
+        GmodCallWriteEffect::Unknown => same_file_call_effect_overlaps_mutation_roots(
+            db,
+            cache,
+            call_expr,
+            mutation_roots,
+            &mut HashSet::new(),
+        ),
+    };
+    call_overlaps
+        || call_expr.get_args_list().is_some_and(|args| {
+            args.get_args().any(|arg| {
+                if let LuaExpr::CallExpr(ref nested_call) = arg
+                    && call_effect_overlaps_mutation_roots(db, cache, &nested_call, mutation_roots)
+                {
+                    return true;
+                }
+                arg.descendants::<LuaCallExpr>().any(|nested_call| {
+                    !node_is_inside_nested_closure(nested_call.syntax(), arg.syntax())
+                        && call_effect_overlaps_mutation_roots(
+                            db,
+                            cache,
+                            &nested_call,
+                            mutation_roots,
+                        )
+                })
+            })
+        })
+}
+
+fn same_file_call_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+    mutation_roots: &[&str],
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(root) = LuaChunk::cast(call_expr.get_root()) else {
+        return true;
+    };
+    let Some(closure) = resolve_same_file_named_function_closure(db, cache, &root, call_expr)
+    else {
+        return true;
+    };
+    let closure_range = closure.get_range();
+    if !active_closures.insert(closure_range) {
+        return true;
+    }
+
+    let overlaps = closure_effect_overlaps_mutation_roots(
+        db,
+        cache,
+        &root,
+        &closure,
+        mutation_roots,
+        active_closures,
+    );
+    active_closures.remove(&closure_range);
+    overlaps
+}
+
+fn closure_effect_overlaps_mutation_roots(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    closure: &LuaClosureExpr,
+    mutation_roots: &[&str],
+    active_closures: &mut HashSet<TextRange>,
+) -> bool {
+    let Some(block) = closure.get_block() else {
+        return true;
+    };
+
+    for assign_stat in block.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        if node_is_inside_nested_closure(assign_stat.syntax(), block.syntax()) {
+            continue;
+        }
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        if vars
+            .iter()
+            .any(|var| var_expr_may_mutate_global_table(var, mutation_roots))
+        {
+            return true;
+        }
+    }
+
+    for nested_call in block.syntax().descendants().filter_map(LuaCallExpr::cast) {
+        if node_is_inside_nested_closure(nested_call.syntax(), block.syntax()) {
+            continue;
+        }
+        let call_overlaps = match gmod_call_write_effect(db, cache, &nested_call) {
+            GmodCallWriteEffect::Globals(roots) => roots.iter().any(|root| {
+                mutation_roots
+                    .iter()
+                    .any(|mutation_root| root == mutation_root)
+            }),
+            GmodCallWriteEffect::Unknown => {
+                let Some(closure) =
+                    resolve_same_file_named_function_closure(db, cache, root, &nested_call)
+                else {
+                    return true;
+                };
+                let closure_range = closure.get_range();
+                if !active_closures.insert(closure_range) {
+                    return true;
+                }
+                let overlaps = closure_effect_overlaps_mutation_roots(
+                    db,
+                    cache,
+                    root,
+                    &closure,
+                    mutation_roots,
+                    active_closures,
+                );
+                active_closures.remove(&closure_range);
+                overlaps
+            }
+        };
+        if call_overlaps {
+            return true;
+        }
+    }
+
+    false
+}
+
+fn node_is_inside_nested_closure(
+    node: &glua_parser::LuaSyntaxNode,
+    boundary: &glua_parser::LuaSyntaxNode,
+) -> bool {
+    node.ancestors()
+        .take_while(|ancestor| ancestor != boundary)
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
+}
+
+fn var_expr_may_mutate_global_table(var: &LuaVarExpr, mutation_roots: &[&str]) -> bool {
+    match var {
+        LuaVarExpr::NameExpr(name_expr) => name_expr
+            .get_name_text()
+            .is_some_and(|name| mutation_roots.iter().any(|root| *root == name)),
+        LuaVarExpr::IndexExpr(index_expr) => index_expr_global_root_name(index_expr)
+            .is_some_and(|name| mutation_roots.iter().any(|root| *root == name)),
+    }
+}
+
+fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<String> {
+    let mut prefix = index_expr.get_prefix_expr()?;
+    while let LuaExpr::IndexExpr(parent_index) = prefix {
+        prefix = parent_index.get_prefix_expr()?;
+    }
+    let LuaExpr::NameExpr(name_expr) = prefix else {
+        return None;
+    };
+    name_expr.get_name_text()
+}
+
+fn numeric_table_index_query(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+) -> Option<(
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+)> {
+    if let VarRefId::IndexRef(query_root, query_path) = var_ref_id
+        && let Some(index_name) = dynamic_bracket_index_name(query_path.deref())
+        && let Some(index) =
+            unambiguous_integer_const_name_value(db, cache, index_name, var_ref_id.get_position())
+    {
+        return Some((query_root.clone(), index));
+    }
+
+    if let VarRefId::IndexRef(query_decl_root, _) = var_ref_id
+        && let Some(decl_id) = query_decl_root.as_decl_id()
+        && let Some(query) =
+            numeric_table_index_query_from_decl_initializer(db, cache, root, decl_id)
+    {
+        return Some(query);
+    }
+
+    let decl_id = var_ref_id.get_decl_id_ref()?;
+    numeric_table_index_query_from_decl_initializer(db, cache, root, decl_id)
+}
+
+fn numeric_table_index_query_from_decl_initializer(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    root: &LuaChunk,
+    decl_id: LuaDeclId,
+) -> Option<(
+    crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+    i64,
+)> {
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let expr = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaExpr::cast)?;
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return None;
+    };
+    let access_index = index_expr_numeric_key_value(db, cache, &index_expr)?;
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    let query_root = index_expr_root_id(db, cache, prefix_expr)?;
+    Some((query_root, access_index))
+}
+
+fn index_expr_root_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    mut prefix_expr: LuaExpr,
+) -> Option<crate::semantic::infer::narrow::var_ref_id::VarRefRootId> {
+    while let LuaExpr::IndexExpr(index_expr) = prefix_expr {
+        prefix_expr = index_expr.get_prefix_expr()?;
+    }
+
+    let LuaExpr::NameExpr(name_expr) = prefix_expr else {
+        return None;
+    };
+    match get_var_expr_var_ref_id(db, cache, LuaExpr::NameExpr(name_expr))? {
+        VarRefId::SelfRef(self_ref_id) => {
+            Some(crate::semantic::infer::narrow::var_ref_id::VarRefRootId::SelfRef(self_ref_id))
+        }
+        VarRefId::VarRef(decl_id) => {
+            Some(crate::semantic::infer::narrow::var_ref_id::VarRefRootId::Decl(decl_id))
+        }
+        _ => None,
+    }
+}
+
+fn resolve_same_file_named_function_closure(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    call_expr: &LuaCallExpr,
+) -> Option<LuaClosureExpr> {
+    let LuaExpr::NameExpr(name_expr) = call_expr.get_prefix_expr()? else {
+        return None;
+    };
+    if let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+        && let Some(decl) = db.get_decl_index().get_decl(&decl_id)
+        && let Some(token) = decl.get_syntax_id().to_token_from_root(root.syntax())
+        && let Some(parent) = token.parent()
+    {
+        for ancestor in parent.ancestors() {
+            if let Some(func_stat) = LuaFuncStat::cast(ancestor.clone()) {
+                return func_stat.get_closure();
+            }
+            if let Some(local_func_stat) = LuaLocalFuncStat::cast(ancestor) {
+                return local_func_stat.get_closure();
+            }
+        }
+    }
+
+    let name_text = name_expr.get_name_text()?;
+    for block in call_expr.ancestors::<LuaBlock>() {
+        let mut matched = block
+            .get_stats()
+            .take_while(|stat| stat.get_position() < call_expr.get_position())
+            .filter_map(|stat| match stat {
+                LuaStat::LocalFuncStat(local_func) => local_func
+                    .get_local_name()
+                    .and_then(|name| name.get_name_token())
+                    .is_some_and(|token| token.get_name_text() == name_text)
+                    .then(|| local_func.get_closure())
+                    .flatten(),
+                LuaStat::FuncStat(func_stat) => {
+                    simple_func_stat_name_matches(&func_stat, &name_text)
+                        .then(|| func_stat.get_closure())
+                        .flatten()
+                }
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        let mut matched = matched.drain(..);
+        let Some(closure) = matched.next() else {
+            continue;
+        };
+        if matched.next().is_some() {
+            return None;
+        }
+        return Some(closure);
+    }
+    None
+}
+
+fn simple_func_stat_name_matches(func_stat: &LuaFuncStat, name: &str) -> bool {
+    let Some(LuaVarExpr::NameExpr(name_expr)) = func_stat.get_func_name() else {
+        return false;
+    };
+    name_expr
+        .get_name_text()
+        .is_some_and(|name_text| name_text == name)
+}
+
+fn index_expr_writes_param_at_for_var(
+    index_expr: &LuaIndexExpr,
+    param_name: &str,
+    for_var_name: &str,
+) -> bool {
+    let Some(prefix) = index_expr.get_prefix_expr() else {
+        return false;
+    };
+    let LuaExpr::NameExpr(prefix_name) = prefix else {
+        return false;
+    };
+    if prefix_name.get_name_text().as_deref() != Some(param_name) {
+        return false;
+    }
+
+    let Some(LuaIndexKey::Expr(LuaExpr::NameExpr(key_name))) = index_expr.get_index_key() else {
+        return false;
+    };
+    key_name.get_name_text().as_deref() == Some(for_var_name)
+}
+
+fn numeric_for_bounds_cover_index(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    for_stat: &glua_parser::LuaForStat,
+    access_index: i64,
+) -> bool {
+    let iter_exprs = for_stat.get_iter_expr().collect::<Vec<_>>();
+    let [start_expr, end_expr] = iter_exprs.as_slice() else {
+        return false;
+    };
+    let Some(start) = integer_const_expr_value(db, cache, start_expr) else {
+        return false;
+    };
+    let Some(end) = integer_const_expr_value(db, cache, end_expr) else {
+        return false;
+    };
+    access_index >= start && access_index <= end
+}
+
+fn integer_const_expr_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> Option<i64> {
+    match infer_expr(db, cache, expr.clone()).ok()? {
+        LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => Some(value),
+        _ => None,
+    }
+}
+
+fn numeric_table_index_query_key_name(var_ref_id: &VarRefId) -> Option<&str> {
+    let VarRefId::IndexRef(_, query_path) = var_ref_id else {
+        return None;
+    };
+    dynamic_bracket_index_name(query_path.deref())
+}
+
+fn numeric_table_index_query_key_name_from_initializer(
+    db: &DbIndex,
+    root: &LuaChunk,
+    var_ref_id: &VarRefId,
+) -> Option<String> {
+    let decl_id = match var_ref_id {
+        VarRefId::IndexRef(query_root, _) => query_root.as_decl_id(),
+        _ => var_ref_id.get_decl_id_ref(),
+    }?;
+    let decl = db.get_decl_index().get_decl(&decl_id)?;
+    let initializer = decl.get_initializer()?;
+    if initializer.get_ret_idx() != 0 {
+        return None;
+    }
+    let expr = initializer
+        .get_expr_syntax_id()
+        .to_node_from_root(root.syntax())
+        .and_then(LuaExpr::cast)?;
+    let LuaExpr::IndexExpr(index_expr) = expr else {
+        return None;
+    };
+    let LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) = index_expr.get_index_key()? else {
+        return None;
+    };
+    name_expr.get_name_text()
+}
+
+fn dynamic_bracket_index_name(path: &str) -> Option<&str> {
+    path.rsplit('.')
+        .next()?
+        .strip_prefix('[')?
+        .strip_suffix(']')
+}
+
+fn unambiguous_integer_const_name_value(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    name: &str,
+    before: TextSize,
+) -> Option<i64> {
+    let file_id = cache.get_file_id();
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+    let mut value = None;
+    for decl in decl_tree
+        .get_decls()
+        .values()
+        .filter(|decl| decl.get_name() == name && decl.get_position() <= before)
+    {
+        let type_cache = db.get_type_index().get_type_cache(&decl.get_id().into())?;
+        let decl_value = match type_cache.as_type() {
+            LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => *value,
+            _ => return None,
+        };
+        match value {
+            Some(existing) if existing != decl_value => return None,
+            Some(_) => {}
+            None => value = Some(decl_value),
+        }
+    }
+    value
+}
+
+fn var_ref_matches_root(
+    var_ref_id: &VarRefId,
+    root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+) -> bool {
+    match var_ref_id {
+        VarRefId::VarRef(decl_id) => root.as_decl_id() == Some(*decl_id),
+        VarRefId::SelfRef(self_ref_id) => root.receiver_eq(&self_ref_id.receiver),
+        VarRefId::IndexRef(index_root, _) => index_root == root,
+        _ => false,
+    }
+}
+
+fn var_ref_is_name(db: &DbIndex, var_ref_id: &VarRefId, name: &str) -> bool {
+    let Some(decl_id) = var_ref_id.get_decl_id_ref() else {
+        return false;
+    };
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .is_some_and(|decl| decl.get_name() == name)
+}
+
+fn assignment_vars_write_root(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    vars: &[LuaVarExpr],
+    root: &crate::semantic::infer::narrow::var_ref_id::VarRefRootId,
+) -> bool {
+    vars.iter().any(|var| {
+        get_var_expr_var_ref_id(db, cache, var.to_expr())
+            .is_some_and(|var_ref_id| var_ref_matches_root(&var_ref_id, root))
+    })
+}
+
+fn assignment_vars_write_dynamic_key_name(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    vars: &[LuaVarExpr],
+    key_name: &str,
+) -> bool {
+    vars.iter().any(|var| {
+        if let LuaVarExpr::NameExpr(name_expr) = var
+            && name_expr.get_name_text().as_deref() == Some(key_name)
+        {
+            return true;
+        }
+
+        get_var_expr_var_ref_id(db, cache, var.to_expr())
+            .is_some_and(|var_ref_id| var_ref_is_name(db, &var_ref_id, key_name))
+    })
+}
+
+fn call_is_inside_nested_closure_expr(call_expr: &LuaCallExpr, expr_range: TextRange) -> bool {
+    call_expr.ancestors::<LuaClosureExpr>().any(|closure| {
+        let closure_range = closure.get_range();
+        closure_range.start() >= expr_range.start() && closure_range.end() <= expr_range.end()
+    })
+}
+
+fn index_expr_numeric_key_value(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: &LuaIndexExpr,
+) -> Option<i64> {
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Expr(key_expr) => integer_const_expr_value(db, cache, &key_expr),
+        LuaIndexKey::Integer(number) => match number.get_number_value() {
+            NumberResult::Int(value) => Some(value),
+            _ => None,
+        },
+        LuaIndexKey::Idx(value) => Some(value as i64),
+        _ => None,
+    }
+}
+
+fn assigned_prefix_member_type(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    query_ref_id: &VarRefId,
+    assigned_ref_id: &VarRefId,
+    assigned_type: &LuaType,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let VarRefId::IndexRef(_, path) = query_ref_id else {
+        return Ok(None);
+    };
+
+    if path.contains('.') {
+        return Ok(None);
+    }
+
+    let key = LuaMemberKey::Name(path.to_string().into());
+    let Some(type_id) = assigned_member_type_id(assigned_type) else {
+        return Ok(None);
+    };
+
+    resolve_assigned_type_member(db, cache, &type_id, &key, assigned_ref_id.get_position())
+        .map(Some)
+}
+
+fn assigned_member_type_id(assigned_type: &LuaType) -> Option<LuaTypeDeclId> {
+    match assigned_type {
+        LuaType::Instance(instance) => assigned_member_type_id(instance.get_base()),
+        LuaType::Union(union) => {
+            let mut resolved = None;
+            for typ in union.types().filter(|typ| !typ.is_nil()) {
+                let type_id = assigned_member_type_id(typ)?;
+                if resolved
+                    .as_ref()
+                    .is_some_and(|existing| existing != &type_id)
+                {
+                    return None;
+                }
+                resolved = Some(type_id);
+            }
+            resolved
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => Some(type_id.clone()),
+        _ => None,
+    }
+}
+
+fn is_class_instance_type(db: &DbIndex, typ: &LuaType) -> bool {
+    let Some(type_id) = assigned_member_type_id(typ) else {
+        return false;
+    };
+
+    db.get_type_index()
+        .get_type_decl(&type_id)
+        .is_some_and(|decl| decl.is_class())
+}
+
+fn resolve_assigned_type_member(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    type_id: &LuaTypeDeclId,
+    key: &LuaMemberKey,
+    access_position: TextSize,
+) -> InferResult {
+    let type_index = db.get_type_index();
+    let type_decl = type_index
+        .get_type_decl(type_id)
+        .ok_or(InferFailReason::None)?;
+
+    let owner = LuaMemberOwner::Type(type_id.clone());
+    if let Some(member_item) = db.get_member_index().get_member_item(&owner, key) {
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
+    }
+
+    let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_id.get_name()));
+    if let Some(member_item) = db.get_member_index().get_member_item(&global_owner, key) {
+        return member_item.resolve_type_with_realm_at_offset(
+            db,
+            &cache.get_file_id(),
+            access_position,
+        );
+    }
+
+    if type_decl.is_class()
+        && let Some(super_types) = type_index.get_super_types(type_id)
+    {
+        for super_type in super_types {
+            let Some(super_type_id) = assigned_member_type_id(&super_type) else {
+                continue;
+            };
+            match resolve_assigned_type_member(db, cache, &super_type_id, key, access_position) {
+                Ok(member_type) => return Ok(member_type),
+                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                Err(err) => return Err(err),
+            }
+        }
+    }
+
+    Err(InferFailReason::FieldNotFound)
+}
+
+fn antecedent_has_relevant_special_call_effect_before_node(
+    db: &DbIndex,
+    tree: &FlowTree,
+    cache: &LuaInferCache,
+    root: &LuaChunk,
+    flow_node: &FlowNode,
+    var_ref_id: &VarRefId,
+) -> bool {
+    let mut visited = HashSet::new();
+    match flow_node.antecedent {
+        Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
+            db,
+            tree,
+            cache,
+            root,
+            prev,
+            flow_node.id,
+            var_ref_id,
+            &mut visited,
+        ),
+        Some(FlowAntecedent::Multiple(idx)) => {
+            tree.get_multi_antecedents(idx).is_some_and(|prevs| {
+                prevs.iter().copied().any(|prev| {
+                    antecedent_has_relevant_special_call_effect(
+                        db,
+                        tree,
+                        cache,
+                        root,
+                        prev,
+                        flow_node.id,
+                        var_ref_id,
+                        &mut visited,
+                    )
+                })
+            })
+        }
+        None => false,
+    }
+}
+
+fn typed_global_nil_placeholder_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    var_ref_id: &VarRefId,
+) -> Option<LuaType> {
+    let declared_type = match var_ref_id {
+        VarRefId::GlobalName(name, position) => {
+            infer_global_type(db, Some(cache.get_file_id()), Some(*position), name).ok()
+        }
+        VarRefId::VarRef(decl_id) => db.get_decl_index().get_decl(decl_id).and_then(|decl| {
+            decl.is_global().then(|| {
+                infer_global_type(db, Some(cache.get_file_id()), None, decl.get_name()).ok()
+            })?
+        }),
+        _ => None,
+    };
+    declared_type.filter(|typ| {
+        !typ.is_nil()
+            && !typ.is_nullable()
+            && !typ.is_unknown()
+            && !matches!(typ, LuaType::Any | LuaType::Never)
+    })
 }
 
 /// Returns true when `expr` is a table-constructor literal `{ ... }`, unwrapping
@@ -1272,6 +3124,9 @@ fn assignment_flow_info_cannot_match(
     let Some(info) = tree.get_assignment_flow_info(flow_id) else {
         return false;
     };
+    if info.is_empty() {
+        return false;
+    }
     if info.has_unknown_index_target {
         return false;
     }
@@ -1282,7 +3137,6 @@ fn assignment_flow_info_cannot_match(
         .any(|path| path.deref().as_str() == query_path.deref().as_str())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn maybe_get_collection_append_assignment_type(
     db: &DbIndex,
     tree: &FlowTree,
@@ -1293,6 +3147,7 @@ fn maybe_get_collection_append_assignment_type(
     var: &LuaVarExpr,
     exprs: &[LuaExpr],
     idx: usize,
+    policy: FlowWalkPolicy,
 ) -> Result<Option<LuaType>, InferFailReason> {
     let LuaVarExpr::IndexExpr(index_expr) = var else {
         return Ok(None);
@@ -1319,16 +3174,17 @@ fn maybe_get_collection_append_assignment_type(
         return Ok(None);
     }
 
-    let source_type =
-        match get_antecedent_type_for_flow_node(db, tree, cache, root, var_ref_id, flow_node) {
-            Ok(ty) => ty,
-            Err(InferFailReason::UnResolveDeclType(decl_id))
-                if should_treat_unresolved_decl_as_nil(db, decl_id) =>
-            {
-                LuaType::Nil
-            }
-            Err(err) => return Err(err),
-        };
+    let source_type = match get_antecedent_type_for_flow_node(
+        db, tree, cache, root, var_ref_id, flow_node, policy,
+    ) {
+        Ok(ty) => ty,
+        Err(InferFailReason::UnResolveDeclType(decl_id))
+            if should_treat_unresolved_decl_as_nil(db, decl_id) =>
+        {
+            LuaType::Nil
+        }
+        Err(err) => return Err(err),
+    };
     let Some(source_base) = infer_collection_base_type(db, &source_type) else {
         return Ok(None);
     };
@@ -1434,14 +3290,7 @@ fn get_member_owner_for_prefix_type(prefix_type: LuaType) -> Option<LuaMemberOwn
 }
 
 fn normalize_infer_collection_type(db: &DbIndex, typ: &LuaType) -> Option<()> {
-    match typ {
-        LuaType::Array(_) => Some(()),
-        LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(()),
-        // Shaped sequential literals are inferred as TableConst; treat them as
-        // inferred collections too so flow narrowing over their elements works.
-        LuaType::TableConst(range) => crate::table_const_array_base(db, range).map(|_| ()),
-        _ => None,
-    }
+    infer_collection_base_type(db, typ).map(|_| ())
 }
 
 fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
@@ -1449,8 +3298,39 @@ fn infer_collection_base_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
         LuaType::Array(array) => Some(array.get_base().clone()),
         LuaType::Tuple(tuple) if tuple.is_infer_resolve() => Some(tuple.cast_down_array_base(db)),
         LuaType::TableConst(range) => crate::table_const_array_base(db, range),
+        LuaType::TypeGuard(inner) => infer_collection_base_type(db, inner),
+        LuaType::Union(union) => infer_collection_base_types(db, union.types()),
+        LuaType::Intersection(intersection) => {
+            infer_collection_base_types(db, intersection.get_types().iter())
+        }
+        LuaType::MergedTable(merged_table) => {
+            infer_collection_base_types(db, merged_table.get_types().iter())
+        }
+        LuaType::MultiLineUnion(union) => {
+            infer_collection_base_types(db, union.get_unions().iter().map(|(typ, _)| typ))
+        }
         _ => None,
     }
+}
+
+fn infer_collection_base_types<'a>(
+    db: &DbIndex,
+    types: impl Iterator<Item = &'a LuaType>,
+) -> Option<LuaType> {
+    let mut base_type = None;
+    for typ in types {
+        if typ.is_never() {
+            continue;
+        }
+
+        let collection_base = infer_collection_base_type(db, typ)?;
+        base_type = Some(match base_type {
+            Some(current) => TypeOps::Union.apply(db, &current, &collection_base),
+            None => collection_base,
+        });
+    }
+
+    base_type
 }
 
 fn expr_access_path(expr: &LuaExpr) -> Option<String> {
@@ -1504,9 +3384,11 @@ fn try_infer_decl_initializer_type(
     };
 
     let ret_idx = initializer.get_ret_idx();
+    let initializer_is_call = matches!(&expr, LuaExpr::CallExpr(_));
     let init_type = match infer_expr(db, cache, expr)? {
         LuaType::Variadic(variadic) => variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil),
         ty if ret_idx == 0 => ty,
+        LuaType::Unknown if initializer_is_call => LuaType::Unknown,
         _ => LuaType::Nil,
     };
 
@@ -1984,5 +3866,206 @@ fn walk_antecedents_for_default(
             // proven on this path.
             false
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use glua_parser::{LuaNameExpr, LuaParser, ParserConfig};
+    use internment::ArcIntern;
+    use rowan::TextSize;
+    use smol_str::SmolStr;
+
+    use super::*;
+    use crate::{AssignmentFlowInfo, FileNarrowingCapability};
+
+    #[test]
+    fn normal_recursive_antecedent_lookup_preserves_counterfactual_origin() {
+        let file_id = FileId::new(1);
+        let parser = LuaParser::parse("", ParserConfig::default());
+        let root = parser.get_chunk_node();
+        let db = DbIndex::new();
+        let flow_tree = FlowTree::new(
+            HashMap::new(),
+            vec![
+                FlowNode {
+                    id: FlowId(0),
+                    kind: FlowNodeKind::Start,
+                    antecedent: None,
+                },
+                FlowNode {
+                    id: FlowId(1),
+                    kind: FlowNodeKind::Start,
+                    antecedent: None,
+                },
+                FlowNode {
+                    id: FlowId(2),
+                    kind: FlowNodeKind::BranchLabel,
+                    antecedent: Some(FlowAntecedent::Multiple(0)),
+                },
+            ],
+            vec![vec![FlowId(0), FlowId(1)]],
+            HashMap::new(),
+            HashMap::new(),
+            vec![AssignmentFlowInfo::default(); 3],
+            FileNarrowingCapability::default(),
+        );
+        let var_ref_id =
+            VarRefId::GlobalName(ArcIntern::from(SmolStr::new("value")), TextSize::new(0));
+        let query_realm = GmodRealm::Shared;
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache.flow_query_realm = Some(query_realm);
+
+        for antecedent in [FlowId(0), FlowId(1)] {
+            cache.set_flow_cache_with_origin(
+                &var_ref_id,
+                antecedent,
+                query_realm,
+                FlowOrigin::Real,
+                CacheEntry::Cache(LuaType::String),
+            );
+            cache.set_flow_cache_with_origin(
+                &var_ref_id,
+                antecedent,
+                query_realm,
+                FlowOrigin::NilCounterfactual,
+                CacheEntry::Cache(LuaType::Number),
+            );
+        }
+
+        let counterfactual_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(2),
+            FlowOrigin::NilCounterfactual,
+        )
+        .expect("counterfactual branch flow should resolve");
+        let real_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(2),
+            FlowOrigin::Real,
+        )
+        .expect("real branch flow should resolve");
+
+        assert_eq!(
+            (counterfactual_result, real_result),
+            (LuaType::Number, LuaType::String)
+        );
+        assert!(matches!(
+            cache.get_flow_cache_with_origin(
+                &var_ref_id,
+                FlowId(2),
+                query_realm,
+                FlowOrigin::NilCounterfactual,
+            ),
+            Some(CacheEntry::Cache(LuaType::Number))
+        ));
+        assert!(matches!(
+            cache
+                .get_flow_cache_with_origin(&var_ref_id, FlowId(2), query_realm, FlowOrigin::Real,),
+            Some(CacheEntry::Cache(LuaType::String))
+        ));
+    }
+
+    #[test]
+    fn condition_recursive_antecedent_lookup_preserves_counterfactual_origin() {
+        let file_id = FileId::new(2);
+        let parser = LuaParser::parse("value", ParserConfig::default());
+        let root = parser.get_chunk_node();
+        let condition = root
+            .clone()
+            .descendants::<LuaNameExpr>()
+            .next()
+            .map(LuaExpr::NameExpr)
+            .expect("condition name expression");
+        let db = DbIndex::new();
+        let flow_tree = FlowTree::new(
+            HashMap::new(),
+            vec![
+                FlowNode {
+                    id: FlowId(0),
+                    kind: FlowNodeKind::Start,
+                    antecedent: None,
+                },
+                FlowNode {
+                    id: FlowId(1),
+                    kind: FlowNodeKind::TrueCondition(condition.to_ptr()),
+                    antecedent: Some(FlowAntecedent::Single(FlowId(0))),
+                },
+            ],
+            Vec::new(),
+            HashMap::new(),
+            HashMap::new(),
+            vec![AssignmentFlowInfo::default(); 2],
+            FileNarrowingCapability::default(),
+        );
+        let var_ref_id =
+            VarRefId::GlobalName(ArcIntern::from(SmolStr::new("value")), TextSize::new(0));
+        let query_realm = GmodRealm::Shared;
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        cache.flow_query_realm = Some(query_realm);
+        cache.set_flow_cache_with_origin(
+            &var_ref_id,
+            FlowId(0),
+            query_realm,
+            FlowOrigin::Real,
+            CacheEntry::Cache(LuaType::String),
+        );
+        cache.set_flow_cache_with_origin(
+            &var_ref_id,
+            FlowId(0),
+            query_realm,
+            FlowOrigin::NilCounterfactual,
+            CacheEntry::Cache(LuaType::Number),
+        );
+
+        let counterfactual_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(1),
+            FlowOrigin::NilCounterfactual,
+        )
+        .expect("counterfactual condition flow should resolve");
+        let real_result = get_type_at_flow_with_origin(
+            &db,
+            &flow_tree,
+            &mut cache,
+            &root,
+            &var_ref_id,
+            FlowId(1),
+            FlowOrigin::Real,
+        )
+        .expect("real condition flow should resolve");
+
+        assert_eq!(
+            (counterfactual_result, real_result),
+            (LuaType::Number, LuaType::String)
+        );
+        assert!(matches!(
+            cache.get_flow_cache_with_origin(
+                &var_ref_id,
+                FlowId(1),
+                query_realm,
+                FlowOrigin::NilCounterfactual,
+            ),
+            Some(CacheEntry::Cache(LuaType::Number))
+        ));
+        assert!(matches!(
+            cache
+                .get_flow_cache_with_origin(&var_ref_id, FlowId(1), query_realm, FlowOrigin::Real,),
+            Some(CacheEntry::Cache(LuaType::String))
+        ));
     }
 }

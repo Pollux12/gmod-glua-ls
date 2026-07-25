@@ -104,7 +104,7 @@ pub fn get_tpl_ref_extend_type(
                 return None;
             }
             let mut result = LuaType::Unknown;
-            for union_member_type in union_type.into_vec().iter() {
+            for union_member_type in union_type.types() {
                 let extend_type = get_tpl_ref_extend_type(
                     db,
                     cache,

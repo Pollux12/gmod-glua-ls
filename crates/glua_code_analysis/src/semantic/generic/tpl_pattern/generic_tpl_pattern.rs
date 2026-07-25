@@ -113,7 +113,7 @@ fn generic_tpl_pattern_match_inner(
             }
         }
         LuaType::Union(union_type) => {
-            for union_sub_type in &union_type.into_vec() {
+            for union_sub_type in union_type.types() {
                 generic_tpl_pattern_match_inner(
                     context,
                     source_generic,

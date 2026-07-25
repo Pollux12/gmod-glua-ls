@@ -178,10 +178,7 @@ impl LuaModuleIndex {
         let node = self.module_nodes.get_mut(&parent_node_id)?;
 
         node.file_ids.push(file_id);
-        let module_name = match module_parts.last() {
-            Some(name) => name.to_string(),
-            None => return None,
-        };
+        let module_name = module_parts.last()?.to_string();
         let module_info = ModuleInfo {
             file_id,
             full_module_name: module_parts.join("."),
@@ -370,10 +367,7 @@ impl LuaModuleIndex {
         let mut parent_node_id = self.module_root_id;
         for part in module_parts {
             let parent_node = self.module_nodes.get(&parent_node_id)?;
-            let child_id = match parent_node.children.get(*part) {
-                Some(id) => *id,
-                None => return None,
-            };
+            let child_id = *parent_node.children.get(*part)?;
             parent_node_id = child_id;
         }
 
@@ -389,10 +383,7 @@ impl LuaModuleIndex {
         let mut parent_node_id = self.module_root_id;
         for part in module_parts {
             let parent_node = self.module_nodes.get(&parent_node_id)?;
-            let child_id = match parent_node.children.get(*part) {
-                Some(id) => *id,
-                None => return None,
-            };
+            let child_id = *parent_node.children.get(*part)?;
             parent_node_id = child_id;
         }
 

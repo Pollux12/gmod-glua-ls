@@ -3,8 +3,12 @@ mod resolve_global_decl;
 mod semantic_decl_level;
 mod semantic_guard;
 
+use std::sync::Arc;
+
 use crate::{
-    DbIndex, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaSemanticDeclId, LuaType, LuaTypeCache,
+    DbIndex, InFiled, LuaDeclExtra, LuaDeclId, LuaInferenceConfidence, LuaInferenceEventId,
+    LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId,
+    LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeFact, LuaTypeOwner,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaDocNameType, LuaDocTag, LuaExpr, LuaLocalName, LuaParamName,
@@ -22,8 +26,69 @@ use super::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SemanticInfo {
-    pub typ: LuaType,
+    inference_fact: LuaTypeFact,
     pub semantic_decl: Option<LuaSemanticDeclId>,
+    pub origin: SemanticInfoOrigin,
+}
+
+impl SemanticInfo {
+    pub fn actual(typ: LuaType, semantic_decl: Option<LuaSemanticDeclId>) -> Self {
+        Self::from_fact(
+            LuaTypeFact::certain(typ),
+            semantic_decl,
+            SemanticInfoOrigin::Actual,
+        )
+    }
+
+    fn from_fact(
+        inference_fact: LuaTypeFact,
+        semantic_decl: Option<LuaSemanticDeclId>,
+        origin: SemanticInfoOrigin,
+    ) -> Self {
+        Self {
+            inference_fact,
+            semantic_decl,
+            origin,
+        }
+    }
+
+    pub fn contextual_expected(
+        inference_fact: LuaTypeFact,
+        semantic_decl: Option<LuaSemanticDeclId>,
+    ) -> Self {
+        Self::from_fact(
+            inference_fact,
+            semantic_decl,
+            SemanticInfoOrigin::ContextualExpected,
+        )
+    }
+
+    pub fn display_typ(&self) -> &LuaType {
+        self.inference_fact.typ()
+    }
+
+    pub fn inference_fact(&self) -> &LuaTypeFact {
+        &self.inference_fact
+    }
+
+    fn canonical(fact: LuaTypeFact, semantic_decl: Option<LuaSemanticDeclId>) -> Self {
+        let origin = if fact.confidence() >= LuaInferenceConfidence::Certain {
+            SemanticInfoOrigin::Actual
+        } else {
+            SemanticInfoOrigin::ContextualExpected
+        };
+        Self::from_fact(fact, semantic_decl, origin)
+    }
+
+    pub fn actual_typ(&self) -> Option<&LuaType> {
+        matches!(self.origin, SemanticInfoOrigin::Actual).then_some(self.inference_fact.typ())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SemanticInfoOrigin {
+    Actual,
+    ContextualExpected,
 }
 
 pub fn infer_token_semantic_info(
@@ -36,9 +101,10 @@ pub fn infer_token_semantic_info(
         LuaSyntaxKind::ForStat | LuaSyntaxKind::ForRangeStat | LuaSyntaxKind::LocalName => {
             let file_id = cache.get_file_id();
             let decl_id = LuaDeclId::new(file_id, token.text_range().start());
+            let type_owner = LuaTypeOwner::Decl(decl_id);
             let type_cache = db
                 .get_type_index()
-                .get_type_cache(&decl_id.into())
+                .get_type_cache(&type_owner)
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
             let typ = type_cache.as_type().clone();
             let typ = try_local_decl_initializer_fallback_type(
@@ -49,10 +115,14 @@ pub fn infer_token_semantic_info(
                 token.text_range().start(),
             )
             .unwrap_or(typ);
-            Some(SemanticInfo {
-                typ,
-                semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
-            })
+            let fact = db
+                .get_inference_fact(&LuaInferenceNodeId::TypeOwner(type_owner))
+                .unwrap_or_else(|| LuaTypeFact::certain(typ.clone()))
+                .with_runtime_type(typ);
+            Some(SemanticInfo::canonical(
+                fact,
+                Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+            ))
         }
         LuaSyntaxKind::ParamName => {
             let file_id = cache.get_file_id();
@@ -62,10 +132,10 @@ pub fn infer_token_semantic_info(
                 LuaDeclExtra::Param { .. } => {
                     let typ = infer_param_with_cache(db, cache, decl).ok()?;
 
-                    Some(SemanticInfo {
+                    Some(SemanticInfo::actual(
                         typ,
-                        semantic_decl: Some(LuaSemanticDeclId::LuaDecl(decl_id)),
-                    })
+                        Some(LuaSemanticDeclId::LuaDecl(decl_id)),
+                    ))
                 }
                 _ => None,
             }
@@ -82,29 +152,14 @@ pub fn infer_node_semantic_info(
     match node {
         expr_node if LuaExpr::can_cast(expr_node.kind().into()) => {
             let expr = LuaExpr::cast(expr_node)?;
-            let mut typ = match infer_expr(db, cache, expr.clone()) {
-                Ok(typ) => typ,
-                Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
-                    infer_bind_value_type(db, cache, expr.clone()).unwrap_or(LuaType::Nil)
-                }
-                Err(_) => LuaType::Unknown,
-            };
-            if typ.is_unknown()
-                && let Some(bind_typ) = infer_bind_value_type(db, cache, expr.clone())
-            {
-                typ = bind_typ;
-            }
             let property_owner = infer_expr_semantic_decl(
                 db,
                 cache,
-                expr,
+                expr.clone(),
                 SemanticDeclGuard::default(),
                 SemanticDeclLevel::NoTrace,
             );
-            Some(SemanticInfo {
-                typ,
-                semantic_decl: property_owner,
-            })
+            Some(infer_expr_semantic_info(db, cache, expr, property_owner))
         }
         table_field_node if LuaTableField::can_cast(table_field_node.kind().into()) => {
             let table_field = LuaTableField::cast(table_field_node)?;
@@ -113,10 +168,10 @@ pub fn infer_node_semantic_info(
                 .get_type_index()
                 .get_type_cache(&member_id.into())
                 .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
-            Some(SemanticInfo {
-                typ: type_cache.as_type().clone(),
-                semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
-            })
+            Some(SemanticInfo::actual(
+                type_cache.as_type().clone(),
+                Some(LuaSemanticDeclId::Member(member_id)),
+            ))
         }
         name_type if LuaDocNameType::can_cast(name_type.kind().into()) => {
             let name_type = LuaDocNameType::cast(name_type)?;
@@ -124,10 +179,10 @@ pub fn infer_node_semantic_info(
             let type_decl = db
                 .get_type_index()
                 .find_type_decl(cache.get_file_id(), &name)?;
-            Some(SemanticInfo {
-                typ: LuaType::Ref(type_decl.get_id()),
-                semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
-            })
+            Some(SemanticInfo::actual(
+                LuaType::Ref(type_decl.get_id()),
+                LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+            ))
         }
         tags if LuaDocTag::can_cast(tags.kind().into()) => {
             let tag = LuaDocTag::cast(tags)?;
@@ -147,10 +202,10 @@ pub fn infer_node_semantic_info(
                         .get_type_index()
                         .get_type_cache(&member_id.into())
                         .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown));
-                    Some(SemanticInfo {
-                        typ: type_cache.as_type().clone(),
-                        semantic_decl: Some(LuaSemanticDeclId::Member(member_id)),
-                    })
+                    Some(SemanticInfo::actual(
+                        type_cache.as_type().clone(),
+                        Some(LuaSemanticDeclId::Member(member_id)),
+                    ))
                 }
                 _ => None,
             }
@@ -159,14 +214,139 @@ pub fn infer_node_semantic_info(
     }
 }
 
+pub(crate) fn infer_expr_semantic_info(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+    semantic_decl: Option<LuaSemanticDeclId>,
+) -> SemanticInfo {
+    let contextual_fact = semantic_decl
+        .as_ref()
+        .and_then(semantic_decl_inference_node)
+        .and_then(|node| db.get_inference_fact(&node))
+        .filter(|fact| {
+            fact.confidence() < LuaInferenceConfidence::Certain && !fact.typ().is_unknown()
+        });
+
+    let actual_result = infer_expr(db, cache, expr.clone());
+    match actual_result {
+        Ok(typ) if !typ.is_unknown() => contextual_fact
+            .filter(|fact| fact.typ() == &typ)
+            .map(|fact| SemanticInfo::canonical(fact, semantic_decl.clone()))
+            .unwrap_or_else(|| actual_expr_semantic_info(db, cache, &expr, typ, semantic_decl)),
+        actual_result => infer_bind_value_type(db, cache, expr.clone())
+            .filter(|typ| !typ.is_nil())
+            .map(|typ| {
+                let node = semantic_decl
+                    .as_ref()
+                    .and_then(semantic_decl_inference_node)
+                    .unwrap_or_else(|| {
+                        LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(InFiled::new(
+                            cache.get_file_id(),
+                            expr.get_syntax_id(),
+                        )))
+                    });
+                let fact = LuaTypeFact::new(
+                    typ,
+                    LuaInferenceConfidence::Anchored,
+                    Arc::from([LuaInferenceStep {
+                        event: LuaInferenceEventId {
+                            node,
+                            kind: LuaInferenceProvenanceKind::ContextualUnknown,
+                            source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
+                        },
+                        found_type: None,
+                        support: Arc::from([]),
+                    }]),
+                );
+                SemanticInfo::contextual_expected(fact, semantic_decl.clone())
+            })
+            .unwrap_or_else(|| match actual_result {
+                Ok(typ) => actual_expr_semantic_info(db, cache, &expr, typ, semantic_decl),
+                Err(InferFailReason::FieldNotFound) if matches!(expr, LuaExpr::IndexExpr(_)) => {
+                    // Lua absent table field reads evaluate to nil when no contextual expected type applies.
+                    SemanticInfo::actual(LuaType::Nil, semantic_decl)
+                }
+                Err(_) => SemanticInfo::actual(LuaType::Unknown, semantic_decl),
+            }),
+    }
+}
+
+fn actual_expr_semantic_info(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    expr: &LuaExpr,
+    typ: LuaType,
+    semantic_decl: Option<LuaSemanticDeclId>,
+) -> SemanticInfo {
+    let has_vgui_parent_fallback = cache
+        .vgui_parent_fallback_calls
+        .contains(&expr.get_syntax_id())
+        || matches!(
+            &semantic_decl,
+            Some(LuaSemanticDeclId::LuaDecl(decl_id))
+                if db
+                    .get_decl_index()
+                    .get_decl(decl_id)
+                    .and_then(|decl| decl.get_initializer())
+                    .is_some_and(|init| cache.vgui_parent_fallback_calls.contains(&init.get_expr_syntax_id()))
+        );
+
+    let fact = if has_vgui_parent_fallback {
+        let node = semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .unwrap_or_else(|| {
+                LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(InFiled::new(
+                    cache.get_file_id(),
+                    expr.get_syntax_id(),
+                )))
+            });
+        LuaTypeFact::new(
+            typ.clone(),
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node,
+                    kind: LuaInferenceProvenanceKind::UnresolvedVguiParent,
+                    source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
+                },
+                found_type: None,
+                support: Arc::from([]),
+            }]),
+        )
+    } else {
+        semantic_decl
+            .as_ref()
+            .and_then(semantic_decl_inference_node)
+            .and_then(|node| db.get_inference_fact(&node))
+            .unwrap_or_else(|| LuaTypeFact::certain(typ.clone()))
+    }
+    .with_runtime_type(typ);
+
+    SemanticInfo::from_fact(fact, semantic_decl, SemanticInfoOrigin::Actual)
+}
+
+fn semantic_decl_inference_node(semantic_decl: &LuaSemanticDeclId) -> Option<LuaInferenceNodeId> {
+    match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            Some(LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(*decl_id)))
+        }
+        LuaSemanticDeclId::Member(member_id) => Some(LuaInferenceNodeId::TypeOwner(
+            LuaTypeOwner::Member(*member_id),
+        )),
+        LuaSemanticDeclId::TypeDecl(_) | LuaSemanticDeclId::Signature(_) => None,
+    }
+}
+
 fn type_def_tag_info(name: &str, db: &DbIndex, cache: &mut LuaInferCache) -> Option<SemanticInfo> {
     let type_decl = db
         .get_type_index()
         .find_type_decl(cache.get_file_id(), name)?;
-    Some(SemanticInfo {
-        typ: LuaType::Ref(type_decl.get_id()),
-        semantic_decl: LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
-    })
+    Some(SemanticInfo::actual(
+        LuaType::Ref(type_decl.get_id()),
+        LuaSemanticDeclId::TypeDecl(type_decl.get_id()).into(),
+    ))
 }
 
 pub fn infer_token_semantic_decl(

@@ -136,6 +136,13 @@ fn check_decl_duplicate_field(
         if member.get_feature() == LuaMemberFeature::MetaMethodDecl {
             continue;
         }
+        if semantic_model
+            .get_db()
+            .get_gmod_load_index()
+            .files_are_mutually_exclusive_by_load_shadowing(file_id, member.get_file_id())
+        {
+            continue;
+        }
 
         member_map
             .entry(member.get_key())

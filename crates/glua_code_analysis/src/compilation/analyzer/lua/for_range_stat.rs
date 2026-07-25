@@ -2,10 +2,14 @@ use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DbIndex, InferFailReason, LuaDeclId, LuaInferCache, LuaMemberKey, LuaObjectType,
-    LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps, TypeSubstitutor,
-    VariadicType, compilation::analyzer::unresolve::UnResolveIterVar, get_member_map, infer_expr,
-    instantiate_doc_function, tpl_pattern_match_args,
+    DbIndex, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
+    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
+    TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    compilation::analyzer::{
+        common::{TypeCacheWriteMode, write_type_cache},
+        unresolve::UnResolveIterVar,
+    },
+    get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
 };
 
 use super::LuaAnalyzer;
@@ -32,20 +36,24 @@ pub fn analyze_for_range_stat(
                     .cloned()
                     .unwrap_or(LuaType::Unknown);
                 let ret_type = TypeOps::Remove.apply(analyzer.db, &ret_type, &LuaType::Nil);
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(ret_type));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::InferType(ret_type),
+                    TypeCacheWriteMode::InsertOnly,
+                );
             }
         }
         Err(InferFailReason::None) => {
             for var_name in var_name_list {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
-                analyzer
-                    .db
-                    .get_type_index_mut()
-                    .bind_type(decl_id.into(), LuaTypeCache::InferType(LuaType::Unknown));
+                write_type_cache(
+                    analyzer.db,
+                    decl_id.into(),
+                    LuaTypeCache::InferType(LuaType::Unknown),
+                    TypeCacheWriteMode::InsertOnly,
+                );
             }
         }
         Err(reason) => {
@@ -206,13 +214,25 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
 
     let table_type = infer_expr(db, cache, table_arg)?;
+    if let LuaType::TableOf(inner) = &table_type {
+        // Keep the value as T[K] instead of materializing every member type. Large
+        // scripted-class hierarchies can contain hundreds of callable members.
+        let key_type = infer_table_projection_key_type(db, inner);
+        let value_type = LuaType::Call(
+            LuaAliasCallType::new(
+                LuaAliasCallKind::Index,
+                vec![inner.as_ref().clone(), key_type.clone()],
+            )
+            .into(),
+        );
+        return Ok(Some(VariadicType::Multi(vec![key_type, value_type])));
+    }
     let Some(members) = get_member_map(db, &table_type) else {
         return Ok(None);
     };
     if members.keys().any(is_pairs_metamethod_key) {
         return Ok(None);
     }
-
     let mut keys = Vec::new();
     let mut values = Vec::new();
     let mut member_entries = members
@@ -232,12 +252,7 @@ fn try_infer_pairs_iter_types_from_table_members(
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
             [member] => member.typ.clone(),
-            _ => LuaType::from_vec(
-                member_infos
-                    .into_iter()
-                    .map(|member| member.typ)
-                    .collect::<Vec<_>>(),
-            ),
+            _ => LuaType::from_vec(member_infos.into_iter().map(|member| member.typ).collect()),
         };
         values.push(value_type);
     }
@@ -252,6 +267,75 @@ fn try_infer_pairs_iter_types_from_table_members(
     ]);
 
     Ok(Some(iter_types))
+}
+
+fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
+    let mut pending = vec![inner.clone()];
+    let mut visited_types = HashSet::new();
+    let mut key_type = None;
+
+    while let Some(typ) = pending.pop() {
+        match typ {
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                if !visited_types.insert(type_id.clone()) {
+                    continue;
+                }
+
+                let owner = LuaMemberOwner::Type(type_id.clone());
+                // Iterate direct indexed keys and visit each supertype once;
+                // flattened member discovery duplicates diamond inheritance paths.
+                for key in db.get_member_index().get_member_keys(&owner) {
+                    let Some(typ) = table_projection_member_key_type(key) else {
+                        continue;
+                    };
+                    union_optional_type(db, &mut key_type, typ);
+                }
+
+                if let Some(super_types) = db.get_type_index().get_super_types_iter(&type_id) {
+                    pending.extend(super_types.cloned());
+                }
+            }
+            LuaType::Instance(_) => {
+                let symbolic_key =
+                    LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![typ]).into());
+                union_optional_type(db, &mut key_type, symbolic_key);
+            }
+            LuaType::Union(union) => pending.extend(union.types().cloned()),
+            LuaType::MultiLineUnion(union) => pending.push(union.to_union()),
+            LuaType::TableOf(inner) => pending.push(*inner),
+            LuaType::TypeGuard(inner) => pending.push(inner.as_ref().clone()),
+            typ => {
+                let symbolic_key =
+                    LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![typ]).into());
+                union_optional_type(db, &mut key_type, symbolic_key);
+            }
+        }
+    }
+
+    key_type.unwrap_or_else(|| {
+        LuaType::Call(LuaAliasCallType::new(LuaAliasCallKind::KeyOf, vec![inner.clone()]).into())
+    })
+}
+
+fn table_projection_member_key_type(key: &LuaMemberKey) -> Option<LuaType> {
+    match key {
+        LuaMemberKey::Name(_) => Some(LuaType::String),
+        LuaMemberKey::Integer(_) => Some(LuaType::Integer),
+        LuaMemberKey::ExprType(typ) => Some(match typ {
+            LuaType::StringConst(_) | LuaType::DocStringConst(_) => LuaType::String,
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => LuaType::Integer,
+            LuaType::FloatConst(_) => LuaType::Number,
+            typ => typ.clone(),
+        }),
+        LuaMemberKey::None => None,
+    }
+}
+
+fn union_optional_type(db: &DbIndex, target: &mut Option<LuaType>, typ: LuaType) {
+    *target = Some(match target.take() {
+        Some(current) => TypeOps::Union.apply(db, &current, &typ),
+        None => typ,
+    });
 }
 
 const LARGE_EXACT_PAIRS_KEY_UNION_THRESHOLD: usize = 128;
@@ -269,7 +353,26 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
 }
 
 fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
+    let values = values
+        .into_iter()
+        .map(|value| remove_pairs_yield_nil(db, &value))
+        .filter(|value| !value.is_unknown() && !value.is_never())
+        .collect::<Vec<_>>();
+    if values.is_empty() {
+        // All observed values were nil-only or otherwise uninformative; avoid collapsing to Nil.
+        return LuaType::Unknown;
+    }
+
     try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
+}
+
+fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {
+    let non_nil = TypeOps::Remove.apply(db, value_type, &LuaType::Nil);
+    if non_nil.is_never() {
+        LuaType::Unknown
+    } else {
+        non_nil
+    }
 }
 
 fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType> {
@@ -279,7 +382,9 @@ fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType
 
     let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::new();
     for value in values {
-        let member_map = get_member_map(db, value)?;
+        let Some(member_map) = get_member_map(db, value) else {
+            continue;
+        };
         let mut present_keys = HashSet::new();
         for (key, member_infos) in member_map.iter() {
             if matches!(key, LuaMemberKey::None) || member_infos.is_empty() {

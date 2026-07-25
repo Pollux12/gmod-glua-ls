@@ -98,20 +98,17 @@ pub fn find_member_origin_owners(
     find_all: bool,
     usage_position: Option<TextSize>,
 ) -> DeclOriginResult {
-    const MAX_ITERATIONS: usize = 50;
     let mut visited_members = HashSet::new();
 
     let mut current_owner = resolve_member_owner(compilation, semantic_model, &member_id);
     let mut final_owner = current_owner.clone();
-    let mut iteration_count = 0;
 
     while let Some(LuaSemanticDeclId::Member(current_member_id)) = &current_owner {
-        if visited_members.contains(current_member_id) || iteration_count >= MAX_ITERATIONS {
+        if visited_members.contains(current_member_id) {
             break;
         }
 
         visited_members.insert(*current_member_id);
-        iteration_count += 1;
 
         match resolve_member_owner(compilation, semantic_model, current_member_id) {
             Some(next_owner) => {
@@ -447,48 +444,4 @@ fn resolve_table_field_through_type_inference(
         .first()
         .cloned()
         .and_then(|m| m.property_owner_id)
-}
-
-#[allow(unused)]
-pub fn replace_semantic_type(
-    semantic_decls: &mut [(LuaSemanticDeclId, LuaType)],
-    origin_type: &LuaType,
-) {
-    // `origin_type`不一定包含所有`semantic_decls`中的类型, 实际的推断可能非常复杂, 这里仅是临时方案.
-
-    // 解开`origin_type`
-    let mut type_vec = Vec::new();
-    match origin_type {
-        LuaType::Union(union) => {
-            for typ in union.into_vec() {
-                type_vec.push(typ);
-            }
-        }
-        _ => {
-            type_vec.push(origin_type.clone());
-        }
-    }
-    if type_vec.len() != semantic_decls.len() {
-        return;
-    }
-
-    // 判断是否存在泛型, 如果有任意类型不匹配我们就认为存在泛型
-    let mut has_generic = false;
-    let type_set: HashSet<_> = type_vec.iter().collect();
-    for (_, typ) in semantic_decls.iter() {
-        if !type_set.contains(&typ) {
-            has_generic = true;
-            break;
-        }
-    }
-    if !has_generic {
-        return;
-    }
-
-    // 替换`semantic_decls`中的类型
-    for (i, (_, typ)) in semantic_decls.iter_mut().enumerate() {
-        if i < type_vec.len() {
-            *typ = type_vec[i].clone();
-        }
-    }
 }

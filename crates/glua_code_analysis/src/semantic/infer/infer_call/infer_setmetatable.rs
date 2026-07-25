@@ -1,10 +1,13 @@
-use glua_parser::{BinaryOperator, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey};
+use glua_parser::{
+    BinaryOperator, LuaAstNode, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexKey,
+    LuaTableExpr, LuaTableField, LuaVarExpr,
+};
 
 use crate::{
-    DbIndex, InFiled, InferFailReason, LuaInferCache, LuaInstanceType, LuaMemberKey, LuaType,
-    LuaUnionType, SemanticDeclLevel, infer_expr,
+    DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
+    LuaMemberOwner, LuaType, LuaUnionType, SemanticDeclLevel, infer_expr,
     semantic::{
-        SemanticDeclGuard, infer::InferResult, infer_expr_semantic_decl,
+        SemanticDeclGuard, get_member_value_expr, infer::InferResult, infer_expr_semantic_decl,
         member::find_members_with_key,
     },
 };
@@ -78,22 +81,28 @@ fn resolve_table_backing_range(
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
     )?;
-    let decl_id = match semantic_decl {
-        crate::LuaSemanticDeclId::LuaDecl(decl_id) => decl_id,
+    let (value_file_id, value_expr) = match semantic_decl {
+        crate::LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let root = db
+                .get_vfs()
+                .get_syntax_tree(&decl_id.file_id)?
+                .get_red_root();
+            (
+                decl_id.file_id,
+                db.get_decl_index()
+                    .get_decl(&decl_id)?
+                    .get_value_syntax_id()?
+                    .to_node_from_root(&root)
+                    .and_then(LuaExpr::cast)?,
+            )
+        }
+        crate::LuaSemanticDeclId::Member(member_id) => {
+            (member_id.file_id, get_member_value_expr(db, member_id)?)
+        }
         _ => return None,
     };
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl_id.file_id)?
-        .get_red_root();
-    let value_expr = db
-        .get_decl_index()
-        .get_decl(&decl_id)?
-        .get_value_syntax_id()?
-        .to_node_from_root(&root)
-        .and_then(LuaExpr::cast)?;
 
-    table_backing_range_from_expr(decl_id.file_id, &value_expr)
+    table_backing_range_from_expr(value_file_id, &value_expr)
 }
 
 fn table_backing_range_from_expr(
@@ -146,53 +155,359 @@ fn infer_metatable_index_type(
     metatable: LuaExpr,
 ) -> Result<(LuaType, bool /*__index type*/), InferFailReason> {
     if let LuaExpr::TableExpr(table) = &metatable {
-        let fields = table.get_fields();
-        for field in fields {
-            let field_name = match field.get_field_key() {
-                Some(key) => match key {
-                    LuaIndexKey::Name(n) => n.get_name_text().to_string(),
-                    LuaIndexKey::String(s) => s.get_value(),
-                    _ => continue,
-                },
-                None => continue,
-            };
+        if let Some(index_value) = last_table_literal_index_value(table) {
+            if matches!(
+                index_value,
+                LuaExpr::TableExpr(_)
+                    | LuaExpr::CallExpr(_)
+                    | LuaExpr::IndexExpr(_)
+                    | LuaExpr::NameExpr(_)
+            ) {
+                return Ok((infer_expr(db, cache, index_value)?, true));
+            }
 
-            if field_name == "__index" {
-                let field_value = field.get_value_expr().ok_or(InferFailReason::None)?;
-                if matches!(
-                    field_value,
-                    LuaExpr::TableExpr(_)
-                        | LuaExpr::CallExpr(_)
-                        | LuaExpr::IndexExpr(_)
-                        | LuaExpr::NameExpr(_)
-                ) {
-                    let meta_type = infer_expr(db, cache, field_value)?;
-                    return Ok((meta_type, true));
+            let inferred_type = infer_expr(db, cache, index_value.clone()).ok();
+            let index_type = inferred_type
+                .as_ref()
+                .filter(|typ| !typ.is_unknown())
+                .cloned()
+                .or_else(|| {
+                    resolve_table_backing_range(db, cache, &index_value).map(LuaType::TableConst)
+                })
+                .or(inferred_type);
+            if let Some(index_type) = index_type {
+                return Ok(match classify_metatable_index_candidate(&index_type) {
+                    MetatableIndexCandidate::Supported(index_type) => (index_type, true),
+                    MetatableIndexCandidate::Unsupported => (LuaType::Unknown, false),
+                });
+            }
+        }
+    }
+
+    let meta_type = match infer_receiver_owner_type(db, cache, &metatable) {
+        ReceiverOwnerType::Exact(owner_type) => owner_type,
+        ReceiverOwnerType::Rejected => return Ok((LuaType::Unknown, false)),
+        ReceiverOwnerType::NotReceiver => infer_expr(db, cache, metatable)?,
+    };
+    match exact_table_index_type(db, cache, &meta_type) {
+        ExactMetatableIndexType::Exact(index_type) => return Ok((index_type, true)),
+        ExactMetatableIndexType::Rejected => return Ok((LuaType::Unknown, false)),
+        ExactMetatableIndexType::None => {}
+    }
+
+    if let Some(meta_members) =
+        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), false)
+    {
+        let mut index_types = Vec::with_capacity(meta_members.len());
+        for meta_member in meta_members {
+            match classify_metatable_index_candidate(&meta_member.typ) {
+                MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
+                MetatableIndexCandidate::Unsupported => {
+                    return Ok((LuaType::Unknown, false));
                 }
             }
         }
-    };
 
-    let meta_type = infer_expr(db, cache, metatable)?;
-    if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), false)
-        && let Some(meta_member) = meta_members.first()
-        && is_supported_metatable_index_type(&meta_member.typ)
-    {
-        return Ok((meta_member.typ.clone(), true));
+        if let Some(index_type) = index_types.first() {
+            if index_types.iter().all(|candidate| candidate == index_type) {
+                return Ok((index_type.clone(), true));
+            }
+            return Ok((LuaType::Unknown, false));
+        }
     }
 
     Ok((meta_type, false))
 }
 
-fn is_supported_metatable_index_type(typ: &LuaType) -> bool {
+enum ReceiverOwnerType {
+    NotReceiver,
+    Rejected,
+    Exact(LuaType),
+}
+
+fn infer_receiver_owner_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    metatable: &LuaExpr,
+) -> ReceiverOwnerType {
+    let LuaExpr::NameExpr(name_expr) = metatable else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    let Some(decl_id) = db
+        .get_reference_index()
+        .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+    else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    let (signature_id, implicit_self) = match &decl.extra {
+        LuaDeclExtra::Param {
+            idx: 0,
+            signature_id,
+            ..
+        } => (*signature_id, false),
+        LuaDeclExtra::ImplicitSelf { .. } => {
+            let Some(closure) = name_expr
+                .syntax()
+                .ancestors()
+                .find_map(LuaClosureExpr::cast)
+            else {
+                return ReceiverOwnerType::Rejected;
+            };
+            (
+                crate::LuaSignatureId::from_closure(cache.get_file_id(), &closure),
+                true,
+            )
+        }
+        _ => return ReceiverOwnerType::NotReceiver,
+    };
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return ReceiverOwnerType::Rejected;
+    };
+
+    if implicit_self && signature.is_colon_define {
+        if decl_is_mutated(db, &decl_id) {
+            return ReceiverOwnerType::Rejected;
+        }
+        let Some(func_stat) = name_expr.syntax().ancestors().find_map(LuaFuncStat::cast) else {
+            return ReceiverOwnerType::Rejected;
+        };
+        let Some(LuaVarExpr::IndexExpr(func_name)) = func_stat.get_func_name() else {
+            return ReceiverOwnerType::Rejected;
+        };
+        let Some(prefix) = func_name.get_prefix_expr() else {
+            return ReceiverOwnerType::Rejected;
+        };
+        return infer_expr(db, cache, prefix)
+            .map(ReceiverOwnerType::Exact)
+            .unwrap_or(ReceiverOwnerType::Rejected);
+    }
+    if implicit_self || signature.is_colon_define {
+        return ReceiverOwnerType::NotReceiver;
+    }
+
+    let Some(closure) = name_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaClosureExpr::cast)
+    else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    if crate::LuaSignatureId::from_closure(cache.get_file_id(), &closure) != signature_id {
+        return ReceiverOwnerType::NotReceiver;
+    }
+    let Some(field) = closure.syntax().parent().and_then(LuaTableField::cast) else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    let Some(LuaIndexKey::Name(key)) = field.get_field_key() else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    if key.get_name_text() != "__call" {
+        return ReceiverOwnerType::NotReceiver;
+    }
+    let Some(owner) = field.syntax().parent().and_then(LuaTableExpr::cast) else {
+        return ReceiverOwnerType::NotReceiver;
+    };
+    if decl_is_mutated(db, &decl_id) {
+        return ReceiverOwnerType::Rejected;
+    }
+    ReceiverOwnerType::Exact(LuaType::TableConst(InFiled::new(
+        cache.get_file_id(),
+        owner.get_range(),
+    )))
+}
+
+fn decl_is_mutated(db: &DbIndex, decl_id: &crate::LuaDeclId) -> bool {
+    db.get_reference_index()
+        .get_decl_references(&decl_id.file_id, decl_id)
+        .is_some_and(|references| references.mutable)
+}
+
+enum ExactMetatableIndexType {
+    None,
+    Rejected,
+    Exact(LuaType),
+}
+
+enum MetatableIndexCandidate {
+    Unsupported,
+    Supported(LuaType),
+}
+
+fn exact_table_index_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    meta_type: &LuaType,
+) -> ExactMetatableIndexType {
+    let table_range = match meta_type {
+        LuaType::TableConst(range) => range,
+        LuaType::Instance(instance) => instance.get_range(),
+        _ => return ExactMetatableIndexType::None,
+    };
+    let owner = LuaMemberOwner::Element(table_range.clone());
+    let key = LuaMemberKey::Name("__index".into());
+    let mut member_ids = db
+        .get_member_index()
+        .get_members_for_owner_key(&owner, &key)
+        .into_iter()
+        .map(|member| member.get_id())
+        .collect::<Vec<_>>();
+    member_ids.sort_by_key(|id| (id.file_id.id, u32::from(id.get_position())));
+    if member_ids.is_empty() {
+        let Some(index_type) = last_table_literal_index_type(db, cache, table_range) else {
+            return ExactMetatableIndexType::None;
+        };
+        return match classify_metatable_index_candidate(&index_type) {
+            MetatableIndexCandidate::Supported(index_type) => {
+                ExactMetatableIndexType::Exact(index_type)
+            }
+            MetatableIndexCandidate::Unsupported => ExactMetatableIndexType::Rejected,
+        };
+    }
+
+    let mut index_types = Vec::new();
+    for member_id in member_ids {
+        let Some(index_type) = member_metatable_index_type(db, cache, member_id) else {
+            return ExactMetatableIndexType::Rejected;
+        };
+        match classify_metatable_index_candidate(&index_type) {
+            MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
+            MetatableIndexCandidate::Unsupported => return ExactMetatableIndexType::Rejected,
+        }
+    }
+
+    let Some(index_type) = index_types.first() else {
+        return ExactMetatableIndexType::None;
+    };
+    if index_types.iter().all(|candidate| candidate == index_type) {
+        ExactMetatableIndexType::Exact(index_type.clone())
+    } else {
+        ExactMetatableIndexType::Rejected
+    }
+}
+
+fn member_metatable_index_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    member_id: crate::LuaMemberId,
+) -> Option<LuaType> {
+    let value_expr = get_member_value_expr(db, member_id)?;
+    if member_id.file_id == cache.get_file_id() {
+        return infer_expr(db, cache, value_expr.clone())
+            .ok()
+            .filter(|typ| !typ.is_unknown())
+            .or_else(|| {
+                resolve_table_backing_range(db, cache, &value_expr).map(LuaType::TableConst)
+            });
+    }
+
+    if let Some(cached) = db.get_type_index().get_type_cache(&member_id.into()) {
+        let cached_type = cached.as_type().clone();
+        if !cached_type.is_unknown() {
+            return Some(cached_type);
+        }
+    }
+
+    let mut definition_cache = LuaInferCache::new(member_id.file_id, cache.get_config().clone());
+    infer_expr(db, &mut definition_cache, value_expr.clone())
+        .ok()
+        .filter(|typ| !typ.is_unknown())
+        .or_else(|| {
+            resolve_table_backing_range(db, &mut definition_cache, &value_expr)
+                .map(LuaType::TableConst)
+        })
+}
+
+fn last_table_literal_index_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    table_range: &InFiled<rowan::TextRange>,
+) -> Option<LuaType> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&table_range.file_id)?
+        .get_red_root();
+    let table = root
+        .token_at_offset(table_range.value.start())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaTableExpr::cast)
+        .filter(|table| table.get_range() == table_range.value)?;
+    let index_value = last_table_literal_index_value(&table)?;
+
+    if table_range.file_id == cache.get_file_id() {
+        return infer_expr(db, cache, index_value.clone())
+            .ok()
+            .filter(|typ| !typ.is_unknown())
+            .or_else(|| {
+                resolve_table_backing_range(db, cache, &index_value).map(LuaType::TableConst)
+            });
+    }
+
+    let mut definition_cache = LuaInferCache::new(table_range.file_id, cache.get_config().clone());
+    infer_expr(db, &mut definition_cache, index_value.clone())
+        .ok()
+        .filter(|typ| !typ.is_unknown())
+        .or_else(|| {
+            resolve_table_backing_range(db, &mut definition_cache, &index_value)
+                .map(LuaType::TableConst)
+        })
+}
+
+fn last_table_literal_index_value(table: &LuaTableExpr) -> Option<LuaExpr> {
+    let fields = table.get_fields().collect::<Vec<_>>();
+    fields.into_iter().rev().find_map(|field| {
+        let key = field.get_field_key()?;
+        let is_index = match key {
+            LuaIndexKey::Name(key) => key.get_name_text() == "__index",
+            LuaIndexKey::String(key) => key.get_value() == "__index",
+            _ => false,
+        };
+        is_index.then(|| field.get_value_expr()).flatten()
+    })
+}
+
+fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
     match typ {
         LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(inner) => is_supported_metatable_index_type(inner),
-            LuaUnionType::Multi(types) => types.iter().any(is_supported_metatable_index_type),
+            LuaUnionType::Nullable(inner) => classify_metatable_index_candidate(inner),
+            LuaUnionType::Multi(types) => {
+                let mut supported_types = Vec::new();
+                for typ in types.iter().filter(|typ| !typ.is_nil()) {
+                    match classify_metatable_index_candidate(typ) {
+                        MetatableIndexCandidate::Supported(typ) => supported_types.push(typ),
+                        MetatableIndexCandidate::Unsupported => {
+                            return MetatableIndexCandidate::Unsupported;
+                        }
+                    }
+                }
+                let Some(index_type) = supported_types.first() else {
+                    return MetatableIndexCandidate::Unsupported;
+                };
+                if supported_types
+                    .iter()
+                    .all(|candidate| candidate == index_type)
+                {
+                    MetatableIndexCandidate::Supported(index_type.clone())
+                } else {
+                    MetatableIndexCandidate::Unsupported
+                }
+            }
         },
-        LuaType::TypeGuard(inner) => is_supported_metatable_index_type(inner),
-        LuaType::Instance(instance) => is_supported_metatable_index_type(instance.get_base()),
-        _ => typ.is_table() || typ.is_custom_type() || typ.is_object(),
+        LuaType::TypeGuard(inner) => classify_metatable_index_candidate(inner),
+        LuaType::Instance(instance) => {
+            match classify_metatable_index_candidate(instance.get_base()) {
+                MetatableIndexCandidate::Supported(_) => {
+                    MetatableIndexCandidate::Supported(typ.clone())
+                }
+                MetatableIndexCandidate::Unsupported => MetatableIndexCandidate::Unsupported,
+            }
+        }
+        _ if typ.is_table() || typ.is_custom_type() || typ.is_object() => {
+            MetatableIndexCandidate::Supported(typ.clone())
+        }
+        _ => MetatableIndexCandidate::Unsupported,
     }
 }

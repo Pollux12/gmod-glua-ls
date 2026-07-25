@@ -295,6 +295,22 @@ impl LuaTypeDeclId {
         }
     }
 
+    pub fn stable_cmp(&self, other: &Self) -> std::cmp::Ordering {
+        match (self.get_id(), other.get_id()) {
+            (LuaTypeIdentifier::Global(left), LuaTypeIdentifier::Global(right)) => left.cmp(right),
+            (LuaTypeIdentifier::Global(_), LuaTypeIdentifier::Local(_, _)) => {
+                std::cmp::Ordering::Less
+            }
+            (LuaTypeIdentifier::Local(_, _), LuaTypeIdentifier::Global(_)) => {
+                std::cmp::Ordering::Greater
+            }
+            (
+                LuaTypeIdentifier::Local(left_file, left),
+                LuaTypeIdentifier::Local(right_file, right),
+            ) => left_file.cmp(right_file).then_with(|| left.cmp(right)),
+        }
+    }
+
     pub fn get_simple_name(&self) -> &str {
         let basic_name = self.get_name();
 
@@ -350,7 +366,7 @@ impl Serialize for LuaTypeDeclId {
         match self.id.as_ref() {
             LuaTypeIdentifier::Global(name) => serializer.serialize_str(name.as_ref()),
             LuaTypeIdentifier::Local(file_id, name) => {
-                let s = format!("{}|{}", file_id.id, &name);
+                let s = format!("{}|{}", file_id.id, name);
                 serializer.serialize_str(&s)
             }
         }

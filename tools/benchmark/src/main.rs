@@ -1,5 +1,11 @@
+#[cfg(feature = "dhat-heap")]
+#[global_allocator]
+static GLOBAL: dhat::Alloc = dhat::Alloc;
+
+#[cfg(not(feature = "dhat-heap"))]
 use mimalloc::MiMalloc;
 
+#[cfg(not(feature = "dhat-heap"))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
@@ -8,7 +14,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, WorkspaceFolder, collect_workspace_files, load_configs,
+    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
     update_code_style,
 };
 use tokio_util::sync::CancellationToken;
@@ -179,21 +185,85 @@ async fn main() {
 
     // Phase 4: Indexing (update_files_by_path runs parsing + full analysis pipeline)
     let t = Instant::now();
+    #[cfg(feature = "dhat-heap")]
+    let dhat_profiler = dhat::Profiler::new_heap();
     analysis.update_files_by_path(files);
+    #[cfg(feature = "dhat-heap")]
+    drop(dhat_profiler);
     let indexing_duration = t.elapsed();
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
         duration: indexing_duration,
     });
 
+    // Phase 4b: Incremental edit latency (simulates a keystroke re-index of a
+    // single already-indexed file — the interactive-editing hot path). Optional,
+    // enabled with BENCH_INCREMENTAL=1.
+    if std::env::var("BENCH_INCREMENTAL").is_ok() {
+        let main_ids = analysis
+            .compilation
+            .get_db()
+            .get_module_index()
+            .get_main_workspace_file_ids();
+        // Pick a handful of representative files spread across the workspace.
+        let sample: Vec<FileId> = {
+            let n = main_ids.len();
+            (0..5)
+                .filter_map(|i| main_ids.get(i * n / 5).copied())
+                .collect()
+        };
+        let mut total = std::time::Duration::ZERO;
+        let mut worst = std::time::Duration::ZERO;
+        let mut edited = 0usize;
+        for file_id in sample {
+            let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
+                continue;
+            };
+            let Some(text) = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_content(&file_id)
+                .cloned()
+            else {
+                continue;
+            };
+            // Append a trivially-different comment to force a real re-index.
+            let edited_text = format!("{text}\n-- bench incremental edit\n");
+            let t = Instant::now();
+            analysis.update_file_by_uri(&uri, Some(edited_text));
+            let elapsed = t.elapsed();
+            total += elapsed;
+            worst = worst.max(elapsed);
+            edited += 1;
+            eprintln!(
+                "  [incremental] re-index {:?}: {:.3}s",
+                file_id,
+                elapsed.as_secs_f64()
+            );
+        }
+        if edited > 0 {
+            eprintln!(
+                "  [incremental] {} edits, avg {:.3}s, worst {:.3}s",
+                edited,
+                total.as_secs_f64() / edited as f64,
+                worst.as_secs_f64()
+            );
+        }
+    }
+
     // Phase 5: Diagnostics (parallel, matching real LS behavior)
     let t = Instant::now();
-    let db = analysis.compilation.get_db();
-    let main_file_ids = db.get_module_index().get_main_workspace_file_ids();
+    let main_file_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
     let diag_file_count = main_file_ids.len();
 
     // Precompute shared diagnostic data once (avoids per-file workspace-wide scans)
+    let precompute_t = Instant::now();
     let shared_data = analysis.precompute_diagnostic_shared_data();
+    eprintln!(
+        "  [diag] precompute_shared_data: {:.3}s",
+        precompute_t.elapsed().as_secs_f64()
+    );
 
     let parallelism = match std::env::var("BENCH_THREADS") {
         Ok(val) => match val.parse::<usize>() {

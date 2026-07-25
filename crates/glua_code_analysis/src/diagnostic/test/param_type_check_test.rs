@@ -2,10 +2,11 @@
 mod test {
     use std::{ops::Deref, sync::Arc};
 
+    use glua_parser::{LuaAstNode, LuaTableField};
     use lsp_types::NumberOrString;
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, LuaMemberId, LuaType, LuaTypeCache, VirtualWorkspace};
 
     #[test]
     fn test_issue_216() {
@@ -22,6 +23,216 @@ mod test {
                 test("wrong type")
             end
         "#
+        ));
+    }
+
+    #[test]
+    fn issue_40_callback_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return number
+            local function returns_number()
+                return 1
+            end
+
+            accepts_string_callback(returns_number)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_multi_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string, number
+            local function accepts_string_number_callback(callback) end
+
+            ---@return string
+            ---@return boolean
+            local function returns_string_boolean()
+                return "value", true
+            end
+
+            accepts_string_number_callback(returns_string_boolean)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_with_fewer_params_and_compatible_return_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: string): string
+            local function accepts_string_callback(callback) end
+
+            ---@return string
+            local function returns_string()
+                return "value"
+            end
+
+            accepts_string_callback(returns_string)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_expected_variadic_return_accepts_no_results() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string...
+            local function accepts_string_results(callback) end
+
+            local function returns_nothing() end
+
+            accepts_string_results(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_actual_variadic_return_does_not_satisfy_required_result() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_required_string(callback) end
+
+            ---@return string ...
+            local function maybe_returns_strings() end
+
+            accepts_required_string(maybe_returns_strings)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_never_return_is_accepted_for_required_result() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return never
+            local function never_returns() end
+
+            accepts_string_callback(never_returns)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_missing_required_return_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            local function returns_nothing() end
+
+            accepts_string_callback(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_extra_finite_return_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@return string
+            ---@return number
+            local function returns_string_number()
+                return "value", 1
+            end
+
+            accepts_string_callback(returns_string_number)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_void_return_contracts_are_compatible() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun()
+            local function accepts_void_callback(callback) end
+
+            local function returns_nothing() end
+
+            accepts_void_callback(returns_nothing)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_void_contract_ignores_actual_results() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun()
+            local function accepts_void_callback(callback) end
+
+            ---@return string
+            local function returns_string()
+                return "value"
+            end
+
+            accepts_void_callback(returns_string)
+            "#
+        ));
+    }
+
+    #[test]
+    fn callback_return_uses_matching_actual_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): string
+            local function accepts_string_callback(callback) end
+
+            ---@overload fun(): string
+            ---@return number
+            local function returns_by_overload()
+                return 1
+            end
+
+            accepts_string_callback(returns_by_overload)
+            "#
         ));
     }
 
@@ -43,6 +254,236 @@ mod test {
 
             takesString(value)
         "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_params_narrow_after_body_normalization() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            local function takesNumber(value) end
+
+            ---@return number
+            local function findIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@overload fun(slot: string)
+            ---@overload fun(slot: nil, name: string)
+            ---@param slot number
+            ---@param name string
+            local function wrapper(slot, name)
+                if isstring(slot) and not name then
+                    name = slot
+                    slot = findIndex()
+                elseif not slot and isstring(name) then
+                    slot = findIndex()
+                end
+
+                takesNumber(slot)
+            end
+
+            wrapper(1, "Age")
+            wrapper("Age")
+            wrapper(nil, "Age")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_overload_param_string_slot_without_normalization_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value number
+            local function takesNumber(value) end
+
+            ---@overload fun(slot: string)
+            ---@param slot number
+            local function wrapper(slot)
+                takesNumber(slot)
+            end
+
+            wrapper(1)
+            wrapper("Name")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_dtvar_string_slot_with_name_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            local function DTVar(type, slot, name) end
+
+            DTVar("Float", "bad", "Name")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_params_forward_to_colon_method_dot_call() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:DTVar(type, slot, name) end
+
+            ---@return number
+            local function findIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            ---@param extended? table
+            function Entity:NetworkVar(type, slot, name, extended)
+                if isstring(slot) and (istable(name) or not name) then
+                    extended = name
+                    name = slot
+                    slot = findIndex()
+                elseif not slot and isstring(name) then
+                    slot = findIndex()
+                end
+
+                self.DTVar(self, type, slot, name)
+            end
+
+            Entity:NetworkVar("Float", 1, "Age")
+            Entity:NetworkVar("Float", "Age")
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_params_forward_from_member_assigned_closure() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Entity
+            local Entity = {}
+
+            ---@overload fun(type: string, name: string)
+            ---@overload fun(type: string, slot: nil, name: string)
+            ---@param type string
+            ---@param slot number
+            ---@param name string
+            function Entity:DTVar(type, slot, name) end
+
+            ---@return number
+            local function FindUnusedIndex() end
+
+            ---@param value any
+            ---@return TypeGuard<string>
+            function isstring(value) end
+
+            ---@param value any
+            ---@return TypeGuard<table>
+            function istable(value) end
+
+            ---@overload fun(type: string, name: string, extended?: table)
+            ---@param ent Entity
+            ---@param typename string
+            ---@param index number
+            ---@param name string
+            ---@param other_data? table
+            Entity.NetworkVar = function(ent, typename, index, name, other_data)
+                if isstring(index) and (istable(name) or not name) then
+                    other_data = name
+                    name = index
+                    index = FindUnusedIndex()
+                elseif not index and isstring(name) then
+                    index = FindUnusedIndex()
+                end
+
+                ent.DTVar(ent, typename, index, name)
+            end
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_truthiness_prunes_doc_true_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value true
+            local function takesTrue(value) end
+
+            ---@overload fun(flag: true)
+            ---@param flag false
+            local function wrapper(flag)
+                if not flag then
+                    return
+                end
+
+                takesTrue(flag)
+            end
+
+            wrapper(true)
+            wrapper(false)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_correlated_overload_truthiness_keeps_boolean_union_flowing() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param value boolean
+            local function takesBoolean(value) end
+
+            ---@return any|boolean
+            local function getFlag() end
+
+            ---@overload fun(flag: boolean)
+            ---@param flag nil
+            local function wrapper(flag)
+                if not flag then
+                    return
+                end
+
+                takesBoolean(flag)
+            end
+
+            wrapper(getFlag())
+            "#
         ));
     }
 
@@ -206,6 +647,177 @@ mod test {
     }
 
     #[test]
+    fn stable_table_field_expression_overrides_stale_aggregate_member_cache() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Vector
+
+            ---@return Vector
+            local function make_vector() end
+
+            ---@class HullTrace
+            ---@field start Vector
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            local spos = make_vector()
+            TraceHull({ start = spos })
+            "#,
+        );
+
+        let (start_member_id, live_spos_type) = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let start_field = semantic_model
+                .get_root()
+                .descendants::<LuaTableField>()
+                .find(|field| field.syntax().text().to_string().contains("start = spos"))
+                .expect("expected start table field");
+            let value_expr = start_field
+                .get_value_expr()
+                .expect("expected start field value");
+            let live_spos_type = semantic_model
+                .infer_expr(value_expr)
+                .expect("expected stable spos inference");
+
+            (
+                LuaMemberId::new(start_field.get_syntax_id(), file_id),
+                live_spos_type,
+            )
+        };
+
+        assert_eq!(ws.humanize_type(live_spos_type), "Vector");
+        ws.get_db_mut().get_type_index_mut().force_bind_type(
+            start_member_id.into(),
+            LuaTypeCache::InferType(LuaType::Nil),
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatches.is_empty(),
+            "live Vector field value should override stale nil aggregate: {mismatches:?}"
+        );
+    }
+
+    #[test]
+    fn contextual_inferred_table_field_type_matches_hover_fact() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Vector
+
+            ---@class Entity
+
+            ---@class HullTrace
+            ---@field start Vector
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            ---@type Entity
+            local owner
+            local spos = owner:GetShootPos()
+            TraceHull({ start = spos })
+            "#
+        ));
+    }
+
+    #[test]
+    fn nested_live_table_field_expression_overrides_stale_aggregate_member_cache() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@class Vector
+
+            ---@return Vector
+            local function make_vector() end
+
+            ---@class NestedTrace
+            ---@field position Vector
+
+            ---@class HullTrace
+            ---@field nested NestedTrace
+
+            ---@param trace HullTrace
+            local function TraceHull(trace) end
+
+            local spos = make_vector()
+            TraceHull({ nested = { position = spos } })
+            "#,
+        );
+
+        let position_member_id = {
+            let semantic_model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("expected semantic model");
+            let position_field = semantic_model
+                .get_root()
+                .descendants::<LuaTableField>()
+                .find(|field| {
+                    field
+                        .syntax()
+                        .text()
+                        .to_string()
+                        .contains("position = spos")
+                })
+                .expect("expected nested position field");
+            LuaMemberId::new(position_field.get_syntax_id(), file_id)
+        };
+
+        ws.get_db_mut().get_type_index_mut().force_bind_type(
+            position_member_id.into(),
+            LuaTypeCache::InferType(LuaType::Nil),
+        );
+
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ParamTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let mismatches = diagnostics
+            .iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::ParamTypeMismatch.get_name().to_string(),
+                    ))
+            })
+            .collect::<Vec<_>>();
+
+        assert!(
+            mismatches.is_empty(),
+            "nested live Vector should override stale nil aggregate: {mismatches:?}"
+        );
+    }
+
+    #[test]
     fn test_inferred_dynamic_table_field_before_assignment_is_lenient_by_default() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -294,6 +906,26 @@ mod test {
             bar(a)
         end
         "#
+        ));
+    }
+
+    #[test]
+    fn test_vararg_packed_table_matches_array_param() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param values string[]
+            local function takes_array(values) end
+
+            local function forward(...)
+                local args = { ... }
+                takes_array(args)
+            end
+
+            forward("a", "b")
+            "#,
         ));
     }
 
@@ -1112,6 +1744,87 @@ mod test {
                     M:event(p)
                 end
         "#
+        ));
+    }
+
+    #[test]
+    fn partial_class_optional_field_refinement_is_optional_in_structural_check() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers? table
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn partial_class_required_duplicate_field_remains_required() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers table
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn partial_class_optional_field_refinement_still_checks_present_value_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@meta
+            ---@class (partial) Request
+            ---@field url string
+            ---@field headers table
+
+            ---@meta
+            ---@class (partial) Request
+            ---@field headers? table
+            "#,
+        );
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@param request Request
+            local function send(request) end
+
+            send({ url = "https://example.invalid", headers = 1 })
+            "#
         ));
     }
 

@@ -47,7 +47,7 @@ pub async fn on_completion_handler(
         let fresh = tokio::select! {
             biased;
             _ = cancel_token.cancelled() => return None,
-            result = context.debounced_analysis().wait_until_fresh(&cancel_token) => result,
+            result = context.debounced_analysis().wait_until_fresh_for(&cancel_token, "textDocument/completion") => result,
             _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => false,
         };
         // If cancelled during wait, bail out
