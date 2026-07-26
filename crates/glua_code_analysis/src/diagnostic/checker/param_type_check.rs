@@ -504,7 +504,9 @@ fn check_call_expr(
                 _ => arg_exprs.get(idx),
             };
             let result = arg_expr
-                .map(|arg_expr| semantic_model.type_check_expr_detail(&check_type, arg_expr))
+                .map(|arg_expr| {
+                    semantic_model.type_check_expr_detail_with_type(&check_type, arg_type, arg_expr)
+                })
                 .unwrap_or_else(|| semantic_model.type_check_detail(&check_type, arg_type));
             if result.is_err() {
                 // `never` and `SelfInfer` indicate type inference limitations, skip the diagnostic.
