@@ -71,7 +71,8 @@ use crate::semantic::type_check::{
     check_type_compact_detail, check_type_compact_detail_with_member_facts,
 };
 use crate::{
-    Emmyrc, LuaDocument, LuaSemanticDeclId, LuaTypeFact, ModuleInfo, db_index::LuaTypeDeclId,
+    Emmyrc, LuaDocument, LuaInferenceConfidence, LuaInferenceProvenanceKind, LuaMemberOwner,
+    LuaSemanticDeclId, LuaTypeFact, ModuleInfo, db_index::LuaTypeDeclId,
 };
 use crate::{
     FileId,
@@ -107,6 +108,117 @@ pub(crate) fn unwrap_paren_to_name_expr(expr: &LuaExpr) -> Option<LuaNameExpr> {
         LuaExpr::NameExpr(name_expr) => Some(name_expr.clone()),
         LuaExpr::ParenExpr(paren_expr) => unwrap_paren_to_name_expr(&paren_expr.get_expr()?),
         _ => None,
+    }
+}
+
+pub(crate) fn infer_expr_fact_with_cache(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> LuaTypeFact {
+    let call_contract_authority = declared_call_contract_authority(db, cache, &expr);
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        expr.clone(),
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::NoTrace,
+    );
+    let fact = infer_expr_semantic_info(db, cache, expr, semantic_decl)
+        .inference_fact()
+        .clone();
+    match call_contract_authority {
+        DeclaredCallContractAuthority::Independent => LuaTypeFact::from_normalized_parts(
+            fact.typ().clone(),
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        ),
+        DeclaredCallContractAuthority::ReceiverDependent(receiver_fact) => {
+            LuaTypeFact::from_normalized_parts(
+                fact.typ().clone(),
+                LuaInferenceConfidence::Anchored,
+                None,
+                receiver_fact.provenance().into(),
+            )
+        }
+        DeclaredCallContractAuthority::NotDeclared => fact,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DeclaredCallContractAuthority {
+    Independent,
+    ReceiverDependent(LuaTypeFact),
+    NotDeclared,
+}
+
+fn declared_call_contract_authority(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: &LuaExpr,
+) -> DeclaredCallContractAuthority {
+    let LuaExpr::CallExpr(call) = expr else {
+        return DeclaredCallContractAuthority::NotDeclared;
+    };
+    let Some(prefix) = call.get_prefix_expr() else {
+        return DeclaredCallContractAuthority::NotDeclared;
+    };
+    let Ok(prefix_type) = infer::infer_expr(db, cache, prefix.clone()) else {
+        return DeclaredCallContractAuthority::NotDeclared;
+    };
+    let is_declared = match &prefix_type {
+        LuaType::DocFunction(_) => true,
+        LuaType::Signature(signature_id) => {
+            db.get_signature_index()
+                .get(signature_id)
+                .is_some_and(|signature| {
+                    signature.resolve_return == crate::SignatureReturnStatus::DocResolve
+                        && !signature.return_docs.is_empty()
+                })
+                || infer::signature_call_selects_declared_overload(
+                    db,
+                    cache,
+                    *signature_id,
+                    call.clone(),
+                )
+        }
+        _ => false,
+    };
+    if !is_declared {
+        return DeclaredCallContractAuthority::NotDeclared;
+    }
+
+    let LuaExpr::IndexExpr(index) = prefix else {
+        return DeclaredCallContractAuthority::Independent;
+    };
+    let Some(LuaSemanticDeclId::Member(member_id)) = infer_expr_semantic_decl(
+        db,
+        cache,
+        LuaExpr::IndexExpr(index.clone()),
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::NoTrace,
+    ) else {
+        return DeclaredCallContractAuthority::Independent;
+    };
+    let Some(member_owner) = db.get_member_index().get_member_owner(&member_id) else {
+        return DeclaredCallContractAuthority::Independent;
+    };
+    let expected_receiver_type = match member_owner {
+        LuaMemberOwner::Type(owner_id) => LuaType::Ref(owner_id.clone()),
+        LuaMemberOwner::Element(range) => LuaType::TableConst(range.clone()),
+        _ => return DeclaredCallContractAuthority::Independent,
+    };
+    let Some(receiver) = index.get_prefix_expr() else {
+        return DeclaredCallContractAuthority::Independent;
+    };
+    let receiver_fact = infer_expr_fact_with_cache(db, cache, receiver);
+    if receiver_fact.confidence() >= LuaInferenceConfidence::Certain
+        && check_type_compact(db, receiver_fact.typ(), &expected_receiver_type).is_ok()
+    {
+        DeclaredCallContractAuthority::Independent
+    } else {
+        DeclaredCallContractAuthority::ReceiverDependent(receiver_fact)
     }
 }
 

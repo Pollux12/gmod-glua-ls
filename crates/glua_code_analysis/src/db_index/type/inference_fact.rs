@@ -221,6 +221,38 @@ impl LuaTypeFact {
         self.provenance.iter().map(|step| &step.event)
     }
 
+    pub(crate) fn has_independently_stronger_authority_than(
+        &self,
+        other: &Self,
+        target: &LuaInferenceNodeId,
+    ) -> bool {
+        self.authority_rank() > other.authority_rank()
+            && self.provenance.iter().all(|step| {
+                &step.event.node != target && !step.support.iter().any(|support| support == target)
+            })
+    }
+
+    fn authority_rank(&self) -> u8 {
+        if self.base_provenance_kind == Some(LuaInferenceProvenanceKind::ExplicitAnnotation) {
+            return 4;
+        }
+        if self.confidence == LuaInferenceConfidence::Certain {
+            return 3;
+        }
+        if self.confidence == LuaInferenceConfidence::Anchored
+            || self
+                .provenance
+                .iter()
+                .any(|step| step.event.kind == LuaInferenceProvenanceKind::ContextualUnknown)
+        {
+            return 2;
+        }
+        if self.confidence == LuaInferenceConfidence::Heuristic {
+            return 1;
+        }
+        0
+    }
+
     pub(crate) fn from_normalized_parts(
         typ: LuaType,
         confidence: LuaInferenceConfidence,
