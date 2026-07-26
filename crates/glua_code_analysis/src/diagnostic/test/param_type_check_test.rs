@@ -726,6 +726,44 @@ mod test {
     }
 
     #[test]
+    fn issue_54_default_after_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class DefaultAfterType
+            ---@field force number=1000
+            ---@field other string
+
+            ---@param value DefaultAfterType
+            local function takes_default(value) end
+
+            takes_default({ force = "wrong", other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_54_default_before_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class DefaultBeforeType
+            ---@field force=1000 number
+            ---@field other string
+
+            ---@param value DefaultBeforeType
+            local function takes_default(value) end
+
+            takes_default({ force = "wrong", other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
     fn stable_table_field_expression_overrides_stale_aggregate_member_cache() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(

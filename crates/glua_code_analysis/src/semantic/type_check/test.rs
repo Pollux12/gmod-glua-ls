@@ -457,6 +457,40 @@ mod test {
     }
 
     #[test]
+    fn issue_54_defaulted_class_field_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithDefault
+            ---@field force number=1000
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("WithDefault");
+        let table_ty = ws.expr_ty(r#"{ force = "wrong", other = "ok" }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn issue_54_defaulted_class_field_is_checked_in_object_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithDefault
+            ---@field force number=1000
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("WithDefault");
+        let object_ty = ws.ty("{ force: string, other: string }");
+
+        assert!(!ws.check_type(&target_ty, &object_ty));
+    }
+
+    #[test]
     fn test_defaulted_generic_field_is_not_required_for_table_compatibility() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -471,5 +505,22 @@ mod test {
         let table_ty = ws.expr_ty("{ Value = 1 }");
 
         assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn issue_54_defaulted_generic_field_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceBox<T>
+            ---@field Value T
+            ---@field Hit boolean=false
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceBox<number>");
+        let table_ty = ws.expr_ty(r#"{ Value = 1, Hit = "wrong" }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
     }
 }

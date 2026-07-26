@@ -157,14 +157,8 @@ fn check_generic_type_compact_table(
     let next_guard = check_guard.next_level()?;
 
     for source_member in source_type_members {
-        if !is_required_structural_member(
-            context.db,
-            source_member.feature,
-            source_member.property_owner_id.as_ref(),
-            Some(&source_member.typ),
-        ) {
-            continue;
-        }
+        let source_member_feature = source_member.feature;
+        let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
         let key = source_member.key;
 
@@ -200,7 +194,14 @@ fn check_generic_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional() => {
+            None if !source_member_type.is_optional()
+                && is_required_structural_member(
+                    context.db,
+                    source_member_feature,
+                    property_owner_id.as_ref(),
+                    Some(&source_member_type),
+                ) =>
+            {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }

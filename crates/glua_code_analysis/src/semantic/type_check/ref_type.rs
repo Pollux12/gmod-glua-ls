@@ -363,14 +363,6 @@ fn check_ref_type_compact_table(
             .get(key)
             .unwrap_or(raw_source_member_type);
         let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
-        if !is_required_structural_member(
-            context.db,
-            Some(source_member.get_feature()),
-            Some(&property_owner_id),
-            Some(source_member_type),
-        ) {
-            continue;
-        }
         let key = source_member.get_key();
 
         if context.is_key_checked(key) {
@@ -410,7 +402,14 @@ fn check_ref_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional() => {
+            None if !source_member_type.is_optional()
+                && is_required_structural_member(
+                    context.db,
+                    Some(source_member.get_feature()),
+                    Some(&property_owner_id),
+                    Some(source_member_type),
+                ) =>
+            {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
@@ -459,14 +458,8 @@ fn check_ref_type_compact_object(
     };
 
     for source_member in source_type_members {
-        if !is_required_structural_member(
-            context.db,
-            source_member.feature,
-            source_member.property_owner_id.as_ref(),
-            Some(&source_member.typ),
-        ) {
-            continue;
-        }
+        let source_member_feature = source_member.feature;
+        let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
         let key = source_member.key;
         if context.is_key_checked(&key) {
@@ -498,7 +491,14 @@ fn check_ref_type_compact_object(
                     ));
                 }
             }
-            None if !source_member_type.is_optional() => {
+            None if !source_member_type.is_optional()
+                && is_required_structural_member(
+                    context.db,
+                    source_member_feature,
+                    property_owner_id.as_ref(),
+                    Some(&source_member_type),
+                ) =>
+            {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
