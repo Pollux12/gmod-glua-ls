@@ -9,6 +9,7 @@ const CARGOS: &[&str] = &[
     "crates/schema_to_glua/Cargo.toml",
     "crates/glua_ls/Cargo.toml",
     "crates/glua_check/Cargo.toml",
+    "crates/glua_doc_cli/Cargo.toml",
 ];
 
 fn main() {
