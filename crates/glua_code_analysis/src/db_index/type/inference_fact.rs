@@ -227,9 +227,26 @@ impl LuaTypeFact {
         target: &LuaInferenceNodeId,
     ) -> bool {
         self.authority_rank() > other.authority_rank()
+            && !other.is_unguarded_child_refinement_of(&self.typ, target)
             && self.provenance.iter().all(|step| {
-                &step.event.node != target && !step.support.iter().any(|support| support == target)
+                !same_fact_target(&step.event.node, target)
+                    && !step
+                        .support
+                        .iter()
+                        .any(|support| same_fact_target(support, target))
             })
+    }
+
+    fn is_unguarded_child_refinement_of(
+        &self,
+        base_type: &LuaType,
+        target: &LuaInferenceNodeId,
+    ) -> bool {
+        self.provenance.iter().any(|step| {
+            step.event.kind == LuaInferenceProvenanceKind::UnguardedChild
+                && same_fact_target(&step.event.node, target)
+                && step.found_type.as_deref() == Some(base_type)
+        })
     }
 
     fn authority_rank(&self) -> u8 {
@@ -265,6 +282,24 @@ impl LuaTypeFact {
             base_provenance_kind,
             provenance,
         }
+    }
+}
+
+fn same_fact_target(left: &LuaInferenceNodeId, right: &LuaInferenceNodeId) -> bool {
+    if left == right {
+        return true;
+    }
+
+    match (left, right) {
+        (
+            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(left)),
+            LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(right)),
+        )
+        | (
+            LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(right)),
+            LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(left)),
+        ) => left == right,
+        _ => false,
     }
 }
 

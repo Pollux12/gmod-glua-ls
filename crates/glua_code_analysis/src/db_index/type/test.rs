@@ -216,6 +216,70 @@ mod test {
     }
 
     #[test]
+    fn declared_base_does_not_replace_its_unguarded_child_runtime_refinement() {
+        let target = LuaInferenceNodeId::TypeOwner(owner());
+        let base_type = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+        let refined_type = LuaType::Ref(LuaTypeDeclId::global("Player"));
+        let unguarded_child = LuaTypeFact::new(
+            refined_type,
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
+                        LuaDeclId::new(file_id(), 10.into()),
+                    )),
+                    kind: LuaInferenceProvenanceKind::UnguardedChild,
+                    source: source(30),
+                },
+                support: Arc::from([]),
+                found_type: Some(Arc::new(base_type.clone())),
+            }]),
+        );
+        let declared_base = LuaTypeFact::from_normalized_parts(
+            base_type.clone(),
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        );
+        let changed_declaration = LuaTypeFact::from_normalized_parts(
+            LuaType::Number,
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        );
+
+        assert!(
+            !declared_base.has_independently_stronger_authority_than(&unguarded_child, &target)
+        );
+        assert!(
+            changed_declaration
+                .has_independently_stronger_authority_than(&unguarded_child, &target)
+        );
+
+        let inherited_receiver_provenance = LuaTypeFact::new(
+            LuaType::Ref(LuaTypeDeclId::global("Vector")),
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
+                        LuaDeclId::new(file_id(), 20.into()),
+                    )),
+                    kind: LuaInferenceProvenanceKind::UnguardedChild,
+                    source: source(30),
+                },
+                support: Arc::from([]),
+                found_type: Some(Arc::new(base_type)),
+            }]),
+        );
+        assert!(
+            declared_base.has_independently_stronger_authority_than(
+                &inherited_receiver_provenance,
+                &target,
+            )
+        );
+    }
+
+    #[test]
     fn ref_type_cache_tracks_the_declaring_file_as_an_incremental_dependency() {
         let provider = FileId::new(1);
         let consumer = FileId::new(2);
