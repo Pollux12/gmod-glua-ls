@@ -22,7 +22,9 @@ use glua_parser::{
     LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind,
     LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
-pub(crate) use gmod_vgui_context::resolve_registered_vgui_method_context;
+pub(crate) use gmod_vgui_context::{
+    resolve_registered_vgui_method_context, resolve_registered_vgui_method_context_for_func,
+};
 pub(crate) use infer::check_iter_var_range;
 pub(crate) use infer::get_prefix_expr_signature_id;
 pub(crate) use infer::infer_bind_value_type;
@@ -81,10 +83,12 @@ use crate::{LuaFunctionType, LuaMemberId, LuaMemberKey, LuaTypeOwner};
 pub use generic::*;
 pub use guard::{InferGuard, InferGuardRef};
 pub use infer::InferFailReason;
+pub(crate) use infer::infer_authoritative_method_self_type;
 pub use infer::infer_call_expr_func;
 pub(crate) use infer::infer_enclosing_self_type;
 pub(crate) use infer::infer_expr;
 pub(crate) use infer::infer_param_is_weak;
+pub(crate) use infer::is_authoritative_self_receiver_type;
 pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::type_decl_is_vgui_panel;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};

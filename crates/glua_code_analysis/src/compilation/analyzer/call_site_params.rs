@@ -10,7 +10,8 @@ use crate::{
     LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType,
     LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, LuaTypeOwner,
     WorkspaceId, find_signature_attribute_use, get_member_map, get_member_value_expr,
-    get_prefix_expr_signature_id, infer_expr, infer_expr_semantic_decl, profile::Profile,
+    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
+    infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -110,6 +111,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
             let mut receiver_signatures = Vec::new();
             let mut receiver_consumers = Vec::new();
             let mut exact_receiver_eligibility = HashMap::new();
+            let mut authoritative_receiver_signatures = HashMap::new();
             let Some(root) = db
                 .get_vfs()
                 .get_syntax_tree(&file_id)
@@ -138,6 +140,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                     &returned_table_cache,
                     &exact_receiver_candidates,
                     &mut exact_receiver_eligibility,
+                    &mut authoritative_receiver_signatures,
                     &mut contributions,
                     &mut receiver_signatures,
                     &mut receiver_consumers,
@@ -745,6 +748,7 @@ fn collect_call_site_param_types(
     returned_table_cache: &ReturnedTableCache,
     exact_receiver_candidates: &HashMap<LuaMemberKey, bool>,
     exact_receiver_eligibility: &mut HashMap<LuaSignatureId, bool>,
+    authoritative_receiver_signatures: &mut HashMap<LuaSignatureId, bool>,
     contributions: &mut Vec<(LuaSignatureId, usize, LuaTypeFact)>,
     receiver_signatures: &mut Vec<LuaSignatureId>,
     receiver_consumers: &mut Vec<CallSiteReturnConsumer>,
@@ -841,6 +845,10 @@ fn collect_call_site_param_types(
         let Some(signature) = db.get_signature_index().get(&signature_id) else {
             continue;
         };
+        let has_authoritative_receiver = signature.is_colon_define
+            && *authoritative_receiver_signatures
+                .entry(signature_id)
+                .or_insert_with(|| signature_has_authoritative_receiver(db, signature_id));
         for (arg_idx, arg) in &useful_args {
             let is_implicit_receiver = signature.is_colon_define
                 && !call_expr.is_colon_call()
@@ -863,6 +871,9 @@ fn collect_call_site_param_types(
                     continue;
                 }
                 _ => {}
+            }
+            if is_implicit_receiver && has_authoritative_receiver {
+                continue;
             }
             let param_idx = if is_implicit_receiver {
                 signature.params.len()
@@ -1523,6 +1534,21 @@ fn exact_signature_closure(db: &DbIndex, signature_id: LuaSignatureId) -> Option
         .filter(|closure| {
             LuaSignatureId::from_closure(signature_id.get_file_id(), closure) == signature_id
         })
+}
+
+fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    let Some(func_stat) = exact_signature_closure(db, signature_id)
+        .and_then(|closure| closure.get_parent::<LuaFuncStat>())
+    else {
+        return false;
+    };
+    let mut cache = LuaInferCache::new(
+        signature_id.get_file_id(),
+        crate::CacheOptions {
+            analysis_phase: crate::LuaAnalysisPhase::Force,
+        },
+    );
+    infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()
 }
 
 fn var_writes_param(var: &LuaVarExpr, param_name: &str) -> bool {

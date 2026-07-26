@@ -2552,6 +2552,26 @@ mod test {
     }
 
     #[test]
+    fn explicit_dot_call_to_colon_method_rejects_incompatible_receiver() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class receiver_base
+            local BASE = {}
+            function BASE:Run() end
+
+            ---@class unrelated_receiver
+            local OTHER = {}
+            function OTHER:Dispatch()
+                BASE.Run(self)
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_vgui_instance_close_override_does_not_poison_sibling_dframe_close() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
