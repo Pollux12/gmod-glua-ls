@@ -10,7 +10,7 @@ pub(in crate::compilation::analyzer::lua) use cache::{
 };
 pub(in crate::compilation::analyzer) use collection::resolve_index_expr_member_owner_for_file;
 pub(in crate::compilation::analyzer::lua) use collection::{
-    direct_local_table_prefix_member_owner,
+    direct_local_prefix_has_declared_type, direct_local_table_prefix_member_owner,
     flush_pending_dynamic_key_collection_widening_for_members,
     get_widened_member_assignment_collection_type, is_collection_append_write,
     is_member_realm_compatible, record_member_collection_assignment_widening_cache,
