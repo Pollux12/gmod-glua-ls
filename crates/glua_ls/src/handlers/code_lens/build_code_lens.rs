@@ -461,11 +461,11 @@ fn resolve_start_kind_label(
         .find(|(flow_file_id, flow)| {
             *flow_file_id == file_id && flow.start_range == call_range && !flow.is_wrapped
         })
-        .map(|(_, flow)| (flow.send_kind, flow.send_target.clone()));
+        .map(|(_, flow)| (flow.send_display_name.clone(), flow.send_target.clone()));
 
     match matching {
-        Some((kind, Some(target))) => format!("{}({target})", kind.to_fn_name()),
-        Some((kind, None)) => kind.to_fn_name().to_string(),
+        Some((name, Some(target))) => format!("{name}({target})"),
+        Some((name, None)) => name.to_string(),
         None => fallback,
     }
 }
@@ -508,9 +508,9 @@ fn resolve_receive_kind_label(
         receive_flow,
     );
 
-    let mut kinds: Vec<&'static str> = Vec::new();
+    let mut kinds: Vec<&str> = Vec::new();
     for (_, flow) in &paired {
-        let name = flow.send_kind.to_fn_name();
+        let name = flow.send_display_name.as_str();
         if !kinds.contains(&name) {
             kinds.push(name);
         }

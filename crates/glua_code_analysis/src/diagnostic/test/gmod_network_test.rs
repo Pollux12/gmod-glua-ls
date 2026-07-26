@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, GmodRealm, NetOpDirection, VirtualWorkspace};
     use googletest::prelude::*;
     use lsp_types::{Diagnostic, NumberOrString};
     use tokio_util::sync::CancellationToken;
@@ -10,6 +10,9 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        // Net ops are recognized through signature metadata, so the annotated
+        // builtins must be present or no flows are collected at all.
+        ws.def_gmod_call_arg_builtins();
         ws
     }
 
@@ -134,6 +137,38 @@ mod tests {
             net.WriteString("hello")
             -- exercise new send method
             net.SendPAS(Vector(0,0,0))
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        assert_that!(
+            count_diagnostic(
+                &diagnostics,
+                DiagnosticCode::GmodNetMissingNetworkCounterpart
+            ),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_static_wrapper_reports_one_missing_receiver_at_call_site() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("WrappedOrphan")
+
+            local function sendWrappedOrphan()
+                net.Start("WrappedOrphan")
+                net.WriteString("hello")
+                net.Broadcast()
+            end
+
+            sendWrappedOrphan()
             "#,
         );
 
@@ -1618,6 +1653,346 @@ mod tests {
         assert_that!(count_network_diagnostics(&diagnostics), eq(0usize));
     }
 
+    /// A normal wrapper that ultimately calls the shipped `net.*` functions
+    /// needs no annotations of its own. The message name is dynamic inside the
+    /// wrapper and becomes concrete only at the cross-file call site.
+    #[gtest]
+    fn test_unannotated_cross_file_send_wrapper_resolves_call_arguments() {
+        let mut ws = new_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/sh_net_helpers.lua",
+            r#"
+            MyLib = MyLib or {}
+
+            function MyLib.SendString(messageName, value)
+                net.Start(messageName)
+                net.WriteString(value)
+                net.SendToServer()
+            end
+            "#,
+        );
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            local sendString = MyLib.SendString
+            sendString("WrappedMessage", "payload")
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("WrappedMessage")
+            net.Receive("WrappedMessage", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        let client_diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let server_diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&client_diagnostics), eq(0usize));
+        expect_that!(count_network_diagnostics(&server_diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .and_then(|data| {
+                data.send_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "WrappedMessage")
+            });
+        let Some(flow) = flow else {
+            panic!("expected the unannotated wrapper call to produce a send flow");
+        };
+        expect_that!(flow.writes.len(), eq(1usize));
+        expect_that!(flow.writes[0].op.wire_format.as_str(), eq("string"));
+        expect_that!(flow.send_kind.receiver_realm, eq(GmodRealm::Server));
+    }
+
+    #[gtest]
+    fn test_unannotated_send_wrapper_participates_in_type_mismatch_checks() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/sh_net_helpers.lua",
+            r#"
+            MyLib = MyLib or {}
+
+            function MyLib.SendString(messageName, value)
+                net.Start(messageName)
+                net.WriteString(value)
+                net.Broadcast()
+            end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("WrappedMismatch")
+            MyLib.SendString("WrappedMismatch", "payload")
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("WrappedMismatch", function()
+                local value = net.ReadUInt(8)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(1usize)
+        );
+    }
+
+    #[gtest]
+    fn test_static_message_wrapper_participates_in_bits_mismatch_checks() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteBitsMismatch);
+
+        let helper_file_id = ws.def_file(
+            "lua/autorun/sh_net_helpers.lua",
+            r#"
+            MyLib = MyLib or {}
+
+            function MyLib.SendId()
+                net.Start("WrappedBits")
+                net.WriteUInt(1, 16)
+                net.Broadcast()
+            end
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("WrappedBits")
+            MyLib.SendId()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("WrappedBits", function()
+                local value = net.ReadUInt(8)
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteBitsMismatch),
+            eq(1usize)
+        );
+
+        let send_flows = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_send_flows_for_message("WrappedBits");
+        expect_that!(send_flows.len(), eq(1usize));
+        expect_that!(send_flows[0].0, eq(server_file_id));
+        expect_that!(
+            send_flows[0]
+                .1
+                .materialized_from
+                .map(|origin| origin.file_id),
+            eq(Some(helper_file_id))
+        );
+    }
+
+    #[gtest]
+    fn test_cross_file_wrapper_cache_keeps_equal_sized_files_distinct() {
+        let mut ws = new_gmod_workspace();
+        let start_helper = r#"
+            LibA = LibA or {}
+            local function inner(value)
+                net.Start(value) --xxxxx
+            end
+            function LibA.Call(value)
+                inner(value)
+            end
+            "#;
+        let write_helper = r#"
+            LibB = LibB or {}
+            local function inner(value)
+                net.WriteString(value)--
+            end
+            function LibB.Call(value)
+                inner(value)
+            end
+            "#;
+        assert_eq!(
+            start_helper.len(),
+            write_helper.len(),
+            "the regression requires identical chunk ranges"
+        );
+
+        ws.def_file("lua/autorun/sh_start_helper.lua", start_helper);
+        ws.def_file("lua/autorun/sh_write_helper.lua", write_helper);
+
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            LibA.Call("EqualSizedHelpers")
+            LibB.Call("payload")
+            net.SendToServer()
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("EqualSizedHelpers")
+            net.Receive("EqualSizedHelpers", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        let client_diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let server_diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&client_diagnostics), eq(0usize));
+        expect_that!(count_network_diagnostics(&server_diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .and_then(|data| {
+                data.send_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "EqualSizedHelpers")
+            });
+        let Some(flow) = flow else {
+            panic!("expected both equal-sized helper files to contribute to the send flow");
+        };
+        expect_that!(flow.writes.len(), eq(1usize));
+        expect_that!(flow.writes[0].op.wire_format.as_str(), eq("string"));
+    }
+
+    #[gtest]
+    fn test_unannotated_start_and_send_wrappers_form_one_flow() {
+        let mut ws = new_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/sh_net_helpers.lua",
+            r#"
+            MyLib = MyLib or {}
+
+            function MyLib.Begin(messageName)
+                net.Start(messageName)
+            end
+
+            function MyLib.Flush()
+                net.Broadcast()
+            end
+            "#,
+        );
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("SplitWrapper")
+            local begin = MyLib.Begin
+            local flush = MyLib.Flush
+            begin("SplitWrapper")
+            net.WriteString("payload")
+            flush()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            net.Receive("SplitWrapper", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        let server_diagnostics = file_diagnostics(&mut ws, server_file_id);
+        let client_diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&server_diagnostics), eq(0usize));
+        expect_that!(count_network_diagnostics(&client_diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(server_file_id)
+            .and_then(|data| {
+                data.send_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "SplitWrapper" && !flow.is_wrapped)
+            });
+        let Some(flow) = flow else {
+            panic!("expected split start/send wrappers to produce one send flow");
+        };
+        expect_that!(flow.writes.len(), eq(1usize));
+        expect_that!(flow.writes[0].op.wire_format.as_str(), eq("string"));
+        expect_that!(flow.send_kind.receiver_realm, eq(GmodRealm::Client));
+    }
+
+    #[gtest]
+    fn test_unannotated_cross_file_receive_wrapper_resolves_call_arguments() {
+        let mut ws = new_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/sh_net_helpers.lua",
+            r#"
+            MyLib = MyLib or {}
+
+            function MyLib.ReceiveString(messageName, callback)
+                net.Receive(messageName, function()
+                    callback(net.ReadString())
+                end)
+            end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/autorun/server/send.lua",
+            r#"
+            util.AddNetworkString("WrappedReceive")
+            net.Start("WrappedReceive")
+            net.WriteString("payload")
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/receive.lua",
+            r#"
+            local receiveString = MyLib.ReceiveString
+            receiveString("WrappedReceive", function(value) end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .and_then(|data| {
+                data.receive_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "WrappedReceive")
+            });
+        let Some(flow) = flow else {
+            panic!("expected the unannotated wrapper call to produce a receive flow");
+        };
+        expect_that!(flow.reads.len(), eq(1usize));
+        expect_that!(flow.reads[0].op.wire_format.as_str(), eq("string"));
+    }
+
     #[gtest]
     fn test_receiver_expands_colon_method_reads_on_same_scripted_class() {
         let mut ws = new_gmod_workspace();
@@ -2113,5 +2488,617 @@ mod tests {
             count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteOrderMismatch),
             gt(0usize)
         );
+    }
+
+    // ---------------------------------------------------------------------
+    // Annotation-driven recognition (GitHub issue #43).
+    //
+    // Recognition resolves the callee's signature metadata, so an alias, a
+    // cross-file global, or a user-annotated wrapper is recognized exactly like
+    // the builtin it points at.
+    // ---------------------------------------------------------------------
+
+    #[gtest]
+    fn test_global_alias_send_has_no_missing_counterpart() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/alias_send.lua",
+            r#"
+            netStart = net.Start
+            netSend = net.Broadcast
+            util.AddNetworkString("AliasMsg")
+            netStart("AliasMsg")
+            net.WriteString("hi")
+            netSend()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/alias_recv.lua",
+            r#"
+            net.Receive("AliasMsg", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let server = file_diagnostics(&mut ws, server_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&server), eq(0usize));
+        expect_that!(count_network_diagnostics(&client), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_local_alias_send_has_no_missing_counterpart() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/server/local_alias_send.lua",
+            r#"
+            local netStart = net.Start
+            local netSend = net.Broadcast
+            util.AddNetworkString("LocalAliasMsg")
+            netStart("LocalAliasMsg")
+            net.WriteString("hi")
+            netSend()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/local_alias_recv.lua",
+            r#"
+            net.Receive("LocalAliasMsg", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    /// The alias is defined in one file and used in another that contains no
+    /// `net.` text at all. The structural call gate must admit the calling file,
+    /// then resolved signature metadata identifies the operations.
+    #[gtest]
+    fn test_cross_file_alias_in_file_without_net_text() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/sh_aliases.lua",
+            r#"
+            beginMsg = net.Start
+            pushText = net.WriteString
+            flushMsg = net.Broadcast
+            "#,
+        );
+        let sender_file_id = ws.def_file(
+            "lua/autorun/server/cross_alias_send.lua",
+            r#"
+            beginMsg("CrossAliasMsg")
+            pushText("hello")
+            flushMsg()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/cross_alias_recv.lua",
+            r#"
+            net.Receive("CrossAliasMsg", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let sender = file_diagnostics(&mut ws, sender_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&sender), eq(0usize));
+        expect_that!(count_network_diagnostics(&client), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_aliased_send_to_server_resolves_realm() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/client/alias_sts.lua",
+            r#"
+            local start = net.Start
+            local toServer = net.SendToServer
+            start("ClientToServer")
+            net.WriteString("hi")
+            toServer()
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/alias_sts_recv.lua",
+            r#"
+            net.Receive("ClientToServer", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_aliased_write_and_read_ops_keep_counts_aligned() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/alias_ops_send.lua",
+            r#"
+            local writeStr = net.WriteString
+            util.AddNetworkString("AliasOps")
+            net.Start("AliasOps")
+            writeStr("a")
+            writeStr("b")
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/alias_ops_recv.lua",
+            r#"
+            local readStr = net.ReadString
+            net.Receive("AliasOps", function()
+                local a = readStr()
+                local b = readStr()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_local_alias_receive_is_resolved_from_signature_metadata() {
+        let mut ws = new_gmod_workspace();
+
+        ws.def_file(
+            "lua/autorun/server/alias_receive_send.lua",
+            r#"
+            util.AddNetworkString("AliasReceive")
+            net.Start("AliasReceive")
+            net.WriteString("payload")
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/alias_receive.lua",
+            r#"
+            local netReceive = net.Receive
+            local readString = net.ReadString
+
+            netReceive("AliasReceive", function()
+                local value = readString()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .and_then(|data| {
+                data.receive_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "AliasReceive")
+            })
+            .expect("aliased receive should produce a network flow");
+        expect_that!(flow.reads.len(), eq(1usize));
+        expect_that!(flow.reads[0].op.wire_format.as_str(), eq("string"));
+    }
+
+    #[gtest]
+    fn test_user_annotated_wrapper_without_net_text_is_recognized() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        // The wrapper library declares its own net vocabulary.
+        ws.def_file(
+            "lua/autorun/sh_wrapperlib.lua",
+            r#"
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function BeginMessage(name) end
+
+            ---@param value string
+            ---@[net_payload("write", "string")]
+            function PutString(value) end
+
+            ---@[net_send("client")]
+            function FlushToClients() end
+            "#,
+        );
+        // This file contains no `net.` text at all. The structural call gate
+        // admits it, then signature metadata classifies each operation.
+        let sender_file_id = ws.def_file(
+            "lua/autorun/server/wrapper_send.lua",
+            r#"
+            BeginMessage("WrappedOnly")
+            PutString("payload")
+            FlushToClients()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/wrapper_recv.lua",
+            r#"
+            net.Receive("WrappedOnly", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let sender = file_diagnostics(&mut ws, sender_file_id);
+        let client = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&sender), eq(0usize));
+        expect_that!(count_network_diagnostics(&client), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_annotated_replacement_api_adjusts_roles_for_colon_calls() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/sh_replacement_net.lua",
+            r#"
+            ---@class ReplacementNet
+            ReplacementNet = {}
+
+            ---@param self ReplacementNet
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function ReplacementNet.Begin(self, name) end
+
+            ---@param self ReplacementNet
+            ---@param value string
+            ---@[net_payload("write", "string")]
+            function ReplacementNet.PutString(self, value) end
+
+            ---@param self ReplacementNet
+            ---@[net_send("server")]
+            function ReplacementNet.Flush(self) end
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/send.lua",
+            r#"
+            ReplacementNet:Begin("ColonReplacement")
+            ReplacementNet:PutString("payload")
+            ReplacementNet:Flush()
+            "#,
+        );
+        let server_file_id = ws.def_file(
+            "lua/autorun/server/receive.lua",
+            r#"
+            util.AddNetworkString("ColonReplacement")
+            net.Receive("ColonReplacement", function()
+                local value = net.ReadString()
+            end)
+            "#,
+        );
+
+        let client_diagnostics = file_diagnostics(&mut ws, client_file_id);
+        let server_diagnostics = file_diagnostics(&mut ws, server_file_id);
+        expect_that!(count_network_diagnostics(&client_diagnostics), eq(0usize));
+        expect_that!(count_network_diagnostics(&server_diagnostics), eq(0usize));
+
+        let flow = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(client_file_id)
+            .and_then(|data| {
+                data.send_flows
+                    .iter()
+                    .find(|flow| flow.message_name == "ColonReplacement")
+            });
+        let Some(flow) = flow else {
+            panic!("expected colon-call argument roles to produce a send flow");
+        };
+        expect_that!(flow.writes.len(), eq(1usize));
+        expect_that!(flow.writes[0].op.wire_format.as_str(), eq("string"));
+        expect_that!(flow.send_kind.receiver_realm, eq(GmodRealm::Server));
+    }
+
+    /// The message name and the receive callback are located by their annotated
+    /// roles, not by position, so a wrapper is free to order its parameters
+    /// differently from `net.Start` / `net.Receive`.
+    #[gtest]
+    fn test_wrapper_with_non_leading_message_and_callback_params_pairs() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        ws.def_file(
+            "lua/autorun/sh_offsetlib.lua",
+            r#"
+            ---@param reliable boolean
+            ---@[call_arg("gmod.net_message", "start")]
+            ---@param name string
+            function Begin(reliable, name) end
+
+            ---@param priority number
+            ---@[call_arg("gmod.net_message", "receive")]
+            ---@param name string
+            ---@[call_arg("gmod.net_message", "callback")]
+            ---@param handler function
+            function Listen(priority, name, handler) end
+
+            ---@[net_send("client")]
+            function Flush() end
+            "#,
+        );
+        let offset_sender_file_id = ws.def_file(
+            "lua/autorun/server/offset_send.lua",
+            r#"
+            Begin(true, "OffsetMsg")
+            net.WriteString("payload")
+            Flush()
+            "#,
+        );
+        let offset_client_file_id = ws.def_file(
+            "lua/autorun/client/offset_recv.lua",
+            r#"
+            Listen(1, "OffsetMsg", function()
+                local s = net.ReadString()
+            end)
+            "#,
+        );
+
+        let offset_sender = file_diagnostics(&mut ws, offset_sender_file_id);
+        let offset_client = file_diagnostics(&mut ws, offset_client_file_id);
+        expect_that!(count_network_diagnostics(&offset_sender), eq(0usize));
+        expect_that!(count_network_diagnostics(&offset_client), eq(0usize));
+    }
+
+    #[gtest]
+    fn test_previously_unmodelled_ops_now_pair() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteOrderMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/new_ops_send.lua",
+            r#"
+            util.AddNetworkString("NewOps")
+            net.Start("NewOps")
+            net.WriteMatrix(m)
+            net.WritePlayer(ply)
+            net.WriteUInt64(v)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/new_ops_recv.lua",
+            r#"
+            net.Receive("NewOps", function()
+                local m = net.ReadMatrix()
+                local p = net.ReadPlayer()
+                local v = net.ReadUInt64()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    /// The numeric family all declares `number`, so only the wire format keeps
+    /// these distinguishable. Losing that axis would silently regress eight ops.
+    #[gtest]
+    fn test_numeric_family_mismatches_still_detected() {
+        for (write_op, read_op) in [
+            ("net.WriteFloat(1)", "net.ReadInt(16)"),
+            ("net.WriteUInt(1, 8)", "net.ReadInt(8)"),
+            ("net.WriteDouble(1)", "net.ReadFloat()"),
+        ] {
+            let mut ws = new_gmod_workspace();
+            ws.analysis
+                .diagnostic
+                .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+            ws.def_file(
+                "lua/autorun/server/num_send.lua",
+                &format!(
+                    r#"
+                    util.AddNetworkString("NumMsg")
+                    net.Start("NumMsg")
+                    {write_op}
+                    net.Broadcast()
+                    "#
+                ),
+            );
+            let client_file_id = ws.def_file(
+                "lua/autorun/client/num_recv.lua",
+                &format!(
+                    r#"
+                    net.Receive("NumMsg", function()
+                        local v = {read_op}
+                    end)
+                    "#
+                ),
+            );
+
+            let diagnostics = file_diagnostics(&mut ws, client_file_id);
+            expect_that!(
+                count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+                eq(1usize),
+                "expected a mismatch for {write_op} paired with {read_op}"
+            );
+        }
+    }
+
+    /// `net.WritePlayer` uses a narrower encoding than `net.WriteEntity`, so the
+    /// two carry distinct wire formats and must not pair.
+    #[gtest]
+    fn test_write_player_read_entity_is_flagged() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/server/player_send.lua",
+            r#"
+            util.AddNetworkString("PlayerMsg")
+            net.Start("PlayerMsg")
+            net.WritePlayer(ply)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/player_recv.lua",
+            r#"
+            net.Receive("PlayerMsg", function()
+                local e = net.ReadEntity()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(
+            count_diagnostic(&diagnostics, DiagnosticCode::GmodNetReadWriteTypeMismatch),
+            eq(1usize)
+        );
+    }
+
+    /// A user subclass of Entity shares `net.WriteEntity`'s wire format, so it
+    /// pairs cleanly without any per-class metadata.
+    #[gtest]
+    fn test_user_entity_subclass_pairs_through_write_entity() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetReadWriteTypeMismatch);
+
+        ws.def_file(
+            "lua/autorun/sh_mynpc.lua",
+            r#"
+            ---@class MyNPC : Entity
+            local MyNPC = {}
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/server/npc_send.lua",
+            r#"
+            util.AddNetworkString("NpcMsg")
+            net.Start("NpcMsg")
+            net.WriteEntity(npc)
+            net.Broadcast()
+            "#,
+        );
+        let client_file_id = ws.def_file(
+            "lua/autorun/client/npc_recv.lua",
+            r#"
+            net.Receive("NpcMsg", function()
+                local e = net.ReadEntity()
+            end)
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, client_file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    /// An unannotated workspace function that merely resembles the builtin must
+    /// not be mistaken for it.
+    #[gtest]
+    fn test_unannotated_lookalike_is_not_recognized() {
+        let mut ws = new_gmod_workspace();
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::GmodNetMissingNetworkCounterpart);
+
+        let file_id = ws.def_file(
+            "lua/autorun/server/lookalike.lua",
+            r#"
+            mynet = {}
+            function mynet.Start(name) end
+            function mynet.Broadcast() end
+
+            mynet.Start("NotARealMessage")
+            mynet.Broadcast()
+            "#,
+        );
+
+        let diagnostics = file_diagnostics(&mut ws, file_id);
+        expect_that!(count_network_diagnostics(&diagnostics), eq(0usize));
+    }
+
+    /// Verifies that the Rust ingestion fixture exposes both payload directions.
+    /// The annotations repository separately validates its generated
+    /// `output/net.lua`, so shipped metadata is not tested through this copy.
+    #[gtest]
+    fn test_fixture_every_wire_format_has_a_write_and_a_read() {
+        let mut ws = new_gmod_workspace();
+        ws.def_file("lua/autorun/server/coverage.lua", "net.Start(\"X\")");
+
+        let coverage = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .wire_format_coverage();
+        assert_that!(coverage.is_empty(), eq(false));
+
+        let unpaired: Vec<String> = coverage
+            .iter()
+            .filter(|(_, (has_write, has_read))| !has_write || !has_read)
+            .map(|(format, (has_write, has_read))| {
+                format!("{format} (write={has_write}, read={has_read})")
+            })
+            .collect();
+        expect_that!(unpaired, eq(&Vec::<String>::new()));
+    }
+
+    #[gtest]
+    fn test_builtin_canonical_op_name_outranks_workspace_wrapper() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .add_library_workspace(ws.virtual_url_generator.new_path("annotations"));
+        ws.def_file("annotations/net.lua", crate::GMOD_CALL_ARG_BUILTINS_FIXTURE);
+        ws.def_file(
+            "lua/autorun/sh_custom_net.lua",
+            r#"
+            MyNet = MyNet or {}
+
+            ---@[net_payload("read", "string")]
+            function MyNet.ReadString() end
+            "#,
+        );
+        ws.def_file("lua/autorun/server/coverage.lua", "net.Start(\"X\")");
+
+        let canonical = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .canonical_op_name("string", NetOpDirection::Read);
+        expect_that!(canonical, eq(Some("net.ReadString")));
     }
 }

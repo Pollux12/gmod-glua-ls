@@ -1,8 +1,8 @@
 use std::collections::HashMap;
 
 use glua_code_analysis::{
-    FileId, GmodHookSiteMetadata, GmodRealm, LuaType, NetSendFlow, NetSendKind, SemanticModel,
-    find_best_direct_call_arg_role_from_type,
+    FileId, GmodHookSiteMetadata, GmodRealm, LuaType, NetOpDirection, NetSendFlow, SemanticModel,
+    find_best_direct_call_arg_role_from_type, type_is_net_read_op,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaCallArgList, LuaCallExpr, LuaComment, LuaCommentOwner, LuaDocTag,
@@ -13,6 +13,7 @@ use lsp_types::{
     Command, CompletionItem, CompletionTextEdit, InsertTextFormat, InsertTextMode, TextEdit,
 };
 use rowan::TextSize;
+use smol_str::SmolStr;
 
 use crate::handlers::completion::add_completions::CompletionTriggerStatus;
 use crate::handlers::completion::completion_builder::CompletionBuilder;
@@ -136,6 +137,21 @@ pub fn apply_staged_call_snippet(
     Some(())
 }
 
+/// True when `prefix_expr` resolves to a table exposing at least one function
+/// annotated as a net payload read.
+fn prefix_exposes_net_read_op(builder: &CompletionBuilder, prefix_expr: &LuaExpr) -> bool {
+    let Ok(prefix_type) = builder.semantic_model.infer_expr(prefix_expr.clone()) else {
+        return false;
+    };
+    let Some(members) = builder.semantic_model.get_member_infos(&prefix_type) else {
+        return false;
+    };
+    let db = builder.semantic_model.get_db();
+    members
+        .iter()
+        .any(|member| type_is_net_read_op(db, &member.typ))
+}
+
 fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
     let Some(trigger_parent) = builder.trigger_token.parent() else {
         return false;
@@ -153,10 +169,15 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return false;
     };
-    let LuaExpr::NameExpr(prefix_name_expr) = prefix_expr else {
+    let LuaExpr::NameExpr(_) = prefix_expr else {
         return false;
     };
-    if prefix_name_expr.get_name_text().as_deref() != Some("net") {
+    // The prefix must actually be a net read namespace. Checking only that it is
+    // a name would offer — and, since the whole index expression is replaced,
+    // silently overwrite — reads on any unrelated `something.R…` typed inside a
+    // receive callback. Resolving the members keeps this annotation-driven, so a
+    // `local n = net` alias or a custom read library qualifies just as `net` does.
+    if !prefix_exposes_net_read_op(builder, &prefix_expr) {
         return false;
     }
 
@@ -213,11 +234,14 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         .iter()
         .filter(|entry| entry.range.end() <= builder.position_offset)
         .count();
+    // Copied out (rather than kept as `&NetOpEntry`) so this data doesn't hold
+    // a live borrow into `builder.semantic_model`'s indexes across the
+    // completion-building loop below, which needs `&mut builder`.
     let current_read = receive_flow
         .reads
         .iter()
         .find(|entry| entry.range.contains(builder.position_offset))
-        .map(|entry| entry.kind);
+        .map(|entry| (entry.op.wire_format.clone(), entry.display_name.clone()));
 
     let receive_realm = infer_index.get_realm_at_offset(&file_id, builder.position_offset);
     let Some((send_file_id, send_flow)) = choose_preferred_send_flow(
@@ -230,15 +254,27 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
 
     let sender_realm =
         infer_index.get_realm_at_offset(&send_file_id, send_flow.start_range.start());
-    let remaining_expected_reads: Vec<_> = send_flow
+    // Only offer writes that have an annotated read counterpart; a write whose
+    // wire format has no registered read function can't produce a completion.
+    // `wire_format` is kept alongside the resolved read name (rather than
+    // re-deriving it later) so the mismatch/label logic below never needs to
+    // re-borrow `network_index` across the loop that follows.
+    let remaining_expected_reads: Vec<(SmolStr, SmolStr, String, Option<u32>, bool)> = send_flow
         .writes
         .iter()
         .skip(consumed_reads)
         .filter_map(|entry| {
-            entry
-                .kind
-                .to_read_counterpart()
-                .map(|read_kind| (entry.kind, read_kind, entry.bits))
+            network_index
+                .canonical_op(&entry.op.wire_format, NetOpDirection::Read)
+                .map(|read_op| {
+                    (
+                        entry.op.wire_format.clone(),
+                        entry.display_name.clone(),
+                        read_op.name.clone(),
+                        entry.bits,
+                        read_op.has_bits_param,
+                    )
+                })
         })
         .collect();
     if remaining_expected_reads.is_empty() {
@@ -253,13 +289,13 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         .completion
         .mismatch_hints
     {
-        if let Some(actual_kind) = current_read {
-            if let Some((_, expected_kind, _)) = remaining_expected_reads.first() {
-                if actual_kind != *expected_kind {
+        if let Some((actual_wire_format, actual_display_name)) = &current_read {
+            if let Some((expected_wire_format, _, expected_read_name, _, _)) =
+                remaining_expected_reads.first()
+            {
+                if actual_wire_format != expected_wire_format {
                     Some(format!(
-                        " [hint: current read is {}, expected {}]",
-                        actual_kind.to_fn_name(),
-                        expected_kind.to_fn_name()
+                        " [hint: current read is {actual_display_name}, expected {expected_read_name}]"
                     ))
                 } else {
                     None
@@ -274,12 +310,11 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
         None
     };
 
-    for (index, (write_kind, read_kind, write_bits)) in
+    for (index, (_, write_display_name, read_name, bits, has_bits_param)) in
         remaining_expected_reads.into_iter().enumerate()
     {
         let mut detail = format!(
-            "Expected read (matches {} in {} send)",
-            write_kind.to_fn_name(),
+            "Expected read (matches {write_display_name} in {} send)",
             realm_label(sender_realm)
         );
         if index == 0
@@ -288,43 +323,34 @@ fn add_net_read_completion_items(builder: &mut CompletionBuilder) -> bool {
             detail.push_str(marker);
         }
 
-        // For ReadUInt/ReadInt, fill in the bit-width literal automatically
-        // when the matching writer used a literal we can read. When unknown,
-        // leave a snippet placeholder so the user knows they must specify it.
-        let needs_bits = matches!(
-            read_kind,
-            glua_code_analysis::NetOpKind::ReadUInt | glua_code_analysis::NetOpKind::ReadInt
-        );
-        let (insert_text, insert_text_format) = if needs_bits {
-            match write_bits {
-                Some(bits) => (
-                    format!("{}({bits})", read_kind.to_fn_name()),
-                    Some(InsertTextFormat::PLAIN_TEXT),
-                ),
-                None => (
-                    format!("{}(${{1:bits}})", read_kind.to_fn_name()),
-                    Some(InsertTextFormat::SNIPPET),
-                ),
-            }
-        } else {
-            (
-                read_kind.to_fn_name().to_string(),
-                Some(InsertTextFormat::PLAIN_TEXT),
-            )
-        };
-        let kind = if needs_bits && write_bits.is_none() {
-            lsp_types::CompletionItemKind::SNIPPET
-        } else {
-            lsp_types::CompletionItemKind::FUNCTION
+        // Three cases, distinguished by annotation rather than by op name:
+        //  - op takes no bit count            -> plain call
+        //  - op takes one, writer used a literal -> fill it in
+        //  - op takes one, value not knowable -> snippet placeholder
+        // `bits` alone cannot separate the first two from the third, because it
+        // is `None` both when there is no bit parameter and when the writer
+        // passed a variable.
+        let (insert_text, is_snippet) = match (has_bits_param, bits) {
+            (true, Some(bits)) => (format!("{read_name}({bits})"), false),
+            (true, None) => (format!("{read_name}(${{1:bits}})"), true),
+            (false, _) => (read_name.clone(), false),
         };
 
         let _ = builder.add_completion_item(CompletionItem {
-            label: read_kind.to_fn_name().to_string(),
-            kind: Some(kind),
+            label: read_name,
+            kind: Some(if is_snippet {
+                lsp_types::CompletionItemKind::SNIPPET
+            } else {
+                lsp_types::CompletionItemKind::FUNCTION
+            }),
             detail: Some(detail),
             sort_text: Some(format!("000_gmod_net_read_{index:03}")),
             insert_text: Some(insert_text.clone()),
-            insert_text_format,
+            insert_text_format: Some(if is_snippet {
+                InsertTextFormat::SNIPPET
+            } else {
+                InsertTextFormat::PLAIN_TEXT
+            }),
             text_edit: Some(CompletionTextEdit::Edit(TextEdit {
                 range: replace_range.clone(),
                 new_text: insert_text,
@@ -349,7 +375,7 @@ fn choose_preferred_send_flow<'a>(
                 infer_index.get_realm_at_offset(send_file_id, flow.start_range.start());
             let realm_score = if matches!(receive_realm, GmodRealm::Client | GmodRealm::Server) {
                 let mut score = 0;
-                if expected_receiver_realm(flow.send_kind) == Some(receive_realm) {
+                if flow.send_kind.receiver_realm == receive_realm {
                     score += 4;
                 }
                 if opposite_realm(receive_realm).is_some_and(|realm| realm == sender_realm) {
@@ -367,17 +393,6 @@ fn choose_preferred_send_flow<'a>(
 
             (realm_score, flow.writes.len())
         })
-}
-
-fn expected_receiver_realm(send_kind: NetSendKind) -> Option<GmodRealm> {
-    match send_kind {
-        NetSendKind::Send
-        | NetSendKind::Broadcast
-        | NetSendKind::Omit
-        | NetSendKind::PAS
-        | NetSendKind::PVS => Some(GmodRealm::Client),
-        NetSendKind::SendToServer => Some(GmodRealm::Server),
-    }
 }
 
 fn opposite_realm(realm: GmodRealm) -> Option<GmodRealm> {

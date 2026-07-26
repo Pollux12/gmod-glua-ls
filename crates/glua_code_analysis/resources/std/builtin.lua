@@ -276,6 +276,32 @@
 --- should remain that type after the guard.
 ---@attribute valid_guard()
 
+--- Marks a function that terminates a net message and sends it, such as `net.Send` or
+--- `net.Broadcast`. Language server features use this to pair senders with receivers without
+--- matching the callable by name, so aliases and annotated replacement APIs are recognized too.
+---
+--- Parameters:
+--- - `receiver_realm`: Realm the payload arrives in. `net.Send`/`net.Broadcast` deliver to
+---   `client`; `net.SendToServer` delivers to `server`.
+---
+--- The recipient argument, when the function takes one, is marked separately with
+--- `call_arg("gmod.net_payload", "target")`.
+---@attribute net_send(receiver_realm: "client"|"server")
+
+--- Marks a function that writes a value into, or reads a value out of, the current net message.
+---
+--- Parameters:
+--- - `direction`: `write` for functions that append to the message, `read` for functions that
+---   consume from it.
+--- - `wire_format`: Identifier for the on-the-wire encoding, such as `string` or `uint`. A write
+---   pairs with a read when both declare the same `wire_format`. This is deliberately separate
+---   from the declared Lua type: `net.ReadInt`, `net.ReadUInt`, `net.ReadFloat` and
+---   `net.ReadDouble` all return `number`, so only the wire format can tell them apart.
+---
+--- A bit-width parameter, when the function takes one, is marked separately with
+--- `call_arg("gmod.net_payload", "bits")`.
+---@attribute net_payload(direction: "write"|"read", wire_format: string)
+
 ---
 --- Associates `getter` and `setter` methods with a field. Currently provides only definition navigation functionality,
 --- and the target methods must reside within the same class.

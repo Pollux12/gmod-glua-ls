@@ -19,9 +19,12 @@
 //! without duplicating literals, and without introducing broad per-call
 //! semantic inference or whole-workspace scans.
 
+use smol_str::SmolStr;
+
 use crate::{
     DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, LuaType, db_index::declaration::LuaDeclExtra,
+    LuaSignatureId, LuaType, NetOpDescriptor, NetOpDirection, NetSendKind,
+    db_index::declaration::LuaDeclExtra,
 };
 
 use super::signature::{LuaCallArgRole, LuaSignature, visit_call_arg_roles_from_type};
@@ -142,9 +145,30 @@ pub const GMOD_ATTR_VALID_GUARD: &str = "valid_guard";
 /// roots are not permitted by the metadata contract.
 pub const GMOD_ATTR_WRITES_GLOBAL: &str = "writes_global";
 
-/// Reserved for future net-payload markers: a signature carrying or consuming a
-/// typed net payload. Modeled as a signature-level standalone attribute.
+/// Net payload domain: signatures that write into or read out of the current net
+/// message, plus the call-arg roles those signatures expose.
 pub const GMOD_DOMAIN_NET_PAYLOAD: &str = "gmod.net_payload";
+
+/// Signature-level standalone attribute name for net send terminators.
+///
+/// Example: `---@[net_send("client")]` on `net.Broadcast` means the call ends the
+/// current message and delivers it to the client realm.
+pub const GMOD_ATTR_NET_SEND: &str = "net_send";
+
+/// Signature-level standalone attribute name for net payload write/read ops.
+///
+/// Example: `---@[net_payload("write", "string")]` on `net.WriteString`.
+pub const GMOD_ATTR_NET_PAYLOAD: &str = "net_payload";
+
+/// Recipient parameter of a net send terminator (e.g. `ply` in `net.Send(ply)`).
+pub const GMOD_ROLE_NET_TARGET: &str = "target";
+
+/// Bit-width parameter of a net payload op (e.g. `bitCount` in `net.WriteUInt`).
+pub const GMOD_ROLE_NET_BITS: &str = "bits";
+
+/// Receiver-callback parameter of a net receive registration (e.g. `callback` in
+/// `net.Receive(name, callback)`).
+pub const GMOD_ROLE_NET_CALLBACK: &str = "callback";
 
 /// All currently-active GMod call-arg domains, sorted for stable, deterministic
 /// iteration. Callers must never assume any domain-specific precedence from the
@@ -161,17 +185,15 @@ pub const GMOD_CALL_ARG_DOMAINS: &[&str] = &[
     GMOD_DOMAIN_HOOK,
     GMOD_DOMAIN_LOAD,
     GMOD_DOMAIN_NET_MESSAGE,
+    GMOD_DOMAIN_NET_PAYLOAD,
     GMOD_DOMAIN_NETWORK_VAR,
     GMOD_DOMAIN_TIMER,
     GMOD_DOMAIN_VGUI_PANEL,
 ];
 
 /// Phase 1 reserved signature-level metadata domains (no call-arg roles yet).
-pub const GMOD_SIGNATURE_METADATA_DOMAINS: &[&str] = &[
-    GMOD_DOMAIN_SELF_GUARD,
-    GMOD_DOMAIN_VALID_GUARD,
-    GMOD_DOMAIN_NET_PAYLOAD,
-];
+pub const GMOD_SIGNATURE_METADATA_DOMAINS: &[&str] =
+    &[GMOD_DOMAIN_SELF_GUARD, GMOD_DOMAIN_VALID_GUARD];
 
 // ---------------------------------------------------------------------------
 // Call-arg role selection helpers.
@@ -374,6 +396,129 @@ pub fn signature_is_valid_guard_in_realm(
     db.get_signature_index()
         .effective_valid_guard_signature_mask(&signature_id)
         .is_some_and(|guard_mask| guard_mask.is_compatible_with(call_realm.state_mask()))
+}
+
+/// Reads the `net_send` standalone attribute off a signature, if present.
+///
+/// The recipient parameter index is resolved separately through the
+/// `gmod.net_payload`/`target` call-arg role, so a terminator with no recipient
+/// (e.g. `net.Broadcast`) yields `target_arg_idx: None` without needing a
+/// distinct attribute form.
+pub fn signature_net_send(db: &DbIndex, signature_id: LuaSignatureId) -> Option<NetSendKind> {
+    let attribute_use = find_signature_attribute_use(db, signature_id, GMOD_ATTR_NET_SEND)?;
+    let realm_text = attribute_positional_or_named(attribute_use, "receiver_realm", 0)?;
+    let receiver_realm = match realm_text.as_str() {
+        "client" => GmodRealm::Client,
+        "server" => GmodRealm::Server,
+        _ => return None,
+    };
+
+    let signature = db.get_signature_index().get(&signature_id)?;
+    Some(NetSendKind {
+        receiver_realm,
+        target_arg_idx: find_param_idx_with_role(
+            signature,
+            GMOD_DOMAIN_NET_PAYLOAD,
+            GMOD_ROLE_NET_TARGET,
+        ),
+    })
+}
+
+/// Reads the `net_payload` standalone attribute off a signature, if present.
+pub fn signature_net_payload(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+) -> Option<NetOpDescriptor> {
+    let attribute_use = find_signature_attribute_use(db, signature_id, GMOD_ATTR_NET_PAYLOAD)?;
+    let direction_text = attribute_positional_or_named(attribute_use, "direction", 0)?;
+    let direction = NetOpDirection::from_attribute_value(&direction_text)?;
+    let wire_format = attribute_positional_or_named(attribute_use, "wire_format", 1)?;
+    if wire_format.is_empty() {
+        return None;
+    }
+
+    Some(NetOpDescriptor {
+        wire_format: SmolStr::new(wire_format),
+        direction,
+    })
+}
+
+/// True when a signature is an annotated net *operation*: a send terminator, a
+/// payload write/read, or a message start.
+///
+/// Excludes receive registrations. A receive carries net metadata but acts on no
+/// message of its own, and editor features that list the operations in a message
+/// render it through its own path.
+pub fn signature_has_net_op_metadata(db: &DbIndex, signature_id: LuaSignatureId) -> bool {
+    signature_net_send(db, signature_id).is_some()
+        || signature_net_payload(db, signature_id).is_some()
+        || signature_has_net_message_role(db, signature_id, &["start"])
+}
+
+fn signature_has_net_message_role(
+    db: &DbIndex,
+    signature_id: LuaSignatureId,
+    roles: &[&str],
+) -> bool {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+    (0..signature.params.len()).any(|param_idx| {
+        find_best_call_arg_role_for_param(signature, param_idx, GMOD_DOMAIN_NET_MESSAGE, roles)
+            .is_some()
+    })
+}
+
+/// True when `typ` is a function annotated as a net payload read.
+///
+/// Lets an editor feature test a *member* for readiness without a call
+/// expression — used to decide whether an index prefix is a net read namespace
+/// before offering read completions on it.
+pub fn type_is_net_read_op(db: &DbIndex, typ: &LuaType) -> bool {
+    let LuaType::Signature(signature_id) = typ else {
+        return false;
+    };
+    signature_net_payload(db, *signature_id).is_some_and(|descriptor| descriptor.is_read())
+}
+
+/// Index of the bit-width parameter of a net payload op, when one is annotated.
+/// Replaces the old per-op-kind hardcoded argument index.
+pub fn signature_net_bits_param_idx(db: &DbIndex, signature_id: LuaSignatureId) -> Option<usize> {
+    let signature = db.get_signature_index().get(&signature_id)?;
+    find_param_idx_with_role(signature, GMOD_DOMAIN_NET_PAYLOAD, GMOD_ROLE_NET_BITS)
+}
+
+/// Index of the receiver-callback parameter of a net receive registration, when
+/// one is annotated. Lets a wrapper place its callback anywhere in the parameter
+/// list rather than assuming `net.Receive`'s own second slot.
+///
+/// Takes the signature rather than an id because the net call resolver already
+/// holds one, and would otherwise pay for a second index lookup per call.
+pub fn signature_net_callback_param_idx(signature: &LuaSignature) -> Option<usize> {
+    find_param_idx_with_role(signature, GMOD_DOMAIN_NET_MESSAGE, GMOD_ROLE_NET_CALLBACK)
+}
+
+/// Finds the first parameter carrying `role` within `domain`.
+fn find_param_idx_with_role(signature: &LuaSignature, domain: &str, role: &str) -> Option<usize> {
+    (0..signature.params.len()).find(|param_idx| {
+        find_best_call_arg_role_for_param(signature, *param_idx, domain, &[role]).is_some()
+    })
+}
+
+/// Reads an attribute argument by name, falling back to its positional slot so
+/// annotations can be written either way.
+fn attribute_positional_or_named(
+    attribute_use: &crate::LuaAttributeUse,
+    name: &str,
+    position: usize,
+) -> Option<String> {
+    if let Some(value) = attribute_string_param(attribute_use, name) {
+        return Some(value);
+    }
+    match attribute_use.args.get(position)?.1.as_ref()? {
+        LuaType::DocStringConst(value) | LuaType::StringConst(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 pub fn signature_writes_global_roots(

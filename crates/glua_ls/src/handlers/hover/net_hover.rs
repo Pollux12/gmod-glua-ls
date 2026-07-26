@@ -2,7 +2,7 @@ use std::{cmp::Reverse, collections::HashMap};
 
 use crate::handlers::gmod_string_context::is_net_message_string_context;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, FileId, NetFlowKind, NetOpEntry, NetOpKind, NetReceiveFlow, NetSendFlow,
+    EmmyLuaAnalysis, FileId, NetFlowKind, NetOpDescriptor, NetOpEntry, NetReceiveFlow, NetSendFlow,
     SemanticModel,
 };
 use glua_parser::{
@@ -11,6 +11,7 @@ use glua_parser::{
 };
 use lsp_types::{Hover, HoverContents, MarkupContent, MarkupKind};
 use rowan::TextRange;
+use smol_str::SmolStr;
 
 pub fn hover_gmod_net_message_string(
     analysis: &EmmyLuaAnalysis,
@@ -207,10 +208,6 @@ fn render_pattern_block(direction: OpDirection, pattern: &[PatternEntry]) -> Str
     if pattern.is_empty() {
         return "_no payload_".to_string();
     }
-    let prefix = match direction {
-        OpDirection::Write => "Write",
-        OpDirection::Read => "Read",
-    };
 
     let mut planned: Vec<PlannedRow> = Vec::new();
     // open_stack tracks ALL currently-open frames (loops + conditionals)
@@ -274,7 +271,7 @@ fn render_pattern_block(direction: OpDirection, pattern: &[PatternEntry]) -> Str
             depth,
             path: path_nums,
             conditional,
-            call: render_call(prefix, entry, direction),
+            call: render_call(entry, direction),
         });
         counters[loop_depth] += 1;
     }
@@ -408,14 +405,16 @@ fn render_frame_header(frame: &PatternFlowFrame) -> String {
     }
 }
 
-fn render_call(prefix: &str, entry: &PatternEntry, direction: OpDirection) -> String {
-    let base = format!("net.{prefix}{}", entry.kind.type_name());
+fn render_call(entry: &PatternEntry, direction: OpDirection) -> String {
+    // Use the function actually called (e.g. "net.WriteString") rather than a
+    // synthesized name, so hover shows what the developer wrote.
+    let base = entry.display_name.as_str();
     let is_read = matches!(direction, OpDirection::Read);
     match (is_read, entry.sample_value.as_deref(), entry.bits) {
         (false, Some(value), Some(bits)) => format!("{base}({value}, {bits})"),
         (false, Some(value), None) => format!("{base}({value})"),
         (_, _, Some(bits)) => format!("{base}({bits})"),
-        _ => base,
+        _ => base.to_string(),
     }
 }
 
@@ -476,7 +475,13 @@ struct PatternGroup {
 
 #[derive(Clone)]
 struct PatternEntry {
-    kind: NetOpKind,
+    op: NetOpDescriptor,
+    /// Source path of the function actually called (e.g. `net.WriteString`),
+    /// carried over from `NetOpEntry::display_name` for use in `render_call`.
+    /// NOT part of pattern identity: two call sites with the same wire format
+    /// and direction are the same payload pattern even if a wrapper renamed
+    /// the call at one of the sites.
+    display_name: SmolStr,
     dynamic: bool,
     /// Static bit-width literal for `WriteUInt`/`WriteInt`/`ReadUInt`/`ReadInt`.
     /// Part of pattern identity (see `PartialEq`/`Hash` impls below) so two
@@ -505,7 +510,7 @@ struct PatternFlowFrame {
 
 impl PartialEq for PatternEntry {
     fn eq(&self, other: &Self) -> bool {
-        self.kind == other.kind
+        self.op == other.op
             && self.dynamic == other.dynamic
             && self.bits == other.bits
             && self.flow_path == other.flow_path
@@ -516,7 +521,7 @@ impl Eq for PatternEntry {}
 
 impl std::hash::Hash for PatternEntry {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
-        self.kind.hash(state);
+        self.op.hash(state);
         self.dynamic.hash(state);
         self.bits.hash(state);
         self.flow_path.hash(state);
@@ -548,7 +553,8 @@ fn pattern_from_ops(ops: &[NetOpEntry]) -> Vec<PatternEntry> {
                 })
                 .collect();
             PatternEntry {
-                kind: op.kind,
+                op: op.op.clone(),
+                display_name: op.display_name.clone(),
                 dynamic: op.dynamic,
                 bits: op.bits,
                 sample_value: op.value_text.clone(),
@@ -609,17 +615,4 @@ fn short_path_label(path: &str) -> String {
         return normalized[idx + 1..].to_string();
     }
     normalized
-}
-
-trait NetOpKindExt {
-    fn type_name(&self) -> &'static str;
-}
-
-impl NetOpKindExt for NetOpKind {
-    fn type_name(&self) -> &'static str {
-        let n = self.to_fn_name();
-        n.strip_prefix("net.Write")
-            .or_else(|| n.strip_prefix("net.Read"))
-            .unwrap_or(n)
-    }
 }
