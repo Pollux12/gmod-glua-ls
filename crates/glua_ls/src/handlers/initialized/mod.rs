@@ -367,6 +367,7 @@ pub async fn init_analysis(
     } else {
         Vec::new()
     };
+    let library_collisions = mut_analysis.library_definition_collisions();
 
     file_diagnostic.invalidate_shared_diagnostic_data();
     drop(mut_analysis);
@@ -378,6 +379,21 @@ pub async fn init_analysis(
         watchdog_status.describe(),
     );
     log::info!("workspace index ready");
+
+    for collision in &library_collisions {
+        log::warn!("{}", collision.warning_message());
+    }
+    if !library_collisions.is_empty() {
+        client.show_message(ShowMessageParams {
+            typ: MessageType::WARNING,
+            message: format!(
+                "GLuaLS found overlapping definitions in {} library-root pair(s). Earlier \
+                 workspace.library entries take precedence. See the GLuaLS output log for roots \
+                 and examples.",
+                library_collisions.len()
+            ),
+        });
+    }
 
     if !schema_urls.is_empty() {
         watchdog_status.set_progress("Fetching JSON schemas", 0, schema_urls.len());

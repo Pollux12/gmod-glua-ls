@@ -60,6 +60,9 @@ pub async fn run_check(cmd_args: CmdArgs) -> Result<(), Box<dyn Error + Sync + S
             return Err("Failed to load workspace".into());
         }
     };
+    for collision in analysis.library_definition_collisions() {
+        log::warn!("{}", collision.warning_message());
+    }
 
     let db = analysis.compilation.get_db();
     let ignore_dirs: Vec<PathBuf> = analysis

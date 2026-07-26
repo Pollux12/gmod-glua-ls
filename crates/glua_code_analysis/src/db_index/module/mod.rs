@@ -11,6 +11,7 @@ pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
 use rowan::TextSize;
+pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
@@ -725,6 +726,50 @@ impl LuaModuleIndex {
                 WorkspaceKind::Main => None,
             },
         }
+    }
+
+    /// Extends the broad workspace-kind priority with configured library order.
+    ///
+    /// For colliding definitions, earlier `workspace.library` entries are
+    /// authoritative. The workspace ID is only a stable final fallback.
+    pub(crate) fn workspace_resolution_key(
+        &self,
+        current_workspace_id: WorkspaceId,
+        candidate_workspace_id: WorkspaceId,
+    ) -> Option<WorkspaceResolutionKey> {
+        let tier =
+            self.workspace_resolution_priority(current_workspace_id, candidate_workspace_id)?;
+        let candidate_kind = self.get_workspace_kind(candidate_workspace_id);
+        let library_order = if candidate_kind == WorkspaceKind::Library {
+            self.workspace_registration_order(candidate_workspace_id)
+                .unwrap_or(usize::MAX)
+        } else {
+            0
+        };
+        let stable_workspace_id = if candidate_kind == WorkspaceKind::Library {
+            candidate_workspace_id
+        } else {
+            WorkspaceId { id: 0 }
+        };
+
+        Some(WorkspaceResolutionKey::new(
+            tier,
+            library_order,
+            stable_workspace_id,
+        ))
+    }
+
+    pub(crate) fn workspace_registration_order(&self, workspace_id: WorkspaceId) -> Option<usize> {
+        self.workspaces
+            .iter()
+            .position(|workspace| workspace.id == workspace_id)
+    }
+
+    pub(crate) fn get_workspace_root(&self, workspace_id: WorkspaceId) -> Option<&Path> {
+        self.workspaces
+            .iter()
+            .find(|workspace| workspace.id == workspace_id)
+            .map(|workspace| workspace.root.as_path())
     }
 
     pub fn extract_module_path(&self, path: &str) -> Option<(String, WorkspaceId)> {
