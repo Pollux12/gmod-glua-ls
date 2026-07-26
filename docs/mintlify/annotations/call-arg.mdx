@@ -11,6 +11,10 @@ Most addons do not need this annotation. The official annotations already apply 
 
 Only add it when the wrapper has the same behavior as the API it represents.
 
+<Note>
+Wrappers that call the standard GMod network functions are detected automatically. You do not need `@call_arg` for normal `net.Start`, `net.Receive`, read, write, or send wrappers.
+</Note>
+
 ---
 
 ## Syntax
@@ -23,16 +27,14 @@ Only add it when the wrapper has the same behavior as the API it represents.
 Put `@call_arg` directly above the `@param` it describes.
 
 ```lua
----@[call_arg("gmod.net_message", "start")]
----@param messageName string
----@param ply Player
-local function StartMessage(messageName, ply)
-    net.Start(messageName)
-    net.Send(ply)
+---@[call_arg("gmod.load", "include")]
+---@param path string
+local function LoadShared(path)
+    include(path)
 end
 ```
 
-After this, `StartMessage("...")` gets net message completion, hover, and navigation like `net.Start("...")`.
+After this, GLuaLS treats the `path` argument as a file loaded by `include`.
 
 For overloaded signatures, use `@overload_call_arg` directly above the `@overload` it describes:
 
@@ -56,7 +58,7 @@ The first argument is the zero-based parameter index inside that overload.
 
 | Domain | Roles | Used for |
 |---|---|---|
-| `gmod.net_message` | `define`, `start`, `receive`, `callback`, `reference` | Net message definitions, sends, receives, callbacks, and name lookups |
+| `gmod.net_message` | `define`, `start`, `receive`, `callback`, `reference` | Replacement network APIs or declarations provided without source code |
 | `gmod.hook` | `add`, `emit`, `callback`, `gamemode_table`, `remove`, `reference` | Hook registration, hook calls, callback inference, and hook name lookup |
 | `gmod.concommand` | `define`, `callback` | Console command registration and callback tracking |
 | `gmod.convar` | `define`, `define_server`, `define_client` | Server and client ConVar registration |

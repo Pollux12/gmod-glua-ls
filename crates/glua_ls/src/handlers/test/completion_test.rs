@@ -2889,6 +2889,122 @@ mod tests {
     }
 
     #[gtest]
+    fn test_gmod_net_read_completion_rejects_unrelated_named_prefix() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteString("hello")
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local config = {}
+            net.Receive("MyMsg", function()
+                local x = config.R<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.sort_text
+                    .as_deref()
+                    .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(false)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_accepts_net_table_alias() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            net.WriteString("hello")
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            local n = net
+            net.Receive("MyMsg", function()
+                local x = n.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+
+        verify_that!(
+            items.iter().any(|item| {
+                item.label == "net.ReadString"
+                    && item
+                        .sort_text
+                        .as_deref()
+                        .is_some_and(|sort_text| sort_text.starts_with("000_gmod_net_read"))
+            }),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_gmod_net_read_completion_uses_snippet_kind_for_unknown_bits() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -2953,6 +3069,88 @@ mod tests {
             eq(Some("net.ReadUInt(${1:bits})"))
         )?;
         verify_that!(item.insert_text_format, eq(Some(InsertTextFormat::SNIPPET)))?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_net_read_completion_uses_reader_bits_metadata() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.network.completion.smart_read_suggestions = true;
+        ws.analysis.update_config(emmyrc.into());
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def_file(
+            "addons/test/lua/autorun/sh_custom_net.lua",
+            r#"
+            MyNet = MyNet or {}
+
+            ---@param value number
+            ---@[call_arg("gmod.net_payload", "bits")]
+            ---@param bits number
+            ---@[net_payload("write", "asymmetric")]
+            function MyNet.WriteAsymmetric(value, bits) end
+
+            ---@[net_payload("read", "asymmetric")]
+            function MyNet.ReadAsymmetric() end
+            "#,
+        );
+        ws.def_file(
+            "addons/test/lua/autorun/server/send.lua",
+            r#"
+            net.Start("MyMsg")
+            MyNet.WriteAsymmetric(1, 8)
+            net.Broadcast()
+            "#,
+        );
+
+        let (receive_content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+            net.Receive("MyMsg", function()
+                local value = MyNet.<??>
+            end)
+            "#,
+        )?;
+        let file_id = ws.def_file(
+            "addons/test/lua/autorun/client/receive.lua",
+            receive_content.as_str(),
+        );
+
+        let result = completion(
+            &ws.analysis,
+            file_id,
+            position,
+            CompletionTriggerKind::INVOKED,
+            CancellationToken::new(),
+        )
+        .ok_or("failed to get completion")
+        .or_fail()?;
+        let items = match result {
+            CompletionResponse::Array(items) => items,
+            CompletionResponse::List(list) => list.items,
+        };
+        let item = items
+            .iter()
+            .find(|item| item.label == "MyNet.ReadAsymmetric")
+            .ok_or("missing MyNet.ReadAsymmetric completion")
+            .or_fail()?;
+        let text_edit = item
+            .text_edit
+            .as_ref()
+            .ok_or("missing MyNet.ReadAsymmetric text edit")
+            .or_fail()?;
+        let lsp_types::CompletionTextEdit::Edit(text_edit) = text_edit else {
+            return fail!("expected text edit for MyNet.ReadAsymmetric completion");
+        };
+
+        verify_eq!(item.kind, Some(CompletionItemKind::FUNCTION))?;
+        verify_that!(text_edit.new_text.as_str(), eq("MyNet.ReadAsymmetric"))?;
+        verify_that!(
+            item.insert_text_format,
+            eq(Some(InsertTextFormat::PLAIN_TEXT))
+        )?;
 
         Ok(())
     }

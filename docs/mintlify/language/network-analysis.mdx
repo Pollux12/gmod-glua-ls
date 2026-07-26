@@ -71,6 +71,42 @@ If both sides use compatible loops or branches, they are matched as the same pay
 
 ---
 
+## Aliases and wrappers
+
+Aliases and wrappers around the standard GMod network functions work automatically. You do not need to add annotations to them.
+
+For example, you can use local aliases:
+
+```lua
+local netStart = net.Start
+local netSend  = net.Broadcast
+
+netStart("MyMessage")
+net.WriteString("hello")
+netSend()
+```
+
+You can also put a complete network message in a helper function:
+
+```lua
+function MyLib.SendGreeting(messageName, greeting)
+    net.Start(messageName)
+    net.WriteString(greeting)
+    net.SendToServer()
+end
+
+local sendGreeting = MyLib.SendGreeting
+sendGreeting("Greeting", "hello")
+```
+
+GLuaLS also supports read and write helpers, receive helpers, and helpers that split `net.Start` from the final send call.
+
+<Note>
+If your library replaces the GMod network API instead of calling `net.*`, use [`@call_arg`](/annotations/call-arg) for message names and receive callbacks, `net_send` for send functions, and `net_payload` for read and write functions. Normal wrappers do not need these attributes.
+</Note>
+
+---
+
 ## Diagnostic codes
 
 | Code | Description |

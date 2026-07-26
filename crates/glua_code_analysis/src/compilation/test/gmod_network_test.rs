@@ -1,20 +1,32 @@
 #[cfg(test)]
 mod test {
-    use crate::{Emmyrc, NetOpKind, NetReceiveFlow, NetSendFlow, NetSendKind, VirtualWorkspace};
+    use crate::{Emmyrc, GmodRealm, NetReceiveFlow, NetSendFlow, VirtualWorkspace};
     use googletest::prelude::*;
 
     fn set_gmod_enabled(ws: &mut VirtualWorkspace) {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        // Net ops are recognized through signature metadata, so the annotated
+        // builtins must be present or no flows are collected at all.
+        ws.def_gmod_call_arg_builtins();
     }
 
-    fn send_op_kinds(flow: &NetSendFlow) -> Vec<NetOpKind> {
-        flow.writes.iter().map(|entry| entry.kind).collect()
+    /// Ops are identified by their annotated wire format now, not by a closed
+    /// enum, so assertions compare the wire format strings. Direction is implied
+    /// by which side of the flow the op came from.
+    fn send_op_kinds(flow: &NetSendFlow) -> Vec<String> {
+        flow.writes
+            .iter()
+            .map(|entry| entry.op.wire_format.to_string())
+            .collect()
     }
 
-    fn receive_op_kinds(flow: &NetReceiveFlow) -> Vec<NetOpKind> {
-        flow.reads.iter().map(|entry| entry.kind).collect()
+    fn receive_op_kinds(flow: &NetReceiveFlow) -> Vec<String> {
+        flow.reads
+            .iter()
+            .map(|entry| entry.op.wire_format.to_string())
+            .collect()
     }
 
     #[gtest]
@@ -44,14 +56,16 @@ mod test {
 
         let flow = &data.send_flows[0];
         assert_that!(flow.message_name.as_str(), eq("MyMessage"));
-        assert_that!(flow.send_kind, eq(NetSendKind::Broadcast));
+        assert_that!(flow.send_kind.receiver_realm, eq(GmodRealm::Client));
+        assert_that!(flow.send_kind.target_arg_idx, none());
+        assert_that!(flow.send_display_name.as_str(), eq("net.Broadcast"));
         assert_that!(flow.is_wrapped, eq(false));
         assert_that!(
             send_op_kinds(flow),
             eq(&vec![
-                NetOpKind::WriteEntity,
-                NetOpKind::WriteString,
-                NetOpKind::WriteInt,
+                "entity".to_string(),
+                "string".to_string(),
+                "int".to_string(),
             ])
         );
     }
@@ -86,9 +100,9 @@ mod test {
         assert_that!(
             receive_op_kinds(flow),
             eq(&vec![
-                NetOpKind::ReadEntity,
-                NetOpKind::ReadString,
-                NetOpKind::ReadInt,
+                "entity".to_string(),
+                "string".to_string(),
+                "int".to_string(),
             ])
         );
     }
@@ -123,15 +137,17 @@ mod test {
 
         let flow_a = &data.send_flows[0];
         assert_that!(flow_a.message_name.as_str(), eq("MsgA"));
-        assert_that!(flow_a.send_kind, eq(NetSendKind::Send));
-        assert_that!(send_op_kinds(flow_a), eq(&vec![NetOpKind::WriteString]));
+        assert_that!(flow_a.send_kind.receiver_realm, eq(GmodRealm::Client));
+        assert_that!(flow_a.send_display_name.as_str(), eq("net.Send"));
+        assert_that!(send_op_kinds(flow_a), eq(&vec!["string".to_string()]));
 
         let flow_b = &data.send_flows[1];
         assert_that!(flow_b.message_name.as_str(), eq("MsgB"));
-        assert_that!(flow_b.send_kind, eq(NetSendKind::SendToServer));
+        assert_that!(flow_b.send_kind.receiver_realm, eq(GmodRealm::Server));
+        assert_that!(flow_b.send_display_name.as_str(), eq("net.SendToServer"));
         assert_that!(
             send_op_kinds(flow_b),
-            eq(&vec![NetOpKind::WriteBool, NetOpKind::WriteFloat])
+            eq(&vec!["bool".to_string(), "float".to_string()])
         );
     }
 
@@ -172,15 +188,34 @@ mod test {
             .expect("expected network data");
 
         assert_that!(data.send_flows.len(), eq(5usize));
-        let kinds: Vec<NetSendKind> = data.send_flows.iter().map(|f| f.send_kind).collect();
+        let names: Vec<String> = data
+            .send_flows
+            .iter()
+            .map(|f| f.send_display_name.to_string())
+            .collect();
         assert_that!(
-            kinds,
+            names,
             eq(&vec![
-                NetSendKind::Omit,
-                NetSendKind::PAS,
-                NetSendKind::PVS,
-                NetSendKind::Broadcast,
-                NetSendKind::SendToServer,
+                "net.SendOmit".to_string(),
+                "net.SendPAS".to_string(),
+                "net.SendPVS".to_string(),
+                "net.Broadcast".to_string(),
+                "net.SendToServer".to_string(),
+            ])
+        );
+        let realms: Vec<GmodRealm> = data
+            .send_flows
+            .iter()
+            .map(|f| f.send_kind.receiver_realm)
+            .collect();
+        assert_that!(
+            realms,
+            eq(&vec![
+                GmodRealm::Client,
+                GmodRealm::Client,
+                GmodRealm::Client,
+                GmodRealm::Client,
+                GmodRealm::Server,
             ])
         );
     }
@@ -217,10 +252,10 @@ mod test {
         assert_that!(
             send_op_kinds(flow),
             eq(&vec![
-                NetOpKind::WriteUInt,
-                NetOpKind::WriteString,
-                NetOpKind::WriteString,
-                NetOpKind::WriteBool,
+                "uint".to_string(),
+                "string".to_string(),
+                "string".to_string(),
+                "bool".to_string(),
             ])
         );
     }
@@ -251,7 +286,7 @@ mod test {
         assert_that!(data.receive_flows.len(), eq(1usize));
         let flow = &data.receive_flows[0];
         assert_that!(flow.message_name.as_str(), eq("Clean"));
-        assert_that!(receive_op_kinds(flow), eq(&vec![NetOpKind::ReadInt]));
+        assert_that!(receive_op_kinds(flow), eq(&vec!["int".to_string()]));
     }
 
     #[gtest]
@@ -272,11 +307,11 @@ mod test {
         let data = ws
             .get_db_mut()
             .get_gmod_network_index()
-            .get_file_data(file_id)
-            .expect("expected network data");
+            .get_file_data(file_id);
 
-        assert_that!(data.send_flows.len(), eq(0usize));
-        expect_that!(data.receive_flows.len(), eq(0usize));
+        assert!(
+            data.is_none_or(|data| { data.send_flows.is_empty() && data.receive_flows.is_empty() })
+        );
     }
 
     #[gtest]
@@ -295,11 +330,11 @@ mod test {
         let data = ws
             .get_db_mut()
             .get_gmod_network_index()
-            .get_file_data(file_id)
-            .expect("expected network data");
+            .get_file_data(file_id);
 
-        assert_that!(data.send_flows.len(), eq(0usize));
-        expect_that!(data.receive_flows.len(), eq(0usize));
+        assert!(
+            data.is_none_or(|data| { data.send_flows.is_empty() && data.receive_flows.is_empty() })
+        );
     }
 
     #[gtest]
@@ -335,7 +370,9 @@ mod test {
         assert_that!(wrapped_flows.len(), ge(1usize));
         let wrapped_flow = wrapped_flows[0];
         assert_that!(wrapped_flow.writes.len(), eq(0usize));
-        assert_that!(wrapped_flow.send_kind, eq(NetSendKind::Broadcast));
+        // Wrapped stubs record a placeholder realm; only counterpart presence
+        // is meaningful for them, so assert the flag rather than the realm.
+        assert_that!(wrapped_flow.is_wrapped, eq(true));
         assert_that!(wrapped_flow.send_range, eq(wrapped_flow.start_range));
     }
 }

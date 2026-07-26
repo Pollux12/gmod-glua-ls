@@ -3,8 +3,8 @@ use std::sync::Arc;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    DiagnosticCode, FileId, GmodRealm, NetOpKind, NetReceiveFlow, NetSendFlow, SemanticModel,
-    expected_receiver_realm, flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
+    DiagnosticCode, FileId, GmodRealm, NetOpEntry, NetReceiveFlow, NetSendFlow, SemanticModel,
+    flows_can_match, is_opposite_strict_realm_pair, is_strict_realm,
 };
 
 use super::{Checker, DiagnosticContext};
@@ -45,6 +45,7 @@ impl Checker for GmodNetworkChecker {
             file_id,
             file_data.receive_flows.as_slice(),
             &sorted_send_flows,
+            network_index,
             infer_index,
         );
 
@@ -78,6 +79,7 @@ fn check_read_write_mismatch(
     file_id: crate::FileId,
     receive_flows: &[NetReceiveFlow],
     sorted_send_flows: &SortedSendFlowCache,
+    network_index: &crate::GmodNetworkIndex,
     infer_index: &crate::GmodInferIndex,
 ) {
     for receive_flow in receive_flows {
@@ -109,11 +111,7 @@ fn check_read_write_mismatch(
                 continue;
             }
 
-            let Some(expected_receive_realm) = expected_receiver_realm(send_flow.send_kind) else {
-                continue;
-            };
-
-            if receive_realm != expected_receive_realm {
+            if receive_realm != send_flow.send_kind.receiver_realm {
                 continue;
             }
 
@@ -128,7 +126,7 @@ fn check_read_write_mismatch(
                 break;
             }
 
-            let (code, range, message) = first_mismatch_diagnostic(send_flow, receive_flow)
+            let (code, range, message) = first_mismatch_diagnostic(network_index, send_flow, receive_flow)
                 .unwrap_or_else(|| {
                     (
                         DiagnosticCode::GmodNetReadWriteOrderMismatch,
@@ -243,8 +241,9 @@ fn matching_prefix_len(send_flow: &NetSendFlow, receive_flow: &NetReceiveFlow) -
     let compared_len = send_flow.writes.len().min(receive_flow.reads.len());
 
     while matched < compared_len {
-        if send_flow.writes[matched].kind.to_read_counterpart()
-            != Some(receive_flow.reads[matched].kind)
+        if !send_flow.writes[matched]
+            .op
+            .pairs_with(&receive_flow.reads[matched].op)
         {
             break;
         }
@@ -263,14 +262,15 @@ fn check_missing_send_counterpart(
     infer_index: &crate::GmodInferIndex,
 ) {
     for send_flow in send_flows {
+        if network_index.is_replaced_definition(file_id, send_flow) {
+            continue;
+        }
         let sender_realm = infer_index.get_realm_at_offset(&file_id, send_flow.start_range.start());
         if !is_strict_realm(sender_realm) {
             continue;
         }
 
-        let Some(expected_realm) = expected_receiver_realm(send_flow.send_kind) else {
-            continue;
-        };
+        let expected_realm = send_flow.send_kind.receiver_realm;
 
         let has_counterpart = network_index
             .get_receive_flows_for_message(&send_flow.message_name)
@@ -335,7 +335,18 @@ fn check_missing_receive_counterpart(
     }
 }
 
+/// Name to show for the read a write expects. Prefers the canonical annotated
+/// read for that wire format; falls back to naming the wire format itself when
+/// no read is annotated for it, which is more useful than naming the write.
+fn expected_read_label(network_index: &crate::GmodNetworkIndex, write: &NetOpEntry) -> String {
+    network_index
+        .counterpart_read_name(&write.op)
+        .map(str::to_string)
+        .unwrap_or_else(|| format!("<{} read>", write.op.wire_format))
+}
+
 fn first_mismatch_diagnostic(
+    network_index: &crate::GmodNetworkIndex,
     send_flow: &NetSendFlow,
     receive_flow: &NetReceiveFlow,
 ) -> Option<(DiagnosticCode, rowan::TextRange, String)> {
@@ -363,16 +374,16 @@ fn first_mismatch_diagnostic(
 
     let compared_len = send_flow.writes.len().min(receive_flow.reads.len());
     for index in 0..compared_len {
-        let Some(expected_read_kind) = send_flow.writes[index].kind.to_read_counterpart() else {
-            continue;
-        };
-
-        let actual_read_kind = receive_flow.reads[index].kind;
-        if expected_read_kind == actual_read_kind {
+        let write = &send_flow.writes[index];
+        let read = &receive_flow.reads[index];
+        if write.op.pairs_with(&read.op) {
             continue;
         }
 
-        if is_mispositioned_read(send_flow, index, actual_read_kind) {
+        let expected = expected_read_label(network_index, write);
+        let actual = read.display_name.as_str();
+
+        if is_mispositioned_read(send_flow, index, read) {
             return Some((
                 DiagnosticCode::GmodNetReadWriteOrderMismatch,
                 receive_flow.receive_range,
@@ -380,8 +391,6 @@ fn first_mismatch_diagnostic(
                     "Read/write order mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                     name = receive_flow.message_name,
                     position = index + 1,
-                    expected = expected_read_kind.to_fn_name(),
-                    actual = actual_read_kind.to_fn_name(),
                 )
                 .to_string(),
             ));
@@ -394,8 +403,6 @@ fn first_mismatch_diagnostic(
                 "Read/write type mismatch for `{name}` at position {position}: expected `{expected}`, got `{actual}`.",
                 name = receive_flow.message_name,
                 position = index + 1,
-                expected = expected_read_kind.to_fn_name(),
-                actual = actual_read_kind.to_fn_name(),
             )
             .to_string(),
         ));
@@ -404,14 +411,18 @@ fn first_mismatch_diagnostic(
     None
 }
 
+/// True when the read at `current_index` would have paired with a write at some
+/// other position — i.e. the values are right but the order is wrong.
 fn is_mispositioned_read(
     send_flow: &NetSendFlow,
     current_index: usize,
-    actual_read_kind: NetOpKind,
+    actual_read: &NetOpEntry,
 ) -> bool {
-    send_flow.writes.iter().enumerate().any(|(index, write)| {
-        index != current_index && write.kind.to_read_counterpart() == Some(actual_read_kind)
-    })
+    send_flow
+        .writes
+        .iter()
+        .enumerate()
+        .any(|(index, write)| index != current_index && write.op.pairs_with(&actual_read.op))
 }
 
 fn opposite_realm(realm: GmodRealm) -> Option<GmodRealm> {
@@ -481,10 +492,7 @@ fn check_bits_mismatch(
             if !is_strict_realm(sender_realm) {
                 continue;
             }
-            let Some(expected_receive_realm) = expected_receiver_realm(send_flow.send_kind) else {
-                continue;
-            };
-            if receive_realm != expected_receive_realm {
+            if receive_realm != send_flow.send_kind.receiver_realm {
                 continue;
             }
             if !is_opposite_strict_realm_pair(sender_realm, receive_realm) {
@@ -507,7 +515,7 @@ fn check_bits_mismatch(
                     continue;
                 }
 
-                if write.kind.to_read_counterpart() != Some(read.kind) {
+                if !write.op.pairs_with(&read.op) {
                     continue;
                 }
 
@@ -530,8 +538,8 @@ fn check_bits_mismatch(
                         "Bit-width mismatch for `{name}` at position {position}: writer uses `{op}({expected})`, reader uses `{rop}({actual})`.",
                         name = receive_flow.message_name,
                         position = index + 1,
-                        op = write.kind.to_fn_name(),
-                        rop = read.kind.to_fn_name(),
+                        op = write.display_name,
+                        rop = read.display_name,
                         expected = expected_bits,
                         actual = actual_bits,
                     )

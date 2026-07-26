@@ -1,11 +1,12 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use glua_code_analysis::{
     DbIndex, EmmyrcGmodOutlineVerbosity, FileId, GmodClassCallLiteral, GmodHookKind,
     GmodScriptedClassCallMetadata, GmodTimerKind, LuaDecl, LuaDeclId, LuaDeclarationTree,
-    LuaDocument, LuaType, LuaTypeOwner, get_scripted_class_info_for_file,
+    LuaDocument, LuaInferCache, LuaType, LuaTypeOwner, call_expr_is_net_op,
+    get_scripted_class_info_for_file,
 };
-use glua_parser::{LuaAstNode, LuaChunk, LuaSyntaxId, LuaSyntaxNode, LuaSyntaxToken};
+use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaSyntaxId, LuaSyntaxNode, LuaSyntaxToken};
 use lsp_types::{DocumentSymbol, SymbolKind};
 use rowan::{TextRange, TextSize};
 
@@ -37,6 +38,10 @@ pub struct DocumentSymbolBuilder<'a> {
     vgui_panel_names: HashMap<LuaDeclId, String>,
     /// Maps call-expression syntax ids to gmod-specific symbol data (hook.Add, net.Receive, …).
     gmod_call_map: HashMap<LuaSyntaxId, GmodCallEntry>,
+    /// Ranges of call expressions that are net ops in this file. Built once by
+    /// resolving each call's signature metadata, so aliases, local bindings and
+    /// annotated wrappers are recognized identically to the `net.*` builtins.
+    net_op_ranges: HashSet<TextRange>,
     /// Information about the scripted entity class this file belongs to (if any).
     scripted_class_info: Option<ScriptedClassInfo>,
     /// Syntax id of the lazily-created top-level class symbol for scripted entities.
@@ -52,6 +57,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
         db: &'a DbIndex,
         decl_tree: &'a LuaDeclarationTree,
         document: &'a LuaDocument,
+        root: &LuaChunk,
     ) -> Self {
         let emmyrc = db.get_emmyrc();
         let gmod_enabled = emmyrc.gmod.enabled;
@@ -66,6 +72,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
         let vgui_panel_names =
             Self::collect_class_panel_names(db, decl_tree, file_id, gmod_enabled);
         let gmod_call_map = Self::collect_gmod_call_map(db, file_id, gmod_enabled);
+        let net_op_ranges = Self::collect_net_op_ranges(db, root, file_id, gmod_enabled);
         let scripted_class_info = if gmod_enabled {
             get_scripted_class_info_for_file(db, file_id).map(|(class_name, global_name)| {
                 let type_label = scripted_class_type_label(&global_name);
@@ -88,6 +95,7 @@ impl<'a> DocumentSymbolBuilder<'a> {
             decl_symbol_ids: HashMap::new(),
             vgui_panel_names,
             gmod_call_map,
+            net_op_ranges,
             scripted_class_info,
             scripted_class_symbol_id: None,
             verbosity,
@@ -253,6 +261,42 @@ impl<'a> DocumentSymbolBuilder<'a> {
         map
     }
 
+    /// Collect the ranges of every net op call in this file.
+    ///
+    /// Classification goes through `call_expr_is_net_op`, the same
+    /// signature-metadata resolution the analyzer uses, so an alias, a local
+    /// binding, or an annotated wrapper is recognized exactly like a `net.*`
+    /// builtin. Receive registrations are excluded there and rendered by
+    /// `check_and_build_gmod_call_symbol`, which can also report the message name.
+    ///
+    /// Deliberately not driven from `GmodNetworkIndex`: that records complete
+    /// send/receive *flows*, so a net op that forms no flow — a bare
+    /// `net.WriteString` with no `net.Start`, or a `net.ReadUInt` outside any
+    /// receive callback — would be missing from the outline even though it is
+    /// still a net call the developer wants to see.
+    fn collect_net_op_ranges(
+        db: &DbIndex,
+        root: &LuaChunk,
+        file_id: FileId,
+        gmod_enabled: bool,
+    ) -> HashSet<TextRange> {
+        let mut ranges = HashSet::new();
+        if !gmod_enabled {
+            return ranges;
+        }
+
+        // One cache for the whole document: every call here resolves against the
+        // same file, so a per-call cache would discard all inference reuse.
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        for call_expr in root.descendants::<LuaCallExpr>() {
+            if call_expr_is_net_op(db, &mut cache, &call_expr) {
+                ranges.insert(call_expr.get_range());
+            }
+        }
+
+        ranges
+    }
+
     pub fn get_file_id(&self) -> FileId {
         self.document.get_file_id()
     }
@@ -273,6 +317,12 @@ impl<'a> DocumentSymbolBuilder<'a> {
 
     pub fn get_gmod_call_entry(&self, syntax_id: &LuaSyntaxId) -> Option<&GmodCallEntry> {
         self.gmod_call_map.get(syntax_id)
+    }
+
+    /// True when `range` is the range of an indexed net op call (a write, a
+    /// read, `net.Start`, or a send terminator) in this file.
+    pub fn is_net_op_range(&self, range: TextRange) -> bool {
+        self.net_op_ranges.contains(&range)
     }
 
     pub fn get_verbosity(&self) -> EmmyrcGmodOutlineVerbosity {

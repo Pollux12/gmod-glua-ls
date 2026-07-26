@@ -10,7 +10,7 @@ use expr::{build_closure_expr_symbol, build_table_symbol};
 use glua_code_analysis::{EmmyrcGmodOutlineVerbosity, SemanticModel};
 use glua_parser::{
     LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaComment, LuaExpr, LuaFuncStat,
-    LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr, PathTrait,
+    LuaSingleArgExpr, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaVarExpr,
 };
 use lsp_types::{
     ClientCapabilities, DocumentSymbol, DocumentSymbolOptions, DocumentSymbolParams,
@@ -63,7 +63,7 @@ fn build_document_symbol(
         .get_decl_tree(&file_id)?;
     let db = semantic_model.get_db();
 
-    let mut builder = DocumentSymbolBuilder::new(db, decl_tree, &document);
+    let mut builder = DocumentSymbolBuilder::new(db, decl_tree, &document, root);
     let symbol = LuaSymbol::new("".into(), None, SymbolKind::FILE, root.get_range());
     let root_id = builder.add_node_symbol(root.syntax().clone(), symbol, None);
     build_child_document_symbols(&mut builder, root, root_id, cancel_token);
@@ -375,21 +375,10 @@ fn check_and_build_net_op_symbol(
         return false;
     }
 
-    let Some(call_path) = call_expr.get_access_path() else {
-        return false;
-    };
-
-    let Some(op_name) = call_path.strip_prefix("net.") else {
-        return false;
-    };
-
-    let is_net_op = op_name == "Broadcast"
-        || op_name == "Start"
-        || op_name.starts_with("Read")
-        || op_name.starts_with("Write")
-        || op_name.starts_with("Send");
-
-    if !is_net_op {
+    // Classify by indexed net-op metadata (built from annotated `net_payload`/
+    // `net_send` signatures) rather than the callee's name, so an annotated
+    // wrapper function is recognized identically to the `net.*` builtins.
+    if !builder.is_net_op_range(call_expr.get_range()) {
         return false;
     }
 
@@ -855,6 +844,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Normal;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/server/hidden_local_value_exprs.lua",
@@ -882,6 +872,7 @@ mod tests {
         emmyrc.gmod.enabled = true;
         emmyrc.gmod.outline.verbosity = EmmyrcGmodOutlineVerbosity::Normal;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/server/hidden_assign_value_exprs.lua",
@@ -998,6 +989,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/server/net_ops.lua",
@@ -1034,6 +1026,7 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
 
         let file_id = ws.def_file(
             "addons/test/lua/autorun/server/net_op_label_format.lua",
