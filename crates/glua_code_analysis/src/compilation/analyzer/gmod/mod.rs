@@ -40,24 +40,23 @@ use crate::{
         GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
         GmodSystemFileMetadata, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
-        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpEntry, NetOpKind,
-        NetReceiveFlow, NetSendFlow, NetSendKind, TableNumericRangePopulation, WorkspaceKind,
+        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpDescriptor,
+        NetOpDirection, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind,
+        TableNumericRangePopulation, WorkspaceKind,
     },
     infer_expr,
     profile::Profile,
 };
 use rowan::{TextRange, TextSize};
+use smol_str::SmolStr;
 
 mod numeric_range_population;
 
-/// Pre-scanned keyword flags for fast gmod_pre skip decisions.
-/// Each flag indicates the file source contains the corresponding keyword pattern.
+/// Cheap pre-analysis flags used to skip unrelated GMod collectors.
 #[derive(Default)]
 struct GmodKeywords {
     /// "hook" — hook.Add/Run/Remove call sites, hook method sites
     has_hook: bool,
-    /// "net." — net.Start/Receive/Send flows, system call metadata
-    has_net: bool,
     /// timer/concommand/ConVar/AddNetworkString — system call metadata
     has_system_call: bool,
     /// Annotated scripted-class wrappers (VGUI, Derma, NetworkVar, inheritance)
@@ -75,7 +74,6 @@ struct GmodKeywords {
 #[derive(Clone, Copy, Default)]
 struct AnnotatedGmodCandidatePresence {
     has_system: bool,
-    has_net: bool,
     has_hook: bool,
     has_scripted_class: bool,
     has_load: bool,
@@ -86,7 +84,6 @@ struct AnnotatedGmodCandidatePresence {
 impl AnnotatedGmodCandidatePresence {
     fn merge(&mut self, other: Self) {
         self.has_system |= other.has_system;
-        self.has_net |= other.has_net;
         self.has_hook |= other.has_hook;
         self.has_scripted_class |= other.has_scripted_class;
         self.has_load |= other.has_load;
@@ -96,19 +93,9 @@ impl AnnotatedGmodCandidatePresence {
 }
 
 impl GmodKeywords {
-    /// Whether the LuaCallExpr walk in collect_hook_metadata is needed
-    fn needs_call_walk(&self) -> bool {
-        self.has_hook || self.has_net || self.has_system_call
-    }
-
-    /// Whether the LuaFuncStat walk in collect_hook_metadata is needed
-    fn needs_func_walk(&self) -> bool {
-        self.has_gm_func || self.has_realm_anno
-    }
-
-    /// Whether any hook/net metadata collection is needed at all
+    /// Whether any non-network metadata collection is needed.
     fn needs_hook_metadata(&self) -> bool {
-        self.needs_call_walk() || self.needs_func_walk()
+        self.has_hook || self.has_system_call || self.has_gm_func || self.has_realm_anno
     }
 }
 
@@ -121,9 +108,7 @@ fn scan_gmod_keywords(
         || content.contains("GAMEMODE:")
         || formatted_hook_prefixes.iter().any(|p| content.contains(p));
     let has_hook_annotation = content.contains("gmod.hook");
-    let has_net_annotation = content.contains("gmod.net_message");
-    let has_system_annotation = has_net_annotation
-        || content.contains("gmod.concommand")
+    let has_system_annotation = content.contains("gmod.concommand")
         || content.contains("gmod.convar")
         || content.contains("gmod.timer");
     let has_scripted_class_annotation = content.contains("gmod.vgui_panel")
@@ -135,7 +120,6 @@ fn scan_gmod_keywords(
     let annotated_candidates = annotated_global_call_roles.candidate_call_paths_in_content(content);
     GmodKeywords {
         has_hook: content.contains("hook") || has_hook_annotation || annotated_candidates.has_hook,
-        has_net: content.contains("net.") || has_net_annotation || annotated_candidates.has_net,
         has_system_call: content.contains("timer.")
             || content.contains("concommand")
             || content.contains("ConVar")
@@ -183,16 +167,33 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_scoped = std::time::Duration::ZERO;
         let mut profile = do_profile.then(GmodPreProfile::default);
 
-        // Build a workspace-global registry of helper functions so that
-        // net.Read/Write expansion can follow helpers defined in *other* files
-        // (DarkRP-style shared helpers like `DarkRP.writeNetDarkRPVarRemoval`).
-        // Same-file resolution still takes priority — the registry is only
-        // consulted as a fallback.
-        //
-        // Sources from the VFS rather than `tree_list` because per-file
-        // incremental analysis (`update_file_by_uri`) only places the changed
-        // file in `tree_list`, but helpers can live in any file.
-        let helper_registry = get_or_build_helper_registry(db);
+        let helper_revision = db.get_vfs().content_revision();
+        let cached_helper_registry = db.get_cached_helper_registry(helper_revision);
+        let mut helper_registry_builder = cached_helper_registry
+            .is_none()
+            .then(HelperRegistryBuilder::default);
+        // Net attributes, canonical op names, and helper signature identities
+        // are all collected during this one signature-index walk.
+        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build_with_helpers(
+            db,
+            helper_registry_builder.as_mut(),
+        );
+        // Publish the canonical op-name table so diagnostics and completions can
+        // name a net op they have no call expression for.
+        db.get_gmod_network_index_mut()
+            .set_canonical_ops(annotated_global_call_roles.canonical_net_ops());
+
+        let helper_registry = if let Some(cached) = cached_helper_registry {
+            cached
+        } else {
+            let registry = Arc::new(
+                helper_registry_builder
+                    .expect("builder exists when the helper cache misses")
+                    .build(db),
+            );
+            db.set_cached_helper_registry(helper_revision, registry.clone());
+            registry
+        };
 
         // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
         let formatted_hook_prefixes: Vec<String> = db
@@ -210,7 +211,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             )
             .map(|prefix| format!("{prefix}:"))
             .collect();
-        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
 
         let t_class = do_profile.then(std::time::Instant::now);
         collect_annotated_gmod_call_sites_with(
@@ -263,7 +263,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             let GmodFileMetadataResult {
                 keywords,
                 hook_metadata,
-                receive_flow_count,
                 network_data,
                 member_ranges,
                 branch_ranges,
@@ -274,12 +273,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
                 profile.record_keywords(&keywords, is_in_scope);
+                profile.receive_flows += network_data.receive_flows.len();
             }
 
             if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
                 if let Some(profile) = profile.as_mut() {
                     profile.gm_method_realms += gm_method_realms.len();
-                    profile.receive_flows += receive_flow_count;
                 }
                 db.get_gmod_infer_index_mut()
                     .add_hook_sites(file_id, hook_sites);
@@ -293,11 +292,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 profile.hook_metadata_skips += 1;
             }
 
-            if let Some(network_data) = network_data {
+            if !network_data.send_flows.is_empty() || !network_data.receive_flows.is_empty() {
                 db.get_gmod_network_index_mut()
                     .add_file_data(file_id, network_data);
-            } else if let Some(profile) = profile.as_mut() {
-                profile.netflow_skips += 1;
             }
 
             if is_in_scope {
@@ -435,14 +432,12 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 struct GmodPreProfile {
     files_scanned: usize,
     hook_keyword_files: usize,
-    net_keyword_files: usize,
     system_call_keyword_files: usize,
     gm_func_keyword_files: usize,
     realm_branch_keyword_files: usize,
     realm_annotation_keyword_files: usize,
     scoped_files: usize,
     hook_metadata_skips: usize,
-    netflow_skips: usize,
     gm_method_realms: usize,
     receive_flows: usize,
     scoped_class_matches: usize,
@@ -454,7 +449,6 @@ struct GmodPreProfile {
 impl GmodPreProfile {
     fn record_keywords(&mut self, keywords: &GmodKeywords, is_scoped: bool) {
         self.hook_keyword_files += usize::from(keywords.has_hook);
-        self.net_keyword_files += usize::from(keywords.has_net);
         self.system_call_keyword_files += usize::from(keywords.has_system_call);
         self.gm_func_keyword_files += usize::from(keywords.has_gm_func);
         self.realm_branch_keyword_files += usize::from(keywords.has_realm_branch);
@@ -464,17 +458,15 @@ impl GmodPreProfile {
 
     fn log(&self) {
         log::info!(
-            "gmod pre profile: files={} keyword_files hook={} net={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} netflow_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
+            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
             self.files_scanned,
             self.hook_keyword_files,
-            self.net_keyword_files,
             self.system_call_keyword_files,
             self.gm_func_keyword_files,
             self.realm_branch_keyword_files,
             self.realm_annotation_keyword_files,
             self.scoped_files,
             self.hook_metadata_skips,
-            self.netflow_skips,
             self.gm_method_realms,
             self.receive_flows,
             self.scoped_class_matches,
@@ -743,148 +735,122 @@ fn collect_annotated_load_dependency_site(
 /// rebuilding the owning file's red tree from the (Send) green tree in the VFS.
 #[derive(Default)]
 pub(crate) struct HelperRegistry {
-    map: HashMap<String, (FileId, LuaSyntaxId)>,
-    methods: HashMap<String, (FileId, LuaSyntaxId)>,
+    /// Function bodies keyed by the language server's canonical global symbol
+    /// identity. This is a call-graph lookup, not a net-op recognizer: the body
+    /// is still inspected through annotated signatures only.
+    globals: HashMap<GlobalId, (FileId, LuaSyntaxId)>,
+    /// Unique method names provide a conservative fallback for dynamic Lua
+    /// receivers whose class cannot be inferred. Ambiguous method names are
+    /// deliberately removed during construction.
+    methods: HashMap<SmolStr, (FileId, LuaSyntaxId)>,
+    signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)>,
 }
 
-/// Returns the workspace-wide net-helper registry, reusing a cached build when the
-/// VFS content has not changed since it was last computed. `build_helper_registry`
-/// scans every "net."-containing file's full AST, so on incremental edits and the
-/// cold-index stabilization re-run (which share a VFS content revision with the
-/// preceding pass) this avoids a redundant whole-workspace rescan.
-fn get_or_build_helper_registry(db: &mut DbIndex) -> Arc<HelperRegistry> {
-    let revision = db.get_vfs().content_revision();
-    if let Some(cached) = db.get_cached_helper_registry(revision) {
-        return cached;
-    }
-    let registry = Arc::new(build_helper_registry(db));
-    db.set_cached_helper_registry(revision, registry.clone());
-    registry
+type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
+
+#[derive(Default)]
+struct HelperRegistryBuilder {
+    definitions: Vec<IndexedHelperDefinition>,
+    /// Whether each file contains any call expression at all. Computed once per
+    /// file so annotation libraries full of empty stubs are rejected before
+    /// resolving every signature back to a red-tree closure.
+    file_has_calls: HashMap<FileId, bool>,
 }
 
-fn build_helper_registry(db: &DbIndex) -> HelperRegistry {
-    let mut map: HashMap<String, (FileId, LuaSyntaxId)> = HashMap::new();
-    let mut methods: HashMap<String, (FileId, LuaSyntaxId)> = HashMap::new();
-    let mut duplicate_methods = HashSet::new();
+impl HelperRegistryBuilder {
+    fn add_signature(&mut self, db: &DbIndex, signature_id: LuaSignatureId) {
+        let file_id = signature_id.get_file_id();
+        let file_has_calls = *self.file_has_calls.entry(file_id).or_insert_with(|| {
+            db.get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| {
+                    tree.get_chunk_node()
+                        .syntax()
+                        .descendants()
+                        .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+                })
+                .unwrap_or(false)
+        });
+        if !file_has_calls {
+            return;
+        }
 
-    let vfs = db.get_vfs();
-    // Filter to files containing "net." BEFORE sorting, to avoid allocating
-    // path strings for the vast majority of files that don't contain net helpers.
-    let mut candidate_file_ids: Vec<FileId> = vfs
-        .get_all_file_ids()
-        .into_iter()
-        .filter(|file_id| {
-            vfs.get_file_content(file_id)
-                .is_some_and(|c| c.contains("net."))
-        })
-        .collect();
-    candidate_file_ids.sort_by_cached_key(|file_id| {
-        let raw_path = vfs
-            .get_file_path(file_id)
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_default();
-        (
-            crate::vfs::normalize_path_for_ordering(&raw_path),
-            raw_path,
-            file_id.id,
-        )
-    });
-
-    for file_id in candidate_file_ids {
-        let Some(tree) = vfs.get_syntax_tree(&file_id) else {
-            continue;
+        let Some(closure) = closure_from_signature_id(db, signature_id) else {
+            return;
         };
-        let chunk = tree.get_chunk_node();
+        let Some(block) = closure.get_block() else {
+            return;
+        };
+        // Annotation libraries contain thousands of empty function stubs.
+        // They can carry net metadata, but they cannot be wrapper bodies.
+        // Checking for a first statement is constant-time and avoids walking
+        // every empty stub's red subtree during the signature scan.
+        if block.get_stats().next().is_none() {
+            return;
+        }
+        let global_id =
+            global_call_path_for_signature_closure(db, signature_id, &closure).map(|path| {
+                let path = path.strip_prefix("_G.").unwrap_or(&path);
+                GlobalId::new(path)
+            });
+        self.definitions.push((
+            signature_id,
+            file_id,
+            LuaSyntaxId::from_node(block.syntax()),
+            global_id,
+        ));
+    }
 
-        // Single descendants walk dispatching by node kind. Avoids two
-        // separate full-file walks for FuncStat and AssignStat.
-        for node in chunk.syntax().descendants() {
-            if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
-                let Some(func_name) = func_stat.get_func_name() else {
-                    continue;
-                };
-                let Some(block) = func_stat
-                    .get_closure()
-                    .and_then(|closure| closure.get_block())
-                else {
-                    continue;
-                };
+    fn build(mut self, db: &DbIndex) -> HelperRegistry {
+        let vfs = db.get_vfs();
+        self.definitions
+            .sort_by_cached_key(|(signature_id, file_id, syntax_id, global_id)| {
+                let raw_path = vfs
+                    .get_file_path(file_id)
+                    .map(|path| path.to_string_lossy().to_string())
+                    .unwrap_or_default();
+                (
+                    crate::vfs::normalize_path_for_ordering(&raw_path),
+                    raw_path,
+                    file_id.id,
+                    syntax_id.get_range().start(),
+                    global_id
+                        .as_ref()
+                        .map(|id| id.get_name().to_string())
+                        .unwrap_or_default(),
+                    signature_id.get_position(),
+                )
+            });
 
-                let key = match &func_name {
-                    LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                    LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
-                };
-                let method_name = match &func_name {
-                    LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
-                    _ => None,
-                };
-
-                if let Some(key) = key {
-                    // Deterministic duplicate winner rule:
-                    // the first helper discovered in sorted path order wins.
-                    map.entry(key)
-                        .or_insert_with(|| (file_id, LuaSyntaxId::from_node(block.syntax())));
-                }
-                if let Some(method_name) = method_name {
-                    if methods
-                        .insert(
-                            method_name.clone(),
-                            (file_id, LuaSyntaxId::from_node(block.syntax())),
-                        )
-                        .is_some()
-                    {
-                        duplicate_methods.insert(method_name);
-                    }
-                }
+        let mut globals: HashMap<GlobalId, (FileId, LuaSyntaxId)> = HashMap::new();
+        let mut methods: HashMap<SmolStr, (FileId, LuaSyntaxId)> = HashMap::new();
+        let mut signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)> = HashMap::new();
+        let mut duplicate_methods = HashSet::new();
+        for (signature_id, file_id, syntax_id, global_id) in self.definitions {
+            let target = (file_id, syntax_id);
+            signatures.entry(signature_id).or_insert(target);
+            let Some(global_id) = global_id else {
                 continue;
-            }
-
-            if let Some(assign_stat) = LuaAssignStat::cast(node) {
-                let (vars, values) = assign_stat.get_var_and_expr_list();
-                for (idx, var) in vars.iter().enumerate() {
-                    let Some(LuaExpr::ClosureExpr(closure_expr)) = values.get(idx) else {
-                        continue;
-                    };
-                    let Some(block) = closure_expr.get_block() else {
-                        continue;
-                    };
-
-                    let key = match var {
-                        LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
-                        LuaVarExpr::IndexExpr(index_expr) => dotted_global_key(index_expr),
-                    };
-                    let method_name = match var {
-                        LuaVarExpr::IndexExpr(index_expr) => index_field_name(index_expr),
-                        _ => None,
-                    };
-
-                    if let Some(key) = key {
-                        // Deterministic duplicate winner rule:
-                        // the first helper discovered in sorted path order wins.
-                        map.entry(key)
-                            .or_insert_with(|| (file_id, LuaSyntaxId::from_node(block.syntax())));
-                    }
-                    if let Some(method_name) = method_name {
-                        if methods
-                            .insert(
-                                method_name.clone(),
-                                (file_id, LuaSyntaxId::from_node(block.syntax())),
-                            )
-                            .is_some()
-                        {
-                            duplicate_methods.insert(method_name);
-                        }
-                    }
+            };
+            globals.entry(global_id.clone()).or_insert(target);
+            if let Some((_, method_name)) = global_id.get_name().rsplit_once('.') {
+                let method_name = SmolStr::new(method_name);
+                if methods.insert(method_name.clone(), target).is_some() {
+                    duplicate_methods.insert(method_name);
                 }
             }
         }
-    }
 
-    for duplicate_method in duplicate_methods {
-        methods.remove(&duplicate_method);
-    }
+        for method_name in duplicate_methods {
+            methods.remove(&method_name);
+        }
 
-    HelperRegistry { map, methods }
+        HelperRegistry {
+            globals,
+            methods,
+            signatures,
+        }
+    }
 }
 
 /// Per-file function definition lookup. Built once and reused for all
@@ -893,14 +859,6 @@ struct FileFunctionMap {
     /// Function bodies: `function f() end`, `local function f() end`,
     /// `local f = function() end`, `f = function() end`.
     bare: HashMap<String, LuaBlock>,
-    /// Method bodies, keyed `"Prefix.Field"`:
-    /// `function M.f() end`, `M.f = function() end`.
-    dotted: HashMap<String, LuaBlock>,
-    /// Colon-callable method bodies keyed by field name:
-    /// `function M:f() end`, `function ENT:f() end`, `M.f = function() end`.
-    /// Used only as a conservative same-file/cross-file fallback for net flow
-    /// expansion through `obj:f()` calls.
-    methods: HashMap<String, LuaBlock>,
     /// All top-level function-defining blocks in source order, including
     /// duplicates and unnamed closures. Lets callers that need to scan every
     /// function body in the file skip running 4 separate `descendants` walks.
@@ -910,8 +868,7 @@ struct FileFunctionMap {
 impl FileFunctionMap {
     fn build(root: &LuaChunk) -> Self {
         let mut bare: HashMap<String, LuaBlock> = HashMap::new();
-        let mut dotted: HashMap<String, LuaBlock> = HashMap::new();
-        let mut methods: HashMap<String, LuaBlock> = HashMap::new();
+        let mut duplicate_bare = HashSet::new();
         let mut all_blocks: Vec<LuaBlock> = Vec::new();
         for node in root.syntax().descendants() {
             if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
@@ -920,8 +877,10 @@ impl FileFunctionMap {
                         .get_local_name()
                         .and_then(|n| n.get_name_token())
                     {
-                        bare.entry(local_name.get_name_text().to_string())
-                            .or_insert_with(|| block.clone());
+                        let name = local_name.get_name_text().to_string();
+                        if bare.insert(name.clone(), block.clone()).is_some() {
+                            duplicate_bare.insert(name);
+                        }
                     }
                     all_blocks.push(block);
                 }
@@ -938,8 +897,10 @@ impl FileFunctionMap {
                         continue;
                     };
                     if let Some(name_token) = names.get(idx).and_then(|n| n.get_name_token()) {
-                        bare.entry(name_token.get_name_text().to_string())
-                            .or_insert_with(|| block.clone());
+                        let name = name_token.get_name_text().to_string();
+                        if bare.insert(name.clone(), block.clone()).is_some() {
+                            duplicate_bare.insert(name);
+                        }
                     }
                     all_blocks.push(block);
                 }
@@ -952,17 +913,12 @@ impl FileFunctionMap {
                 match func_stat.get_func_name() {
                     Some(LuaVarExpr::NameExpr(name_expr)) => {
                         if let Some(name) = name_expr.get_name_text() {
-                            bare.entry(name).or_insert_with(|| block.clone());
+                            if bare.insert(name.clone(), block.clone()).is_some() {
+                                duplicate_bare.insert(name);
+                            }
                         }
                     }
-                    Some(LuaVarExpr::IndexExpr(index_expr)) => {
-                        if let Some(key) = dotted_global_key(&index_expr) {
-                            dotted.entry(key).or_insert_with(|| block.clone());
-                        }
-                        if let Some(method_name) = index_field_name(&index_expr) {
-                            methods.entry(method_name).or_insert_with(|| block.clone());
-                        }
-                    }
+                    Some(LuaVarExpr::IndexExpr(_)) => {}
                     None => {}
                 }
                 all_blocks.push(block);
@@ -981,17 +937,12 @@ impl FileFunctionMap {
                         match var {
                             LuaVarExpr::NameExpr(name_expr) => {
                                 if let Some(name) = name_expr.get_name_text() {
-                                    bare.entry(name).or_insert_with(|| block.clone());
+                                    if bare.insert(name.clone(), block.clone()).is_some() {
+                                        duplicate_bare.insert(name);
+                                    }
                                 }
                             }
-                            LuaVarExpr::IndexExpr(index_expr) => {
-                                if let Some(key) = dotted_global_key(index_expr) {
-                                    dotted.entry(key).or_insert_with(|| block.clone());
-                                }
-                                if let Some(method_name) = index_field_name(index_expr) {
-                                    methods.entry(method_name).or_insert_with(|| block.clone());
-                                }
-                            }
+                            LuaVarExpr::IndexExpr(_) => {}
                         }
                     }
                     all_blocks.push(block);
@@ -1007,48 +958,28 @@ impl FileFunctionMap {
                 all_blocks.push(block);
             }
         }
-        FileFunctionMap {
-            bare,
-            dotted,
-            methods,
-            all_blocks,
+        for name in duplicate_bare {
+            bare.remove(&name);
         }
+        FileFunctionMap { bare, all_blocks }
     }
 }
 
-/// Lazy cache of per-file function maps, keyed by chunk text-range. Used so
-/// that cross-file helper recursion doesn't rebuild the same map repeatedly.
+/// Lazy cache of per-file function maps, keyed by file identity and chunk
+/// range. Used so cross-file helper recursion doesn't rebuild the same map
+/// repeatedly or alias equal-sized chunks from different files.
 #[derive(Default)]
 struct LocalFnCache {
-    cache: HashMap<TextRange, FileFunctionMap>,
+    cache: HashMap<(FileId, TextRange), FileFunctionMap>,
 }
 
 impl LocalFnCache {
-    fn get(&mut self, root: &LuaChunk) -> &FileFunctionMap {
-        let key = root.syntax().text_range();
+    fn get(&mut self, file_id: FileId, root: &LuaChunk) -> &FileFunctionMap {
+        let key = (file_id, root.syntax().text_range());
         self.cache
             .entry(key)
             .or_insert_with(|| FileFunctionMap::build(root))
     }
-}
-
-fn dotted_global_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
-    let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
-        return None;
-    };
-    let prefix_text = prefix_name.get_name_text()?;
-    let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
-        return None;
-    };
-    let field_text = field_token.get_name_text();
-    Some(format!("{prefix_text}.{field_text}"))
-}
-
-fn index_field_name(index_expr: &glua_parser::LuaIndexExpr) -> Option<String> {
-    let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
-        return None;
-    };
-    Some(field_token.get_name_text().to_string())
 }
 
 /// All per-file gmod pre-analysis metadata collected off-thread for one file.
@@ -1064,10 +995,7 @@ struct GmodFileMetadataResult {
         GmodSystemFileMetadata,
         Vec<(String, GmodRealm)>,
     )>,
-    /// Number of net.Receive flows discovered (for profiling parity).
-    receive_flow_count: usize,
-    /// `Some` when network flow metadata was collected for this file.
-    network_data: Option<crate::db_index::FileNetworkData>,
+    network_data: crate::db_index::FileNetworkData,
     /// `---@realm` member ranges (only populated when `keywords.has_realm_anno`).
     member_ranges: Vec<GmodRealmRange>,
     /// Branch realm ranges (only populated when `keywords.has_realm_branch`).
@@ -1092,7 +1020,13 @@ fn collect_file_gmod_metadata(
 ) -> GmodFileMetadataResult {
     let content = db.get_vfs().get_file_content(&file_id);
     let keywords = content
-        .map(|c| scan_gmod_keywords(c, formatted_hook_prefixes, annotated_global_call_roles))
+        .map(|content| {
+            scan_gmod_keywords(
+                content,
+                formatted_hook_prefixes,
+                annotated_global_call_roles,
+            )
+        })
         .unwrap_or_default();
 
     // Rebuild the red tree locally from the (Send) green tree so no non-Send
@@ -1105,8 +1039,7 @@ fn collect_file_gmod_metadata(
         return GmodFileMetadataResult {
             keywords,
             hook_metadata: None,
-            receive_flow_count: 0,
-            network_data: None,
+            network_data: crate::db_index::FileNetworkData::default(),
             member_ranges: Vec::new(),
             branch_ranges: Vec::new(),
             annotation_realm: None,
@@ -1115,36 +1048,35 @@ fn collect_file_gmod_metadata(
     };
 
     let mut local_fns = LocalFnCache::default();
+    // One resolver per file: it memoizes signature resolution per call site and
+    // holds an infer cache per file touched, including helper bodies expanded
+    // from other files.
+    let mut net = NetCallResolver::default();
 
-    let (hook_metadata, receive_flows) = if keywords.needs_hook_metadata() {
-        let (hook_sites, system_metadata, gm_method_realms, receive_flows) = collect_hook_metadata(
+    let collect_non_net_metadata = keywords.needs_hook_metadata();
+    let (hook_sites, system_metadata, gm_method_realms, receive_flows) =
+        collect_hook_and_receive_metadata(
             db,
             file_id,
             root.clone(),
+            collect_non_net_metadata,
             helper_registry,
             annotated_global_call_roles,
             &mut local_fns,
+            &mut net,
         );
-        (
-            Some((hook_sites, system_metadata, gm_method_realms)),
-            receive_flows,
-        )
-    } else {
-        (None, Vec::new())
-    };
-    let receive_flow_count = receive_flows.len();
+    let hook_metadata =
+        collect_non_net_metadata.then_some((hook_sites, system_metadata, gm_method_realms));
 
-    let network_data = if keywords.has_net || !receive_flows.is_empty() {
-        Some(collect_network_flow_metadata(
-            db,
-            root.clone(),
-            receive_flows,
-            helper_registry,
-            &mut local_fns,
-        ))
-    } else {
-        None
-    };
+    let network_data = collect_network_flow_metadata(
+        db,
+        file_id,
+        root.clone(),
+        receive_flows,
+        helper_registry,
+        &mut local_fns,
+        &mut net,
+    );
 
     let branch_ranges = if keywords.has_realm_branch {
         collect_branch_realm_ranges(&root)
@@ -1171,7 +1103,6 @@ fn collect_file_gmod_metadata(
     GmodFileMetadataResult {
         keywords,
         hook_metadata,
-        receive_flow_count,
         network_data,
         member_ranges,
         branch_ranges,
@@ -1180,13 +1111,16 @@ fn collect_file_gmod_metadata(
     }
 }
 
-fn collect_hook_metadata(
+#[allow(clippy::too_many_arguments)]
+fn collect_hook_and_receive_metadata(
     db: &DbIndex,
     file_id: FileId,
     root: LuaChunk,
+    collect_non_net_metadata: bool,
     helper_registry: &HelperRegistry,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     local_fns: &mut LocalFnCache,
+    net: &mut NetCallResolver,
 ) -> (
     Vec<GmodHookSiteMetadata>,
     GmodSystemFileMetadata,
@@ -1197,36 +1131,54 @@ fn collect_hook_metadata(
     let mut system_metadata = GmodSystemFileMetadata::default();
     let mut gm_method_realms = Vec::new();
     let mut receive_flows = Vec::new();
-    let annotated_call_roles =
-        AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
+    let annotated_call_roles = collect_non_net_metadata
+        .then(|| AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles));
+    let net_site = NetWalkSite {
+        root: root.clone(),
+        file_id,
+    };
 
     // Single descendants walk dispatching by node kind. Avoids two separate
     // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
     for node in root.syntax().descendants() {
         if let Some(call_expr) = LuaCallExpr::cast(node.clone()) {
-            if let Some(site) =
-                collect_hook_call_site(db, file_id, &annotated_call_roles, call_expr.clone())
-            {
-                hook_sites.push(site);
+            if let Some(annotated_call_roles) = annotated_call_roles.as_ref() {
+                if let Some(site) =
+                    collect_hook_call_site(db, file_id, annotated_call_roles, call_expr.clone())
+                {
+                    hook_sites.push(site);
+                }
+                collect_system_call_metadata_into(
+                    db,
+                    file_id,
+                    annotated_call_roles,
+                    call_expr.clone(),
+                    &mut system_metadata,
+                );
             }
 
+            let mut net_ctx = NetCollectCtx {
+                db,
+                helper_registry,
+                local_fns,
+                net,
+            };
             if let Some(receive_flow) =
-                collect_net_receive_flow(&root, &call_expr, helper_registry, local_fns, db)
+                collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
             {
                 receive_flows.push(receive_flow);
+            } else if call_has_literal_string_arg(&call_expr) {
+                receive_flows.extend(collect_unannotated_net_wrapper_receive_flows(
+                    &mut net_ctx,
+                    &net_site,
+                    &call_expr,
+                ));
             }
 
-            collect_system_call_metadata_into(
-                db,
-                file_id,
-                &annotated_call_roles,
-                call_expr,
-                &mut system_metadata,
-            );
             continue;
         }
 
-        if let Some(func_stat) = LuaFuncStat::cast(node) {
+        if collect_non_net_metadata && let Some(func_stat) = LuaFuncStat::cast(node) {
             if let Some(site) = collect_hook_method_site(db, func_stat.clone()) {
                 hook_sites.push(site);
             }
@@ -1249,22 +1201,33 @@ fn collect_hook_metadata(
 
 fn collect_network_flow_metadata(
     db: &DbIndex,
+    file_id: FileId,
     root: LuaChunk,
     receive_flows: Vec<NetReceiveFlow>,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    net: &mut NetCallResolver,
 ) -> crate::db_index::FileNetworkData {
-    let mut send_flows = collect_net_send_flows(&root, helper_registry, local_fns, db);
-    send_flows.extend(collect_wrapped_net_send_flows(
-        &root,
+    let site = NetWalkSite { root, file_id };
+    let mut ctx = NetCollectCtx {
+        db,
         helper_registry,
         local_fns,
-        db,
-    ));
+        net,
+    };
+    let mut send_flows = collect_net_send_flows(&mut ctx, &site);
+    send_flows.extend(collect_wrapped_net_send_flows(&mut ctx, &site));
+    send_flows.extend(collect_unannotated_net_wrapper_send_flows(&mut ctx, &site));
     send_flows.sort_by_key(|flow| flow.start_range.start());
+    let mut unique_send_flows = Vec::with_capacity(send_flows.len());
+    for flow in send_flows {
+        if !unique_send_flows.contains(&flow) {
+            unique_send_flows.push(flow);
+        }
+    }
 
     crate::db_index::FileNetworkData {
-        send_flows,
+        send_flows: unique_send_flows,
         receive_flows,
     }
 }
@@ -1289,30 +1252,28 @@ fn collect_gm_method_realm_annotation(func_stat: &LuaFuncStat) -> Option<(String
     Some((method_name, realm))
 }
 
-fn collect_net_send_flows(
-    root: &LuaChunk,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
-) -> Vec<NetSendFlow> {
+fn collect_net_send_flows(ctx: &mut NetCollectCtx<'_>, site: &NetWalkSite) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
-    for block in root.descendants::<LuaBlock>() {
+    for block in site.root.descendants::<LuaBlock>() {
         let stats: Vec<LuaStat> = block.get_stats().collect();
         for (index, stat) in stats.iter().enumerate() {
             let Some(call_expr) = call_expr_from_stat(stat) else {
                 continue;
             };
 
-            let Some(method_name) = get_exact_net_method_name(&call_expr) else {
-                continue;
-            };
-
-            if method_name != "Start" {
+            if !call_has_literal_string_arg(&call_expr) {
                 continue;
             }
 
-            let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
+            let message_name = match ctx.net.role(ctx.db, site.file_id, &call_expr) {
+                Some(NetCallRole::Start { message_idx }) => {
+                    extract_static_string_arg_value(&call_expr, message_idx)
+                }
+                Some(_) => None,
+                None => resolve_helper_start_message(ctx, site, &call_expr),
+            };
+            let Some(message_name) = message_name else {
                 continue;
             };
 
@@ -1320,32 +1281,43 @@ fn collect_net_send_flows(
             let mut send = None;
 
             for next_stat in stats.iter().skip(index + 1) {
-                if let Some(next_call_expr) = call_expr_from_stat(next_stat)
-                    && let Some(next_method_name) = get_exact_net_method_name(&next_call_expr)
-                {
-                    if next_method_name == "Start" {
-                        break;
-                    }
-
-                    if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                        let target = extract_send_target_text(&next_call_expr, send_kind);
-                        send = Some((next_call_expr.get_range(), send_kind, target));
-                        break;
+                if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
+                    match ctx.net.role(ctx.db, site.file_id, &next_call_expr) {
+                        Some(NetCallRole::Start { .. }) => break,
+                        Some(NetCallRole::Send(send_kind)) => {
+                            let target = extract_send_target_text(&next_call_expr, send_kind);
+                            send = Some((
+                                next_call_expr.get_range(),
+                                send_kind,
+                                target,
+                                call_display_name(&next_call_expr),
+                            ));
+                            break;
+                        }
+                        Some(_) => {}
+                        None => {
+                            if resolve_helper_start_message(ctx, site, &next_call_expr).is_some() {
+                                break;
+                            }
+                            if let Some((send_kind, send_target)) =
+                                resolve_helper_send(ctx, site, &next_call_expr)
+                            {
+                                send = Some((
+                                    next_call_expr.get_range(),
+                                    send_kind,
+                                    send_target,
+                                    call_display_name(&next_call_expr),
+                                ));
+                                break;
+                            }
+                        }
                     }
                 }
 
-                collect_net_write_ops_from_stat(
-                    root,
-                    &block,
-                    next_stat,
-                    &mut writes,
-                    helper_registry,
-                    local_fns,
-                    db,
-                );
+                collect_net_write_ops_from_stat(ctx, site, &block, next_stat, &mut writes);
             }
 
-            let Some((send_range, send_kind, send_target)) = send else {
+            let Some((send_range, send_kind, send_target, send_display_name)) = send else {
                 continue;
             };
 
@@ -1355,8 +1327,10 @@ fn collect_net_send_flows(
                 writes,
                 send_range,
                 send_kind,
+                send_display_name,
                 send_target,
                 is_wrapped: false,
+                materialized_from: None,
             });
         }
     }
@@ -1365,26 +1339,163 @@ fn collect_net_send_flows(
     flows
 }
 
+fn resolve_helper_start_message(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    call_expr: &LuaCallExpr,
+) -> Option<String> {
+    resolve_helper_start_message_recursive(
+        ctx,
+        site,
+        call_expr,
+        &HashMap::new(),
+        &mut HashSet::new(),
+    )
+}
+
+fn resolve_helper_start_message_recursive(
+    ctx: &mut NetCollectCtx<'_>,
+    caller_site: &NetWalkSite,
+    helper_call: &LuaCallExpr,
+    caller_bindings: &HashMap<String, String>,
+    visited: &mut HashSet<(FileId, String)>,
+) -> Option<String> {
+    let (helper_key, helper_block, helper_root, helper_file_id) = resolve_call_to_function_block(
+        &caller_site.root,
+        caller_site.file_id,
+        helper_call,
+        ctx.helper_registry,
+        ctx.local_fns,
+        ctx.net,
+        ctx.db,
+    )?;
+    if !visited.insert((helper_file_id, helper_key.clone())) {
+        return None;
+    }
+
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let helper_site = NetWalkSite {
+        root: helper_root,
+        file_id: helper_file_id,
+    };
+    let mut messages = Vec::new();
+    for nested_call in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+    {
+        if is_call_expr_in_nested_closure(&helper_block, &nested_call) {
+            continue;
+        }
+        match ctx.net.role(ctx.db, helper_file_id, &nested_call) {
+            Some(NetCallRole::Start { message_idx }) => {
+                if let Some(message) = extract_static_string_arg_value_with_bindings(
+                    &nested_call,
+                    message_idx,
+                    &bindings,
+                ) {
+                    messages.push(message);
+                }
+            }
+            Some(_) => {}
+            None => {
+                if let Some(message) = resolve_helper_start_message_recursive(
+                    ctx,
+                    &helper_site,
+                    &nested_call,
+                    &bindings,
+                    visited,
+                ) {
+                    messages.push(message);
+                }
+            }
+        }
+    }
+
+    visited.remove(&(helper_file_id, helper_key));
+    let mut messages = messages.into_iter();
+    let message = messages.next()?;
+    messages
+        .all(|candidate| candidate == message)
+        .then_some(message)
+}
+
+fn resolve_helper_send(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    call_expr: &LuaCallExpr,
+) -> Option<(NetSendKind, Option<String>)> {
+    resolve_helper_send_recursive(ctx, site, call_expr, &mut HashSet::new())
+}
+
+fn resolve_helper_send_recursive(
+    ctx: &mut NetCollectCtx<'_>,
+    caller_site: &NetWalkSite,
+    helper_call: &LuaCallExpr,
+    visited: &mut HashSet<(FileId, String)>,
+) -> Option<(NetSendKind, Option<String>)> {
+    let (helper_key, helper_block, helper_root, helper_file_id) = resolve_call_to_function_block(
+        &caller_site.root,
+        caller_site.file_id,
+        helper_call,
+        ctx.helper_registry,
+        ctx.local_fns,
+        ctx.net,
+        ctx.db,
+    )?;
+    if !visited.insert((helper_file_id, helper_key.clone())) {
+        return None;
+    }
+
+    let helper_site = NetWalkSite {
+        root: helper_root,
+        file_id: helper_file_id,
+    };
+    let mut sends = Vec::new();
+    for nested_call in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+    {
+        if is_call_expr_in_nested_closure(&helper_block, &nested_call) {
+            continue;
+        }
+        match ctx.net.role(ctx.db, helper_file_id, &nested_call) {
+            Some(NetCallRole::Send(send_kind)) => {
+                sends.push((send_kind, extract_send_target_text(&nested_call, send_kind)));
+            }
+            Some(_) => {}
+            None => {
+                if let Some(send) =
+                    resolve_helper_send_recursive(ctx, &helper_site, &nested_call, visited)
+                {
+                    sends.push(send);
+                }
+            }
+        }
+    }
+
+    visited.remove(&(helper_file_id, helper_key));
+    let mut sends = sends.into_iter();
+    let send = sends.next()?;
+    sends.all(|candidate| candidate.0 == send.0).then_some(send)
+}
+
 fn collect_wrapped_net_send_flows(
-    root: &LuaChunk,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
 
     // Snapshot the per-file function blocks so we can borrow `local_fns`
     // mutably during the recursive collect call below.
-    let blocks: Vec<LuaBlock> = local_fns.get(root).all_blocks.clone();
+    let blocks: Vec<LuaBlock> = ctx
+        .local_fns
+        .get(site.file_id, &site.root)
+        .all_blocks
+        .clone();
     for block in &blocks {
-        collect_wrapped_net_send_flows_in_function_block(
-            root,
-            block,
-            &mut flows,
-            helper_registry,
-            local_fns,
-            db,
-        );
+        collect_wrapped_net_send_flows_in_function_block(ctx, site, block, &mut flows);
     }
 
     flows.sort_by_key(|flow| flow.start_range.start());
@@ -1392,12 +1503,10 @@ fn collect_wrapped_net_send_flows(
 }
 
 fn collect_wrapped_net_send_flows_in_function_block(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     function_block: &LuaBlock,
     flows: &mut Vec<NetSendFlow>,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     for block in function_block
         .syntax()
@@ -1416,15 +1525,17 @@ fn collect_wrapped_net_send_flows_in_function_block(
                 continue;
             };
 
-            let Some(method_name) = get_exact_net_method_name(&call_expr) else {
-                continue;
-            };
-
-            if method_name != "Start" {
+            if !call_has_literal_string_arg(&call_expr) {
                 continue;
             }
 
-            let Some(message_name) = extract_static_string_arg_value(&call_expr, 0) else {
+            let Some(NetCallRole::Start { message_idx }) =
+                ctx.net.role(ctx.db, site.file_id, &call_expr)
+            else {
+                continue;
+            };
+            let Some(message_name) = extract_static_string_arg_value(&call_expr, message_idx)
+            else {
                 continue;
             };
 
@@ -1432,57 +1543,257 @@ fn collect_wrapped_net_send_flows_in_function_block(
             let mut send = None;
 
             for next_stat in stats.iter().skip(index + 1) {
-                if let Some(next_call_expr) = call_expr_from_stat(next_stat)
-                    && let Some(next_method_name) = get_exact_net_method_name(&next_call_expr)
-                {
-                    if next_method_name == "Start" {
-                        break;
-                    }
-
-                    if let Some(send_kind) = net_send_kind_from_method_name(&next_method_name) {
-                        let target = extract_send_target_text(&next_call_expr, send_kind);
-                        send = Some((next_call_expr.get_range(), send_kind, target));
-                        break;
+                if let Some(next_call_expr) = call_expr_from_stat(next_stat) {
+                    match ctx.net.role(ctx.db, site.file_id, &next_call_expr) {
+                        Some(NetCallRole::Start { .. }) => break,
+                        Some(NetCallRole::Send(send_kind)) => {
+                            let target = extract_send_target_text(&next_call_expr, send_kind);
+                            send = Some((
+                                next_call_expr.get_range(),
+                                send_kind,
+                                target,
+                                call_display_name(&next_call_expr),
+                            ));
+                            break;
+                        }
+                        _ => {}
                     }
                 }
 
-                collect_net_write_ops_from_stat(
-                    root,
-                    &block,
-                    next_stat,
-                    &mut writes,
-                    helper_registry,
-                    local_fns,
-                    db,
-                );
+                collect_net_write_ops_from_stat(ctx, site, &block, next_stat, &mut writes);
             }
 
-            if let Some((send_range, send_kind, send_target)) = send {
+            if let Some((send_range, send_kind, send_target, send_display_name)) = send {
                 flows.push(NetSendFlow {
                     message_name,
                     start_range: call_expr.get_range(),
                     writes,
                     send_range,
                     send_kind,
+                    send_display_name,
                     send_target,
                     is_wrapped: true,
+                    materialized_from: None,
                 });
                 continue;
             }
 
             // Wrapped helper flows can start a net message in one function and send at call-site.
             // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
+            // The realm is a placeholder: `is_wrapped` flows are used for counterpart
+            // presence only and are skipped by every realm-sensitive check.
             flows.push(NetSendFlow {
                 message_name,
                 start_range: call_expr.get_range(),
                 writes: Vec::new(),
                 send_range: call_expr.get_range(),
-                send_kind: NetSendKind::Broadcast,
+                send_kind: NetSendKind {
+                    receiver_realm: GmodRealm::Client,
+                    target_arg_idx: None,
+                },
+                send_display_name: call_display_name(&call_expr),
                 send_target: None,
                 is_wrapped: true,
+                materialized_from: None,
             });
         }
     }
+}
+
+/// Collect complete send flows performed by ordinary, unannotated helpers.
+///
+/// The helper itself is found through the metadata-derived helper registry, and
+/// every operation inside it is still classified by [`NetCallResolver`] from
+/// the shipped signature annotations. The only extra work here is propagating
+/// literal string arguments from the call site into the helper's parameters so
+/// `net.Start(messageName)` can become concrete at
+/// `MyLib.SendString("Message", value)`. Static message names take this same
+/// path, which lets a no-argument helper produce a complete call-site flow.
+fn collect_unannotated_net_wrapper_send_flows(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+) -> Vec<NetSendFlow> {
+    let mut flows = Vec::new();
+    let mut visited = HashSet::new();
+    let empty_bindings = HashMap::new();
+
+    for call_expr in site.root.descendants::<LuaCallExpr>() {
+        if ctx.net.role(ctx.db, site.file_id, &call_expr).is_some() {
+            continue;
+        }
+        collect_send_flows_from_helper_call(
+            ctx,
+            site,
+            &call_expr,
+            &call_expr,
+            &empty_bindings,
+            &mut visited,
+            &mut flows,
+        );
+    }
+
+    flows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_send_flows_from_helper_call(
+    ctx: &mut NetCollectCtx<'_>,
+    caller_site: &NetWalkSite,
+    helper_call: &LuaCallExpr,
+    origin_call: &LuaCallExpr,
+    caller_bindings: &HashMap<String, String>,
+    visited: &mut HashSet<(FileId, String)>,
+    flows: &mut Vec<NetSendFlow>,
+) {
+    let Some((helper_key, helper_block, helper_root, helper_file_id)) =
+        resolve_call_to_function_block(
+            &caller_site.root,
+            caller_site.file_id,
+            helper_call,
+            ctx.helper_registry,
+            ctx.local_fns,
+            ctx.net,
+            ctx.db,
+        )
+    else {
+        return;
+    };
+    if !visited.insert((helper_file_id, helper_key.clone())) {
+        return;
+    }
+
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let helper_site = NetWalkSite {
+        root: helper_root,
+        file_id: helper_file_id,
+    };
+
+    for block in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaBlock::cast)
+    {
+        if block.syntax() != helper_block.syntax()
+            && is_block_in_nested_closure(&helper_block, &block)
+        {
+            continue;
+        }
+
+        let stats = block.get_stats().collect::<Vec<_>>();
+        for (index, stat) in stats.iter().enumerate() {
+            let Some(start_call) = call_expr_from_stat(stat) else {
+                continue;
+            };
+            let Some(NetCallRole::Start { message_idx }) =
+                ctx.net.role(ctx.db, helper_file_id, &start_call)
+            else {
+                continue;
+            };
+            let Some(message_name) =
+                extract_static_string_arg_value_with_bindings(&start_call, message_idx, &bindings)
+            else {
+                continue;
+            };
+
+            let mut writes = Vec::new();
+            let mut send = None;
+            for next_stat in stats.iter().skip(index + 1) {
+                if let Some(next_call) = call_expr_from_stat(next_stat) {
+                    match ctx.net.role(ctx.db, helper_file_id, &next_call) {
+                        Some(NetCallRole::Start { .. }) => break,
+                        Some(NetCallRole::Send(send_kind)) => {
+                            send =
+                                Some((send_kind, extract_send_target_text(&next_call, send_kind)));
+                            break;
+                        }
+                        _ => {}
+                    }
+                }
+                collect_net_write_ops_from_stat(ctx, &helper_site, &block, next_stat, &mut writes);
+            }
+
+            let Some((send_kind, send_target)) = send else {
+                continue;
+            };
+            flows.push(NetSendFlow {
+                message_name,
+                start_range: origin_call.get_range(),
+                writes,
+                send_range: origin_call.get_range(),
+                send_kind,
+                send_display_name: call_display_name(origin_call),
+                send_target,
+                // Unlike the conservative definition-site stubs, this is a
+                // complete transaction materialized at a concrete call site.
+                is_wrapped: false,
+                materialized_from: Some(crate::db_index::NetFlowOrigin {
+                    file_id: helper_file_id,
+                    start_range: start_call.get_range(),
+                }),
+            });
+        }
+    }
+
+    // Follow wrapper chains as well: an outer helper can delegate the complete
+    // transaction to an inner helper while forwarding its message parameter.
+    for nested_call in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+    {
+        if is_call_expr_in_nested_closure(&helper_block, &nested_call)
+            || ctx.net.role(ctx.db, helper_file_id, &nested_call).is_some()
+        {
+            continue;
+        }
+        collect_send_flows_from_helper_call(
+            ctx,
+            &helper_site,
+            &nested_call,
+            origin_call,
+            &bindings,
+            visited,
+            flows,
+        );
+    }
+
+    visited.remove(&(helper_file_id, helper_key));
+}
+
+fn helper_call_string_bindings(
+    call_expr: &LuaCallExpr,
+    helper_block: &LuaBlock,
+    caller_bindings: &HashMap<String, String>,
+) -> HashMap<String, String> {
+    let Some(closure) = helper_block
+        .syntax()
+        .parent()
+        .and_then(LuaClosureExpr::cast)
+    else {
+        return HashMap::new();
+    };
+    let params = get_closure_param_names(&closure);
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    params
+        .into_iter()
+        .zip(args)
+        .filter_map(|(param, arg)| {
+            static_string_expr(&arg, caller_bindings).map(|value| (param, value))
+        })
+        .collect()
+}
+
+fn extract_static_string_arg_value_with_bindings(
+    call_expr: &LuaCallExpr,
+    arg_idx: usize,
+    bindings: &HashMap<String, String>,
+) -> Option<String> {
+    let arg = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
+    static_string_expr(&arg, bindings)
 }
 
 fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBlock) -> bool {
@@ -1494,34 +1805,61 @@ fn is_block_in_nested_closure(function_block: &LuaBlock, candidate_block: &LuaBl
 }
 
 fn collect_net_receive_flow(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     call_expr: &LuaCallExpr,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) -> Option<NetReceiveFlow> {
-    let method_name = get_exact_net_method_name(call_expr)?;
-    if method_name != "Receive" {
+    // Same ordering as the send collector: this runs for every call expression
+    // in the file, so the cheap literal-string check gates the far more
+    // expensive signature resolution.
+    if !call_has_literal_string_arg(call_expr) {
         return None;
     }
 
-    let message_name = extract_static_string_arg_value(call_expr, 0)?;
+    let Some(NetCallRole::Receive {
+        message_idx,
+        callback_idx,
+    }) = ctx.net.role(ctx.db, site.file_id, call_expr)
+    else {
+        return None;
+    };
+    build_net_receive_flow(
+        ctx,
+        site,
+        call_expr,
+        message_idx,
+        callback_idx,
+        &HashMap::new(),
+        call_expr.get_range(),
+    )
+}
+
+fn build_net_receive_flow(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    call_expr: &LuaCallExpr,
+    message_idx: usize,
+    callback_idx: Option<usize>,
+    bindings: &HashMap<String, String>,
+    receive_range: TextRange,
+) -> Option<NetReceiveFlow> {
+    let message_name =
+        extract_static_string_arg_value_with_bindings(call_expr, message_idx, bindings)?;
 
     let mut reads = Vec::new();
-    let mut reads_opaque = false;
-    if let Some(callback_expr) = call_expr
-        .get_args_list()
-        .and_then(|args| args.get_args().nth(1))
-    {
-        match resolve_callback_block(root, &callback_expr, local_fns) {
-            Some(callback_block) => collect_net_read_ops_from_block(
-                root,
-                callback_block,
-                &mut reads,
-                helper_registry,
-                local_fns,
-                db,
-            ),
+    // No annotated `callback` role means we cannot know which argument holds the
+    // receiver, so treat the reads as unknown rather than as none — asserting an
+    // empty read list here would invent count mismatches against every send.
+    let mut reads_opaque = callback_idx.is_none();
+    if let Some(callback_expr) = callback_idx.and_then(|idx| {
+        call_expr
+            .get_args_list()
+            .and_then(|args| args.get_args().nth(idx))
+    }) {
+        match resolve_callback_block(site.file_id, &site.root, &callback_expr, ctx.local_fns) {
+            Some(callback_block) => {
+                collect_net_read_ops_from_block(ctx, site, callback_block, &mut reads)
+            }
             None => {
                 // Inline closure that can't yield a block is malformed — but a
                 // bare name reference we couldn't resolve in the file is the
@@ -1537,10 +1875,107 @@ fn collect_net_receive_flow(
 
     Some(NetReceiveFlow {
         message_name,
-        receive_range: call_expr.get_range(),
+        receive_range,
         reads,
         reads_opaque,
     })
+}
+
+fn collect_unannotated_net_wrapper_receive_flows(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    call_expr: &LuaCallExpr,
+) -> Vec<NetReceiveFlow> {
+    let mut flows = Vec::new();
+    collect_receive_flows_from_helper_call(
+        ctx,
+        site,
+        call_expr,
+        call_expr,
+        &HashMap::new(),
+        &mut HashSet::new(),
+        &mut flows,
+    );
+    flows
+}
+
+#[allow(clippy::too_many_arguments)]
+fn collect_receive_flows_from_helper_call(
+    ctx: &mut NetCollectCtx<'_>,
+    caller_site: &NetWalkSite,
+    helper_call: &LuaCallExpr,
+    origin_call: &LuaCallExpr,
+    caller_bindings: &HashMap<String, String>,
+    visited: &mut HashSet<(FileId, String)>,
+    flows: &mut Vec<NetReceiveFlow>,
+) {
+    let Some((helper_key, helper_block, helper_root, helper_file_id)) =
+        resolve_call_to_function_block(
+            &caller_site.root,
+            caller_site.file_id,
+            helper_call,
+            ctx.helper_registry,
+            ctx.local_fns,
+            ctx.net,
+            ctx.db,
+        )
+    else {
+        return;
+    };
+    if !visited.insert((helper_file_id, helper_key.clone())) {
+        return;
+    }
+
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
+    let helper_site = NetWalkSite {
+        root: helper_root,
+        file_id: helper_file_id,
+    };
+    for nested_call in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+    {
+        if is_call_expr_in_nested_closure(&helper_block, &nested_call) {
+            continue;
+        }
+        match ctx.net.role(ctx.db, helper_file_id, &nested_call) {
+            Some(NetCallRole::Receive {
+                message_idx,
+                callback_idx,
+            }) => {
+                // Literal registrations are already indexed in the helper's
+                // defining file. Only materialize a call-site flow when the
+                // wrapper call makes a dynamic message parameter concrete.
+                if extract_static_string_arg_value(&nested_call, message_idx).is_some() {
+                    continue;
+                }
+                if let Some(flow) = build_net_receive_flow(
+                    ctx,
+                    &helper_site,
+                    &nested_call,
+                    message_idx,
+                    callback_idx,
+                    &bindings,
+                    origin_call.get_range(),
+                ) {
+                    flows.push(flow);
+                }
+            }
+            Some(_) => {}
+            None => collect_receive_flows_from_helper_call(
+                ctx,
+                &helper_site,
+                &nested_call,
+                origin_call,
+                &bindings,
+                visited,
+                flows,
+            ),
+        }
+    }
+
+    visited.remove(&(helper_file_id, helper_key));
 }
 
 /// Resolve the callback block for a `net.Receive` second argument. Handles
@@ -1550,6 +1985,7 @@ fn collect_net_receive_flow(
 /// Cross-file references are out of scope — those resolve at semantic-model
 /// time and are not part of the per-file collection pass.
 fn resolve_callback_block(
+    file_id: FileId,
     root: &LuaChunk,
     callback_expr: &LuaExpr,
     local_fns: &mut LocalFnCache,
@@ -1563,7 +1999,7 @@ fn resolve_callback_block(
     };
     let target_name = name_expr.get_name_text()?;
 
-    local_fns.get(root).bare.get(&target_name).cloned()
+    local_fns.get(file_id, root).bare.get(&target_name).cloned()
 }
 
 /// Resolve a call expression to a function definition, returning a
@@ -1571,12 +2007,6 @@ fn resolve_callback_block(
 /// and the chunk that owns the body (which becomes the new `root` for
 /// further nested helper resolution within that body).
 ///
-/// Same-file resolution takes priority. If that fails, falls back to a
-/// workspace-global helper registry (cross-file helpers) — DarkRP-style
-/// `Module.fn` helpers defined in shared files are the motivating case.
-///
-/// Handles bare-name calls (`helperFn(...)`) and dotted calls
-/// (`Module.fn(...)`). Method calls (`obj:method(...)`) are out of scope.
 /// Resolve a `(FileId, LuaSyntaxId)` helper-registry entry back to its
 /// `(LuaBlock, LuaChunk)` by rebuilding the owning file's red tree on demand.
 /// Returns an owned `LuaChunk` (cheap clone of a red node) which becomes the new
@@ -1595,260 +2025,269 @@ fn resolve_registry_entry(
 
 fn resolve_call_to_function_block(
     root: &LuaChunk,
+    root_file_id: FileId,
     call_expr: &LuaCallExpr,
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
+    net: &mut NetCallResolver,
     db: &DbIndex,
-) -> Option<(String, LuaBlock, LuaChunk)> {
-    let prefix = call_expr.get_prefix_expr()?;
-
-    match prefix {
-        LuaExpr::NameExpr(name_expr) => {
-            let name = name_expr.get_name_text()?;
-            if let Some(block) = local_fns.get(root).bare.get(&name).cloned() {
-                return Some((name, block, root.clone()));
-            }
-            // Cross-file fallback: a bare-name call may reference a global
-            // function defined in another file (less common than dotted
-            // helpers, but supported for symmetry).
-            if let Some((file_id, syntax_id)) = helper_registry.map.get(&name)
-                && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
-            {
-                return Some((name.clone(), block, chunk));
-            }
-            None
+) -> Option<(String, LuaBlock, LuaChunk, FileId)> {
+    // Direct global member calls have a stable symbol identity even when
+    // duplicate declarations make the inferred signature winner dependent on
+    // index order. Resolve that identity through the deterministic registry.
+    // Aliases and locals take the signature-identity path below.
+    if !call_expr_has_shadowing_local_root(db, root_file_id, call_expr)
+        && let Some(call_path) = call_expr.get_access_path()
+    {
+        let call_path = call_path.strip_prefix("_G.").unwrap_or(&call_path);
+        let global_id = GlobalId::new(call_path);
+        if let Some((file_id, syntax_id)) = helper_registry.globals.get(&global_id)
+            && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+        {
+            return Some((
+                format!("global:{}", global_id.get_name()),
+                block,
+                chunk,
+                *file_id,
+            ));
         }
-        LuaExpr::IndexExpr(index_expr) => {
-            if call_expr.is_colon_call()
-                && let Some(method_name) = index_field_name(&index_expr)
-            {
-                if let Some(block) = local_fns.get(root).methods.get(&method_name).cloned() {
-                    return Some((format!(":{method_name}"), block, root.clone()));
-                }
-                if let Some((file_id, syntax_id)) = helper_registry.methods.get(&method_name)
-                    && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
-                {
-                    return Some((format!(":{method_name}"), block, chunk));
-                }
-            }
-            let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
-                return None;
-            };
-            let prefix_text = prefix_name.get_name_text()?;
-            let LuaIndexKey::Name(field_token) = index_expr.get_index_key()? else {
-                return None;
-            };
-            let field_text = field_token.get_name_text().to_string();
-            let key = format!("{prefix_text}.{field_text}");
-            if let Some(block) = local_fns.get(root).dotted.get(&key).cloned() {
-                return Some((key, block, root.clone()));
-            }
-            if let Some((file_id, syntax_id)) = helper_registry.map.get(&key)
-                && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
-            {
-                return Some((key.clone(), block, chunk));
-            }
-            None
-        }
-        _ => None,
     }
+
+    if let Some(signature_id) = net.signature_id(db, root_file_id, call_expr)
+        && let Some((file_id, syntax_id)) = helper_registry.signatures.get(&signature_id)
+        && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+    {
+        return Some((
+            format!("signature:{signature_id:?}"),
+            block,
+            chunk,
+            *file_id,
+        ));
+    }
+
+    // Pre-analysis can run before every local/global callable type cache is
+    // available. Preserve lexical same-file wrapper expansion only when the
+    // written bare name identifies exactly one function body in that file.
+    if let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
+        && let Some(name) = name_expr.get_name_text()
+        && let Some(block) = local_fns.get(root_file_id, root).bare.get(&name).cloned()
+    {
+        return Some((
+            format!("unique-local:{name}"),
+            block,
+            root.clone(),
+            root_file_id,
+        ));
+    }
+
+    // Dynamic receivers sometimes have no inferable class in Lua source. Keep
+    // existing wrapper support only when the method name maps to exactly one
+    // indexed function body workspace-wide; ambiguity is a hard stop.
+    if call_expr.is_colon_call()
+        && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
+        && let Some(LuaIndexKey::Name(method_token)) = index_expr.get_index_key()
+    {
+        let method_name = SmolStr::new(method_token.get_name_text());
+        if let Some((file_id, syntax_id)) = helper_registry.methods.get(&method_name)
+            && let Some((block, chunk)) = resolve_registry_entry(db, file_id, syntax_id)
+        {
+            return Some((
+                format!("unique-method:{method_name}"),
+                block,
+                chunk,
+                *file_id,
+            ));
+        }
+    }
+
+    None
+}
+
+/// Shared state for a file's net collection walk. Bundled so the recursive
+/// helpers stay readable: they already carried 11 positional arguments before
+/// `file_id` and the call resolver had to be threaded for annotation lookup.
+struct NetCollectCtx<'a> {
+    db: &'a DbIndex,
+    helper_registry: &'a HelperRegistry,
+    local_fns: &'a mut LocalFnCache,
+    net: &'a mut NetCallResolver,
+}
+
+/// Position of the walk within a file, which changes when helper expansion
+/// crosses into a function body defined elsewhere. `file_id` must travel with
+/// `root` so signature resolution runs against the owning file.
+#[derive(Clone)]
+struct NetWalkSite {
+    root: LuaChunk,
+    file_id: FileId,
 }
 
 fn collect_net_read_ops_from_block(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     block: LuaBlock,
     reads: &mut Vec<NetOpEntry>,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
-        root,
+        ctx,
+        site,
         &block,
         block.syntax(),
         reads,
         &mut visited,
         false,
         NetOpDirection::Read,
-        helper_registry,
         &[],
-        local_fns,
-        db,
     );
 }
 
 fn collect_net_write_ops_from_stat(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     block: &LuaBlock,
     stat: &LuaStat,
     writes: &mut Vec<NetOpEntry>,
-    helper_registry: &HelperRegistry,
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     let mut visited = HashSet::new();
     collect_net_ops_recursive(
-        root,
+        ctx,
+        site,
         block,
         stat.syntax(),
         writes,
         &mut visited,
         false,
         NetOpDirection::Write,
-        helper_registry,
         &[],
-        local_fns,
-        db,
     );
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum NetOpDirection {
-    Read,
-    Write,
-}
-
-impl NetOpDirection {
-    fn matches(self, kind: NetOpKind) -> bool {
-        match self {
-            NetOpDirection::Read => kind.is_read(),
-            NetOpDirection::Write => kind.is_write(),
-        }
-    }
-}
-
-/// Walk `subtree` for net.Read*/Write* call expressions, treating non-net
+/// Walk `subtree` for net payload call expressions, treating non-net
 /// calls that resolve to a same-file function as helper expansions: we recurse
 /// into the helper body so writes/reads it performs participate in the
 /// outer flow. Cycles are guarded via `visited`, and dynamic-context propagates
 /// from the call site into the helper body.
+#[allow(clippy::too_many_arguments)]
 fn collect_net_ops_recursive(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
     visited: &mut HashSet<String>,
     force_dynamic: bool,
     direction: NetOpDirection,
-    helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     // Keep the public helper name used by read/write collection call sites,
     // while the implementation below documents the call-argument evaluation
     // ordering needed for nested reads such as `net.ReadData(net.ReadUInt(16))`.
     collect_net_ops_eval_order(
-        root,
+        ctx,
+        site,
         enclosing_block,
         subtree,
         out,
         visited,
         force_dynamic,
         direction,
-        helper_registry,
         flow_prefix,
-        local_fns,
-        db,
     );
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_net_ops_eval_order(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     enclosing_block: &LuaBlock,
     subtree: &LuaSyntaxNode,
     out: &mut Vec<NetOpEntry>,
     visited: &mut HashSet<String>,
     force_dynamic: bool,
     direction: NetOpDirection,
-    helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     if let Some(call_expr) = LuaCallExpr::cast(subtree.clone()) {
         collect_net_ops_from_call_expr(
-            root,
+            ctx,
+            site,
             enclosing_block,
             &call_expr,
             out,
             visited,
             force_dynamic,
             direction,
-            helper_registry,
             flow_prefix,
-            local_fns,
-            db,
         );
         return;
     }
 
     for child in subtree.children() {
         collect_net_ops_eval_order(
-            root,
+            ctx,
+            site,
             enclosing_block,
             &child,
             out,
             visited,
             force_dynamic,
             direction,
-            helper_registry,
             flow_prefix,
-            local_fns,
-            db,
         );
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_net_ops_from_call_expr(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
     visited: &mut HashSet<String>,
     force_dynamic: bool,
     direction: NetOpDirection,
-    helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     if is_call_expr_in_nested_closure(enclosing_block, call_expr) {
         return;
     }
 
     collect_net_ops_from_call_args(
-        root,
+        ctx,
+        site,
         enclosing_block,
         call_expr,
         out,
         visited,
         force_dynamic,
         direction,
-        helper_registry,
         flow_prefix,
-        local_fns,
-        db,
     );
 
-    if let Some(method_name) = get_exact_net_method_name(call_expr) {
-        if let Some(op_kind) = NetOpKind::from_fn_name(method_name.as_str())
-            && direction.matches(op_kind)
+    // A call the metadata recognizes as a net op is a leaf: it never doubles as
+    // a helper to expand into.
+    if let Some(role) = ctx.net.role(ctx.db, site.file_id, call_expr) {
+        if let NetCallRole::Payload(op) = role
+            && op.direction == direction
         {
             let dynamic =
                 force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, call_expr);
-            let bits = extract_bit_width_arg(call_expr, op_kind);
-            let value_text = extract_write_value_text(call_expr, op_kind);
+            let bits_param_idx = ctx.net.bits_param_idx(ctx.db, site.file_id, call_expr);
+            let bits = bits_param_idx.and_then(|arg_idx| extract_bit_width_arg(call_expr, arg_idx));
+            let value_text = extract_write_value_text(call_expr, &op);
             let local_path = extract_flow_path(enclosing_block, call_expr);
             let mut flow_path = Vec::with_capacity(flow_prefix.len() + local_path.len());
             flow_path.extend_from_slice(flow_prefix);
             flow_path.extend(local_path);
             out.push(NetOpEntry {
-                kind: op_kind,
+                op,
+                display_name: call_display_name(call_expr),
                 range: call_expr.get_range(),
                 dynamic,
                 bits,
+                has_bits_param: bits_param_idx.is_some(),
                 value_text,
                 flow_path,
             });
@@ -1856,8 +2295,16 @@ fn collect_net_ops_from_call_expr(
         return;
     }
 
-    let Some((helper_key, helper_block, helper_root)) =
-        resolve_call_to_function_block(root, call_expr, helper_registry, local_fns, db)
+    let Some((helper_key, helper_block, helper_root, helper_file_id)) =
+        resolve_call_to_function_block(
+            &site.root,
+            site.file_id,
+            call_expr,
+            ctx.helper_registry,
+            ctx.local_fns,
+            ctx.net,
+            ctx.db,
+        )
     else {
         return;
     };
@@ -1875,34 +2322,35 @@ fn collect_net_ops_from_call_expr(
     let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
     nested_prefix.extend_from_slice(flow_prefix);
     nested_prefix.extend(local_path);
+    let helper_site = NetWalkSite {
+        root: helper_root,
+        file_id: helper_file_id,
+    };
     collect_net_ops_recursive(
-        &helper_root,
+        ctx,
+        &helper_site,
         &helper_block,
         helper_block.syntax(),
         out,
         visited,
         helper_force_dynamic,
         direction,
-        helper_registry,
         &nested_prefix,
-        local_fns,
-        db,
     );
     visited.remove(&helper_key);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn collect_net_ops_from_call_args(
-    root: &LuaChunk,
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
     enclosing_block: &LuaBlock,
     call_expr: &LuaCallExpr,
     out: &mut Vec<NetOpEntry>,
     visited: &mut HashSet<String>,
     force_dynamic: bool,
     direction: NetOpDirection,
-    helper_registry: &HelperRegistry,
     flow_prefix: &[NetFlowFrame],
-    local_fns: &mut LocalFnCache,
-    db: &DbIndex,
 ) {
     let Some(args) = call_expr.get_args_list() else {
         return;
@@ -1910,17 +2358,15 @@ fn collect_net_ops_from_call_args(
 
     for arg in args.get_args() {
         collect_net_ops_eval_order(
-            root,
+            ctx,
+            site,
             enclosing_block,
             arg.syntax(),
             out,
             visited,
             force_dynamic,
             direction,
-            helper_registry,
             flow_prefix,
-            local_fns,
-            db,
         );
     }
 }
@@ -2122,39 +2568,200 @@ fn call_expr_from_stat(stat: &LuaStat) -> Option<LuaCallExpr> {
     call_expr_stat.get_call_expr()
 }
 
-fn get_exact_net_method_name(call_expr: &LuaCallExpr) -> Option<String> {
-    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
-        return None;
-    };
-
-    let LuaExpr::NameExpr(prefix_name_expr) = index_expr.get_prefix_expr()? else {
-        return None;
-    };
-
-    if prefix_name_expr.get_name_text()? != "net" {
-        return None;
-    }
-
-    let LuaIndexKey::Name(method_name_token) = index_expr.get_index_key()? else {
-        return None;
-    };
-
-    Some(method_name_token.get_name_text().to_string())
+/// What a call does in the net subsystem, resolved purely from the callee's
+/// signature metadata. Because resolution goes through the type layer, aliases
+/// (`local netStart = net.Start`), cross-file globals, and annotated replacement
+/// APIs are all recognized identically to the builtins. Ordinary wrappers are
+/// expanded through their bodies and need no annotations of their own.
+#[derive(Debug, Clone)]
+enum NetCallRole {
+    /// Begins a message: `call_arg("gmod.net_message", "start")`. Carries the
+    /// index of the parameter holding the message name, so a wrapper that takes
+    /// it somewhere other than first is read correctly.
+    Start { message_idx: usize },
+    /// Registers a receiver: `call_arg("gmod.net_message", "receive")`, with the
+    /// message-name index and the `callback` role's index when annotated.
+    Receive {
+        message_idx: usize,
+        callback_idx: Option<usize>,
+    },
+    /// Terminates and sends a message: the `net_send` attribute.
+    Send(NetSendKind),
+    /// Writes or reads a payload value: the `net_payload` attribute.
+    Payload(NetOpDescriptor),
 }
 
-/// Extracts the static bit-width literal from `WriteUInt`/`WriteInt`/`ReadUInt`/`ReadInt`.
-/// Returns `None` for op kinds without a bit-width parameter, or when the bits arg is
-/// not an integer literal (variable, expression, runtime computation). We deliberately
-/// only capture literals — anything else is unknowable at index time and would produce
-/// false-positive mismatches if compared.
-/// Captures a short snippet of the value-arg source text for a `Write*` op so
+/// Resolves [`NetCallRole`] for call expressions, memoizing per call site.
+///
+/// Signature resolution runs type inference, which is far more expensive than
+/// the syntax match it replaces, so results are cached by syntax id — the send
+/// and wrapped-send passes both scan the same statements, and helper expansion
+/// can revisit a body. One [`LuaInferCache`] is kept per file so expansion into
+/// a helper defined in another file still resolves against that file.
+#[derive(Default)]
+struct NetCallResolver {
+    caches: HashMap<FileId, LuaInferCache>,
+    memo: HashMap<(FileId, LuaSyntaxId), Option<NetCallRole>>,
+}
+
+impl NetCallResolver {
+    fn role(
+        &mut self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+    ) -> Option<NetCallRole> {
+        let key = (file_id, LuaSyntaxId::from_node(call_expr.syntax()));
+        if let Some(cached) = self.memo.get(&key) {
+            return cached.clone();
+        }
+        let resolved = self.resolve_uncached(db, file_id, call_expr);
+        self.memo.insert(key, resolved.clone());
+        resolved
+    }
+
+    fn resolve_uncached(
+        &mut self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+    ) -> Option<NetCallRole> {
+        let signature_id = self.signature_id(db, file_id, call_expr)?;
+        let signature = db.get_signature_index().get(&signature_id)?;
+        let call_arg_idx = |param_idx| {
+            param_idx_to_call_arg_idx(
+                param_idx,
+                call_expr.is_colon_call(),
+                signature.is_colon_define,
+            )
+        };
+
+        if let Some(mut send_kind) = crate::db_index::signature_net_send(db, signature_id) {
+            send_kind.target_arg_idx = send_kind.target_arg_idx.and_then(call_arg_idx);
+            return Some(NetCallRole::Send(send_kind));
+        }
+        if let Some(descriptor) = crate::db_index::signature_net_payload(db, signature_id) {
+            return Some(NetCallRole::Payload(descriptor));
+        }
+
+        for param_idx in 0..signature.params.len() {
+            let Some(role) = crate::db_index::find_best_call_arg_role_for_param(
+                signature,
+                param_idx,
+                crate::db_index::GMOD_DOMAIN_NET_MESSAGE,
+                &["start", "receive"],
+            ) else {
+                continue;
+            };
+            return match role.role.as_str() {
+                "start" => Some(NetCallRole::Start {
+                    message_idx: call_arg_idx(param_idx)?,
+                }),
+                "receive" => Some(NetCallRole::Receive {
+                    message_idx: call_arg_idx(param_idx)?,
+                    callback_idx: crate::db_index::signature_net_callback_param_idx(signature)
+                        .and_then(call_arg_idx),
+                }),
+                _ => None,
+            };
+        }
+        None
+    }
+
+    /// Index of the bit-width parameter, from the `gmod.net_payload`/`bits` role.
+    fn bits_param_idx(
+        &mut self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+    ) -> Option<usize> {
+        let signature_id = self.signature_id(db, file_id, call_expr)?;
+        let signature = db.get_signature_index().get(&signature_id)?;
+        let param_idx = crate::db_index::signature_net_bits_param_idx(db, signature_id)?;
+        param_idx_to_call_arg_idx(
+            param_idx,
+            call_expr.is_colon_call(),
+            signature.is_colon_define,
+        )
+    }
+
+    fn signature_id(
+        &mut self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+    ) -> Option<LuaSignatureId> {
+        let cache = self
+            .caches
+            .entry(file_id)
+            .or_insert_with(|| LuaInferCache::new(file_id, Default::default()));
+        if let Some(signature_id) =
+            crate::semantic::get_prefix_expr_signature_id(db, cache, call_expr)
+        {
+            return Some(signature_id);
+        }
+
+        // Some same-file member declarations do not yet have a semantic owner
+        // edge at this pre-analysis phase, while their inferred callable type
+        // is already available. Read that type instead of falling back to the
+        // source spelling of the member. Ambiguous callable unions are left
+        // unresolved rather than choosing an arbitrary body.
+        let prefix = call_expr.get_prefix_expr()?;
+        let typ = crate::semantic::infer_expr(db, cache, prefix).ok()?;
+        unique_signature_id_from_type(&typ)
+    }
+}
+
+fn unique_signature_id_from_type(typ: &LuaType) -> Option<LuaSignatureId> {
+    match typ {
+        LuaType::Signature(signature_id) => Some(*signature_id),
+        LuaType::TypeGuard(inner) => unique_signature_id_from_type(inner),
+        LuaType::TableOf(inner) => unique_signature_id_from_type(inner),
+        LuaType::Union(union) => {
+            let mut signature = None;
+            for member in union.types() {
+                let Some(candidate) = unique_signature_id_from_type(member) else {
+                    continue;
+                };
+                if signature.is_some_and(|existing| existing != candidate) {
+                    return None;
+                }
+                signature = Some(candidate);
+            }
+            signature
+        }
+        _ => None,
+    }
+}
+
+/// Source text of the called function, used for display in diagnostics, hover
+/// and code lens. Prefers what the developer actually wrote so an aliased or
+/// wrapped call reports its own name.
+fn call_display_name(call_expr: &LuaCallExpr) -> SmolStr {
+    call_expr
+        .get_prefix_expr()
+        .map(|prefix| {
+            SmolStr::new(
+                prefix
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(""),
+            )
+        })
+        .unwrap_or_else(|| SmolStr::new_static("<net call>"))
+}
+
+/// Captures a short snippet of the value-arg source text for a write op so
 /// hover can display *what* is being written (e.g. `net.WriteString("hi")`
 /// instead of just `net.WriteString`). Returns `None` for read ops, when the
 /// arg is missing, when it spans multiple lines, or when it's too long to
 /// render inline — robustness over completeness; we'd rather show the bare
 /// op name than blow up the hover popup with a 200-char expression.
-fn extract_write_value_text(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Option<String> {
-    if !op_kind.is_write() {
+fn extract_write_value_text(call_expr: &LuaCallExpr, op: &NetOpDescriptor) -> Option<String> {
+    if !op.is_write() {
         return None;
     }
 
@@ -2175,14 +2782,13 @@ fn extract_write_value_text(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Opti
     Some(trimmed.to_string())
 }
 
-fn extract_bit_width_arg(call_expr: &LuaCallExpr, op_kind: NetOpKind) -> Option<u32> {
-    let arg_idx = match op_kind {
-        NetOpKind::WriteUInt | NetOpKind::WriteInt => 1,
-        NetOpKind::ReadUInt | NetOpKind::ReadInt => 0,
-        _ => return None,
-    };
-
-    let arg_expr = call_expr.get_args_list()?.get_args().nth(arg_idx)?;
+/// Extracts the static bit-width literal from a payload op that declares a
+/// `gmod.net_payload`/`bits` parameter. Returns `None` for ops with no such
+/// parameter, or when the argument is not an integer literal (variable,
+/// expression, runtime computation) — anything else is unknowable at index time
+/// and would produce false-positive mismatches if compared.
+fn extract_bit_width_arg(call_expr: &LuaCallExpr, bits_arg_idx: usize) -> Option<u32> {
+    let arg_expr = call_expr.get_args_list()?.get_args().nth(bits_arg_idx)?;
     let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
         return None;
     };
@@ -2206,32 +2812,37 @@ fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> O
     crate::ast_util::literal_string_arg_value(call_expr, arg_idx)
 }
 
-fn net_send_kind_from_method_name(method_name: &str) -> Option<NetSendKind> {
-    match method_name {
-        "Send" => Some(NetSendKind::Send),
-        "Broadcast" => Some(NetSendKind::Broadcast),
-        "SendToServer" => Some(NetSendKind::SendToServer),
-        "SendOmit" => Some(NetSendKind::Omit),
-        "SendPAS" => Some(NetSendKind::PAS),
-        "SendPVS" => Some(NetSendKind::PVS),
-        _ => None,
-    }
+/// Cheap syntactic gate for the flow collectors, which run over every
+/// statement-level call in a candidate file. A tracked flow always names its
+/// message with a literal string, so a call carrying none can never start or
+/// receive one, and is rejected here before the far more expensive signature
+/// resolution runs.
+///
+/// Deliberately index-agnostic: the message parameter's position comes from the
+/// annotation and is not fixed at zero. Ordering only — every call that would
+/// have produced a flow still reaches the resolver.
+fn call_has_literal_string_arg(call_expr: &LuaCallExpr) -> bool {
+    let Some(args_list) = call_expr.get_args_list() else {
+        return false;
+    };
+    args_list.get_args().any(|arg| match arg {
+        LuaExpr::LiteralExpr(literal_expr) => {
+            matches!(literal_expr.get_literal(), Some(LuaLiteralToken::String(_)))
+        }
+        _ => false,
+    })
 }
 
-/// Captures the recipient argument of a `net.Send*` call as a single-line
-/// snippet for display in code lens. Returns `None` for kinds with no
-/// recipient (`Broadcast`, `SendToServer`) or when the source is multi-line,
-/// too long, or otherwise unsuitable for inline display. Cheap: only inspects
-/// the first arg's source text.
+/// Captures the recipient argument of a send terminator as a single-line snippet
+/// for display in code lens. The argument position comes from the
+/// `gmod.net_payload`/`target` call-arg role, so terminators with no recipient
+/// (`net.Broadcast`, `net.SendToServer`) yield `None` without a name check.
+/// Returns `None` when the source is multi-line or too long to render inline.
 fn extract_send_target_text(call_expr: &LuaCallExpr, send_kind: NetSendKind) -> Option<String> {
-    match send_kind {
-        NetSendKind::Broadcast | NetSendKind::SendToServer => return None,
-        _ => {}
-    }
-
     const MAX_INLINE_LEN: usize = 40;
 
-    let arg_expr = call_expr.get_args_list()?.get_args().next()?;
+    let target_arg_idx = send_kind.target_arg_idx?;
+    let arg_expr = call_expr.get_args_list()?.get_args().nth(target_arg_idx)?;
     let raw = arg_expr.syntax().text().to_string();
     let trimmed = raw.trim();
     if trimmed.is_empty() || trimmed.contains('\n') || trimmed.contains('\r') {
@@ -6884,6 +7495,12 @@ struct AnnotatedGmodGlobalCallRoleMap {
     candidate_call_path_matcher: Option<AhoCorasick>,
     candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
     environment_role_source_files: HashSet<FileId>,
+    /// Canonical function metadata per `(wire_format, direction)`, published to
+    /// the network index for features that must emit a net call. Values keep
+    /// their precedence rank so the winner does not depend on the signature
+    /// index's iteration order.
+    canonical_net_ops:
+        HashMap<(SmolStr, NetOpDirection), (CanonicalNetOpRank, crate::db_index::CanonicalNetOp)>,
 }
 
 struct AnnotatedGmodCallRoleMap<'a> {
@@ -7304,14 +7921,6 @@ impl AnnotatedGmodCallRoles {
     fn direct_candidate_presence(&self) -> AnnotatedGmodCandidatePresence {
         AnnotatedGmodCandidatePresence {
             has_system: !self.system_roles.is_empty() || !self.system_callback_roles.is_empty(),
-            has_net: self.system_roles.iter().any(|(kind, _)| {
-                matches!(
-                    kind,
-                    GmodSystemCallKind::AddNetworkString
-                        | GmodSystemCallKind::NetStart
-                        | GmodSystemCallKind::NetReceive
-                )
-            }),
             has_hook: !self.hook_roles.is_empty() || !self.hook_callback_roles.is_empty(),
             has_load: !self.load_roles.is_empty() || !self.compilefile_roles.is_empty(),
             has_environment: !self.compilefile_roles.is_empty()
@@ -7630,10 +8239,62 @@ fn match_bool(matches: bool) -> StaticArgTypeMatch {
     }
 }
 
+/// Total precedence of canonical net metadata, lowest wins. Workspace class is
+/// the meaningful preference; path and position make equal-name duplicates
+/// deterministic even when their metadata conflicts.
+#[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct CanonicalNetOpRank {
+    workspace: u8,
+    normalized_path: String,
+    raw_path: String,
+    position: TextSize,
+}
+
+fn canonical_net_op_rank(db: &DbIndex, signature_id: LuaSignatureId) -> CanonicalNetOpRank {
+    let file_id = signature_id.get_file_id();
+    let workspace_id = db
+        .get_module_index()
+        .get_workspace_id(file_id)
+        .unwrap_or(crate::WorkspaceId::MAIN);
+    let workspace = match workspace_id {
+        crate::WorkspaceId::STD => 0,
+        id if id.is_library() => 1,
+        id if id.is_remote() => 2,
+        _ => 3,
+    };
+    let raw_path = db
+        .get_vfs()
+        .get_file_path(&file_id)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_default();
+    CanonicalNetOpRank {
+        workspace,
+        normalized_path: crate::vfs::normalize_path_for_ordering(&raw_path),
+        raw_path,
+        position: signature_id.get_position(),
+    }
+}
+
 impl AnnotatedGmodGlobalCallRoleMap {
     fn build(db: &DbIndex) -> Self {
+        Self::build_with_helpers(db, None)
+    }
+
+    fn build_with_helpers(
+        db: &DbIndex,
+        mut helper_registry: Option<&mut HelperRegistryBuilder>,
+    ) -> Self {
         let mut role_map = Self::default();
         for (signature_id, signature) in db.get_signature_index().iter() {
+            if let Some(helper_registry) = helper_registry.as_deref_mut() {
+                helper_registry.add_signature(db, *signature_id);
+            }
+            // Net payload/send metadata rides on standalone signature attributes
+            // rather than call-arg roles, so it is collected before the
+            // `has_call_arg_roles` filter — keeping this to a single pass over
+            // the signature index instead of adding a second whole-index scan.
+            role_map.add_signature_net_op(db, *signature_id);
+
             if !signature.has_call_arg_roles() {
                 continue;
             }
@@ -7642,9 +8303,65 @@ impl AnnotatedGmodGlobalCallRoleMap {
             };
             role_map.add_signature_closure(db, *signature_id, &closure);
         }
+
         role_map.rebuild_candidate_call_path_set();
 
         role_map
+    }
+
+    /// Records the canonical function name for an annotated payload op.
+    fn add_signature_net_op(&mut self, db: &DbIndex, signature_id: LuaSignatureId) {
+        let descriptor = crate::db_index::signature_net_payload(db, signature_id);
+        let is_send =
+            descriptor.is_none() && crate::db_index::signature_net_send(db, signature_id).is_some();
+        if descriptor.is_none() && !is_send {
+            return;
+        }
+
+        let Some(closure) = closure_from_signature_id(db, signature_id) else {
+            return;
+        };
+        let Some(call_path) = global_call_path_for_signature_closure(db, signature_id, &closure)
+        else {
+            return;
+        };
+        let display_path = call_path
+            .strip_prefix("_G.")
+            .unwrap_or(&call_path)
+            .to_string();
+
+        if let Some(descriptor) = descriptor {
+            // Wrappers are expected to share a wire format with the builtin they
+            // wrap, so collisions here are normal rather than exceptional. The
+            // signature index is a `HashMap`, so its iteration order varies per
+            // process; ranking the candidates keeps the published name stable.
+            let candidate = (
+                canonical_net_op_rank(db, signature_id),
+                crate::db_index::CanonicalNetOp {
+                    name: display_path,
+                    has_bits_param: crate::db_index::signature_net_bits_param_idx(db, signature_id)
+                        .is_some(),
+                },
+            );
+            self.canonical_net_ops
+                .entry((descriptor.wire_format, descriptor.direction))
+                .and_modify(|current| {
+                    if candidate.0 < current.0 {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert(candidate);
+        }
+    }
+
+    /// Canonical op metadata with its ranking dropped, ready to publish.
+    fn canonical_net_ops(
+        &self,
+    ) -> HashMap<(SmolStr, NetOpDirection), crate::db_index::CanonicalNetOp> {
+        self.canonical_net_ops
+            .iter()
+            .map(|(key, (_, op))| (key.clone(), op.clone()))
+            .collect()
     }
 
     fn rebuild_candidate_call_path_set(&mut self) {
@@ -7654,7 +8371,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
         for (call_path, roles) in &self.roles_by_path {
             let presence = roles.candidate_presence();
             if !presence.has_system
-                && !presence.has_net
                 && !presence.has_hook
                 && !presence.has_scripted_class
                 && !presence.has_load
@@ -7689,7 +8405,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
             };
 
             presence.has_system |= candidate_presence.has_system;
-            presence.has_net |= candidate_presence.has_net;
             presence.has_hook |= candidate_presence.has_hook;
             presence.has_scripted_class |= candidate_presence.has_scripted_class;
             presence.has_load |= candidate_presence.has_load;
@@ -7697,7 +8412,6 @@ impl AnnotatedGmodGlobalCallRoleMap {
             presence.has_file_find |= candidate_presence.has_file_find;
 
             if presence.has_system
-                && presence.has_net
                 && presence.has_hook
                 && presence.has_scripted_class
                 && presence.has_load

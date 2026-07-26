@@ -180,6 +180,30 @@ fn call_resolves_to_inferred_guard_owner(
     semantic::get_prefix_expr_signature_id(db, cache, &call) == Some(owner.signature_id())
 }
 
+/// True when `call_expr` calls an annotated net operation — a message start, a
+/// send terminator, or a payload write/read.
+///
+/// Shares the analyzer's resolution path, so an alias, a local binding, or an
+/// annotated wrapper is classified identically to the `net.*` builtin. Editor
+/// handlers should use this instead of re-deriving the answer, and instead of
+/// consulting the flow index: an op that forms no complete flow (a bare
+/// `net.WriteString` with no `net.Start`) is still a net op and is never
+/// recorded in the flow index.
+///
+/// `cache` is supplied by the caller because classifying a document means asking
+/// this for every call in it, and building an inference cache per question would
+/// throw away all reuse between them.
+pub fn call_expr_is_net_op(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(signature_id) = semantic::get_prefix_expr_signature_id(db, cache, call_expr) else {
+        return false;
+    };
+    db_index::signature_has_net_op_metadata(db, signature_id)
+}
+
 pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
     let mut url_contents = HashMap::new();
     for url in urls {

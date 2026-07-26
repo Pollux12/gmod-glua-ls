@@ -41,6 +41,8 @@ pub const GMOD_CALL_ARG_BUILTINS_FIXTURE: &str = r#"
 ---@attribute call_arg_field(domain: string, role: string, field_path: string, priority: integer?)
 ---@attribute overload_call_arg(param: integer, domain: string, role: string, priority: integer?)
 ---@attribute overload_call_arg_field(param: integer, domain: string, role: string, field_path: string, priority: integer?)
+---@attribute net_send(receiver_realm: string)
+---@attribute net_payload(direction: string, wire_format: string)
 
 util = util or {}
 net = net or {}
@@ -101,6 +103,188 @@ function net.Start(messageName, unreliable) end
 ---@[call_arg("gmod.net_message", "callback")]
 ---@param callback function
 function net.Receive(messageName, callback) end
+
+-- Net payload ops. Recognition is annotation-driven, so these carry the
+-- same `net_payload` / `net_send` metadata as the shipped annotations;
+-- without it the analyzer sees no net flows at all.
+
+---@param angle any
+---@[net_payload("write", "angle")]
+function net.WriteAngle(angle) end
+
+---@return Angle
+---@[net_payload("read", "angle")]
+function net.ReadAngle() end
+
+---@param boolean any
+---@[net_payload("write", "bit")]
+function net.WriteBit(boolean) end
+
+---@return number
+---@[net_payload("read", "bit")]
+function net.ReadBit() end
+
+---@param boolean any
+---@[net_payload("write", "bool")]
+function net.WriteBool(boolean) end
+
+---@return boolean
+---@[net_payload("read", "bool")]
+function net.ReadBool() end
+
+---@param color any
+---@[net_payload("write", "color")]
+function net.WriteColor(color) end
+
+---@return table
+---@[net_payload("read", "color")]
+function net.ReadColor() end
+
+---@param binaryData any
+---@[net_payload("write", "data")]
+function net.WriteData(binaryData) end
+
+---@return string
+---@[net_payload("read", "data")]
+function net.ReadData() end
+
+---@param double any
+---@[net_payload("write", "double")]
+function net.WriteDouble(double) end
+
+---@return number
+---@[net_payload("read", "double")]
+function net.ReadDouble() end
+
+---@param entity any
+---@[net_payload("write", "entity")]
+function net.WriteEntity(entity) end
+
+---@return Entity
+---@[net_payload("read", "entity")]
+function net.ReadEntity() end
+
+---@param float any
+---@[net_payload("write", "float")]
+function net.WriteFloat(float) end
+
+---@return number
+---@[net_payload("read", "float")]
+function net.ReadFloat() end
+
+---@param matrix any
+---@[net_payload("write", "matrix")]
+function net.WriteMatrix(matrix) end
+
+---@return VMatrix
+---@[net_payload("read", "matrix")]
+function net.ReadMatrix() end
+
+---@param normal any
+---@[net_payload("write", "normal")]
+function net.WriteNormal(normal) end
+
+---@return Vector
+---@[net_payload("read", "normal")]
+function net.ReadNormal() end
+
+---@param ply any
+---@[net_payload("write", "player")]
+function net.WritePlayer(ply) end
+
+---@return Player
+---@[net_payload("read", "player")]
+function net.ReadPlayer() end
+
+---@param str any
+---@[net_payload("write", "string")]
+function net.WriteString(str) end
+
+---@return string
+---@[net_payload("read", "string")]
+function net.ReadString() end
+
+---@param tbl any
+---@[net_payload("write", "table")]
+function net.WriteTable(tbl) end
+
+---@return table
+---@[net_payload("read", "table")]
+function net.ReadTable() end
+
+---@param data any
+---@[net_payload("write", "type")]
+function net.WriteType(data) end
+
+---@return any
+---@[net_payload("read", "type")]
+function net.ReadType() end
+
+---@param uint64 any
+---@[net_payload("write", "uint64")]
+function net.WriteUInt64(uint64) end
+
+---@return string
+---@[net_payload("read", "uint64")]
+function net.ReadUInt64() end
+
+---@param vector any
+---@[net_payload("write", "vector")]
+function net.WriteVector(vector) end
+
+---@return Vector
+---@[net_payload("read", "vector")]
+function net.ReadVector() end
+
+---@param value number
+---@[call_arg("gmod.net_payload", "bits")]
+---@param bitCount number
+---@[net_payload("write", "int")]
+function net.WriteInt(value, bitCount) end
+
+---@[call_arg("gmod.net_payload", "bits")]
+---@param bitCount number
+---@return number
+---@[net_payload("read", "int")]
+function net.ReadInt(bitCount) end
+
+---@param value number
+---@[call_arg("gmod.net_payload", "bits")]
+---@param bitCount number
+---@[net_payload("write", "uint")]
+function net.WriteUInt(value, bitCount) end
+
+---@[call_arg("gmod.net_payload", "bits")]
+---@param bitCount number
+---@return number
+---@[net_payload("read", "uint")]
+function net.ReadUInt(bitCount) end
+
+---@[call_arg("gmod.net_payload", "target")]
+---@param ply any
+---@[net_send("client")]
+function net.Send(ply) end
+
+---@[call_arg("gmod.net_payload", "target")]
+---@param ply any
+---@[net_send("client")]
+function net.SendOmit(ply) end
+
+---@[call_arg("gmod.net_payload", "target")]
+---@param position any
+---@[net_send("client")]
+function net.SendPAS(position) end
+
+---@[call_arg("gmod.net_payload", "target")]
+---@param position any
+---@[net_send("client")]
+function net.SendPVS(position) end
+
+---@[net_send("client")]
+function net.Broadcast() end
+
+---@[net_send("server")]
+function net.SendToServer() end
 
 ---@[call_arg("gmod.hook", "add")]
 ---@param eventName string

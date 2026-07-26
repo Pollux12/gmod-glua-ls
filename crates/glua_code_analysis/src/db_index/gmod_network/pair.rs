@@ -1,6 +1,6 @@
 use crate::FileId;
 
-use super::{GmodNetworkIndex, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind};
+use super::{GmodNetworkIndex, NetOpEntry, NetReceiveFlow, NetSendFlow};
 use crate::db_index::gmod_infer::{GmodInferIndex, GmodRealm};
 
 /// True when a sender flow's writes are structurally compatible with a
@@ -33,7 +33,7 @@ fn is_perfect_read_write_match(send_flow: &NetSendFlow, receive_flow: &NetReceiv
             .writes
             .iter()
             .zip(receive_flow.reads.iter())
-            .all(|(write, read)| write.kind.to_read_counterpart() == Some(read.kind))
+            .all(|(write, read)| write.op.pairs_with(&read.op))
 }
 
 fn flow_match_dp(
@@ -59,7 +59,7 @@ fn flow_match_dp(
     } else {
         let w = &writes[i];
         let r = &reads[j];
-        let kinds_match = w.kind.to_read_counterpart() == Some(r.kind);
+        let kinds_match = w.op.pairs_with(&r.op);
 
         let mut ok = false;
 
@@ -84,19 +84,6 @@ fn flow_match_dp(
 
     memo[i][j] = Some(result);
     result
-}
-
-/// The realm a `net.Send*` call's payload will arrive in. Broadcast/PVS/PAS/
-/// SendOmit/Send all target clients; only `SendToServer` targets the server.
-pub fn expected_receiver_realm(send_kind: NetSendKind) -> Option<GmodRealm> {
-    match send_kind {
-        NetSendKind::Send
-        | NetSendKind::Broadcast
-        | NetSendKind::Omit
-        | NetSendKind::PAS
-        | NetSendKind::PVS => Some(GmodRealm::Client),
-        NetSendKind::SendToServer => Some(GmodRealm::Server),
-    }
 }
 
 pub fn is_strict_realm(realm: GmodRealm) -> bool {
@@ -142,10 +129,7 @@ pub fn pair_senders_for_receive<'a>(
             if !is_strict_realm(sender_realm) {
                 return false;
             }
-            let Some(expected) = expected_receiver_realm(send_flow.send_kind) else {
-                return false;
-            };
-            if expected != receive_realm {
+            if send_flow.send_kind.receiver_realm != receive_realm {
                 return false;
             }
             if !is_opposite_strict_realm_pair(sender_realm, receive_realm) {

@@ -593,6 +593,9 @@ mod tests {
         let mut emmyrc = Emmyrc::default();
         emmyrc.gmod.enabled = true;
         ws.analysis.update_config(emmyrc.into());
+        // `net.Receive` is recognized through its annotation now, so the
+        // annotated builtins must be present for the cross-file reference.
+        ws.def_gmod_call_arg_builtins();
 
         check!(ws.check_references(
             r#"
