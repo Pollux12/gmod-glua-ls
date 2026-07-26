@@ -68,6 +68,85 @@ mod test {
     }
 
     #[test]
+    fn issue_47_multi_return_expansion_uses_positional_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param ok boolean
+            ---@param msg string
+            local function take(ok, msg) return ok, msg end
+
+            ---@return boolean, string
+            local function producer() return true, "x" end
+
+            local direct = take(producer())
+            local protected = take(pcall(producer))
+            local ok, msg = producer()
+            local positional = take(ok, msg)
+            local truncated = take((producer()), "x")
+
+            ---@param prefix integer
+            ---@param ok boolean
+            ---@param msg string
+            local function take_three(prefix, ok, msg) return prefix, ok, msg end
+
+            local prefixed = take_three(1, producer())
+
+            ---@class Vector
+            ---@class Angle
+
+            ---@return Vector, Angle
+            local function local_to_world() end
+
+            ---@param value Vector
+            local function take_vector(value) return value end
+
+            local vector = take_vector(local_to_world())
+            "#,
+        ));
+    }
+
+    #[test]
+    fn issue_47_multi_return_expansion_reports_first_slot_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param ok boolean
+            ---@param msg string
+            local function take(ok, msg) end
+
+            ---@return number, string
+            local function producer() return 1, "x" end
+
+            take(producer())
+            "#,
+        ));
+    }
+
+    #[test]
+    fn issue_47_multi_return_expansion_reports_later_slot_mismatch() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param ok boolean
+            ---@param msg string
+            local function take(ok, msg) end
+
+            ---@return boolean, table
+            local function producer() return true, {} end
+
+            take(producer())
+            "#,
+        ));
+    }
+
+    #[test]
     fn callback_with_fewer_params_and_compatible_return_is_accepted() {
         let mut ws = VirtualWorkspace::new();
 

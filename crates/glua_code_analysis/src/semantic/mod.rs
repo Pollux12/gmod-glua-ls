@@ -478,14 +478,18 @@ impl<'a> SemanticModel<'a> {
         compact_expr: &LuaExpr,
     ) -> TypeCheckResult {
         let compact_fact = self.infer_expr_fact(compact_expr.clone());
+        self.type_check_expr_detail_with_type(source, compact_fact.typ(), compact_expr)
+    }
+
+    pub(crate) fn type_check_expr_detail_with_type(
+        &self,
+        source: &LuaType,
+        compact_type: &LuaType,
+        compact_expr: &LuaExpr,
+    ) -> TypeCheckResult {
         let mut member_facts = HashMap::new();
         self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
-        check_type_compact_detail_with_member_facts(
-            self.db,
-            source,
-            compact_fact.typ(),
-            member_facts,
-        )
+        check_type_compact_detail_with_member_facts(self.db, source, compact_type, member_facts)
     }
 
     fn collect_table_expr_member_facts(
