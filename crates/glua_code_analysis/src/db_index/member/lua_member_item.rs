@@ -5,7 +5,8 @@ use std::{
 
 use crate::{
     DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
-    db_index::gmod_infer::GmodRealm, is_table_assignment_merge_type, widen_file_define_member_type,
+    db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
+    is_table_assignment_merge_type, widen_file_define_member_type,
 };
 use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, PathTrait};
 use rowan::TextSize;
@@ -858,10 +859,13 @@ fn get_member_id_priority_tiers(
     db: &DbIndex,
     caller_file_id: &FileId,
     member_ids: &[LuaMemberId],
-) -> Vec<(u8, Vec<LuaMemberId>)> {
+) -> Vec<(WorkspaceResolutionKey, Vec<LuaMemberId>)> {
     let module_index = db.get_module_index();
     let Some(caller_workspace_id) = module_index.get_workspace_id(*caller_file_id) else {
-        return vec![(0, member_ids.to_vec())];
+        return vec![(
+            WorkspaceResolutionKey::new(0, 0, crate::WorkspaceId { id: 0 }),
+            member_ids.to_vec(),
+        )];
     };
 
     let mut priority_tiers = BTreeMap::new();
@@ -870,7 +874,7 @@ fn get_member_id_priority_tiers(
             .get_workspace_id(member_id.file_id)
             .unwrap_or(crate::WorkspaceId::MAIN);
         let Some(priority) =
-            module_index.workspace_resolution_priority(caller_workspace_id, candidate_workspace_id)
+            module_index.workspace_resolution_key(caller_workspace_id, candidate_workspace_id)
         else {
             continue;
         };
@@ -886,8 +890,8 @@ fn get_member_id_priority_tiers(
 
 fn select_member_ids_by_workspace_and_realm(
     db: &DbIndex,
-    _caller_file_id: &FileId,
-    priority_tiers: Vec<(u8, Vec<LuaMemberId>)>,
+    caller_file_id: &FileId,
+    priority_tiers: Vec<(WorkspaceResolutionKey, Vec<LuaMemberId>)>,
     caller_realm: GmodRealm,
 ) -> Vec<LuaMemberId> {
     if !db.get_emmyrc().gmod.enabled {
@@ -912,12 +916,19 @@ fn select_member_ids_by_workspace_and_realm(
 
     let member_index = db.get_member_index();
     let infer_index = db.get_gmod_infer_index();
+    let caller_is_main = db
+        .get_module_index()
+        .get_workspace_id(*caller_file_id)
+        .is_some_and(|workspace_id| {
+            db.get_module_index().get_workspace_kind(workspace_id) == WorkspaceKind::Main
+        });
 
     let mut result = Vec::new();
     let mut found_first_compatible = false;
     let mut all_seen_are_non_meta = true;
+    let mut can_supplement_from_library = false;
 
-    for (_, tier_member_ids) in priority_tiers {
+    for (priority, tier_member_ids) in priority_tiers {
         let compatible_member_ids = tier_member_ids
             .into_iter()
             .filter(|member_id| {
@@ -940,7 +951,9 @@ fn select_member_ids_by_workspace_and_realm(
             result.extend(compatible_member_ids);
             found_first_compatible = true;
             all_seen_are_non_meta = !has_meta;
-        } else if all_seen_are_non_meta {
+            can_supplement_from_library =
+                caller_is_main && priority.broad_tier() == 0 && all_seen_are_non_meta;
+        } else if can_supplement_from_library && all_seen_are_non_meta {
             // We have only non-meta members so far. Supplement with any
             // meta (annotated) members from this lower-priority tier so that
             // resolve_member_type can prefer them via meta_override_file_define.
@@ -1262,7 +1275,7 @@ mod tests {
 
     use crate::{
         DbIndex, Emmyrc, FileId, GmodRealm, GmodRealmFileMetadata, GmodRealmRange, InFiled,
-        LuaSemanticDeclId, LuaType, LuaTypeDeclId, WorkspaceId,
+        LuaSemanticDeclId, LuaType, LuaTypeDeclId, WorkspaceId, WorkspaceResolutionKey,
         db_index::{
             LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey, LuaMemberOwner, WorkspaceKind,
         },
@@ -1282,6 +1295,10 @@ mod tests {
     fn make_member_id_with_kind(file_id: FileId, start: u32, kind: LuaSyntaxKind) -> LuaMemberId {
         let range = TextRange::new(TextSize::new(start), TextSize::new(start + 1));
         LuaMemberId::new(LuaSyntaxId::new(kind.into(), range), file_id)
+    }
+
+    fn priority(tier: u8) -> WorkspaceResolutionKey {
+        WorkspaceResolutionKey::new(tier, 0, WorkspaceId { id: 0 })
     }
 
     fn table_const(start: u32, end: u32) -> LuaType {
@@ -1392,8 +1409,14 @@ mod tests {
         );
 
         assert_eq!(tiers.len(), 2);
-        assert_eq!(tiers[0], (1, vec![library_member]));
-        assert_eq!(tiers[1], (2, vec![std_member]));
+        assert_eq!(
+            tiers[0],
+            (
+                WorkspaceResolutionKey::new(1, 2, library_workspace),
+                vec![library_member]
+            )
+        );
+        assert_eq!(tiers[1], (priority(2), vec![std_member]));
     }
 
     #[test]
@@ -1432,7 +1455,96 @@ mod tests {
             get_member_id_priority_tiers(&db, &caller_file, &[caller_member, other_main_member]);
 
         assert_eq!(tiers.len(), 1);
-        assert_eq!(tiers[0], (0, vec![caller_member, other_main_member]));
+        assert_eq!(
+            tiers[0],
+            (priority(0), vec![caller_member, other_main_member])
+        );
+    }
+
+    #[test]
+    fn member_id_priority_tiers_split_library_roots_in_registration_order() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+        let first_library = WorkspaceId { id: 3 };
+        let second_library = WorkspaceId { id: 4 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Project").into(),
+            WorkspaceId::MAIN,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Libraries/first").into(),
+            first_library,
+            WorkspaceKind::Library,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Libraries/second").into(),
+            second_library,
+            WorkspaceKind::Library,
+        );
+
+        let caller_file = FileId::new(1);
+        let first_file = FileId::new(2);
+        let second_file = FileId::new(3);
+        module_index.add_module_by_path(caller_file, "C:/Project/init.lua");
+        module_index.add_module_by_path(first_file, "C:/Libraries/first/api.lua");
+        module_index.add_module_by_path(second_file, "C:/Libraries/second/api.lua");
+        let first_member = make_member_id(first_file, 1);
+        let second_member = make_member_id(second_file, 1);
+
+        let tiers = get_member_id_priority_tiers(&db, &caller_file, &[second_member, first_member]);
+
+        assert_eq!(
+            tiers,
+            vec![
+                (
+                    WorkspaceResolutionKey::new(1, 1, first_library),
+                    vec![first_member]
+                ),
+                (
+                    WorkspaceResolutionKey::new(1, 2, second_library),
+                    vec![second_member]
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn member_id_priority_tiers_keep_same_library_declarations_together() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+        let library = WorkspaceId { id: 3 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Project").into(),
+            WorkspaceId::MAIN,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Libraries/annotations").into(),
+            library,
+            WorkspaceKind::Library,
+        );
+
+        let caller_file = FileId::new(1);
+        let first_file = FileId::new(2);
+        let second_file = FileId::new(3);
+        module_index.add_module_by_path(caller_file, "C:/Project/init.lua");
+        module_index.add_module_by_path(first_file, "C:/Libraries/annotations/first.lua");
+        module_index.add_module_by_path(second_file, "C:/Libraries/annotations/second.lua");
+        let first_member = make_member_id(first_file, 1);
+        let second_member = make_member_id(second_file, 1);
+
+        let tiers = get_member_id_priority_tiers(&db, &caller_file, &[second_member, first_member]);
+
+        assert_eq!(
+            tiers,
+            vec![(
+                WorkspaceResolutionKey::new(1, 1, library),
+                vec![second_member, first_member]
+            )]
+        );
     }
 
     #[test]
@@ -1452,7 +1564,10 @@ mod tests {
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
             &FileId::new(100),
-            vec![(0, vec![tier_one_member]), (1, vec![tier_two_member])],
+            vec![
+                (priority(0), vec![tier_one_member]),
+                (priority(1), vec![tier_two_member]),
+            ],
             GmodRealm::Client,
         );
 
@@ -1476,11 +1591,47 @@ mod tests {
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
             &FileId::new(101),
-            vec![(0, vec![server_member]), (1, vec![unknown_member])],
+            vec![
+                (priority(0), vec![server_member]),
+                (priority(1), vec![unknown_member]),
+            ],
             GmodRealm::Client,
         );
 
         assert!(selected.is_empty());
+    }
+
+    #[test]
+    fn select_member_ids_by_workspace_and_realm_uses_next_realm_compatible_library() {
+        let mut db = make_db();
+        let first_library_member = make_member_id(FileId::new(20), 1);
+        let second_library_member = make_member_id(FileId::new(21), 2);
+
+        set_file_realms(
+            &mut db,
+            &[
+                (first_library_member.file_id, GmodRealm::Server),
+                (second_library_member.file_id, GmodRealm::Client),
+            ],
+        );
+
+        let selected = select_member_ids_by_workspace_and_realm(
+            &db,
+            &FileId::new(101),
+            vec![
+                (
+                    WorkspaceResolutionKey::new(1, 1, WorkspaceId { id: 3 }),
+                    vec![first_library_member],
+                ),
+                (
+                    WorkspaceResolutionKey::new(1, 2, WorkspaceId { id: 4 }),
+                    vec![second_library_member],
+                ),
+            ],
+            GmodRealm::Client,
+        );
+
+        assert_eq!(selected, vec![second_library_member]);
     }
 
     #[test]
@@ -1502,7 +1653,7 @@ mod tests {
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
             &caller_file,
-            vec![(0, vec![other_file_member, same_file_member])],
+            vec![(priority(0), vec![other_file_member, same_file_member])],
             GmodRealm::Server,
         );
 
@@ -1521,13 +1672,13 @@ mod tests {
         let selected_forward = select_member_ids_by_workspace_and_realm(
             &db,
             &caller_file,
-            vec![(0, vec![first_member, second_member])],
+            vec![(priority(0), vec![first_member, second_member])],
             GmodRealm::Server,
         );
         let selected_reversed = select_member_ids_by_workspace_and_realm(
             &db,
             &caller_file,
-            vec![(0, vec![second_member, first_member])],
+            vec![(priority(0), vec![second_member, first_member])],
             GmodRealm::Server,
         );
 
@@ -2173,7 +2324,10 @@ mod tests {
         let selected = select_member_ids_by_workspace_and_realm(
             &db,
             &caller_file,
-            vec![(0, vec![override_member]), (1, vec![library_member])],
+            vec![
+                (priority(0), vec![override_member]),
+                (priority(1), vec![library_member]),
+            ],
             GmodRealm::Shared,
         );
 

@@ -288,6 +288,10 @@ impl LuaTypeDeclId {
         self.id.as_ref()
     }
 
+    pub(crate) fn is_global(&self) -> bool {
+        matches!(self.id.as_ref(), LuaTypeIdentifier::Global(_))
+    }
+
     pub fn get_name(&self) -> &str {
         match self.id.as_ref() {
             LuaTypeIdentifier::Global(name) => name.as_ref(),

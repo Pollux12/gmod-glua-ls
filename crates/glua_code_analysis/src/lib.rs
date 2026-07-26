@@ -14,6 +14,7 @@ mod config;
 mod db_index;
 mod diagnostic;
 mod gamemode_base;
+mod library_collision;
 mod profile;
 mod resources;
 mod semantic;
@@ -30,6 +31,7 @@ use glua_parser::{
     LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
     LuaParenExpr, LuaParser, LuaSyntaxTree,
 };
+pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;

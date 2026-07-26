@@ -26,6 +26,27 @@ pub struct WorkspaceId {
     pub id: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct WorkspaceResolutionKey {
+    tier: u8,
+    library_order: usize,
+    workspace_id: u32,
+}
+
+impl WorkspaceResolutionKey {
+    pub(crate) fn new(tier: u8, library_order: usize, workspace_id: WorkspaceId) -> Self {
+        Self {
+            tier,
+            library_order,
+            workspace_id: workspace_id.id,
+        }
+    }
+
+    pub(crate) fn broad_tier(self) -> u8 {
+        self.tier
+    }
+}
+
 #[allow(unused)]
 impl WorkspaceId {
     pub const STD: WorkspaceId = WorkspaceId { id: 0 };

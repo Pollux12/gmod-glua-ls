@@ -698,6 +698,14 @@ impl LuaMemberIndex {
             .collect()
     }
 
+    pub(crate) fn iter_current_owner_keys(
+        &self,
+    ) -> impl Iterator<Item = (&LuaMemberOwner, &LuaMemberKey)> {
+        self.member_owner_key_index
+            .iter()
+            .flat_map(|(owner, members_by_key)| members_by_key.keys().map(move |key| (owner, key)))
+    }
+
     pub fn add_function_scope_range(&mut self, file_id: FileId, range: TextRange) {
         let ranges = self.function_scope_ranges.entry(file_id).or_default();
         match ranges.binary_search_by_key(&range.start(), |range| range.start()) {

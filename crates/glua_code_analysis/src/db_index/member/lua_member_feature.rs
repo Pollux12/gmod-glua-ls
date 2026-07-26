@@ -32,6 +32,13 @@ impl LuaMemberFeature {
         )
     }
 
+    pub fn is_method_decl(&self) -> bool {
+        matches!(
+            self,
+            LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl
+        )
+    }
+
     pub fn is_decl(&self) -> bool {
         matches!(
             self,
