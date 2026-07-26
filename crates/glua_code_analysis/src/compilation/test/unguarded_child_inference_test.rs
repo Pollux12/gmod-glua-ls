@@ -1636,6 +1636,186 @@ mod test {
     }
 
     #[test]
+    fn immutable_return_cast_guard_suppresses_closure_child_diagnostic() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetPlayerColor fun(self: Player): number
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            local function make(ent)
+                if ent:IsPlayer() then
+                    local direct = ent:GetPlayerColor()
+                    local callback = function()
+                        return ent:GetPlayerColor()
+                    end
+                    return direct, callback
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn mutable_return_cast_guard_reports_only_closure_child_access() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetPlayerColor fun(self: Player): number
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            ---@param replacement Entity
+            local function make(ent, replacement)
+                if ent:IsPlayer() then
+                    local direct = ent:GetPlayerColor()
+                    local callback = function()
+                        return ent:GetPlayerColor()
+                    end
+                    ent = replacement
+                    return direct, callback
+                end
+            end
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(diagnostics[0].range.start.line, 15);
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+        );
+    }
+
+    #[test]
+    fn return_cast_closure_capture_tracks_incremental_mutability_and_reopen() {
+        const IMMUTABLE_SOURCE: &str = r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetPlayerColor fun(self: Player): number
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            ---@param replacement Entity
+            local function make(ent, replacement)
+                if ent:IsPlayer() then
+                    local callback = function()
+                        return ent:GetPlayerColor()
+                    end
+                    return callback
+                end
+            end
+        "#;
+        const MUTABLE_SOURCE: &str = r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field GetPlayerColor fun(self: Player): number
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            ---@param replacement Entity
+            local function make(ent, replacement)
+                if ent:IsPlayer() then
+                    local callback = function()
+                        return ent:GetPlayerColor()
+                    end
+                    ent = replacement
+                    return callback
+                end
+            end
+        "#;
+
+        let fresh_diagnostic_count = |source: &str| {
+            let mut fresh = VirtualWorkspace::new();
+            enable_gmod(&mut fresh);
+            let file_id = fresh.def(source);
+            diagnostic_count(&mut fresh, file_id, DiagnosticCode::InferUnguardedChild)
+        };
+
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let uri = ws
+            .virtual_url_generator
+            .new_uri("lua/autorun/shared/issue_49_incremental.lua");
+        let file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .expect("initial immutable file");
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            fresh_diagnostic_count(IMMUTABLE_SOURCE)
+        );
+
+        let updated_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(MUTABLE_SOURCE.to_string()))
+            .expect("mutable update");
+        assert_eq!(updated_file_id, file_id);
+        assert_eq!(
+            diagnostic_count(
+                &mut ws,
+                updated_file_id,
+                DiagnosticCode::InferUnguardedChild
+            ),
+            fresh_diagnostic_count(MUTABLE_SOURCE)
+        );
+
+        let restored_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .expect("restored immutable update");
+        assert_eq!(
+            diagnostic_count(
+                &mut ws,
+                restored_file_id,
+                DiagnosticCode::InferUnguardedChild
+            ),
+            fresh_diagnostic_count(IMMUTABLE_SOURCE)
+        );
+
+        ws.analysis
+            .remove_file_by_uri(&uri)
+            .expect("removed incremental file");
+        let reopened_file_id = ws
+            .analysis
+            .update_file_by_uri(&uri, Some(IMMUTABLE_SOURCE.to_string()))
+            .expect("reopened immutable file");
+        assert_eq!(
+            diagnostic_count(
+                &mut ws,
+                reopened_file_id,
+                DiagnosticCode::InferUnguardedChild
+            ),
+            fresh_diagnostic_count(IMMUTABLE_SOURCE)
+        );
+    }
+
+    #[test]
     fn unguarded_child_reports_once_and_keeps_unknown_diagnostic_separate() {
         let mut ws = VirtualWorkspace::new();
         enable_gmod(&mut ws);
