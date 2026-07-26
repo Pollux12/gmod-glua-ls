@@ -21,11 +21,13 @@ use std::{
 
 use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
-    LuaFunctionType, LuaInferredGuardOwner, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
-    LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact, LuaTypeOwner, WorkspaceId,
+    LuaFunctionType, LuaInferenceNodeId, LuaInferredGuardOwner, LuaMember, LuaMemberFeature,
+    LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact,
+    LuaTypeOwner, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
+    semantic::infer_expr_fact_with_cache,
 };
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr, LuaSyntaxId,
@@ -290,6 +292,12 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                 continue;
             }
             let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
+            let current_fact = db.get_type_index().get_type_fact(&type_owner);
+            let target_node = LuaInferenceNodeId::TypeOwner(type_owner.clone());
+            let can_upgrade_authority = current_fact.as_ref().is_some_and(|fact| {
+                fact.base_provenance_kind()
+                    != Some(crate::LuaInferenceProvenanceKind::ExplicitAnnotation)
+            });
             let can_refine_nominal_type = !current_is_uninformative
                 && db.get_emmyrc().gmod.enabled
                 && current_cache
@@ -299,7 +307,7 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                     .get_reference_index()
                     .get_decl_references(&decl_id.file_id, decl_id)
                     .is_none_or(|references| !references.mutable);
-            if !current_is_uninformative && !can_refine_nominal_type {
+            if !current_is_uninformative && !can_refine_nominal_type && !can_upgrade_authority {
                 continue;
             }
 
@@ -309,35 +317,49 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             if !matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)) {
                 continue;
             }
-            let Ok(mut inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
+            let inferred_fact = select_result_fact(
+                infer_expr_fact_with_cache(db, &mut infer_cache, expr),
+                ret_idx,
+            );
+            let inferred_type = inferred_fact.typ().clone();
+            if type_is_uninformative(&inferred_type) {
                 continue;
-            };
-            if let LuaType::Variadic(variadic) = inferred_type {
-                inferred_type = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
-            } else if ret_idx != 0 {
-                inferred_type = LuaType::Nil;
             }
-            if type_is_uninformative(&inferred_type)
-                || current_cache
-                    .as_ref()
-                    .is_some_and(|current| current.as_type() == &inferred_type)
+            if current_cache
+                .as_ref()
+                .is_some_and(|current| current.as_type() == &inferred_type)
             {
+                if current_fact.as_ref().is_some_and(|current| {
+                    inferred_fact.has_independently_stronger_authority_than(current, &target_node)
+                }) {
+                    result.updates.push(InitializerCacheUpdate::ReplaceFact {
+                        owner: type_owner,
+                        fact: inferred_fact,
+                    });
+                }
                 continue;
             }
 
+            let has_stronger_declared_authority = can_upgrade_authority
+                && current_fact.as_ref().is_some_and(|current| {
+                    inferred_fact.base_provenance_kind()
+                        == Some(crate::LuaInferenceProvenanceKind::ExplicitAnnotation)
+                        && inferred_fact
+                            .has_independently_stronger_authority_than(current, &target_node)
+                });
+            let is_nominal_refinement = can_refine_nominal_type
+                && current_cache.as_ref().is_some_and(|current| {
+                    is_strict_nominal_refinement(db, &inferred_type, current.as_type())
+                });
             if current_is_uninformative {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
-                    inferred_type,
+                    fact: inferred_fact,
                 });
-            } else if can_refine_nominal_type
-                && current_cache.as_ref().is_some_and(|current| {
-                    is_strict_nominal_refinement(db, &inferred_type, current.as_type())
-                })
-            {
+            } else if has_stronger_declared_authority || is_nominal_refinement {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
-                    inferred_type,
+                    fact: inferred_fact,
                 });
             }
         }
@@ -346,14 +368,16 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
         result
     });
 
+    let mut updates = Vec::new();
     for result in results {
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
             result.guard_dependencies,
         );
-        apply_initializer_cache_updates(db, result.updates);
+        updates.extend(result.updates);
     }
+    apply_initializer_cache_updates(db, updates);
 }
 
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -409,7 +433,7 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
 
             result.updates.push(InitializerCacheUpdate::Overwrite {
                 owner: type_owner,
-                inferred_type,
+                fact: LuaTypeFact::certain(inferred_type),
             });
         }
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
@@ -417,14 +441,16 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
         result
     });
 
+    let mut updates = Vec::new();
     for result in results {
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
             result.guard_dependencies,
         );
-        apply_initializer_cache_updates(db, result.updates);
+        updates.extend(result.updates);
     }
+    apply_initializer_cache_updates(db, updates);
 }
 
 struct InitializerRefreshResult {
@@ -448,36 +474,55 @@ impl InitializerRefreshResult {
 enum InitializerCacheUpdate {
     Bind {
         owner: LuaTypeOwner,
-        inferred_type: LuaType,
+        fact: LuaTypeFact,
     },
     Overwrite {
         owner: LuaTypeOwner,
-        inferred_type: LuaType,
+        fact: LuaTypeFact,
+    },
+    ReplaceFact {
+        owner: LuaTypeOwner,
+        fact: LuaTypeFact,
     },
 }
 
 fn apply_initializer_cache_updates(db: &mut DbIndex, updates: Vec<InitializerCacheUpdate>) {
+    let mut fact_updates = Vec::with_capacity(updates.len());
     for update in updates {
         match update {
-            InitializerCacheUpdate::Bind {
-                owner,
-                inferred_type,
-            } => {
-                common::bind_resolved_type(db, owner, LuaTypeCache::InferType(inferred_type));
-            }
-            InitializerCacheUpdate::Overwrite {
-                owner,
-                inferred_type,
-            } => {
-                common::write_type_cache(
+            InitializerCacheUpdate::Bind { owner, fact } => {
+                common::bind_resolved_type(
                     db,
-                    owner,
-                    LuaTypeCache::InferType(inferred_type),
-                    common::TypeCacheWriteMode::ForceOverwrite,
+                    owner.clone(),
+                    LuaTypeCache::InferType(fact.typ().clone()),
                 );
+                if db
+                    .get_type_index()
+                    .get_type_cache(&owner)
+                    .is_some_and(|cache| cache.as_type() == fact.typ())
+                {
+                    fact_updates.push((LuaInferenceNodeId::TypeOwner(owner), fact));
+                }
+            }
+            InitializerCacheUpdate::Overwrite { owner, fact }
+            | InitializerCacheUpdate::ReplaceFact { owner, fact } => {
+                fact_updates.push((LuaInferenceNodeId::TypeOwner(owner), fact));
             }
         }
     }
+    db.publish_inference_facts(fact_updates);
+}
+
+fn select_result_fact(fact: LuaTypeFact, result_idx: usize) -> LuaTypeFact {
+    let typ = match fact.typ() {
+        LuaType::Variadic(variadic) => variadic
+            .get_type(result_idx)
+            .cloned()
+            .unwrap_or(LuaType::Nil),
+        typ if result_idx == 0 => typ.clone(),
+        _ => LuaType::Nil,
+    };
+    fact.with_runtime_type(typ)
 }
 
 fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Option<LuaExpr> {
@@ -897,6 +942,9 @@ impl AnalyzeContext {
                 .push(definition);
         }
         self.infer_manager.clear();
+        let mut fact_updates = Vec::with_capacity(
+            consumers.len() + definition_refreshes.values().map(Vec::len).sum::<usize>(),
+        );
 
         for consumer in consumers {
             let (file_id, owner, expr, ret_idx) = match consumer {
@@ -920,23 +968,15 @@ impl AnalyzeContext {
                 _ => continue,
             };
             let cache = self.infer_manager.get_infer_cache(file_id);
-            let Ok(mut typ) = crate::infer_expr(db, cache, expr) else {
-                continue;
-            };
-            if let LuaType::Variadic(variadic) = typ {
-                typ = variadic.get_type(ret_idx).cloned().unwrap_or(LuaType::Nil);
-            } else if ret_idx != 0 {
-                typ = LuaType::Nil;
-            }
-            db.get_type_index_mut()
-                .force_bind_type(owner.clone(), LuaTypeCache::InferType(typ.clone()));
+            let fact = select_result_fact(infer_expr_fact_with_cache(db, cache, expr), ret_idx);
+            fact_updates.push((LuaInferenceNodeId::TypeOwner(owner.clone()), fact.clone()));
             if let Some(definitions) = definition_refreshes.get(&owner) {
                 for definition in definitions {
-                    db.get_type_index_mut()
-                        .bind_definition_fact(*definition, LuaTypeFact::certain(typ.clone()));
+                    fact_updates.push((LuaInferenceNodeId::Definition(*definition), fact.clone()));
                 }
             }
         }
+        db.publish_inference_facts(fact_updates);
         count
     }
 

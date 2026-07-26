@@ -26,7 +26,7 @@ use super::{
     member_write_policy::{
         MemberAssignmentWideningCacheKey, MemberAssignmentWideningDecision,
         MemberAssignmentWideningState, WideningCacheLookup, decide_member_assignment_widening,
-        direct_local_table_prefix_member_owner,
+        direct_local_prefix_has_declared_type, direct_local_table_prefix_member_owner,
         flush_pending_dynamic_key_collection_widening_for_members,
         get_widened_member_assignment_collection_type, is_collection_append_write,
         is_member_realm_compatible, lookup_widening_cache, member_assignment_state_mask,
@@ -814,9 +814,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             continue;
         }
 
+        let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
         set_index_expr_owner(analyzer, var.clone());
 
-        let expr_type = match analyzer.infer_expr(expr) {
+        let expr_type = match declared_empty_table_type
+            .map(Ok)
+            .unwrap_or_else(|| analyzer.infer_expr(expr))
+        {
             Ok(mut expr_type) => {
                 if let LuaType::Variadic(multi) = expr_type {
                     expr_type = multi.get_type(0)?.clone();
@@ -979,6 +983,92 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
     }
 
     Some(())
+}
+
+fn declared_empty_table_assignment_type(
+    analyzer: &mut LuaAnalyzer,
+    var: &LuaVarExpr,
+    expr: &LuaExpr,
+) -> Option<LuaType> {
+    let LuaExpr::TableExpr(table_expr) = expr else {
+        return None;
+    };
+    if table_expr.get_fields().next().is_some() {
+        return None;
+    }
+
+    let LuaVarExpr::IndexExpr(index_expr) = var else {
+        return None;
+    };
+    let prefix_expr = index_expr.get_prefix_expr()?;
+    if !direct_local_prefix_has_declared_type(analyzer, &prefix_expr) {
+        return None;
+    }
+
+    let cache = analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(analyzer.file_id);
+    let declared_type =
+        crate::infer_index_expr(analyzer.db, cache, index_expr.clone(), false).ok()?;
+    let table_value_type = declared_table_assignment_type(analyzer.db, &declared_type)?;
+
+    write_type_cache(
+        analyzer.db,
+        LuaTypeOwner::SyntaxId(InFiled::new(analyzer.file_id, table_expr.get_syntax_id())),
+        LuaTypeCache::InferType(table_value_type.clone()),
+        TypeCacheWriteMode::InsertOnly,
+    );
+
+    Some(table_value_type)
+}
+
+fn declared_table_assignment_type(db: &crate::DbIndex, declared_type: &LuaType) -> Option<LuaType> {
+    match declared_type {
+        typ if typ.is_table() => Some(typ.clone()),
+        LuaType::Ref(type_id) | LuaType::Def(type_id)
+            if db
+                .get_type_index()
+                .get_type_decl(type_id)
+                .is_some_and(|decl| decl.is_class()) =>
+        {
+            Some(declared_type.clone())
+        }
+        LuaType::Instance(instance)
+            if declared_table_assignment_type(db, instance.get_base()).is_some() =>
+        {
+            Some(declared_type.clone())
+        }
+        LuaType::TypeGuard(inner) => declared_table_assignment_type(db, inner),
+        LuaType::Union(union) => union
+            .types()
+            .filter_map(|typ| declared_table_assignment_type(db, typ))
+            .fold(None, |result, typ| {
+                Some(match result {
+                    Some(current) => TypeOps::Union.apply(db, &current, &typ),
+                    None => typ,
+                })
+            }),
+        LuaType::Intersection(intersection)
+            if intersection
+                .get_types()
+                .iter()
+                .any(|typ| declared_table_assignment_type(db, typ).is_some()) =>
+        {
+            Some(declared_type.clone())
+        }
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .filter_map(|(typ, _)| declared_table_assignment_type(db, typ))
+            .fold(None, |result, typ| {
+                Some(match result {
+                    Some(current) => TypeOps::Union.apply(db, &current, &typ),
+                    None => typ,
+                })
+            }),
+        _ => None,
+    }
 }
 
 fn type_contains_nominal_reference(typ: &LuaType) -> bool {

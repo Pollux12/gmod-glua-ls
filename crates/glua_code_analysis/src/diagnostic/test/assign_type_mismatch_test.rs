@@ -2927,3 +2927,152 @@ fn repeated_initialized_index_member_assignments_diagnose_quick_smoke() {
         "unexpected assign-type diagnostics: {diagnostics:#?}"
     );
 }
+
+#[test]
+fn declared_array_empty_initializer_keeps_declared_owner_on_append() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Thing
+        ---@field icon string
+        local _Thing = {}
+
+        ---@type Thing[]
+        local values = {}
+        values[#values + 1] = { icon = "" }
+        "#
+    ));
+}
+
+#[test]
+fn declared_map_empty_slot_keeps_declared_collection_type() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Thing
+
+        ---@type table<Thing, Thing[]|false>
+        local cache = {}
+
+        ---@param owner Thing
+        ---@param member Thing
+        local function add(owner, member)
+            if not cache[owner] then cache[owner] = {} end
+            local group = cache[owner]
+            if group then group[#group + 1] = member end
+            cache[owner] = false
+        end
+        "#
+    ));
+}
+
+#[test]
+fn declared_nested_container_empty_slot_preserves_all_value_arms() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Ent
+        ---@class Portal
+
+        ---@type table<Portal, table<Ent, Ent[]|false>>
+        local cache = {}
+
+        ---@param key Ent
+        ---@param portal Portal
+        ---@param group Ent[]?
+        local function store(key, portal, group)
+            if not cache[portal] then cache[portal] = {} end
+            local portalCache = cache[portal]
+            if group then
+                portalCache[key] = group
+            else
+                portalCache[key] = false
+            end
+        end
+        "#
+    ));
+}
+
+#[test]
+fn declared_index_signature_empty_slot_keeps_named_field_type() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class cat
+        ---@field icon string?
+        ---@field [string] { icon: string, real: string }
+
+        ---@type table<string, cat>
+        local cats = {}
+
+        ---@param category string
+        ---@param displayName string
+        ---@param surfaceId string
+        ---@param categoryIcon string?
+        local function add(category, displayName, surfaceId, categoryIcon)
+            if not cats[category] then cats[category] = {} end
+            local entry = cats[category]
+            entry.icon = categoryIcon or entry.icon or ""
+            entry[displayName] = { icon = entry.icon or "", real = surfaceId }
+        end
+        "#
+    ));
+}
+
+#[test]
+fn declared_array_invalid_append_still_reports() {
+    let mut ws = crate::VirtualWorkspace::new();
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Thing
+
+        ---@type Thing[]
+        local values = {}
+        values[#values + 1] = "not a Thing"
+        "#
+    ));
+}
+
+#[test]
+fn declared_empty_container_controls_remain_clean() {
+    let mut ws = crate::VirtualWorkspace::new_with_init_std_lib();
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class Ent
+        ---@class Portal
+
+        ---@type Ent[]
+        local viaInsert = {}
+        table.insert(viaInsert, {})
+
+        ---@type Ent[]
+        local neverFilled = {}
+
+        ---@type table<Ent, Ent[]|false>
+        local seed = {}
+
+        ---@type table<Portal, table<Ent, Ent[]|false>>
+        local cache = {}
+
+        ---@param key Ent
+        ---@param portal Portal
+        ---@param group Ent[]
+        local function controls(key, portal, group)
+            if not cache[portal] then cache[portal] = seed end
+            local typed = cache[portal]
+            typed[key] = group
+            typed[key] = false
+
+            if not cache[portal] then cache[portal] = {} end
+            local singleWrite = cache[portal]
+            singleWrite[key] = group
+        end
+        "#
+    ));
+}

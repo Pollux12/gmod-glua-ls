@@ -245,6 +245,20 @@ pub fn analyze_param(analyzer: &mut DocAnalyzer, tag: LuaDocTagParam) -> Option<
         let idx = signature.find_param_idx(&name)?;
 
         signature.param_docs.insert(idx, param_info);
+        if let Some(param_token) = closure
+            .get_params_list()
+            .into_iter()
+            .flat_map(|params| params.get_params())
+            .filter_map(|param| param.get_name_token())
+            .find(|token| token.get_name_text() == name)
+        {
+            write_type_cache(
+                analyzer.db,
+                LuaDeclId::new(analyzer.file_id, param_token.get_position()).into(),
+                LuaTypeCache::DocType(type_ref),
+                TypeCacheWriteMode::ForceOverwrite,
+            );
+        }
     } else if let Some(LuaAst::LuaForRangeStat(for_range)) = analyzer.comment.get_owner() {
         // for in 支持 @param 语法
         for it_name_token in for_range.get_var_name_list() {
