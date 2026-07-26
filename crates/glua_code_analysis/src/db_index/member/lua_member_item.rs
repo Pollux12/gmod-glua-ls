@@ -967,8 +967,11 @@ fn select_member_ids_by_workspace_and_realm(
                 .collect();
             if !meta_members.is_empty() {
                 result.extend(meta_members);
-                all_seen_are_non_meta = false;
             }
+            // Each library root has its own tier. Once the first compatible
+            // lower tier is examined, later libraries must not supply
+            // metadata for the same member.
+            break;
         }
     }
 
@@ -2343,5 +2346,83 @@ mod tests {
             selected.contains(&override_member),
             "main-workspace FileMethodDecl override should still be included"
         );
+    }
+
+    #[test]
+    fn select_member_ids_does_not_skip_first_compatible_library_for_metadata() {
+        let mut db = make_db();
+        let module_index = db.get_module_index_mut();
+        let first_library = WorkspaceId { id: 3 };
+        let second_library = WorkspaceId { id: 4 };
+
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Project").into(),
+            WorkspaceId::MAIN,
+            WorkspaceKind::Main,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Libraries/first").into(),
+            first_library,
+            WorkspaceKind::Library,
+        );
+        module_index.add_workspace_root_with_kind(
+            Path::new("C:/Libraries/second").into(),
+            second_library,
+            WorkspaceKind::Library,
+        );
+
+        let caller_file = FileId::new(1);
+        let main_file = FileId::new(2);
+        let first_library_file = FileId::new(3);
+        let second_library_file = FileId::new(4);
+        module_index.add_module_by_path(caller_file, "C:/Project/init.lua");
+        module_index.add_module_by_path(main_file, "C:/Project/override.lua");
+        module_index.add_module_by_path(first_library_file, "C:/Libraries/first/api.lua");
+        module_index.add_module_by_path(second_library_file, "C:/Libraries/second/api.lua");
+
+        let main_member = make_member_id(main_file, 1);
+        let first_library_member = make_member_id(first_library_file, 2);
+        let second_library_member = make_member_id(second_library_file, 3);
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Example"));
+        let key = LuaMemberKey::Name("Read".into());
+
+        for (member_id, feature) in [
+            (main_member, LuaMemberFeature::FileMethodDecl),
+            (first_library_member, LuaMemberFeature::FileMethodDecl),
+            (second_library_member, LuaMemberFeature::MetaMethodDecl),
+        ] {
+            db.get_member_index_mut().add_member(
+                owner.clone(),
+                LuaMember::new(member_id, key.clone(), feature, None),
+            );
+        }
+        set_file_realms(
+            &mut db,
+            &[
+                (caller_file, GmodRealm::Shared),
+                (main_file, GmodRealm::Shared),
+                (first_library_file, GmodRealm::Shared),
+                (second_library_file, GmodRealm::Shared),
+            ],
+        );
+
+        let selected = select_member_ids_by_workspace_and_realm(
+            &db,
+            &caller_file,
+            vec![
+                (priority(0), vec![main_member]),
+                (
+                    WorkspaceResolutionKey::new(1, 1, first_library),
+                    vec![first_library_member],
+                ),
+                (
+                    WorkspaceResolutionKey::new(1, 2, second_library),
+                    vec![second_library_member],
+                ),
+            ],
+            GmodRealm::Shared,
+        );
+
+        assert_eq!(selected, vec![main_member]);
     }
 }
