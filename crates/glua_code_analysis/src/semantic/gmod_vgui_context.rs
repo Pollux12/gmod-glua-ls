@@ -14,7 +14,23 @@ pub(crate) fn resolve_registered_vgui_method_context(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<RegisteredVguiMethodContext> {
-    let file_id = cache.get_file_id();
+    let func_stat = name_expr.ancestors::<LuaFuncStat>().find(|func_stat| {
+        matches!(
+            func_stat.get_func_name(),
+            Some(LuaVarExpr::IndexExpr(index_expr))
+                if index_expr
+                    .get_index_token()
+                    .is_some_and(|token| token.is_colon())
+        )
+    })?;
+    resolve_registered_vgui_method_context_for_func(db, cache.get_file_id(), &func_stat)
+}
+
+pub(crate) fn resolve_registered_vgui_method_context_for_func(
+    db: &DbIndex,
+    file_id: FileId,
+    func_stat: &LuaFuncStat,
+) -> Option<RegisteredVguiMethodContext> {
     let metadata = db.get_gmod_class_metadata_index();
     let file_metadata = metadata.get_file_metadata(&file_id)?;
     if file_metadata.derma_define_control_calls.is_empty()
@@ -23,7 +39,7 @@ pub(crate) fn resolve_registered_vgui_method_context(
         return None;
     }
     let (receiver_decl_id, receiver_position, receiver_signature_id) =
-        find_enclosing_panel_receiver_context(db, file_id, name_expr)?;
+        panel_receiver_context_for_func(db, file_id, func_stat)?;
 
     for call in file_metadata
         .derma_define_control_calls
@@ -50,37 +66,34 @@ pub(crate) fn resolve_registered_vgui_method_context(
     None
 }
 
-fn find_enclosing_panel_receiver_context(
+fn panel_receiver_context_for_func(
     db: &DbIndex,
     file_id: FileId,
-    name_expr: &LuaNameExpr,
+    func_stat: &LuaFuncStat,
 ) -> Option<(LuaDeclId, TextSize, LuaSignatureId)> {
-    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
-        if !index_expr
-            .get_index_token()
-            .is_some_and(|token| token.is_colon())
-        {
-            continue;
-        }
-        let Some(LuaExpr::NameExpr(prefix_name)) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        let range = prefix_name.get_range();
-        let decl_id = db
-            .get_reference_index()
-            .get_local_reference(&file_id)?
-            .get_decl_id(&range)?;
-        let closure = func_stat.get_closure()?;
-        return Some((
-            decl_id,
-            range.start(),
-            LuaSignatureId::from_closure(file_id, &closure),
-        ));
+    let LuaVarExpr::IndexExpr(index_expr) = func_stat.get_func_name()? else {
+        return None;
+    };
+    if !index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
+    {
+        return None;
     }
-    None
+    let LuaExpr::NameExpr(prefix_name) = index_expr.get_prefix_expr()? else {
+        return None;
+    };
+    let range = prefix_name.get_range();
+    let decl_id = db
+        .get_reference_index()
+        .get_local_reference(&file_id)?
+        .get_decl_id(&range)?;
+    let closure = func_stat.get_closure()?;
+    Some((
+        decl_id,
+        range.start(),
+        LuaSignatureId::from_closure(file_id, &closure),
+    ))
 }
 
 fn registered_panel_name(call: &GmodScriptedClassCallMetadata) -> Option<String> {

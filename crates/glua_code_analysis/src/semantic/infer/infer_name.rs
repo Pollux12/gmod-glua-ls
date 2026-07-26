@@ -24,7 +24,7 @@ use crate::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
         member::{find_members_with_key, merge_open_table_types},
-        resolve_registered_vgui_method_context,
+        resolve_registered_vgui_method_context_for_func,
         semantic_info::resolve_global_decl_id,
     },
 };
@@ -578,20 +578,12 @@ fn infer_implicit_method_self_type_inner(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
-    // 1. Scoped authoring tables (ENT/SWEP/GM): metadata-driven, one class
-    //    per file. Keep this first to preserve scoped-class behavior.
-    if let Some(scoped_type) = infer_scoped_authoring_self_type(db, cache, name_expr) {
-        return Some(scoped_type);
+    let func_stat = enclosing_colon_func_stat(name_expr)?;
+    if let Some(authoritative_type) = infer_authoritative_method_self_type(db, cache, &func_stat) {
+        return Some(authoritative_type);
     }
 
-    // 2. Registered VGUI method tables have a declaration-precise class type.
-    //    Keep this ahead of call-site evidence so sibling methods do not split
-    //    between the raw PANEL table and the registered panel owner.
-    if let Some(context) = resolve_registered_vgui_method_context(db, cache, name_expr) {
-        return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
-    }
-
-    // 3. A colon method selected as a raw table member can be invoked with an
+    // A colon method selected as a raw table member can be invoked with an
     // explicit receiver (`callback(self, ...)`). Call-site analysis stores that
     // receiver in the synthetic slot immediately after the explicit params.
     if let Some(call_site_type) =
@@ -600,10 +592,10 @@ fn infer_implicit_method_self_type_inner(
         return Some(call_site_type);
     }
 
-    // 4. General case: infer the enclosing colon-method prefix at its position.
+    // General case: infer the enclosing colon-method prefix at its position.
     //    This is region-aware, so a reused local resolves `self` to the class
     //    of the table backing the current region.
-    let prefix_type = infer_raw_enclosing_self_type(db, cache, name_expr)?;
+    let prefix_type = infer_method_prefix_type(db, cache, &func_stat)?;
     is_concrete_self_receiver_type(&prefix_type).then_some(prefix_type)
 }
 
@@ -624,14 +616,11 @@ fn infer_implicit_self_type_from_call_site(
         .cloned()
 }
 
-/// Resolves `self` for virtual scoped authoring tables (ENT/SWEP/GM),
-/// which map a file to a single class through scoped-class metadata.
-fn infer_scoped_authoring_self_type(
+pub(crate) fn infer_authoritative_method_self_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
+    func_stat: &LuaFuncStat,
 ) -> Option<LuaType> {
-    let func_stat = name_expr.ancestors::<LuaFuncStat>().next()?;
     let func_name = func_stat.get_func_name()?;
     let LuaVarExpr::IndexExpr(index_expr) = func_name else {
         return None;
@@ -640,12 +629,29 @@ fn infer_scoped_authoring_self_type(
         return None;
     }
 
-    let LuaExpr::NameExpr(prefix_name_expr) = index_expr.get_prefix_expr()? else {
-        return None;
-    };
-    let class_decl_id =
-        name_expr_resolves_to_scoped_authoring_table(db, cache.get_file_id(), &prefix_name_expr)?;
-    Some(LuaType::Def(class_decl_id))
+    if let Some(LuaExpr::NameExpr(prefix_name_expr)) = index_expr.get_prefix_expr()
+        && let Some(class_decl_id) =
+            name_expr_resolves_to_scoped_authoring_table(db, cache.get_file_id(), &prefix_name_expr)
+    {
+        return Some(LuaType::Def(class_decl_id));
+    }
+
+    if let Some(context) =
+        resolve_registered_vgui_method_context_for_func(db, cache.get_file_id(), func_stat)
+    {
+        return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
+    }
+
+    let prefix_type = infer_method_prefix_type(db, cache, func_stat)?;
+    is_authoritative_self_receiver_type(&prefix_type).then_some(prefix_type)
+}
+
+pub(crate) fn is_authoritative_self_receiver_type(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Def(_) | LuaType::Ref(_) => true,
+        LuaType::Instance(instance) => is_authoritative_self_receiver_type(instance.get_base()),
+        _ => false,
+    }
 }
 
 /// Returns true when `typ` is a concrete receiver type suitable to be used
@@ -2415,37 +2421,41 @@ pub(crate) fn infer_enclosing_self_type(
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
 ) -> Option<LuaType> {
-    if let Some(context) = resolve_registered_vgui_method_context(db, cache, name_expr) {
-        return Some(LuaType::Def(LuaTypeDeclId::global(&context.panel_name)));
+    let func_stat = enclosing_colon_func_stat(name_expr)?;
+    if let Some(authoritative_type) = infer_authoritative_method_self_type(db, cache, &func_stat) {
+        return Some(authoritative_type);
     }
 
-    infer_raw_enclosing_self_type(db, cache, name_expr)
+    infer_method_prefix_type(db, cache, &func_stat)
 }
 
-fn infer_raw_enclosing_self_type(
+fn enclosing_colon_func_stat(name_expr: &LuaNameExpr) -> Option<LuaFuncStat> {
+    name_expr.ancestors::<LuaFuncStat>().find(|func_stat| {
+        matches!(
+            func_stat.get_func_name(),
+            Some(LuaVarExpr::IndexExpr(index_expr))
+                if index_expr
+                    .get_index_token()
+                    .is_some_and(|token| token.is_colon())
+        )
+    })
+}
+
+fn infer_method_prefix_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
+    func_stat: &LuaFuncStat,
 ) -> Option<LuaType> {
-    for func_stat in name_expr.ancestors::<LuaFuncStat>() {
-        // Skip anonymous/non-colon ancestors (e.g. nested closures) and keep
-        // walking outward to the enclosing colon method, rather than bailing out
-        // on the first ancestor that lacks a colon-method name.
-        let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name() else {
-            continue;
-        };
-        if !index_expr
-            .get_index_token()
-            .is_some_and(|token| token.is_colon())
-        {
-            continue;
-        }
-        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
-            continue;
-        };
-        return infer_expr(db, cache, prefix_expr).ok();
+    let LuaVarExpr::IndexExpr(index_expr) = func_stat.get_func_name()? else {
+        return None;
+    };
+    if !index_expr
+        .get_index_token()
+        .is_some_and(|token| token.is_colon())
+    {
+        return None;
     }
-    None
+    infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()
 }
 
 #[cfg(test)]
