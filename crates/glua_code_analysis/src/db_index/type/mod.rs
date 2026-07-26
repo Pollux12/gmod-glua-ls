@@ -1028,7 +1028,7 @@ impl LuaTypeIndex {
                 continue;
             }
 
-            if type_references_any_file(cache.as_type(), file_ids) {
+            if self.type_references_any_file(cache.as_type(), file_ids, owner_file_id) {
                 dependent_files.insert(owner_file_id);
             }
         }
@@ -1043,58 +1043,88 @@ impl LuaTypeIndex {
         let mut dependent_files = HashSet::new();
         for (owner, cache) in &self.types {
             let owner_file_id = owner.get_file_id();
-            if type_references_other_file(cache.as_type(), file_ids, owner_file_id) {
+            if self.type_references_other_file(cache.as_type(), file_ids, owner_file_id) {
                 dependent_files.insert(owner_file_id);
             }
         }
 
         dependent_files
     }
-}
+    fn type_references_any_file(
+        &self,
+        typ: &LuaType,
+        file_ids: &HashSet<FileId>,
+        owner_file_id: FileId,
+    ) -> bool {
+        let mut references_file = false;
+        typ.visit_type(&mut |inner| {
+            if references_file {
+                return;
+            }
 
-fn type_references_any_file(typ: &LuaType, file_ids: &HashSet<FileId>) -> bool {
-    let mut references_file = false;
-    typ.visit_type(&mut |inner| {
-        if references_file {
-            return;
-        }
+            references_file = match inner {
+                LuaType::TableConst(range) => file_ids.contains(&range.file_id),
+                LuaType::Instance(instance) => file_ids.contains(&instance.get_range().file_id),
+                LuaType::Signature(signature_id) => file_ids.contains(&signature_id.get_file_id()),
+                LuaType::ModuleRef(file_id) => file_ids.contains(file_id),
+                LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                    self.get_type_decl(type_id).is_some_and(|decl| {
+                        let locations = decl.get_locations();
+                        !locations
+                            .iter()
+                            .any(|location| location.file_id == owner_file_id)
+                            && locations
+                                .iter()
+                                .any(|location| file_ids.contains(&location.file_id))
+                    })
+                }
+                _ => false,
+            };
+        });
 
-        references_file = match inner {
-            LuaType::TableConst(range) => file_ids.contains(&range.file_id),
-            LuaType::Instance(instance) => file_ids.contains(&instance.get_range().file_id),
-            LuaType::Signature(signature_id) => file_ids.contains(&signature_id.get_file_id()),
-            LuaType::ModuleRef(file_id) => file_ids.contains(file_id),
-            _ => false,
-        };
-    });
+        references_file
+    }
 
-    references_file
-}
+    fn type_references_other_file(
+        &self,
+        typ: &LuaType,
+        file_ids: &HashSet<FileId>,
+        owner_file_id: FileId,
+    ) -> bool {
+        let references_changed_file =
+            |file_id: FileId| file_id != owner_file_id && file_ids.contains(&file_id);
+        let mut references_file = false;
+        typ.visit_type(&mut |inner| {
+            if references_file {
+                return;
+            }
 
-fn type_references_other_file(
-    typ: &LuaType,
-    file_ids: &HashSet<FileId>,
-    owner_file_id: FileId,
-) -> bool {
-    let mut references_file = false;
-    typ.visit_type(&mut |inner| {
-        if references_file {
-            return;
-        }
+            references_file = match inner {
+                LuaType::TableConst(range) => references_changed_file(range.file_id),
+                LuaType::Instance(instance) => {
+                    references_changed_file(instance.get_range().file_id)
+                }
+                LuaType::Signature(signature_id) => {
+                    references_changed_file(signature_id.get_file_id())
+                }
+                LuaType::ModuleRef(file_id) => references_changed_file(*file_id),
+                LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                    self.get_type_decl(type_id).is_some_and(|decl| {
+                        let locations = decl.get_locations();
+                        !locations
+                            .iter()
+                            .any(|location| location.file_id == owner_file_id)
+                            && locations
+                                .iter()
+                                .any(|location| references_changed_file(location.file_id))
+                    })
+                }
+                _ => false,
+            };
+        });
 
-        let referenced_file_id = match inner {
-            LuaType::TableConst(range) => Some(range.file_id),
-            LuaType::Instance(instance) => Some(instance.get_range().file_id),
-            LuaType::Signature(signature_id) => Some(signature_id.get_file_id()),
-            LuaType::ModuleRef(file_id) => Some(*file_id),
-            _ => None,
-        };
-
-        references_file = referenced_file_id
-            .is_some_and(|file_id| file_id != owner_file_id && file_ids.contains(&file_id));
-    });
-
-    references_file
+        references_file
+    }
 }
 
 impl LuaIndex for LuaTypeIndex {

@@ -9,10 +9,10 @@ mod test {
     use crate::db_index::r#type::LuaTypeIndex;
     use crate::db_index::{LuaDeclTypeKind, LuaTypeFlag};
     use crate::{
-        DbIndex, FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaInferenceConfidence,
-        LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind, LuaInferenceStep,
-        LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata,
-        LuaTypeOwner, resolve_alias_type,
+        DbIndex, FileId, InFiled, LuaDeclId, LuaDeclLocation, LuaDefinitionId,
+        LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
+        LuaInferenceProvenanceKind, LuaInferenceStep, LuaType, LuaTypeCache, LuaTypeDecl,
+        LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner, resolve_alias_type,
     };
 
     fn create_type_index() -> LuaTypeIndex {
@@ -178,6 +178,176 @@ mod test {
             Some(LuaInferenceProvenanceKind::ConcreteValue)
         );
         assert!(infer_fact.provenance().is_empty());
+    }
+
+    #[test]
+    fn inference_fact_authority_order_rejects_self_confirming_upgrades() {
+        let target = LuaInferenceNodeId::TypeOwner(owner());
+        let contextual = LuaTypeFact::new(
+            LuaType::Number,
+            LuaInferenceConfidence::Anchored,
+            anchored_metadata().provenance,
+        );
+        let concrete = LuaTypeFact::certain(LuaType::Number);
+        let explicit = LuaTypeFact::from_normalized_parts(
+            LuaType::Number,
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        );
+        let cyclic = LuaTypeFact::new(
+            LuaType::Number,
+            LuaInferenceConfidence::Certain,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: target.clone(),
+                    kind: LuaInferenceProvenanceKind::ConcreteValue,
+                    source: source(30),
+                },
+                support: Arc::from([target.clone()]),
+                found_type: None,
+            }]),
+        );
+
+        assert!(concrete.has_independently_stronger_authority_than(&contextual, &target));
+        assert!(explicit.has_independently_stronger_authority_than(&concrete, &target));
+        assert!(!contextual.has_independently_stronger_authority_than(&concrete, &target));
+        assert!(!cyclic.has_independently_stronger_authority_than(&contextual, &target));
+    }
+
+    #[test]
+    fn declared_base_does_not_replace_its_unguarded_child_runtime_refinement() {
+        let target = LuaInferenceNodeId::TypeOwner(owner());
+        let base_type = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+        let refined_type = LuaType::Ref(LuaTypeDeclId::global("Player"));
+        let unguarded_child = LuaTypeFact::new(
+            refined_type,
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
+                        LuaDeclId::new(file_id(), 10.into()),
+                    )),
+                    kind: LuaInferenceProvenanceKind::UnguardedChild,
+                    source: source(30),
+                },
+                support: Arc::from([]),
+                found_type: Some(Arc::new(base_type.clone())),
+            }]),
+        );
+        let declared_base = LuaTypeFact::from_normalized_parts(
+            base_type.clone(),
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        );
+        let changed_declaration = LuaTypeFact::from_normalized_parts(
+            LuaType::Number,
+            LuaInferenceConfidence::Certain,
+            Some(LuaInferenceProvenanceKind::ExplicitAnnotation),
+            Arc::from([]),
+        );
+
+        assert!(
+            !declared_base.has_independently_stronger_authority_than(&unguarded_child, &target)
+        );
+        assert!(
+            changed_declaration
+                .has_independently_stronger_authority_than(&unguarded_child, &target)
+        );
+
+        let inherited_receiver_provenance = LuaTypeFact::new(
+            LuaType::Ref(LuaTypeDeclId::global("Vector")),
+            LuaInferenceConfidence::Heuristic,
+            Arc::from([LuaInferenceStep {
+                event: LuaInferenceEventId {
+                    node: LuaInferenceNodeId::Definition(LuaDefinitionId::Declaration(
+                        LuaDeclId::new(file_id(), 20.into()),
+                    )),
+                    kind: LuaInferenceProvenanceKind::UnguardedChild,
+                    source: source(30),
+                },
+                support: Arc::from([]),
+                found_type: Some(Arc::new(base_type)),
+            }]),
+        );
+        assert!(
+            declared_base.has_independently_stronger_authority_than(
+                &inherited_receiver_provenance,
+                &target,
+            )
+        );
+    }
+
+    #[test]
+    fn ref_type_cache_tracks_the_declaring_file_as_an_incremental_dependency() {
+        let provider = FileId::new(1);
+        let consumer = FileId::new(2);
+        let type_id = LuaTypeDeclId::global("ProviderType");
+        let mut index = LuaTypeIndex::new();
+        index.add_type_decl(
+            provider,
+            LuaTypeDecl::new(
+                provider,
+                TextRange::new(0.into(), 1.into()),
+                "ProviderType".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                type_id.clone(),
+            ),
+        );
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Ref(type_id)),
+        );
+
+        assert_eq!(
+            index.files_with_type_caches_referencing_files(&HashSet::from([provider])),
+            HashSet::from([consumer])
+        );
+    }
+
+    #[test]
+    fn ref_type_dependency_excludes_files_that_contribute_to_the_same_type() {
+        let provider = FileId::new(1);
+        let contributor = FileId::new(2);
+        let consumer = FileId::new(3);
+        let type_id = LuaTypeDeclId::global("SharedType");
+        let mut index = LuaTypeIndex::new();
+        index.add_type_decl(
+            provider,
+            LuaTypeDecl::new(
+                provider,
+                TextRange::new(0.into(), 1.into()),
+                "SharedType".to_string(),
+                LuaDeclTypeKind::Class,
+                LuaTypeFlag::None.into(),
+                type_id.clone(),
+            ),
+        );
+        index.add_type_decl_location(
+            contributor,
+            &type_id,
+            LuaDeclLocation {
+                file_id: contributor,
+                range: TextRange::new(0.into(), 1.into()),
+                flag: LuaTypeFlag::None.into(),
+            },
+        );
+        index.bind_type(
+            owner_in(contributor, 10),
+            LuaTypeCache::DocType(LuaType::Ref(type_id.clone())),
+        );
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Ref(type_id)),
+        );
+
+        assert_eq!(
+            index
+                .files_with_cross_file_type_caches_referencing_files(&HashSet::from([contributor])),
+            HashSet::from([consumer])
+        );
     }
 
     #[test]
