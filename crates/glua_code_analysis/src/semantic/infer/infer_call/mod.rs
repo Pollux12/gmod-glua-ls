@@ -1009,6 +1009,37 @@ fn infer_signature_doc_function(
     }
 }
 
+pub(crate) fn signature_call_selects_declared_overload(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    call_expr: LuaCallExpr,
+) -> bool {
+    let Some(signature) = db.get_signature_index().get(&signature_id) else {
+        return false;
+    };
+    if signature.overloads.is_empty() || !signature.is_resolve_return() {
+        return false;
+    }
+    let is_generic = signature_is_generic(db, cache, signature, &call_expr).unwrap_or(false);
+    let declared_overload_count = signature.overloads.len();
+    let mut candidates = signature.overloads.clone();
+    candidates.push(Arc::new(
+        LuaFunctionType::new(
+            signature.async_state,
+            signature.is_colon_define,
+            signature.is_vararg,
+            signature.get_type_params(),
+            signature.get_return_type(),
+        )
+        .with_optional_params(signature.get_param_optional_flags()),
+    ));
+    crate::semantic::overload_resolve::resolve_signature_with_index(
+        db, cache, candidates, call_expr, is_generic, None,
+    )
+    .is_ok_and(|(_, selected_idx)| selected_idx < declared_overload_count)
+}
+
 fn specialize_class_name_param_return_alias_for_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,

@@ -293,6 +293,20 @@ fn get_type_at_immutable_closure_condition(
             };
             Ok(Some(narrowed))
         }
+        LuaExpr::CallExpr(call_expr) => match get_type_at_condition_flow(
+            db,
+            tree,
+            cache,
+            root,
+            var_ref_id,
+            flow_node,
+            LuaExpr::CallExpr(call_expr),
+            condition_flow,
+            policy,
+        )? {
+            ResultTypeOrContinue::Result(condition_type) => Ok(Some(condition_type)),
+            ResultTypeOrContinue::Continue => Ok(None),
+        },
         _ => Ok(None),
     }
 }

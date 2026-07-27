@@ -12,7 +12,7 @@ use crate::{
     LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType, RenderLevel, SemanticDeclLevel,
     SemanticModel, TypeCheckFailReason, TypeCheckResult, TypeOps, TypeVisitTrait, VariadicType,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type, infer_index_expr,
-    resolve_alias_type,
+    is_authoritative_self_receiver_type, resolve_alias_type,
 };
 
 use super::{Checker, DiagnosticContext, should_suppress_inferred_value_mismatch};
@@ -498,13 +498,19 @@ fn check_call_expr(
                     continue;
                 }
             }
+            let has_authoritative_direct_self_contract = was_self_infer
+                && idx == 0
+                && matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
+                && is_authoritative_self_receiver_type(&check_type);
             let arg_expr = match (colon_call, colon_define) {
                 (true, false) if idx == 0 => None,
                 (true, false) => arg_exprs.get(idx - 1),
                 _ => arg_exprs.get(idx),
             };
             let result = arg_expr
-                .map(|arg_expr| semantic_model.type_check_expr_detail(&check_type, arg_expr))
+                .map(|arg_expr| {
+                    semantic_model.type_check_expr_detail_with_type(&check_type, arg_type, arg_expr)
+                })
                 .unwrap_or_else(|| semantic_model.type_check_detail(&check_type, arg_type));
             if result.is_err() {
                 // `never` and `SelfInfer` indicate type inference limitations, skip the diagnostic.
@@ -516,6 +522,7 @@ fn check_call_expr(
                 if matches!(check_type, LuaType::Never | LuaType::SelfInfer)
                     || matches!(arg_type, LuaType::Never | LuaType::SelfInfer)
                     || (was_self_infer
+                        && !has_authoritative_direct_self_contract
                         && matches!(
                             arg_type,
                             LuaType::Ref(_) | LuaType::Def(_) | LuaType::SelfInfer

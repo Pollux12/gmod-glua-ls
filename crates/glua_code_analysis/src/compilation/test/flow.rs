@@ -26,6 +26,7 @@ mod test {
             ---@param value any
             ---@return TypeGuard<any>
             ---@return_cast value -NULL
+            ---@[valid_guard]
             function IsValid(value) end
             "#,
         );
@@ -1237,8 +1238,9 @@ end
     }
 
     #[test]
-    fn deferred_closure_drops_immutable_entity_isvalid_guard() {
+    fn deferred_closure_retains_immutable_entity_isvalid_guard() {
         let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
         def_isvalid_guard(&mut ws);
 
         ws.def(
@@ -1253,12 +1255,12 @@ end
         );
 
         let captured = ws.expr_ty("isvalid_capture");
-        let expected = ws.ty("Entity|NULL");
+        let expected = ws.ty("Entity");
         assert_eq!(captured, expected);
     }
 
     #[test]
-    fn deferred_closure_drops_custom_type_guard() {
+    fn deferred_closure_retains_custom_type_guard() {
         let mut ws = VirtualWorkspace::new();
 
         ws.def(
@@ -1277,8 +1279,184 @@ end
         );
 
         let captured = ws.expr_ty("custom_guard_capture");
-        let expected = ws.ty("string|number");
+        let expected = ws.ty("string");
         assert_eq!(captured, expected);
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_return_cast_self_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            local function make(ent)
+                if ent:IsPlayer() then
+                    direct_return_cast_capture = ent
+                    local callback = function()
+                        closure_return_cast_capture = ent
+                    end
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("direct_return_cast_capture"), ws.ty("Player"));
+        assert_eq!(ws.expr_ty("closure_return_cast_capture"), ws.ty("Player"));
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_named_parameter_return_cast() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@param value Entity
+            ---@return boolean
+            ---@return_cast value Player
+            local function isPlayer(value) end
+
+            ---@param ent Entity
+            local function make(ent)
+                if isPlayer(ent) then
+                    local callback = function()
+                        named_parameter_return_cast_capture = ent
+                    end
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(
+            ws.expr_ty("named_parameter_return_cast_capture"),
+            ws.ty("Player")
+        );
+    }
+
+    #[test]
+    fn deferred_closure_retains_immutable_return_cast_false_branch() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@class NPC: Entity
+
+            ---@return boolean
+            ---@return_cast self Player else NPC
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            local function make(ent)
+                if ent:IsPlayer() then
+                    return
+                end
+                local callback = function()
+                    return_cast_false_branch_capture = ent
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("return_cast_false_branch_capture"), ws.ty("NPC"));
+    }
+
+    #[test]
+    fn nested_deferred_closures_retain_immutable_return_cast_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            local function make(ent)
+                if ent:IsPlayer() then
+                    local outer = function()
+                        local inner = function()
+                            nested_return_cast_capture = ent
+                        end
+                    end
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("nested_return_cast_capture"), ws.ty("Player"));
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_return_cast_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@param ent Entity
+            ---@param replacement Entity
+            local function make(ent, replacement)
+                if ent:IsPlayer() then
+                    local callback = function()
+                        mutable_return_cast_capture = ent
+                    end
+                end
+                ent = replacement
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("mutable_return_cast_capture"), ws.ty("Entity"));
+    }
+
+    #[test]
+    fn deferred_closure_drops_mutable_custom_type_guard() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@param value any
+            ---@return TypeGuard<string>
+            local function is_string(value) end
+
+            ---@param replacement string|number
+            local function make(replacement)
+                local value ---@type string|number
+                if is_string(value) then
+                    local callback = function()
+                        mutable_custom_guard_capture = value
+                    end
+                end
+                value = replacement
+            end
+            "#,
+        );
+
+        assert_eq!(
+            ws.expr_ty("mutable_custom_guard_capture"),
+            ws.ty("string|number")
+        );
     }
 
     #[test]

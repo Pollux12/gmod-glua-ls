@@ -283,7 +283,7 @@ pub(in crate::compilation::analyzer::lua) fn direct_local_table_prefix_member_ow
     prefix_expr: &LuaExpr,
 ) -> Option<LuaMemberOwner> {
     let decl_id = direct_local_prefix_decl_id(analyzer, prefix_expr)?;
-    if local_decl_binds_class_type(analyzer, decl_id) {
+    if local_decl_has_declared_type(analyzer, decl_id) {
         return None;
     }
 
@@ -302,6 +302,14 @@ pub(in crate::compilation::analyzer::lua) fn direct_local_table_prefix_member_ow
     owner
 }
 
+pub(in crate::compilation::analyzer::lua) fn direct_local_prefix_has_declared_type(
+    analyzer: &LuaAnalyzer,
+    prefix_expr: &LuaExpr,
+) -> bool {
+    direct_local_prefix_decl_id(analyzer, prefix_expr)
+        .is_some_and(|decl_id| local_decl_has_declared_type(analyzer, decl_id))
+}
+
 fn direct_local_prefix_decl_id(analyzer: &LuaAnalyzer, prefix_expr: &LuaExpr) -> Option<LuaDeclId> {
     let LuaExpr::NameExpr(name_expr) = prefix_expr else {
         return None;
@@ -313,20 +321,12 @@ fn direct_local_prefix_decl_id(analyzer: &LuaAnalyzer, prefix_expr: &LuaExpr) ->
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
 }
 
-fn local_decl_binds_class_type(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {
-    let Some(type_cache) = analyzer.db.get_type_index().get_type_cache(&decl_id.into()) else {
-        return false;
-    };
-    let type_id = match type_cache.as_type() {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => type_id,
-        _ => return false,
-    };
-
+fn local_decl_has_declared_type(analyzer: &LuaAnalyzer, decl_id: LuaDeclId) -> bool {
     analyzer
         .db
         .get_type_index()
-        .get_type_decl(type_id)
-        .is_some_and(|decl| decl.is_class())
+        .get_type_cache(&decl_id.into())
+        .is_some_and(LuaTypeCache::is_doc)
 }
 
 fn resolve_direct_local_table_prefix_member_owner(

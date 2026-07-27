@@ -14339,7 +14339,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_deferred_timer_immutable_entity_isvalid_guard_needs_check_nil() {
+    fn test_deferred_timer_immutable_entity_isvalid_guard_has_no_need_check_nil() {
         let mut ws = VirtualWorkspace::new();
         def_isvalid_type_guard(&mut ws);
         let diagnostics = diagnostics_for_code(
@@ -14361,6 +14361,36 @@ mod test {
                     captured:GetClass()
                 end)
             end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    #[gtest]
+    fn test_deferred_timer_mutable_entity_isvalid_guard_needs_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        def_isvalid_type_guard(&mut ws);
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+
+            timer = {}
+            ---@param delay number
+            ---@param callback fun()
+            function timer.Simple(delay, callback) end
+
+            local entity ---@type Entity?
+            if IsValid(entity) then
+                timer.Simple(0, function()
+                    local captured = entity
+                    captured:GetClass()
+                end)
+            end
+            entity = nil
             "#,
         );
 
