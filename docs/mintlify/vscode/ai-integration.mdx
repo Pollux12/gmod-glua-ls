@@ -19,21 +19,64 @@ The server combines three parts of your development environment:
 
 ## Available tools
 
-The server intentionally exposes only three tools:
+The server intentionally exposes only five tools:
 
 | Tool | Description |
 |---|---|
-| `execute_lua` | Execute up to 256 KiB of queued Lua in the `server`, `client`, or `shared` realm |
-| `read_console` | Read recent timestamped console lines, optionally after a previous cursor |
-| `read_issues` | Read timestamped runtime errors and current GLuaLS errors/warnings |
+| `execute_lua` | Evaluate inline code like a live REPL, run a workspace Lua file, or manually refresh a file |
+| `run_console_command` | Run one command in the Garry's Mod server console |
+| `read_console` | Read filtered, timestamped console lines, optionally after a previous cursor |
+| `get_errors` | Read filtered in-game runtime errors |
+| `get_issues` | Read filtered GLuaLS language-server errors and warnings |
 
-`execute_lua` returns dispatch status and an observation cursor. Pass that cursor to `read_console` after execution, and call `read_issues` to inspect runtime failures. This avoids incorrectly attributing delayed client output to a later execution. Use `print(...)` in the chunk to return values through the console.
+For inline execution, supply `code`. Inline source is limited to 256 KiB in UTF-8. For a file, supply `file`; the debugger sends the path rather than putting the file contents in the MCP request, so the inline limit does not apply. Server files execute directly. Client/shared file payloads use bounded chunked net messages and can be up to 1 MiB. The file must be inside a workspace `lua/` directory.
+
+`execute_lua` is designed for quick experiments and active debugging, similar to a REPL against the running game. Inline server/shared execution returns a bounded summary of server return values plus console lines and errors observed immediately after dispatch. That observed context is best-effort and can include unrelated game activity. Pass the returned cursor to `read_console` and `get_errors` for later or paged results, especially for asynchronous client code, hooks, and timers.
+
+Choose the execution realm explicitly:
+
+| Realm | Where the Lua runs |
+|---|---|
+| `server` | Only the connected Garry's Mod server |
+| `client` | Every client currently connected to that server, not one selected client |
+| `shared` | The server and every connected client |
 
 <Warning>
-The debugger bridge broadcasts `client` and `shared` execution to every player connected to the development server. The tool rejects those realms unless the request explicitly sets `confirmClientBroadcast` to `true`. Use the `server` realm unless you intend to run the code on every connected client.
+The debugger bridge broadcasts `client` and `shared` execution to every player connected to the development server. The tool rejects those realms unless the request explicitly sets `confirmClientBroadcast` to `true`. This option means "I understand this runs clientside on all connected clients"; it does not target one client. Use the `server` realm unless you intend to run the code on every connected client.
 </Warning>
 
-The runtime tools require the [debugger](/debugger/setup). `read_issues` can return language diagnostics without a running game.
+`run_console_command` always targets the server console. It accepts one command, rejects semicolon chaining, and never invokes a command on clients. Console commands have the same ability to mutate or stop the development server as commands entered manually.
+
+The runtime tools require the [debugger](/debugger/setup). `get_issues` can return language diagnostics without a running game.
+
+## Auto-refresh and files
+
+Garry's Mod normally reruns eligible Lua files as soon as you save them. Agents should not call `execute_lua` merely to rerun every edited file, because that can execute initialization code twice.
+
+Auto-refresh primarily covers files automatically loaded by gamemodes, `autorun`, effects, entities, and weapons. Dynamic `include` or `AddCSLuaFile` patterns and some base-file relationships may not refresh automatically.
+
+Use file execution modes deliberately:
+
+| Request | When to use it |
+|---|---|
+| `{ "file": "...", "action": "execute", "realm": "server" }` | Explicitly run a file for the first time or rerun a file that is not auto-loaded |
+| `{ "file": "...", "action": "refresh" }` | Force Garry's Mod's `lua_refresh_file` behavior after auto-refresh did not apply or trigger |
+
+`action` defaults to `execute`. Execute actions require `realm`. `refresh` only accepts a file, not inline code, and lets Garry's Mod determine the affected realm through `lua_refresh_file`.
+
+## Limit returned context
+
+All read tools use small defaults and bounded responses. Narrow the request before increasing its limit:
+
+| Tool | Useful controls |
+|---|---|
+| `read_console` | `lines`, `cursor`, `realm`, `source`, `contains` |
+| `get_errors` | `source`, `realm`, `cursor`, `minCount`, `contains`, `includeStackTrace`, `limit` |
+| `get_issues` | `severity`, `path`, `code`, `contains`, `offset`, `limit` |
+
+`get_errors` defaults to runtime errors whose source is `lua` and omits stack traces. Set `source` to `console`, `debugger`, or `all` only when those domains are relevant. `get_issues` never includes runtime errors.
+
+Runtime reads return `truncated` when more matching data exists or fields were shortened. Cursored reads also return `dropped` when the requested cursor is older than the retained ring buffer, so an agent does not silently mistake an incomplete history for a complete one.
 
 ## Connect from VS Code
 
@@ -77,8 +120,9 @@ The copied entry has this shape:
 ```text
 You: Check the current map and report any Lua failures.
 
-Agent: [calls execute_lua with print(game.GetMap())]
-Agent: [calls read_issues]
+Agent: [calls execute_lua with code="return game.GetMap()" and realm=server]
+Agent: [calls get_errors]
+Agent: [calls get_issues with severity=warning and path=lua/autorun/example.lua]
 Agent: The server is running gm_construct. No runtime Lua errors were captured,
        but GLuaLS reports one warning in lua/autorun/example.lua:14.
 ```
