@@ -1,89 +1,110 @@
 ---
-title: AI and Copilot integration
-description: Let AI tools search GLua documentation and work with a connected Garry's Mod session.
+title: MCP and AI integration
+description: Connect any MCP-compatible AI agent to GLuaLS for live Garry's Mod testing.
 ---
 
 ## Overview
 
-The VS Code extension provides tools for GitHub Copilot and a local MCP server for other compatible AI clients.
+The VS Code extension runs a local [Model Context Protocol](https://modelcontextprotocol.io/) server for AI-assisted GLua development. It works with VS Code chat and other MCP-compatible agents.
 
-AI tools can search GLua API documentation without a running game. Runtime tools can also execute Lua, run commands, and inspect recent output when the debugger is connected.
+The server combines three parts of your development environment:
 
-<Note>
-Runtime commands can change game state. Review tool requests before allowing them to run.
-</Note>
+- The active Garry's Mod debugger session for Lua execution
+- Captured server and client console output
+- Runtime Lua errors and GLuaLS language diagnostics
 
----
+<Warning>
+`execute_lua` can change game state. Only connect agents you trust, and only install `gm_rdb` on development servers.
+</Warning>
 
-## GitHub Copilot tools
+## Available tools
 
-The extension registers these tools directly with VS Code:
-
-| Tool | Description |
-|---|---|
-| `gluaDocs` | Search Garry's Mod API definitions and workspace symbols |
-| `gmodRunLua` | Execute Lua in the selected realm |
-| `gmodRunCommand` | Run a Garry's Mod console command |
-| `gmodRunFile` | Run a Lua file in the selected realm |
-| `gmodGetOutput` | Read recent debugger output |
-| `gmodGetErrors` | Read recent debugger errors |
-| `gmodGetDebugState` | Check the debugger, realm, and language server state |
-
----
-
-The runtime tools require the [debugger](/debugger/setup). Documentation search does not.
-
-## MCP tools
-
-The local MCP server provides these tool names for compatible clients:
+The server intentionally exposes only three tools:
 
 | Tool | Description |
 |---|---|
-| `run_lua` | Execute Lua in the active debug session |
-| `run_command` | Run a Garry's Mod console command |
-| `run_file` | Run a Lua file |
-| `get_output` | Read recent debugger output |
-| `get_errors` | Read recent debugger errors |
-| `get_debug_state` | Read the current debugger state |
-| `list_realms` | List available realms and the currently selected realm |
+| `execute_lua` | Execute up to 256 KiB of queued Lua in the `server`, `client`, or `shared` realm |
+| `read_console` | Read recent timestamped console lines, optionally after a previous cursor |
+| `read_issues` | Read timestamped runtime errors and current GLuaLS errors/warnings |
 
-The MCP server listens only on your computer and uses an authentication token. It is enabled by default.
+`execute_lua` returns dispatch status and an observation cursor. Pass that cursor to `read_console` after execution, and call `read_issues` to inspect runtime failures. This avoids incorrectly attributing delayed client output to a later execution. Use `print(...)` in the chunk to return values through the console.
 
-## Set up Copilot
+<Warning>
+The debugger bridge broadcasts `client` and `shared` execution to every player connected to the development server. The tool rejects those realms unless the request explicitly sets `confirmClientBroadcast` to `true`. Use the `server` realm unless you intend to run the code on every connected client.
+</Warning>
+
+The runtime tools require the [debugger](/debugger/setup). `read_issues` can return language diagnostics without a running game.
+
+## Connect from VS Code
+
+VS Code discovers the GLuaLS MCP server automatically. Open the chat tool picker and enable **GLuaLS Garry's Mod Runtime**. You do not need to configure a separate Copilot integration.
+
+## Connect another AI agent
 
 <Steps>
-  <Step title="Enable the GLuaLS tools">
-    Open Copilot Chat's tool picker and enable the GLuaLS tools you want to use.
+  <Step title="Start GLuaLS in VS Code">
+    Open your GLua workspace in VS Code. The extension hosts the MCP server because it owns the debugger connection and language diagnostics.
   </Step>
-  <Step title="Connect the debugger for runtime tools">
-    Start a Garry's Mod debug session before asking Copilot to run Lua, run files, or send commands.
+  <Step title="Copy the connection configuration">
+    Run **GLuaLS: MCP: Copy Server Configuration** from the Command Palette. The command copies the current Streamable HTTP URL and bearer token.
   </Step>
-  <Step title="Use Copilot Chat">
-    Ask a direct question, such as "What arguments does `Entity:TakeDamageInfo` accept?" or "Show the recent Lua errors."
+  <Step title="Add it to your agent">
+    Paste the copied server entry into your agent's MCP configuration. The exact outer property can vary between clients; the copied object uses VS Code's `servers` format.
+  </Step>
+  <Step title="Connect the debugger">
+    Start a Garry's Mod debug session before asking the agent to execute Lua. Console and runtime error capture starts with the debug session.
   </Step>
 </Steps>
 
----
+The copied entry has this shape:
 
-## Example interactions
-
+```json
+{
+  "servers": {
+    "gluals-gmod": {
+      "type": "http",
+      "url": "http://127.0.0.1:21113/mcp",
+      "headers": {
+        "Authorization": "Bearer <generated-token>"
+      }
+    }
+  }
+}
 ```
-You: What arguments does Entity:TakeDamageInfo accept?
 
-Copilot: [uses gluaDocs] Entity:TakeDamageInfo accepts one CTakeDamageInfo value.
+## Example workflow
+
+```text
+You: Check the current map and report any Lua failures.
+
+Agent: [calls execute_lua with print(game.GetMap())]
+Agent: [calls read_issues]
+Agent: The server is running gm_construct. No runtime Lua errors were captured,
+       but GLuaLS reports one warning in lua/autorun/example.lua:14.
 ```
 
-```
-You: Run print(game.GetMap()) on the server
+For repeated console reads, pass the `cursor` from the previous `read_console` response. This returns only newer lines and avoids confusing old output with the current test.
 
-Copilot: [uses gmodRunLua] Output: gm_flatgrass
-```
+## Security
+
+The MCP server:
+
+- Binds only to `127.0.0.1`
+- Requires a bearer token for every request
+- Stores its generated token in VS Code secret storage
+- Validates host and origin headers to prevent DNS rebinding
+- Rate-limits requests and bounds request/output sizes
+- Marks game output as untrusted runtime data in tool responses
+
+Set `gluals.gmod.mcp.authToken` only if you need a fixed token. Leaving it empty is safer for most users.
 
 ## Settings
 
 | Setting | Default | Description |
 |---|---|---|
 | `gluals.gmod.mcp.enabled` | `true` | Start the local MCP server |
-| `gluals.gmod.mcp.port` | `0` | Local port. `0` chooses an available port |
-| `gluals.gmod.mcp.authToken` | `""` | Authentication token. An empty value creates a local token |
-| `gluals.gmod.mcp.rateLimitPerMinute` | `60` | Maximum MCP requests per minute for each client |
+| `gluals.gmod.mcp.port` | `21113` | Streamable HTTP port. `0` chooses an available port |
+| `gluals.gmod.mcp.authToken` | `""` | Bearer token override. Empty securely generates and stores a token |
+| `gluals.gmod.mcp.rateLimitPerMinute` | `120` | Maximum MCP requests per minute for each local client |
+
+If you set the port to `0`, copy a new external-agent configuration after each extension restart because the ephemeral URL can change.
