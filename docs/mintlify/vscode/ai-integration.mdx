@@ -9,8 +9,8 @@ The VS Code extension runs a local [Model Context Protocol](https://modelcontext
 
 The server combines three parts of your development environment:
 
-- The active Garry's Mod debugger session for Lua execution
-- Captured server and client console output
+- A selected server debugger for control and execution
+- Captured server and client console output and runtime errors
 - Runtime Lua errors and GLuaLS language diagnostics
 
 <Warning>
@@ -29,6 +29,23 @@ The server intentionally exposes only five tools:
 | `get_errors` | Read filtered in-game runtime errors |
 | `get_issues` | Read filtered GLuaLS language-server errors and warnings |
 
+## Debugger connections and routing
+
+`gluals_gmod` is the server-control debugger connection. `execute_lua`, workspace file execution, `lua_refresh_file`, and `run_console_command` require a connected server debugger.
+
+`gluals_gmod_client` provides client telemetry and paused debugging. It does not provide custom MCP client control. MCP `client` and `shared` Lua still dispatch through the selected server debugger's net broadcast.
+
+Mutation tools accept an optional `sessionId`:
+
+- With exactly one connected server, MCP selects it automatically.
+- With no connected server, MCP returns a server-required capability error.
+- With multiple connected servers, supply the intended server `sessionId`.
+- Client and terminated session IDs are rejected for mutations.
+
+Mutation results identify the selected target session. The active debug-session dropdown in VS Code does not choose the MCP target.
+
+`get_issues` reads static GLuaLS diagnostics and is independent of runtime debugger sessions.
+
 For inline execution, supply `code`. Inline source is limited to 256 KiB in UTF-8. For a file, supply `file`; the debugger sends the path rather than putting the file contents in the MCP request, so the inline limit does not apply. Server files execute directly. Client/shared file payloads use bounded chunked net messages and can be up to 1 MiB. The file must be inside a workspace `lua/` directory.
 
 `execute_lua` is designed for quick experiments and active debugging, similar to a REPL against the running game. Inline server/shared execution returns a bounded summary of server return values plus console lines and errors observed immediately after dispatch. That observed context is best-effort and can include unrelated game activity. Pass the returned cursor to `read_console` and `get_errors` for later or paged results, especially for asynchronous client code, hooks, and timers.
@@ -42,8 +59,10 @@ Choose the execution realm explicitly:
 | `shared` | The server and every connected client |
 
 <Warning>
-The debugger bridge broadcasts `client` and `shared` execution to every player connected to the development server. The tool rejects those realms unless the request explicitly sets `confirmClientBroadcast` to `true`. This option means "I understand this runs clientside on all connected clients"; it does not target one client. Use the `server` realm unless you intend to run the code on every connected client.
+The debugger bridge broadcasts `client` and `shared` execution to every player connected to the selected development server. The tool rejects those realms unless the request explicitly sets `confirmClientBroadcast` to `true`. This option means "I understand this runs clientside on all connected clients"; it does not target one client. Use the `server` realm unless you intend to run the code on every connected client.
 </Warning>
+
+A client debugger is not required to dispatch a client/shared broadcast. Without an attached client telemetry session, the agent cannot observe that client's prints or errors. A `gluals_gmod_client` session observes only the client it is attached to, not every client that received the broadcast.
 
 `run_console_command` always targets the server console. It accepts one command, rejects semicolon chaining, and never invokes a command on clients. Console commands have the same ability to mutate or stop the development server as commands entered manually.
 
@@ -70,11 +89,13 @@ All read tools use small defaults and bounded responses. Narrow the request befo
 
 | Tool | Useful controls |
 |---|---|
-| `read_console` | `lines`, `cursor`, `realm`, `source`, `contains` |
-| `get_errors` | `source`, `realm`, `cursor`, `minCount`, `contains`, `includeStackTrace`, `limit` |
+| `read_console` | `lines`, `cursor`, `sessionId`, `realm`, `source`, `contains`, `includeSessions` |
+| `get_errors` | `source`, `sessionId`, `realm`, `cursor`, `minCount`, `contains`, `includeStackTrace`, `limit`, `includeSessions` |
 | `get_issues` | `severity`, `path`, `code`, `contains`, `offset`, `limit` |
 
 `get_errors` defaults to runtime errors whose source is `lua` and omits stack traces. Set `source` to `console`, `debugger`, or `all` only when those domains are relevant. `get_issues` never includes runtime errors.
+
+`read_console` and `get_errors` accept an optional `sessionId` and filter telemetry by `realm: "server"` or `realm: "client"`. `shared` is execution-only and is not a telemetry filter. Each telemetry record keeps its session attribution and current session state. Set `includeSessions` to `true` when the response should also include the compact available-session inventory; retained terminated-session records are marked as terminated so they remain distinguishable from connected sessions.
 
 Runtime reads return `truncated` when more matching data exists or fields were shortened. Cursored reads also return `dropped` when the requested cursor is older than the retained ring buffer, so an agent does not silently mistake an incomplete history for a complete one.
 
@@ -95,7 +116,7 @@ VS Code discovers the GLuaLS MCP server automatically. Open the chat tool picker
     Paste the copied server entry into your agent's MCP configuration. The exact outer property can vary between clients; the copied object uses VS Code's `servers` format.
   </Step>
   <Step title="Connect the debugger">
-    Start a Garry's Mod debug session before asking the agent to execute Lua. Console and runtime error capture starts with the debug session.
+    Start a `gluals_gmod` server debug session before asking the agent to execute Lua. Attach `gluals_gmod_client` separately when you need telemetry or paused debugging for one client.
   </Step>
 </Steps>
 
