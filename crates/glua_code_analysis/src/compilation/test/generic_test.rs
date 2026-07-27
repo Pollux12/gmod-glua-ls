@@ -436,6 +436,66 @@ mod test {
     }
 
     #[test]
+    fn test_issue_63_class_declaration_tables_satisfy_mapped_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@alias Mapped<T> { [P in keyof T]: T[P]; }
+
+            ---@class Seeded
+            ---@field a string
+            Seeded = Seeded or {}
+
+            ---@class Plain
+            ---@field a string
+            Plain = {}
+
+            ---@class Localised
+            ---@field a string
+            local Localised = {}
+
+            ---@param v Partial<Seeded>
+            local function takeSeeded(v) end
+            ---@param v Partial<Plain>
+            local function takePlain(v) end
+            ---@param v Partial<Localised>
+            local function takeLocalised(v) end
+            ---@param v Mapped<Seeded>
+            local function takeMapped(v) end
+
+            takeSeeded(Seeded)
+            takePlain(Plain)
+            takeLocalised(Localised)
+            takeMapped(Seeded)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_issue_63_class_declaration_tables_still_check_mapped_member_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Expected
+            ---@field a string
+
+            ---@class Actual
+            ---@field a number
+            Actual = {}
+
+            ---@param v Partial<Expected>
+            local function take(v) end
+
+            take(Actual)
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_issue_787() {
         let mut ws = VirtualWorkspace::new();
 
