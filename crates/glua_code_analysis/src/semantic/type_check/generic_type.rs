@@ -164,6 +164,9 @@ fn check_generic_type_compact_table(
         let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
         let key = source_member.key;
+        if context.is_key_checked(&key) {
+            continue;
+        }
 
         match table_member_map.get(&key) {
             Some(table_member_id) => {
@@ -214,6 +217,8 @@ fn check_generic_type_compact_table(
             }
             _ => {} // 可选成员未找到，继续检查
         }
+
+        context.mark_key_checked(key);
     }
 
     // 检查超类型

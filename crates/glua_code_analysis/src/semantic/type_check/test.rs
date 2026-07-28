@@ -569,6 +569,26 @@ mod test {
     }
 
     #[test]
+    fn generic_child_default_suppresses_parent_required_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericParent<T>
+            ---@field force T
+            ---@field other string
+
+            ---@class GenericChild<T> : GenericParent<T>
+            ---@field force T=1
+            "#,
+        );
+
+        let target_ty = ws.ty("GenericChild<number>");
+        let table_ty = ws.expr_ty(r#"{ other = "ok" }"#);
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
     fn generic_method_member_is_not_checked_when_present() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
