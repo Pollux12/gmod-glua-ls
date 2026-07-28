@@ -154,6 +154,10 @@ impl LuaInferenceEventId {
 pub struct LuaInferenceStep {
     pub event: LuaInferenceEventId,
     pub support: Arc<[LuaInferenceNodeId]>,
+    /// The type inferred when a reportable event originated. Unlike the containing fact's
+    /// runtime type, this remains stable when provenance propagates through assignments and
+    /// return values.
+    pub inferred_type: Option<Arc<LuaType>>,
     pub found_type: Option<Arc<LuaType>>,
 }
 

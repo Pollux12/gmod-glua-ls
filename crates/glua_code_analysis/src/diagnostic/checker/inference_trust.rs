@@ -36,20 +36,20 @@ impl Checker for InferenceTrustChecker {
                 }
                 _ => continue,
             };
-            let typ = humanize_type(
-                semantic_model.get_db(),
-                inference.fact.typ(),
-                RenderLevel::Simple,
-            );
+            let step = inference
+                .fact
+                .provenance()
+                .iter()
+                .find(|step| step.event == inference.event);
+            let inferred_type = step
+                .and_then(|step| step.inferred_type.as_deref())
+                .unwrap_or_else(|| inference.fact.typ());
+            let typ = humanize_type(semantic_model.get_db(), inferred_type, RenderLevel::Simple);
             context.add_diagnostic(
                 code,
                 inference.event.source.value.get_range(),
                 if is_unguarded_child {
-                    let found = inference
-                        .fact
-                        .provenance()
-                        .iter()
-                        .find(|step| step.event == inference.event)
+                    let found = step
                         .and_then(|step| step.found_type.as_deref())
                         .map_or_else(
                             || "unknown".to_string(),
