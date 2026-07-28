@@ -57,6 +57,7 @@ mod test {
             provenance: Arc::from([LuaInferenceStep {
                 event,
                 support: Arc::from([]),
+                inferred_type: None,
                 found_type: None,
             }]),
         }
@@ -96,16 +97,19 @@ mod test {
             Arc::from([
                 LuaInferenceStep {
                     event: second.clone(),
+                    inferred_type: None,
                     found_type: None,
                     support: Arc::from([]),
                 },
                 LuaInferenceStep {
                     event: first.clone(),
+                    inferred_type: None,
                     found_type: None,
                     support: Arc::from([]),
                 },
                 LuaInferenceStep {
                     event: second.clone(),
+                    inferred_type: None,
                     found_type: None,
                     support: Arc::from([]),
                 },
@@ -205,6 +209,7 @@ mod test {
                     source: source(30),
                 },
                 support: Arc::from([target.clone()]),
+                inferred_type: None,
                 found_type: None,
             }]),
         );
@@ -232,6 +237,7 @@ mod test {
                     source: source(30),
                 },
                 support: Arc::from([]),
+                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Player")))),
                 found_type: Some(Arc::new(base_type.clone())),
             }]),
         );
@@ -268,6 +274,7 @@ mod test {
                     source: source(30),
                 },
                 support: Arc::from([]),
+                inferred_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Vector")))),
                 found_type: Some(Arc::new(base_type)),
             }]),
         );
@@ -405,6 +412,7 @@ mod test {
             provenance: Arc::from([LuaInferenceStep {
                 event,
                 support: Arc::from([]),
+                inferred_type: None,
                 found_type: None,
             }]),
         };
@@ -440,6 +448,7 @@ mod test {
                     kind: LuaInferenceProvenanceKind::ContextualUnknown,
                     source: source_in(source_file, position),
                 },
+                inferred_type: None,
                 found_type: None,
                 support: Arc::from([]),
             }]),
@@ -519,6 +528,7 @@ mod test {
                         ),
                     ),
                 },
+                inferred_type: Some(Arc::new(LuaType::String)),
                 found_type: None,
                 support: Arc::from([LuaInferenceNodeId::TypeOwner(LuaTypeOwner::SyntaxId(
                     InFiled::new(
@@ -579,6 +589,50 @@ mod test {
             index.get_inference_events_for_file(file_id())[0].fact.typ(),
             &LuaType::Table
         );
+    }
+
+    #[test]
+    fn inference_event_retains_its_type_after_provenance_propagates() {
+        let mut index = LuaTypeIndex::new();
+        let target_owner = owner_in(file_id(), 10);
+        let downstream_owner = owner_in(file_id(), 20);
+        let expected = LuaType::Ref(LuaTypeDeclId::global("Player"));
+        let event = LuaInferenceEventId {
+            node: LuaInferenceNodeId::TypeOwner(target_owner.clone()),
+            kind: LuaInferenceProvenanceKind::UnguardedChild,
+            source: source(30),
+        };
+        let metadata = LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Heuristic,
+            base_provenance_kind: None,
+            provenance: Arc::from([LuaInferenceStep {
+                event,
+                support: Arc::from([]),
+                inferred_type: Some(Arc::new(expected.clone())),
+                found_type: Some(Arc::new(LuaType::Ref(LuaTypeDeclId::global("Entity")))),
+            }]),
+        };
+
+        index.force_bind_type_fact(
+            target_owner,
+            LuaTypeCache::InferType(expected.clone()),
+            metadata.clone(),
+        );
+        index.force_bind_type_fact(
+            downstream_owner,
+            LuaTypeCache::InferType(LuaType::String),
+            metadata,
+        );
+
+        let events = index.get_inference_events_for_file(file_id());
+        assert_eq!(events.len(), 1, "{events:?}");
+        let step = events[0]
+            .fact
+            .provenance()
+            .iter()
+            .find(|step| step.event == events[0].event)
+            .expect("event provenance");
+        assert_eq!(step.inferred_type.as_deref(), Some(&expected));
     }
 
     #[test]

@@ -505,6 +505,7 @@ mod tests {
                 vec![LuaInferenceStep {
                     event: receiver_event.clone(),
                     support: Vec::new().into(),
+                    inferred_type: Some(Arc::new(receiver_fact.typ().clone())),
                     found_type: None,
                 }]
                 .into(),
@@ -543,6 +544,13 @@ mod tests {
                 None,
                 vec![&receiver_event],
             )
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "Type `{ GetNumber = fun() -> number }` was inferred from usage context and may be incorrect."
         );
     }
 
@@ -897,6 +905,7 @@ mod tests {
                 vec![LuaInferenceStep {
                     event,
                     support: vec![].into(),
+                    inferred_type: Some(Arc::new(LuaType::String)),
                     found_type: None,
                 }]
                 .into(),

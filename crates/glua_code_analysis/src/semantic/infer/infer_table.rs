@@ -2,16 +2,18 @@ use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaChunk, LuaExpr,
-    LuaIndexMemberExpr, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr, LuaTableField,
-    LuaVarExpr,
+    LuaIndexExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaLocalStat, LuaReturnStat, LuaTableExpr,
+    LuaTableField, LuaVarExpr,
 };
 use rowan::TextRange;
 
 use crate::{
-    InFiled, InferGuard, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaTupleStatus,
-    LuaTupleType, LuaUnionType, TypeOps, VariadicType, check_type_compact,
+    InFiled, InferGuard, LuaArrayType, LuaDeclId, LuaInferCache, LuaMemberId, LuaSemanticDeclId,
+    LuaTupleStatus, LuaTupleType, LuaUnionType, SemanticDeclGuard, SemanticDeclLevel, TypeOps,
+    VariadicType, check_type_compact,
     db_index::{DbIndex, LuaType},
     infer_call_expr_func, infer_expr,
+    semantic::infer_expr_semantic_decl,
 };
 
 use super::{
@@ -556,6 +558,12 @@ fn infer_table_type_by_assign_stat(
         }
     } else {
         if let LuaVarExpr::IndexExpr(index_expr) = name {
+            if let Some(declared_type) =
+                infer_declared_index_assignment_type(db, cache, index_expr.clone())
+            {
+                return Ok(declared_type);
+            }
+
             let member_id = LuaMemberId::new(index_expr.get_syntax_id(), cache.get_file_id());
             if let Some(type_cache) = db.get_type_index().get_type_cache(&member_id.into()) {
                 return match type_cache.as_type() {
@@ -570,6 +578,42 @@ fn infer_table_type_by_assign_stat(
             cache,
             LuaExpr::cast(name.syntax().clone()).ok_or(InferFailReason::None)?,
         )
+    }
+}
+
+fn infer_declared_index_assignment_type(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    index_expr: LuaIndexExpr,
+) -> Option<LuaType> {
+    let semantic_decl = infer_expr_semantic_decl(
+        db,
+        cache,
+        LuaExpr::IndexExpr(index_expr.clone()),
+        SemanticDeclGuard::default(),
+        SemanticDeclLevel::NoTrace,
+    )?;
+    let type_owner = match semantic_decl {
+        LuaSemanticDeclId::LuaDecl(decl_id) => decl_id.into(),
+        LuaSemanticDeclId::Member(member_id) => member_id.into(),
+        LuaSemanticDeclId::TypeDecl(_) | LuaSemanticDeclId::Signature(_) => return None,
+    };
+    db.get_type_index()
+        .get_type_cache(&type_owner)
+        .filter(|type_cache| type_cache.is_doc())?;
+
+    let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
+    let declared_type = infer_member_by_member_key(
+        db,
+        cache,
+        &prefix_type,
+        LuaIndexMemberExpr::IndexExpr(index_expr),
+        &InferGuard::new(),
+    )
+    .ok()?;
+    match declared_type {
+        LuaType::TableConst(_) => None,
+        typ => Some(typ),
     }
 }
 
