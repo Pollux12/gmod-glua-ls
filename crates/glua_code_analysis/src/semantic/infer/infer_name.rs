@@ -24,9 +24,8 @@ use crate::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
         member::{
-            find_inherited_members_with_key,
-            find_inherited_members_with_key_in_workspace_for_file_at_offset, find_members_with_key,
-            merge_open_table_types,
+            find_members_with_key, find_members_with_key_in_workspace_for_file_at_offset,
+            merge_open_table_types, visible_super_types_in_workspace_for_file_at_offset,
         },
         resolve_registered_vgui_method_context_for_func,
         semantic_info::resolve_global_decl_id,
@@ -1249,23 +1248,41 @@ fn find_param_type_from_inherited_members(
         .get_member(&current_member_id)?
         .get_key()
         .clone();
-    let member_infos = match db.get_module_index().get_workspace_id(caller_file_id) {
-        Some(workspace_id) => find_inherited_members_with_key_in_workspace_for_file_at_offset(
+    let caller_workspace_id = db.get_module_index().get_workspace_id(caller_file_id);
+    let super_types = match caller_workspace_id {
+        Some(workspace_id) => visible_super_types_in_workspace_for_file_at_offset(
             db,
             owner_id,
-            key,
-            false,
             workspace_id,
             caller_file_id,
             caller_position,
         ),
-        None => find_inherited_members_with_key(db, owner_id, key, false),
+        None => db.get_type_index().get_super_types(owner_id),
     }?;
-    for member_info in member_infos {
-        if let Some(param_type) =
-            find_param_type_from_type(db, member_info.typ, param_idx, colon_define, is_dots)
-        {
-            return Some(param_type);
+
+    for super_type in super_types {
+        let member_infos = match caller_workspace_id {
+            Some(workspace_id) => find_members_with_key_in_workspace_for_file_at_offset(
+                db,
+                &super_type,
+                key.clone(),
+                false,
+                workspace_id,
+                caller_file_id,
+                caller_position,
+            ),
+            None => find_members_with_key(db, &super_type, key.clone(), false),
+        };
+        let Some(member_infos) = member_infos else {
+            continue;
+        };
+
+        for member_info in member_infos {
+            if let Some(param_type) =
+                find_param_type_from_type(db, member_info.typ, param_idx, colon_define, is_dots)
+            {
+                return Some(param_type);
+            }
         }
     }
 

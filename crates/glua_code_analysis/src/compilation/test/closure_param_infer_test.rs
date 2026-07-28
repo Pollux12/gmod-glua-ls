@@ -864,6 +864,32 @@ mod test {
     }
 
     #[test]
+    fn inherited_param_uses_later_superclass_with_usable_contract() {
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def(
+            r#"
+            ---@class UntypedBase
+            ---@field Run function
+            local UntypedBase = {}
+
+            ---@class TypedBase
+            ---@field Run fun(value: string)
+            local TypedBase = {}
+
+            ---@class MultiBaseChild : UntypedBase, TypedBase
+            local MultiBaseChild = {}
+
+            function MultiBaseChild.Run(value)
+                later_super_param = value
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("later_super_param"), LuaType::String);
+    }
+
+    #[test]
     fn test_stool_buildcpanel_param_inherits_global_tool_contract() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

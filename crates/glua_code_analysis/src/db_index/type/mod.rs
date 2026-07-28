@@ -711,18 +711,25 @@ impl LuaTypeIndex {
     }
 
     pub fn get_super_types(&self, decl_id: &LuaTypeDeclId) -> Option<Vec<LuaType>> {
-        self.supers
-            .get(decl_id)
-            .map(|supers| supers.iter().map(|s| s.value.typ.clone()).collect())
+        self.get_super_types_iter(decl_id)
+            .map(|super_types| super_types.cloned().collect())
     }
 
     pub fn get_super_types_iter(
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        self.supers
-            .get(decl_id)
-            .map(|supers| supers.iter().map(|s| &s.value.typ))
+        self.supers.get(decl_id).map(|supers| {
+            supers
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, super_type)| {
+                    supers[..index]
+                        .iter()
+                        .all(|previous| previous.value.typ != super_type.value.typ)
+                        .then_some(&super_type.value.typ)
+                })
+        })
     }
 
     pub(crate) fn get_super_type_entries(
@@ -1318,6 +1325,47 @@ pub fn first_param_may_not_self(typ: &LuaType) -> bool {
         return u.types().any(first_param_may_not_self);
     }
     false
+}
+
+#[cfg(test)]
+mod super_type_tests {
+    use rowan::TextRange;
+
+    use super::*;
+
+    #[test]
+    fn logical_super_type_accessors_deduplicate_source_edges() {
+        let mut index = LuaTypeIndex::new();
+        let child_id = LuaTypeDeclId::global("Child");
+        let parent_type = LuaType::Ref(LuaTypeDeclId::global("Parent"));
+        let edge_file = FileId::new(1);
+
+        index.add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(10.into(), 20.into()),
+            parent_type.clone(),
+        );
+        index.add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(30.into(), 40.into()),
+            parent_type.clone(),
+        );
+
+        let source_edge_count = index
+            .get_super_type_entries(&child_id)
+            .map_or(0, <[_]>::len);
+        let super_types = index.get_super_types(&child_id).unwrap_or_default();
+        let iter_super_types = index
+            .get_super_types_iter(&child_id)
+            .map(|types| types.cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        assert_eq!(source_edge_count, 2);
+        assert_eq!(super_types, vec![parent_type.clone()]);
+        assert_eq!(iter_super_types, vec![parent_type]);
+    }
 }
 
 #[cfg(test)]

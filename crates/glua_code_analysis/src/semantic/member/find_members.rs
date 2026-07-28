@@ -128,50 +128,6 @@ pub fn find_members_with_key_in_workspace_for_file_at_offset(
     )
 }
 
-pub(crate) fn find_inherited_members_with_key(
-    db: &DbIndex,
-    type_decl_id: &LuaTypeDeclId,
-    member_key: LuaMemberKey,
-    find_all: bool,
-) -> FindMembersResult {
-    let ctx = FindMembersContext::new(InferGuard::new());
-    find_super_type_members(
-        db,
-        type_decl_id,
-        &ctx,
-        &FindMemberFilter::ByKey {
-            member_key,
-            find_all,
-        },
-    )
-}
-
-pub(crate) fn find_inherited_members_with_key_in_workspace_for_file_at_offset(
-    db: &DbIndex,
-    type_decl_id: &LuaTypeDeclId,
-    member_key: LuaMemberKey,
-    find_all: bool,
-    workspace_id: WorkspaceId,
-    file_id: FileId,
-    caller_position: TextSize,
-) -> FindMembersResult {
-    let ctx = FindMembersContext::new_with_workspace_file_and_position(
-        InferGuard::new(),
-        workspace_id,
-        file_id,
-        caller_position,
-    );
-    find_super_type_members(
-        db,
-        type_decl_id,
-        &ctx,
-        &FindMemberFilter::ByKey {
-            member_key,
-            find_all,
-        },
-    )
-}
-
 pub(crate) fn visible_super_types_in_workspace_for_file_at_offset(
     db: &DbIndex,
     type_decl_id: &LuaTypeDeclId,
