@@ -486,6 +486,7 @@ fn collect_vgui_named_callback_receiver_types(
                     Arc::from([LuaInferenceStep {
                         event,
                         support: Arc::from([]),
+                        inferred_type: None,
                         found_type: None,
                     }]),
                 ),
@@ -929,11 +930,12 @@ fn collect_call_site_param_types(
                 signature_id,
                 param_idx,
                 LuaTypeFact::new(
-                    arg_type,
+                    arg_type.clone(),
                     LuaInferenceConfidence::Anchored,
                     vec![LuaInferenceStep {
                         event,
                         support: vec![].into(),
+                        inferred_type: Some(Arc::new(arg_type)),
                         found_type: None,
                     }]
                     .into(),
@@ -1068,6 +1070,7 @@ fn collect_direct_callback_param_types(
                         Arc::from([LuaInferenceStep {
                             event,
                             support: Arc::from([]),
+                            inferred_type: None,
                             found_type: None,
                         }]),
                     ),
@@ -1347,11 +1350,12 @@ fn collect_exact_colon_receiver_type(
         signature_id,
         0,
         LuaTypeFact::new(
-            receiver_type,
+            receiver_type.clone(),
             LuaInferenceConfidence::Anchored,
             vec![LuaInferenceStep {
                 event,
                 support: vec![].into(),
+                inferred_type: Some(Arc::new(receiver_type)),
                 found_type: None,
             }]
             .into(),

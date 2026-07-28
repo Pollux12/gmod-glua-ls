@@ -1707,6 +1707,35 @@ mod test {
     }
 
     #[test]
+    fn unguarded_child_diagnostic_uses_receiver_type_after_return_propagation() {
+        for _ in 0..32 {
+            let mut ws = VirtualWorkspace::new();
+            enable_gmod(&mut ws);
+            let file_id = ws.def(
+                r#"
+                ---@class Entity
+                ---@class Player: Entity
+                ---@field SteamID fun(self: Player): string
+
+                ---@param user Entity
+                local function read_steam_id(user)
+                    local steam_id = user:SteamID()
+                    return steam_id
+                end
+                "#,
+            );
+
+            let diagnostics =
+                diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+            assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+            assert_eq!(
+                diagnostics[0].message,
+                "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+            );
+        }
+    }
+
+    #[test]
     fn return_cast_closure_capture_tracks_incremental_mutability_and_reopen() {
         const IMMUTABLE_SOURCE: &str = r#"
             ---@class Entity

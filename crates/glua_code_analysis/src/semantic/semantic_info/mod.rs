@@ -247,7 +247,7 @@ pub(crate) fn infer_expr_semantic_info(
                         )))
                     });
                 let fact = LuaTypeFact::new(
-                    typ,
+                    typ.clone(),
                     LuaInferenceConfidence::Anchored,
                     Arc::from([LuaInferenceStep {
                         event: LuaInferenceEventId {
@@ -255,6 +255,7 @@ pub(crate) fn infer_expr_semantic_info(
                             kind: LuaInferenceProvenanceKind::ContextualUnknown,
                             source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
                         },
+                        inferred_type: Some(Arc::new(typ)),
                         found_type: None,
                         support: Arc::from([]),
                     }]),
@@ -311,6 +312,7 @@ fn actual_expr_semantic_info(
                     kind: LuaInferenceProvenanceKind::UnresolvedVguiParent,
                     source: InFiled::new(cache.get_file_id(), expr.get_syntax_id()),
                 },
+                inferred_type: None,
                 found_type: None,
                 support: Arc::from([]),
             }]),

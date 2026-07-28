@@ -536,11 +536,12 @@ pub(super) fn stabilize_unguarded_children(
         updates.push((
             node,
             LuaTypeFact::new(
-                typ,
+                typ.clone(),
                 LuaInferenceConfidence::Heuristic,
                 Arc::from([LuaInferenceStep {
                     event,
                     support: support.into(),
+                    inferred_type: Some(Arc::new(typ)),
                     found_type: Some(Arc::new(found_type)),
                 }]),
             ),
@@ -602,6 +603,7 @@ pub(super) fn stabilize_unguarded_children(
                     Arc::from([LuaInferenceStep {
                         event,
                         support: support.clone().into(),
+                        inferred_type: Some(Arc::new(typ.clone())),
                         found_type: Some(Arc::new(found_type.clone())),
                     }]),
                 ),
