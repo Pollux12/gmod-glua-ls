@@ -1,8 +1,8 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
-    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
+    LuaTypeDecl, LuaTypeDeclId, RenderLevel, humanize_type,
     semantic::{
         member::find_members,
         type_check::{
@@ -330,25 +330,28 @@ fn check_ref_type_compact_table(
         })
         .unwrap_or_default();
 
-    let source_owner = LuaMemberOwner::Type(source_type_id.clone());
-    let source_type_members = member_index.get_members(&source_owner);
+    let source_type = LuaType::Ref(source_type_id.clone());
+    let source_type_members = find_members(context.db, &source_type);
     let Some(source_type_members) = source_type_members else {
         return Ok(()); // empty member donot need check
     };
 
-    let mut resolved_duplicate_types = HashMap::new();
+    let mut checked_keys = HashSet::new();
 
     for source_member in source_type_members {
-        let raw_source_member_type = context
-            .db
-            .get_type_index()
-            .get_type_cache(&source_member.get_id().into())
-            .unwrap_or(&LuaTypeCache::InferType(LuaType::Any))
-            .as_type();
-        let key = source_member.get_key();
-        if let std::collections::hash_map::Entry::Vacant(entry) =
-            resolved_duplicate_types.entry(key.clone())
-            && let Some(item) = member_index.get_member_item(&source_owner, key)
+        let key = source_member.key;
+        if !checked_keys.insert(key.clone()) {
+            continue;
+        }
+        if is_structural_method_member(source_member.feature) {
+            continue;
+        }
+
+        let mut source_member_type = source_member.typ;
+        if let Some(LuaSemanticDeclId::Member(source_member_id)) =
+            source_member.property_owner_id.as_ref()
+            && let Some(source_owner) = member_index.get_current_owner(source_member_id)
+            && let Some(item) = member_index.get_member_item(source_owner, &key)
             && !item.is_one()
             && item.get_member_ids().iter().all(|member_id| {
                 member_index.get_member(member_id).is_some_and(|member| {
@@ -357,22 +360,10 @@ fn check_ref_type_compact_table(
             })
             && let Ok(typ) = context.resolve_member_item_type(item)
         {
-            entry.insert(typ);
-        }
-        let source_member_type = resolved_duplicate_types
-            .get(key)
-            .unwrap_or(raw_source_member_type);
-        let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
-        if is_structural_method_member(Some(source_member.get_feature())) {
-            continue;
-        }
-        let key = source_member.get_key();
-
-        if context.is_key_checked(key) {
-            continue;
+            source_member_type = typ;
         }
 
-        match table_member_map.get(key) {
+        match table_member_map.get(&key) {
             Some(table_member_id) => {
                 let table_member = member_index
                     .get_member(table_member_id)
@@ -383,7 +374,7 @@ fn check_ref_type_compact_table(
 
                 if let Err(err) = check_general_type_compact(
                     context,
-                    source_member_type,
+                    &source_member_type,
                     &table_member_type,
                     check_guard.next_level()?,
                 ) && err.is_type_not_match()
@@ -397,7 +388,7 @@ fn check_ref_type_compact_table(
                             "member {name} type not match, expect {expect}, got {got}",
                             name = key.to_path(),
                             expect =
-                                humanize_type(context.db, source_member_type, RenderLevel::Simple),
+                                humanize_type(context.db, &source_member_type, RenderLevel::Simple),
                             got =
                                 humanize_type(context.db, &table_member_type, RenderLevel::Simple)
                         )
@@ -408,8 +399,8 @@ fn check_ref_type_compact_table(
             None if !source_member_type.is_optional()
                 && !member_has_documented_default(
                     context.db,
-                    Some(&property_owner_id),
-                    Some(source_member_type),
+                    source_member.property_owner_id.as_ref(),
+                    Some(&source_member_type),
                 ) =>
             {
                 if !context.detail {
@@ -421,26 +412,6 @@ fn check_ref_type_compact_table(
                 ));
             }
             _ => {} // Optional member not found, continue
-        }
-
-        context.mark_key_checked(key.clone());
-    }
-
-    // 检查超类型
-    if let Some(supers) = context.db.get_type_index().get_super_types(source_type_id) {
-        let table_type = LuaType::TableConst(
-            table_owner
-                .get_element_range()
-                .ok_or(TypeCheckFailReason::TypeNotMatch)?
-                .clone(),
-        );
-        for super_type in supers {
-            check_general_type_compact(
-                context,
-                &super_type,
-                &table_type,
-                check_guard.next_level()?,
-            )?;
         }
     }
 
@@ -459,16 +430,17 @@ fn check_ref_type_compact_object(
         return Ok(());
     };
 
+    let mut checked_keys = HashSet::new();
     for source_member in source_type_members {
+        let key = source_member.key;
+        if !checked_keys.insert(key.clone()) {
+            continue;
+        }
         if is_structural_method_member(source_member.feature) {
             continue;
         }
         let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
-        let key = source_member.key;
-        if context.is_key_checked(&key) {
-            continue;
-        }
 
         match get_object_field_type(object_type, &key) {
             Some(field_type) => {
@@ -511,8 +483,6 @@ fn check_ref_type_compact_object(
             }
             _ => {} // Optional member not found, continue
         }
-
-        context.mark_key_checked(key);
     }
 
     Ok(())
@@ -546,9 +516,10 @@ fn check_ref_type_compact_tuple(
     };
 
     let tuple_types = tuple_type.get_types();
+    let mut checked_keys = HashSet::new();
     for member in source_type_members {
         let key = member.key;
-        if context.is_key_checked(&key) {
+        if !checked_keys.insert(key.clone()) {
             continue;
         }
         match &key {
@@ -584,8 +555,6 @@ fn check_ref_type_compact_tuple(
                 return Err(TypeCheckFailReason::TypeNotMatch);
             }
         }
-
-        context.mark_key_checked(key);
     }
 
     Ok(())

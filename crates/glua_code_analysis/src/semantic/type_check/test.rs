@@ -589,6 +589,46 @@ mod test {
     }
 
     #[test]
+    fn nested_generic_fields_do_not_share_checked_keys() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Inner<T>
+            ---@field value T
+
+            ---@class Outer<T>
+            ---@field inner Inner<T>
+            ---@field value string
+            "#,
+        );
+
+        let target_ty = ws.ty("Outer<number>");
+        let table_ty = ws.expr_ty(r#"{ inner = { value = 1 }, value = 1 }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn nested_class_fields_do_not_share_checked_keys() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Inner
+            ---@field value number
+
+            ---@class Outer
+            ---@field inner Inner
+            ---@field value string
+            "#,
+        );
+
+        let target_ty = ws.ty("Outer");
+        let table_ty = ws.expr_ty(r#"{ inner = { value = 1 }, value = 1 }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
     fn generic_method_member_is_not_checked_when_present() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

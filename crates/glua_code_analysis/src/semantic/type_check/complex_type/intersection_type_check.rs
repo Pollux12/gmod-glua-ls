@@ -37,9 +37,8 @@ pub fn check_intersection_type_compact(
         LuaType::Object(_) => {
             // 检查对象是否满足交叉类型的所有组成部分
             for intersection_component in source_intersection.get_types() {
-                // NOTE: Use a fresh TypeCheckContext per component so `table_member_checked` (and
-                // similar state) doesn't leak across components. Otherwise `A & B` may check `A`
-                // first and then skip `B`'s same-key checks.
+                // Use a fresh context so branch-local checking state cannot leak across
+                // intersection components.
                 let mut component_context =
                     TypeCheckContext::new(context.db, context.detail, context.level.clone());
                 check_general_type_compact(
