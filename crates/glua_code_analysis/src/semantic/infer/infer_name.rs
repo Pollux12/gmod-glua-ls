@@ -23,7 +23,10 @@ use crate::{
         infer::narrow::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
-        member::{find_members_with_key, merge_open_table_types},
+        member::{
+            find_members_with_key, find_members_with_key_in_workspace_for_file_at_offset,
+            merge_open_table_types,
+        },
         resolve_registered_vgui_method_context_for_func,
         semantic_info::resolve_global_decl_id,
     },
@@ -784,16 +787,6 @@ fn infer_param_inner(
     }
 
     if let Some(current_member_id) = member_id {
-        if let Some(param_type) = find_param_type_from_inherited_members(
-            db,
-            current_member_id,
-            param_idx,
-            colon_define,
-            decl.get_name() == "...",
-        ) {
-            return Ok((param_type, ParamInferenceSource::Concrete));
-        }
-
         let member_decl_type = find_decl_member_type(db, current_member_id)?;
         let param_type = find_param_type_from_type(
             db,
@@ -803,6 +796,18 @@ fn infer_param_inner(
             decl.get_name() == "...",
         );
         if let Some(param_type) = param_type {
+            return Ok((param_type, ParamInferenceSource::Concrete));
+        }
+
+        if let Some(param_type) = find_param_type_from_inherited_members(
+            db,
+            current_member_id,
+            param_idx,
+            colon_define,
+            decl.get_name() == "...",
+            decl.get_file_id(),
+            decl.get_position(),
+        ) {
             return Ok((param_type, ParamInferenceSource::Concrete));
         }
 
@@ -1233,6 +1238,8 @@ fn find_param_type_from_inherited_members(
     param_idx: usize,
     colon_define: bool,
     is_dots: bool,
+    caller_file_id: FileId,
+    caller_position: TextSize,
 ) -> Option<LuaType> {
     let member_index = db.get_member_index();
     let owner = member_index.get_current_owner(&current_member_id)?;
@@ -1241,8 +1248,21 @@ fn find_param_type_from_inherited_members(
         .get_member(&current_member_id)?
         .get_key()
         .clone();
+    let caller_workspace_id = db.get_module_index().get_workspace_id(caller_file_id);
     for super_type in db.get_type_index().get_super_types_iter(owner_id)? {
-        let Some(member_infos) = find_members_with_key(db, super_type, key.clone(), false) else {
+        let member_infos = match caller_workspace_id {
+            Some(workspace_id) => find_members_with_key_in_workspace_for_file_at_offset(
+                db,
+                super_type,
+                key.clone(),
+                false,
+                workspace_id,
+                caller_file_id,
+                caller_position,
+            ),
+            None => find_members_with_key(db, super_type, key.clone(), false),
+        };
+        let Some(member_infos) = member_infos else {
             continue;
         };
         for member_info in member_infos {

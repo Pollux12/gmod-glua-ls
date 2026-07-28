@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod test {
-    use crate::{Emmyrc, GmodHookKind, LuaType, VirtualWorkspace};
+    use crate::{
+        Emmyrc, GmodHookKind, LuaMemberKey, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        semantic::find_members_with_key_in_workspace_for_file,
+    };
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
 
     fn index_expr_type(ws: &VirtualWorkspace, file_id: crate::FileId, text: &str) -> LuaType {
@@ -889,6 +892,146 @@ mod test {
 
         let ty = ws.expr_ty("inferred_panel");
         let expected = ws.ty("ControlPanel");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_explicit_member_function_type_overrides_inherited_contract() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class ExplicitParent
+            ---@field Run fun(value: string)
+            local ExplicitParent = {}
+
+            ---@class ExplicitChild : ExplicitParent
+            local ExplicitChild = {}
+
+            ---@type fun(value: number)
+            ExplicitChild.Run = function(value)
+                explicit_member_value = value
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("explicit_member_value");
+        let expected = ws.ty("number");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_inherited_member_contract_respects_main_workspace_visibility() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.workspace.enable_isolation = true;
+        ws.update_emmyrc(emmyrc);
+        let other_workspace = ws
+            .virtual_url_generator
+            .base
+            .parent()
+            .expect("virtual workspace parent")
+            .join("other_workspace");
+        ws.analysis.add_main_workspace(other_workspace.clone());
+        let other_uri =
+            lsp_types::Uri::parse_from_file_path(&other_workspace.join("base.lua")).unwrap();
+        let other_file_id = ws
+            .analysis
+            .update_file_by_uri(
+                &other_uri,
+                Some(
+                    r#"
+            ---@class WorkspaceBase
+            ---@field Run fun(value: number)
+            "#
+                    .to_string(),
+                ),
+            )
+            .expect("other workspace file");
+        let main_file_id = ws.def_file(
+            "base.lua",
+            r#"
+            ---@class WorkspaceBase
+            ---@field Run fun(value: string)
+            "#,
+        );
+        let caller_file_id = ws.def_file(
+            "override.lua",
+            r#"
+            ---@class WorkspaceChild : WorkspaceBase
+            local WorkspaceChild = {}
+
+            function WorkspaceChild.Run(value)
+                workspace_member_value = value
+            end
+            "#,
+        );
+
+        let expected_contract = ws.ty("fun(value: string)");
+        let module_index = ws.analysis.compilation.get_db().get_module_index();
+        assert_ne!(
+            module_index.get_workspace_id(other_file_id),
+            module_index.get_workspace_id(main_file_id)
+        );
+        assert_eq!(
+            module_index.get_workspace_id(main_file_id),
+            module_index.get_workspace_id(caller_file_id)
+        );
+        let caller_workspace_id = module_index
+            .get_workspace_id(caller_file_id)
+            .expect("caller workspace");
+        let inherited_members = find_members_with_key_in_workspace_for_file(
+            ws.analysis.compilation.get_db(),
+            &LuaType::Ref(LuaTypeDeclId::global("WorkspaceBase")),
+            LuaMemberKey::Name("Run".into()),
+            false,
+            caller_workspace_id,
+            caller_file_id,
+        )
+        .expect("visible inherited member");
+        assert_eq!(
+            ws.humanize_type(inherited_members[0].typ.clone()),
+            ws.humanize_type(expected_contract)
+        );
+
+        let ty = ws.expr_ty("workspace_member_value");
+        let expected = ws.ty("string");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
+    fn test_inherited_member_contract_respects_realm_visibility() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "sv_contract.lua",
+            r#"
+            ---@class RealmBase
+            ---@field Run fun(value: number)
+            "#,
+        );
+        ws.def_file(
+            "cl_contract.lua",
+            r#"
+            ---@class RealmBase
+            ---@field Run fun(value: string)
+            "#,
+        );
+        ws.def_file(
+            "cl_override.lua",
+            r#"
+            ---@class RealmChild : RealmBase
+            local RealmChild = {}
+
+            function RealmChild.Run(value)
+                realm_member_value = value
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("realm_member_value");
+        let expected = ws.ty("string");
         assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
     }
 
