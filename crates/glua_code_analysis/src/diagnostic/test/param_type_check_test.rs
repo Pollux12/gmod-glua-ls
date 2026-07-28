@@ -1213,6 +1213,61 @@ mod test {
     }
 
     #[test]
+    fn test_method_members_are_not_type_checked_when_present_in_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "libraries/sh_cami_present.lua",
+            r#"
+            CAMI_PRESENT = {}
+
+            ---@class CAMI_PRESENT_PRIVILEGE
+            ---@field Name string
+            local CAMI_PRESENT_PRIVILEGE = {}
+
+            function CAMI_PRESENT_PRIVILEGE:HasAccess(actor, target)
+                return true
+            end
+
+            ---@param privilege CAMI_PRESENT_PRIVILEGE
+            function CAMI_PRESENT.RegisterPrivilege(privilege)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            CAMI_PRESENT.RegisterPrivilege{
+                Name = "DarkRP_SetLicense",
+                HasAccess = function(actor, target) return false end,
+            }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_subclass_documented_default_overrides_parent_required_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class ProbeDParent
+            ---@field force number
+            ---@field other string
+
+            ---@class ProbeDChild : ProbeDParent
+            ---@field force number=1000
+
+            ---@param d ProbeDChild
+            local function takes_child(d) end
+
+            takes_child({ other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
     fn test_function_fields_still_cause_param_type_mismatch_when_missing() {
         let mut ws = VirtualWorkspace::new();
 

@@ -7,8 +7,9 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_required_structural_member,
-    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_structural_method_member,
+    member_has_documented_default, type_check_fail_reason::TypeCheckFailReason,
+    type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_generic_type_compact(
@@ -157,7 +158,9 @@ fn check_generic_type_compact_table(
     let next_guard = check_guard.next_level()?;
 
     for source_member in source_type_members {
-        let source_member_feature = source_member.feature;
+        if is_structural_method_member(source_member.feature) {
+            continue;
+        }
         let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
         let key = source_member.key;
@@ -195,9 +198,8 @@ fn check_generic_type_compact_table(
                 }
             }
             None if !source_member_type.is_optional()
-                && is_required_structural_member(
+                && !member_has_documented_default(
                     context.db,
-                    source_member_feature,
                     property_owner_id.as_ref(),
                     Some(&source_member_type),
                 ) =>

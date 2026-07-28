@@ -491,6 +491,50 @@ mod test {
     }
 
     #[test]
+    fn method_member_is_not_checked_in_object_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithMethod
+            ---@field other string
+            local WithMethod = {}
+
+            function WithMethod:check()
+                return true
+            end
+            "#,
+        );
+
+        let target_ty = ws.ty("WithMethod");
+        let object_ty = ws.ty("{ check: number, other: string }");
+
+        assert!(ws.check_type(&target_ty, &object_ty));
+    }
+
+    #[test]
+    fn inherited_method_member_is_not_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class MethodParent
+            local MethodParent = {}
+
+            function MethodParent:check()
+                return true
+            end
+
+            ---@class MethodChild : MethodParent
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("MethodChild");
+        let table_ty = ws.expr_ty(r#"{ check = 1, other = "ok" }"#);
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
     fn test_defaulted_generic_field_is_not_required_for_table_compatibility() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -522,5 +566,26 @@ mod test {
         let table_ty = ws.expr_ty(r#"{ Value = 1, Hit = "wrong" }"#);
 
         assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn generic_method_member_is_not_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericWithMethod<T>
+            ---@field value T
+            local GenericWithMethod = {}
+
+            function GenericWithMethod:check()
+                return true
+            end
+            "#,
+        );
+
+        let target_ty = ws.ty("GenericWithMethod<number>");
+        let table_ty = ws.expr_ty("{ value = 1, check = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
     }
 }

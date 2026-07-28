@@ -12,9 +12,9 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_required_structural_member, is_sub_type_of,
-    sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
-    type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_structural_method_member, is_sub_type_of,
+    member_has_documented_default, sub_type::get_base_type_id,
+    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
@@ -363,6 +363,9 @@ fn check_ref_type_compact_table(
             .get(key)
             .unwrap_or(raw_source_member_type);
         let property_owner_id = LuaSemanticDeclId::Member(source_member.get_id());
+        if is_structural_method_member(Some(source_member.get_feature())) {
+            continue;
+        }
         let key = source_member.get_key();
 
         if context.is_key_checked(key) {
@@ -403,9 +406,8 @@ fn check_ref_type_compact_table(
                 }
             }
             None if !source_member_type.is_optional()
-                && is_required_structural_member(
+                && !member_has_documented_default(
                     context.db,
-                    Some(source_member.get_feature()),
                     Some(&property_owner_id),
                     Some(source_member_type),
                 ) =>
@@ -458,7 +460,9 @@ fn check_ref_type_compact_object(
     };
 
     for source_member in source_type_members {
-        let source_member_feature = source_member.feature;
+        if is_structural_method_member(source_member.feature) {
+            continue;
+        }
         let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
         let key = source_member.key;
@@ -492,9 +496,8 @@ fn check_ref_type_compact_object(
                 }
             }
             None if !source_member_type.is_optional()
-                && is_required_structural_member(
+                && !member_has_documented_default(
                     context.db,
-                    source_member_feature,
                     property_owner_id.as_ref(),
                     Some(&source_member_type),
                 ) =>
