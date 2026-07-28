@@ -1347,6 +1347,33 @@ mod test {
     }
 
     #[test]
+    fn intersection_function_field_return_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HasHandler
+            ---@field handler fun(): boolean
+
+            ---@class Tagged
+            ---@field tag string
+
+            ---@param contract HasHandler & Tagged
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return "not a boolean"
+                end,
+                tag = "test",
+            })
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_compatible_function_field_return_type_is_accepted() {
         let mut ws = VirtualWorkspace::new();
 
