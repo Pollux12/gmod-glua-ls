@@ -44,7 +44,9 @@ pub(crate) fn infer_closure_body_function_type(
 ) -> Option<LuaType> {
     let signature_id = LuaSignatureId::from_closure(cache.get_file_id(), closure);
     let signature = db.get_signature_index().get(&signature_id)?;
-    if signature.resolve_return != crate::SignatureReturnStatus::DocResolve {
+    if signature.resolve_return != crate::SignatureReturnStatus::DocResolve
+        || !signature.overloads.is_empty()
+    {
         return None;
     }
 

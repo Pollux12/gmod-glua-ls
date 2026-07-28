@@ -1324,6 +1324,28 @@ mod test {
     }
 
     #[test]
+    fn overloaded_inline_callback_uses_matching_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: number): boolean
+            local function register(callback) end
+
+            register(
+                ---@overload fun(value: number): boolean
+                ---@param value string
+                ---@return string
+                function(value)
+                    return value
+                end
+            )
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_function_field_return_type_is_checked_when_present() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1341,6 +1363,32 @@ mod test {
                 handler = function()
                     return "not a boolean"
                 end,
+            })
+            "#,
+        ));
+    }
+
+    #[test]
+    fn overloaded_function_field_uses_matching_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(value: number): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract) end
+
+            register({
+                handler =
+                    ---@overload fun(value: number): boolean
+                    ---@param value string
+                    ---@return string
+                    function(value)
+                        return value
+                    end,
             })
             "#,
         ));
