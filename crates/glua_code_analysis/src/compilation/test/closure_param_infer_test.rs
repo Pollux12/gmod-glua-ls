@@ -861,6 +861,38 @@ mod test {
     }
 
     #[test]
+    fn test_stool_buildcpanel_param_inherits_global_tool_contract() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let library_root = ws.virtual_url_generator.base.join("library");
+        ws.analysis.add_library_workspace(library_root);
+        ws.def_file(
+            "library/tool.lua",
+            r#"
+            ---@meta
+            ---@class ControlPanel
+            ---@type fun(panel: ControlPanel, ...any)
+            TOOL.BuildCPanel = nil
+            "#,
+        );
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/context_test.lua",
+            r#"
+            function TOOL.BuildCPanel(panel)
+                inferred_panel = panel
+            end
+            "#,
+        );
+
+        let ty = ws.expr_ty("inferred_panel");
+        let expected = ws.ty("ControlPanel");
+        assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
+    }
+
+    #[test]
     fn test_gmod_hook_add_callback_params_infer_from_hook_name() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

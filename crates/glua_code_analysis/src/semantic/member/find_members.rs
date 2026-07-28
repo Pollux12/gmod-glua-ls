@@ -336,8 +336,8 @@ fn find_custom_type_members(
 ) -> FindMembersResult {
     ctx.infer_guard().check(type_decl_id).ok()?;
     let type_index = db.get_type_index();
-    let type_decl = type_index.get_type_decl(type_decl_id)?;
-    if type_decl.is_alias() {
+    let type_decl = type_index.get_type_decl(type_decl_id);
+    if let Some(type_decl) = type_decl.filter(|decl| decl.is_alias()) {
         if let Some(origin) = type_decl.get_alias_origin(db, None) {
             return find_members_guard(db, &origin, ctx, filter);
         } else {
@@ -407,7 +407,7 @@ fn find_custom_type_members(
         }
     }
 
-    if type_decl.is_class()
+    if type_decl.is_some_and(|decl| decl.is_class())
         && let Some(super_types) = type_index.get_super_types(type_decl_id)
     {
         for super_type in super_types {
@@ -1401,6 +1401,34 @@ mod tests {
         assert_eq!(members[0].key, key);
         assert_eq!(members[0].typ, LuaType::String);
         assert_eq!(members[0].property_owner_id, Some(shared_member.into()));
+    }
+
+    #[test]
+    fn find_ref_members_include_global_path_without_type_declaration() {
+        let mut db = make_db();
+        let type_decl_id = LuaTypeDeclId::global("TOOL");
+        let member_id = make_member_id(FileId::new(19), 1);
+        let key = LuaMemberKey::Name("BuildCPanel".into());
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(type_decl_id.get_name()));
+
+        db.get_member_index_mut().add_member(
+            owner,
+            LuaMember::new(
+                member_id,
+                key.clone(),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+        bind_member_type(&mut db, member_id, LuaType::Function);
+
+        let members = find_members_with_key(&db, &LuaType::Ref(type_decl_id), key.clone(), false)
+            .expect("global-path member should resolve without a nominal type declaration");
+
+        assert_eq!(members.len(), 1);
+        assert_eq!(members[0].key, key);
+        assert_eq!(members[0].typ, LuaType::Function);
+        assert_eq!(members[0].property_owner_id, Some(member_id.into()));
     }
 
     #[test]

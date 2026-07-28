@@ -784,6 +784,16 @@ fn infer_param_inner(
     }
 
     if let Some(current_member_id) = member_id {
+        if let Some(param_type) = find_param_type_from_inherited_members(
+            db,
+            current_member_id,
+            param_idx,
+            colon_define,
+            decl.get_name() == "...",
+        ) {
+            return Ok((param_type, ParamInferenceSource::Concrete));
+        }
+
         let member_decl_type = find_decl_member_type(db, current_member_id)?;
         let param_type = find_param_type_from_type(
             db,
@@ -1215,6 +1225,36 @@ fn find_param_type_from_sibling_members(
     }
 
     final_type
+}
+
+fn find_param_type_from_inherited_members(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+) -> Option<LuaType> {
+    let member_index = db.get_member_index();
+    let owner = member_index.get_current_owner(&current_member_id)?;
+    let owner_id = owner.get_type_id()?;
+    let key = member_index
+        .get_member(&current_member_id)?
+        .get_key()
+        .clone();
+    for super_type in db.get_type_index().get_super_types_iter(owner_id)? {
+        let Some(member_infos) = find_members_with_key(db, super_type, key.clone(), false) else {
+            continue;
+        };
+        for member_info in member_infos {
+            if let Some(param_type) =
+                find_param_type_from_type(db, member_info.typ, param_idx, colon_define, is_dots)
+            {
+                return Some(param_type);
+            }
+        }
+    }
+
+    None
 }
 
 fn find_param_type_from_outer_factory_member(
