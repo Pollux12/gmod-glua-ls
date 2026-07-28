@@ -46,6 +46,7 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
 
     if let Some(supers) = tag.get_supers() {
         for super_doc_type in supers.get_types() {
+            let source_range = super_doc_type.get_range();
             let super_type = infer_type(analyzer, super_doc_type);
             if super_type.is_unknown() {
                 continue;
@@ -54,6 +55,7 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
             analyzer.db.get_type_index_mut().add_super_type(
                 class_decl_id.clone(),
                 file_id,
+                source_range,
                 super_type,
             );
         }

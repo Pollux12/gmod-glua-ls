@@ -46,7 +46,11 @@ impl InferCacheManager {
         let infer_cache = self.get_infer_cache(file_id);
         for pending in pending_type_decls {
             debug_assert_eq!(pending.file_id, file_id);
-            infer_cache.add_pending_str_tpl_type_decl(pending.type_decl_id, pending.super_type);
+            infer_cache.add_pending_str_tpl_type_decl(
+                pending.source_range,
+                pending.type_decl_id,
+                pending.super_type,
+            );
         }
         for dependency in guard_dependencies {
             infer_cache.add_inferred_guard_dependency(dependency);

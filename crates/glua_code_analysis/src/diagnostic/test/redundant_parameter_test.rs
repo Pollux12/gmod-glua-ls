@@ -1,5 +1,8 @@
 #[cfg(test)]
 mod test {
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
     use crate::{DiagnosticCode, VirtualWorkspace};
 
     #[test]
@@ -47,6 +50,68 @@ mod test {
             }
         "#
         ));
+    }
+
+    fn inherited_callable_suppresses_redundant_parameter(enable_isolation: bool) -> bool {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.workspace.enable_isolation = enable_isolation;
+        ws.update_emmyrc(emmyrc);
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::RedundantParameter);
+
+        let other_workspace = ws
+            .virtual_url_generator
+            .base
+            .parent()
+            .expect("virtual workspace parent")
+            .join("other_workspace");
+        ws.analysis.add_main_workspace(other_workspace.clone());
+        let other_uri = lsp_types::Uri::parse_from_file_path(
+            &other_workspace.join("lua/foreign_arity_edge.lua"),
+        )
+        .expect("other workspace uri");
+        ws.analysis.update_file_by_uri(
+            &other_uri,
+            Some(
+                r#"
+                ---@class ArityChild : ArityBase
+                local ArityChild = {}
+                "#
+                .to_string(),
+            ),
+        );
+        let file_id = ws.def_file(
+            "lua/current_arity.lua",
+            r#"
+            ---@class ArityBase
+            ---@field Run fun(first: string, second: string)
+            local ArityBase = {}
+
+            ---@class ArityChild
+            local ArityChild = {}
+
+            function ArityChild.Run(first) end
+            ArityChild.Run("first", "second")
+            "#,
+        );
+
+        let code = Some(NumberOrString::String(
+            DiagnosticCode::RedundantParameter.get_name().to_string(),
+        ));
+        ws.analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .iter()
+            .all(|diagnostic| diagnostic.code != code)
+    }
+
+    #[test]
+    fn isolated_inherited_callable_does_not_suppress_redundant_parameter() {
+        assert!(inherited_callable_suppresses_redundant_parameter(false));
+        assert!(!inherited_callable_suppresses_redundant_parameter(true));
     }
 
     #[test]

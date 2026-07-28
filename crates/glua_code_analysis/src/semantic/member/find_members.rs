@@ -128,6 +128,67 @@ pub fn find_members_with_key_in_workspace_for_file_at_offset(
     )
 }
 
+pub(crate) fn find_inherited_members_with_key(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    member_key: LuaMemberKey,
+    find_all: bool,
+) -> FindMembersResult {
+    let ctx = FindMembersContext::new(InferGuard::new());
+    find_super_type_members(
+        db,
+        type_decl_id,
+        &ctx,
+        &FindMemberFilter::ByKey {
+            member_key,
+            find_all,
+        },
+    )
+}
+
+pub(crate) fn find_inherited_members_with_key_in_workspace_for_file_at_offset(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    member_key: LuaMemberKey,
+    find_all: bool,
+    workspace_id: WorkspaceId,
+    file_id: FileId,
+    caller_position: TextSize,
+) -> FindMembersResult {
+    let ctx = FindMembersContext::new_with_workspace_file_and_position(
+        InferGuard::new(),
+        workspace_id,
+        file_id,
+        caller_position,
+    );
+    find_super_type_members(
+        db,
+        type_decl_id,
+        &ctx,
+        &FindMemberFilter::ByKey {
+            member_key,
+            find_all,
+        },
+    )
+}
+
+pub(crate) fn visible_super_types_in_workspace_for_file_at_offset(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    workspace_id: WorkspaceId,
+    file_id: FileId,
+    caller_position: TextSize,
+) -> Option<Vec<LuaType>> {
+    let ctx = FindMembersContext::new_with_workspace_file_and_position(
+        InferGuard::new(),
+        workspace_id,
+        file_id,
+        caller_position,
+    );
+    super_types_for_context(db, type_decl_id, &ctx)
+        .map(|super_types| super_types.into_iter().cloned().collect())
+}
+
 #[derive(Clone)]
 struct FindMembersContext {
     infer_guard: InferGuardRef,
@@ -211,6 +272,10 @@ impl FindMembersContext {
 
     fn file_id(&self) -> Option<FileId> {
         self.file_id
+    }
+
+    fn workspace_id(&self) -> Option<WorkspaceId> {
+        self.workspace_id
     }
 
     fn has_workspace_scope(&self) -> bool {
@@ -408,17 +473,11 @@ fn find_custom_type_members(
     }
 
     if type_decl.is_some_and(|decl| decl.is_class())
-        && let Some(super_types) = type_index.get_super_types(type_decl_id)
+        && let Some(super_members) = find_super_type_members(db, type_decl_id, ctx, filter)
     {
-        for super_type in super_types {
-            let instantiated_super = ctx.instantiate_type(db, &super_type);
-            if let Some(super_members) = find_members_guard(db, &instantiated_super, ctx, filter) {
-                members.extend(super_members);
-
-                if should_stop_collecting(members.len(), filter) {
-                    return Some(members);
-                }
-            }
+        members.extend(super_members);
+        if should_stop_collecting(members.len(), filter) {
+            return Some(members);
         }
     }
 
@@ -427,6 +486,96 @@ fn find_custom_type_members(
     }
 
     Some(members)
+}
+
+fn find_super_type_members(
+    db: &DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    ctx: &FindMembersContext,
+    filter: &FindMemberFilter,
+) -> FindMembersResult {
+    let mut members = Vec::new();
+    for super_type in super_types_for_context(db, type_decl_id, ctx)? {
+        let instantiated_super = ctx.instantiate_type(db, super_type);
+        if let Some(super_members) = find_members_guard(db, &instantiated_super, ctx, filter) {
+            members.extend(super_members);
+            if should_stop_collecting(members.len(), filter) {
+                break;
+            }
+        }
+    }
+
+    Some(members)
+}
+
+fn super_types_for_context<'a>(
+    db: &'a DbIndex,
+    type_decl_id: &LuaTypeDeclId,
+    ctx: &FindMembersContext,
+) -> Option<Vec<&'a LuaType>> {
+    let entries = db.get_type_index().get_super_type_entries(type_decl_id)?;
+    let Some(caller_workspace_id) = ctx.workspace_id() else {
+        return Some(entries.iter().map(|entry| &entry.value.typ).collect());
+    };
+    let caller_file_id = ctx.file_id()?;
+    let infer_index = db.get_gmod_infer_index();
+    let caller_realm = ctx.caller_position().map_or_else(
+        || {
+            infer_index
+                .get_realm_file_metadata(&caller_file_id)
+                .map_or(crate::GmodRealm::Unknown, |metadata| {
+                    metadata.inferred_realm
+                })
+        },
+        |position| infer_index.get_realm_at_offset(&caller_file_id, position),
+    );
+    let module_index = db.get_module_index();
+    let mut visible = entries
+        .iter()
+        .filter_map(|entry| {
+            if db.get_emmyrc().gmod.enabled
+                && !caller_realm.is_compatible_with(
+                    infer_index
+                        .get_realm_at_offset(&entry.file_id, entry.value.source_range.start()),
+                )
+            {
+                return None;
+            }
+
+            let candidate_workspace_id = module_index
+                .get_workspace_id(entry.file_id)
+                .unwrap_or(crate::WorkspaceId::MAIN);
+            let workspace_key = module_index
+                .workspace_resolution_key(caller_workspace_id, candidate_workspace_id)?;
+            Some((
+                workspace_key,
+                candidate_workspace_id != caller_workspace_id,
+                entry.file_id,
+                entry.value.source_range,
+                &entry.value.typ,
+            ))
+        })
+        .collect::<Vec<_>>();
+    visible.sort_by_key(
+        |(workspace_key, is_other_workspace, file_id, source_range, _)| {
+            (
+                *workspace_key,
+                *is_other_workspace,
+                file_id.id,
+                u32::from(source_range.start()),
+                u32::from(source_range.end()),
+            )
+        },
+    );
+    let mut seen_super_types = HashSet::new();
+    visible.retain(|(_, _, _, _, super_type)| seen_super_types.insert(*super_type));
+
+    Some(
+        visible
+            .into_iter()
+            .map(|(_, _, _, _, super_type)| super_type)
+            .collect(),
+    )
 }
 
 fn find_owner_members(
@@ -1164,12 +1313,13 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        find_members_in_workspace_for_file, find_members_with_key,
-        find_members_with_key_in_workspace_for_file,
+        FindMembersContext, find_members_in_workspace_for_file, find_members_with_key,
+        find_members_with_key_in_workspace_for_file, super_types_for_context,
     };
     use crate::{
         DbIndex, DynamicFieldOwner, Emmyrc, FileId, GlobalId, GmodRealm, GmodRealmFileMetadata,
-        InFiled, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, WorkspaceId,
+        InFiled, InferGuard, LuaMemberKey, LuaType, LuaTypeCache, LuaTypeDecl, LuaTypeDeclId,
+        WorkspaceId,
         db_index::{
             LuaDeclTypeKind, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner,
             WorkspaceKind,
@@ -1233,6 +1383,43 @@ mod tests {
     fn bind_member_type(db: &mut DbIndex, member_id: LuaMemberId, typ: LuaType) {
         db.get_type_index_mut()
             .bind_type(member_id.into(), LuaTypeCache::InferType(typ));
+    }
+
+    #[test]
+    fn visible_super_types_deduplicate_equivalent_edges() {
+        let mut db = make_db();
+        let (workspace_a, _, _) = configure_workspaces(&mut db);
+        let caller_file = FileId::new(1);
+        let edge_file = FileId::new(2);
+        let module_index = db.get_module_index_mut();
+        module_index.add_module_by_path(caller_file, "C:/Users/username/ProjectA/caller.lua");
+        module_index.add_module_by_path(edge_file, "C:/Users/username/ProjectA/edges.lua");
+
+        let child_id = LuaTypeDeclId::global("Child");
+        let parent_type = LuaType::Ref(LuaTypeDeclId::global("Parent"));
+        add_type_decl(&mut db, caller_file, child_id.clone());
+        db.get_type_index_mut().add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(10.into(), 20.into()),
+            parent_type.clone(),
+        );
+        db.get_type_index_mut().add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(30.into(), 40.into()),
+            parent_type.clone(),
+        );
+
+        let context = FindMembersContext::new_with_workspace_file_and_position(
+            InferGuard::new(),
+            workspace_a,
+            caller_file,
+            TextSize::new(0),
+        );
+        let visible = super_types_for_context(&db, &child_id, &context).expect("super types");
+
+        assert_eq!(visible, vec![&parent_type]);
     }
 
     fn set_file_realms(db: &mut DbIndex, file_realms: &[(FileId, GmodRealm)]) {

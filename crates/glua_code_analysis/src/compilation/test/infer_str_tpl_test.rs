@@ -8,7 +8,7 @@ mod test {
     use tokio_util::sync::CancellationToken;
 
     use crate::{
-        DiagnosticCode, Emmyrc, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType,
+        DiagnosticCode, Emmyrc, GmodRealm, LuaSignatureId, LuaType, LuaTypeDeclId, LuaUnionType,
         VirtualWorkspace,
     };
     use smol_str::SmolStr;
@@ -960,6 +960,65 @@ mod test {
         assert!(
             super_types.contains(&LuaType::Ref(LuaTypeDeclId::global("Entity"))),
             "expected `sent_custom` to inherit `Entity`, got {super_types:?}"
+        );
+    }
+
+    #[gtest]
+    fn str_tpl_generated_super_type_keeps_call_source_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+                ---@class Entity
+                ---@field Run fun(value: string)
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@param class `T`
+                ---@return T
+                function ents.Create(class) end
+
+                if CLIENT then
+                    generated_entity = ents.Create("sent_realm_generated")
+                end
+            "#,
+        );
+        assert_eq!(
+            ws.expr_ty("generated_entity"),
+            ws.ty("sent_realm_generated")
+        );
+        ws.def_file(
+            "sv_generated_contract.lua",
+            r#"
+                ---@class GeneratedRightBase
+                ---@field Run fun(value: number)
+                local GeneratedRightBase = {}
+
+                ---@class sent_realm_generated : GeneratedRightBase
+                local GeneratedEntity = {}
+
+                function GeneratedEntity.Run(value)
+                    generated_realm_param = value
+                end
+            "#,
+        );
+        assert_eq!(ws.expr_ty("generated_realm_param"), LuaType::Number);
+
+        let db = ws.get_db_mut();
+        let edge = db
+            .get_type_index()
+            .get_super_type_entries(&LuaTypeDeclId::global("sent_realm_generated"))
+            .and_then(|entries| entries.first())
+            .expect("generated superclass edge");
+        assert_eq!(edge.file_id, file_id);
+        assert_eq!(
+            db.get_gmod_infer_index()
+                .get_realm_at_offset(&file_id, edge.value.source_range.start()),
+            GmodRealm::Client
         );
     }
 

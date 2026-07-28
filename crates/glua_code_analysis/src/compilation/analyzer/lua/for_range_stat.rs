@@ -165,6 +165,7 @@ pub fn infer_for_range_iter_expr_func(
         cache,
         substitutor: &mut substitutor,
         call_expr: None,
+        source_range: iter_exprs[0].get_range(),
     };
     let params = doc_function
         .get_params()

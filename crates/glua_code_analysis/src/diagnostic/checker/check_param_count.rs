@@ -535,12 +535,22 @@ fn inherited_type_callable_accepts_call_args(
         return false;
     }
 
-    let Some(super_types) = db.get_type_index().get_super_types_iter(type_id) else {
+    let super_types = match db.get_module_index().get_workspace_id(*file_id) {
+        Some(workspace_id) => crate::semantic::visible_super_types_in_workspace_for_file_at_offset(
+            db,
+            type_id,
+            workspace_id,
+            *file_id,
+            position,
+        ),
+        None => db.get_type_index().get_super_types(type_id),
+    };
+    let Some(super_types) = super_types else {
         return false;
     };
 
     for super_type in super_types {
-        let (LuaType::Def(super_id) | LuaType::Ref(super_id)) = super_type else {
+        let (LuaType::Def(super_id) | LuaType::Ref(super_id)) = &super_type else {
             continue;
         };
 

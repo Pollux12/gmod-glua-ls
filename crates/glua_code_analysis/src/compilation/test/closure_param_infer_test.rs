@@ -1,7 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::{
-        Emmyrc, GmodHookKind, LuaMemberKey, LuaType, LuaTypeDeclId, VirtualWorkspace,
+        Emmyrc, GmodHookKind, GmodRealm, LuaMemberKey, LuaType, LuaTypeDeclId, VirtualWorkspace,
         semantic::find_members_with_key_in_workspace_for_file,
     };
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaNameExpr};
@@ -999,13 +999,15 @@ mod test {
     }
 
     fn infer_scripted_class_param_from_workspace_super_edge(
-        enable_isolation: bool,
+        enable_isolation: Option<bool>,
         current_super: Option<(&str, &str)>,
     ) -> LuaType {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
-        emmyrc.workspace.enable_isolation = enable_isolation;
+        if let Some(enable_isolation) = enable_isolation {
+            emmyrc.workspace.enable_isolation = enable_isolation;
+        }
         ws.update_emmyrc(emmyrc);
 
         let other_workspace = ws
@@ -1023,8 +1025,6 @@ mod test {
             &other_uri,
             Some(
                 r#"
-                ---@class WrongBase
-                ---@field BuildCPanel fun(panel: string)
                 ---@class TOOL.context_test : WrongBase
                 TOOL = {}
                 "#
@@ -1033,10 +1033,16 @@ mod test {
         );
 
         let (base_contract, class_contract) = current_super.map_or_else(
-            || (String::new(), "---@class TOOL.context_test".to_string()),
+            || (
+                "---@class WrongBase\n---@field CustomRun fun(value: string)\nlocal WrongBase = {}"
+                    .to_string(),
+                "---@class TOOL.context_test".to_string(),
+            ),
             |(base, param_type)| {
                 (
-                    format!("---@class {base}\n---@field BuildCPanel fun(panel: {param_type})"),
+                    format!(
+                        "---@class WrongBase\n---@field CustomRun fun(value: string)\nlocal WrongBase = {{}}\n---@class {base}\n---@field CustomRun fun(value: {param_type})\nlocal {base} = {{}}"
+                    ),
                     format!("---@class TOOL.context_test : {base}"),
                 )
             },
@@ -1049,8 +1055,8 @@ mod test {
                 {class_contract}
                 TOOL = {{}}
 
-                function TOOL.BuildCPanel(panel)
-                    inherited_workspace_param = panel
+                function TOOL.CustomRun(value)
+                    inherited_workspace_param = value
                 end
                 "#
             ),
@@ -1062,8 +1068,16 @@ mod test {
     #[test]
     fn inherited_scripted_class_param_ignores_other_main_workspace_edges_with_isolation() {
         assert_eq!(
+            infer_scripted_class_param_from_workspace_super_edge(Some(true), None),
+            LuaType::Unknown
+        );
+    }
+
+    #[test]
+    fn inherited_scripted_class_param_uses_current_edge_with_isolation() {
+        assert_eq!(
             infer_scripted_class_param_from_workspace_super_edge(
-                true,
+                Some(true),
                 Some(("RightBase", "number")),
             ),
             LuaType::Number
@@ -1074,7 +1088,7 @@ mod test {
     fn inherited_scripted_class_param_prefers_current_workspace_edge_without_isolation() {
         assert_eq!(
             infer_scripted_class_param_from_workspace_super_edge(
-                false,
+                Some(false),
                 Some(("RightBase", "number")),
             ),
             LuaType::Number
@@ -1082,50 +1096,255 @@ mod test {
     }
 
     #[test]
-    fn inherited_scripted_class_param_keeps_other_main_workspace_edges_without_isolation() {
+    fn inherited_scripted_class_param_keeps_other_main_workspace_edges_by_default() {
         assert_eq!(
-            infer_scripted_class_param_from_workspace_super_edge(false, None),
+            infer_scripted_class_param_from_workspace_super_edge(None, None),
             LuaType::String
         );
     }
 
     #[test]
-    fn inherited_member_contract_rejects_realm_incompatible_super_edges() {
+    fn inherited_member_contract_rejects_branch_realm_edges_at_every_hop() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.enabled = true;
         ws.update_emmyrc(emmyrc);
-        ws.def_file(
-            "cl_contract.lua",
-            r#"
+        let edge_source = |realm| {
+            format!(
+                r#"
             ---@class WrongBase
             ---@field Run fun(value: string)
-            ---@class RealmChild : WrongBase
-            local RealmChild = {}
-            "#,
-        );
+
+            if {realm} then
+                ---@class RealmMid : WrongBase
+                local RealmMid = {{}}
+            end
+            "#
+            )
+        };
+        let edge_uri = ws.virtual_url_generator.new_uri("sh_contract.lua");
+        ws.analysis
+            .update_file_by_uri(&edge_uri, Some(edge_source("CLIENT")))
+            .expect("client edge file");
         ws.def_file(
-            "sv_contract.lua",
+            "sh_override.lua",
             r#"
             ---@class RightBase
             ---@field Run fun(value: number)
-            ---@class RealmChild : RightBase
-            local RealmChild = {}
-            "#,
-        );
-        ws.def_file(
-            "sv_override.lua",
-            r#"
-            ---@class RealmChild
+
+            ---@class RealmMid : RightBase
+            local RealmMid = {}
+
+            ---@class RealmChild : RealmMid
             local RealmChild = {}
 
-            function RealmChild.Run(value)
-                realm_edge_param = value
+            if SERVER then
+                function RealmChild.Run(value)
+                    realm_edge_param = value
+                end
             end
             "#,
         );
 
         assert_eq!(ws.expr_ty("realm_edge_param"), LuaType::Number);
+    }
+
+    #[test]
+    fn registered_entity_contract_uses_base_source_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let registration_file_id = ws.def_file(
+            "lua/sh_registration.lua",
+            r#"
+            ---@class WrongEntityBase
+            ---@field Run fun(value: string)
+            local WrongEntityBase = {}
+
+            if CLIENT then
+                DEFINE_BASECLASS("WrongEntityBase")
+            end
+
+            local ENT = {}
+            scripted_ents.Register(ENT, "RealmRegisteredEntity")
+            "#,
+        );
+        ws.def_file(
+            "lua/sv_override.lua",
+            r#"
+            ---@class RightEntityBase
+            ---@field Run fun(value: number)
+            local RightEntityBase = {}
+
+            ---@class RealmRegisteredEntity : RightEntityBase
+            local RealmRegisteredEntity = {}
+
+            function RealmRegisteredEntity.Run(value)
+                registered_entity_realm_param = value
+            end
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let wrong_base = LuaType::Ref(LuaTypeDeclId::global("WrongEntityBase"));
+        let wrong_edge = db
+            .get_type_index()
+            .get_super_type_entries(&LuaTypeDeclId::global("RealmRegisteredEntity"))
+            .and_then(|entries| entries.iter().find(|entry| entry.value.typ == wrong_base))
+            .expect("registered entity base edge");
+        assert_eq!(wrong_edge.file_id, registration_file_id);
+        assert_eq!(
+            db.get_gmod_infer_index()
+                .get_realm_at_offset(&registration_file_id, wrong_edge.value.source_range.start()),
+            GmodRealm::Client
+        );
+
+        assert_eq!(ws.expr_ty("registered_entity_realm_param"), LuaType::Number);
+    }
+
+    #[test]
+    fn inherited_member_contract_rejects_isolated_intermediate_edge() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.workspace.enable_isolation = true;
+        ws.update_emmyrc(emmyrc);
+
+        let other_workspace = ws
+            .virtual_url_generator
+            .base
+            .parent()
+            .expect("virtual workspace parent")
+            .join("other_workspace");
+        ws.analysis.add_main_workspace(other_workspace.clone());
+        let other_uri =
+            lsp_types::Uri::parse_from_file_path(&other_workspace.join("lua/foreign_contract.lua"))
+                .expect("other workspace uri");
+        ws.analysis.update_file_by_uri(
+            &other_uri,
+            Some(
+                r#"
+                ---@class WorkspaceMid : WorkspaceContract
+                local WorkspaceMid = {}
+                "#
+                .to_string(),
+            ),
+        );
+        ws.def_file(
+            "lua/current_override.lua",
+            r#"
+            ---@class WorkspaceContract
+            ---@field Run fun(value: string)
+            local WorkspaceContract = {}
+
+            ---@class WorkspaceMid
+            local WorkspaceMid = {}
+
+            ---@class WorkspaceChild : WorkspaceMid
+            local WorkspaceChild = {}
+
+            function WorkspaceChild.Run(value)
+                isolated_intermediate_param = value
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("isolated_intermediate_param"), LuaType::Unknown);
+    }
+
+    fn infer_cross_workspace_inherited_callback_call_params(
+        enable_isolation: bool,
+    ) -> [LuaType; 3] {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.workspace.enable_isolation = enable_isolation;
+        ws.update_emmyrc(emmyrc);
+
+        let other_workspace = ws
+            .virtual_url_generator
+            .base
+            .parent()
+            .expect("virtual workspace parent")
+            .join("other_workspace");
+        ws.analysis.add_main_workspace(other_workspace.clone());
+        let other_uri = lsp_types::Uri::parse_from_file_path(
+            &other_workspace.join("lua/foreign_callback_edges.lua"),
+        )
+        .expect("other workspace uri");
+        ws.analysis.update_file_by_uri(
+            &other_uri,
+            Some(
+                r#"
+                ---@class CallbackChild : CallbackBase
+                local CallbackChild = {}
+
+                ---@class GenericCallbackChild<T> : T
+                local GenericCallbackChild = {}
+
+                ---@class IndexCallbackChild : IndexCallbackBase
+                local IndexCallbackChild = {}
+                "#
+                .to_string(),
+            ),
+        );
+        ws.def_file(
+            "lua/current_callback_calls.lua",
+            r#"
+            ---@class CallbackBase
+            ---@field Run fun(callback: fun(value: string))
+            local CallbackBase = {}
+            ---@class CallbackChild
+            local CallbackChild = {}
+
+            ---@class GenericCallbackChild<T>
+            local GenericCallbackChild = {}
+
+            ---@class IndexCallbackBase
+            ---@field [string] fun(callback: fun(value: string))
+            local IndexCallbackBase = {}
+            ---@class IndexCallbackChild
+            local IndexCallbackChild = {}
+
+            ---@type CallbackChild
+            local direct
+            direct.Run(function(value)
+                direct_inherited_callback_param = value
+            end)
+
+            ---@type GenericCallbackChild<{ Run: fun(callback: fun(value: string)) }>
+            local generic
+            generic.Run(function(value)
+                generic_inherited_callback_param = value
+            end)
+
+            ---@type IndexCallbackChild
+            local indexed
+            indexed.Run(function(value)
+                index_inherited_callback_param = value
+            end)
+            "#,
+        );
+
+        [
+            ws.expr_ty("direct_inherited_callback_param"),
+            ws.expr_ty("generic_inherited_callback_param"),
+            ws.expr_ty("index_inherited_callback_param"),
+        ]
+    }
+
+    #[test]
+    fn inherited_callback_calls_filter_every_isolated_super_path() {
+        assert_eq!(
+            infer_cross_workspace_inherited_callback_call_params(false),
+            [LuaType::String, LuaType::String, LuaType::String]
+        );
+        assert_eq!(
+            infer_cross_workspace_inherited_callback_call_params(true),
+            [LuaType::Unknown, LuaType::Unknown, LuaType::Unknown]
+        );
     }
 
     #[test]

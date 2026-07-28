@@ -24,7 +24,8 @@ use crate::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
         },
         member::{
-            find_members_with_key, find_members_with_key_in_workspace_for_file_at_offset,
+            find_inherited_members_with_key,
+            find_inherited_members_with_key_in_workspace_for_file_at_offset, find_members_with_key,
             merge_open_table_types,
         },
         resolve_registered_vgui_method_context_for_func,
@@ -1248,77 +1249,23 @@ fn find_param_type_from_inherited_members(
         .get_member(&current_member_id)?
         .get_key()
         .clone();
-    let module_index = db.get_module_index();
-    let caller_workspace_id = module_index.get_workspace_id(caller_file_id);
-    let caller_realm = db
-        .get_gmod_infer_index()
-        .get_realm_at_offset(&caller_file_id, caller_position);
-    let mut super_types = db
-        .get_type_index()
-        .get_super_types_with_file_iter(owner_id)?
-        .filter_map(|super_type| {
-            if db.get_emmyrc().gmod.enabled
-                && !caller_realm.is_compatible_with(
-                    db.get_gmod_infer_index()
-                        .get_realm_file_metadata(&super_type.file_id)
-                        .map_or(crate::GmodRealm::Unknown, |metadata| {
-                            metadata.inferred_realm
-                        }),
-                )
-            {
-                return None;
-            }
-
-            let (workspace_key, is_other_workspace) =
-                if let Some(caller_workspace_id) = caller_workspace_id {
-                    let candidate_workspace_id = module_index
-                        .get_workspace_id(super_type.file_id)
-                        .unwrap_or(crate::WorkspaceId::MAIN);
-                    let workspace_key = module_index
-                        .workspace_resolution_key(caller_workspace_id, candidate_workspace_id)?;
-                    (
-                        Some(workspace_key),
-                        candidate_workspace_id != caller_workspace_id,
-                    )
-                } else {
-                    (None, false)
-                };
-
-            Some((
-                workspace_key,
-                is_other_workspace,
-                super_type.file_id,
-                &super_type.value,
-            ))
-        })
-        .collect::<Vec<_>>();
-    // Keep visible cross-workspace edges as fallbacks while preferring this root.
-    super_types.sort_by_key(|(workspace_key, is_other_workspace, file_id, _)| {
-        (*workspace_key, *is_other_workspace, file_id.id)
-    });
-
-    for (_, _, _, super_type) in super_types {
-        let member_infos = match caller_workspace_id {
-            Some(workspace_id) => find_members_with_key_in_workspace_for_file_at_offset(
-                db,
-                super_type,
-                key.clone(),
-                false,
-                workspace_id,
-                caller_file_id,
-                caller_position,
-            ),
-            None => find_members_with_key(db, super_type, key.clone(), false),
-        };
-        let Some(member_infos) = member_infos else {
-            continue;
-        };
-        for member_info in member_infos {
-            if let Some(param_type) =
-                find_param_type_from_type(db, member_info.typ, param_idx, colon_define, is_dots)
-            {
-                return Some(param_type);
-            }
+    let member_infos = match db.get_module_index().get_workspace_id(caller_file_id) {
+        Some(workspace_id) => find_inherited_members_with_key_in_workspace_for_file_at_offset(
+            db,
+            owner_id,
+            key,
+            false,
+            workspace_id,
+            caller_file_id,
+            caller_position,
+        ),
+        None => find_inherited_members_with_key(db, owner_id, key, false),
+    }?;
+    for member_info in member_infos {
+        if let Some(param_type) =
+            find_param_type_from_type(db, member_info.typ, param_idx, colon_define, is_dots)
+        {
+            return Some(param_type);
         }
     }
 
