@@ -998,6 +998,136 @@ mod test {
         assert_eq!(ws.humanize_type(ty), ws.humanize_type(expected));
     }
 
+    fn infer_scripted_class_param_from_workspace_super_edge(
+        enable_isolation: bool,
+        current_super: Option<(&str, &str)>,
+    ) -> LuaType {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.workspace.enable_isolation = enable_isolation;
+        ws.update_emmyrc(emmyrc);
+
+        let other_workspace = ws
+            .virtual_url_generator
+            .base
+            .parent()
+            .expect("virtual workspace parent")
+            .join("other_workspace");
+        ws.analysis.add_main_workspace(other_workspace.clone());
+        let other_uri = lsp_types::Uri::parse_from_file_path(
+            &other_workspace.join("lua/weapons/gmod_tool/stools/context_test.lua"),
+        )
+        .expect("other workspace uri");
+        ws.analysis.update_file_by_uri(
+            &other_uri,
+            Some(
+                r#"
+                ---@class WrongBase
+                ---@field BuildCPanel fun(panel: string)
+                ---@class TOOL.context_test : WrongBase
+                TOOL = {}
+                "#
+                .to_string(),
+            ),
+        );
+
+        let (base_contract, class_contract) = current_super.map_or_else(
+            || (String::new(), "---@class TOOL.context_test".to_string()),
+            |(base, param_type)| {
+                (
+                    format!("---@class {base}\n---@field BuildCPanel fun(panel: {param_type})"),
+                    format!("---@class TOOL.context_test : {base}"),
+                )
+            },
+        );
+        ws.def_file(
+            "lua/weapons/gmod_tool/stools/context_test.lua",
+            &format!(
+                r#"
+                {base_contract}
+                {class_contract}
+                TOOL = {{}}
+
+                function TOOL.BuildCPanel(panel)
+                    inherited_workspace_param = panel
+                end
+                "#
+            ),
+        );
+
+        ws.expr_ty("inherited_workspace_param")
+    }
+
+    #[test]
+    fn inherited_scripted_class_param_ignores_other_main_workspace_edges_with_isolation() {
+        assert_eq!(
+            infer_scripted_class_param_from_workspace_super_edge(
+                true,
+                Some(("RightBase", "number")),
+            ),
+            LuaType::Number
+        );
+    }
+
+    #[test]
+    fn inherited_scripted_class_param_prefers_current_workspace_edge_without_isolation() {
+        assert_eq!(
+            infer_scripted_class_param_from_workspace_super_edge(
+                false,
+                Some(("RightBase", "number")),
+            ),
+            LuaType::Number
+        );
+    }
+
+    #[test]
+    fn inherited_scripted_class_param_keeps_other_main_workspace_edges_without_isolation() {
+        assert_eq!(
+            infer_scripted_class_param_from_workspace_super_edge(false, None),
+            LuaType::String
+        );
+    }
+
+    #[test]
+    fn inherited_member_contract_rejects_realm_incompatible_super_edges() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "cl_contract.lua",
+            r#"
+            ---@class WrongBase
+            ---@field Run fun(value: string)
+            ---@class RealmChild : WrongBase
+            local RealmChild = {}
+            "#,
+        );
+        ws.def_file(
+            "sv_contract.lua",
+            r#"
+            ---@class RightBase
+            ---@field Run fun(value: number)
+            ---@class RealmChild : RightBase
+            local RealmChild = {}
+            "#,
+        );
+        ws.def_file(
+            "sv_override.lua",
+            r#"
+            ---@class RealmChild
+            local RealmChild = {}
+
+            function RealmChild.Run(value)
+                realm_edge_param = value
+            end
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("realm_edge_param"), LuaType::Number);
+    }
+
     #[test]
     fn test_inherited_member_contract_respects_realm_visibility() {
         let mut ws = VirtualWorkspace::new();

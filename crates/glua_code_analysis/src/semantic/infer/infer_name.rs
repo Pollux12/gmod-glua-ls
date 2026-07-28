@@ -1248,8 +1248,56 @@ fn find_param_type_from_inherited_members(
         .get_member(&current_member_id)?
         .get_key()
         .clone();
-    let caller_workspace_id = db.get_module_index().get_workspace_id(caller_file_id);
-    for super_type in db.get_type_index().get_super_types_iter(owner_id)? {
+    let module_index = db.get_module_index();
+    let caller_workspace_id = module_index.get_workspace_id(caller_file_id);
+    let caller_realm = db
+        .get_gmod_infer_index()
+        .get_realm_at_offset(&caller_file_id, caller_position);
+    let mut super_types = db
+        .get_type_index()
+        .get_super_types_with_file_iter(owner_id)?
+        .filter_map(|super_type| {
+            if db.get_emmyrc().gmod.enabled
+                && !caller_realm.is_compatible_with(
+                    db.get_gmod_infer_index()
+                        .get_realm_file_metadata(&super_type.file_id)
+                        .map_or(crate::GmodRealm::Unknown, |metadata| {
+                            metadata.inferred_realm
+                        }),
+                )
+            {
+                return None;
+            }
+
+            let (workspace_key, is_other_workspace) =
+                if let Some(caller_workspace_id) = caller_workspace_id {
+                    let candidate_workspace_id = module_index
+                        .get_workspace_id(super_type.file_id)
+                        .unwrap_or(crate::WorkspaceId::MAIN);
+                    let workspace_key = module_index
+                        .workspace_resolution_key(caller_workspace_id, candidate_workspace_id)?;
+                    (
+                        Some(workspace_key),
+                        candidate_workspace_id != caller_workspace_id,
+                    )
+                } else {
+                    (None, false)
+                };
+
+            Some((
+                workspace_key,
+                is_other_workspace,
+                super_type.file_id,
+                &super_type.value,
+            ))
+        })
+        .collect::<Vec<_>>();
+    // Keep visible cross-workspace edges as fallbacks while preferring this root.
+    super_types.sort_by_key(|(workspace_key, is_other_workspace, file_id, _)| {
+        (*workspace_key, *is_other_workspace, file_id.id)
+    });
+
+    for (_, _, _, super_type) in super_types {
         let member_infos = match caller_workspace_id {
             Some(workspace_id) => find_members_with_key_in_workspace_for_file_at_offset(
                 db,

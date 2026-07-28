@@ -706,6 +706,13 @@ impl LuaTypeIndex {
             .map(|supers| supers.iter().map(|s| &s.value))
     }
 
+    pub(crate) fn get_super_types_with_file_iter(
+        &self,
+        decl_id: &LuaTypeDeclId,
+    ) -> Option<impl Iterator<Item = &InFiled<LuaType>> + '_> {
+        self.supers.get(decl_id).map(|supers| supers.iter())
+    }
+
     /// Get all direct subclasses of a given type
     /// Returns a vector of type declarations that directly inherit from the given type
     pub fn get_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
