@@ -408,6 +408,38 @@ mod test {
     }
 
     #[test]
+    fn table_literal_assigned_to_field_of_generic_value_contextualizes_nested_closure() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericContextEntity
+
+            ---@class GenericContextHolder
+            ---@field condition fun(id: string, ent: GenericContextEntity): boolean?
+
+            ---@class GenericContextMeta<T>
+            ---@field templates table<string, T>
+
+            ---@type GenericContextMeta<GenericContextHolder>
+            local meta = {}
+            meta.templates = {
+                example = {
+                    condition = function(id, ent)
+                        inferred_generic_condition_id = id
+                        inferred_generic_condition_ent = ent
+                    end,
+                },
+            }
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("inferred_generic_condition_id"), LuaType::String);
+        let actual_ent = ws.expr_ty("inferred_generic_condition_ent");
+        let expected_ent = ws.ty("GenericContextEntity");
+        assert_eq!(ws.humanize_type(actual_ent), ws.humanize_type(expected_ent));
+    }
+
+    #[test]
     fn test_issue_350() {
         let mut ws = VirtualWorkspace::new();
         ws.def(

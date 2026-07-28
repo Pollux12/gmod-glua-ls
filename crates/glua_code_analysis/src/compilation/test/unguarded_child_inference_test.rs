@@ -1841,4 +1841,48 @@ mod test {
             0
         );
     }
+
+    #[test]
+    fn table_literal_through_declared_field_does_not_report_unguarded_child() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+
+            ---@class ContextChildA: Entity
+            local A = {}
+            function A:special() return true end
+
+            ---@class ContextChildB: Entity
+            local B = {}
+            function B:special() return true end
+
+            ---@class ContextHolder
+            ---@field condition (fun(id: string, ent: ContextChildA|ContextChildB): boolean?)?
+
+            ---@class ContextMeta
+            ---@field templates table<string, ContextHolder>?
+
+            ---@type ContextMeta
+            local meta = {}
+            meta.templates = {
+                example = {
+                    condition = function(id, ent)
+                        return ent:special()
+                    end,
+                },
+            }
+            "#,
+        );
+
+        let child_diagnostics =
+            diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(
+            child_diagnostics.len(),
+            0,
+            "declared field contract should type `ent` as ContextChildA|ContextChildB: \
+             {child_diagnostics:?}"
+        );
+    }
 }

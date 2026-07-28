@@ -589,7 +589,7 @@ fn infer_declared_index_assignment_type(
     let semantic_decl = infer_expr_semantic_decl(
         db,
         cache,
-        LuaExpr::IndexExpr(index_expr),
+        LuaExpr::IndexExpr(index_expr.clone()),
         SemanticDeclGuard::default(),
         SemanticDeclLevel::NoTrace,
     )?;
@@ -600,8 +600,21 @@ fn infer_declared_index_assignment_type(
     };
     db.get_type_index()
         .get_type_cache(&type_owner)
-        .filter(|type_cache| type_cache.is_doc())
-        .map(|type_cache| type_cache.as_type().clone())
+        .filter(|type_cache| type_cache.is_doc())?;
+
+    let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
+    let declared_type = infer_member_by_member_key(
+        db,
+        cache,
+        &prefix_type,
+        LuaIndexMemberExpr::IndexExpr(index_expr),
+        &InferGuard::new(),
+    )
+    .ok()?;
+    match declared_type {
+        LuaType::TableConst(_) => None,
+        typ => Some(typ),
+    }
 }
 
 fn infer_table_type_by_return_stat(
