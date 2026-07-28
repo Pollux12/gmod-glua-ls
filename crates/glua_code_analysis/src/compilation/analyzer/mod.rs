@@ -37,6 +37,35 @@ use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
 use unresolve::{UnResolve, UnResolveReturn};
 
+pub(crate) fn infer_closure_body_function_type(
+    db: &DbIndex,
+    cache: &mut crate::LuaInferCache,
+    closure: &LuaClosureExpr,
+) -> Option<LuaType> {
+    let signature_id = LuaSignatureId::from_closure(cache.get_file_id(), closure);
+    let signature = db.get_signature_index().get(&signature_id)?;
+    if signature.resolve_return != crate::SignatureReturnStatus::DocResolve {
+        return None;
+    }
+
+    let return_points = lua::func_body::analyze_func_body_returns(closure.get_block()?);
+    let return_type = lua::analyze_return_point(db, cache, &return_points)
+        .ok()?
+        .into_iter()
+        .next()?
+        .type_ref;
+    let function_type = LuaFunctionType::new(
+        signature.async_state,
+        signature.is_colon_define,
+        signature.is_vararg,
+        signature.get_type_params(),
+        return_type,
+    )
+    .with_optional_params(signature.get_param_optional_flags());
+
+    Some(LuaType::DocFunction(function_type.into()))
+}
+
 pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
     if need_analyzed_files.is_empty() {
         return;

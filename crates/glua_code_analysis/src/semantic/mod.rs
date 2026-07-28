@@ -18,9 +18,9 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaDocType, LuaExpr,
-    LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError, LuaSyntaxKind,
-    LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
+    LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaDocType,
+    LuaExpr, LuaIndexExpr, LuaIndexKey, LuaIndexMemberExpr, LuaNameExpr, LuaParseError,
+    LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableExpr, LuaTokenKind, LuaVarExpr,
 };
 pub(crate) use gmod_vgui_context::{
     resolve_registered_vgui_method_context, resolve_registered_vgui_method_context_for_func,
@@ -493,7 +493,22 @@ impl<'a> SemanticModel<'a> {
     ) -> TypeCheckResult {
         let mut member_facts = HashMap::new();
         self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
-        check_type_compact_detail_with_member_facts(self.db, source, compact_type, member_facts)
+        let runtime_compact_type = self.infer_closure_body_type_for_check(compact_expr);
+        check_type_compact_detail_with_member_facts(
+            self.db,
+            source,
+            runtime_compact_type.as_ref().unwrap_or(compact_type),
+            member_facts,
+        )
+    }
+
+    fn infer_closure_body_type_for_check(&self, expr: &LuaExpr) -> Option<LuaType> {
+        let closure = LuaClosureExpr::cast(expr.syntax().clone())?;
+        crate::compilation::analyzer::infer_closure_body_function_type(
+            self.db,
+            &mut self.infer_cache.borrow_mut(),
+            &closure,
+        )
     }
 
     fn collect_table_expr_member_facts(
@@ -510,7 +525,12 @@ impl<'a> SemanticModel<'a> {
                 continue;
             };
             let member_id = LuaMemberId::new(field.get_syntax_id(), self.file_id);
-            member_facts.insert(member_id, self.infer_expr_fact(value_expr.clone()));
+            let fact = self.infer_expr_fact(value_expr.clone());
+            let fact = match self.infer_closure_body_type_for_check(&value_expr) {
+                Some(typ) => fact.with_runtime_type(typ),
+                None => fact,
+            };
+            member_facts.insert(member_id, fact);
             self.collect_table_expr_member_facts(&value_expr, member_facts);
         }
     }

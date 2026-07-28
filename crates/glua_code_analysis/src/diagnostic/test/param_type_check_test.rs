@@ -1290,6 +1290,86 @@ mod test {
     }
 
     #[test]
+    fn inline_callback_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): boolean
+            local function register(callback) end
+
+            register(function()
+                return "not a boolean"
+            end)
+            "#
+        ));
+    }
+
+    #[test]
+    fn compatible_inline_callback_return_type_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: string): string
+            local function register(callback) end
+
+            register(function(value)
+                return value
+            end)
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_function_field_return_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return "not a boolean"
+                end,
+            })
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_compatible_function_field_return_type_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return true
+                end,
+            })
+            "#,
+        ));
+    }
+
+    #[test]
     fn test_issue_135() {
         let mut ws = VirtualWorkspace::new();
 
@@ -3632,16 +3712,16 @@ mod test {
             r#"
             ---@class Entity
             ---@field Activate function
-            
+
             ---@class BaseEntity : Entity
             ---@field baseField number
-            
-            ---@class MyEntity : BaseEntity  
+
+            ---@class MyEntity : BaseEntity
             ---@field myField number
-            
+
             ---@param filter Entity|Entity[]|function
             local function testFunc(filter) end
-            
+
             local myInstance = {} ---@type MyEntity
             -- This should work - MyEntity inherits from Entity through BaseEntity
             testFunc({myInstance})
@@ -3658,7 +3738,7 @@ mod test {
             r#"
             ---@param x number
             local function test(x) end
-            
+
             test("string")
         "#
         ));
@@ -3673,10 +3753,10 @@ mod test {
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@class Entity
-            
+
             ---@param filter Entity|Entity[]|function
             local function testFunc(filter) end
-            
+
             -- This should report an error - number is not compatible with Entity
             testFunc({123})
         "#
