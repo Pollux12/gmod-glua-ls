@@ -1,4 +1,7 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use crate::{
     LuaGenericType, LuaMemberOwner, LuaType, LuaTypeDeclId, RenderLevel, TypeSubstitutor,
@@ -7,8 +10,9 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_required_structural_member,
-    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_structural_method_member,
+    member_has_documented_default, type_check_fail_reason::TypeCheckFailReason,
+    type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_generic_type_compact(
@@ -155,18 +159,18 @@ fn check_generic_type_compact_table(
 
     // 提前计算下一级检查守卫
     let next_guard = check_guard.next_level()?;
+    let mut checked_keys = HashSet::new();
 
     for source_member in source_type_members {
-        if !is_required_structural_member(
-            context.db,
-            source_member.feature,
-            source_member.property_owner_id.as_ref(),
-            Some(&source_member.typ),
-        ) {
+        let key = source_member.key;
+        if !checked_keys.insert(key.clone()) {
             continue;
         }
+        if is_structural_method_member(source_member.feature) {
+            continue;
+        }
+        let property_owner_id = source_member.property_owner_id;
         let source_member_type = source_member.typ;
-        let key = source_member.key;
 
         match table_member_map.get(&key) {
             Some(table_member_id) => {
@@ -200,7 +204,13 @@ fn check_generic_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional() => {
+            None if !source_member_type.is_optional()
+                && !member_has_documented_default(
+                    context.db,
+                    property_owner_id.as_ref(),
+                    Some(&source_member_type),
+                ) =>
+            {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
                 }
@@ -210,19 +220,6 @@ fn check_generic_type_compact_table(
                 ));
             }
             _ => {} // 可选成员未找到，继续检查
-        }
-    }
-
-    // 检查超类型
-    let source_base_id = source_generic.get_base_type_id();
-    if let Some(supers) = context.db.get_type_index().get_super_types(&source_base_id) {
-        let element_range = table_owner
-            .get_element_range()
-            .ok_or(TypeCheckFailReason::TypeNotMatch)?;
-        let table_type = LuaType::TableConst(element_range.clone());
-
-        for super_type in supers {
-            check_general_type_compact(context, &super_type, &table_type, next_guard)?;
         }
     }
 

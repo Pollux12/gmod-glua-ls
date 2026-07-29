@@ -29,22 +29,13 @@ pub use sub_type::is_sub_type_of;
 pub type TypeCheckResult = Result<(), TypeCheckFailReason>;
 pub use type_check_context::TypeCheckCheckLevel;
 
-fn is_required_structural_member(
-    db: &DbIndex,
-    feature: Option<LuaMemberFeature>,
-    property_owner_id: Option<&LuaSemanticDeclId>,
-    member_type: Option<&LuaType>,
-) -> bool {
-    if matches!(
-        feature,
-        Some(LuaMemberFeature::FileMethodDecl | LuaMemberFeature::MetaMethodDecl)
-    ) {
-        return false;
-    }
-
-    !member_has_documented_default(db, property_owner_id, member_type)
+// Method declarations are exempt from structural comparison because their inferred
+// types can include body-specific literal returns and, for colon methods, `self`.
+fn is_structural_method_member(feature: Option<LuaMemberFeature>) -> bool {
+    feature.is_some_and(|feature| feature.is_method_decl())
 }
 
+// A documented default makes a member optional for presence only.
 fn member_has_documented_default(
     db: &DbIndex,
     property_owner_id: Option<&LuaSemanticDeclId>,

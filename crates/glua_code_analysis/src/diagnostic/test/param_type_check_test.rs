@@ -726,6 +726,44 @@ mod test {
     }
 
     #[test]
+    fn issue_54_default_after_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class DefaultAfterType
+            ---@field force number=1000
+            ---@field other string
+
+            ---@param value DefaultAfterType
+            local function takes_default(value) end
+
+            takes_default({ force = "wrong", other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
+    fn issue_54_default_before_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class DefaultBeforeType
+            ---@field force=1000 number
+            ---@field other string
+
+            ---@param value DefaultBeforeType
+            local function takes_default(value) end
+
+            takes_default({ force = "wrong", other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
     fn stable_table_field_expression_overrides_stale_aggregate_member_cache() {
         let mut ws = VirtualWorkspace::new();
         let file_id = ws.def(
@@ -1175,6 +1213,61 @@ mod test {
     }
 
     #[test]
+    fn test_method_members_are_not_type_checked_when_present_in_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "libraries/sh_cami_present.lua",
+            r#"
+            CAMI_PRESENT = {}
+
+            ---@class CAMI_PRESENT_PRIVILEGE
+            ---@field Name string
+            local CAMI_PRESENT_PRIVILEGE = {}
+
+            function CAMI_PRESENT_PRIVILEGE:HasAccess(actor, target)
+                return true
+            end
+
+            ---@param privilege CAMI_PRESENT_PRIVILEGE
+            function CAMI_PRESENT.RegisterPrivilege(privilege)
+            end
+            "#,
+        );
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            CAMI_PRESENT.RegisterPrivilege{
+                Name = "DarkRP_SetLicense",
+                HasAccess = function(actor, target) return false end,
+            }
+            "#
+        ));
+    }
+
+    #[test]
+    fn test_subclass_documented_default_overrides_parent_required_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class ProbeDParent
+            ---@field force number
+            ---@field other string
+
+            ---@class ProbeDChild : ProbeDParent
+            ---@field force number=1000
+
+            ---@param d ProbeDChild
+            local function takes_child(d) end
+
+            takes_child({ other = "ok" })
+            "#
+        ));
+    }
+
+    #[test]
     fn test_function_fields_still_cause_param_type_mismatch_when_missing() {
         let mut ws = VirtualWorkspace::new();
 
@@ -1193,6 +1286,161 @@ mod test {
                 Name = "DarkRP_SetLicense",
             })
             "#
+        ));
+    }
+
+    #[test]
+    fn inline_callback_return_type_mismatch_is_reported() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(): boolean
+            local function register(callback) end
+
+            register(function()
+                return "not a boolean"
+            end)
+            "#
+        ));
+    }
+
+    #[test]
+    fn compatible_inline_callback_return_type_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: string): string
+            local function register(callback) end
+
+            register(function(value)
+                return value
+            end)
+            "#
+        ));
+    }
+
+    #[test]
+    fn overloaded_inline_callback_uses_matching_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param callback fun(value: number): boolean
+            local function register(callback) end
+
+            register(
+                ---@overload fun(value: number): boolean
+                ---@param value string
+                ---@return string
+                function(value)
+                    return value
+                end
+            )
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_function_field_return_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return "not a boolean"
+                end,
+            })
+            "#,
+        ));
+    }
+
+    #[test]
+    fn overloaded_function_field_uses_matching_overload() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(value: number): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract) end
+
+            register({
+                handler =
+                    ---@overload fun(value: number): boolean
+                    ---@param value string
+                    ---@return string
+                    function(value)
+                        return value
+                    end,
+            })
+            "#,
+        ));
+    }
+
+    #[test]
+    fn intersection_function_field_return_type_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HasHandler
+            ---@field handler fun(): boolean
+
+            ---@class Tagged
+            ---@field tag string
+
+            ---@param contract HasHandler & Tagged
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return "not a boolean"
+                end,
+                tag = "test",
+            })
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_compatible_function_field_return_type_is_accepted() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class HandlerContract
+            ---@field handler fun(): boolean
+
+            ---@param contract HandlerContract
+            local function register(contract)
+            end
+
+            register({
+                handler = function()
+                    return true
+                end,
+            })
+            "#,
         ));
     }
 
@@ -3539,16 +3787,16 @@ mod test {
             r#"
             ---@class Entity
             ---@field Activate function
-            
+
             ---@class BaseEntity : Entity
             ---@field baseField number
-            
-            ---@class MyEntity : BaseEntity  
+
+            ---@class MyEntity : BaseEntity
             ---@field myField number
-            
+
             ---@param filter Entity|Entity[]|function
             local function testFunc(filter) end
-            
+
             local myInstance = {} ---@type MyEntity
             -- This should work - MyEntity inherits from Entity through BaseEntity
             testFunc({myInstance})
@@ -3565,7 +3813,7 @@ mod test {
             r#"
             ---@param x number
             local function test(x) end
-            
+
             test("string")
         "#
         ));
@@ -3580,10 +3828,10 @@ mod test {
             DiagnosticCode::ParamTypeMismatch,
             r#"
             ---@class Entity
-            
+
             ---@param filter Entity|Entity[]|function
             local function testFunc(filter) end
-            
+
             -- This should report an error - number is not compatible with Entity
             testFunc({123})
         "#

@@ -1,8 +1,6 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 
-use crate::{
-    DbIndex, InferFailReason, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaType, LuaTypeFact,
-};
+use crate::{DbIndex, InferFailReason, LuaMemberId, LuaMemberIndexItem, LuaType, LuaTypeFact};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum TypeCheckCheckLevel {
@@ -15,7 +13,6 @@ pub struct TypeCheckContext<'db> {
     pub detail: bool,
     pub db: &'db DbIndex,
     pub level: TypeCheckCheckLevel,
-    pub table_member_checked: Option<HashSet<LuaMemberKey>>,
     member_facts: HashMap<LuaMemberId, LuaTypeFact>,
 }
 
@@ -25,7 +22,6 @@ impl<'db> TypeCheckContext<'db> {
             detail,
             db,
             level,
-            table_member_checked: None,
             member_facts: HashMap::new(),
         }
     }
@@ -54,22 +50,5 @@ impl<'db> TypeCheckContext<'db> {
         }
 
         member_item.resolve_type(self.db)
-    }
-
-    pub fn is_key_checked(&self, key: &LuaMemberKey) -> bool {
-        if let Some(checked) = &self.table_member_checked {
-            checked.contains(key)
-        } else {
-            false
-        }
-    }
-
-    pub fn mark_key_checked(&mut self, key: LuaMemberKey) {
-        if self.table_member_checked.is_none() {
-            self.table_member_checked = Some(HashSet::new());
-        }
-        if let Some(checked) = &mut self.table_member_checked {
-            checked.insert(key);
-        }
     }
 }

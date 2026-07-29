@@ -457,6 +457,84 @@ mod test {
     }
 
     #[test]
+    fn issue_54_defaulted_class_field_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithDefault
+            ---@field force number=1000
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("WithDefault");
+        let table_ty = ws.expr_ty(r#"{ force = "wrong", other = "ok" }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn issue_54_defaulted_class_field_is_checked_in_object_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithDefault
+            ---@field force number=1000
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("WithDefault");
+        let object_ty = ws.ty("{ force: string, other: string }");
+
+        assert!(!ws.check_type(&target_ty, &object_ty));
+    }
+
+    #[test]
+    fn method_member_is_not_checked_in_object_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class WithMethod
+            ---@field other string
+            local WithMethod = {}
+
+            function WithMethod:check()
+                return true
+            end
+            "#,
+        );
+
+        let target_ty = ws.ty("WithMethod");
+        let object_ty = ws.ty("{ check: number, other: string }");
+
+        assert!(ws.check_type(&target_ty, &object_ty));
+    }
+
+    #[test]
+    fn inherited_method_member_is_not_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class MethodParent
+            local MethodParent = {}
+
+            function MethodParent:check()
+                return true
+            end
+
+            ---@class MethodChild : MethodParent
+            ---@field other string
+            "#,
+        );
+
+        let target_ty = ws.ty("MethodChild");
+        let table_ty = ws.expr_ty(r#"{ check = 1, other = "ok" }"#);
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
     fn test_defaulted_generic_field_is_not_required_for_table_compatibility() {
         let mut ws = VirtualWorkspace::new();
         ws.def(
@@ -469,6 +547,104 @@ mod test {
 
         let target_ty = ws.ty("TraceBox<number>");
         let table_ty = ws.expr_ty("{ Value = 1 }");
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn issue_54_defaulted_generic_field_is_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class TraceBox<T>
+            ---@field Value T
+            ---@field Hit boolean=false
+            "#,
+        );
+
+        let target_ty = ws.ty("TraceBox<number>");
+        let table_ty = ws.expr_ty(r#"{ Value = 1, Hit = "wrong" }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn generic_child_default_suppresses_parent_required_field() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericParent<T>
+            ---@field force T
+            ---@field other string
+
+            ---@class GenericChild<T> : GenericParent<T>
+            ---@field force T=1
+            "#,
+        );
+
+        let target_ty = ws.ty("GenericChild<number>");
+        let table_ty = ws.expr_ty(r#"{ other = "ok" }"#);
+
+        assert!(ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn nested_generic_fields_do_not_share_checked_keys() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Inner<T>
+            ---@field value T
+
+            ---@class Outer<T>
+            ---@field inner Inner<T>
+            ---@field value string
+            "#,
+        );
+
+        let target_ty = ws.ty("Outer<number>");
+        let table_ty = ws.expr_ty(r#"{ inner = { value = 1 }, value = 1 }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn nested_class_fields_do_not_share_checked_keys() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class Inner
+            ---@field value number
+
+            ---@class Outer
+            ---@field inner Inner
+            ---@field value string
+            "#,
+        );
+
+        let target_ty = ws.ty("Outer");
+        let table_ty = ws.expr_ty(r#"{ inner = { value = 1 }, value = 1 }"#);
+
+        assert!(!ws.check_type(&target_ty, &table_ty));
+    }
+
+    #[test]
+    fn generic_method_member_is_not_checked_when_present() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class GenericWithMethod<T>
+            ---@field value T
+            local GenericWithMethod = {}
+
+            function GenericWithMethod:check()
+                return true
+            end
+            "#,
+        );
+
+        let target_ty = ws.ty("GenericWithMethod<number>");
+        let table_ty = ws.expr_ty("{ value = 1, check = 1 }");
 
         assert!(ws.check_type(&target_ty, &table_ty));
     }
