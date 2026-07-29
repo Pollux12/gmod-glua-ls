@@ -8,7 +8,7 @@ mod test;
 
 use std::{collections::HashMap, path::Path};
 
-pub use config_loader::{load_configs, load_configs_raw};
+pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};
 pub use configs::{
     DiagnosticSeveritySetting, DocSyntax, EmmyLibraryConfig, EmmyLibraryItem, EmmyrcCodeAction,
     EmmyrcCodeLens, EmmyrcCompletion, EmmyrcDiagnostic, EmmyrcDoc, EmmyrcDocumentColor,

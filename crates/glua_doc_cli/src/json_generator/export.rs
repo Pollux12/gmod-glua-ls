@@ -8,13 +8,13 @@ use glua_code_analysis::{
 use glua_parser::VisibilityKind;
 use rowan::TextRange;
 
-pub fn export(db: &DbIndex) -> Index {
-    Index {
+pub fn export(db: &DbIndex) -> Result<Index, serde_json::Error> {
+    Ok(Index {
         modules: export_modules(db),
         types: export_types(db),
         globals: export_globals(db),
-        config: db.get_emmyrc().clone(),
-    }
+        config: serde_json::to_value(db.get_emmyrc())?,
+    })
 }
 
 fn export_modules(db: &DbIndex) -> Vec<Module> {
@@ -23,7 +23,7 @@ fn export_modules(db: &DbIndex) -> Vec<Module> {
     let modules = module_index.get_module_infos();
     let vfs = db.get_vfs();
 
-    modules
+    let mut exported = modules
         .into_iter()
         .filter(|module| module_index.is_main(&module.file_id))
         .filter_map(|module| {
@@ -46,10 +46,12 @@ fn export_modules(db: &DbIndex) -> Vec<Module> {
                 .unwrap_or_default();
 
             let namespace = type_index.get_file_namespace(&module.file_id).cloned();
-            let using = type_index
+            let mut using = type_index
                 .get_file_using_namespace(&module.file_id)
                 .cloned()
                 .unwrap_or_default();
+            using.sort();
+            using.dedup();
 
             Some(Module {
                 name: module.full_module_name.clone(),
@@ -61,7 +63,14 @@ fn export_modules(db: &DbIndex) -> Vec<Module> {
                 using,
             })
         })
-        .collect()
+        .collect::<Vec<_>>();
+    exported.sort_by(|a, b| {
+        a.name
+            .cmp(&b.name)
+            .then_with(|| a.file.cmp(&b.file))
+            .then_with(|| a.namespace.cmp(&b.namespace))
+    });
+    exported
 }
 
 fn export_types(db: &DbIndex) -> Vec<Type> {
@@ -69,7 +78,7 @@ fn export_types(db: &DbIndex) -> Vec<Type> {
     let module_index = db.get_module_index();
     let types = type_index.get_all_types();
 
-    types
+    let mut exported = types
         .into_iter()
         .filter(|type_decl| {
             type_decl
@@ -88,7 +97,13 @@ fn export_types(db: &DbIndex) -> Vec<Type> {
                 None
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    exported.sort_by(|a, b| {
+        type_name(a)
+            .cmp(type_name(b))
+            .then_with(|| type_locations(a).cmp(type_locations(b)))
+    });
+    exported
 }
 
 fn export_globals(db: &DbIndex) -> Vec<Global> {
@@ -98,7 +113,7 @@ fn export_globals(db: &DbIndex) -> Vec<Global> {
     let vfs = db.get_vfs();
     let globals = global_index.get_all_global_decl_ids();
 
-    globals
+    let mut exported = globals
         .into_iter()
         .filter(|global| module_index.is_main(&global.file_id))
         .filter_map(|global| {
@@ -125,7 +140,43 @@ fn export_globals(db: &DbIndex) -> Vec<Global> {
                 })),
             }
         })
-        .collect()
+        .collect::<Vec<_>>();
+    exported.sort_by(|a, b| {
+        global_name(a)
+            .cmp(global_name(b))
+            .then_with(|| global_location(a).cmp(&global_location(b)))
+    });
+    exported
+}
+
+fn type_name(typ: &Type) -> &str {
+    match typ {
+        Type::Class(class) => &class.name,
+        Type::Enum(enumeration) => &enumeration.name,
+        Type::Alias(alias) => &alias.name,
+    }
+}
+
+fn type_locations(typ: &Type) -> &[Loc] {
+    match typ {
+        Type::Class(class) => &class.loc,
+        Type::Enum(enumeration) => &enumeration.loc,
+        Type::Alias(alias) => &alias.loc,
+    }
+}
+
+fn global_name(global: &Global) -> &str {
+    match global {
+        Global::Table(table) => &table.name,
+        Global::Field(field) => &field.name,
+    }
+}
+
+fn global_location(global: &Global) -> Option<&Loc> {
+    match global {
+        Global::Table(table) => table.loc.as_ref(),
+        Global::Field(field) => field.loc.as_ref(),
+    }
 }
 
 fn export_class(db: &DbIndex, type_decl: &LuaTypeDecl) -> Class {
@@ -345,14 +396,20 @@ fn export_property(db: &DbIndex, semantic_decl: &LuaSemanticDeclId) -> Property 
                 LuaDeprecated::DeprecatedWithMessage(msg) => Some(msg.to_string()),
             }),
             tag_content: property.tag_content().map(|tag_content| {
-                tag_content
+                let mut tags = tag_content
                     .get_all_tags()
                     .iter()
                     .map(|(name, content)| TagNameContent {
                         tag_name: name.clone(),
                         content: content.clone(),
                     })
-                    .collect()
+                    .collect::<Vec<_>>();
+                tags.sort_by(|a, b| {
+                    a.tag_name
+                        .cmp(&b.tag_name)
+                        .then_with(|| a.content.cmp(&b.content))
+                });
+                tags
             }),
         },
         None => Default::default(),
@@ -361,11 +418,13 @@ fn export_property(db: &DbIndex, semantic_decl: &LuaSemanticDeclId) -> Property 
 
 fn export_loc_for_type(db: &DbIndex, type_decl: &LuaTypeDecl) -> Vec<Loc> {
     let vfs = db.get_vfs();
-    type_decl
+    let mut locations = type_decl
         .get_locations()
         .iter()
         .filter_map(|loc| export_loc(vfs, loc.file_id, loc.range))
-        .collect()
+        .collect::<Vec<_>>();
+    locations.sort();
+    locations
 }
 
 fn export_loc(vfs: &Vfs, file_id: FileId, range: TextRange) -> Option<Loc> {
