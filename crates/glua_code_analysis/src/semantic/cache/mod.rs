@@ -72,6 +72,7 @@ pub enum CacheEntry<T> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingStrTplTypeDecl {
     pub file_id: FileId,
+    pub source_range: TextRange,
     pub type_decl_id: LuaTypeDeclId,
     pub super_type: LuaType,
 }
@@ -182,11 +183,13 @@ impl LuaInferCache {
 
     pub fn add_pending_str_tpl_type_decl(
         &mut self,
+        source_range: TextRange,
         type_decl_id: LuaTypeDeclId,
         super_type: LuaType,
     ) {
         let pending = PendingStrTplTypeDecl {
             file_id: self.file_id,
+            source_range,
             type_decl_id,
             super_type,
         };

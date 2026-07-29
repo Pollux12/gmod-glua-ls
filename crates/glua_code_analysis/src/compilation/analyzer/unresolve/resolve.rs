@@ -1979,15 +1979,12 @@ fn materialize_str_tpl_class_from_call(
     }
 
     let super_type = LuaType::Ref(constraint);
-    let has_super = db
-        .get_type_index()
-        .get_super_types_iter(&class_decl_id)
-        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-        .unwrap_or(false);
-    if !has_super {
-        db.get_type_index_mut()
-            .add_super_type(class_decl_id, file_id, super_type);
-    }
+    db.get_type_index_mut().add_super_type_if_missing(
+        class_decl_id,
+        file_id,
+        arg_expr.get_range(),
+        super_type,
+    );
 
     Ok(())
 }
@@ -2067,15 +2064,12 @@ fn try_resolve_constructor_param(
             && type_decl.is_class()
         {
             let root_type = LuaType::Ref(root_type_id.clone());
-            let has_super = db
-                .get_type_index()
-                .get_super_types_iter(&target_id)
-                .map(|mut supers| supers.any(|existing_super| existing_super == &root_type))
-                .unwrap_or(false);
-            if !has_super {
-                db.get_type_index_mut()
-                    .add_super_type(target_id.clone(), file_id, root_type);
-            }
+            db.get_type_index_mut().add_super_type_if_missing(
+                target_id.clone(),
+                file_id,
+                call_expr.get_range(),
+                root_type,
+            );
         }
     }
 

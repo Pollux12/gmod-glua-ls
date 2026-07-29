@@ -1,7 +1,7 @@
 mod evidence;
 mod solver;
 
-use std::{collections::HashMap, sync::Arc};
+use std::{cmp::Ordering, collections::HashMap, sync::Arc};
 
 use rustc_hash::FxHashMap;
 
@@ -213,6 +213,18 @@ struct NestedUnguardedChildCandidates {
     children: HashMap<crate::LuaTypeDeclId, FxHashSet<LuaMemberKey>>,
     receivers: FxHashSet<InFiled<glua_parser::LuaSyntaxId>>,
     source: InFiled<glua_parser::LuaSyntaxId>,
+}
+
+fn compare_unguarded_child_candidates(
+    left: &LuaTypeDeclId,
+    left_display_name: &str,
+    right: &LuaTypeDeclId,
+    right_display_name: &str,
+) -> Ordering {
+    left_display_name
+        .cmp(right_display_name)
+        .then_with(|| left.get_name().cmp(right.get_name()))
+        .then_with(|| left.stable_cmp(right))
 }
 
 pub(super) fn stabilize_unguarded_children(
@@ -482,18 +494,17 @@ pub(super) fn stabilize_unguarded_children(
             .filter_map(|(child_id, keys)| (keys.len() == max_score).then_some(child_id))
             .collect::<Vec<_>>();
         winners.sort_by(|left, right| {
-            db.get_type_index()
+            let left_display_name = db
+                .get_type_index()
                 .get_type_decl(left)
                 .map(|decl| decl.get_name())
-                .unwrap_or_else(|| left.get_name())
-                .cmp(
-                    db.get_type_index()
-                        .get_type_decl(right)
-                        .map(|decl| decl.get_name())
-                        .unwrap_or_else(|| right.get_name()),
-                )
-                .then_with(|| left.get_name().cmp(right.get_name()))
-                .then_with(|| left.stable_cmp(right))
+                .unwrap_or_else(|| left.get_name());
+            let right_display_name = db
+                .get_type_index()
+                .get_type_decl(right)
+                .map(|decl| decl.get_name())
+                .unwrap_or_else(|| right.get_name());
+            compare_unguarded_child_candidates(left, left_display_name, right, right_display_name)
         });
         let Some(source) = winners
             .iter()
@@ -559,17 +570,17 @@ pub(super) fn stabilize_unguarded_children(
             .filter_map(|(child_id, keys)| (keys.len() == max_score).then_some(child_id))
             .collect::<Vec<_>>();
         winners.sort_by(|left, right| {
-            db.get_type_index()
+            let left_display_name = db
+                .get_type_index()
                 .get_type_decl(left)
                 .map(|decl| decl.get_name())
-                .unwrap_or_else(|| left.get_name())
-                .cmp(
-                    db.get_type_index()
-                        .get_type_decl(right)
-                        .map(|decl| decl.get_name())
-                        .unwrap_or_else(|| right.get_name()),
-                )
-                .then_with(|| left.get_name().cmp(right.get_name()))
+                .unwrap_or_else(|| left.get_name());
+            let right_display_name = db
+                .get_type_index()
+                .get_type_decl(right)
+                .map(|decl| decl.get_name())
+                .unwrap_or_else(|| right.get_name());
+            compare_unguarded_child_candidates(left, left_display_name, right, right_display_name)
         });
         let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
@@ -1491,9 +1502,13 @@ fn declaration_base_type(
 
 #[cfg(test)]
 mod tests {
+    use std::cmp::Ordering;
+
     use glua_parser::{LuaAstNode, LuaIndexExpr, LuaParser, ParserConfig};
 
-    use super::is_assignment_target;
+    use crate::{FileId, LuaTypeDeclId};
+
+    use super::{compare_unguarded_child_candidates, is_assignment_target};
 
     fn parse_index_expr(code: &str) -> LuaIndexExpr {
         LuaParser::parse(code, ParserConfig::default())
@@ -1515,5 +1530,27 @@ mod tests {
         let index_expr = parse_index_expr("result = value.ChildOnly");
 
         assert!(!is_assignment_target(&index_expr));
+    }
+
+    #[test]
+    fn unguarded_child_candidate_order_breaks_global_local_name_ties() {
+        let global = LuaTypeDeclId::global("SharedName");
+        let local = LuaTypeDeclId::local(FileId::new(1), "SharedName");
+
+        assert_eq!(
+            compare_unguarded_child_candidates(&global, "SharedName", &local, "SharedName"),
+            Ordering::Less
+        );
+    }
+
+    #[test]
+    fn unguarded_child_candidate_order_breaks_local_file_name_ties() {
+        let first = LuaTypeDeclId::local(FileId::new(1), "SharedName");
+        let second = LuaTypeDeclId::local(FileId::new(2), "SharedName");
+
+        assert_eq!(
+            compare_unguarded_child_candidates(&first, "SharedName", &second, "SharedName"),
+            Ordering::Less
+        );
     }
 }

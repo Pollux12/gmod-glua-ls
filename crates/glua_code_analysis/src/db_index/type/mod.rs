@@ -35,6 +35,12 @@ pub struct LuaResolvedAliasType {
     pub typ: LuaType,
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+pub(crate) struct LuaSuperType {
+    pub(crate) source_range: TextRange,
+    pub(crate) typ: LuaType,
+}
+
 pub fn resolve_alias_type(db: &DbIndex, typ: &LuaType) -> LuaResolvedAliasType {
     let mut visited_aliases = HashSet::new();
     resolve_alias_type_inner(db, typ, None, &mut visited_aliases)
@@ -478,7 +484,7 @@ pub struct LuaTypeIndex {
     file_types: HashMap<FileId, Vec<LuaTypeDeclId>>,
     full_name_type_map: HashMap<LuaTypeDeclId, LuaTypeDecl>,
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
-    supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaType>>>,
+    supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
@@ -658,23 +664,35 @@ impl LuaTypeIndex {
         self.generic_params.get(decl_id)
     }
 
-    pub fn add_super_type(&mut self, decl_id: LuaTypeDeclId, file_id: FileId, super_type: LuaType) {
-        self.supers
-            .entry(decl_id)
-            .or_default()
-            .push(InFiled::new(file_id, super_type));
+    pub fn add_super_type(
+        &mut self,
+        decl_id: LuaTypeDeclId,
+        file_id: FileId,
+        source_range: TextRange,
+        super_type: LuaType,
+    ) {
+        self.supers.entry(decl_id).or_default().push(InFiled::new(
+            file_id,
+            LuaSuperType {
+                source_range,
+                typ: super_type,
+            },
+        ));
     }
 
-    pub fn has_super_type_in_file(
+    fn has_super_type_at_source(
         &self,
         decl_id: &LuaTypeDeclId,
         file_id: FileId,
+        source_range: TextRange,
         super_type: &LuaType,
     ) -> bool {
         self.supers.get(decl_id).is_some_and(|supers| {
-            supers
-                .iter()
-                .any(|entry| entry.file_id == file_id && &entry.value == super_type)
+            supers.iter().any(|entry| {
+                entry.file_id == file_id
+                    && entry.value.source_range == source_range
+                    && &entry.value.typ == super_type
+            })
         })
     }
 
@@ -682,28 +700,43 @@ impl LuaTypeIndex {
         &mut self,
         decl_id: LuaTypeDeclId,
         file_id: FileId,
+        source_range: TextRange,
         super_type: LuaType,
     ) {
-        if self.has_super_type_in_file(&decl_id, file_id, &super_type) {
+        if self.has_super_type_at_source(&decl_id, file_id, source_range, &super_type) {
             return;
         }
 
-        self.add_super_type(decl_id, file_id, super_type);
+        self.add_super_type(decl_id, file_id, source_range, super_type);
     }
 
     pub fn get_super_types(&self, decl_id: &LuaTypeDeclId) -> Option<Vec<LuaType>> {
-        self.supers
-            .get(decl_id)
-            .map(|supers| supers.iter().map(|s| s.value.clone()).collect())
+        self.get_super_types_iter(decl_id)
+            .map(|super_types| super_types.cloned().collect())
     }
 
     pub fn get_super_types_iter(
         &self,
         decl_id: &LuaTypeDeclId,
     ) -> Option<impl Iterator<Item = &LuaType> + '_> {
-        self.supers
-            .get(decl_id)
-            .map(|supers| supers.iter().map(|s| &s.value))
+        self.supers.get(decl_id).map(|supers| {
+            supers
+                .iter()
+                .enumerate()
+                .filter_map(move |(index, super_type)| {
+                    supers[..index]
+                        .iter()
+                        .all(|previous| previous.value.typ != super_type.value.typ)
+                        .then_some(&super_type.value.typ)
+                })
+        })
+    }
+
+    pub(crate) fn get_super_type_entries(
+        &self,
+        decl_id: &LuaTypeDeclId,
+    ) -> Option<&[InFiled<LuaSuperType>]> {
+        self.supers.get(decl_id).map(Vec::as_slice)
     }
 
     /// Get all direct subclasses of a given type
@@ -715,7 +748,7 @@ impl LuaTypeIndex {
         for (type_id, supers) in &self.supers {
             for super_filed in supers {
                 // Check if this super type references our target type
-                if let LuaType::Ref(super_id) = &super_filed.value {
+                if let LuaType::Ref(super_id) = &super_filed.value.typ {
                     if super_id == decl_id {
                         // Found a subclass
                         if let Some(sub_decl) = self.full_name_type_map.get(type_id) {
@@ -1139,6 +1172,10 @@ impl LuaIndex for LuaTypeIndex {
                 self.remove_file_raw(file_id);
             }
         }
+        self.supers.retain(|_, supers| {
+            supers.retain(|super_type| !changed_files.contains(&super_type.file_id));
+            !supers.is_empty()
+        });
 
         self.definition_facts
             .retain(|definition, _| !changed_files.contains(&definition.file_id()));
@@ -1180,13 +1217,6 @@ impl LuaTypeIndex {
                             id.get_simple_name(),
                             file_id,
                         );
-                    }
-                }
-
-                if let Some(supers) = self.supers.get_mut(&id) {
-                    supers.retain(|s| s.file_id != file_id);
-                    if supers.is_empty() {
-                        self.supers.remove(&id);
                     }
                 }
 
@@ -1298,6 +1328,47 @@ pub fn first_param_may_not_self(typ: &LuaType) -> bool {
 }
 
 #[cfg(test)]
+mod super_type_tests {
+    use rowan::TextRange;
+
+    use super::*;
+
+    #[test]
+    fn logical_super_type_accessors_deduplicate_source_edges() {
+        let mut index = LuaTypeIndex::new();
+        let child_id = LuaTypeDeclId::global("Child");
+        let parent_type = LuaType::Ref(LuaTypeDeclId::global("Parent"));
+        let edge_file = FileId::new(1);
+
+        index.add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(10.into(), 20.into()),
+            parent_type.clone(),
+        );
+        index.add_super_type(
+            child_id.clone(),
+            edge_file,
+            TextRange::new(30.into(), 40.into()),
+            parent_type.clone(),
+        );
+
+        let source_edge_count = index
+            .get_super_type_entries(&child_id)
+            .map_or(0, <[_]>::len);
+        let super_types = index.get_super_types(&child_id).unwrap_or_default();
+        let iter_super_types = index
+            .get_super_types_iter(&child_id)
+            .map(|types| types.cloned().collect::<Vec<_>>())
+            .unwrap_or_default();
+
+        assert_eq!(source_edge_count, 2);
+        assert_eq!(super_types, vec![parent_type.clone()]);
+        assert_eq!(iter_super_types, vec![parent_type]);
+    }
+}
+
+#[cfg(test)]
 mod batch_removal_tests {
     use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
     use rowan::TextRange;
@@ -1374,8 +1445,13 @@ mod batch_removal_tests {
         add_type(&mut index, survivor, "Survivor");
 
         let shared = LuaTypeDeclId::global("Shared");
-        index.add_super_type(shared.clone(), second, LuaType::String);
-        index.add_super_type(shared, survivor, LuaType::Number);
+        index.add_super_type(
+            shared.clone(),
+            second,
+            TextRange::default(),
+            LuaType::String,
+        );
+        index.add_super_type(shared, survivor, TextRange::default(), LuaType::Number);
 
         let first_owner = owner(first, 10);
         let second_owner = owner(second, 10);
@@ -1405,6 +1481,26 @@ mod batch_removal_tests {
             LuaTypeFact::certain(LuaType::Number),
         );
         index
+    }
+
+    #[test]
+    fn removing_edge_only_file_removes_its_super_types() {
+        let declaring_file = file_id(1);
+        let edge_file = file_id(2);
+        let type_id = LuaTypeDeclId::global("Shared");
+        let mut index = LuaTypeIndex::new();
+        add_type(&mut index, declaring_file, "Shared");
+        index.add_super_type(
+            type_id.clone(),
+            edge_file,
+            TextRange::new(10.into(), 20.into()),
+            LuaType::String,
+        );
+
+        index.remove_files(&[edge_file]);
+
+        assert!(index.get_super_type_entries(&type_id).is_none());
+        assert!(index.get_type_decl(&type_id).is_some());
     }
 
     fn type_cache_types(index: &LuaTypeIndex) -> HashMap<LuaTypeOwner, LuaType> {

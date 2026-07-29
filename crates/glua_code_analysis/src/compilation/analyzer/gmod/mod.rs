@@ -2992,6 +2992,7 @@ fn ensure_scoped_class_type_decl(
         db.get_type_index_mut().add_super_type_if_missing(
             class_decl_id.clone(),
             file_id,
+            range,
             super_type,
         );
     }
@@ -4953,14 +4954,15 @@ fn synthesize_scripted_ent_registration(
     db.get_type_index_mut()
         .replace_table_const_type(&table_range, &class_type);
 
-    let base_name =
+    let base =
         resolve_registered_scripted_ent_base(table_expr.clone(), metadata, register_position);
-    if let Some(base_name) = base_name {
+    if let Some((base_name, source_range)) = base {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_name));
         if super_type != class_type {
             db.get_type_index_mut().add_super_type_if_missing(
                 class_decl_id.clone(),
                 file_id,
+                source_range,
                 super_type,
             );
         }
@@ -4973,7 +4975,7 @@ fn synthesize_scripted_ent_registration(
     // injection). Without this, `self:StartActivity()` on a `base_nextbot`
     // entity produces false-positive `undefined-field` diagnostics because
     // the synthesized `base_nextbot` class doesn't inherit from `NextBot`.
-    if let Some(type_name) = resolve_registered_scripted_ent_type(&table_expr)
+    if let Some((type_name, source_range)) = resolve_registered_scripted_ent_type(&table_expr)
         && let Some(super_name) = super_type_for_entity_type(&type_name)
     {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(&super_name));
@@ -4981,6 +4983,7 @@ fn synthesize_scripted_ent_registration(
             db.get_type_index_mut().add_super_type_if_missing(
                 class_decl_id.clone(),
                 file_id,
+                source_range,
                 super_type,
             );
         }
@@ -5000,12 +5003,12 @@ fn resolve_registered_scripted_ent_base(
     table_expr: LuaTableExpr,
     metadata: &GmodScriptedClassFileMetadata,
     register_position: TextSize,
-) -> Option<String> {
+) -> Option<(String, TextRange)> {
     if let Some(field) = find_table_field_by_name(&table_expr, "Base")
         && let Some(value_expr) = field.get_value_expr()
         && let Some(base_name) = extract_scoped_base_name(&value_expr)
     {
-        return Some(base_name);
+        return Some((base_name, field.get_range()));
     }
 
     metadata
@@ -5016,7 +5019,7 @@ fn resolve_registered_scripted_ent_base(
         .and_then(
             |call| match call.literal_args.get(call.inheritance_name_arg_idx()) {
                 Some(Some(GmodClassCallLiteral::String(name))) if !name.is_empty() => {
-                    Some(name.clone())
+                    Some((name.clone(), call.syntax_id.get_range()))
                 }
                 _ => None,
             },
@@ -5025,10 +5028,10 @@ fn resolve_registered_scripted_ent_base(
 
 /// Reads the `Type` field from a scripted-entity table literal (e.g.
 /// `ENT.Type = "nextbot"`).
-fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<String> {
+fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<(String, TextRange)> {
     let field = find_table_field_by_name(table_expr, "Type")?;
     let value_expr = field.get_value_expr()?;
-    extract_scoped_base_name(&value_expr)
+    extract_scoped_base_name(&value_expr).map(|name| (name, field.get_range()))
 }
 
 /// Maps `ENT.Type` values to the annotation class that provides the
@@ -5183,7 +5186,13 @@ fn synthesize_scoped_base_assignments_with(
                 let Some(base_name) = extract_scoped_base_name(value_expr) else {
                     continue;
                 };
-                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, &base_name);
+                add_scoped_super_type_if_missing(
+                    db,
+                    &class_decl_id,
+                    file_id,
+                    value_expr.get_range(),
+                    &base_name,
+                );
                 synthesize_baseclass_member(
                     db,
                     file_id,
@@ -5203,7 +5212,13 @@ fn synthesize_scoped_base_assignments_with(
                 let Some(super_name) = super_type_for_entity_type(&type_name) else {
                     continue;
                 };
-                add_scoped_super_type_if_missing(db, &class_decl_id, file_id, super_name);
+                add_scoped_super_type_if_missing(
+                    db,
+                    &class_decl_id,
+                    file_id,
+                    value_expr.get_range(),
+                    super_name,
+                );
             }
         }
     }
@@ -5215,21 +5230,19 @@ fn add_scoped_super_type_if_missing(
     db: &mut DbIndex,
     class_decl_id: &LuaTypeDeclId,
     file_id: FileId,
+    source_range: TextRange,
     super_name: &str,
 ) {
     let super_type = LuaType::Ref(LuaTypeDeclId::global(super_name));
     if super_type == LuaType::Ref(class_decl_id.clone()) {
         return;
     }
-    let has_super = db
-        .get_type_index()
-        .get_super_types_iter(class_decl_id)
-        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-        .unwrap_or(false);
-    if !has_super {
-        db.get_type_index_mut()
-            .add_super_type(class_decl_id.clone(), file_id, super_type);
-    }
+    db.get_type_index_mut().add_super_type_if_missing(
+        class_decl_id.clone(),
+        file_id,
+        source_range,
+        super_type,
+    );
 }
 
 fn extract_scoped_base_name(expr: &LuaExpr) -> Option<String> {
@@ -5692,8 +5705,12 @@ fn synthesize_inheritance_base(
     materialize_scoped_gamemode_base(db, file_id, class_name_prefix, &effective_base_name);
 
     let super_type = LuaType::Ref(LuaTypeDeclId::global(&effective_base_name));
-    db.get_type_index_mut()
-        .add_super_type_if_missing(class_decl_id.clone(), file_id, super_type);
+    db.get_type_index_mut().add_super_type_if_missing(
+        class_decl_id.clone(),
+        file_id,
+        source_syntax_id.get_range(),
+        super_type,
+    );
     synthesize_baseclass_member(
         db,
         file_id,
@@ -6313,8 +6330,15 @@ fn synthesize_vgui_register_file_target(
         resolve_load_dependency_target(db, source_file_id, LuaDependencyKind::Include, path)?;
     // `vgui.RegisterFile` gives a temporary PANEL table the same runtime
     // default as `vgui.Register`: without an explicit Base it derives Panel.
-    let base_panel = find_target_panel_base_assignment(db, target_file_id)
-        .unwrap_or_else(|| "Panel".to_string());
+    let (base_panel, base_source_range) = find_target_panel_base_assignment(db, target_file_id)
+        .unwrap_or_else(|| {
+            let file_range = db
+                .get_vfs()
+                .get_syntax_tree(&target_file_id)
+                .map(|tree| tree.get_chunk_node().syntax().text_range())
+                .unwrap_or_default();
+            ("Panel".to_string(), file_range)
+        });
 
     let class_decl_id = LuaTypeDeclId::local(
         target_file_id,
@@ -6361,15 +6385,12 @@ fn synthesize_vgui_register_file_target(
     }
 
     let super_type = LuaType::Ref(LuaTypeDeclId::global(&base_panel));
-    let has_super = db
-        .get_type_index()
-        .get_super_types_iter(&class_decl_id)
-        .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-        .unwrap_or(false);
-    if !has_super {
-        db.get_type_index_mut()
-            .add_super_type(class_decl_id.clone(), target_file_id, super_type);
-    }
+    db.get_type_index_mut().add_super_type_if_missing(
+        class_decl_id.clone(),
+        target_file_id,
+        base_source_range,
+        super_type,
+    );
 
     let target_panel_decl_ids = ensure_register_file_panel_decls(db, target_file_id)?;
     let panel_decl_id = *target_panel_decl_ids.first()?;
@@ -6478,7 +6499,7 @@ fn ensure_register_file_panel_decls(db: &mut DbIndex, file_id: FileId) -> Option
     Some(vec![decl_id])
 }
 
-fn find_target_panel_base_assignment(db: &DbIndex, file_id: FileId) -> Option<String> {
+fn find_target_panel_base_assignment(db: &DbIndex, file_id: FileId) -> Option<(String, TextRange)> {
     let tree = db.get_vfs().get_syntax_tree(&file_id)?;
     let chunk = tree.get_chunk_node();
     let mut base_name = None;
@@ -6499,7 +6520,7 @@ fn find_target_panel_base_assignment(db: &DbIndex, file_id: FileId) -> Option<St
                 continue;
             }
             if let Some(name) = exprs.get(idx).and_then(lua_expr_string_literal) {
-                base_name = Some(name);
+                base_name = Some((name, index_expr.get_range()));
             }
         }
     }
@@ -6881,15 +6902,12 @@ fn synthesize_panel_class_with_id(
     // Set super type from base panel
     if let Some(base_name) = base_panel {
         let super_type = LuaType::Ref(LuaTypeDeclId::global(base_name));
-        let has_super = db
-            .get_type_index()
-            .get_super_types_iter(&class_decl_id)
-            .map(|mut supers| supers.any(|existing_super| existing_super == &super_type))
-            .unwrap_or(false);
-        if !has_super {
-            db.get_type_index_mut()
-                .add_super_type(class_decl_id.clone(), file_id, super_type);
-        }
+        db.get_type_index_mut().add_super_type_if_missing(
+            class_decl_id.clone(),
+            file_id,
+            call.syntax_id.get_range(),
+            super_type,
+        );
         synthesize_panel_baseclass_member(db, file_id, &class_decl_id, base_name, call_kind, call);
     }
 

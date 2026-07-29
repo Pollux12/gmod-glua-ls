@@ -357,6 +357,7 @@ pub fn instantiate_func_generic(
         cache,
         substitutor: &mut substitutor,
         call_expr: Some(call_expr.clone()),
+        source_range: call_expr.get_range(),
     };
     if !generic_tpls.is_empty() {
         context.substitutor.add_need_infer_tpls(generic_tpls);

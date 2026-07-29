@@ -12,6 +12,7 @@ use crate::{
     semantic::type_check::check_type_compact,
 };
 pub use find_index::find_index_operations;
+pub(crate) use find_members::visible_super_types_in_workspace_for_file_at_offset;
 pub use find_members::{
     find_members, find_members_in_workspace_for_file, find_members_in_workspace_for_file_at_offset,
     find_members_with_key, find_members_with_key_in_workspace_for_file,

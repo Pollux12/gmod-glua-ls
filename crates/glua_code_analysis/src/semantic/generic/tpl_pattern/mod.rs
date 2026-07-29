@@ -145,9 +145,11 @@ fn get_str_tpl_infer_type(
                         .get_type_decl(extend_type_decl_id)
                     && extend_type_decl.is_class()
                 {
-                    context
-                        .cache
-                        .add_pending_str_tpl_type_decl(type_decl_id, extend_type.clone());
+                    context.cache.add_pending_str_tpl_type_decl(
+                        context.source_range,
+                        type_decl_id,
+                        extend_type.clone(),
+                    );
                     ref_type
                 } else {
                     extend_type.clone()

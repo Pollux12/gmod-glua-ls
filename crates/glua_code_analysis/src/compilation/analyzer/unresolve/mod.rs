@@ -248,18 +248,12 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
             );
         }
 
-        let has_super = db
-            .get_type_index()
-            .get_super_types_iter(&pending.type_decl_id)
-            .map(|mut supers| supers.any(|existing_super| existing_super == &pending.super_type))
-            .unwrap_or(false);
-        if !has_super {
-            db.get_type_index_mut().add_super_type(
-                pending.type_decl_id.clone(),
-                pending.file_id,
-                pending.super_type,
-            );
-        }
+        db.get_type_index_mut().add_super_type_if_missing(
+            pending.type_decl_id.clone(),
+            pending.file_id,
+            pending.source_range,
+            pending.super_type,
+        );
     }
 }
 

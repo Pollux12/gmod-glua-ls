@@ -10,7 +10,7 @@ use crate::{
         LuaOperatorMetaMethod, LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType,
     },
     infer_expr, instantiate_type_generic,
-    semantic::InferGuard,
+    semantic::{InferGuard, visible_super_types_in_workspace_for_file_at_offset},
 };
 
 type FunctionTypeResult = Result<LuaType, InferFailReason>;
@@ -51,6 +51,25 @@ fn get_member_id(cache: &mut LuaInferCache, index_member_expr: &LuaIndexMemberEx
             let syntax_id = table_field.get_syntax_id();
             LuaMemberId::new(syntax_id, file_id)
         }
+    }
+}
+
+fn visible_super_types_for_index(
+    db: &DbIndex,
+    cache: &LuaInferCache,
+    type_decl_id: &LuaTypeDeclId,
+    index_expr: &LuaIndexMemberExpr,
+) -> Option<Vec<LuaType>> {
+    if let Some(workspace_id) = db.get_module_index().get_workspace_id(cache.get_file_id()) {
+        visible_super_types_in_workspace_for_file_at_offset(
+            db,
+            type_decl_id,
+            workspace_id,
+            cache.get_file_id(),
+            index_expr.get_position(),
+        )
+    } else {
+        db.get_type_index().get_super_types(type_decl_id)
     }
 }
 
@@ -218,9 +237,12 @@ fn find_custom_type_function_member(
         }
     }
 
-    if type_decl.is_class()
-        && let Some(super_types) = type_index.get_super_types(&prefix_type_id)
-    {
+    let super_types = if type_decl.is_class() {
+        visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
+    } else {
+        None
+    };
+    if let Some(super_types) = super_types {
         deep_guard.next();
         for super_type in super_types {
             let result = find_function_type_by_member_key(
@@ -367,7 +389,8 @@ fn index_generic_members_from_super_generics(
     };
 
     let type_decl_id = type_decl.get_id();
-    if let Some(super_types) = type_index.get_super_types(&type_decl_id) {
+    if let Some(super_types) = visible_super_types_for_index(db, cache, &type_decl_id, &index_expr)
+    {
         super_types.iter().find_map(|super_type| {
             let super_type = instantiate_type_generic(db, super_type, substitutor);
             find_function_type_by_member_key(
@@ -624,7 +647,8 @@ fn find_member_by_index_custom_type(
 
     // find member by key in super
     if type_decl.is_class()
-        && let Some(super_types) = type_index.get_super_types(prefix_type_id)
+        && let Some(super_types) =
+            visible_super_types_for_index(db, cache, prefix_type_id, &index_expr)
     {
         deep_guard.next();
         for super_type in super_types {
@@ -818,7 +842,7 @@ fn find_member_by_index_generic(
     }
 
     // for supers
-    if let Some(supers) = type_index.get_super_types(&type_decl_id) {
+    if let Some(supers) = visible_super_types_for_index(db, cache, &type_decl_id, &index_expr) {
         for super_type in supers {
             let result = find_function_type_by_operator(
                 db,
