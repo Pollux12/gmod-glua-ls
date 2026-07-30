@@ -3,7 +3,7 @@ title: Installation
 description: Install the Garry's Mod Language Server extension and open your first project.
 ---
 
-## VS Code extension (recommended)
+## Install the VS Code extension
 
 The VS Code extension downloads and updates the language server and Garry's Mod API definitions for you. It also includes the settings panel, Class Explorer, debugger, and runtime tools.
 
@@ -17,9 +17,7 @@ The VS Code extension downloads and updates the language server and Garry's Mod 
     For working on multiple addons at once, use a [multi-root workspace](https://code.visualstudio.com/docs/editing/workspaces/multi-root-workspaces).
   </Step>
   <Step title="Let the extension initialize">
-    On first launch, the extension downloads the language server and the latest Garry's Mod API definitions. Wait for the GLuaLS status item to show that the server is running.
-
-    If you want to set up the debugger, continue to [Debugger setup](/debugger/setup).
+    On first launch, the extension downloads the language server and Garry's Mod API definitions. Wait for the GLuaLS status item to show that the server is running.
   </Step>
 </Steps>
 
@@ -58,51 +56,17 @@ If you expected diagnostics but do not see any, check the Garry's Mod Language S
 ## Next steps
 
 <CardGroup cols={2}>
-  <Card title="Get started" icon="rocket" href="/getting-started/workspace-setup">
-    Configure your workspace for the best GLuaLS experience.
+  <Card title="Set up your workspace" icon="folder" href="/getting-started/workspace-setup">
+    Add shared libraries, ignore generated files, or configure a multi-root project.
   </Card>
   <Card title="Set up the debugger" icon="bug" href="/debugger/setup">
     Install `gm_rdb` and connect VS Code to a running SRCDS server.
   </Card>
-  <Card title="Annotations" icon="tag" href="/annotations">
-    Add types and documentation to your own code.
+  <Card title="Use the main features" icon="sparkles" href="/features/overview">
+    Browse editor, Garry's Mod, and debugger features.
   </Card>
-  <Card title="Configuration reference" icon="file-code" href="/configuration/overview">
-    Reference all GLuaLS configuration options.
-  </Card>
-</CardGroup>
-
----
-
-## Explore features
-
-<CardGroup cols={2}>
-  <Card title="Class Explorer" icon="cube" href="/language/scripted-classes">
-    Browse scripted classes and jump to members.
-  </Card>
-  <Card title="Debugger" icon="bug" href="/debugger/overview">
-    Attach, set breakpoints, and inspect live state.
-  </Card>
-  <Card title="AI integration" icon="wand-magic-sparkles" href="/vscode/ai-integration">
-    Runtime-aware Copilot/MCP enhancements.
-  </Card>
-  <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
-    Detect client/server/shared code issues.
-  </Card>
-  <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
-    Validate `net.*` send/receive flows.
-  </Card>
-  <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
-    Hook autocomplete and docs.
-  </Card>
-  <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
-    Tools and generated helpers for ENT/SWEP/TOOL.
-  </Card>
-  <Card title="Code intelligence" icon="search" href="/language/code-intelligence">
-    Completion, go to definition, and diagnostics for Lua and GMod APIs.
-  </Card>
-  <Card title="Command-line checks" icon="terminal" href="/tools/glua-check">
-    Run the same diagnostics from a terminal or CI job.
+  <Card title="Configuration" icon="sliders" href="/configuration/overview">
+    Change completion, diagnostics, formatting, and workspace settings.
   </Card>
 </CardGroup>
 
