@@ -12,14 +12,15 @@ The server combines three parts of your development environment:
 - A selected server debugger for control and execution
 - Captured server and client console output and runtime errors
 - Runtime Lua errors and GLuaLS language diagnostics
+- Exact-client screenshots and bounded server status
 
 <Warning>
-`execute_lua` can change game state. Only connect agents you trust, and only install `gm_rdb` on development servers.
+`execute_lua` can change game state, and `take_screenshot` sends visible client pixels to the requesting agent. Only connect agents you trust, and only install `gm_rdb` on development systems.
 </Warning>
 
 ## Available tools
 
-The server intentionally exposes only five tools:
+The server intentionally exposes only seven tools:
 
 | Tool | Description |
 |---|---|
@@ -28,12 +29,14 @@ The server intentionally exposes only five tools:
 | `read_console` | Read filtered, timestamped console lines, optionally after a previous cursor and observation window |
 | `get_errors` | Read filtered in-game runtime errors |
 | `get_issues` | Read filtered GLuaLS language-server errors and warnings |
+| `take_screenshot` | Capture a bounded JPEG from one exact attached graphical client |
+| `get_runtime_status` | Read bounded session state and current server map, gamemode, and player counts |
 
 ## Debugger connections and routing
 
 `gluals_gmod` is the server-control debugger connection. `execute_lua`, workspace file execution, `lua_refresh_file`, and `run_console_command` require a connected server debugger.
 
-`gluals_gmod_client` provides client telemetry and paused debugging. It does not provide custom MCP client control. MCP `client` and `shared` Lua still dispatch through the selected server debugger's net broadcast.
+`gluals_gmod_client` provides client telemetry, paused debugging, and exact-client screenshot capture. It does not expose arbitrary client commands or client Lua execution. MCP `client` and `shared` Lua still dispatch through the selected server debugger's net broadcast.
 
 Mutation tools accept an optional `sessionId`:
 
@@ -43,6 +46,20 @@ Mutation tools accept an optional `sessionId`:
 - Client and terminated session IDs are rejected for mutations.
 
 Mutation results identify the selected target session. The active debug-session dropdown in VS Code does not choose the MCP target.
+
+`take_screenshot` uses a separate client target:
+
+- With exactly one connected, running client debugger, MCP selects it automatically.
+- With multiple eligible clients, supply the intended client `sessionId`.
+- Server, paused, disconnected, terminated, and unknown sessions are rejected.
+- The selected target is checked again immediately before capture; MCP never falls back to another client.
+- Capture runs only on an attached in-game graphical client. It does not inject into the main menu and never broadcasts.
+
+The tool invokes the engine's `jpeg` command with an internal filename, reads the result through the client module, deletes the temporary file, and returns standard MCP `image/jpeg` content. Quality defaults to `70` and accepts integers from `1` through `100`. Raw JPEG data is limited to 1 MiB, and capture times out after five seconds. The tool does not accept paths, filenames, arbitrary commands, broadcast targets, or confirmation bypasses.
+
+Screenshot capture is not marked read-only, so VS Code asks for tool confirmation before visible screen content is sent to the agent. Image pixels and visible text are marked as untrusted runtime data and are not written to debugger or MCP logs.
+
+`get_runtime_status` queries the sole connected server automatically or an exact server `sessionId`. If no server is connected, it returns the bounded session inventory without live game details. If multiple servers are connected and no ID is supplied, it reports that selection is required rather than choosing the active VS Code session. Live status includes the map, gamemode, dedicated and single-player state, current player count, and maximum player count. It never includes player names, SteamIDs, network addresses, or arbitrary server configuration.
 
 `get_issues` reads static GLuaLS diagnostics and is independent of runtime debugger sessions.
 
@@ -118,7 +135,7 @@ VS Code discovers the GLuaLS MCP server automatically. Open the chat tool picker
     Paste the copied server entry into your agent's MCP configuration. The exact outer property can vary between clients; the copied object uses VS Code's `servers` format.
   </Step>
   <Step title="Connect the debugger">
-    Start a `gluals_gmod` server debug session before asking the agent to execute Lua. Attach `gluals_gmod_client` separately when you need telemetry or paused debugging for one client.
+    Start a `gluals_gmod` server debug session before asking the agent to execute Lua or query live server status. Attach `gluals_gmod_client` separately when you need telemetry, paused debugging, or screenshots for one client.
   </Step>
 </Steps>
 
