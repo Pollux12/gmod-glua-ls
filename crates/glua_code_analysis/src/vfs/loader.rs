@@ -108,19 +108,23 @@ pub fn load_workspace_files(
                     Err(_) => return WalkState::Continue,
                 };
                 let path = entry.path();
+                let file_type = entry.file_type();
                 if exclude_dirs.iter().any(|d| path.starts_with(d)) {
-                    if entry.file_type().is_some_and(|t| t.is_dir()) {
+                    if file_type.is_some_and(|t| t.is_dir()) {
                         return WalkState::Skip;
                     }
-                    return WalkState::Continue;
-                }
-                if !entry.file_type().is_some_and(|t| t.is_file()) {
                     return WalkState::Continue;
                 }
                 let Ok(relative) = path.strip_prefix(&root_path) else {
                     return WalkState::Continue;
                 };
                 if exclude_set.is_match(relative) {
+                    if file_type.is_some_and(|t| t.is_dir()) {
+                        return WalkState::Skip;
+                    }
+                    return WalkState::Continue;
+                }
+                if !file_type.is_some_and(|t| t.is_file()) {
                     return WalkState::Continue;
                 }
                 if !include_set.is_match(relative) {
@@ -167,9 +171,34 @@ pub fn read_file_with_encoding(path: &Path, encoding: &str) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{LuaFileInfo, normalize_path_for_ordering, sort_lua_files_by_normalized_path};
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
     use googletest::prelude::*;
-    use std::path::PathBuf;
+
+    use super::{
+        LuaFileInfo, load_workspace_files, normalize_path_for_ordering,
+        sort_lua_files_by_normalized_path,
+    };
+
+    fn temp_workspace() -> PathBuf {
+        static NEXT_ID: AtomicU64 = AtomicU64::new(0);
+
+        let timestamp = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("system clock must be after the Unix epoch")
+            .as_nanos();
+        std::env::temp_dir().join(format!(
+            "glua_ls_loader_test_{}_{}_{}",
+            std::process::id(),
+            timestamp,
+            NEXT_ID.fetch_add(1, Ordering::Relaxed)
+        ))
+    }
 
     #[test]
     fn vfs_loader_normalizes_slashes_and_trailing_separator() {
@@ -218,5 +247,38 @@ mod tests {
         expect_that!(result, ok(anything()));
         let files = result.unwrap();
         expect_that!(files.len(), eq(0));
+    }
+
+    #[test]
+    fn load_workspace_files_prunes_directory_matching_exclude_glob() {
+        let workspace = temp_workspace();
+        let excluded = workspace.join(".claude").join("worktrees").join("copy");
+        fs::create_dir_all(&excluded).expect("excluded test directory should be created");
+        fs::write(workspace.join("main.lua"), "return true")
+            .expect("main test file should be written");
+        fs::write(excluded.join("duplicate.lua"), "return false")
+            .expect("excluded test file should be written");
+
+        let files = load_workspace_files(
+            &workspace,
+            &["**/*.lua".to_string()],
+            &[".claude".to_string()],
+            &[],
+            None,
+        )
+        .expect("workspace files should load");
+        let loaded_paths = files
+            .iter()
+            .map(|file| {
+                PathBuf::from(&file.path)
+                    .strip_prefix(&workspace)
+                    .expect("loaded file should remain inside the workspace")
+                    .to_path_buf()
+            })
+            .collect::<Vec<_>>();
+
+        fs::remove_dir_all(&workspace).expect("test workspace should be removed");
+
+        assert_eq!(loaded_paths, vec![PathBuf::from("main.lua")]);
     }
 }

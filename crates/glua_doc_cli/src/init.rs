@@ -1,9 +1,10 @@
 use fern::Dispatch;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, WorkspaceFolder, collect_workspace_files, load_configs, update_code_style,
+    EmmyLuaAnalysis, WorkspaceFolder, collect_workspace_files, try_load_configs, update_code_style,
 };
 use log::LevelFilter;
 use std::{
+    error::Error,
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -67,7 +68,7 @@ pub fn load_workspace(
     config_paths: Option<Vec<PathBuf>>,
     exclude_pattern: Option<Vec<String>>,
     include_pattern: Option<Vec<String>>,
-) -> Option<EmmyLuaAnalysis> {
+) -> Result<EmmyLuaAnalysis, Box<dyn Error>> {
     let (config_files, config_root): (Vec<PathBuf>, PathBuf) =
         if let Some(config_paths) = config_paths {
             (
@@ -81,7 +82,7 @@ pub fn load_workspace(
             )
         };
 
-    let mut emmyrc = load_configs(config_files, None);
+    let mut emmyrc = try_load_configs(config_files, None)?;
     log::info!(
         "Pre processing configurations using root: \"{}\"",
         config_root.display()
@@ -138,7 +139,7 @@ pub fn load_workspace(
         .collect();
     analysis.update_files_by_path(files);
 
-    Some(analysis)
+    Ok(analysis)
 }
 
 fn discover_config_files_in_order(root: &Path) -> Vec<PathBuf> {

@@ -40,18 +40,18 @@ pub fn run_doc_cli(mut cmd_args: CmdArgs) -> Result<(), Box<dyn std::error::Erro
         .ok_or("Failed to load workspace")?
         .clone();
 
-    let analysis = match init::load_workspace(
+    let config_paths = if cmd_args.no_config {
+        Some(Vec::new())
+    } else {
+        cmd_args.config
+    };
+    let analysis = init::load_workspace(
         main_path.clone(),
         workspaces.clone(),
-        cmd_args.config,
+        config_paths,
         cmd_args.exclude_pattern,
         cmd_args.include_pattern,
-    ) {
-        Some(analysis) => analysis,
-        None => {
-            return Err("Failed to load workspace".into());
-        }
-    };
+    )?;
 
     match cmd_args.output_format {
         Format::Markdown => markdown_generator::generate_markdown(
