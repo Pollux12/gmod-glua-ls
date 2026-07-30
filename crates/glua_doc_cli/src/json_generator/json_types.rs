@@ -1,5 +1,5 @@
-use glua_code_analysis::Emmyrc;
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::path::PathBuf;
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -7,7 +7,7 @@ pub struct Index {
     pub modules: Vec<Module>,
     pub types: Vec<Type>,
     pub globals: Vec<Global>,
-    pub config: Emmyrc,
+    pub config: Value,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -150,7 +150,7 @@ pub struct TypeVar {
     pub base: Option<String>,
 }
 
-#[derive(Debug, Serialize, Deserialize, Default)]
+#[derive(Debug, Serialize, Deserialize, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub struct Loc {
     pub file: PathBuf,
     pub line: usize,

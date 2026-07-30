@@ -10,6 +10,10 @@ pub struct CmdArgs {
     #[arg(short, long, value_delimiter = ',')]
     pub config: Option<Vec<PathBuf>>,
 
+    /// Do not discover or load a workspace configuration file
+    #[arg(long, conflicts_with = "config")]
+    pub no_config: bool,
+
     /// Deprecated, use [WORKSPACE] instead
     #[arg(short, long, num_args = 1..)]
     pub input: Vec<PathBuf>,
@@ -18,8 +22,7 @@ pub struct CmdArgs {
     #[arg(num_args = 1..)]
     pub workspace: Vec<PathBuf>,
 
-    /// Comma separated list of exclude patterns
-    /// Patterns must follow glob syntax
+    /// Comma separated list of workspace-relative paths or glob patterns to exclude
     /// Exclude patterns take precedence over include patterns
     #[arg(long = "exclude", alias = "ignore", value_delimiter = ',')]
     pub exclude_pattern: Option<Vec<String>>,
