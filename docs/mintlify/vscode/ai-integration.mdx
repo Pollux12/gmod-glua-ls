@@ -161,15 +161,12 @@ The MCP server:
 - Rate-limits requests and bounds request/output sizes
 - Marks game output as untrusted runtime data in tool responses
 
-Set `gluals.gmod.mcp.authToken` only if you need a fixed token. Leaving it empty is safer for most users.
-
 ## Settings
 
 | Setting | Default | Description |
 |---|---|---|
 | `gluals.gmod.mcp.enabled` | `true` | Start the local MCP server |
 | `gluals.gmod.mcp.port` | `21113` | Streamable HTTP port. `0` chooses an available port |
-| `gluals.gmod.mcp.authToken` | `""` | Bearer token override. Empty securely generates and stores a token |
 | `gluals.gmod.mcp.rateLimitPerMinute` | `120` | Maximum MCP requests per minute for each local client |
 
 If you set the port to `0`, copy a new external-agent configuration after each extension restart because the ephemeral URL can change.
