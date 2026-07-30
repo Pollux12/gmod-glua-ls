@@ -850,14 +850,14 @@ mod tests {
         assert!(
             markup
                 .value
-                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+                .contains("![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)"),
             "expected SERVER badge from annotated realm, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge for annotated server realm, got: {}",
             markup.value
         );
@@ -914,14 +914,14 @@ mod tests {
         assert!(
             markup
                 .value
-                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+                .contains("![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)"),
             "expected SERVER badge from annotated realm, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge when annotated realm is server, got: {}",
             markup.value
         );
@@ -1018,7 +1018,7 @@ mod tests {
         assert!(
             client_markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "expected client hover to show SHARED badge from original signature, got: {}",
             client_markup.value
         );

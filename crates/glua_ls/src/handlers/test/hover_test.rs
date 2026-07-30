@@ -1440,11 +1440,11 @@ local EscapeStringMap: {
             markup.value
         );
         let has_inline_realm_badge = markup.value.contains(
-            "![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)",
+            "![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)",
         ) || markup.value.contains(
-            "![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)",
+            "![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)",
         ) || markup.value.contains(
-            "![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)",
+            "![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)",
         );
         assert!(
             has_inline_realm_badge,
@@ -1655,7 +1655,7 @@ local EscapeStringMap: {
         assert!(
             markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "expected hover to include shared realm badge without text description, got: {}",
             markup.value
         );
@@ -1708,7 +1708,7 @@ local EscapeStringMap: {
         assert!(
             markup
                 .value
-                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+                .contains("![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)"),
             "expected client badge from annotation realm precedence, got: {}",
             markup.value
         );
@@ -1764,14 +1764,14 @@ local EscapeStringMap: {
         assert!(
             markup
                 .value
-                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+                .contains("![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)"),
             "expected CLIENT badge from declaration annotation, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge when declaration has ---@realm client, got: {}",
             markup.value
         );
@@ -1817,21 +1817,21 @@ local EscapeStringMap: {
         assert!(
             markup
                 .value
-                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+                .contains("![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)"),
             "expected CLIENT badge for annotated table method, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge for annotated table method, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+                .contains("![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)"),
             "did not expect SERVER badge for annotated table method, got: {}",
             markup.value
         );
@@ -1868,21 +1868,21 @@ local EscapeStringMap: {
         assert!(
             markup
                 .value
-                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+                .contains("![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)"),
             "expected CLIENT badge for annotated global function, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge for annotated global function, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+                .contains("![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)"),
             "did not expect SERVER badge for annotated global function, got: {}",
             markup.value
         );
@@ -1923,21 +1923,21 @@ local EscapeStringMap: {
         assert!(
             !markup
                 .value
-                .contains("![(Shared)](https://github.com/user-attachments/assets/a356f942-57d7-4915-a8cc-559870a980fc)"),
+                .contains("![(Shared)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/shared.png)"),
             "did not expect SHARED badge for variable hover, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Server)](https://github.com/user-attachments/assets/d8fbe13a-6305-4e16-8698-5be874721ca1)"),
+                .contains("![(Server)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/server.png)"),
             "did not expect SERVER badge for variable hover, got: {}",
             markup.value
         );
         assert!(
             !markup
                 .value
-                .contains("![(Client)](https://github.com/user-attachments/assets/a5f6ba64-374d-42f0-b2f4-50e5c964e808)"),
+                .contains("![(Client)](https://raw.githubusercontent.com/Pollux12/gmod-glua-ls/main/docs/mintlify/images/realms/client.png)"),
             "did not expect CLIENT badge for variable hover, got: {}",
             markup.value
         );
