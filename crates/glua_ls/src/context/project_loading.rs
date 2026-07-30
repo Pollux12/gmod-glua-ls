@@ -1,5 +1,5 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashMap,
     path::{Path, PathBuf},
 };
 
@@ -66,6 +66,13 @@ pub struct ChooseGamemodeParams {
     pub current_gamemode_id: Option<String>,
     pub requested_gamemode_id: Option<String>,
     pub reason: GamemodeChoiceReason,
+}
+
+#[derive(Clone, Debug, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ProjectLoadingState {
+    pub candidates: Vec<GamemodeCandidate>,
+    pub current_gamemode_id: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize)]
@@ -207,6 +214,13 @@ impl GmodProjectLoading {
         }
     }
 
+    pub fn state(&self) -> ProjectLoadingState {
+        ProjectLoadingState {
+            candidates: self.gamemode_candidates(),
+            current_gamemode_id: self.active_gamemode_id.clone(),
+        }
+    }
+
     pub fn gamemode_for_uri(&self, uri: &Uri) -> Option<&GmodProject> {
         let path = uri_to_file_path(uri)?;
         self.topology
@@ -298,34 +312,43 @@ impl GmodProjectLoading {
             .into_iter()
             .map(|project| project.root.clone())
             .collect::<Vec<_>>();
-        let loaded_ids = self.loaded_project_ids();
+        let loaded_project_roots = self
+            .topology
+            .addons()
+            .map(|project| project.root.clone())
+            .chain(loaded_gamemode_roots.iter().cloned())
+            .collect::<Vec<_>>();
         let mut folders = self
             .explicit_workspace_folders
             .iter()
             .map(|workspace| {
-                let mut excluded = self
+                let has_logical_projects = self
                     .topology
-                    .gamemodes()
-                    .filter(|project| !loaded_ids.contains(&project.id))
-                    .filter_map(|project| {
-                        project
-                            .root
-                            .strip_prefix(&workspace.root)
+                    .projects()
+                    .iter()
+                    .any(|project| project.root.starts_with(&workspace.root));
+                if !has_logical_projects {
+                    return workspace.clone();
+                }
+
+                let mut imported = loaded_project_roots
+                    .iter()
+                    .filter_map(|root| {
+                        root.strip_prefix(&workspace.root)
                             .ok()
                             .map(Path::to_path_buf)
                     })
                     .collect::<Vec<_>>();
-                excluded.sort();
-                excluded.dedup();
-
-                if excluded.is_empty() {
+                imported.sort();
+                imported.dedup();
+                if imported.iter().any(|path| path.as_os_str().is_empty()) {
                     workspace.clone()
                 } else {
-                    WorkspaceFolder::with_excluded_sub_paths(
-                        workspace.root.clone(),
-                        excluded,
-                        workspace.is_library,
-                    )
+                    WorkspaceFolder {
+                        root: workspace.root.clone(),
+                        import: WorkspaceImport::SubPaths(imported),
+                        is_library: workspace.is_library,
+                    }
                 }
             })
             .collect::<Vec<_>>();
@@ -377,18 +400,6 @@ impl GmodProjectLoading {
             .collect()
     }
 
-    fn loaded_project_ids(&self) -> HashSet<String> {
-        self.topology
-            .addons()
-            .map(|project| project.id.clone())
-            .chain(
-                self.loaded_gamemode_chain()
-                    .into_iter()
-                    .map(|project| project.id.clone()),
-            )
-            .collect()
-    }
-
     fn is_project_loaded(&self, project: &GmodProject) -> bool {
         project.kind == GmodProjectKind::Addon
             || self
@@ -413,21 +424,11 @@ impl GmodProjectLoading {
     }
 
     fn has_fallback_workspace(&self, workspace: &WorkspaceFolder) -> bool {
-        if self
+        !self
             .topology
             .projects()
             .iter()
-            .any(|project| paths_equal(&project.root, &workspace.root))
-        {
-            return false;
-        }
-        !workspace
-            .root
-            .file_name()
-            .and_then(|name| name.to_str())
-            .is_some_and(|name| {
-                name.eq_ignore_ascii_case("addons") || name.eq_ignore_ascii_case("gamemodes")
-            })
+            .any(|project| project.root.starts_with(&workspace.root))
     }
 }
 
@@ -438,15 +439,6 @@ fn workspace_project_id(root: &Path) -> Option<String> {
 
 fn is_annotation_backed_builtin_gamemode(name: &str) -> bool {
     name.eq_ignore_ascii_case("base") || name.eq_ignore_ascii_case("sandbox")
-}
-
-fn paths_equal(left: &Path, right: &Path) -> bool {
-    if cfg!(windows) {
-        left.to_string_lossy()
-            .eq_ignore_ascii_case(&right.to_string_lossy())
-    } else {
-        left == right
-    }
 }
 
 const fn loaded_kind_order(kind: LoadedProjectKind) -> u8 {
@@ -520,7 +512,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_gamemode_filters_other_gamemodes_but_keeps_addons_and_fallback() {
+    fn logical_projects_exclude_unselected_gamemodes_and_unclassified_server_files() {
         let root = temp_dir();
         fs::create_dir_all(root.join("addons").join("example").join("lua"))
             .expect("addon should be created");
@@ -552,7 +544,7 @@ mod tests {
         ));
         assert!(import_contains(workspace, &selected.join("init.lua")));
         assert!(!import_contains(workspace, &unselected.join("init.lua")));
-        assert!(import_contains(
+        assert!(!import_contains(
             workspace,
             &root.join("cfg").join("server.lua")
         ));

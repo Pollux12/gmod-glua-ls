@@ -153,6 +153,15 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
+            if let Some(state) = workspace_manager
+                .read()
+                .await
+                .project_loading
+                .as_ref()
+                .map(GmodProjectLoading::state)
+            {
+                client.send_notification("gluals/projectsChanged", state);
+            }
             if lsp_features.supports_workspace_diagnostic() {
                 client.refresh_workspace_diagnostics();
             }
@@ -210,6 +219,15 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
+            if let Some(state) = workspace_manager
+                .read()
+                .await
+                .project_loading
+                .as_ref()
+                .map(GmodProjectLoading::state)
+            {
+                client.send_notification("gluals/projectsChanged", state);
+            }
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;

@@ -122,6 +122,7 @@ async fn switch_active_gamemode(
         merged_emmyrc,
         open_documents,
         changed,
+        project_loading_state,
     ) = {
         let merged_emmyrc = context.analysis().read().await.get_emmyrc();
         let mut workspace = context.workspace_manager().write().await;
@@ -136,6 +137,7 @@ async fn switch_active_gamemode(
         let new_roots = project_loading.loaded_gamemode_roots();
         let new_base_roots = new_roots.iter().skip(1).cloned().collect::<Vec<_>>();
         let open_documents = project_loading.open_documents_in_loaded_projects();
+        let project_loading_state = project_loading.state();
         let loaded_workspace_folders = project_loading.loaded_workspace_folders();
         workspace.workspace_folders = loaded_workspace_folders;
         workspace.update_workspace_version(crate::context::WorkspaceDiagnosticLevel::Fast, true);
@@ -148,6 +150,7 @@ async fn switch_active_gamemode(
             merged_emmyrc,
             open_documents,
             changed,
+            project_loading_state,
         )
     };
 
@@ -256,7 +259,7 @@ async fn switch_active_gamemode(
     }
     context
         .client()
-        .send_notification("gluals/projectsChanged", ());
+        .send_notification("gluals/projectsChanged", project_loading_state);
 
     for (uri, document) in open_documents {
         if is_uri_in_roots(&uri, &new_roots) {

@@ -3,7 +3,7 @@ use std::{
     path::{Path, PathBuf},
 };
 
-use crate::read_gamemode_base;
+use crate::{find_gamemode_manifest, read_gamemode_base};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum GmodProjectKind {
@@ -221,8 +221,9 @@ fn insert_project(
     };
     let root = root.to_path_buf();
     let base = (kind == GmodProjectKind::Gamemode)
-        .then(|| read_gamemode_base(&root.join(format!("{name}.txt"))))
-        .flatten();
+        .then(|| find_gamemode_manifest(&root))
+        .flatten()
+        .and_then(|manifest| read_gamemode_base(&manifest));
 
     projects_by_root.insert(
         key,
@@ -258,7 +259,8 @@ fn discover_gamemode_bases(
             return;
         }
         let current_root = gamemodes_root.join(&current_name);
-        let Some(base_name) = read_gamemode_base(&current_root.join(format!("{current_name}.txt")))
+        let Some(base_name) = find_gamemode_manifest(&current_root)
+            .and_then(|manifest| read_gamemode_base(&manifest))
         else {
             return;
         };
@@ -277,10 +279,7 @@ fn discover_gamemode_bases(
 }
 
 fn is_gamemode_root(root: &Path) -> bool {
-    let Some(name) = root.file_name().and_then(|name| name.to_str()) else {
-        return false;
-    };
-    root.join(format!("{name}.txt")).is_file()
+    find_gamemode_manifest(root).is_some()
 }
 
 fn is_addon_root(root: &Path) -> bool {
@@ -462,6 +461,28 @@ mod tests {
         assert_eq!(projects.len(), 1);
         assert_eq!(projects[0].name, "my_addon");
         assert_eq!(projects[0].root, addon);
+        fs::remove_dir_all(root).expect("temp root should be removed");
+    }
+
+    #[test]
+    fn discovers_gamemode_with_manifest_named_differently_from_folder() {
+        let root = temp_dir();
+        create_gamemode(&root, "helix", None);
+        let schema = root.join("gamemodes").join("helix-hl2rp");
+        fs::create_dir_all(schema.join("gamemode")).expect("schema should be created");
+        fs::write(
+            schema.join("ixhl2rp.txt"),
+            "\"ixhl2rp\"\n{\n\"base\" \"helix\"\n}\n",
+        )
+        .expect("schema manifest should be written");
+
+        let topology = GmodWorkspaceTopology::discover(std::slice::from_ref(&root));
+        let schema_project = topology
+            .primary_gamemodes()
+            .find(|project| project.name == "helix-hl2rp")
+            .expect("schema should be selectable");
+
+        assert_eq!(schema_project.base.as_deref(), Some("helix"));
         fs::remove_dir_all(root).expect("temp root should be removed");
     }
 }

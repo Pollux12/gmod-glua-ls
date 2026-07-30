@@ -240,6 +240,19 @@ pub async fn initialized_handler(
     )
     .await;
 
+    let project_loading_state = {
+        let workspace_manager = context.workspace_manager().read().await;
+        workspace_manager
+            .project_loading
+            .as_ref()
+            .map(GmodProjectLoading::state)
+    };
+    if let Some(state) = project_loading_state {
+        context
+            .client()
+            .send_notification("gluals/projectsChanged", state);
+    }
+
     register_files_watch(context.clone(), &params.capabilities).await;
     log::info!("initialized handler completed; notifying workspace loaded");
     context.file_diagnostic().notify_workspace_loaded();
@@ -507,7 +520,6 @@ pub async fn init_analysis(
     } else {
         log::info!("client supports workspace diagnostics; waiting for diagnostic pull requests");
     }
-    client.send_notification("gluals/projectsChanged", ());
 }
 
 fn build_workspace_collection_folders(
