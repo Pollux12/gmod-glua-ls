@@ -99,6 +99,8 @@ All read tools use small defaults and bounded responses. Narrow the request befo
 
 Runtime reads return `truncated` when more matching data exists or fields were shortened. Cursored reads also return `dropped` when the requested cursor is older than the retained ring buffer, so an agent does not silently mistake an incomplete history for a complete one.
 
+For repeated console reads, pass the `cursor` from the previous `read_console` response to return only newer lines. Set `observeMs` to wait for the requested window before reading when output is asynchronous. The maximum is 30 seconds and the default is `0`, so existing reads remain immediate.
+
 ## Connect from VS Code
 
 VS Code discovers the GLuaLS MCP server automatically. Open the chat tool picker and enable **GLuaLS Garry's Mod Runtime**. You do not need to configure a separate Copilot integration.
@@ -135,29 +137,6 @@ The copied entry has this shape:
   }
 }
 ```
-
-## Example workflow
-
-```text
-You: Check the current map and report any Lua failures.
-
-Agent: [calls execute_lua with code="return game.GetMap()" and realm=server]
-Agent: [calls get_errors]
-Agent: [calls get_issues with severity=warning and path=lua/autorun/example.lua]
-Agent: The server is running gm_construct. No runtime Lua errors were captured,
-       but GLuaLS reports one warning in lua/autorun/example.lua:14.
-```
-
-For repeated console reads, pass the `cursor` from the previous `read_console` response. This returns only newer lines and avoids confusing old output with the current test. When output is asynchronous, wait for it in the same request:
-
-```json
-{
-  "cursor": 42,
-  "observeMs": 2000
-}
-```
-
-`observeMs` waits for the requested window before reading and is limited to 30 seconds. The default is `0`, so existing reads remain immediate.
 
 ## Security
 
