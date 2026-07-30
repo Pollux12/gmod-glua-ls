@@ -3,7 +3,7 @@ use std::path::Path;
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaCallExprStat, LuaClosureExpr,
     LuaDocTagCast, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLiteralExpr,
-    LuaLiteralToken, LuaNameExpr, LuaTableExpr, LuaVarExpr, NumberResult,
+    LuaLiteralToken, LuaNameExpr, LuaReturnStat, LuaTableExpr, LuaVarExpr, NumberResult,
 };
 
 use crate::{
@@ -11,7 +11,8 @@ use crate::{
     LuaMemberFeature, LuaMemberId, LuaSignatureId,
     compilation::analyzer::unresolve::UnResolveTableField,
     db_index::{
-        LuaDecl, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberKey, LuaMemberOwner,
+        DeclIndexUse, LuaDecl, LuaDependencyKind, LuaDependencySite, LuaMember, LuaMemberKey,
+        LuaMemberOwner,
     },
 };
 
@@ -42,10 +43,26 @@ pub fn analyze_name_expr(analyzer: &mut DeclAnalyzer, expr: LuaNameExpr) -> Opti
     };
 
     let is_scoped_class_global_name = analyzer.is_scoped_class_global_name(name);
+    let direct_index_use = decl_id.and_then(|_| {
+        let index_expr = expr.get_parent::<LuaIndexExpr>()?;
+        index_expr
+            .get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax() == expr.syntax())
+            .then(|| DeclIndexUse {
+                index_expr_id: index_expr.get_syntax_id(),
+                is_inside_return: index_expr
+                    .syntax()
+                    .ancestors()
+                    .any(|node| LuaReturnStat::cast(node).is_some()),
+            })
+    });
     let reference_index = analyzer.db.get_reference_index_mut();
 
     if let Some(id) = decl_id {
-        reference_index.add_decl_reference(id, file_id, range, false);
+        let accepted = reference_index.add_decl_reference(id, file_id, range, false);
+        if accepted && let Some(use_site) = direct_index_use {
+            reference_index.add_direct_index_use(id, file_id, use_site);
+        }
     }
 
     if !is_local && !is_scoped_class_global_name {

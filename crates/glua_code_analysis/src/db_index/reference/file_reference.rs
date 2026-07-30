@@ -2,11 +2,13 @@ use rowan::TextRange;
 use std::collections::HashMap;
 
 use crate::db_index::LuaDeclId;
+use glua_parser::LuaSyntaxId;
 
 #[derive(Debug)]
 pub struct FileReference {
     decl_references: HashMap<LuaDeclId, DeclReference>,
     references_to_decl: HashMap<TextRange, LuaDeclId>,
+    direct_index_uses: HashMap<LuaDeclId, Vec<DeclIndexUse>>,
 }
 
 impl Default for FileReference {
@@ -20,21 +22,31 @@ impl FileReference {
         Self {
             decl_references: HashMap::new(),
             references_to_decl: HashMap::new(),
+            direct_index_uses: HashMap::new(),
         }
     }
 
-    pub fn add_decl_reference(&mut self, decl_id: LuaDeclId, range: TextRange, is_write: bool) {
-        if self.references_to_decl.contains_key(&range) {
-            return;
+    pub fn add_decl_reference(
+        &mut self,
+        decl_id: LuaDeclId,
+        range: TextRange,
+        is_write: bool,
+    ) -> bool {
+        if let std::collections::hash_map::Entry::Vacant(entry) =
+            self.references_to_decl.entry(range)
+        {
+            entry.insert(decl_id);
+        } else {
+            return false;
         }
 
-        self.references_to_decl.insert(range, decl_id);
         let decl_ref = DeclReferenceCell { range, is_write };
 
         self.decl_references
             .entry(decl_id)
             .or_default()
             .add_cell(decl_ref);
+        true
     }
 
     pub fn get_decl_references(&self, decl_id: &LuaDeclId) -> Option<&DeclReference> {
@@ -48,6 +60,23 @@ impl FileReference {
     pub fn get_decl_id(&self, range: &TextRange) -> Option<LuaDeclId> {
         self.references_to_decl.get(range).copied()
     }
+
+    pub fn add_direct_index_use(&mut self, decl_id: LuaDeclId, use_site: DeclIndexUse) {
+        self.direct_index_uses
+            .entry(decl_id)
+            .or_default()
+            .push(use_site);
+    }
+
+    pub fn get_direct_index_uses(&self) -> &HashMap<LuaDeclId, Vec<DeclIndexUse>> {
+        &self.direct_index_uses
+    }
+}
+
+#[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
+pub struct DeclIndexUse {
+    pub index_expr_id: LuaSyntaxId,
+    pub is_inside_return: bool,
 }
 
 #[derive(Debug, Copy, Clone, Eq, PartialEq, Hash)]
