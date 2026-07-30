@@ -10,7 +10,8 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaMemberOwner, db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner,
+    db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
 pub use humanize_type::{
@@ -486,6 +487,7 @@ pub struct LuaTypeIndex {
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
+    decls_by_exact_type: HashMap<LuaTypeDeclId, HashSet<LuaDeclId>>,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
@@ -509,6 +511,7 @@ impl LuaTypeIndex {
             generic_params: HashMap::new(),
             supers: HashMap::new(),
             types: HashMap::new(),
+            decls_by_exact_type: HashMap::new(),
             in_filed_type_owner: HashMap::new(),
             fact_metadata: HashMap::new(),
             definition_facts: HashMap::new(),
@@ -817,6 +820,7 @@ impl LuaTypeIndex {
             return;
         }
         let file_id = owner.get_file_id();
+        self.update_exact_decl_type_binding(&owner, None, exact_type_decl_id(&cache));
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
@@ -826,6 +830,12 @@ impl LuaTypeIndex {
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
+        let previous_type_id = self.types.get(&owner).and_then(exact_type_decl_id).cloned();
+        self.update_exact_decl_type_binding(
+            &owner,
+            previous_type_id.as_ref(),
+            exact_type_decl_id(&cache),
+        );
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
@@ -848,6 +858,7 @@ impl LuaTypeIndex {
 
         let file_id = owner.get_file_id();
         let metadata = metadata.normalized();
+        self.update_exact_decl_type_binding(&owner, None, exact_type_decl_id(&cache));
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
@@ -914,6 +925,13 @@ impl LuaTypeIndex {
         self.types.get(owner)
     }
 
+    pub(crate) fn get_decls_bound_to_exact_type(
+        &self,
+        type_id: &LuaTypeDeclId,
+    ) -> Option<&HashSet<LuaDeclId>> {
+        self.decls_by_exact_type.get(type_id)
+    }
+
     pub(crate) fn force_bind_type_fact_unchecked(
         &mut self,
         owner: LuaTypeOwner,
@@ -922,6 +940,12 @@ impl LuaTypeIndex {
     ) -> FileId {
         let file_id = owner.get_file_id();
         let metadata = metadata.normalized();
+        let previous_type_id = self.types.get(&owner).and_then(exact_type_decl_id).cloned();
+        self.update_exact_decl_type_binding(
+            &owner,
+            previous_type_id.as_ref(),
+            exact_type_decl_id(&cache),
+        );
         self.types.insert(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
@@ -1015,6 +1039,12 @@ impl LuaTypeIndex {
         let mut changed_files = HashSet::new();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
+            let previous_type_id = self.types.get(&owner).and_then(exact_type_decl_id).cloned();
+            self.update_exact_decl_type_binding(
+                &owner,
+                previous_type_id.as_ref(),
+                exact_type_decl_id(&new_cache),
+            );
             self.types.insert(owner, new_cache);
         }
         self.rebuild_inference_derived_state(&changed_files);
@@ -1045,6 +1075,12 @@ impl LuaTypeIndex {
         let mut changed_files = HashSet::new();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
+            let previous_type_id = self.types.get(&owner).and_then(exact_type_decl_id).cloned();
+            self.update_exact_decl_type_binding(
+                &owner,
+                previous_type_id.as_ref(),
+                exact_type_decl_id(&new_cache),
+            );
             self.types.insert(owner, new_cache);
         }
         self.rebuild_inference_derived_state(&changed_files);
@@ -1191,6 +1227,7 @@ impl LuaIndex for LuaTypeIndex {
         self.generic_params.clear();
         self.supers.clear();
         self.types.clear();
+        self.decls_by_exact_type.clear();
         self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
         self.definition_facts.clear();
@@ -1228,10 +1265,57 @@ impl LuaTypeIndex {
 
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
+                let previous_type_id = self
+                    .types
+                    .get(&type_owner)
+                    .and_then(exact_type_decl_id)
+                    .cloned();
+                self.update_exact_decl_type_binding(&type_owner, previous_type_id.as_ref(), None);
                 self.types.remove(&type_owner);
                 self.fact_metadata.remove(&type_owner);
             }
         }
+    }
+
+    fn update_exact_decl_type_binding(
+        &mut self,
+        owner: &LuaTypeOwner,
+        previous_type_id: Option<&LuaTypeDeclId>,
+        new_type_id: Option<&LuaTypeDeclId>,
+    ) {
+        let LuaTypeOwner::Decl(decl_id) = owner else {
+            return;
+        };
+        if previous_type_id == new_type_id {
+            return;
+        }
+
+        if let Some(previous_type_id) = previous_type_id {
+            let remove_bucket =
+                if let Some(decls) = self.decls_by_exact_type.get_mut(previous_type_id) {
+                    decls.remove(decl_id);
+                    decls.is_empty()
+                } else {
+                    false
+                };
+            if remove_bucket {
+                self.decls_by_exact_type.remove(previous_type_id);
+            }
+        }
+
+        if let Some(new_type_id) = new_type_id {
+            self.decls_by_exact_type
+                .entry(new_type_id.clone())
+                .or_default()
+                .insert(*decl_id);
+        }
+    }
+}
+
+fn exact_type_decl_id(cache: &LuaTypeCache) -> Option<&LuaTypeDeclId> {
+    match cache.as_type() {
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => Some(type_id),
+        _ => None,
     }
 }
 
@@ -1325,6 +1409,157 @@ pub fn first_param_may_not_self(typ: &LuaType) -> bool {
         return u.types().any(first_param_may_not_self);
     }
     false
+}
+
+#[cfg(test)]
+mod exact_decl_type_binding_tests {
+    use super::*;
+
+    fn assert_exact_decl_type_bindings_match_types(index: &LuaTypeIndex) {
+        let mut expected = HashMap::<LuaTypeDeclId, HashSet<LuaDeclId>>::new();
+        for (owner, cache) in &index.types {
+            let LuaTypeOwner::Decl(decl_id) = owner else {
+                continue;
+            };
+            let Some(type_id) = exact_type_decl_id(cache) else {
+                continue;
+            };
+            expected
+                .entry(type_id.clone())
+                .or_default()
+                .insert(*decl_id);
+        }
+
+        assert_eq!(index.decls_by_exact_type, expected);
+    }
+
+    fn metadata() -> LuaTypeFactMetadata {
+        LuaTypeFactMetadata {
+            confidence: LuaInferenceConfidence::Certain,
+            base_provenance_kind: None,
+            provenance: Arc::from([]),
+        }
+    }
+
+    #[test]
+    fn exact_decl_type_binding_tracks_all_write_paths() {
+        let mut index = LuaTypeIndex::new();
+        let file_id = FileId::new(1);
+        let plain_decl_id = LuaDeclId::new(file_id, 10.into());
+        let fact_decl_id = LuaDeclId::new(file_id, 20.into());
+        let plain_owner = LuaTypeOwner::Decl(plain_decl_id);
+        let fact_owner = LuaTypeOwner::Decl(fact_decl_id);
+        let first_type = LuaTypeDeclId::global("First");
+        let second_type = LuaTypeDeclId::global("Second");
+
+        index.bind_type(
+            plain_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Ref(first_type.clone())),
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.bind_type(
+            plain_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Def(second_type.clone())),
+        );
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&first_type),
+            Some(&HashSet::from([plain_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.force_bind_type(
+            plain_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Def(second_type.clone())),
+        );
+        assert!(index.get_decls_bound_to_exact_type(&first_type).is_none());
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&second_type),
+            Some(&HashSet::from([plain_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.bind_type_fact(
+            fact_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Ref(first_type.clone())),
+            metadata(),
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.bind_type_fact(
+            fact_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Def(second_type.clone())),
+            metadata(),
+        );
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&first_type),
+            Some(&HashSet::from([fact_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.force_bind_type_fact(
+            fact_owner.clone(),
+            LuaTypeCache::InferType(LuaType::Def(second_type.clone())),
+            metadata(),
+        );
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&second_type),
+            Some(&HashSet::from([plain_decl_id, fact_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.force_bind_type_fact(
+            fact_owner,
+            LuaTypeCache::InferType(LuaType::String),
+            metadata(),
+        );
+        index.force_bind_type(plain_owner, LuaTypeCache::InferType(LuaType::String));
+        assert!(index.decls_by_exact_type.is_empty());
+        assert_exact_decl_type_bindings_match_types(&index);
+    }
+
+    #[test]
+    fn exact_decl_type_binding_tracks_batch_replacement_and_partial_file_removal() {
+        let mut index = LuaTypeIndex::new();
+        let first_file_id = FileId::new(1);
+        let second_file_id = FileId::new(2);
+        let first_table_range = InFiled::new(first_file_id, TextRange::new(20.into(), 30.into()));
+        let second_table_range = InFiled::new(second_file_id, TextRange::new(20.into(), 30.into()));
+        let first_decl_id = LuaDeclId::new(first_file_id, 10.into());
+        let second_decl_id = LuaDeclId::new(second_file_id, 10.into());
+        let replacement_type = LuaTypeDeclId::global("Replacement");
+
+        index.bind_type(
+            LuaTypeOwner::Decl(first_decl_id),
+            LuaTypeCache::InferType(LuaType::TableConst(first_table_range.clone())),
+        );
+        index.bind_type(
+            LuaTypeOwner::Decl(second_decl_id),
+            LuaTypeCache::InferType(LuaType::TableConst(second_table_range.clone())),
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.replace_table_const_types(&HashMap::from([
+            (first_table_range, LuaType::Ref(replacement_type.clone())),
+            (second_table_range, LuaType::Def(replacement_type.clone())),
+        ]));
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&replacement_type),
+            Some(&HashSet::from([first_decl_id, second_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.remove(first_file_id);
+        assert_eq!(
+            index.get_decls_bound_to_exact_type(&replacement_type),
+            Some(&HashSet::from([second_decl_id]))
+        );
+        assert_exact_decl_type_bindings_match_types(&index);
+
+        index.remove(second_file_id);
+        assert!(index.decls_by_exact_type.is_empty());
+        assert_exact_decl_type_bindings_match_types(&index);
+    }
 }
 
 #[cfg(test)]

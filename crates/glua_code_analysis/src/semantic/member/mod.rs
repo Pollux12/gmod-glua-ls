@@ -144,33 +144,41 @@ pub(crate) fn local_class_table_member_ids(
         return Vec::new();
     }
 
+    let location_file_ids = type_decl
+        .get_locations()
+        .iter()
+        .map(|location| location.file_id)
+        .collect::<HashSet<_>>();
+    let Some(bound_decl_ids) = db.get_type_index().get_decls_bound_to_exact_type(type_id) else {
+        return Vec::new();
+    };
+
+    let decl_index = db.get_decl_index();
     let member_index = db.get_member_index();
     let mut member_ids = Vec::new();
-    for location in type_decl.get_locations() {
-        let Some(decl_tree) = db.get_decl_index().get_decl_tree(&location.file_id) else {
+    for decl_id in bound_decl_ids {
+        if !location_file_ids.contains(&decl_id.file_id) {
+            continue;
+        }
+        let Some(decl) = decl_index.get_decl(decl_id) else {
             continue;
         };
-        for decl in decl_tree.get_decls().values() {
-            if !decl_binds_type(db, decl, type_id) {
-                continue;
-            }
-            let Some(owner) = local_table_decl_member_owner(db, decl) else {
-                continue;
-            };
-            let Some(member_item) = member_index.get_member_item(&owner, member_key) else {
-                continue;
-            };
-            member_ids.extend(
-                member_item
-                    .get_member_ids()
-                    .into_iter()
-                    .filter(|member_id| {
-                        member_index
-                            .get_member(member_id)
-                            .is_some_and(|member| member.get_key() == member_key)
-                    }),
-            );
-        }
+        let Some(owner) = local_table_decl_member_owner(db, decl) else {
+            continue;
+        };
+        let Some(member_item) = member_index.get_member_item(&owner, member_key) else {
+            continue;
+        };
+        member_ids.extend(
+            member_item
+                .get_member_ids()
+                .into_iter()
+                .filter(|member_id| {
+                    member_index
+                        .get_member(member_id)
+                        .is_some_and(|member| member.get_key() == member_key)
+                }),
+        );
     }
 
     member_ids.sort_by_key(|member_id| {
@@ -202,15 +210,6 @@ pub(crate) fn cached_local_class_table_member_ids(
         .local_class_table_member_ids_cache
         .insert(cache_key, std::sync::Arc::new(member_ids.clone()));
     member_ids
-}
-
-fn decl_binds_type(db: &DbIndex, decl: &LuaDecl, type_id: &LuaTypeDeclId) -> bool {
-    db.get_type_index()
-        .get_type_cache(&decl.get_id().into())
-        .is_some_and(|type_cache| match type_cache.as_type() {
-            LuaType::Ref(bound_id) | LuaType::Def(bound_id) => bound_id == type_id,
-            _ => false,
-        })
 }
 
 fn local_table_decl_member_owner(db: &DbIndex, decl: &LuaDecl) -> Option<LuaMemberOwner> {
@@ -874,4 +873,131 @@ fn resolve_table_field_through_type_inference(
         .first()
         .cloned()
         .and_then(|m| m.property_owner_id)
+}
+
+#[cfg(test)]
+mod local_class_table_member_tests {
+    use super::*;
+    use crate::VirtualWorkspace;
+
+    const FIRST_SOURCE: &str = r#"
+        ---@class ReverseIndexedClass
+        local FirstTypeDeclaration
+
+        ---@type ReverseIndexedClass
+        local first_backing = { first = "first" }
+    "#;
+
+    const EDITED_FIRST_SOURCE: &str = r#"
+        ---@class ReverseIndexedClass
+        local FirstTypeDeclaration
+
+        ---@type ReverseIndexedClass
+        local first_backing = { edited = false }
+    "#;
+
+    const SECOND_SOURCE: &str = r#"
+        ---@class ReverseIndexedClass
+        local SecondTypeDeclaration
+
+        ---@type ReverseIndexedClass
+        local second_backing = { second = 2 }
+    "#;
+
+    const OUTSIDE_SOURCE: &str = r#"
+        ---@type ReverseIndexedClass
+        local outside_backing = { outside = true }
+    "#;
+
+    fn member_file_ids(ws: &VirtualWorkspace, key: &str) -> Vec<FileId> {
+        let db = ws.analysis.compilation.get_db();
+        let mut file_ids = local_class_table_member_ids(
+            db,
+            &LuaTypeDeclId::global("ReverseIndexedClass"),
+            &LuaMemberKey::Name(key.into()),
+        )
+        .into_iter()
+        .map(|member_id| member_id.file_id)
+        .collect::<Vec<_>>();
+        file_ids.sort();
+        file_ids
+    }
+
+    #[test]
+    fn local_class_table_members_follow_type_locations_and_file_lifecycle() {
+        let mut ws = VirtualWorkspace::new();
+        let first_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/reverse_index_first.lua");
+        let second_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/reverse_index_second.lua");
+        let outside_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/includes/reverse_index_outside.lua");
+
+        let first_file_id = ws
+            .analysis
+            .update_file_by_uri(&first_uri, Some(FIRST_SOURCE.to_owned()))
+            .expect("expected first type-location file");
+        let second_file_id = ws
+            .analysis
+            .update_file_by_uri(&second_uri, Some(SECOND_SOURCE.to_owned()))
+            .expect("expected second type-location file");
+        let outside_file_id = ws
+            .analysis
+            .update_file_by_uri(&outside_uri, Some(OUTSIDE_SOURCE.to_owned()))
+            .expect("expected non-location backing file");
+
+        let type_id = LuaTypeDeclId::global("ReverseIndexedClass");
+        let type_index = ws.analysis.compilation.get_db().get_type_index();
+        let location_file_ids = type_index
+            .get_type_decl(&type_id)
+            .expect("expected merged class declaration")
+            .get_locations()
+            .iter()
+            .map(|location| location.file_id)
+            .collect::<HashSet<_>>();
+        assert_eq!(
+            location_file_ids,
+            HashSet::from([first_file_id, second_file_id])
+        );
+        assert!(
+            type_index
+                .get_decls_bound_to_exact_type(&type_id)
+                .expect("expected exact class bindings")
+                .iter()
+                .any(|decl_id| decl_id.file_id == outside_file_id),
+            "the negative fixture must be exact-bound so only the location filter excludes it"
+        );
+
+        assert_eq!(member_file_ids(&ws, "first"), vec![first_file_id]);
+        assert_eq!(member_file_ids(&ws, "second"), vec![second_file_id]);
+        assert!(
+            member_file_ids(&ws, "outside").is_empty(),
+            "a backing declaration outside the class location files must remain excluded"
+        );
+
+        ws.analysis
+            .update_file_by_uri(&first_uri, Some(EDITED_FIRST_SOURCE.to_owned()))
+            .expect("expected first backing edit");
+        assert!(member_file_ids(&ws, "first").is_empty());
+        assert_eq!(member_file_ids(&ws, "edited"), vec![first_file_id]);
+        assert_eq!(member_file_ids(&ws, "second"), vec![second_file_id]);
+
+        ws.analysis
+            .remove_file_by_uri(&first_uri)
+            .expect("expected first backing removal");
+        assert!(member_file_ids(&ws, "edited").is_empty());
+        assert_eq!(member_file_ids(&ws, "second"), vec![second_file_id]);
+
+        let reopened_first_file_id = ws
+            .analysis
+            .update_file_by_uri(&first_uri, Some(FIRST_SOURCE.to_owned()))
+            .expect("expected first backing reopen");
+        assert_ne!(reopened_first_file_id, first_file_id);
+        assert_eq!(member_file_ids(&ws, "first"), vec![reopened_first_file_id]);
+        assert_eq!(member_file_ids(&ws, "second"), vec![second_file_id]);
+        assert!(member_file_ids(&ws, "outside").is_empty());
+    }
 }
