@@ -50,14 +50,17 @@ pub fn infer_call_expr_func(
 ) -> InferCallFuncResult {
     let syntax_id = call_expr.get_syntax_id();
     let key = (syntax_id, args_count, call_expr_type.clone());
-    if let Some(cache_entry) = cache.call_cache.get(&key) {
-        match cache_entry {
+    let key = match cache.call_cache.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => match entry.get() {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             _ => return Err(InferFailReason::RecursiveInfer),
+        },
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let key = entry.key().clone();
+            entry.insert(CacheEntry::Ready);
+            key
         }
-    }
-
-    cache.call_cache.insert(key.clone(), CacheEntry::Ready);
+    };
     let prefix_signature_id = matches!(call_expr_type, LuaType::DocFunction(_))
         .then(|| get_prefix_expr_signature_id(db, cache, &call_expr))
         .flatten();
