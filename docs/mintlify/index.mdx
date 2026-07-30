@@ -4,79 +4,47 @@ description: Completion, diagnostics, formatting, and debugging for Garry's Mod 
 mode: wide
 ---
 
-## What is GLuaLS?
-
-GLua Language Server (GLuaLS) adds completion, type checking, formatting, and debugging for **Garry's Mod Lua**.
-
-GLuaLS works out of the box. Install the extension, open your GMod Lua project, and start coding. If you need custom settings, use the built-in settings panel.
+GLua Language Server (GLuaLS) adds completion, diagnostics, formatting, and debugging to Garry's Mod Lua in VS Code.
 
 <CardGroup cols={3}>
   <Card title="Install" icon="download" href="/getting-started/installation">
-    Install the VS Code extension and open your first project.
-  </Card>
-  <Card title="Annotations reference" icon="tag" href="/annotations">
-    Add types and documentation to your own Lua code.
+    Install the VS Code extension and check that it is running.
   </Card>
   <Card title="Workspace setup" icon="sliders" href="/getting-started/workspace-setup">
-    Open addons, gamemodes, and multi-root projects correctly.
+    Open addons, gamemodes, and shared libraries correctly.
+  </Card>
+  <Card title="Set up debugging" icon="bug" href="/debugger/setup">
+    Connect VS Code to a local or remote SRCDS server.
   </Card>
 </CardGroup>
 
 ---
 
-## Core features
+## Find what you need
 
 <CardGroup cols={2}>
   <Card title="Realm awareness" icon="globe" href="/language/realm-awareness">
-    Detects client/server/shared realms from filenames, includes, and API usage. Warns about cross-realm mistakes in real time.
+    Find client, server, and shared realm mistakes.
   </Card>
   <Card title="Network validation" icon="network-wired" href="/language/network-analysis">
-    Validates `net.Start`/`net.Receive` payloads, catches mismatched write/read types, and delivers smart completion.
+    Check network message names and read/write payloads.
   </Card>
   <Card title="Scripted class support" icon="cube" href="/language/scripted-classes">
-    Detects ENT, SWEP, TOOL, and custom classes. Synthesizes NetworkVar getters/setters and AccessorFuncs.
+    Work with ENT, SWEP, TOOL, NetworkVar, and AccessorFunc code.
   </Card>
   <Card title="Hook intelligence" icon="link" href="/language/hook-intelligence">
-    Autocomplete for `hook.Add`, `hook.Run`, and `GM:` overrides. Registers custom hooks.
+    Complete hook names and type hook callback parameters.
   </Card>
   <Card title="Integrated debugger" icon="bug" href="/debugger/overview">
-    Full SRCDS debugger with breakpoints, variable inspection, live entity explorer, and Lua execution straight from the editor.
+    Set breakpoints, inspect state, and run Lua on SRCDS.
   </Card>
   <Card title="AI integration" icon="wand-magic-sparkles" href="/vscode/ai-integration">
-    Use Copilot and the built-in MCP tools to run Lua, read console output, and fetch server errors.
+    Give supported AI tools access to GLua docs and a debug session.
   </Card>
 </CardGroup>
 
 ---
 
-## Example: what GLuaLS catches
+## More help
 
-GLuaLS catches Garry's Mod Lua mistakes that generic Lua tools miss:
-
-<CodeGroup>
-```lua Realm mismatch
--- sv_example.lua (server-side file)
-
--- Warning: draw.SimpleText is a clientside-only function
-draw.SimpleText("Hello", "DermaDefault", 0, 0, Color(255, 255, 255))
-```
-
-```lua Network type mismatch
--- sv_send.lua
-net.Start("PlayerData")
-net.WriteString(ply:Nick())
-net.WriteInt(ply:Frags(), 32)
-net.Send(ply)
-
--- cl_receive.lua
-net.Receive("PlayerData", function()
-    local name = net.ReadString()
-    local frags = net.ReadFloat() -- Warning: expected ReadInt, not ReadFloat
-end)
-```
-
-```lua Invalid hook name
--- Warning: "PlayerSpawne" is not a known GMod hook name
-hook.Add("PlayerSpawne", "MyAddon", function(ply) end)
-```
-</CodeGroup>
+Use [configuration](/configuration/overview) to change analyzer behavior, [annotations](/annotations) to document your own code, or [command-line checks](/tools/glua-check) to run the same diagnostics in CI.

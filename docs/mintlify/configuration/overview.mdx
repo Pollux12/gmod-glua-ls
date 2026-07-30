@@ -9,11 +9,7 @@ import ConfigTip from "/snippets/config-tip.mdx"
 
 Configure language server behavior in a `.gluarc.json` file at your workspace root. The file has full JSON schema support, so your editor validates settings and provides completions.
 
-GLuaLS provides two ways to manage configuration:
-- **Settings panel** (recommended): an interactive VS Code UI that edits `.gluarc.json` for you
-- **Manual editing**: edit `.gluarc.json` with full IDE validation
-
-Both methods write to the same file and stay in sync.
+Use the VS Code settings panel to edit `.gluarc.json` without writing JSON, or edit the file directly. Both update the same configuration.
 
 ---
 
@@ -23,38 +19,9 @@ The GLua Settings panel lets you configure GLuaLS without touching JSON. Changes
 
 ### Opening the panel
 
-You can open the settings panel in three ways:
+Open **GLuaLS: Open GLuaLS Settings** from the Command Palette (`Ctrl+Shift+P`), click the GLuaLS status item, or right-click a `.gluarc.json` file in the Explorer. In a multi-root workspace, choose the folder to configure.
 
-1. **Command Palette** (`Ctrl+Shift+P`) -> **GLuaLS: Open GLuaLS Settings**
-2. Click the **GLuaLS** item in the status bar
-3. Right-click any `.gluarc.json` file in the Explorer -> **Open GLuaLS Settings**
-
-The panel opens as a tab in your editor. In a multi-root workspace, you'll be prompted to choose which workspace folder to configure.
-
-### Panel layout
-
-The settings panel uses collapsible sections that match the `.gluarc.json` structure:
-
-| Section | What it configures |
-|---|---|
-| **Garry's Mod** | Realm detection, scripted classes, network analysis, VGUI hints |
-| **Diagnostics** | Enable/disable individual diagnostic codes, set severity levels |
-| **Completion** | Autocomplete behavior, call snippets, postfix triggers |
-| **Formatting** | Formatter preset, style overrides |
-| **Hints** | Inlay hint types and thresholds |
-| **Workspace** | Library paths, ignore patterns, module maps |
-| **Runtime** | Non-standard Lua symbols, require-like functions |
-
-### Editing settings
-
-Every control maps directly to a `.gluarc.json` property:
-
-- **Toggles**: boolean options
-- **Dropdowns**: enum options (e.g., severity levels)
-- **Text fields**: string and number options
-- **Tables**: array and map options (e.g., file param defaults, scripted class definitions)
-
-Click **Save** to write your changes to `.gluarc.json`. You can turn on **Auto-save settings** in the panel header if you want changes saved automatically.
+The panel groups settings by the same top-level sections as `.gluarc.json`. Click **Save** to write your changes, or enable **Auto-save settings** in the panel header.
 
 <Tip>
 If you want to inspect the generated JSON, open `.gluarc.json` directly. You can edit both the settings panel and the JSON file, and they stay in sync.
@@ -136,39 +103,7 @@ The config file is split into top-level sections. Each page lists the available 
 
 ## VS Code extension settings
 
-Some settings are specific to the VS Code extension and are not part of `.gluarc.json`. These control extension-level behavior like the debugger, MCP server, UI preferences, and annotation downloads.
+Extension settings control the debugger, AI integration, UI preferences, and annotation downloads. Open VS Code **Settings** and search for `gluals` to find them.
 
-| Setting | Type | Default | Description |
-|---|---|---|---|
-| `gluals.gmod.autoLoadAnnotations` | `boolean` | `true` | Auto-download and load Garry's Mod wiki annotations (workspace default is `null` to use this setting) |
-| `gluals.gmod.settingsAutoSave` | `boolean` | `false` | Auto-save settings panel changes to `.gluarc.json` |
-| `gluals.gmod.debugRealm` | `string` | `"server"` | Default realm for debug execution (`server`, `client`, `shared`) |
-| `gluals.gmod.debugger.autoUpdateRdb` | `boolean` | `true` | Prompt to update `gm_rdb` on version mismatch |
-| `gluals.gmod.mcp.enabled` | `boolean` | `true` | Enable MCP server for AI integration |
-| `gluals.gmod.mcp.authToken` | `string` | `""` | MCP auth token (empty = auto-generate local token) |
-| `gluals.gmod.mcp.port` | `integer` | `0` | MCP server port (0 = random ephemeral) |
-| `gluals.gmod.mcp.rateLimitPerMinute` | `integer` | `60` | Max MCP requests per minute per client |
-| `gluals.gmod.templatePath` | `string \| null` | `null` | Path to custom scaffolding templates |
-| `gluals.gmod.vgui.codeLensEnabled` | `boolean` | `true` | VGUI panel code lens |
-| `gluals.gmod.vgui.inlayHintEnabled` | `boolean` | `false` | VGUI panel inlay hints |
-| `gluals.ls.executablePath` | `string` | `""` | Override language server binary path |
-| `gluals.ls.annotationPath` | `string` | `""` | Load an additional annotation library |
-| `gluals.ls.debugPort` | `integer \| null` | `null` | Connect to existing language server on this port |
-| `gluals.ls.startParameters` | `array` | `[]` | Additional language server arguments |
-| `gluals.ls.globalConfigPath` | `string` | `""` | Path to global `.emmyrc.json` |
-| `gluals.language.completeAnnotation` | `boolean` | `true` | Complete annotation tags while typing |
-| `gluals.misc.autoInsertTripleDash` | `boolean` | `true` | Continue `---` documentation comments on a new line |
-| `gluals.decorations.globalUnderline` | `boolean` | `false` | Underline global variables |
-| `gluals.decorations.mutableLocalUnderline` | `boolean` | `false` | Underline mutable local variables |
-| `gluals.decorations.mutableParameterUnderline` | `boolean` | `false` | Underline mutable function parameters |
-| `gluals.decorations.readonlyLocalUnderline` | `boolean` | `false` | Underline read-only local variables |
-| `gluals.decorations.readonlyParameterUnderline` | `boolean` | `false` | Underline read-only function parameters |
-| `gluals.workspace.enableIsolation` | `boolean \| null` | `null` | Override multi-root workspace isolation |
-| `gluals.workspace.useDefaultIgnores` | `boolean \| null` | `null` | Override built-in workspace ignore rules |
-| `gluals.inlineValues.enable` | `boolean \| null` | `null` | Show inline values during debug |
-| `gluals.semanticTokens.enable` | `boolean \| null` | `null` | Enable semantic tokens |
-| `gluals.semanticTokens.renderDocumentationMarkup` | `boolean \| null` | `null` | Apply semantic colors inside documentation comments |
-| `lua.trace.server` | `string` | `"off"` | Log language server messages for troubleshooting. Use `"messages"` or `"verbose"` only when needed |
-
-Settings in `.gluarc.json` always take precedence over VS Code workspace settings for analysis behavior.
+Use `.gluarc.json` for analysis behavior. Its settings take precedence over matching VS Code workspace settings.
 

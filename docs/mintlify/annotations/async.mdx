@@ -1,61 +1,23 @@
 ---
 title: "@async"
-description: Mark a function as coroutine-based or asynchronous.
+description: Mark a function that must be called from asynchronous code.
 ---
 
-## Overview
+`@async` marks a function that must be called from another async function. It is metadata for GLuaLS; it does not change runtime behavior.
 
-`@async` marks a function as asynchronous. In GLua, this often means the function calls `coroutine.yield` and must run inside a coroutine. The annotation affects documentation and async-aware diagnostics. It does not change runtime behavior.
-
----
-
-## Syntax
+## Use it on an async function
 
 ```lua
 ---@async
-```
-
----
-
-## Usage
-
-```lua
----@async
----@param url string The URL to fetch
----@return string response The response body
-function fetch(url)
-    -- internally yields waiting for I/O
-    local response = http.Fetch(url)
+function WaitForNextTick()
     coroutine.yield()
-    return response
 end
 ```
-
----
 
 ## What it does
 
-- Marks the function in hover documentation as async
-- Allows tools and linters to warn when an `@async` function is called outside a coroutine context (if that diagnostic is enabled)
-- Has no runtime effect
+- Marks the function as async in hover documentation.
+- Reports an `await-in-sync` diagnostic when an async function is called from a non-async function.
+- Has no runtime effect.
 
----
-
-## Common GMod patterns
-
-GLuaLS supports async-style code that uses coroutines and callbacks. GMod has no built-in `await()`, but many addons use helper wrappers for the same pattern.
-
-```lua
----@async
-function PLUGIN:FetchPlayerData(steamId)
-    local response
-    http.Fetch("https://api.example.com/player/" .. steamId, function(body)
-        response = body
-    end)
-
-    coroutine.yield() -- wait for the callback to set `response`
-    return response
-end
-```
-
-
+Mark your coroutine or callback wrapper as `@async`; GLuaLS cannot make an ordinary callback API asynchronous.

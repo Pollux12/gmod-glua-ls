@@ -14,7 +14,7 @@ You can use the Entity Explorer whenever the debugger is connected:
 1. Click the **GLuaLS** icon in the sidebar
 2. Open the **Entity Explorer** section
 
-The list refreshes every second while connected.
+Use **Refresh** if the entity list is out of date.
 
 ---
 
@@ -57,19 +57,6 @@ You can edit only while paused. When the game runs, the explorer is read-only to
 
 ---
 
-## Page size and polling
-
-The explorer loads entities in pages of 50. Scroll to the bottom to load the next page.
-
-The auto-refresh polls every 1 second and stops after 30 seconds of inactivity to reduce server load during idle periods. Click **Refresh** to resume polling.
-
----
-
 ## Filtering entities
 
-Type in the filter box above the entity list to show only entities whose class name matches. Filtering is case-insensitive.
-
-```
-Filter: prop_physics
--- Shows only prop_physics entities
-```
+Type in the filter box above the entity list to show only matching class names. Filtering is case-insensitive.

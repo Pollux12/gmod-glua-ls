@@ -14,11 +14,20 @@
         "tab": "Get Started",
         "groups": [
           {
-            "group": "Introduction",
+            "group": "Start here",
             "pages": [
               "index",
               "getting-started/installation",
               "getting-started/workspace-setup",
+              "features/overview"
+            ]
+          },
+          {
+            "group": "Common tasks",
+            "pages": [
+              "debugger/setup",
+              "configuration/overview",
+              "annotations/index",
               "tools/glua-check"
             ]
           }

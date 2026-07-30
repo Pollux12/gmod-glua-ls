@@ -30,7 +30,9 @@ Put `---@realm` at the top of a file or on a function:
 
 ```lua
 ---@realm client
--- Everything in this file is clientside
+function MyAddon.OpenMenu()
+    vgui.Create("DFrame")
+end
 ```
 
 See the [`@realm` annotation reference](/annotations/realm) for full syntax. A function annotation can be more specific than its file.
@@ -131,11 +133,11 @@ Disable realm diagnostics workspace-wide:
 }
 ```
 
-Or suppress for a specific file:
+Or set the known realm for a specific file:
 
 ```lua
 ---@realm shared
--- This file intentionally has mixed realm code
+-- Shared code follows.
 ```
 
 ---
