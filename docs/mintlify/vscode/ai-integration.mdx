@@ -25,7 +25,7 @@ The server intentionally exposes only five tools:
 |---|---|
 | `execute_lua` | Evaluate inline code like a live REPL, run a workspace Lua file, or manually refresh a file |
 | `run_console_command` | Run one command in the Garry's Mod server console |
-| `read_console` | Read filtered, timestamped console lines, optionally after a previous cursor |
+| `read_console` | Read filtered, timestamped console lines, optionally after a previous cursor and observation window |
 | `get_errors` | Read filtered in-game runtime errors |
 | `get_issues` | Read filtered GLuaLS language-server errors and warnings |
 
@@ -89,7 +89,7 @@ All read tools use small defaults and bounded responses. Narrow the request befo
 
 | Tool | Useful controls |
 |---|---|
-| `read_console` | `lines`, `cursor`, `sessionId`, `realm`, `source`, `contains`, `includeSessions` |
+| `read_console` | `lines`, `cursor`, `observeMs`, `sessionId`, `realm`, `source`, `contains`, `includeSessions` |
 | `get_errors` | `source`, `sessionId`, `realm`, `cursor`, `minCount`, `contains`, `includeStackTrace`, `limit`, `includeSessions` |
 | `get_issues` | `severity`, `path`, `code`, `contains`, `offset`, `limit` |
 
@@ -148,7 +148,16 @@ Agent: The server is running gm_construct. No runtime Lua errors were captured,
        but GLuaLS reports one warning in lua/autorun/example.lua:14.
 ```
 
-For repeated console reads, pass the `cursor` from the previous `read_console` response. This returns only newer lines and avoids confusing old output with the current test.
+For repeated console reads, pass the `cursor` from the previous `read_console` response. This returns only newer lines and avoids confusing old output with the current test. When output is asynchronous, wait for it in the same request:
+
+```json
+{
+  "cursor": 42,
+  "observeMs": 2000
+}
+```
+
+`observeMs` waits for the requested window before reading and is limited to 30 seconds. The default is `0`, so existing reads remain immediate.
 
 ## Security
 
