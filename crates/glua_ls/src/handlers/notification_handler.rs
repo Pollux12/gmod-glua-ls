@@ -70,6 +70,10 @@ pub async fn on_notification_handler(
             )
         {
             let uri = params.text_document.uri.clone();
+            let text = params
+                .content_changes
+                .first()
+                .map(|change| change.text.clone());
             let snapshot = server_context.snapshot();
             snapshot
                 .note_document_seen_version(&uri, params.text_document.version)
@@ -77,6 +81,16 @@ pub async fn on_notification_handler(
             if snapshot.lsp_features().supports_workspace_diagnostic() {
                 let workspace = snapshot.workspace_manager().read().await;
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
+            }
+            if let Some(text) = text {
+                let mut workspace = snapshot.workspace_manager().write().await;
+                if let Some(project_loading) = workspace.project_loading.as_mut() {
+                    project_loading.update_open_document(
+                        uri.clone(),
+                        text,
+                        params.text_document.version,
+                    );
+                }
             }
             // Keep stale-aware UI requests alive so they can wait for fresh
             // data instead of flickering while typing.
@@ -107,6 +121,13 @@ pub async fn on_notification_handler(
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
+                if let Some(project_loading) = workspace.project_loading.as_mut() {
+                    project_loading.update_open_document(
+                        uri.clone(),
+                        params.text_document.text.clone(),
+                        params.text_document.version,
+                    );
+                }
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
@@ -141,6 +162,9 @@ pub async fn on_notification_handler(
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);
+                if let Some(project_loading) = workspace.project_loading.as_mut() {
+                    project_loading.remove_open_document(&uri);
+                }
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;

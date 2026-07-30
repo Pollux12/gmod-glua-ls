@@ -1,6 +1,7 @@
 use lsp_types::request::Request;
 use serde::{Deserialize, Serialize};
 
+use crate::context::LoadedProject;
 use glua_code_analysis::ResolvedGmodScriptedClassDefinition;
 
 #[derive(Debug)]
@@ -30,6 +31,8 @@ pub struct GmodScriptedClassesParams {}
 pub struct GmodScriptedClassesResult {
     pub definitions: Vec<ResolvedGmodScriptedClassDefinition>,
     pub entries: Vec<GmodScriptedClassEntry>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projects: Vec<LoadedProject>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -50,6 +53,8 @@ pub struct GmodScriptedClassEntry {
     pub class_name: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub definition_id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub range: Option<lsp_types::Range>,
 }

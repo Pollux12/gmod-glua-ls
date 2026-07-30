@@ -45,6 +45,7 @@ pub fn build_gmod_scripted_classes(
             class_type: scope_match.definition.class_global.clone(),
             class_name: scope_match.class_name,
             definition_id: Some(scope_match.definition.id),
+            project_id: None,
             range: None,
         });
     }
@@ -88,6 +89,7 @@ pub fn build_gmod_scripted_classes(
     Some(GmodScriptedClassesResult {
         definitions,
         entries,
+        projects: Vec::new(),
     })
 }
 
@@ -119,6 +121,7 @@ fn push_vgui_panel_entries(
             class_type: "VGUI".to_string(),
             class_name: panel_name.to_string(),
             definition_id: None,
+            project_id: None,
             range,
         });
     }

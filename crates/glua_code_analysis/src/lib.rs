@@ -25,7 +25,7 @@ pub use compilation::*;
 pub use config::*;
 pub use db_index::*;
 pub use diagnostic::*;
-pub use gamemode_base::detect_gamemode_base_libraries;
+pub use gamemode_base::{detect_gamemode_base_libraries, read_gamemode_base};
 pub use glua_codestyle::*;
 use glua_parser::{
     LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,

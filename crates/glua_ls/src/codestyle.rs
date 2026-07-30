@@ -237,7 +237,9 @@ fn collect_workspace_editorconfigs(workspace_folders: &[WorkspaceFolder]) -> Vec
     let mut editorconfig_files = Vec::new();
     for workspace in workspace_folders {
         match &workspace.import {
-            WorkspaceImport::All => collect_editorconfigs(&workspace.root, &mut editorconfig_files),
+            WorkspaceImport::All | WorkspaceImport::AllExcept(_) => {
+                collect_editorconfigs(&workspace.root, &mut editorconfig_files)
+            }
             WorkspaceImport::SubPaths(subs) => {
                 for sub in subs {
                     collect_editorconfigs(&workspace.root.join(sub), &mut editorconfig_files);
@@ -253,7 +255,9 @@ fn collect_workspace_style_roots(workspace_folders: &[WorkspaceFolder]) -> Vec<P
     let mut roots = Vec::new();
     for workspace in workspace_folders {
         match &workspace.import {
-            WorkspaceImport::All => roots.push(workspace.root.clone()),
+            WorkspaceImport::All | WorkspaceImport::AllExcept(_) => {
+                roots.push(workspace.root.clone())
+            }
             WorkspaceImport::SubPaths(subs) => {
                 for sub in subs {
                     roots.push(workspace.root.join(sub));
