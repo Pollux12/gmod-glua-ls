@@ -1,14 +1,14 @@
 //! Server-side detection of GMod gamemode base libraries.
 //!
 //! Garry's Mod gamemodes live under `<gameroot>/gamemodes/<name>/` and carry a
-//! `<name>.txt` KeyValues metadata file describing the gamemode. That file may
+//! `.txt` KeyValues metadata file describing the gamemode. That file may
 //! contain a `"base"` field naming a parent gamemode whose folder name is
 //! `<base>`. At runtime, gmod loads the parent's code first via
 //! `DeriveGamemode("<base>")`, so for accurate static analysis we must resolve
 //! the inheritance chain and add each ancestor's gamemode folder as a library.
 //!
 //! This module:
-//!   * scans a workspace root for any `gamemodes/<name>/<name>.txt`,
+//!   * scans a workspace root for gamemode metadata files,
 //!   * parses just enough of the KeyValues format to extract the `"base"` field,
 //!   * follows the `base` chain (e.g. `darkrp` -> `sandbox` -> `base`),
 //!   * returns the absolute folder paths of all ancestor gamemodes that exist
@@ -35,6 +35,40 @@ fn is_valid_gamemode_name(name: &str) -> bool {
         .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
 }
 
+/// Locate the KeyValues metadata file for a gamemode folder.
+///
+/// Most gamemodes use `<folder-name>.txt`, but Garry's Mod also accepts a
+/// differently named metadata file (for example `helix-hl2rp/ixhl2rp.txt`).
+/// Prefer the conventional filename, then inspect direct `.txt` children in a
+/// deterministic order and accept the first valid KeyValues document.
+pub fn find_gamemode_manifest(gamemode_root: &Path) -> Option<PathBuf> {
+    let name = gamemode_root.file_name()?.to_str()?;
+    let conventional = gamemode_root.join(format!("{name}.txt"));
+    if conventional.is_file() {
+        return Some(conventional);
+    }
+    if !gamemode_root.join("gamemode").is_dir() {
+        return None;
+    }
+
+    let mut candidates = std::fs::read_dir(gamemode_root)
+        .ok()?
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path
+                    .extension()
+                    .and_then(|extension| extension.to_str())
+                    .is_some_and(|extension| extension.eq_ignore_ascii_case("txt"))
+        })
+        .collect::<Vec<_>>();
+    candidates.sort();
+    candidates
+        .into_iter()
+        .find(|path| is_gamemode_metadata_file(path))
+}
+
 /// Extract the `"base"` value from a gamemode `.txt` KeyValues file.
 ///
 /// Returns `None` when the file is missing, unreadable, malformed, or has an
@@ -46,13 +80,23 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
     parse_base_field(trimmed)
 }
 
+fn is_gamemode_metadata_file(path: &Path) -> bool {
+    let Ok(content) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let content = content.strip_prefix('\u{FEFF}').unwrap_or(&content);
+    let mut tokens = Tokenizer::new(content);
+    matches!(tokens.next_token(), Some(Token::Word(_)))
+        && matches!(tokens.next_token(), Some(Token::Open))
+}
+
 /// Detect base gamemode library paths for a single workspace root.
 ///
 /// The detector handles two layouts:
 ///   1. **Game install root** (e.g. `.../garrysmod/`): scans `gamemodes/*` for
-///      every gamemode that has a `<name>/<name>.txt` and follows each chain.
+///      every gamemode that has a metadata file and follows each chain.
 ///   2. **Single gamemode root** (e.g. `.../gamemodes/darkrp/`): if the root
-///      itself contains `<basename>/<basename>.txt`, follows that chain.
+///      itself contains a metadata file, follows that chain.
 ///
 /// Returned paths:
 ///   * are absolute,
@@ -70,7 +114,7 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
     // as gamemodes.
     if let Some(name) = workspace_root.file_name().and_then(|s| s.to_str())
         && is_valid_gamemode_name(name)
-        && workspace_root.join(format!("{name}.txt")).is_file()
+        && find_gamemode_manifest(workspace_root).is_some()
         && let Some(parent) = workspace_root.parent()
         && parent
             .file_name()
@@ -105,7 +149,7 @@ pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
                 if !is_valid_gamemode_name(name) {
                     continue;
                 }
-                if !gm_folder.join(format!("{name}.txt")).is_file() {
+                if find_gamemode_manifest(&gm_folder).is_none() {
                     continue;
                 }
                 walk_chain(
@@ -139,15 +183,9 @@ fn walk_chain(
     }
 
     loop {
-        let Some(name) = current
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(str::to_string)
+        let Some(base) =
+            find_gamemode_manifest(&current).and_then(|manifest| read_gamemode_base(&manifest))
         else {
-            return;
-        };
-        let txt = current.join(format!("{name}.txt"));
-        let Some(base) = read_gamemode_base(&txt) else {
             return;
         };
         if base.is_empty() {
@@ -486,6 +524,24 @@ sandbox
         expected.sort();
         assert_eq!(libs, expected);
 
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn detect_uses_metadata_named_differently_from_gamemode_folder() {
+        let root = temp_dir();
+        write_gamemode(&root, "helix", None);
+        let schema = root.join("gamemodes").join("helix-hl2rp");
+        fs::create_dir_all(schema.join("gamemode")).expect("create schema folder");
+        fs::write(
+            schema.join("ixhl2rp.txt"),
+            "\"ixhl2rp\"\n{\n\t\"base\"\t\"helix\"\n}\n",
+        )
+        .expect("write schema metadata");
+
+        let libraries = detect_gamemode_base_libraries(&root);
+
+        assert_eq!(libraries, vec![root.join("gamemodes").join("helix")]);
         let _ = fs::remove_dir_all(root);
     }
 

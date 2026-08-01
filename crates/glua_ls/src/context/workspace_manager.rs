@@ -4,15 +4,15 @@ use std::path::Path;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::{path::PathBuf, sync::Arc, time::Duration};
 
-use super::{ClientProxy, FileDiagnostic, StatusBar};
+use super::{ClientProxy, FileDiagnostic, GmodProjectLoading, StatusBar, import_contains};
 use crate::codestyle::{apply_editorconfig_file, apply_workspace_code_style};
 use crate::context::lsp_features::LspFeatures;
 use crate::handlers::{ClientConfig, init_analysis};
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 use glua_code_analysis::uri_to_file_path;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, WorkspaceImport,
-    calculate_include_and_exclude, load_configs,
+    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
+    load_configs,
 };
 use log::{debug, info};
 use lsp_types::Uri;
@@ -29,7 +29,10 @@ pub struct WorkspaceManager {
     file_diagnostic: Arc<FileDiagnostic>,
     lsp_features: Arc<LspFeatures>,
     pub client_config: ClientConfig,
+    pub explicit_workspace_folders: Vec<WorkspaceFolder>,
     pub workspace_folders: Vec<WorkspaceFolder>,
+    pub project_loading: Option<GmodProjectLoading>,
+    pub workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     pub watcher: Option<notify::RecommendedWatcher>,
     pub current_open_files: HashSet<Uri>,
     /// Fallback matcher used when no workspace-root-specific matcher applies
@@ -39,6 +42,7 @@ pub struct WorkspaceManager {
     /// matcher for the first workspace root that is a prefix of the file path,
     /// so each root's `useDefaultIgnores` / `ignoreDirDefaults` stays isolated.
     pub per_root_matchers: HashMap<PathBuf, WorkspaceFileMatcher>,
+    gamemode_selection_lock: Arc<Mutex<()>>,
     workspace_diagnostic_level: Arc<AtomicU8>,
     workspace_version: Arc<AtomicI64>,
 }
@@ -56,7 +60,10 @@ impl WorkspaceManager {
             client,
             status_bar,
             client_config: ClientConfig::default(),
+            explicit_workspace_folders: Vec::new(),
             workspace_folders: Vec::new(),
+            project_loading: None,
+            workspace_emmyrcs: HashMap::new(),
             update_token: Arc::new(Mutex::new(None)),
             file_diagnostic,
             lsp_features,
@@ -64,6 +71,7 @@ impl WorkspaceManager {
             current_open_files: HashSet::new(),
             match_file_pattern: WorkspaceFileMatcher::default(),
             per_root_matchers: HashMap::new(),
+            gamemode_selection_lock: Arc::new(Mutex::new(())),
             workspace_diagnostic_level: Arc::new(AtomicU8::new(
                 WorkspaceDiagnosticLevel::Fast.to_u8(),
             )),
@@ -101,6 +109,7 @@ impl WorkspaceManager {
 
         let analysis = self.analysis.clone();
         let workspace_folders = self.workspace_folders.clone();
+        let explicit_workspace_folders = self.explicit_workspace_folders.clone();
         let config_update_token = self.update_token.clone();
         let client_config = self.client_config.clone();
         let status_bar = self.status_bar.clone();
@@ -113,18 +122,20 @@ impl WorkspaceManager {
                 return;
             }
 
-            let config_roots = collect_config_roots(&workspace_folders, Some(file_dir.clone()));
+            let config_roots =
+                collect_config_roots(&explicit_workspace_folders, Some(file_dir.clone()));
             let watchdog_status = LongRunningWatchdogStatus::new("Reloading GLuaLS configuration");
             let _watchdog =
                 spawn_long_running_watchdog("workspace config reload", watchdog_status.clone());
             let loaded = load_emmy_config(config_roots, client_config);
-            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
+            apply_workspace_code_style(&explicit_workspace_folders, loaded.emmyrc.as_ref());
 
             // Refresh per-root matchers before re-indexing so that
             // `is_workspace_file` is consistent with the new config.
             {
                 let mut wm = workspace_manager.write().await;
                 wm.per_root_matchers = loaded.workspace_matchers.clone();
+                wm.workspace_emmyrcs = loaded.workspace_emmyrcs.clone();
                 let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
                 wm.match_file_pattern = WorkspaceFileMatcher::new(include, exclude, exclude_dir);
             }
@@ -142,6 +153,15 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
+            if let Some(state) = workspace_manager
+                .read()
+                .await
+                .project_loading
+                .as_ref()
+                .map(GmodProjectLoading::state)
+            {
+                client.send_notification("gluals/projectsChanged", state);
+            }
             if lsp_features.supports_workspace_diagnostic() {
                 client.refresh_workspace_diagnostics();
             }
@@ -160,10 +180,11 @@ impl WorkspaceManager {
         &self,
         workspace_manager: Arc<RwLock<WorkspaceManager>>,
     ) -> Option<()> {
-        let config_roots = collect_config_roots(&self.workspace_folders, None);
+        let config_roots = collect_config_roots(&self.explicit_workspace_folders, None);
         let loaded = load_emmy_config(config_roots, self.client_config.clone());
         let analysis = self.analysis.clone();
         let workspace_folders = self.workspace_folders.clone();
+        let explicit_workspace_folders = self.explicit_workspace_folders.clone();
         let status_bar = self.status_bar.clone();
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
@@ -173,12 +194,13 @@ impl WorkspaceManager {
             let watchdog_status = LongRunningWatchdogStatus::new("Reloading workspace");
             let _watchdog =
                 spawn_long_running_watchdog("workspace reload", watchdog_status.clone());
-            apply_workspace_code_style(&workspace_folders, loaded.emmyrc.as_ref());
+            apply_workspace_code_style(&explicit_workspace_folders, loaded.emmyrc.as_ref());
 
             // Refresh per-root matchers before re-indexing.
             {
                 let mut wm = workspace_manager.write().await;
                 wm.per_root_matchers = loaded.workspace_matchers.clone();
+                wm.workspace_emmyrcs = loaded.workspace_emmyrcs.clone();
                 let (include, exclude, exclude_dir) = calculate_include_and_exclude(&loaded.emmyrc);
                 wm.match_file_pattern = WorkspaceFileMatcher::new(include, exclude, exclude_dir);
             }
@@ -197,6 +219,15 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
+            if let Some(state) = workspace_manager
+                .read()
+                .await
+                .project_loading
+                .as_ref()
+                .map(GmodProjectLoading::state)
+            {
+                client.send_notification("gluals/projectsChanged", state);
+            }
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
@@ -284,6 +315,10 @@ impl WorkspaceManager {
             &self.match_file_pattern,
         )
     }
+
+    pub fn gamemode_selection_lock(&self) -> Arc<Mutex<()>> {
+        self.gamemode_selection_lock.clone()
+    }
 }
 
 /// Inner logic for `WorkspaceManager::is_workspace_file`, extracted so it can
@@ -325,12 +360,7 @@ fn is_workspace_file_inner(
         return false;
     };
 
-    let inside_import = match &workspace.import {
-        WorkspaceImport::All => true,
-        WorkspaceImport::SubPaths(paths) => paths.iter().any(|p| relative.starts_with(p)),
-    };
-
-    if !inside_import {
+    if !import_contains(workspace, &file_path) {
         return false;
     }
 
@@ -988,6 +1018,10 @@ fn inject_gamemode_base_libraries(
     emmyrc: &mut Emmyrc,
     workspace_root: Option<&Path>,
 ) {
+    if client_config.logical_project_loading {
+        return;
+    }
+
     // Check if explicitly disabled in config
     if matches!(emmyrc.gmod.auto_detect_gamemode_base, Some(false)) {
         log::info!("Gamemode base auto-detection explicitly disabled in config");

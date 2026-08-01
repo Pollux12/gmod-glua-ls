@@ -10,7 +10,8 @@ use std::{
 use crate::{
     cmd_args::CmdArgs,
     context::{
-        FileDiagnostic, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
+        ChooseGamemodeResult, FileDiagnostic, GamemodeChoiceReason, GmodProjectLoading,
+        GmodProjectLoadingOptions, LspFeatures, ProgressTask, ServerContextSnapshot, StatusBar,
         WorkspaceFileMatcher, get_client_id, load_emmy_config, validate_gmod_annotations_for_ls,
     },
     handlers::text_document::register_files_watch,
@@ -20,11 +21,13 @@ use crate::{
 pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, LuaDiagnosticConfig, WorkspaceFolder, calculate_include_and_exclude,
-    collect_workspace_files, fetch_schema_urls, uri_to_file_path,
+    EmmyLuaAnalysis, Emmyrc, GmodWorkspaceTopology, LuaDiagnosticConfig, WorkspaceFolder,
+    calculate_include_and_exclude, collect_workspace_files, fetch_schema_urls, uri_to_file_path,
 };
+use lsp_server::RequestId;
 use lsp_types::{InitializeParams, MessageType, ShowMessageParams};
 use tokio::sync::RwLock;
+use tokio_util::sync::CancellationToken;
 
 /// Initialize the workspace.
 ///
@@ -39,8 +42,8 @@ pub async fn initialized_handler(
     cmd_args: CmdArgs,
 ) -> Result<(), String> {
     log::info!("initialized handler started");
-    let workspace_folders = get_workspace_folders(&params);
-    let main_root: Option<&str> = match workspace_folders.first() {
+    let explicit_workspace_folders = get_workspace_folders(&params);
+    let main_root: Option<&str> = match explicit_workspace_folders.first() {
         Some(path) => path.root.to_str(),
         None => None,
     };
@@ -64,18 +67,12 @@ pub async fn initialized_handler(
         .unwrap_or_default();
     log::info!("client_id: {:?}", client_id);
 
-    {
-        log::info!("set workspace folders: {:?}", workspace_folders);
-        let mut workspace_manager = context.workspace_manager().write().await;
-        workspace_manager.workspace_folders = workspace_folders.clone();
-        log::info!("workspace folders set");
-    }
-
     let client_config = get_client_config(&context, client_id, supports_config_request).await;
 
     // Extract gmodAnnotationsPath from initialization options if provided
     // CLI argument takes precedence over VSCode extension-provided path
     let mut client_config = client_config;
+    client_config.logical_project_loading = true;
     if let Some(ref init_options) = params.initialization_options {
         if let Some(gmod_path) = init_options.get("gmodAnnotationsPath") {
             if let Some(path_str) = gmod_path.as_str() {
@@ -125,10 +122,58 @@ pub async fn initialized_handler(
     let params_json = serde_json::to_string_pretty(&params).unwrap();
     log::info!("initialization_params: {}", params_json);
 
+    let project_loading_options = params
+        .initialization_options
+        .as_ref()
+        .and_then(|options| options.get("gmodProjectLoading"))
+        .and_then(|options| {
+            serde_json::from_value::<GmodProjectLoadingOptions>(options.clone()).ok()
+        });
+    let topology = GmodWorkspaceTopology::discover(
+        &explicit_workspace_folders
+            .iter()
+            .map(|workspace| workspace.root.clone())
+            .collect::<Vec<_>>(),
+    );
+    let mut project_loading = GmodProjectLoading::new(
+        topology,
+        explicit_workspace_folders.clone(),
+        project_loading_options
+            .as_ref()
+            .is_some_and(|options| options.interactive_gamemode_selection),
+    );
+    if let Some(persisted) = project_loading_options
+        .as_ref()
+        .and_then(|options| options.selected_gamemode_uri.as_deref())
+        .and_then(|value| project_loading.resolve_persisted_gamemode(value))
+    {
+        project_loading.set_active_gamemode(Some(persisted));
+    } else if let Some(sole_gamemode) = project_loading.sole_primary_gamemode_id() {
+        project_loading.set_active_gamemode(Some(sole_gamemode));
+    } else if project_loading.interactive() && project_loading.primary_gamemode_count() > 1 {
+        let choice = request_gamemode_choice(
+            &context,
+            project_loading.choose_params(None, GamemodeChoiceReason::Initial),
+        )
+        .await;
+        if let Some(selected) = choice.filter(|id| project_loading.is_valid_primary_id(id)) {
+            project_loading.set_active_gamemode(Some(selected));
+        }
+    }
+    let workspace_folders = project_loading.loaded_workspace_folders();
+    {
+        log::info!("set logical workspace folders: {:?}", workspace_folders);
+        let mut workspace_manager = context.workspace_manager().write().await;
+        workspace_manager.explicit_workspace_folders = explicit_workspace_folders.clone();
+        workspace_manager.workspace_folders = workspace_folders.clone();
+        workspace_manager.project_loading = Some(project_loading);
+        log::info!("logical workspace folders set");
+    }
+
     // init config
     watchdog_status.set_phase("Loading GLuaLS configuration");
     log::info!("loading GLuaLS configuration");
-    let config_roots = workspace_folders
+    let config_roots = explicit_workspace_folders
         .iter()
         .map(|workspace| workspace.root.clone())
         .collect();
@@ -137,7 +182,7 @@ pub async fn initialized_handler(
     let workspace_diagnostic_configs = loaded.workspace_diagnostic_configs;
     let workspace_emmyrcs = loaded.workspace_emmyrcs;
     let workspace_matchers = loaded.workspace_matchers;
-    load_editorconfig(workspace_folders.clone(), emmyrc.as_ref());
+    load_editorconfig(explicit_workspace_folders.clone(), emmyrc.as_ref());
     log::info!("configuration loaded");
 
     // LS-only fail-fast: when GMod mode is enabled, require a resolved,
@@ -177,6 +222,7 @@ pub async fn initialized_handler(
         workspace_manager.match_file_pattern =
             WorkspaceFileMatcher::new(include, exclude, exclude_dir);
         workspace_manager.per_root_matchers = workspace_matchers;
+        workspace_manager.workspace_emmyrcs = workspace_emmyrcs.clone();
         log::info!("workspace manager updated with client config and watch file patterns")
     }
 
@@ -194,10 +240,46 @@ pub async fn initialized_handler(
     )
     .await;
 
+    let project_loading_state = {
+        let workspace_manager = context.workspace_manager().read().await;
+        workspace_manager
+            .project_loading
+            .as_ref()
+            .map(GmodProjectLoading::state)
+    };
+    if let Some(state) = project_loading_state {
+        context
+            .client()
+            .send_notification("gluals/projectsChanged", state);
+    }
+
     register_files_watch(context.clone(), &params.capabilities).await;
     log::info!("initialized handler completed; notifying workspace loaded");
     context.file_diagnostic().notify_workspace_loaded();
     Ok(())
+}
+
+async fn request_gamemode_choice(
+    context: &ServerContextSnapshot,
+    params: crate::context::ChooseGamemodeParams,
+) -> Option<String> {
+    let request_id: RequestId = context.client().next_id();
+    let response = context
+        .client()
+        .send_request(
+            request_id,
+            "gluals/chooseGamemode",
+            params,
+            CancellationToken::new(),
+        )
+        .await?;
+    let result = response.result?;
+    if result.is_null() {
+        return None;
+    }
+    serde_json::from_value::<ChooseGamemodeResult>(result)
+        .ok()?
+        .selected_gamemode_id
 }
 
 pub async fn init_analysis(
@@ -227,26 +309,24 @@ pub async fn init_analysis(
     );
     log::info!("preparing workspace folders for initial indexing");
 
-    let workspace_roots = workspace_folders
-        .into_iter()
-        .map(|workspace| workspace.root)
-        .collect::<Vec<_>>();
-
     let mut workspace_collection_groups: Vec<(Arc<Emmyrc>, Vec<WorkspaceFolder>)> = Vec::new();
-    if workspace_roots.is_empty() {
+    if workspace_folders.is_empty() {
         workspace_collection_groups.push((
             emmyrc.clone(),
             build_workspace_collection_folders(None, emmyrc.as_ref()),
         ));
     } else {
-        for workspace_root in workspace_roots {
+        for workspace in workspace_folders {
             let workspace_config = workspace_emmyrcs
-                .get(&workspace_root)
+                .iter()
+                .filter(|(config_root, _)| workspace.root.starts_with(config_root))
+                .max_by_key(|(config_root, _)| config_root.as_os_str().len())
+                .map(|(_, config)| config)
                 .cloned()
                 .unwrap_or_else(|| emmyrc.clone());
             workspace_collection_groups.push((
                 workspace_config.clone(),
-                build_workspace_collection_folders(Some(workspace_root), workspace_config.as_ref()),
+                build_workspace_collection_folders(Some(workspace), workspace_config.as_ref()),
             ));
         }
     }
@@ -443,13 +523,13 @@ pub async fn init_analysis(
 }
 
 fn build_workspace_collection_folders(
-    workspace_root: Option<PathBuf>,
+    workspace_root: Option<WorkspaceFolder>,
     emmyrc: &Emmyrc,
 ) -> Vec<WorkspaceFolder> {
     let mut workspaces = Vec::new();
 
     if let Some(workspace_root) = workspace_root {
-        workspaces.push(WorkspaceFolder::new(workspace_root, false));
+        workspaces.push(workspace_root);
     }
 
     for extra_root in &emmyrc.workspace.workspace_roots {

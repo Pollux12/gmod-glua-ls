@@ -9,6 +9,7 @@ use crate::{
 pub enum WorkspaceImport {
     All,
     SubPaths(Vec<PathBuf>),
+    AllExcept(Vec<PathBuf>),
 }
 
 #[derive(Clone, Debug)]
@@ -31,6 +32,18 @@ impl WorkspaceFolder {
         Self {
             root,
             import: WorkspaceImport::SubPaths(sub_paths),
+            is_library,
+        }
+    }
+
+    pub fn with_excluded_sub_paths(
+        root: PathBuf,
+        excluded_sub_paths: Vec<PathBuf>,
+        is_library: bool,
+    ) -> Self {
+        Self {
+            root,
+            import: WorkspaceImport::AllExcept(excluded_sub_paths),
             is_library,
         }
     }
@@ -117,7 +130,11 @@ pub fn collect_workspace_files(
         }
 
         match &workspace.import {
-            WorkspaceImport::All => {
+            WorkspaceImport::All | WorkspaceImport::AllExcept(_) => {
+                if let WorkspaceImport::AllExcept(paths) = &workspace.import {
+                    workspace_exclude_dir
+                        .extend(paths.iter().map(|path| workspace.root.join(path)));
+                }
                 let loaded = if workspace.is_library {
                     let (lib_exclude, lib_exclude_dir) = find_library_exclude(workspace, emmyrc);
                     // Merge library exclude with workspace exclude
@@ -275,8 +292,31 @@ fn find_library_exclude(library: &WorkspaceFolder, emmyrc: &Emmyrc) -> (Vec<Stri
 
 #[cfg(test)]
 mod tests {
-    use super::{WorkspaceFileCandidate, dedupe_workspace_files_deterministic};
-    use crate::LuaFileInfo;
+    use std::{
+        fs,
+        path::PathBuf,
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
+
+    use super::{
+        WorkspaceFileCandidate, WorkspaceFolder, collect_workspace_files,
+        dedupe_workspace_files_deterministic,
+    };
+    use crate::{Emmyrc, LuaFileInfo};
+
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn temp_dir() -> PathBuf {
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time should be valid")
+            .as_nanos();
+        let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let root = std::env::temp_dir().join(format!("gluals_collect_{nanos}_{counter}"));
+        fs::create_dir_all(&root).expect("temp root should be created");
+        root
+    }
 
     #[test]
     fn vfs_collect_dedupe_is_deterministic_with_workspace_priority() {
@@ -302,5 +342,64 @@ mod tests {
         let deduped = dedupe_workspace_files_deterministic(candidates);
         assert_eq!(deduped.len(), 1);
         assert_eq!(deduped[0].content, "from workspace 0");
+    }
+
+    #[test]
+    fn all_except_excludes_unselected_project_and_keeps_existing_glob_exclusions() {
+        let root = temp_dir();
+        fs::create_dir_all(root.join("gamemodes").join("selected"))
+            .expect("selected gamemode should be created");
+        fs::create_dir_all(root.join("gamemodes").join("unselected"))
+            .expect("unselected gamemode should be created");
+        fs::create_dir_all(root.join("addons").join("example").join("lua"))
+            .expect("addon should be created");
+        fs::write(
+            root.join("gamemodes").join("selected").join("init.lua"),
+            "Selected = true",
+        )
+        .expect("selected file should be written");
+        fs::write(
+            root.join("gamemodes").join("unselected").join("init.lua"),
+            "Unselected = true",
+        )
+        .expect("unselected file should be written");
+        fs::write(
+            root.join("addons")
+                .join("example")
+                .join("lua")
+                .join("included.lua"),
+            "Included = true",
+        )
+        .expect("included file should be written");
+        fs::write(
+            root.join("addons")
+                .join("example")
+                .join("lua")
+                .join("ignored.lua"),
+            "Ignored = true",
+        )
+        .expect("ignored file should be written");
+
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.workspace.ignore_globs = vec!["**/ignored.lua".to_string()];
+        let workspace = WorkspaceFolder::with_excluded_sub_paths(
+            root.clone(),
+            vec![PathBuf::from("gamemodes").join("unselected")],
+            false,
+        );
+        let paths = collect_workspace_files(&vec![workspace], &emmyrc, None, None)
+            .into_iter()
+            .map(|file| file.path.replace('\\', "/"))
+            .collect::<Vec<_>>();
+
+        assert!(paths.iter().any(|path| path.ends_with("selected/init.lua")));
+        assert!(paths.iter().any(|path| path.ends_with("included.lua")));
+        assert!(
+            paths
+                .iter()
+                .all(|path| !path.ends_with("unselected/init.lua"))
+        );
+        assert!(paths.iter().all(|path| !path.ends_with("ignored.lua")));
+        fs::remove_dir_all(root).expect("temp root should be removed");
     }
 }

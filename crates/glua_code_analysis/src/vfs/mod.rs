@@ -4,6 +4,7 @@ mod file_id;
 mod file_uri_handler;
 mod loader;
 mod virtual_url;
+mod workspace_topology;
 
 pub use collect_workspace_files::*;
 pub use document::LuaDocument;
@@ -18,6 +19,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
+pub use workspace_topology::*;
 
 use crate::Emmyrc;
 

@@ -221,6 +221,11 @@ pub async fn on_did_open_text_document(
     let version = params.text_document.version;
     let supports_pull = context.lsp_features().supports_pull_diagnostic();
 
+    if !crate::handlers::ensure_gamemode_loaded_for_document(&context, &uri).await {
+        context.mark_document_closed(&uri).await;
+        return None;
+    }
+
     // Check if file should be filtered before acquiring locks
     // Follow lock order: workspace_manager (read) -> analysis (write)
     let should_process = {

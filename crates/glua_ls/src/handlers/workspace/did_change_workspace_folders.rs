@@ -39,18 +39,27 @@ pub async fn on_did_change_workspace_folders(
 
         if !removed_roots.is_empty() {
             workspace_manager
-                .workspace_folders
+                .explicit_workspace_folders
                 .retain(|workspace| !removed_roots.contains(&workspace.root));
         }
 
         for added_workspace in added_folders {
             let already_exists = workspace_manager
-                .workspace_folders
+                .explicit_workspace_folders
                 .iter()
                 .any(|workspace| workspace.root == added_workspace.root);
             if !already_exists {
-                workspace_manager.workspace_folders.push(added_workspace);
+                workspace_manager
+                    .explicit_workspace_folders
+                    .push(added_workspace);
             }
+        }
+        let explicit_workspace_folders = workspace_manager.explicit_workspace_folders.clone();
+        if let Some(project_loading) = workspace_manager.project_loading.as_mut() {
+            project_loading.rediscover(explicit_workspace_folders);
+            workspace_manager.workspace_folders = project_loading.loaded_workspace_folders();
+        } else {
+            workspace_manager.workspace_folders = explicit_workspace_folders;
         }
 
         (
@@ -59,7 +68,8 @@ pub async fn on_did_change_workspace_folders(
         )
     };
 
-    let client_config = get_client_config(&context, client_id, supports_config_request).await;
+    let mut client_config = get_client_config(&context, client_id, supports_config_request).await;
+    client_config.logical_project_loading = true;
 
     let mut workspace_manager = context.workspace_manager().write().await;
     workspace_manager.client_config = client_config;
