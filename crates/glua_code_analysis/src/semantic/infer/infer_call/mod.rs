@@ -50,14 +50,17 @@ pub fn infer_call_expr_func(
 ) -> InferCallFuncResult {
     let syntax_id = call_expr.get_syntax_id();
     let key = (syntax_id, args_count, call_expr_type.clone());
-    if let Some(cache_entry) = cache.call_cache.get(&key) {
-        match cache_entry {
+    let key = match cache.call_cache.entry(key) {
+        std::collections::hash_map::Entry::Occupied(entry) => match entry.get() {
             CacheEntry::Cache(ty) => return Ok(ty.clone()),
             _ => return Err(InferFailReason::RecursiveInfer),
+        },
+        std::collections::hash_map::Entry::Vacant(entry) => {
+            let key = entry.key().clone();
+            entry.insert(CacheEntry::Ready);
+            key
         }
-    }
-
-    cache.call_cache.insert(key.clone(), CacheEntry::Ready);
+    };
     let prefix_signature_id = matches!(call_expr_type, LuaType::DocFunction(_))
         .then(|| get_prefix_expr_signature_id(db, cache, &call_expr))
         .flatten();
@@ -176,15 +179,19 @@ pub fn infer_call_expr_func(
         match &func_ret {
             LuaType::TypeGuard(_) => Ok(func_ty),
             _ => unwrapp_return_type(db, cache, func_ret, call_expr).map(|new_ret| {
-                LuaFunctionType::new(
-                    func_ty.get_async_state(),
-                    func_ty.is_colon_define(),
-                    func_ty.is_variadic(),
-                    func_ty.get_params().to_vec(),
-                    new_ret,
-                )
-                .with_optional_params(func_ty.get_optional_params().to_vec())
-                .into()
+                if &new_ret == func_ty.get_ret() && func_ty.get_call_arg_roles().is_empty() {
+                    func_ty
+                } else {
+                    LuaFunctionType::new(
+                        func_ty.get_async_state(),
+                        func_ty.is_colon_define(),
+                        func_ty.is_variadic(),
+                        func_ty.get_params().to_vec(),
+                        new_ret,
+                    )
+                    .with_optional_params(func_ty.get_optional_params().to_vec())
+                    .into()
+                }
             }),
         }
     } else {
@@ -218,18 +225,6 @@ fn refine_known_vgui_panel_return(
     if !db.get_emmyrc().gmod.enabled {
         return return_type;
     }
-    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
-        return return_type;
-    };
-    let Some(args) = call_expr.get_args_list() else {
-        return return_type;
-    };
-    if !args.get_args().enumerate().any(|(arg_idx, _)| {
-        check_vgui_panel_ref_role(db, cache, &prefix_expr, arg_idx, call_expr.is_colon_call())
-    }) {
-        return return_type;
-    }
-
     let Some(type_id) = single_non_nil_instance_type_id(&return_type) else {
         return return_type;
     };
@@ -239,6 +234,18 @@ fn refine_known_vgui_panel_return(
             .get_vgui_panel_base(type_id.get_name())
             .is_none()
     {
+        return return_type;
+    }
+
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return return_type;
+    };
+    let Some(args) = call_expr.get_args_list() else {
+        return return_type;
+    };
+    if !args.get_args().enumerate().any(|(arg_idx, _)| {
+        check_vgui_panel_ref_role(db, cache, &prefix_expr, arg_idx, call_expr.is_colon_call())
+    }) {
         return return_type;
     }
 
@@ -637,13 +644,13 @@ fn infer_tpl_ref_call(
 fn infer_doc_function(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    func: &LuaFunctionType,
+    func: &Arc<LuaFunctionType>,
     call_expr: LuaCallExpr,
     _: Option<usize>,
     prefix_signature_id: Option<LuaSignatureId>,
 ) -> InferCallFuncResult {
     if func.contain_tpl() {
-        let result = instantiate_func_generic(db, cache, func, call_expr.clone())?;
+        let result = instantiate_func_generic(db, cache, func.as_ref(), call_expr.clone())?;
         return Ok(Arc::new(result));
     }
 
@@ -654,7 +661,9 @@ fn infer_doc_function(
         if let Some(self_type) = self_type {
             let mut substitutor = crate::semantic::generic::TypeSubstitutor::new();
             substitutor.add_self_type(self_type);
-            if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, &substitutor) {
+            if let LuaType::DocFunction(f) =
+                instantiate_doc_function(db, func.as_ref(), &substitutor)
+            {
                 return Ok(f);
             }
         }
@@ -668,19 +677,24 @@ fn infer_doc_function(
             || !signature.falsy_param_return_aliases().is_empty())
     {
         let specialized =
-            specialize_return_aliases_for_call(db, cache, signature, func, &call_expr);
+            specialize_return_aliases_for_call(db, cache, signature, func.as_ref(), &call_expr);
+        let specialized = specialized.unwrap_or_else(|| Arc::clone(func));
         return Ok(specialize_falsy_param_returns_for_call(
             db,
             cache,
             signature,
-            specialized.as_deref().unwrap_or(func),
+            specialized,
             &call_expr,
         ));
     }
 
-    if let Some(registered_convar_type) =
-        get_registered_convar_type_at_call(db, cache, prefix_signature_id, &call_expr, func)
-    {
+    if let Some(registered_convar_type) = get_registered_convar_type_at_call(
+        db,
+        cache,
+        prefix_signature_id,
+        &call_expr,
+        func.as_ref(),
+    ) {
         return Ok(Arc::new(
             LuaFunctionType::new(
                 func.get_async_state(),
@@ -693,7 +707,7 @@ fn infer_doc_function(
         ));
     }
 
-    Ok(func.clone().into())
+    Ok(Arc::clone(func))
 }
 
 fn get_registered_convar_type_at_call(
@@ -932,14 +946,14 @@ fn infer_signature_doc_function(
             db,
             cache,
             signature,
-            fake_doc_function.as_ref(),
+            fake_doc_function,
             &call_expr,
         );
         let fake_doc_function = specialize_falsy_param_returns_for_call(
             db,
             cache,
             signature,
-            fake_doc_function.as_ref(),
+            fake_doc_function,
             &call_expr,
         );
         let fake_doc_function = specialize_return_aliases_for_call(
@@ -955,7 +969,7 @@ fn infer_signature_doc_function(
             cache,
             signature_id,
             signature,
-            fake_doc_function.as_ref(),
+            fake_doc_function,
             &call_expr,
         ))
     } else {
@@ -981,20 +995,10 @@ fn infer_signature_doc_function(
             is_generic,
             args_count,
         )?;
-        let resolved = specialize_nil_guarded_return_for_call(
-            db,
-            cache,
-            signature,
-            resolved.as_ref(),
-            &call_expr,
-        );
-        let resolved = specialize_falsy_param_returns_for_call(
-            db,
-            cache,
-            signature,
-            resolved.as_ref(),
-            &call_expr,
-        );
+        let resolved =
+            specialize_nil_guarded_return_for_call(db, cache, signature, resolved, &call_expr);
+        let resolved =
+            specialize_falsy_param_returns_for_call(db, cache, signature, resolved, &call_expr);
         let resolved =
             specialize_return_aliases_for_call(db, cache, signature, resolved.as_ref(), &call_expr)
                 .unwrap_or(resolved);
@@ -1003,7 +1007,7 @@ fn infer_signature_doc_function(
             cache,
             signature_id,
             signature,
-            resolved.as_ref(),
+            resolved,
             &call_expr,
         ))
     }
@@ -1177,7 +1181,7 @@ fn specialize_registered_convar_return_for_call(
     cache: &mut LuaInferCache,
     signature_id: LuaSignatureId,
     signature: &LuaSignature,
-    func: &LuaFunctionType,
+    func: Arc<LuaFunctionType>,
     call_expr: &LuaCallExpr,
 ) -> Arc<LuaFunctionType> {
     if let Some(registered_convar_type) = get_registered_convar_type_at_signature_call(
@@ -1186,7 +1190,7 @@ fn specialize_registered_convar_return_for_call(
         signature_id,
         signature,
         call_expr,
-        func,
+        func.as_ref(),
     ) {
         return Arc::new(
             LuaFunctionType::new(
@@ -1199,33 +1203,33 @@ fn specialize_registered_convar_return_for_call(
             .with_optional_params(func.get_optional_params().to_vec()),
         );
     }
-    Arc::new(func.clone())
+    func
 }
 
 fn specialize_nil_guarded_return_for_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     signature: &LuaSignature,
-    func_ty: &LuaFunctionType,
+    func_ty: Arc<LuaFunctionType>,
     call_expr: &LuaCallExpr,
 ) -> Arc<LuaFunctionType> {
     if signature.nil_return_guard_params().is_empty() || !func_ty.get_ret().is_nullable() {
-        return Arc::new(func_ty.clone());
+        return func_ty;
     }
 
     let Some(args) = call_expr.get_args_list() else {
-        return Arc::new(func_ty.clone());
+        return func_ty;
     };
     let args = args.get_args().collect::<Vec<_>>();
 
     let guard_satisfied = signature.nil_return_guard_params().iter().all(|param_idx| {
-        call_arg_for_param(call_expr, func_ty, &args, *param_idx)
+        call_arg_for_param(call_expr, func_ty.as_ref(), &args, *param_idx)
             .and_then(|arg| infer_expr(db, cache, arg.clone()).ok())
             .is_some_and(|arg_type| arg_type.is_always_truthy())
     });
 
     if !guard_satisfied {
-        return Arc::new(func_ty.clone());
+        return func_ty;
     }
 
     Arc::new(
@@ -1244,14 +1248,14 @@ fn specialize_falsy_param_returns_for_call(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     signature: &LuaSignature,
-    func_ty: &LuaFunctionType,
+    func_ty: Arc<LuaFunctionType>,
     call_expr: &LuaCallExpr,
 ) -> Arc<LuaFunctionType> {
     if (signature.falsy_param_nil_free_return_slots().is_empty()
         && signature.falsy_param_return_aliases().is_empty())
         || !func_ty.get_ret().is_nullable()
     {
-        return Arc::new(func_ty.clone());
+        return func_ty;
     }
 
     let args = call_expr
@@ -1262,7 +1266,7 @@ fn specialize_falsy_param_returns_for_call(
     let mut changed = false;
 
     for fact in signature.falsy_param_nil_free_return_slots() {
-        let arg = call_arg_for_param(call_expr, func_ty, &args, fact.param_idx);
+        let arg = call_arg_for_param(call_expr, func_ty.as_ref(), &args, fact.param_idx);
         if arg_is_omitted_or_always_falsy(db, cache, arg.as_ref()) {
             let old_return_type = return_type.clone();
             let new_return_type = remove_nil_from_return_slot(return_type, fact.return_slot);
@@ -1272,11 +1276,13 @@ fn specialize_falsy_param_returns_for_call(
     }
 
     for fact in signature.falsy_param_return_aliases() {
-        let falsy_arg = call_arg_for_param(call_expr, func_ty, &args, fact.falsy_param_idx);
+        let falsy_arg =
+            call_arg_for_param(call_expr, func_ty.as_ref(), &args, fact.falsy_param_idx);
         if !arg_is_omitted_or_always_falsy(db, cache, falsy_arg.as_ref()) {
             continue;
         }
-        let Some(alias_arg) = call_arg_for_param(call_expr, func_ty, &args, fact.aliased_param_idx)
+        let Some(alias_arg) =
+            call_arg_for_param(call_expr, func_ty.as_ref(), &args, fact.aliased_param_idx)
         else {
             continue;
         };
@@ -1300,7 +1306,7 @@ fn specialize_falsy_param_returns_for_call(
     }
 
     if !changed {
-        return Arc::new(func_ty.clone());
+        return func_ty;
     }
 
     Arc::new(

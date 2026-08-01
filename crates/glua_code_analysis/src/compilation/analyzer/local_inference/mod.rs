@@ -264,10 +264,7 @@ pub(super) fn stabilize_unguarded_children(
         .map(|tree| tree.file_id)
         .collect::<Vec<_>>();
     for file_id in file_ids {
-        let Some(references) = db
-            .get_reference_index()
-            .get_decl_references_map(&file_id)
-            .cloned()
+        let Some(direct_index_uses) = db.get_reference_index().get_direct_index_uses(&file_id)
         else {
             continue;
         };
@@ -280,7 +277,10 @@ pub(super) fn stabilize_unguarded_children(
         };
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
 
-        for (decl_id, references) in references {
+        let mut decl_uses = direct_index_uses.iter().collect::<Vec<_>>();
+        decl_uses.sort_unstable_by_key(|(decl_id, _)| (decl_id.file_id, decl_id.position));
+        for (decl_id, use_sites) in decl_uses {
+            let decl_id = *decl_id;
             let Some(base_type) = declaration_base_type(db, context, decl_id) else {
                 continue;
             };
@@ -291,35 +291,22 @@ pub(super) fn stabilize_unguarded_children(
                 continue;
             };
 
-            for cell in references.cells.into_iter().filter(|cell| !cell.is_write) {
-                let Some(name_expr) = root
-                    .covering_element(cell.range)
-                    .ancestors()
-                    .find_map(LuaNameExpr::cast)
-                    .filter(|name| name.get_range() == cell.range)
-                else {
-                    continue;
-                };
-                let Some(index_expr) = name_expr
-                    .syntax()
-                    .ancestors()
-                    .find_map(LuaIndexExpr::cast)
-                    .filter(|index| {
-                        index
-                            .get_prefix_expr()
-                            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                    })
-                else {
-                    continue;
-                };
-                if only_return_evidence
-                    && !index_expr
-                        .syntax()
-                        .ancestors()
-                        .any(|node| LuaReturnStat::cast(node).is_some())
-                {
+            let mut use_sites = use_sites.iter().collect::<Vec<_>>();
+            use_sites.sort_unstable_by_key(|use_site| use_site.index_expr_id.get_range().start());
+            for use_site in use_sites {
+                if only_return_evidence && !use_site.is_inside_return {
                     continue;
                 }
+                let Some(index_expr) = use_site
+                    .index_expr_id
+                    .to_node_from_root(&root)
+                    .and_then(LuaIndexExpr::cast)
+                else {
+                    continue;
+                };
+                let Some(LuaExpr::NameExpr(name_expr)) = index_expr.get_prefix_expr() else {
+                    continue;
+                };
                 if let Some(profile) = &mut profile {
                     profile.references_scanned += 1;
                 }

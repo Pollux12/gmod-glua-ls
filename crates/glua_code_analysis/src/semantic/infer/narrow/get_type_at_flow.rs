@@ -12,7 +12,7 @@ use crate::{
     FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
-    semantic::cache::FlowOrigin,
+    semantic::cache::{FlowOrigin, VarRefCacheKey},
     semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -87,13 +87,14 @@ pub fn get_type_at_flow_with_origin(
     flow_origin: FlowOrigin,
 ) -> InferResult {
     let policy = FlowWalkPolicy::normal(flow_origin);
+    let flow_cache_key = VarRefCacheKey::from(var_ref_id);
     let query_realm = cache.flow_query_realm.unwrap_or_else(|| {
         db.get_gmod_infer_index()
             .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
     });
     // Check cache for both success and error results.
     match cache
-        .get_flow_cache_with_origin(var_ref_id, flow_id, query_realm, policy.origin)
+        .get_flow_cache_by_key_with_origin(&flow_cache_key, flow_id, query_realm, policy.origin)
         .cloned()
     {
         Some(CacheEntry::Cache(narrow_type)) => {
@@ -111,6 +112,7 @@ pub fn get_type_at_flow_with_origin(
         cache,
         root,
         var_ref_id,
+        Some(&flow_cache_key),
         query_realm,
         flow_id,
         &mut visited_flow_ids,
@@ -122,22 +124,14 @@ pub fn get_type_at_flow_with_origin(
     match &result {
         Ok(ty) => {
             let entry = CacheEntry::Cache(ty.clone());
-            cache.set_flow_cache_with_origin(
-                var_ref_id,
+            cache.set_flow_caches_by_key_with_origin(
+                flow_cache_key,
                 flow_id,
+                visited_flow_ids,
                 query_realm,
                 policy.origin,
-                entry.clone(),
+                entry,
             );
-            for visited_flow_id in visited_flow_ids {
-                cache.set_flow_cache_with_origin(
-                    var_ref_id,
-                    visited_flow_id,
-                    query_realm,
-                    policy.origin,
-                    entry.clone(),
-                );
-            }
         }
         Err(InferFailReason::RecursiveInfer) => {
             // Don't cache — this is a transient cycle-detection signal.
@@ -152,22 +146,14 @@ pub fn get_type_at_flow_with_origin(
 
             if should_cache {
                 let entry = CacheEntry::Error(reason.clone());
-                cache.set_flow_cache_with_origin(
-                    var_ref_id,
+                cache.set_flow_caches_by_key_with_origin(
+                    flow_cache_key,
                     flow_id,
+                    visited_flow_ids,
                     query_realm,
                     policy.origin,
-                    entry.clone(),
+                    entry,
                 );
-                for visited_flow_id in visited_flow_ids {
-                    cache.set_flow_cache_with_origin(
-                        var_ref_id,
-                        visited_flow_id,
-                        query_realm,
-                        policy.origin,
-                        entry.clone(),
-                    );
-                }
             }
         }
     }
@@ -200,6 +186,7 @@ pub(super) fn get_type_at_flow_in_mode(
                 cache,
                 root,
                 var_ref_id,
+                None,
                 query_realm,
                 flow_id,
                 &mut visited_flow_ids,
@@ -358,20 +345,26 @@ fn get_type_at_flow_walk(
     cache: &mut LuaInferCache,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
+    flow_cache_key: Option<&VarRefCacheKey>,
     query_realm: GmodRealm,
     initial_flow_id: FlowId,
     visited_flow_ids: &mut Vec<FlowId>,
     policy: FlowWalkPolicy,
 ) -> InferResult {
     let mut antecedent_flow_id = initial_flow_id;
+    debug_assert!(flow_cache_key.is_some() || policy.is_closure_baseline());
+    let mut cache_already_checked = flow_cache_key.is_some();
     let pending_branch_types = [];
     loop {
         // Check cache for intermediate flow nodes (both success and error).
         // This is critical for performance in large files where many walks
         // share overlapping flow chains.
-        if policy.is_normal() {
-            match cache.get_flow_cache_with_origin(
-                var_ref_id,
+        if policy.is_normal()
+            && !cache_already_checked
+            && let Some(flow_cache_key) = flow_cache_key
+        {
+            match cache.get_flow_cache_by_key_with_origin(
+                flow_cache_key,
                 antecedent_flow_id,
                 query_realm,
                 policy.origin,
@@ -389,6 +382,7 @@ fn get_type_at_flow_walk(
             }
             visited_flow_ids.push(antecedent_flow_id);
         }
+        cache_already_checked = false;
 
         let flow_node = tree
             .get_flow_node(antecedent_flow_id)
@@ -414,6 +408,7 @@ fn get_type_at_flow_walk(
                         cache,
                         root,
                         var_ref_id,
+                        None,
                         query_realm,
                         antecedent_flow_id,
                         visited_flow_ids,

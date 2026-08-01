@@ -299,8 +299,18 @@ impl LuaInferCache {
         origin: FlowOrigin,
     ) -> Option<&CacheEntry<LuaType>> {
         let cache_key = VarRefCacheKey::from(var_ref_id);
+        self.get_flow_cache_by_key_with_origin(&cache_key, flow_id, query_realm, origin)
+    }
+
+    pub(crate) fn get_flow_cache_by_key_with_origin(
+        &self,
+        cache_key: &VarRefCacheKey,
+        flow_id: FlowId,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+    ) -> Option<&CacheEntry<LuaType>> {
         self.flow_node_cache
-            .get(&cache_key)
+            .get(cache_key)
             .and_then(|by_flow| by_flow.get(&(flow_id, query_realm, origin)))
     }
 
@@ -327,6 +337,22 @@ impl LuaInferCache {
             .entry(cache_key)
             .or_default()
             .insert((flow_id, query_realm, origin), entry);
+    }
+
+    pub(crate) fn set_flow_caches_by_key_with_origin(
+        &mut self,
+        cache_key: VarRefCacheKey,
+        initial_flow_id: FlowId,
+        additional_flow_ids: impl IntoIterator<Item = FlowId>,
+        query_realm: GmodRealm,
+        origin: FlowOrigin,
+        entry: CacheEntry<LuaType>,
+    ) {
+        let by_flow = self.flow_node_cache.entry(cache_key).or_default();
+        for flow_id in additional_flow_ids {
+            by_flow.insert((flow_id, query_realm, origin), entry.clone());
+        }
+        by_flow.insert((initial_flow_id, query_realm, origin), entry);
     }
 
     pub fn take_flow_cache_for_var_ref(
@@ -426,7 +452,7 @@ mod tests {
     use rowan::{TextRange, TextSize};
     use smol_str::SmolStr;
 
-    use super::{CacheEntry, LuaInferCache};
+    use super::{CacheEntry, FlowOrigin, LuaInferCache, VarRefCacheKey};
     use crate::{
         DbIndex, FileId, FlowId, GmodRealm, LuaDecl, LuaDeclExtra, LuaDeclId, LuaDeclarationTree,
         LuaType, VarRefId, VarRefRootId,
@@ -451,6 +477,12 @@ mod tests {
         cache
             .flow_node_realm_cache
             .insert(FlowId(1), GmodRealm::Server);
+        cache.set_flow_cache(
+            &VarRefId::VarRef(decl_id),
+            FlowId(1),
+            GmodRealm::Server,
+            CacheEntry::Cache(LuaType::Integer),
+        );
         cache
             .narrow_by_literal_stop_position_cache
             .insert(syntax_id);
@@ -463,6 +495,7 @@ mod tests {
 
         assert!(cache.expr_cache.is_empty());
         assert!(cache.expr_var_ref_id_cache.is_empty());
+        assert_eq!(cache.flow_cache_entry_count(), 0);
         assert_eq!(
             cache.flow_node_realm_cache.get(&FlowId(1)),
             Some(&GmodRealm::Server)
@@ -490,6 +523,62 @@ mod tests {
         cache.clear();
 
         assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
+    }
+
+    #[test]
+    fn batch_flow_cache_write_preserves_flow_realm_and_origin_keys() {
+        let file_id = FileId { id: 7 };
+        let decl_id = LuaDeclId::new(file_id, TextSize::from(3));
+        let var_ref_id = VarRefId::VarRef(decl_id);
+        let cache_key = VarRefCacheKey::from(&var_ref_id);
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+
+        cache.set_flow_caches_by_key_with_origin(
+            cache_key.clone(),
+            FlowId(1),
+            [FlowId(2)],
+            GmodRealm::Server,
+            FlowOrigin::Real,
+            CacheEntry::Cache(LuaType::Integer),
+        );
+        cache.set_flow_caches_by_key_with_origin(
+            cache_key.clone(),
+            FlowId(1),
+            [],
+            GmodRealm::Client,
+            FlowOrigin::NilCounterfactual,
+            CacheEntry::Cache(LuaType::String),
+        );
+
+        assert!(matches!(
+            cache.get_flow_cache_by_key_with_origin(
+                &cache_key,
+                FlowId(2),
+                GmodRealm::Server,
+                FlowOrigin::Real,
+            ),
+            Some(&CacheEntry::Cache(LuaType::Integer))
+        ));
+        assert!(matches!(
+            cache.get_flow_cache_by_key_with_origin(
+                &cache_key,
+                FlowId(1),
+                GmodRealm::Client,
+                FlowOrigin::NilCounterfactual,
+            ),
+            Some(&CacheEntry::Cache(LuaType::String))
+        ));
+        assert!(
+            cache
+                .get_flow_cache_by_key_with_origin(
+                    &cache_key,
+                    FlowId(1),
+                    GmodRealm::Server,
+                    FlowOrigin::NilCounterfactual,
+                )
+                .is_none()
+        );
+        assert_eq!(cache.flow_cache_entry_count(), 3);
     }
 
     #[test]

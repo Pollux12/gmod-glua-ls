@@ -3,7 +3,7 @@ mod string_reference;
 
 use std::collections::{HashMap, HashSet};
 
-pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
+pub use file_reference::{DeclIndexUse, DeclReference, DeclReferenceCell, FileReference};
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -44,11 +44,11 @@ impl LuaReferenceIndex {
         file_id: FileId,
         range: TextRange,
         is_write: bool,
-    ) {
+    ) -> bool {
         self.file_references
             .entry(file_id)
             .or_default()
-            .add_decl_reference(decl_id, range, is_write);
+            .add_decl_reference(decl_id, range, is_write)
     }
 
     pub fn add_global_reference(&mut self, name: &str, file_id: FileId, syntax_id: LuaSyntaxId) {
@@ -125,6 +125,27 @@ impl LuaReferenceIndex {
         self.file_references
             .get(file_id)
             .map(|file_reference| file_reference.get_decl_references_map())
+    }
+
+    pub fn add_direct_index_use(
+        &mut self,
+        decl_id: LuaDeclId,
+        file_id: FileId,
+        use_site: DeclIndexUse,
+    ) {
+        self.file_references
+            .entry(file_id)
+            .or_default()
+            .add_direct_index_use(decl_id, use_site);
+    }
+
+    pub fn get_direct_index_uses(
+        &self,
+        file_id: &FileId,
+    ) -> Option<&HashMap<LuaDeclId, Vec<DeclIndexUse>>> {
+        self.file_references
+            .get(file_id)
+            .map(FileReference::get_direct_index_uses)
     }
 
     pub fn get_global_file_references(
@@ -275,8 +296,8 @@ mod tests {
     use glua_parser::{LuaSyntaxId, LuaSyntaxKind};
     use rowan::{TextRange, TextSize};
 
-    use super::{LuaIndex, LuaReferenceIndex};
-    use crate::{FileId, LuaMemberKey, db_index::LuaTypeDeclId};
+    use super::{DeclIndexUse, LuaIndex, LuaReferenceIndex};
+    use crate::{FileId, LuaDeclId, LuaMemberKey, db_index::LuaTypeDeclId};
 
     #[test]
     fn batch_removal_keeps_references_from_surviving_files() {
@@ -300,6 +321,25 @@ mod tests {
         index.add_global_reference("GLOBAL", surviving, syntax_id);
         index.add_index_reference(member_key.clone(), first, syntax_id);
         index.add_index_reference(member_key.clone(), surviving, syntax_id);
+        let index_expr_id = LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), range);
+        let first_decl = LuaDeclId::new(first, range.start());
+        let surviving_decl = LuaDeclId::new(surviving, range.start());
+        index.add_direct_index_use(
+            first_decl,
+            first,
+            DeclIndexUse {
+                index_expr_id,
+                is_inside_return: false,
+            },
+        );
+        index.add_direct_index_use(
+            surviving_decl,
+            surviving,
+            DeclIndexUse {
+                index_expr_id,
+                is_inside_return: true,
+            },
+        );
 
         index.remove_files(&[second, first, second]);
 
@@ -315,6 +355,14 @@ mod tests {
         assert_eq!(index.get_type_references(&surviving_type).unwrap().len(), 1);
         assert_eq!(index.get_global_references("GLOBAL").unwrap().len(), 1);
         assert_eq!(index.get_index_references(&member_key).unwrap().len(), 1);
+        assert!(index.get_direct_index_uses(&first).is_none());
+        assert_eq!(
+            index
+                .get_direct_index_uses(&surviving)
+                .and_then(|uses| uses.get(&surviving_decl))
+                .map(Vec::len),
+            Some(1)
+        );
 
         index.clear();
         assert!(
@@ -323,5 +371,6 @@ mod tests {
                 .unwrap()
                 .is_empty()
         );
+        assert!(index.get_direct_index_uses(&surviving).is_none());
     }
 }

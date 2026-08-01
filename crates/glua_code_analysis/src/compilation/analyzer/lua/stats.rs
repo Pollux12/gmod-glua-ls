@@ -465,24 +465,46 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
     }
 }
 
-fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
+fn set_index_expr_owner(
+    analyzer: &mut LuaAnalyzer,
+    var_expr: LuaVarExpr,
+    guarded_table_assignment: bool,
+) -> Option<()> {
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
     let prefix_expr = index_expr.get_prefix_expr()?;
 
     if let Some((member_owner, set_owner_only)) =
         try_resolve_scoped_class_prefix_member_owner(analyzer, &prefix_expr)
     {
-        apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
+        apply_index_expr_member_owner(
+            analyzer,
+            index_expr,
+            member_owner,
+            set_owner_only,
+            guarded_table_assignment,
+        );
         return Some(());
     }
 
     if let Some(member_owner) = direct_local_table_prefix_member_owner(analyzer, &prefix_expr) {
-        apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
+        apply_index_expr_member_owner(
+            analyzer,
+            index_expr,
+            member_owner,
+            false,
+            guarded_table_assignment,
+        );
         return Some(());
     }
 
     if let Some(member_owner) = cached_literal_index_prefix_member_owner(analyzer, &prefix_expr) {
-        apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
+        apply_index_expr_member_owner(
+            analyzer,
+            index_expr,
+            member_owner,
+            false,
+            guarded_table_assignment,
+        );
         return Some(());
     }
 
@@ -493,7 +515,13 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             }
             let (member_owner, set_owner_only) =
                 resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))?;
-            apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
+            apply_index_expr_member_owner(
+                analyzer,
+                index_expr,
+                member_owner,
+                set_owner_only,
+                guarded_table_assignment,
+            );
         }
         Err(InferFailReason::None) => {}
         Err(reason) => {
@@ -660,8 +688,8 @@ fn apply_index_expr_member_owner(
     index_expr: LuaIndexExpr,
     member_owner: LuaMemberOwner,
     set_owner_only: bool,
+    guarded_table_assignment: bool,
 ) -> Option<()> {
-    let guarded_table_assignment = is_guarded_table_assignment_index_expr(&index_expr);
     apply_index_expr_member_owner_with_guarded(
         analyzer,
         index_expr,
@@ -802,20 +830,22 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         let type_owner = get_var_owner(analyzer, var.clone());
 
         let assign_stat_range = assign_stat.get_range();
-        if special_assign_pattern(
+        let guarded_table_assignment = match special_assign_pattern(
             analyzer,
             type_owner.clone(),
             var.clone(),
             expr.clone(),
             assign_stat_range,
-        )
-        .is_some()
-        {
-            continue;
-        }
+        ) {
+            SpecialAssignOutcome::NotMatched => false,
+            SpecialAssignOutcome::Handled => continue,
+            SpecialAssignOutcome::Fallback {
+                guarded_table_assignment,
+            } => guarded_table_assignment,
+        };
 
         let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
-        set_index_expr_owner(analyzer, var.clone());
+        set_index_expr_owner(analyzer, var.clone(), guarded_table_assignment);
 
         let expr_type = match declared_empty_table_type
             .map(Ok)
@@ -928,7 +958,14 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
+        assign_merge_type_owner_and_expr_type(
+            analyzer,
+            type_owner,
+            &expr_type,
+            0,
+            &var,
+            guarded_table_assignment,
+        );
         update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
     }
 
@@ -942,12 +979,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     for i in expr_count..var_count {
                         let var = var_list.get(i)?;
                         let type_owner = get_var_owner(analyzer, var.clone());
-                        set_index_expr_owner(analyzer, var.clone());
+                        set_index_expr_owner(analyzer, var.clone(), false);
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
                             type_owner,
                             &last_expr_type,
                             i - expr_count + 1,
+                            &var,
                             false,
                         );
                     }
@@ -955,12 +993,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     for i in expr_count..var_count {
                         let var = var_list.get(i)?;
                         let type_owner = get_var_owner(analyzer, var.clone());
-                        set_index_expr_owner(analyzer, var.clone());
+                        set_index_expr_owner(analyzer, var.clone(), false);
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
                             type_owner,
                             &LuaType::Any,
                             0, // Any doesn't need indexing
+                            &var,
                             false,
                         );
                     }
@@ -970,7 +1009,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 for i in expr_count..var_count {
                     let var = var_list.get(i)?;
                     let type_owner = get_var_owner(analyzer, var.clone());
-                    set_index_expr_owner(analyzer, var.clone());
+                    set_index_expr_owner(analyzer, var.clone(), false);
                     merge_type_owner_and_unresolve_expr(
                         analyzer,
                         type_owner,
@@ -1441,7 +1480,8 @@ fn assign_merge_type_owner_and_expr_type(
     type_owner: LuaTypeOwner,
     expr_type: &LuaType,
     idx: usize,
-    preserve_table_literals: bool,
+    var: &LuaVarExpr,
+    guarded_table_assignment: bool,
 ) -> Option<()> {
     let mut expr_type = expr_type.clone();
     if let LuaType::Variadic(multi) = expr_type {
@@ -1460,7 +1500,7 @@ fn assign_merge_type_owner_and_expr_type(
             analyzer,
             &type_owner,
             &expr_type,
-            preserve_table_literals,
+            guarded_table_assignment,
         ) {
             Some(Some(widened_type)) => {
                 expr_type = widened_type;
@@ -1471,7 +1511,7 @@ fn assign_merge_type_owner_and_expr_type(
                     analyzer,
                     &type_owner,
                     &expr_type,
-                    preserve_table_literals,
+                    guarded_table_assignment,
                 ) {
                     expr_type = widened_type;
                 }
@@ -1492,10 +1532,6 @@ fn assign_merge_type_owner_and_expr_type(
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && is_assignment_file_define_member(analyzer.db, *member_id)
     {
-        let guarded_table_assignment =
-            preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
-        let conditional_branch_assignment =
-            is_member_assignment_in_conditional_branch(analyzer, *member_id);
         if guarded_table_assignment {
             let already_preserved = analyzer
                 .db
@@ -1508,7 +1544,7 @@ fn assign_merge_type_owner_and_expr_type(
                     .mark_non_overwriting_assignment_member(*member_id);
                 preserve_guarded_table_assignment_members(analyzer, *member_id);
             }
-        } else if conditional_branch_assignment {
+        } else if is_var_assignment_in_conditional_branch(var) {
             analyzer
                 .db
                 .get_member_index_mut()
@@ -1532,7 +1568,7 @@ fn assign_merge_type_owner_and_expr_type(
             analyzer,
             &type_owner,
             &expr_type,
-            preserve_table_literals,
+            guarded_table_assignment,
         );
         record_member_collection_assignment_widening_cache(analyzer, &type_owner, &expr_type);
     }
@@ -1751,7 +1787,7 @@ fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_
         .preserve_members_for_owner_key(member_id, member_ids);
 }
 
-/// Returns true when the assignment that introduced this member sits inside a
+/// Returns true when the assignment target sits inside a
 /// branching construct (if / while / repeat / for). In those cases we must not
 /// collapse to a single "latest write" member, because the assignments in
 /// sibling branches (or earlier loop iterations) are not dominated by this one
@@ -1768,19 +1804,8 @@ fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_
 /// ```
 ///
 /// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
-fn is_member_assignment_in_conditional_branch(
-    analyzer: &LuaAnalyzer,
-    member_id: LuaMemberId,
-) -> bool {
-    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
-        return false;
-    };
-    let root = tree.get_red_root();
-    let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
-        return false;
-    };
-
-    node.ancestors().any(|ancestor| {
+fn is_var_assignment_in_conditional_branch(var: &LuaVarExpr) -> bool {
+    var.syntax().ancestors().any(|ancestor| {
         matches!(
             ancestor.kind().into(),
             LuaSyntaxKind::IfStat
@@ -2041,7 +2066,7 @@ pub fn analyze_func_stat(analyzer: &mut LuaAnalyzer, func_stat: LuaFuncStat) -> 
     let signature_type =
         LuaType::Signature(LuaSignatureId::from_closure(analyzer.file_id, &closure));
     let type_owner = get_var_owner(analyzer, func_name.clone());
-    set_index_expr_owner(analyzer, func_name.clone());
+    set_index_expr_owner(analyzer, func_name.clone(), false);
     write_type_cache(
         analyzer.db,
         type_owner,
@@ -2181,29 +2206,43 @@ fn extract_string_literal_from_expr(expr: &LuaExpr) -> Option<String> {
     }
 }
 
+enum SpecialAssignOutcome {
+    NotMatched,
+    Handled,
+    Fallback { guarded_table_assignment: bool },
+}
+
 fn special_assign_pattern(
     analyzer: &mut LuaAnalyzer,
     type_owner: LuaTypeOwner,
     var: LuaVarExpr,
     expr: LuaExpr,
     assign_stat_range: rowan::TextRange,
-) -> Option<()> {
-    let access_path = var.get_access_path()?;
+) -> SpecialAssignOutcome {
     let binary_expr = if let LuaExpr::BinaryExpr(binary_expr) = expr {
         binary_expr
     } else {
-        return None;
+        return SpecialAssignOutcome::NotMatched;
     };
 
-    if binary_expr.get_op_token()?.get_op() != BinaryOperator::OpOr {
-        return None;
+    if binary_expr.get_op_token().map(|token| token.get_op()) != Some(BinaryOperator::OpOr) {
+        return SpecialAssignOutcome::NotMatched;
     }
 
-    let (left, right) = binary_expr.get_exprs()?;
-    let left_var = LuaVarExpr::cast(left.syntax().clone())?;
-    let left_access_path = left_var.get_access_path()?;
+    let Some((left, right)) = binary_expr.get_exprs() else {
+        return SpecialAssignOutcome::NotMatched;
+    };
+    let Some(left_var) = LuaVarExpr::cast(left.syntax().clone()) else {
+        return SpecialAssignOutcome::NotMatched;
+    };
+    let Some(access_path) = var.get_access_path() else {
+        return SpecialAssignOutcome::NotMatched;
+    };
+    let Some(left_access_path) = left_var.get_access_path() else {
+        return SpecialAssignOutcome::NotMatched;
+    };
     if access_path != left_access_path {
-        return None;
+        return SpecialAssignOutcome::NotMatched;
     }
 
     let guarded_table_expr = matches!(&right, LuaExpr::TableExpr(_));
@@ -2215,14 +2254,14 @@ fn special_assign_pattern(
             &right,
         )
     } else {
-        set_index_expr_owner(analyzer, var.clone());
+        set_index_expr_owner(analyzer, var.clone(), false);
         analyzer.infer_expr(&right)
     };
 
     match expr_type {
         Ok(expr_type) => {
             if guarded_table_expr {
-                set_guarded_table_assignment_index_owner(analyzer, var, &left);
+                set_guarded_table_assignment_index_owner(analyzer, &var, &left);
             }
 
             // Register inferred string default for `x = x or "literal"`.
@@ -2251,18 +2290,23 @@ fn special_assign_pattern(
                 type_owner,
                 &expr_type,
                 0,
+                &var,
                 guarded_table_expr,
             );
         }
-        Err(_) => return None,
+        Err(_) => {
+            return SpecialAssignOutcome::Fallback {
+                guarded_table_assignment: guarded_table_expr,
+            };
+        }
     }
 
-    Some(())
+    SpecialAssignOutcome::Handled
 }
 
 fn set_guarded_table_assignment_index_owner(
     analyzer: &mut LuaAnalyzer,
-    var: LuaVarExpr,
+    var: &LuaVarExpr,
     left: &LuaExpr,
 ) -> Option<()> {
     match var {
@@ -2270,16 +2314,16 @@ fn set_guarded_table_assignment_index_owner(
             if let Some(cache_key) = guarded_table_assignment_cache_key(analyzer, left) {
                 apply_index_expr_member_owner_with_guarded(
                     analyzer,
-                    index_expr,
+                    index_expr.clone(),
                     cache_key.owner,
                     false,
                     true,
                 )
             } else {
-                set_index_expr_owner(analyzer, LuaVarExpr::IndexExpr(index_expr))
+                set_index_expr_owner(analyzer, LuaVarExpr::IndexExpr(index_expr.clone()), true)
             }
         }
-        other => set_index_expr_owner(analyzer, other),
+        other => set_index_expr_owner(analyzer, other.clone(), true),
     }
 }
 

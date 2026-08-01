@@ -6,6 +6,76 @@ mod test {
     use crate::{DiagnosticCode, LuaType, VirtualWorkspace};
 
     #[test]
+    fn direct_index_use_index_records_exact_receivers_and_computed_keys() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/autorun/direct-index-uses.lua",
+            r#"
+            local value = {}
+            local key = "field"
+            local other = {}
+            local a = value.field
+            local b = value["named"]
+            local c = value[1]
+            local d = value[key]
+            local e = other[value]
+            local f = value.nested.child
+            local g = (value).parenthesized
+            function value.method() end
+            return value.returned
+            "#,
+        );
+        let db = ws.analysis.compilation.get_db();
+        let decl_id = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .and_then(|tree| {
+                tree.get_decls()
+                    .values()
+                    .find(|decl| decl.get_name() == "value")
+                    .map(|decl| decl.get_id())
+            })
+            .expect("value declaration");
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_red_root();
+        let mut uses = db
+            .get_reference_index()
+            .get_direct_index_uses(&file_id)
+            .and_then(|uses| uses.get(&decl_id))
+            .expect("direct value index uses")
+            .iter()
+            .map(|use_site| {
+                (
+                    use_site
+                        .index_expr_id
+                        .to_node_from_root(&root)
+                        .expect("indexed expression")
+                        .text()
+                        .to_string(),
+                    use_site.is_inside_return,
+                )
+            })
+            .collect::<Vec<_>>();
+        uses.sort();
+
+        assert_eq!(
+            uses,
+            vec![
+                ("value.field".to_string(), false),
+                ("value.method".to_string(), false),
+                ("value.nested".to_string(), false),
+                ("value.returned".to_string(), true),
+                ("value[\"named\"]".to_string(), false),
+                ("value[1]".to_string(), false),
+                ("value[key]".to_string(), false),
+            ]
+        );
+    }
+
+    #[test]
     fn unknown_local_stabilizes_from_anchored_usage_for_every_raw_query() {
         let mut ws = VirtualWorkspace::new();
         ws.def_file(
