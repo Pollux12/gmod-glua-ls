@@ -5,6 +5,9 @@ name = "gmod-glua-ls"
 [setup]
 script = ""
 
+[setup.win32]
+script = "codegraph init"
+
 [[actions]]
 name = "Run All Tests"
 icon = "test"

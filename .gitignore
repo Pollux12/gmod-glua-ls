@@ -22,3 +22,5 @@ benchmark_*.log
 *.log
 diag_*.json
 prof.json.gz
+
+.codegraph/
