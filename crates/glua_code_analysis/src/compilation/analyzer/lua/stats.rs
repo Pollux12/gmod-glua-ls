@@ -1,7 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{
-    CacheEntry, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
+    CacheEntry, DbIndex, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
     LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, add_member, bind_type, write_type_cache},
@@ -744,7 +744,7 @@ fn apply_index_expr_member_owner_with_guarded(
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         if guarded_table_assignment && !guarded_file_define {
-            preserve_guarded_table_assignment_members(analyzer, member_id);
+            preserve_guarded_table_assignment_members(analyzer.db, member_id);
         }
         return Some(());
     }
@@ -766,7 +766,7 @@ fn apply_index_expr_member_owner_with_guarded(
             member_index.set_member_function_scope_range(member_id, function_scope);
         }
         if guarded_table_assignment {
-            preserve_guarded_table_assignment_members(analyzer, member_id);
+            preserve_guarded_table_assignment_members(analyzer.db, member_id);
         }
         return Some(());
     }
@@ -794,7 +794,7 @@ fn apply_index_expr_member_owner_with_guarded(
         .get_member_index_mut()
         .set_member_function_scope_range(member_id, function_scope);
     if guarded_table_assignment && !guarded_existing_file_define {
-        preserve_guarded_table_assignment_members(analyzer, member_id);
+        preserve_guarded_table_assignment_members(analyzer.db, member_id);
     }
 
     Some(())
@@ -1543,7 +1543,7 @@ fn assign_merge_type_owner_and_expr_type(
                     .db
                     .get_member_index_mut()
                     .mark_non_overwriting_assignment_member(*member_id);
-                preserve_guarded_table_assignment_members(analyzer, *member_id);
+                preserve_guarded_table_assignment_members(analyzer.db, *member_id);
             }
         } else if conditional_branch_assignment {
             analyzer
@@ -1776,15 +1776,15 @@ fn record_member_assignment_widening_cache(
     );
 }
 
-fn preserve_guarded_table_assignment_members(analyzer: &mut LuaAnalyzer, member_id: LuaMemberId) {
-    let Some(member_ids) = guarded_table_assignment_member_ids_for_owner_key(analyzer, member_id)
-    else {
+pub(in crate::compilation::analyzer) fn preserve_guarded_table_assignment_members(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+) {
+    let Some(member_ids) = guarded_table_assignment_member_ids_for_owner_key(db, member_id) else {
         return;
     };
 
-    analyzer
-        .db
-        .get_member_index_mut()
+    db.get_member_index_mut()
         .preserve_members_for_owner_key(member_id, member_ids);
 }
 
@@ -1832,17 +1832,17 @@ fn is_member_assignment_in_conditional_branch(
 }
 
 fn guarded_table_assignment_member_ids_for_owner_key(
-    analyzer: &LuaAnalyzer,
+    db: &DbIndex,
     member_id: LuaMemberId,
 ) -> Option<Vec<LuaMemberId>> {
-    let member_index = analyzer.db.get_member_index();
+    let member_index = db.get_member_index();
     let owner = member_index.get_member_owner(&member_id)?.clone();
     let key = member_index.get_member(&member_id)?.get_key().clone();
     let mut member_ids = Vec::new();
 
     for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
         let related_member_id = related_member.get_id();
-        if !is_guarded_table_assignment_member(analyzer.db, related_member_id) {
+        if !is_guarded_table_assignment_member(db, related_member_id) {
             return None;
         }
 
@@ -1870,7 +1870,7 @@ fn get_widened_member_assignment_type(
     let key = member_index.get_member(member_id)?.get_key().clone();
     let related_members = if preserve_table_literals {
         let related_member_ids =
-            guarded_table_assignment_member_ids_for_owner_key(analyzer, *member_id)?;
+            guarded_table_assignment_member_ids_for_owner_key(analyzer.db, *member_id)?;
         related_member_ids
             .into_iter()
             .filter_map(|related_member_id| member_index.get_member(&related_member_id))

@@ -22,7 +22,8 @@ use crate::{
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
             has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
-            is_guarded_table_assignment_index_expr, resolve_index_expr_member_owner_for_file,
+            is_guarded_table_assignment_index_expr, preserve_guarded_table_assignment_members,
+            resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -102,12 +103,25 @@ fn create_deferred_index_expr_member(
     } else {
         LuaMemberFeature::FileDefine
     };
-    if is_guarded_table_assignment_index_expr(&index_expr) {
+    let guarded = is_guarded_table_assignment_index_expr(&index_expr);
+    if guarded {
         db.get_member_index_mut()
             .mark_non_overwriting_assignment_member(member_id);
     }
     let member = LuaMember::new(member_id, member_key, feature, None);
-    db.get_member_index_mut().add_member(owner, member);
+    let member_index = db.get_member_index_mut();
+    member_index.add_member(owner, member);
+    // `add_member` records the enclosing function scope for `FileDefine`
+    // index-expr members only; for the rest it stores `None`. Same follow-up
+    // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
+    if !matches!(feature, LuaMemberFeature::FileDefine) {
+        let function_scope =
+            member_index.enclosing_function_scope_range(member_id.file_id, member_id.get_position());
+        member_index.set_member_function_scope_range(member_id, function_scope);
+        if guarded {
+            preserve_guarded_table_assignment_members(db, member_id);
+        }
+    }
     Some(())
 }
 
@@ -213,6 +227,23 @@ pub fn try_resolve_member(
         // `Ref` prefix names a declared class, so the member is re-homed onto it
         // but does not become one of its declared members.
         if let Some((member_owner, set_owner_only)) = member_owner {
+            // The Lua pass creates a missing member before it looks at
+            // `set_owner_only`, so this must too: `set_member_owner` cannot
+            // re-home a member that does not exist, and a `Ref` prefix would
+            // otherwise leave the cold build with no member at all.
+            if db.get_member_index().get_member(&member_id).is_none() {
+                super::census::record("try_resolve_member.add_member", "member_missing");
+                create_deferred_index_expr_member(
+                    db,
+                    cache,
+                    &prefix_type,
+                    member_owner.clone(),
+                    member_id,
+                );
+            } else {
+                super::census::record("try_resolve_member.add_member", "member_present");
+            }
+
             if set_owner_only {
                 db.get_member_index_mut().set_member_owner(
                     member_owner,
@@ -220,18 +251,6 @@ pub fn try_resolve_member(
                     member_id,
                 );
             } else {
-                if db.get_member_index().get_member(&member_id).is_none() {
-                    super::census::record("try_resolve_member.add_member", "member_missing");
-                    create_deferred_index_expr_member(
-                        db,
-                        cache,
-                        &prefix_type,
-                        member_owner.clone(),
-                        member_id,
-                    );
-                } else {
-                    super::census::record("try_resolve_member.add_member", "member_present");
-                }
                 add_member(db, member_owner, member_id);
             }
         }
