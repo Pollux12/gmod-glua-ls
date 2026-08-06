@@ -105,11 +105,11 @@ impl LuaTypeCache {
         // against `any`) otherwise left the owner holding whichever round
         // happened to arrive first, and `nil` vs `unknown` is the difference
         // between reporting a nil-check and not.
-        if let (Some(existing_rank), Some(new_rank)) = (
-            uninformative_rank(existing_type),
-            uninformative_rank(new_type),
+        if let (Some(existing_key), Some(new_key)) = (
+            uninformative_key(existing_type),
+            uninformative_key(new_type),
         ) {
-            return new_rank > existing_rank;
+            return new_key > existing_key;
         }
 
         // A literal and its widened primitive describe the same value at
@@ -142,6 +142,13 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
             }),
         _ => None,
     }
+}
+
+/// Total order over the "carries no type information" band:
+/// [`uninformative_rank`] first, then the nullable variant ahead of the
+/// bare one.
+fn uninformative_key(typ: &LuaType) -> Option<(u8, u8)> {
+    Some((uninformative_rank(typ)?, typ.is_nullable() as u8))
 }
 
 /// Whether `wider` is the widened primitive of the literal `narrower`.
@@ -220,5 +227,47 @@ mod tests {
         // `any|nil` is not bottom: it admits every value, not none.
         assert!(!is_bottom_type(&union(vec![LuaType::Any, LuaType::Nil])));
         assert!(is_bottom_type(&union(vec![LuaType::Nil, LuaType::Never])));
+    }
+
+    /// Every ordered pair inside the uninformative band must get exactly one
+    /// verdict, so the slot converges on the same join no matter which write
+    /// lands first. Rank alone tied `unknown` with `unknown|nil` (and `any`
+    /// with `any|nil`), which left write order deciding whether the slot was
+    /// sticky or displaceable.
+    #[test]
+    fn supersedes_is_a_total_order_inside_the_uninformative_band() {
+        // `unknown|nil` is not in the list because it does not exist: union
+        // construction drops `unknown` next to any other member, so it is just
+        // `nil`. `any|nil` is the tie that does occur.
+        assert_eq!(union(vec![LuaType::Unknown, LuaType::Nil]), LuaType::Nil);
+
+        let band = [
+            ("never", LuaType::Never),
+            ("nil", LuaType::Nil),
+            ("unknown", LuaType::Unknown),
+            ("any", LuaType::Any),
+            ("any|nil", union(vec![LuaType::Any, LuaType::Nil])),
+        ];
+
+        for (i, (a_name, a)) in band.iter().enumerate() {
+            let a_cache = LuaTypeCache::InferType(a.clone());
+            assert!(
+                !a_cache.supersedes(&a_cache),
+                "{a_name} superseded itself, so repeating a write is not a no-op"
+            );
+
+            for (b_name, b) in band.iter().skip(i + 1) {
+                let b_cache = LuaTypeCache::InferType(b.clone());
+                // Listed widest-last, so the later entry always wins.
+                assert!(
+                    b_cache.supersedes(&a_cache),
+                    "{b_name} must supersede {a_name}"
+                );
+                assert!(
+                    !a_cache.supersedes(&b_cache),
+                    "{a_name} must not supersede {b_name}"
+                );
+            }
+        }
     }
 }

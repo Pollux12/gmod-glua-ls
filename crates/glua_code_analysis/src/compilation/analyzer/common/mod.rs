@@ -137,7 +137,13 @@ fn should_replace_uninformative_inferred_cache(
         LuaTypeOwner::Member(_) => {}
         // A decl's cache is its whole-lifetime type; narrowing it to one
         // assignment's type is flow analysis' job, not the cache's. So only
-        // a *placeholder* may be displaced here.
+        // a *placeholder* may be displaced here, and a bare `any`/`unknown`
+        // is not treated as one: several inference paths deliberately park
+        // a decl at `any`/`unknown` and expect it to survive a later,
+        // narrower assignment (pinned by
+        // `test_flow_merge_keeps_inferred_any_over_specific_non_table_assignment`,
+        // `stabilized_local_respects_assignment_regions` and
+        // `bind_type_keeps_uninformative_decl_cache_for_non_signature_inference`).
         LuaTypeOwner::Decl(_) => {
             if matches!(current_cache.as_type(), LuaType::Any | LuaType::Unknown) {
                 return false;
