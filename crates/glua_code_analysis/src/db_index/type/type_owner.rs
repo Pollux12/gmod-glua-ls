@@ -120,14 +120,26 @@ impl LuaTypeCache {
     }
 }
 
-/// Rank within the "carries no type information" band, ordered by how much the
-/// value could be: `never` (nothing) through `any` (anything).
-fn uninformative_rank(typ: &LuaType) -> Option<u8> {
+const NIL_RANK: u8 = 1;
+
+/// Rank within the "carries no type information" band, ordered by how much
+/// the value could be: `never` (nothing) through `any` (anything). `None`
+/// means the type carries information, i.e.
+pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     match typ {
         LuaType::Never => Some(0),
-        LuaType::Nil => Some(1),
+        LuaType::Nil => Some(NIL_RANK),
         LuaType::Unknown => Some(2),
         LuaType::Any => Some(3),
+        LuaType::Union(union) => union
+            .types()
+            .try_fold(0, |rank: u8, typ| Some(rank.max(uninformative_rank(typ)?))),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .try_fold(0, |rank: u8, (typ, _)| {
+                Some(rank.max(uninformative_rank(typ)?))
+            }),
         _ => None,
     }
 }
@@ -152,28 +164,17 @@ fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
     )
 }
 
+/// The bottom of the lattice — `nil`/`never`, or a union of only those. Records
+/// "no value was found" rather than "any value is allowed".
 pub(crate) fn is_bottom_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(is_bottom_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| is_bottom_type(typ)),
-        _ => false,
-    }
+    uninformative_rank(typ).is_some_and(|rank| rank <= NIL_RANK)
 }
 
+/// Whether `typ` says anything about the value. The single authoritative
+/// definition of "informative"; everything else derives from
+/// [`uninformative_rank`].
 pub fn is_informative_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union.types().any(is_informative_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .any(|(typ, _)| is_informative_type(typ)),
-        _ => true,
-    }
+    uninformative_rank(typ).is_none()
 }
 
 impl std::ops::Deref for LuaTypeCache {
@@ -181,5 +182,43 @@ impl std::ops::Deref for LuaTypeCache {
 
     fn deref(&self) -> &Self::Target {
         self.as_type()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn union(types: Vec<LuaType>) -> LuaType {
+        LuaType::from_vec(types)
+    }
+
+    #[test]
+    fn union_of_uninformative_members_ranks_with_its_widest_member() {
+        // `any|nil` says exactly as little as `any`. Ranking it `None` let a
+        // deferred round freeze a local against every later real inference.
+        assert_eq!(
+            uninformative_rank(&union(vec![LuaType::Any, LuaType::Nil])),
+            Some(3)
+        );
+        assert_eq!(
+            uninformative_rank(&union(vec![LuaType::Any, LuaType::Nil, LuaType::Never])),
+            Some(3)
+        );
+        assert!(!is_informative_type(&union(vec![LuaType::Any, LuaType::Nil])));
+
+        // One informative member makes the whole union informative.
+        assert_eq!(
+            uninformative_rank(&union(vec![LuaType::String, LuaType::Nil])),
+            None
+        );
+        assert!(is_informative_type(&union(vec![
+            LuaType::String,
+            LuaType::Nil
+        ])));
+
+        // `any|nil` is not bottom: it admits every value, not none.
+        assert!(!is_bottom_type(&union(vec![LuaType::Any, LuaType::Nil])));
+        assert!(is_bottom_type(&union(vec![LuaType::Nil, LuaType::Never])));
     }
 }

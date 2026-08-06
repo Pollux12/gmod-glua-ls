@@ -7,7 +7,7 @@ use rowan::TextRange;
 
 use crate::{
     InFiled, LuaMemberId, LuaTypeCache, LuaTypeOwner,
-    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId},
+    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -133,8 +133,17 @@ fn should_replace_uninformative_inferred_cache(
         return true;
     }
 
-    if !matches!(type_owner, LuaTypeOwner::Member(_)) {
-        return false;
+    match type_owner {
+        LuaTypeOwner::Member(_) => {}
+        // A decl's cache is its whole-lifetime type; narrowing it to one
+        // assignment's type is flow analysis' job, not the cache's. So only
+        // a *placeholder* may be displaced here.
+        LuaTypeOwner::Decl(_) => {
+            if matches!(current_cache.as_type(), LuaType::Any | LuaType::Unknown) {
+                return false;
+            }
+        }
+        LuaTypeOwner::SyntaxId(_) => return false,
     }
 
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
@@ -164,7 +173,7 @@ fn should_replace_uninformative_infer_type_cache(
         return false;
     };
 
-    is_uninformative_inferred_type(current_type) && is_informative_inferred_type(new_type)
+    !is_informative_type(current_type) && is_informative_type(new_type)
 }
 
 fn should_inferred_signature_replace_uninformative_cache(
@@ -179,30 +188,6 @@ fn should_inferred_signature_replace_uninformative_cache(
             LuaTypeCache::InferType(typ) => typ.is_any() || typ.is_unknown(),
             _ => false,
         }
-}
-
-fn is_uninformative_inferred_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(is_uninformative_inferred_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| is_uninformative_inferred_type(typ)),
-        _ => false,
-    }
-}
-
-fn is_informative_inferred_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union.types().any(is_informative_inferred_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .any(|(typ, _)| is_informative_inferred_type(typ)),
-        _ => true,
-    }
 }
 
 fn merge_def_type(db: &mut DbIndex, decl_type: LuaType, expr_type: LuaType, merge_level: i32) {
