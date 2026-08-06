@@ -2,7 +2,7 @@ mod instantiate_func_generic;
 mod instantiate_special_generic;
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     ops::Deref,
 };
 
@@ -288,7 +288,7 @@ fn instantiate_object(
     let fields = object.get_fields();
     let index_access = object.get_index_access();
 
-    let mut new_fields = HashMap::new();
+    let mut new_fields = BTreeMap::new();
     for (key, field) in fields {
         let new_field = instantiate_type_generic(db, field, substitutor);
         new_fields.insert(key.clone(), new_field);
@@ -1053,7 +1053,7 @@ fn instantiate_mapped_type(
                     );
                 }
             }
-            let field_map: HashMap<LuaMemberKey, LuaType> = fields.into_iter().collect();
+            let field_map: BTreeMap<LuaMemberKey, LuaType> = fields.into_iter().collect();
             return LuaType::Object(LuaObjectType::new_with_fields(field_map, index_access).into());
         }
     }

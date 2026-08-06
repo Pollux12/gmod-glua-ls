@@ -106,9 +106,18 @@ pub fn try_resolve_member(
     if let Some(prefix_expr) = &unresolve_member.prefix {
         let prefix_type = infer_expr(db, cache, prefix_expr.clone())?;
         let member_id = unresolve_member.member_id;
-        let member_owner = match prefix_type {
-            LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range)),
-            LuaType::Def(def_id) => {
+        // Ownership is decided by
+        // `resolve_index_expr_member_owner_for_file`, the same function the
+        // Lua pass uses when the prefix resolves immediately. This used to
+        // be a separate `match` that only understood `TableConst`, `Def`
+        // and `Instance`, so a prefix that inferred to a `MergedTable` (`SF
+        // = SF or {}` written once per realm — the GLua norm), a `Union` or
+        // a `Ref` fell through to the annotation-class fallback and the
+        // member was left parked on its global path.
+        let resolved_owner =
+            resolve_index_expr_member_owner_for_file(&prefix_type, Some(unresolve_member.file_id));
+        let member_owner = match resolved_owner {
+            Some((LuaMemberOwner::Type(def_id), set_owner_only)) => {
                 let type_decl = db
                     .get_type_index()
                     .get_type_decl(&def_id)
@@ -117,15 +126,13 @@ pub fn try_resolve_member(
                 if type_decl.is_exact() {
                     return Ok(());
                 }
-                Some(LuaMemberOwner::Type(def_id))
+                Some((LuaMemberOwner::Type(def_id), set_owner_only))
             }
-            LuaType::Instance(instance) => {
-                Some(LuaMemberOwner::Element(instance.get_range().clone()))
-            }
-            _ => {
+            Some(owner) => Some(owner),
+            None => {
                 if matches!(prefix_expr, LuaExpr::IndexExpr(_)) {
                     let dynamic_type = infer_dynamic_index_expr_shape(db, cache, prefix_expr)?;
-                    let Some((owner, _)) = resolve_index_expr_member_owner_for_file(
+                    let Some(owner) = resolve_index_expr_member_owner_for_file(
                         &dynamic_type,
                         Some(unresolve_member.file_id),
                     ) else {
@@ -156,8 +163,19 @@ pub fn try_resolve_member(
                 }
             }
         };
-        if let Some(member_owner) = member_owner {
-            add_member(db, member_owner, member_id);
+        // `set_owner_only` carries the same meaning it does in the Lua pass: a
+        // `Ref` prefix names a declared class, so the member is re-homed onto it
+        // but does not become one of its declared members.
+        if let Some((member_owner, set_owner_only)) = member_owner {
+            if set_owner_only {
+                db.get_member_index_mut().set_member_owner(
+                    member_owner,
+                    member_id.file_id,
+                    member_id,
+                );
+            } else {
+                add_member(db, member_owner, member_id);
+            }
         }
         unresolve_member.prefix = None;
     }

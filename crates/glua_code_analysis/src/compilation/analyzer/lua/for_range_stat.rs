@@ -253,7 +253,9 @@ fn try_infer_pairs_iter_types_from_table_members(
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
             [member] => member.typ.clone(),
-            _ => LuaType::from_vec(member_infos.into_iter().map(|member| member.typ).collect()),
+            _ => LuaType::from_inferred_vec(
+                member_infos.into_iter().map(|member| member.typ).collect(),
+            ),
         };
         values.push(value_type);
     }
@@ -349,7 +351,7 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
     {
         LuaType::Integer
     } else {
-        LuaType::from_vec(keys.to_vec())
+        LuaType::from_inferred_vec(keys.to_vec())
     }
 }
 
@@ -364,7 +366,7 @@ fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
         return LuaType::Unknown;
     }
 
-    try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
+    try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_inferred_vec(values))
 }
 
 fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {

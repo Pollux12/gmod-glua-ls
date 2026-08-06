@@ -2315,7 +2315,9 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
             LuaType::from_vec(vec![left.clone(), LuaType::Unknown])
         }
         (LuaType::Unknown, LuaType::Unknown) => LuaType::Unknown,
-        (LuaType::Unknown, _) | (_, LuaType::Unknown) => LuaType::from_vec(vec![left, right]),
+        (LuaType::Unknown, _) | (_, LuaType::Unknown) => {
+            LuaType::from_inferred_vec(vec![left, right])
+        }
         (LuaType::Variadic(left_variadic), LuaType::Variadic(right_variadic)) => {
             match (&left_variadic.deref(), &right_variadic.deref()) {
                 (VariadicType::Base(left_base), VariadicType::Base(right_base)) => {

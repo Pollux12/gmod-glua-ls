@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod test {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use crate::{
         DiagnosticCode, LuaMemberKey, LuaMergedTableType, LuaObjectType, LuaType, VirtualWorkspace,
@@ -225,7 +225,7 @@ mod test {
     }
 
     fn object_with_field(name: &str, typ: LuaType) -> LuaType {
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         fields.insert(LuaMemberKey::Name(name.into()), typ);
         LuaObjectType::new_with_fields(fields, Vec::new()).into()
     }
@@ -235,7 +235,7 @@ mod test {
     }
 
     fn object_with_index_accesses(index_access: Vec<(LuaType, LuaType)>) -> LuaType {
-        LuaObjectType::new_with_fields(HashMap::new(), index_access).into()
+        LuaObjectType::new_with_fields(BTreeMap::new(), index_access).into()
     }
 
     fn merged_table_with_field_and_index_access(
@@ -258,7 +258,7 @@ mod test {
         index_key_type: LuaType,
         index_value_type: LuaType,
     ) -> LuaType {
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         fields.insert(LuaMemberKey::Name(name.into()), field_type);
         LuaObjectType::new_with_fields(fields, vec![(index_key_type, index_value_type)]).into()
     }

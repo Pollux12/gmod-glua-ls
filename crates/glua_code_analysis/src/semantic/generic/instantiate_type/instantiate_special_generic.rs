@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Deref, vec};
+use std::{collections::BTreeMap, ops::Deref, vec};
 
 use smol_str::SmolStr;
 
@@ -110,12 +110,12 @@ fn instantiate_merge_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
         return LuaType::Unknown;
     }
 
-    let mut left_map: HashMap<_, _> = HashMap::new();
+    let mut left_map: BTreeMap<_, _> = BTreeMap::new();
     for member in left_members.unwrap_or_default() {
         left_map.entry(member.key).or_insert(member.typ);
     }
 
-    let mut right_map: HashMap<_, _> = HashMap::new();
+    let mut right_map: BTreeMap<_, _> = BTreeMap::new();
     for member in right_members.unwrap_or_default() {
         right_map.entry(member.key).or_insert(member.typ);
     }

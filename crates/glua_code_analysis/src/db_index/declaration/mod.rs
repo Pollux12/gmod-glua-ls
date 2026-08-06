@@ -7,6 +7,7 @@ pub use decl::LuaDeclExtra;
 pub use decl::{LocalAttribute, LuaDecl, LuaDeclInitializer};
 pub use decl_id::LuaDeclId;
 pub use decl_tree::{LuaDeclOrMemberId, LuaDeclarationTree};
+use rowan::TextRange;
 pub use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 use std::collections::HashMap;
 
@@ -17,6 +18,9 @@ use super::traits::LuaIndex;
 #[derive(Debug)]
 pub struct LuaDeclIndex {
     decl_trees: HashMap<FileId, LuaDeclarationTree>,
+    /// The table literal a global declaration is written with — the `{}` of
+    /// `X = {}` or of the GLua-idiomatic `X = X or {}`.
+    global_initializer_tables: HashMap<LuaDeclId, TextRange>,
 }
 
 impl Default for LuaDeclIndex {
@@ -29,7 +33,16 @@ impl LuaDeclIndex {
     pub fn new() -> Self {
         Self {
             decl_trees: HashMap::new(),
+            global_initializer_tables: HashMap::new(),
         }
+    }
+
+    pub fn set_global_initializer_table(&mut self, decl_id: LuaDeclId, range: TextRange) {
+        self.global_initializer_tables.insert(decl_id, range);
+    }
+
+    pub fn get_global_initializer_table(&self, decl_id: &LuaDeclId) -> Option<TextRange> {
+        self.global_initializer_tables.get(decl_id).copied()
     }
 
     pub fn add_decl_tree(&mut self, tree: LuaDeclarationTree) {
@@ -58,9 +71,12 @@ impl LuaDeclIndex {
 impl LuaIndex for LuaDeclIndex {
     fn remove(&mut self, file_id: FileId) {
         self.decl_trees.remove(&file_id);
+        self.global_initializer_tables
+            .retain(|decl_id, _| decl_id.file_id != file_id);
     }
 
     fn clear(&mut self) {
         self.decl_trees.clear();
+        self.global_initializer_tables.clear();
     }
 }

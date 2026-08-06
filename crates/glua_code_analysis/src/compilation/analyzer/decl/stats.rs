@@ -1,7 +1,7 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat, LuaForStat, LuaFuncStat,
     LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat, LuaSyntaxId, LuaSyntaxKind,
-    LuaVarExpr, NumberResult,
+    LuaTableExpr, LuaVarExpr, NumberResult,
 };
 
 use crate::{
@@ -70,6 +70,22 @@ pub fn analyze_local_stat(analyzer: &mut DeclAnalyzer, stat: LuaLocalStat) -> Op
     Some(())
 }
 
+/// The `{}` a global is initialised with: written directly (`X = {}`) or as the
+/// fallback branch of the GLua-idiomatic `X = X or {}`.
+fn initializer_table_expr(expr: &LuaExpr) -> Option<LuaTableExpr> {
+    match expr {
+        LuaExpr::TableExpr(table_expr) => Some(table_expr.clone()),
+        LuaExpr::BinaryExpr(binary_expr) => {
+            let (left, right) = binary_expr.get_exprs()?;
+            [left, right].into_iter().find_map(|operand| match operand {
+                LuaExpr::TableExpr(table_expr) => Some(table_expr),
+                _ => None,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> Option<()> {
     let (vars, value_exprs) = stat.get_var_and_expr_list();
     for (idx, var) in vars.iter().enumerate() {
@@ -122,7 +138,20 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                     value_expr_id,
                 );
 
+                let decl_id = decl.get_id();
                 analyzer.add_decl(decl);
+
+                // Record the `{}` this global is written with while the value
+                // expression is already in hand. The global-member owner
+                // election needs it to see declarations whose type has not been
+                // inferred yet; re-deriving it there would mean resolving a
+                // node per election, which measured 6x slower.
+                if let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr) {
+                    analyzer
+                        .db
+                        .get_decl_index_mut()
+                        .set_global_initializer_table(decl_id, table_expr.get_range());
+                }
             }
             LuaVarExpr::IndexExpr(index_expr) => {
                 let index_key = index_expr.get_index_key()?;

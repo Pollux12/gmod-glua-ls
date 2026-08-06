@@ -177,11 +177,23 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
 
+                let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
                 bind_type(
                     analyzer.db,
                     decl_id.into(),
                     LuaTypeCache::InferType(expr_type),
                 );
+                if retry_uninformative {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                }
             }
             Err(InferFailReason::None) => {
                 if should_defer_none_infer_expr(&expr) {
@@ -876,6 +888,15 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     // is `nil` at runtime, not "unknown".
                     LuaType::Nil
                 } else {
+                    if should_retry_uninformative_initializer(expr, &expr_type) {
+                        add_unresolve_for_assignment(
+                            analyzer,
+                            type_owner.clone(),
+                            &var,
+                            expr.clone(),
+                            InferFailReason::FieldNotFound,
+                        );
+                    }
                     expr_type
                 }
             }
@@ -1308,6 +1329,12 @@ fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
 
 fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
     matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_))
+}
+
+/// Whether an initializer that inferred to a type carrying no information
+/// has to be queued for the unresolve pass as well as committed here.
+fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
+    is_call_or_index_expr(expr) && !crate::db_index::is_informative_type(expr_type)
 }
 
 fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {

@@ -9,7 +9,7 @@ use rowan::{TextRange, TextSize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::traits::LuaIndex;
-use crate::{FileId, db_index::member::lua_owner_members::LuaOwnerMembers};
+use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
 pub use lua_member_item::LuaMemberIndexItem;
@@ -28,6 +28,9 @@ pub struct LuaMemberIndex {
         HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     non_overwriting_assignment_members: HashSet<LuaMemberId>,
+    /// Members whose owner was decided by scripted-class synthesis rather
+    /// than by name resolution.
+    synthesized_owner_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
 }
@@ -67,6 +70,7 @@ impl LuaMemberIndex {
             current_owner_member_history: HashMap::new(),
             current_members_by_key: HashMap::new(),
             non_overwriting_assignment_members: HashSet::new(),
+            synthesized_owner_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
             member_function_scope_ranges: HashMap::new(),
         }
@@ -206,15 +210,23 @@ impl LuaMemberIndex {
 
         match item {
             LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-            _ => MemberInsertAction::StoreRemovingVisibleOldIds {
-                item: LuaMemberIndexItem::One(id),
-                old_ids: old_member_ids
-                    .into_iter()
-                    .filter(|old_id| {
-                        *old_id != id && !self.is_assignment_file_define_member(*old_id)
-                    })
-                    .collect(),
-            },
+            _ => {
+                let winner = latest_defined_member(&old_member_ids, id);
+                if matches!(item, LuaMemberIndexItem::One(current) if *current == winner) {
+                    return MemberInsertAction::Noop;
+                }
+                MemberInsertAction::StoreRemovingVisibleOldIds {
+                    item: LuaMemberIndexItem::One(winner),
+                    old_ids: old_member_ids
+                        .into_iter()
+                        .chain(std::iter::once(id))
+                        .filter(|candidate| {
+                            *candidate != winner
+                                && !self.is_assignment_file_define_member(*candidate)
+                        })
+                        .collect(),
+                }
+            }
         }
     }
 
@@ -246,6 +258,16 @@ impl LuaMemberIndex {
                 self.push_preserved_assignment_member(owner, key, id);
             }
         }
+    }
+
+    /// Records that `id`'s owner was decided by scripted-class synthesis, so the
+    /// global-member migration must leave it alone.
+    pub fn pin_synthesized_owner(&mut self, id: LuaMemberId) {
+        self.synthesized_owner_members.insert(id);
+    }
+
+    pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
+        self.synthesized_owner_members.contains(id)
     }
 
     pub fn add_member_alias_to_owner(
@@ -565,6 +587,21 @@ impl LuaMemberIndex {
 
     pub fn get_member_mut(&mut self, id: &LuaMemberId) -> Option<&mut LuaMember> {
         self.members.get_mut(id)
+    }
+
+    /// Every global path that currently has members parked on it, in a
+    /// stable order.
+    pub fn sorted_global_path_owners(&self) -> Vec<GlobalId> {
+        let mut global_ids = self
+            .owner_members
+            .keys()
+            .filter_map(|owner| match owner {
+                LuaMemberOwner::GlobalPath(global_id) => Some(global_id.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        global_ids.sort_unstable_by(|left, right| left.get_name().cmp(right.get_name()));
+        global_ids
     }
 
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
@@ -961,6 +998,7 @@ impl LuaIndex for LuaMemberIndex {
                         self.members.remove(&member_id);
                         self.member_current_owner.remove(&member_id);
                         self.non_overwriting_assignment_members.remove(&member_id);
+                        self.synthesized_owner_members.remove(&member_id);
                         self.member_function_scope_ranges.remove(&member_id);
                     }
                     MemberOrOwner::Owner(owner) => {
@@ -1022,6 +1060,16 @@ impl LuaIndex for LuaMemberIndex {
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
     }
+}
+
+/// Picks the definition that wins when a key is redefined without a guard.
+fn latest_defined_member(existing_ids: &[LuaMemberId], incoming_id: LuaMemberId) -> LuaMemberId {
+    existing_ids
+        .iter()
+        .copied()
+        .chain(std::iter::once(incoming_id))
+        .max_by_key(|candidate| member_id_sort_key(*candidate))
+        .unwrap_or(incoming_id)
 }
 
 fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {

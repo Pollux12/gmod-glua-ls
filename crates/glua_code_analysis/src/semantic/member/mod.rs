@@ -259,7 +259,7 @@ fn is_open_table_merge_component(typ: &LuaType) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::collections::HashMap;
+    use std::collections::BTreeMap;
 
     use crate::{DbIndex, LuaMemberKey, LuaObjectType, LuaType, LuaTypeDeclId};
 
@@ -270,7 +270,7 @@ mod tests {
         let db = DbIndex::new();
         let table_of = LuaType::TableOf(Box::new(LuaType::Ref(LuaTypeDeclId::global("Entity"))));
 
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         fields.insert(LuaMemberKey::Name("flags".into()), LuaType::Table);
         let object = LuaType::Object(LuaObjectType::new_with_fields(fields, Vec::new()).into());
 

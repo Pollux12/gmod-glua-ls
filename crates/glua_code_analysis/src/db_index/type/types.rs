@@ -2,7 +2,7 @@ use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     hash::Hash,
     ops::Deref,
     sync::Arc,
@@ -533,6 +533,23 @@ impl LuaType {
         }
     }
 
+    /// [`from_vec`](Self::from_vec) for unions assembled from inference results.
+    ///
+    /// Same flattening and de-duplication, but the members come out in a
+    /// canonical order. See [`LuaUnionType::from_inferred_vec`] for why declared
+    /// unions must keep the author's order while inferred ones must not.
+    pub fn from_inferred_vec(types: Vec<LuaType>) -> Self {
+        match Self::from_vec(types) {
+            LuaType::Union(union) => match union.as_ref() {
+                LuaUnionType::Multi(members) => {
+                    LuaType::Union(LuaUnionType::from_inferred_vec(members.clone()).into())
+                }
+                LuaUnionType::Nullable(_) => LuaType::Union(union),
+            },
+            other => other,
+        }
+    }
+
     pub fn is_module_ref(&self) -> bool {
         matches!(self, LuaType::ModuleRef(_))
     }
@@ -899,9 +916,10 @@ pub enum LuaIndexAccessKey {
     Type(LuaType),
 }
 
+/// An anonymous table shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaObjectType {
-    fields: HashMap<LuaMemberKey, LuaType>,
+    fields: BTreeMap<LuaMemberKey, LuaType>,
     index_access: Vec<(LuaType, LuaType)>,
 }
 
@@ -922,7 +940,7 @@ impl TypeVisitTrait for LuaObjectType {
 
 impl LuaObjectType {
     pub fn new(object_fields: Vec<(LuaIndexAccessKey, LuaType)>) -> Self {
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         let mut index_access = Vec::new();
         for (key, value_type) in object_fields.into_iter() {
             match key {
@@ -945,7 +963,7 @@ impl LuaObjectType {
     }
 
     pub fn new_with_fields(
-        fields: HashMap<LuaMemberKey, LuaType>,
+        fields: BTreeMap<LuaMemberKey, LuaType>,
         index_access: Vec<(LuaType, LuaType)>,
     ) -> Self {
         Self {
@@ -954,7 +972,7 @@ impl LuaObjectType {
         }
     }
 
-    pub fn get_fields(&self) -> &HashMap<LuaMemberKey, LuaType> {
+    pub fn get_fields(&self) -> &BTreeMap<LuaMemberKey, LuaType> {
         &self.fields
     }
 
@@ -1068,17 +1086,39 @@ impl LuaUnionType {
             types.retain(|typ| !matches!(typ, LuaType::Unknown));
         }
 
-        if types.len() == 2 {
-            if types.contains(&LuaType::Nil) {
-                let non_nil_type = types.iter().find(|t| !matches!(t, LuaType::Nil));
-                if let Some(ty) = non_nil_type {
-                    return Self::Nullable(ty.clone());
-                }
-            } else {
-                return Self::Multi(types);
-            }
+        // Member order in a union is only ever consulted for members that
+        // take part in ordered resolution: overloads are matched and
+        // displayed in declaration order, and `` `T` ``|T resolves the
+        // string-template branch first on purpose. Every other union is a
+        // set, and leaving those in discovery order let an otherwise
+        // identical type render differently and offer a different first
+        // candidate to member resolution, purely because the contributing
+        // files were analysed in a different order or batch.
+        if types.len() > 1 && types.iter().all(Self::is_order_insensitive_member) {
+            types.sort_by_cached_key(lua_type_sort_key);
+            types.dedup();
+        }
+
+        if types.len() == 2
+            && types.contains(&LuaType::Nil)
+            && let Some(ty) = types.iter().find(|t| !matches!(t, LuaType::Nil))
+        {
+            return Self::Nullable(ty.clone());
         }
         Self::Multi(types)
+    }
+
+    /// Builds a union out of *inferred* alternatives, in a canonical order.
+    ///
+    /// Stronger than [`from_vec`]'s normalisation: this sorts even when the
+    /// union contains overload-like members, because a union assembled purely
+    /// from inference results carries no author intent about order.
+    pub fn from_inferred_vec(mut types: Vec<LuaType>) -> Self {
+        if types.len() > 1 {
+            types.sort_by_cached_key(lua_type_sort_key);
+            types.dedup();
+        }
+        Self::from_vec(types)
     }
 
     pub fn into_vec(&self) -> Vec<LuaType> {
@@ -1086,6 +1126,22 @@ impl LuaUnionType {
             LuaUnionType::Nullable(ty) => vec![ty.clone(), LuaType::Nil],
             LuaUnionType::Multi(types) => types.clone(),
         }
+    }
+
+    /// Whether a union member's position carries no meaning.
+    ///
+    /// Callables are matched and rendered in declaration order, and template
+    /// refs drive `` `T` ``|T dispatch, so a union containing either keeps the
+    /// order it was built with.
+    fn is_order_insensitive_member(typ: &LuaType) -> bool {
+        !matches!(
+            typ,
+            LuaType::Signature(_)
+                | LuaType::DocFunction(_)
+                | LuaType::TplRef(_)
+                | LuaType::StrTplRef(_)
+                | LuaType::ConstTplRef(_)
+        )
     }
 
     /// Borrowing iterator over the union members. Zero-allocation alternative to
@@ -1266,8 +1322,33 @@ impl TypeVisitTrait for LuaMergedTableType {
     }
 }
 
+/// Appends `types` to `out`, replacing every nested merged table by its own
+/// components so the result is the set of tables actually being merged.
+fn flatten_merged_tables(types: &[LuaType], out: &mut Vec<LuaType>) {
+    for typ in types {
+        match typ {
+            LuaType::MergedTable(nested) => flatten_merged_tables(nested.get_types(), out),
+            _ => out.push(typ.clone()),
+        }
+    }
+}
+
 impl LuaMergedTableType {
+    /// Builds a merged table, normalising it to the flat, ordered set of
+    /// the tables it is written from.
     pub fn new(types: Vec<LuaType>) -> Self {
+        let mut types = if types
+            .iter()
+            .any(|typ| matches!(typ, LuaType::MergedTable(_)))
+        {
+            let mut flattened = Vec::with_capacity(types.len());
+            flatten_merged_tables(&types, &mut flattened);
+            flattened
+        } else {
+            types
+        };
+        types.sort_by_key(lua_type_sort_key);
+        types.dedup();
         Self { types }
     }
 
@@ -1858,7 +1939,7 @@ impl LuaMappedType {
 /// The key is `(discriminant_ordinal, variant_detail)` where
 /// `variant_detail` differentiates same-variant entries cheaply
 /// (e.g., by pointer address for Arc-wrapped types, or by value for Copy types).
-fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
+pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
     let disc: u8 = match ty {
         LuaType::Nil => 0,
         LuaType::Boolean => 1,

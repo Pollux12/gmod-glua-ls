@@ -47,9 +47,16 @@ use url::Url;
 pub use vfs::*;
 
 #[derive(Default)]
+/// The cross-file facts an edit can invalidate, captured before
+/// re-analysis.
 struct InferredGuardSnapshot {
     facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
     consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
+    /// Parameter types inferred from the snapshotted files' call sites, keyed by
+    /// the callee signature they belong to.
+    inferred_params: HashMap<(LuaSignatureId, usize), LuaType>,
+    /// The files the snapshot was taken for, needed to recompute the same set.
+    snapshot_file_ids: HashSet<FileId>,
 }
 
 #[derive(Default)]
@@ -528,6 +535,7 @@ impl EmmyLuaAnalysis {
             &reindex_file_ids,
             &incremental_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
 
         Some(file_id)
     }
@@ -646,6 +654,7 @@ impl EmmyLuaAnalysis {
                 &reindex_file_ids,
                 &incremental_source_file_ids,
             );
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
         }
 
         Some(file_id)
@@ -759,11 +768,28 @@ impl EmmyLuaAnalysis {
             &file_ids,
             &incremental_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
+    }
+
+    /// The set of files an edit to `file_ids` would re-analyse.
+    pub fn diagnostic_reindex_scope(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        self.expand_reindex_file_ids(file_ids)
+    }
+
+    /// Re-analyses exactly `file_ids`, skipping dependency expansion.
+    pub fn reindex_files_without_expansion(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.remove_index(file_ids.clone());
+        self.compilation.update_index(file_ids.clone());
+        self.stabilize_cross_file_type_caches(&file_ids);
     }
 
     fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let profile = std::env::var_os("GLUALS_PROFILE_EXPAND").is_some();
+        let expand_start = std::time::Instant::now();
+        let mut rounds = 0usize;
         let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
         loop {
+            rounds += 1;
             // Include/require callers must be rebuilt with their changed target.
             // Traverse the indexed dependency graph; never rescan workspace ASTs.
             let dependency_dependents = self
@@ -816,6 +842,14 @@ impl EmmyLuaAnalysis {
 
         let mut expanded = expanded.into_iter().collect::<Vec<_>>();
         expanded.sort_unstable();
+        if profile {
+            eprintln!(
+                "  [expand] {} files in {} rounds, {:.3}s",
+                expanded.len(),
+                rounds,
+                expand_start.elapsed().as_secs_f64()
+            );
+        }
         expanded
     }
 
@@ -1067,7 +1101,70 @@ impl EmmyLuaAnalysis {
                 )
             })
             .collect();
-        InferredGuardSnapshot { facts, consumers }
+        let inferred_params = self
+            .compilation
+            .get_db()
+            .get_call_site_param_index()
+            .inferred_params_for_contributor_files(file_ids);
+        InferredGuardSnapshot {
+            facts,
+            consumers,
+            inferred_params,
+            snapshot_file_ids: file_ids.clone(),
+        }
+    }
+
+    /// Re-analyses callee files whose call-site-inferred parameter types
+    /// changed.
+    fn reindex_changed_inferred_param_consumers(
+        &mut self,
+        old_snapshot: &InferredGuardSnapshot,
+        already_reindexed: &[FileId],
+    ) {
+        let new_params = self
+            .compilation
+            .get_db()
+            .get_call_site_param_index()
+            .inferred_params_for_contributor_files(&old_snapshot.snapshot_file_ids);
+        let old_params = &old_snapshot.inferred_params;
+        if old_params.is_empty() && new_params.is_empty() {
+            return;
+        }
+
+        let already_reindexed = already_reindexed
+            .iter()
+            .copied()
+            .chain(old_snapshot.snapshot_file_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut changed_files = old_params
+            .keys()
+            .chain(new_params.keys())
+            .filter(|key| old_params.get(*key) != new_params.get(*key))
+            .map(|(signature_id, _)| signature_id.get_file_id())
+            .filter(|file_id| !already_reindexed.contains(file_id))
+            .collect::<Vec<_>>();
+        changed_files.sort_unstable();
+        changed_files.dedup();
+        if changed_files.is_empty() {
+            return;
+        }
+
+        let expanded = self.expand_reindex_file_ids(changed_files);
+        let expanded = expanded
+            .into_iter()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        if expanded.is_empty() {
+            return;
+        }
+        self.compilation.remove_index(expanded.clone());
+        self.compilation.update_index(expanded);
     }
 
     fn reconcile_equivalent_inferred_guard_owners(
@@ -1480,6 +1577,7 @@ impl EmmyLuaAnalysis {
             &updated_files,
             &old_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
         updated_files
     }
 
@@ -1578,6 +1676,7 @@ impl EmmyLuaAnalysis {
             &updated_files,
             &old_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
         updated_files
     }
 

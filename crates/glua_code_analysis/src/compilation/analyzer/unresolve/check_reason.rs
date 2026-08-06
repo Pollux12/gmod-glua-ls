@@ -3,8 +3,8 @@ use rustc_hash::FxHashMap;
 use glua_parser::LuaAstNode;
 
 use crate::{
-    DbIndex, InFiled, InferFailReason, LuaDocReturnInfo, LuaSemanticDeclId, LuaType, LuaTypeCache,
-    ReturnTypeKind, SignatureReturnStatus,
+    DbIndex, InFiled, InferFailReason, LuaDocReturnInfo, LuaType, LuaTypeCache, ReturnTypeKind,
+    SignatureReturnStatus,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
         infer_cache_manager::InferCacheManager,
@@ -37,11 +37,18 @@ pub fn check_reach_reason(
             Some(db.get_type_index().get_type_decl(type_id).is_some())
         }
         InferFailReason::UnResolveMemberType(member_id) => {
-            let member = db.get_member_index().get_member(member_id)?;
-            let key = member.get_key();
-            let owner = db.get_member_index().get_current_owner(member_id)?;
-            let member_item = db.get_member_index().get_member_item(owner, key)?;
-            Some(member_item.resolve_type(db).is_ok())
+            // `resolve_member_type` raises this reason naming the one
+            // member whose type cache was missing, so that exact cache is
+            // what "reached" has to mean. Asking the member *item* instead
+            // — reached through `get_current_owner` — answers a different
+            // question: a member parked on its global path resolves through
+            // the parked item while inference, which reaches it through the
+            // prefix's type, still sees no cache.
+            Some(
+                db.get_type_index()
+                    .get_type_cache(&(*member_id).into())
+                    .is_some(),
+            )
         }
         InferFailReason::UnResolveExpr(expr) => {
             let cache = infer_manager.get_infer_cache(expr.file_id);
@@ -97,22 +104,17 @@ pub fn resolve_as_unknown(
             if loop_count == 0 {
                 return Some(());
             }
-            let member = db.get_member_index().get_member(member_id)?;
-            let key = member.get_key();
-            let owner = db.get_member_index().get_current_owner(member_id)?;
-            let member_item = db.get_member_index().get_member_item(owner, key)?;
-            let opt_type = member_item.resolve_type(db).ok();
-            if opt_type.is_none() {
-                let semantic_member_id = member_item.resolve_semantic_decl(db)?;
-                if let LuaSemanticDeclId::Member(member_id) = semantic_member_id {
-                    write_type_cache(
-                        db,
-                        member_id.into(),
-                        LuaTypeCache::InferType(LuaType::Unknown),
-                        TypeCacheWriteMode::InsertOnly,
-                    );
-                }
-            }
+            // Fill the cache `check_reach_reason` reads, which is the one
+            // member named by the reason. Going through the member *item*
+            // asked a different question — a member parked on its global
+            // path resolves through the parked item, so this arm wrote
+            // nothing and the blocked member kept no type forever.
+            write_type_cache(
+                db,
+                (*member_id).into(),
+                LuaTypeCache::InferType(LuaType::Unknown),
+                TypeCacheWriteMode::InsertOnly,
+            );
         }
         InferFailReason::UnResolveExpr(expr) => {
             let key = InFiled::new(expr.file_id, expr.value.get_syntax_id());

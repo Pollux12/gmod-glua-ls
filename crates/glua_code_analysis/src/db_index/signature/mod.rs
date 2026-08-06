@@ -154,6 +154,11 @@ impl LuaSignatureIndex {
         self.signatures.iter()
     }
 
+    /// Number of signatures currently indexed. `O(1)`.
+    pub fn indexed_signature_count(&self) -> usize {
+        self.signatures.len()
+    }
+
     pub fn local_func_decl_for(&self, signature_id: &LuaSignatureId) -> Option<LuaDeclId> {
         self.local_func_decls.get(signature_id).copied()
     }

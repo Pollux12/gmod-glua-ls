@@ -198,7 +198,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
     let changed_signatures = db
         .get_call_site_param_index_mut()
         .set_files_fact_contributions(fact_updates);
-    receiver_signatures.retain(|signature_id| changed_signatures.contains(signature_id));
+    // Deliberately *not* filtered by `changed_signatures`.
     receiver_signatures.extend(changed_signatures);
     receiver_signatures.sort_unstable_by_key(|signature_id| {
         (signature_id.get_file_id().id, signature_id.get_position())
@@ -1087,7 +1087,7 @@ fn snapshot_callback_table_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> 
     let fields = get_member_map(db, typ)?
         .into_iter()
         .filter_map(|(key, members)| {
-            let member_type = LuaType::from_vec(
+            let member_type = LuaType::from_inferred_vec(
                 members
                     .into_iter()
                     .map(|member| member.typ)

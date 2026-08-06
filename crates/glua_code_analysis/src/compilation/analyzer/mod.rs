@@ -73,10 +73,24 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         return;
     }
 
-    let contexts = module_analyze(db, need_analyzed_files);
+    let mut contexts = module_analyze(db, need_analyzed_files);
+
+    // Declaration and documentation indexing runs for *every* workspace
+    // group before any group enters resolution. Both passes are per-file
+    // syntactic walks that only populate the decl/type/signature indexes,
+    // so hoisting them costs nothing — each file is still visited exactly
+    // once — but it guarantees that later stages observe the complete
+    // signature and type declaration set rather than only the groups
+    // analysed so far.
+    for (workspace_id, context) in contexts.iter_mut() {
+        context.workspace_id = Some(*workspace_id);
+        let profile_log = format!("declare workspace {}", workspace_id);
+        let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
+        run_analysis::<decl::DeclAnalysisPipeline>(db, context);
+        run_analysis::<doc::DocAnalysisPipeline>(db, context);
+    }
 
     for (workspace_id, mut context) in contexts {
-        context.workspace_id = Some(workspace_id);
         let profile_log = format!("analyze workspace {}", workspace_id);
         let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
         let workspace_file_ids = context
@@ -85,8 +99,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .map(|in_filed_tree| in_filed_tree.file_id)
             .collect::<Vec<_>>();
 
-        run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
-        run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
         let early_signature_owners = publish_callable_signatures(db, &context);
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
@@ -177,6 +189,16 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             }
             refresh_initializer_caches(db, &mut context);
         }
+
+        // Members that landed on a global path before the global's owner was
+        // known are attached now that it is. See
+        // `reconcile_parked_global_path_members`.
+        common::reconcile_parked_global_path_members(db);
+
+        // Net flows are collected last: the collector resolves wrappers through
+        // signatures, receiver types and members, none of which exist yet when
+        // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
+        run_analysis::<gmod::GmodNetworkAnalysisPipeline>(db, &mut context);
 
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
         {
@@ -699,6 +721,20 @@ trait AnalysisPipeline {
 }
 
 fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    if std::env::var_os("GLUALS_PROFILE_PIPELINE").is_some() {
+        let t = std::time::Instant::now();
+        T::analyze(db, context);
+        eprintln!(
+            "  [pipeline] {:<44} {:.3}s ({} files)",
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or_default(),
+            t.elapsed().as_secs_f64(),
+            context.tree_list.len()
+        );
+        return;
+    }
     T::analyze(db, context);
 }
 
@@ -795,6 +831,12 @@ pub struct AnalyzeContext {
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
+    /// Annotated global call-role map built by the gmod pre-pass, keyed by the
+    /// helper-registry revision it was derived from. Building it is a full
+    /// signature-index scan, so the late network pass reuses it whenever the
+    /// index has not grown since.
+    #[allow(clippy::type_complexity)]
+    gmod_global_call_roles: Option<(u64, Arc<gmod::AnnotatedGmodGlobalCallRoleMap>)>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     inferred_return_candidates: Vec<UnResolveReturn>,
     pending_call_site_return_consumers: Vec<UnResolve>,
@@ -818,6 +860,7 @@ impl AnalyzeContext {
             metas: HashSet::new(),
             scripted_scope_files: None,
             scripted_scope_infos: None,
+            gmod_global_call_roles: None,
             unresolves: Vec::new(),
             inferred_return_candidates: Vec::new(),
             pending_call_site_return_consumers: Vec::new(),

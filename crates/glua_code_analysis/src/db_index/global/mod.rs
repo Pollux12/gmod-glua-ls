@@ -13,6 +13,13 @@ pub struct LuaGlobalIndex {
     global_decl: HashMap<GlobalId, Vec<LuaDeclId>>,
 }
 
+/// Canonical order for a global's declarations: source position, with the file
+/// as the outer key. `FileId`s are handed out in workspace-collection order and
+/// never reused within a session, so this is stable for as long as the index is.
+fn decl_sort_key(decl_id: LuaDeclId) -> (u32, u32) {
+    (decl_id.file_id.id, u32::from(decl_id.position))
+}
+
 impl Default for LuaGlobalIndex {
     fn default() -> Self {
         Self::new()
@@ -26,17 +33,29 @@ impl LuaGlobalIndex {
         }
     }
 
+    /// Registers a declaration of `name`, keeping the global's declaration
+    /// list in canonical source order.
     pub fn add_global_decl(&mut self, name: &str, decl_id: LuaDeclId) {
         let id = GlobalId::new(name);
-        self.global_decl.entry(id).or_default().push(decl_id);
+        let decl_ids = self.global_decl.entry(id).or_default();
+        if let Err(insert_at) = decl_ids
+            .binary_search_by_key(&decl_sort_key(decl_id), |existing| decl_sort_key(*existing))
+        {
+            decl_ids.insert(insert_at, decl_id);
+        }
     }
 
     pub fn get_all_global_decl_ids(&self) -> Vec<LuaDeclId> {
-        let mut decls = Vec::new();
-        for v in self.global_decl.values() {
-            decls.extend(v);
-        }
-
+        // `global_decl` is a `HashMap`, so its iteration order is not stable
+        // across index states; sort so callers see the same sequence whatever
+        // order the globals were discovered in.
+        let mut decls = self
+            .global_decl
+            .values()
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        decls.sort_unstable_by_key(|decl_id| decl_sort_key(*decl_id));
         decls
     }
 
@@ -134,6 +153,63 @@ impl LuaIndex for LuaGlobalIndex {
 
     fn clear(&mut self) {
         self.global_decl.clear();
+    }
+}
+
+#[cfg(test)]
+mod order_tests {
+    use rowan::TextSize;
+
+    use super::*;
+    use crate::LuaIndex;
+
+    fn decl(file: u32, position: u32) -> LuaDeclId {
+        LuaDeclId::new(FileId::new(file), TextSize::new(position))
+    }
+
+    /// Re-indexing one file must not reorder a global's declaration list: the
+    /// list is what `resolve_global_decl_id` picks the canonical declaration
+    /// from, and that identity keys flow narrowing for the whole global path.
+    #[test]
+    fn declaration_order_survives_reindexing_a_file() {
+        let mut cold = LuaGlobalIndex::new();
+        for decl_id in [decl(1, 0), decl(2, 10), decl(3, 20)] {
+            cold.add_global_decl("cityrp", decl_id);
+        }
+
+        let mut reindexed = LuaGlobalIndex::new();
+        for decl_id in [decl(1, 0), decl(2, 10), decl(3, 20)] {
+            reindexed.add_global_decl("cityrp", decl_id);
+        }
+        reindexed.remove(FileId::new(1));
+        reindexed.add_global_decl("cityrp", decl(1, 0));
+
+        assert_eq!(
+            cold.get_global_decl_ids("cityrp"),
+            reindexed.get_global_decl_ids("cityrp"),
+        );
+    }
+
+    #[test]
+    fn declarations_are_ordered_by_file_then_position() {
+        let mut index = LuaGlobalIndex::new();
+        for decl_id in [decl(3, 5), decl(1, 40), decl(1, 2)] {
+            index.add_global_decl("cityrp", decl_id);
+        }
+
+        assert_eq!(
+            index.get_global_decl_ids("cityrp"),
+            Some(&vec![decl(1, 2), decl(1, 40), decl(3, 5)]),
+        );
+    }
+
+    #[test]
+    fn adding_the_same_declaration_twice_does_not_duplicate_it() {
+        let mut index = LuaGlobalIndex::new();
+        index.add_global_decl("cityrp", decl(1, 0));
+        index.add_global_decl("cityrp", decl(1, 0));
+
+        assert_eq!(index.get_global_decl_ids("cityrp"), Some(&vec![decl(1, 0)]));
     }
 }
 

@@ -369,7 +369,7 @@ fn find_union_function_member(
         }
     }
 
-    Ok(LuaType::from_vec(member_types))
+    Ok(LuaType::from_inferred_vec(member_types))
 }
 
 fn index_generic_members_from_super_generics(

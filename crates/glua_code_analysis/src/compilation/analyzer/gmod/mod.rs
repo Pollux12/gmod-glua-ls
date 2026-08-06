@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet, VecDeque},
+    hash::{Hash, Hasher},
     path::Path,
-    sync::Arc,
+    sync::{Arc, Mutex},
 };
 
 use aho_corasick::AhoCorasick;
@@ -48,6 +49,7 @@ use crate::{
     profile::Profile,
 };
 use rowan::{TextRange, TextSize};
+use rustc_hash::FxHashMap;
 use smol_str::SmolStr;
 
 mod numeric_range_population;
@@ -155,8 +157,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let tree_list = context.tree_list.clone();
         let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
+        let profile_pre = std::env::var_os("GLUALS_PROFILE_PIPELINE").is_some();
+        let t_scope = std::time::Instant::now();
         // Pre-compute scripted class scope for all files (compile globs once)
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
+        if profile_pre {
+            eprintln!(
+                "    [pre] scoped_scope_files {:.3}s",
+                t_scope.elapsed().as_secs_f64()
+            );
+        }
 
         let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
@@ -167,33 +177,33 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_scoped = std::time::Duration::ZERO;
         let mut profile = do_profile.then(GmodPreProfile::default);
 
-        let helper_revision = db.get_vfs().content_revision();
-        let cached_helper_registry = db.get_cached_helper_registry(helper_revision);
-        let mut helper_registry_builder = cached_helper_registry
-            .is_none()
-            .then(HelperRegistryBuilder::default);
-        // Net attributes, canonical op names, and helper signature identities
-        // are all collected during this one signature-index walk.
-        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build_with_helpers(
-            db,
-            helper_registry_builder.as_mut(),
-        );
+        // The registry is derived by scanning the entire signature index, so the
+        // cache key has to cover how much of that index existed when it was
+        // built — not just VFS content. Keying on content alone let a registry
+        // built during an earlier workspace group (with fewer files indexed) be
+        // served to a later group that could see more.
+        let helper_revision = helper_registry_revision(db);
+        // "Does this file contain any call expression" is a pure function
+        // of the file's content, but it used to be memoised only for the
+        // lifetime of one builder — so every single-file edit re-walked the
+        // syntax tree of every file that owns a signature. Resolving it
+        // against the db-level cache first keeps that work proportional to
+        // the files actually re-analysed.
+        let t_roles = std::time::Instant::now();
+        let (helper_registry, annotated_global_call_roles, rescanned) =
+            build_call_roles_and_registry(db);
+        if profile_pre {
+            eprintln!(
+                "    [pre] helper scan {:.3}s ({rescanned} files rescanned)",
+                t_roles.elapsed().as_secs_f64()
+            );
+        }
         // Publish the canonical op-name table so diagnostics and completions can
         // name a net op they have no call expression for.
         db.get_gmod_network_index_mut()
             .set_canonical_ops(annotated_global_call_roles.canonical_net_ops());
-
-        let helper_registry = if let Some(cached) = cached_helper_registry {
-            cached
-        } else {
-            let registry = Arc::new(
-                helper_registry_builder
-                    .expect("builder exists when the helper cache misses")
-                    .build(db),
-            );
-            db.set_cached_helper_registry(helper_revision, registry.clone());
-            registry
-        };
+        context.gmod_global_call_roles =
+            Some((helper_revision, annotated_global_call_roles.clone()));
 
         // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
         let formatted_hook_prefixes: Vec<String> = db
@@ -480,6 +490,122 @@ impl GmodPreProfile {
 /// Post-analysis phase: runs AFTER lua_analyze.
 /// Synthesizes members that depend on metadata collected during lua_analyze
 /// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
+/// Collects GMod `net` message flows.
+///
+/// This runs at the very end of the batch, after declaration, doc, lua and
+/// unresolve analysis, because flow collection *reads* what those produce:
+/// resolving `net.Start`/`net.Send` reached through a wrapper needs the
+/// wrapper's signature, its receiver's type, and the members those depend on.
+///
+/// It used to run inside `GmodPreAnalysisPipeline`, before any of that existed.
+/// The collector therefore saw a far poorer index on a cold build than on any
+/// later re-index — on CityRP a cold index found 2592 flows where a re-index of
+/// the same unchanged source found 2845 — so `gmod-net-*` diagnostics changed
+/// across the workspace after the first edit. Nothing in the analysis pipeline
+/// reads the network index (only diagnostics do), so collecting it last costs
+/// nothing and is the only point at which the input state is the same for a
+/// cold build and a partial re-index.
+pub struct GmodNetworkAnalysisPipeline;
+
+impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
+    fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
+        if !db.get_emmyrc().gmod.enabled {
+            return;
+        }
+
+        let tree_list = context.tree_list.clone();
+        if tree_list.is_empty() {
+            return;
+        }
+        let _p = Profile::cond_new("gmod net-analyze", tree_list.len() > 1);
+
+        // The gmod pre-pass already built these for this batch; reuse them
+        // unless the signature index has grown since (the revision covers that).
+        // On a miss the rebuild is served from the per-file scan cache, so it
+        // only re-derives the files that changed.
+        let helper_revision = helper_registry_revision(db);
+        let reusable_roles = context
+            .gmod_global_call_roles
+            .as_ref()
+            .filter(|(revision, _)| *revision == helper_revision)
+            .map(|(_, roles)| roles.clone());
+        let cached_registry = db.get_cached_helper_registry(helper_revision);
+
+        let (helper_registry, annotated_global_call_roles) = match (cached_registry, reusable_roles)
+        {
+            (Some(registry), Some(roles)) => (registry, roles),
+            _ => {
+                let (registry, roles, _) = build_call_roles_and_registry(db);
+                context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
+                (registry, roles)
+            }
+        };
+
+        let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
+        let reach = HelperStartReachCache::default();
+        let collected = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
+            collect_file_network_flows(
+                db,
+                file_id,
+                &helper_registry,
+                &annotated_global_call_roles,
+                &reach,
+            )
+        });
+
+        for (file_id, network_data) in file_ids.iter().zip(collected) {
+            if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
+                continue;
+            }
+            db.get_gmod_network_index_mut()
+                .add_file_data(*file_id, network_data);
+        }
+    }
+}
+
+fn collect_file_network_flows(
+    db: &DbIndex,
+    file_id: FileId,
+    helper_registry: &HelperRegistry,
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    reach: &HelperStartReachCache,
+) -> crate::db_index::FileNetworkData {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_chunk_node())
+    else {
+        return crate::db_index::FileNetworkData::default();
+    };
+
+    let mut local_fns = LocalFnCache::default();
+    let mut net = NetCallResolver::default();
+
+    let (_, _, _, receive_flows) = collect_hook_and_receive_metadata(
+        db,
+        file_id,
+        root.clone(),
+        false,
+        true,
+        helper_registry,
+        annotated_global_call_roles,
+        &mut local_fns,
+        &mut net,
+        reach,
+    );
+
+    collect_network_flow_metadata(
+        db,
+        file_id,
+        root,
+        receive_flows,
+        helper_registry,
+        &mut local_fns,
+        &mut net,
+        reach,
+    )
+}
+
 pub struct GmodPostAnalysisPipeline;
 
 impl AnalysisPipeline for GmodPostAnalysisPipeline {
@@ -509,7 +635,10 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t_class = do_profile.then(std::time::Instant::now);
-        let annotated_global_call_roles = AnnotatedGmodGlobalCallRoleMap::build(db);
+        // Same per-file cached scan the net pass uses. Folding the signature
+        // index directly here took its `HashMap` iteration order, so a call path
+        // defined by two files resolved differently between processes.
+        let (_, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
         collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles);
         update_compilefile_execution_environments(db, context, &annotated_global_call_roles);
         if let Some(t_class) = t_class {
@@ -748,6 +877,123 @@ pub(crate) struct HelperRegistry {
 
 type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
 
+/// Cache key for the net-helper registry.
+///
+/// The registry is a pure function of the syntax trees reachable through the
+/// signature index, so both the VFS content revision and the size of that index
+/// have to take part in the key. Both reads are `O(1)`.
+fn helper_registry_revision(db: &DbIndex) -> u64 {
+    let content_revision = db.get_vfs().content_revision();
+    let signature_count = db.get_signature_index().indexed_signature_count() as u64;
+    content_revision
+        .rotate_left(32)
+        .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+        ^ signature_count
+}
+
+/// A single file's cached contribution to the gmod net-helper scan.
+struct FileHelperScan {
+    role_map: AnnotatedGmodGlobalCallRoleMap,
+    definitions: Vec<IndexedHelperDefinition>,
+}
+
+/// Builds the annotated call-role map and the net-helper registry from
+/// per-file cached scans.
+fn build_call_roles_and_registry(
+    db: &mut DbIndex,
+) -> (
+    Arc<HelperRegistry>,
+    Arc<AnnotatedGmodGlobalCallRoleMap>,
+    usize,
+) {
+    let helper_revision = helper_registry_revision(db);
+    let cached_helper_registry = db.get_cached_helper_registry::<HelperRegistry>(helper_revision);
+
+    let mut signatures_by_file: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::new();
+    for (signature_id, _) in db.get_signature_index().iter() {
+        signatures_by_file
+            .entry(signature_id.get_file_id())
+            .or_default()
+            .push(*signature_id);
+    }
+    // Merge order decides which file wins a call path both define, so it has to
+    // be a property of the source, not of the session. `FileId`s are handed out
+    // in workspace-collection order and shift when a file is removed and
+    // re-added, so order by normalized path — the same policy
+    // `HelperRegistryBuilder::build` already uses for its definitions.
+    let vfs = db.get_vfs();
+    let mut scan_files = signatures_by_file.keys().copied().collect::<Vec<_>>();
+    scan_files.sort_by_cached_key(|file_id| {
+        let raw_path = vfs
+            .get_file_path(file_id)
+            .map(|path| path.to_string_lossy().to_string())
+            .unwrap_or_default();
+        (
+            crate::vfs::normalize_path_for_ordering(&raw_path),
+            raw_path,
+            file_id.id,
+        )
+    });
+
+    let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
+    let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
+    let mut rescanned = 0usize;
+    for file_id in scan_files {
+        let scan = match db.get_cached_file_helper_scan::<FileHelperScan>(file_id) {
+            Some(cached) => cached,
+            None => {
+                let has_calls = match db.get_file_has_call_expr(file_id) {
+                    Some(cached) => cached,
+                    None => {
+                        let computed = db
+                            .get_vfs()
+                            .get_syntax_tree(&file_id)
+                            .map(|tree| {
+                                tree.get_chunk_node()
+                                    .syntax()
+                                    .descendants()
+                                    .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+                            })
+                            .unwrap_or(false);
+                        db.set_file_has_call_expr(file_id, computed);
+                        computed
+                    }
+                };
+                let mut signature_ids = signatures_by_file.remove(&file_id).unwrap_or_default();
+                signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
+                let scan = Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
+                    db,
+                    &signature_ids,
+                    has_calls,
+                ));
+                db.set_cached_file_helper_scan(file_id, scan.clone());
+                rescanned += 1;
+                scan
+            }
+        };
+        role_map.merge_from(&scan.role_map);
+        if cached_helper_registry.is_none() {
+            definitions.extend(scan.definitions.iter().cloned());
+        }
+    }
+    role_map.rebuild_candidate_call_path_set();
+
+    let registry = match cached_helper_registry {
+        Some(registry) => registry,
+        None => {
+            let builder = HelperRegistryBuilder {
+                definitions,
+                ..Default::default()
+            };
+            let registry = Arc::new(builder.build(db));
+            db.set_cached_helper_registry(helper_revision, registry.clone());
+            registry
+        }
+    };
+
+    (registry, Arc::new(role_map), rescanned)
+}
+
 #[derive(Default)]
 struct HelperRegistryBuilder {
     definitions: Vec<IndexedHelperDefinition>,
@@ -758,20 +1004,16 @@ struct HelperRegistryBuilder {
 }
 
 impl HelperRegistryBuilder {
+    fn with_file_has_calls(file_has_calls: HashMap<FileId, bool>) -> Self {
+        Self {
+            definitions: Vec::new(),
+            file_has_calls,
+        }
+    }
+
     fn add_signature(&mut self, db: &DbIndex, signature_id: LuaSignatureId) {
         let file_id = signature_id.get_file_id();
-        let file_has_calls = *self.file_has_calls.entry(file_id).or_insert_with(|| {
-            db.get_vfs()
-                .get_syntax_tree(&file_id)
-                .map(|tree| {
-                    tree.get_chunk_node()
-                        .syntax()
-                        .descendants()
-                        .any(|node| LuaCallExpr::can_cast(node.kind().into()))
-                })
-                .unwrap_or(false)
-        });
-        if !file_has_calls {
+        if !self.file_has_calls.get(&file_id).copied().unwrap_or(false) {
             return;
         }
 
@@ -1053,30 +1295,33 @@ fn collect_file_gmod_metadata(
     // from other files.
     let mut net = NetCallResolver::default();
 
-    let collect_non_net_metadata = keywords.needs_hook_metadata();
-    let (hook_sites, system_metadata, gm_method_realms, receive_flows) =
-        collect_hook_and_receive_metadata(
-            db,
-            file_id,
-            root.clone(),
-            collect_non_net_metadata,
-            helper_registry,
-            annotated_global_call_roles,
-            &mut local_fns,
-            &mut net,
-        );
-    let hook_metadata =
-        collect_non_net_metadata.then_some((hook_sites, system_metadata, gm_method_realms));
+    // Hook metadata collection never expands wrapper chains for send flows, so
+    // this cache stays empty; it exists only to satisfy the shared context.
+    let reach = HelperStartReachCache::default();
 
-    let network_data = collect_network_flow_metadata(
-        db,
-        file_id,
-        root.clone(),
-        receive_flows,
-        helper_registry,
-        &mut local_fns,
-        &mut net,
-    );
+    let collect_non_net_metadata = keywords.needs_hook_metadata();
+    // Network flows are collected later, by `GmodNetworkAnalysisPipeline`; see
+    // that pipeline for why. When a file needs no hook metadata either, the
+    // whole walk can now be skipped — previously it still had to run because
+    // receive-flow collection rode along with it.
+    let hook_metadata = collect_non_net_metadata.then(|| {
+        let (hook_sites, system_metadata, gm_method_realms, _receive_flows) =
+            collect_hook_and_receive_metadata(
+                db,
+                file_id,
+                root.clone(),
+                true,
+                false,
+                helper_registry,
+                annotated_global_call_roles,
+                &mut local_fns,
+                &mut net,
+                &reach,
+            );
+        (hook_sites, system_metadata, gm_method_realms)
+    });
+
+    let network_data = crate::db_index::FileNetworkData::default();
 
     let branch_ranges = if keywords.has_realm_branch {
         collect_branch_realm_ranges(&root)
@@ -1117,10 +1362,12 @@ fn collect_hook_and_receive_metadata(
     file_id: FileId,
     root: LuaChunk,
     collect_non_net_metadata: bool,
+    collect_receive_flows: bool,
     helper_registry: &HelperRegistry,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
+    reach: &HelperStartReachCache,
 ) -> (
     Vec<GmodHookSiteMetadata>,
     GmodSystemFileMetadata,
@@ -1157,22 +1404,26 @@ fn collect_hook_and_receive_metadata(
                 );
             }
 
-            let mut net_ctx = NetCollectCtx {
-                db,
-                helper_registry,
-                local_fns,
-                net,
-            };
-            if let Some(receive_flow) =
-                collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
-            {
-                receive_flows.push(receive_flow);
-            } else if call_has_literal_string_arg(&call_expr) {
-                receive_flows.extend(collect_unannotated_net_wrapper_receive_flows(
-                    &mut net_ctx,
-                    &net_site,
-                    &call_expr,
-                ));
+            if collect_receive_flows {
+                let mut net_ctx = NetCollectCtx {
+                    db,
+                    helper_registry,
+                    local_fns,
+                    net,
+                    resolve_memo: FxHashMap::default(),
+                    reach,
+                };
+                if let Some(receive_flow) =
+                    collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
+                {
+                    receive_flows.push(receive_flow);
+                } else if call_has_literal_string_arg(&call_expr) {
+                    receive_flows.extend(collect_unannotated_net_wrapper_receive_flows(
+                        &mut net_ctx,
+                        &net_site,
+                        &call_expr,
+                    ));
+                }
             }
 
             continue;
@@ -1207,6 +1458,7 @@ fn collect_network_flow_metadata(
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
+    reach: &HelperStartReachCache,
 ) -> crate::db_index::FileNetworkData {
     let site = NetWalkSite { root, file_id };
     let mut ctx = NetCollectCtx {
@@ -1214,6 +1466,8 @@ fn collect_network_flow_metadata(
         helper_registry,
         local_fns,
         net,
+        resolve_memo: FxHashMap::default(),
+        reach,
     };
     let mut send_flows = collect_net_send_flows(&mut ctx, &site);
     send_flows.extend(collect_wrapped_net_send_flows(&mut ctx, &site));
@@ -1360,15 +1614,8 @@ fn resolve_helper_start_message_recursive(
     caller_bindings: &HashMap<String, String>,
     visited: &mut HashSet<(FileId, String)>,
 ) -> Option<String> {
-    let (helper_key, helper_block, helper_root, helper_file_id) = resolve_call_to_function_block(
-        &caller_site.root,
-        caller_site.file_id,
-        helper_call,
-        ctx.helper_registry,
-        ctx.local_fns,
-        ctx.net,
-        ctx.db,
-    )?;
+    let (helper_key, helper_block, helper_root, helper_file_id) =
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
     if !visited.insert((helper_file_id, helper_key.clone())) {
         return None;
     }
@@ -1434,15 +1681,8 @@ fn resolve_helper_send_recursive(
     helper_call: &LuaCallExpr,
     visited: &mut HashSet<(FileId, String)>,
 ) -> Option<(NetSendKind, Option<String>)> {
-    let (helper_key, helper_block, helper_root, helper_file_id) = resolve_call_to_function_block(
-        &caller_site.root,
-        caller_site.file_id,
-        helper_call,
-        ctx.helper_registry,
-        ctx.local_fns,
-        ctx.net,
-        ctx.db,
-    )?;
+    let (helper_key, helper_block, helper_root, helper_file_id) =
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)?;
     if !visited.insert((helper_file_id, helper_key.clone())) {
         return None;
     }
@@ -1646,15 +1886,7 @@ fn collect_send_flows_from_helper_call(
     flows: &mut Vec<NetSendFlow>,
 ) {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
-        resolve_call_to_function_block(
-            &caller_site.root,
-            caller_site.file_id,
-            helper_call,
-            ctx.helper_registry,
-            ctx.local_fns,
-            ctx.net,
-            ctx.db,
-        )
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
     else {
         return;
     };
@@ -1662,11 +1894,29 @@ fn collect_send_flows_from_helper_call(
         return;
     }
 
-    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
+
+    // A send flow always starts at a `net.Start` somewhere in the expansion, so
+    // a helper that cannot reach one contributes nothing however it is called.
+    // Answering that once per helper instead of walking its body once per
+    // calling file is the difference between ~438k body scans and ~2k.
+    let helper_id = (helper_file_id, helper_key.clone());
+    let (reaches_start, _) = helper_reaches_net_start(
+        ctx,
+        &helper_site,
+        &helper_block,
+        &helper_id,
+        &mut Vec::new(),
+    );
+    if !reaches_start {
+        visited.remove(&helper_id);
+        return;
+    }
+
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
 
     for block in helper_block
         .syntax()
@@ -1910,15 +2160,7 @@ fn collect_receive_flows_from_helper_call(
     flows: &mut Vec<NetReceiveFlow>,
 ) {
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
-        resolve_call_to_function_block(
-            &caller_site.root,
-            caller_site.file_id,
-            helper_call,
-            ctx.helper_registry,
-            ctx.local_fns,
-            ctx.net,
-            ctx.db,
-        )
+        resolve_call_to_function_block_cached(ctx, caller_site, helper_call)
     else {
         return;
     };
@@ -2111,6 +2353,132 @@ struct NetCollectCtx<'a> {
     helper_registry: &'a HelperRegistry,
     local_fns: &'a mut LocalFnCache,
     net: &'a mut NetCallResolver,
+    /// Memo for [`resolve_call_to_function_block`], keyed by the calling
+    /// site.
+    resolve_memo: FxHashMap<(FileId, TextRange), Option<ResolvedHelperFn>>,
+    /// Shared across files; see [`HelperStartReachCache`].
+    reach: &'a HelperStartReachCache,
+}
+
+type ResolvedHelperFn = (String, LuaBlock, LuaChunk, FileId);
+
+type HelperId = (FileId, String);
+
+const HELPER_REACH_SHARDS: usize = 32;
+
+/// Whether a helper body can transitively reach a `net.Start`.
+#[derive(Default)]
+struct HelperStartReachCache {
+    shards: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
+}
+
+impl HelperStartReachCache {
+    fn shard(&self, helper: &HelperId) -> &Mutex<FxHashMap<HelperId, bool>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        helper.hash(&mut hasher);
+        &self.shards[hasher.finish() as usize % HELPER_REACH_SHARDS]
+    }
+
+    fn get(&self, helper: &HelperId) -> Option<bool> {
+        self.shard(helper).lock().ok()?.get(helper).copied()
+    }
+
+    fn insert(&self, helper: HelperId, reaches: bool) {
+        if let Ok(mut shard) = self.shard(&helper).lock() {
+            shard.insert(helper, reaches);
+        }
+    }
+}
+
+/// Whether expanding `helper_block` can reach a `NetCallRole::Start`.
+fn helper_reaches_net_start(
+    ctx: &mut NetCollectCtx<'_>,
+    helper_site: &NetWalkSite,
+    helper_block: &LuaBlock,
+    helper: &HelperId,
+    stack: &mut Vec<HelperId>,
+) -> (bool, bool) {
+    if let Some(cached) = ctx.reach.get(helper) {
+        return (cached, false);
+    }
+    if stack.contains(helper) {
+        return (false, true);
+    }
+    stack.push(helper.clone());
+
+    let mut nested = Vec::new();
+    let mut reaches = false;
+    for call in helper_block
+        .syntax()
+        .descendants()
+        .filter_map(LuaCallExpr::cast)
+    {
+        if matches!(
+            ctx.net.role(ctx.db, helper_site.file_id, &call),
+            Some(NetCallRole::Start { .. })
+        ) {
+            reaches = true;
+            break;
+        }
+        nested.push(call);
+    }
+
+    let mut cycle_cut = false;
+    if !reaches {
+        for call in nested {
+            let Some((nested_key, nested_block, nested_root, nested_file_id)) =
+                resolve_call_to_function_block_cached(ctx, helper_site, &call)
+            else {
+                continue;
+            };
+            let nested_site = NetWalkSite {
+                root: nested_root,
+                file_id: nested_file_id,
+            };
+            let (nested_reaches, nested_cut) = helper_reaches_net_start(
+                ctx,
+                &nested_site,
+                &nested_block,
+                &(nested_file_id, nested_key),
+                stack,
+            );
+            cycle_cut |= nested_cut;
+            if nested_reaches {
+                reaches = true;
+                break;
+            }
+        }
+    }
+
+    stack.pop();
+    if reaches || !cycle_cut {
+        ctx.reach.insert(helper.clone(), reaches);
+    }
+    (reaches, cycle_cut)
+}
+
+/// [`resolve_call_to_function_block`] memoised on [`NetCollectCtx`].
+fn resolve_call_to_function_block_cached(
+    ctx: &mut NetCollectCtx<'_>,
+    site: &NetWalkSite,
+    call_expr: &LuaCallExpr,
+) -> Option<ResolvedHelperFn> {
+    let key = (site.file_id, call_expr.get_range());
+    if let Some(cached) = ctx.resolve_memo.get(&key) {
+        return cached.clone();
+    }
+
+    let resolved = resolve_call_to_function_block(
+        &site.root,
+        site.file_id,
+        call_expr,
+        ctx.helper_registry,
+        ctx.local_fns,
+        ctx.net,
+        ctx.db,
+    );
+    ctx.resolve_memo.insert(key, resolved.clone());
+    resolved
 }
 
 /// Position of the walk within a file, which changes when helper expansion
@@ -2296,15 +2664,7 @@ fn collect_net_ops_from_call_expr(
     }
 
     let Some((helper_key, helper_block, helper_root, helper_file_id)) =
-        resolve_call_to_function_block(
-            &site.root,
-            site.file_id,
-            call_expr,
-            ctx.helper_registry,
-            ctx.local_fns,
-            ctx.net,
-            ctx.db,
-        )
+        resolve_call_to_function_block_cached(ctx, site, call_expr)
     else {
         return;
     };
@@ -7044,11 +7404,44 @@ fn synthesize_panel_class_with_id(
                 }
             }
 
+            // A derma file conventionally uses the *global* `PANEL` scratch
+            // table (`PANEL = {}` … `function PANEL:Paint()` …
+            // `vgui.Register("X", PANEL, "DButton")`). At runtime that
+            // table is consumed by the register call and the next file
+            // overwrites the global, so each file's `PANEL` is a separate
+            // class — exactly like `ENT`/`SWEP`, which are modelled as
+            // scoped class globals.
+            for global_owner in global_panel_member_owners(db, var_name) {
+                let members = db
+                    .get_member_index()
+                    .get_current_owner_member_history(&global_owner);
+                for member in members {
+                    let member_id = member.get_id();
+                    if member_id.file_id != file_id {
+                        continue;
+                    }
+                    let member_position = member_id.get_position();
+                    if member_position >= register_position {
+                        continue;
+                    }
+                    if latest_write_position
+                        .is_some_and(|write_position| member_position < write_position)
+                    {
+                        continue;
+                    }
+                    if !member_defined_via_variable(db, file_id, member_position, var_name) {
+                        continue;
+                    }
+                    table_member_ids.insert(member_id);
+                }
+            }
+
             let mut table_member_ids = table_member_ids.into_iter().collect::<Vec<_>>();
             table_member_ids
                 .sort_unstable_by_key(|member_id| (member_id.file_id.id, member_id.get_position()));
             for member_id in table_member_ids {
                 add_member(db, class_member_owner.clone(), member_id);
+                db.get_member_index_mut().pin_synthesized_owner(member_id);
             }
 
             // Backfill persistent type caches that still hold this exact
@@ -7160,6 +7553,22 @@ fn bind_inline_vgui_panel_table(
 ///
 /// Callers slice the resulting members by source position to attribute them to
 /// the correct region.
+/// Owners a *global* panel-table variable's members can be sitting on.
+///
+/// Decl analysis parks `PANEL.Field` / `function PANEL:Method()` under
+/// `GlobalPath("PANEL")`; the global-member migration then re-homes them onto
+/// whatever the `PANEL` declaration resolved to, which for GMod workspaces is
+/// the annotation `@class PANEL`. Both are checked so the transfer works
+/// whichever stage the member reached.
+fn global_panel_member_owners(db: &DbIndex, var_name: &str) -> Vec<LuaMemberOwner> {
+    let mut owners = vec![LuaMemberOwner::GlobalPath(GlobalId::new(var_name))];
+    let type_decl_id = LuaTypeDeclId::global(var_name);
+    if db.get_type_index().get_type_decl(&type_decl_id).is_some() {
+        owners.push(LuaMemberOwner::Type(type_decl_id));
+    }
+    owners
+}
+
 fn collect_panel_member_source_ranges(
     cache: &mut VguiSynthesisCache,
     db: &DbIndex,
@@ -7507,8 +7916,18 @@ struct GmodSystemCallSite {
     callback_arg_idx: Option<usize>,
 }
 
-#[derive(Default)]
-struct AnnotatedGmodGlobalCallRoleMap {
+impl std::fmt::Debug for AnnotatedGmodGlobalCallRoleMap {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The contents are a large derived lookup table; a summary keeps
+        // `AnalyzeContext`'s `Debug` useful without dumping thousands of rows.
+        f.debug_struct("AnnotatedGmodGlobalCallRoleMap")
+            .field("paths", &self.roles_by_path.len())
+            .finish_non_exhaustive()
+    }
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct AnnotatedGmodGlobalCallRoleMap {
     roles_by_path: HashMap<String, AnnotatedGmodCallRoles>,
     candidate_call_path_matcher: Option<AhoCorasick>,
     candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
@@ -8294,25 +8713,29 @@ fn canonical_net_op_rank(db: &DbIndex, signature_id: LuaSignatureId) -> Canonica
 }
 
 impl AnnotatedGmodGlobalCallRoleMap {
-    fn build(db: &DbIndex) -> Self {
-        Self::build_with_helpers(db, None)
-    }
-
-    fn build_with_helpers(
+    /// One file's contribution to the role map, plus the helper definitions its
+    /// signatures produced. Cached on the db and re-derived only when the file
+    /// is re-analysed — see `DbIndex::get_cached_file_helper_scan`.
+    fn build_for_file(
         db: &DbIndex,
-        mut helper_registry: Option<&mut HelperRegistryBuilder>,
-    ) -> Self {
+        signature_ids: &[LuaSignatureId],
+        file_has_calls: bool,
+    ) -> FileHelperScan {
+        let mut builder = HelperRegistryBuilder::with_file_has_calls(
+            signature_ids
+                .first()
+                .map(|signature_id| (signature_id.get_file_id(), file_has_calls))
+                .into_iter()
+                .collect(),
+        );
         let mut role_map = Self::default();
-        for (signature_id, signature) in db.get_signature_index().iter() {
-            if let Some(helper_registry) = helper_registry.as_deref_mut() {
-                helper_registry.add_signature(db, *signature_id);
-            }
-            // Net payload/send metadata rides on standalone signature attributes
-            // rather than call-arg roles, so it is collected before the
-            // `has_call_arg_roles` filter — keeping this to a single pass over
-            // the signature index instead of adding a second whole-index scan.
+        for signature_id in signature_ids {
+            builder.add_signature(db, *signature_id);
             role_map.add_signature_net_op(db, *signature_id);
 
+            let Some(signature) = db.get_signature_index().get(signature_id) else {
+                continue;
+            };
             if !signature.has_call_arg_roles() {
                 continue;
             }
@@ -8322,9 +8745,34 @@ impl AnnotatedGmodGlobalCallRoleMap {
             role_map.add_signature_closure(db, *signature_id, &closure);
         }
 
-        role_map.rebuild_candidate_call_path_set();
+        FileHelperScan {
+            role_map,
+            definitions: builder.definitions,
+        }
+    }
 
-        role_map
+    /// Folds another file's fragment in. Files are merged in a fixed order and
+    /// the first file to define a call path wins, so a path that two files both
+    /// define resolves the same way every run — the previous whole-index fold
+    /// took the signature index's `HashMap` order, which varies per process.
+    fn merge_from(&mut self, other: &Self) {
+        for (path, roles) in &other.roles_by_path {
+            self.roles_by_path
+                .entry(path.clone())
+                .or_insert_with(|| roles.clone());
+        }
+        self.environment_role_source_files
+            .extend(other.environment_role_source_files.iter().copied());
+        for (key, candidate) in &other.canonical_net_ops {
+            self.canonical_net_ops
+                .entry(key.clone())
+                .and_modify(|current| {
+                    if candidate.0 < current.0 {
+                        *current = candidate.clone();
+                    }
+                })
+                .or_insert_with(|| candidate.clone());
+        }
     }
 
     /// Records the canonical function name for an annotated payload op.

@@ -532,7 +532,7 @@ pub(super) fn stabilize_unguarded_children(
             kind: LuaInferenceProvenanceKind::UnguardedChild,
             source: source.clone(),
         };
-        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let typ = LuaType::from_inferred_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
         for child in &winners {
             support.extend(
@@ -582,7 +582,7 @@ pub(super) fn stabilize_unguarded_children(
                 .unwrap_or_else(|| right.get_name());
             compare_unguarded_child_candidates(left, left_display_name, right, right_display_name)
         });
-        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let typ = LuaType::from_inferred_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
         for child in &winners {
             support.extend(

@@ -72,7 +72,11 @@ impl CallSiteParamAccumulator {
         );
         provenance.extend_from_slice(self.first_fact.provenance());
         provenance.extend(self.additional_provenance);
-        LuaTypeFact::new(LuaType::from_vec(types), self.confidence, provenance.into())
+        LuaTypeFact::new(
+            LuaType::from_inferred_vec(types),
+            self.confidence,
+            provenance.into(),
+        )
     }
 }
 
@@ -106,6 +110,9 @@ pub struct CallSiteParamIndex {
     /// These survive dependent reindexing while a producer is absent so reopening the producer
     /// can invalidate its consumers. Direct consumer edits refresh their entry exactly.
     file_source_dependencies: HashMap<FileId, HashSet<FileId>>,
+    /// signature-owning file → files whose call sites supplied the inferred
+    /// parameter types for signatures declared in it.
+    signature_param_contributors: HashMap<FileId, HashSet<FileId>>,
     source_dependents: HashMap<FileId, HashSet<FileId>>,
     source_paths: HashMap<FileId, PathBuf>,
     source_path_dependents: HashMap<PathBuf, HashSet<FileId>>,
@@ -229,6 +236,45 @@ impl CallSiteParamIndex {
                 (previous.get(&(signature_id, param_idx)) != Some(&current)).then_some(signature_id)
             })
             .collect()
+    }
+
+    /// The inferred parameter facts of every signature that `file_ids`
+    /// supply call-site evidence for.
+    pub(crate) fn inferred_params_for_contributor_files(
+        &self,
+        file_ids: &HashSet<FileId>,
+    ) -> HashMap<(LuaSignatureId, usize), LuaType> {
+        let mut out = HashMap::new();
+        for file_id in file_ids {
+            let Some(contributions) = self.file_contributions.get(file_id) else {
+                continue;
+            };
+            for contribution in contributions {
+                let key = (contribution.signature_id, contribution.param_idx);
+                if out.contains_key(&key) {
+                    continue;
+                }
+                if let Some(fact) =
+                    self.get_inferred_param_fact(&contribution.signature_id, contribution.param_idx)
+                {
+                    out.insert(key, fact.typ().clone());
+                }
+            }
+        }
+        out
+    }
+
+    /// Every call-site-inferred parameter type currently indexed.
+    pub fn iter_inferred_params(
+        &self,
+    ) -> impl Iterator<Item = (&LuaSignatureId, usize, &LuaTypeFact)> {
+        self.inferred_params
+            .iter()
+            .flat_map(|(signature_id, params)| {
+                params
+                    .iter()
+                    .map(move |(param_idx, fact)| (signature_id, *param_idx, fact))
+            })
     }
 
     pub fn get_inferred_param(
@@ -391,6 +437,7 @@ impl CallSiteParamIndex {
         self.inferred_params.clear();
         self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
+        self.signature_param_contributors.clear();
 
         let mut accumulators =
             HashMap::<LuaSignatureId, HashMap<usize, CallSiteParamAccumulator>>::new();
@@ -408,6 +455,20 @@ impl CallSiteParamIndex {
                             .or_default()
                             .insert(step.event.source.file_id);
                     }
+                }
+                // The callee depends on this caller: its body is typed by the
+                // parameter fact contributed here. Only an informative fact can
+                // change how the callee's body types, so an `unknown`/`any`
+                // contribution buys nothing and would only widen every reindex
+                // that touches a call site.
+                let signature_file_id = contribution.signature_id.get_file_id();
+                if signature_file_id != file_id
+                    && crate::db_index::is_informative_type(contribution.param_fact.typ())
+                {
+                    self.signature_param_contributors
+                        .entry(signature_file_id)
+                        .or_default()
+                        .insert(file_id);
                 }
                 accumulators
                     .entry(contribution.signature_id)
@@ -587,6 +648,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
         self.file_source_dependencies.clear();
+        self.signature_param_contributors.clear();
         self.source_dependents.clear();
         self.source_paths.clear();
         self.source_path_dependents.clear();
@@ -642,7 +704,11 @@ mod tests {
             (higher_file_id, vec![higher_file_contribution]),
         ]);
 
-        let expected = vec![LuaType::String, LuaType::Boolean];
+        // The union is canonicalised by type rather than by which file
+        // contributed first, so the order no longer depends on the contributing
+        // set being complete — an incremental reindex that replaces only some
+        // files' contributions still produces this exact union.
+        let expected = vec![LuaType::Boolean, LuaType::String];
         assert_eq!(
             inferred_union_members(&forward_index, &signature_id),
             expected

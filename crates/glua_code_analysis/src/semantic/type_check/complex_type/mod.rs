@@ -5,7 +5,7 @@ mod object_type_check;
 mod table_generic_check;
 mod tuple_type_check;
 
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use array_type_check::check_array_type_compact;
 use call_type_check::check_call_type_compact;
@@ -196,7 +196,7 @@ fn check_merged_table_type_compact(
 
 fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
     let members = find_members(context.db, typ).unwrap_or_default();
-    let fields: HashMap<_, _> = members
+    let fields: BTreeMap<_, _> = members
         .into_iter()
         .map(|member| (member.key, member.typ))
         .collect();

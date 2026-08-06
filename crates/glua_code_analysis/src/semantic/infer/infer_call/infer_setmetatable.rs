@@ -27,7 +27,22 @@ pub fn infer_setmetatable_call(
     let basic_table = args[0].clone();
     let metatable = args[1].clone();
 
-    let (meta_type, is_index) = infer_metatable_index_type(db, cache, metatable)?;
+    // A metatable whose own type is not inferred yet must not be answered
+    // with the bare table: that fallback is indistinguishable from "this
+    // metatable really has no `__index`", and committing it freezes the
+    // wrong result for good. Deferring lets the resolution machinery retry
+    // once the metatable has a type — which is how a self-referential
+    // `setmetatable(T, T)` constructor resolves at all.
+    let (meta_type, is_index) = match infer_metatable_index_type(db, cache, metatable.clone())? {
+        MetatableIndex::Unresolved => {
+            return Err(InferFailReason::UnResolveExpr(InFiled::new(
+                cache.get_file_id(),
+                metatable,
+            )));
+        }
+        MetatableIndex::Index(index_type) => (index_type, true),
+        MetatableIndex::NoIndex(meta_type) => (meta_type, false),
+    };
     match &basic_table {
         LuaExpr::TableExpr(table_expr) => {
             if table_expr.is_empty() && is_index {
@@ -149,11 +164,22 @@ fn table_backing_range_from_expr(
 //     None
 // }
 
+/// Outcome of looking for a metatable's `__index`.
+enum MetatableIndex {
+    /// `__index` resolved to this type.
+    Index(LuaType),
+    /// The metatable resolved, and it has no usable `__index`.
+    NoIndex(LuaType),
+    /// The metatable's own type has not been inferred yet.
+    Unresolved,
+}
+
 fn infer_metatable_index_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     metatable: LuaExpr,
-) -> Result<(LuaType, bool /*__index type*/), InferFailReason> {
+) -> Result<MetatableIndex, InferFailReason> {
+    let metatable_expr = metatable.clone();
     if let LuaExpr::TableExpr(table) = &metatable {
         if let Some(index_value) = last_table_literal_index_value(table) {
             if matches!(
@@ -163,7 +189,7 @@ fn infer_metatable_index_type(
                     | LuaExpr::IndexExpr(_)
                     | LuaExpr::NameExpr(_)
             ) {
-                return Ok((infer_expr(db, cache, index_value)?, true));
+                return Ok(MetatableIndex::Index(infer_expr(db, cache, index_value)?));
             }
 
             let inferred_type = infer_expr(db, cache, index_value.clone()).ok();
@@ -177,8 +203,12 @@ fn infer_metatable_index_type(
                 .or(inferred_type);
             if let Some(index_type) = index_type {
                 return Ok(match classify_metatable_index_candidate(&index_type) {
-                    MetatableIndexCandidate::Supported(index_type) => (index_type, true),
-                    MetatableIndexCandidate::Unsupported => (LuaType::Unknown, false),
+                    MetatableIndexCandidate::Supported(index_type) => {
+                        MetatableIndex::Index(index_type)
+                    }
+                    MetatableIndexCandidate::Unsupported => {
+                        MetatableIndex::NoIndex(LuaType::Unknown)
+                    }
                 });
             }
         }
@@ -186,12 +216,14 @@ fn infer_metatable_index_type(
 
     let meta_type = match infer_receiver_owner_type(db, cache, &metatable) {
         ReceiverOwnerType::Exact(owner_type) => owner_type,
-        ReceiverOwnerType::Rejected => return Ok((LuaType::Unknown, false)),
+        ReceiverOwnerType::Rejected => return Ok(MetatableIndex::NoIndex(LuaType::Unknown)),
         ReceiverOwnerType::NotReceiver => infer_expr(db, cache, metatable)?,
     };
     match exact_table_index_type(db, cache, &meta_type) {
-        ExactMetatableIndexType::Exact(index_type) => return Ok((index_type, true)),
-        ExactMetatableIndexType::Rejected => return Ok((LuaType::Unknown, false)),
+        ExactMetatableIndexType::Exact(index_type) => {
+            return Ok(MetatableIndex::Index(index_type));
+        }
+        ExactMetatableIndexType::Rejected => return Ok(MetatableIndex::NoIndex(LuaType::Unknown)),
         ExactMetatableIndexType::None => {}
     }
 
@@ -203,20 +235,66 @@ fn infer_metatable_index_type(
             match classify_metatable_index_candidate(&meta_member.typ) {
                 MetatableIndexCandidate::Supported(index_type) => index_types.push(index_type),
                 MetatableIndexCandidate::Unsupported => {
-                    return Ok((LuaType::Unknown, false));
+                    return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
                 }
             }
         }
 
         if let Some(index_type) = index_types.first() {
             if index_types.iter().all(|candidate| candidate == index_type) {
-                return Ok((index_type.clone(), true));
+                return Ok(MetatableIndex::Index(index_type.clone()));
             }
-            return Ok((LuaType::Unknown, false));
+            return Ok(MetatableIndex::NoIndex(LuaType::Unknown));
         }
     }
 
-    Ok((meta_type, false))
+    // No `__index` was found. Whether that is an answer depends on whether
+    // the metatable itself is known.
+    if meta_type.is_unknown()
+        && metatable_is_receiver_field(db, cache, &metatable_expr)
+        && !metatable_already_finalised(db, cache, &metatable_expr)
+    {
+        return Ok(MetatableIndex::Unresolved);
+    }
+    Ok(MetatableIndex::NoIndex(meta_type))
+}
+
+/// Whether the resolution machinery has already given up on this
+/// expression.
+fn metatable_already_finalised(db: &DbIndex, cache: &LuaInferCache, metatable: &LuaExpr) -> bool {
+    let owner =
+        crate::LuaTypeOwner::SyntaxId(InFiled::new(cache.get_file_id(), metatable.get_syntax_id()));
+    db.get_type_index().get_type_cache(&owner).is_some()
+}
+
+/// Whether the metatable expression is a field reached from the enclosing
+/// function's receiver.
+fn metatable_is_receiver_field(db: &DbIndex, cache: &LuaInferCache, metatable: &LuaExpr) -> bool {
+    let LuaExpr::IndexExpr(index_expr) = metatable else {
+        return false;
+    };
+    match index_expr.get_prefix_expr() {
+        // `self.a.b` is still rooted at the receiver.
+        Some(prefix @ LuaExpr::IndexExpr(_)) => metatable_is_receiver_field(db, cache, &prefix),
+        Some(LuaExpr::NameExpr(name_expr)) => {
+            if name_expr.get_name_text().as_deref() != Some("self") {
+                return false;
+            }
+            let Some(decl_id) = db
+                .get_reference_index()
+                .get_var_reference_decl(&cache.get_file_id(), name_expr.get_range())
+            else {
+                return false;
+            };
+            db.get_decl_index().get_decl(&decl_id).is_some_and(|decl| {
+                matches!(
+                    &decl.extra,
+                    LuaDeclExtra::Param { idx: 0, .. } | LuaDeclExtra::ImplicitSelf { .. }
+                )
+            })
+        }
+        _ => false,
+    }
 }
 
 enum ReceiverOwnerType {

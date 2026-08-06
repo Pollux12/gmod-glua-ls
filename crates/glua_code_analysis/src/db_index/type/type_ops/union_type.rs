@@ -2,6 +2,11 @@ use std::ops::Deref;
 
 use crate::{DbIndex, LuaType, LuaUnionType, get_real_type};
 
+// `TypeOps::Union` deliberately preserves member order. It is used both to
+// accumulate inferred alternatives *and* to build declared unions and
+// overload sets, where the author's order is meaningful — overloads are
+// displayed and matched in declaration order.
+
 pub fn union_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
     let real_type = get_real_type(db, &source).unwrap_or(&source);
 

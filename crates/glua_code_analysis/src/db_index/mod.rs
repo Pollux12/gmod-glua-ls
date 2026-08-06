@@ -23,7 +23,11 @@ mod signature;
 mod traits;
 mod r#type;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
@@ -84,6 +88,8 @@ pub struct DbIndex {
     /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
+    file_has_call_expr: HashMap<FileId, bool>,
+    file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
@@ -135,7 +141,36 @@ impl DbIndex {
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_registry_cache: RevisionedCache::default(),
+            file_has_call_expr: HashMap::new(),
+            file_helper_scan_cache: HashMap::new(),
         }
+    }
+
+    /// Whether a file contains any call expression at all.
+    pub fn get_file_has_call_expr(&self, file_id: FileId) -> Option<bool> {
+        self.file_has_call_expr.get(&file_id).copied()
+    }
+
+    pub fn set_file_has_call_expr(&mut self, file_id: FileId, has_calls: bool) {
+        self.file_has_call_expr.insert(file_id, has_calls);
+    }
+
+    /// One file's contribution to the gmod net-helper scan.
+    pub fn get_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<T>> {
+        self.file_helper_scan_cache
+            .get(&file_id)
+            .and_then(|value| value.clone().downcast::<T>().ok())
+    }
+
+    pub fn set_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
+        &mut self,
+        file_id: FileId,
+        value: Arc<T>,
+    ) {
+        self.file_helper_scan_cache.insert(file_id, value);
     }
 
     /// Fetch the cached gmod net-helper registry if it was built at `revision`.
@@ -171,6 +206,10 @@ impl DbIndex {
         }
 
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
+        for &file_id in &file_ids {
+            self.file_has_call_expr.remove(&file_id);
+            self.file_helper_scan_cache.remove(&file_id);
+        }
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
                 log::debug!(
@@ -562,5 +601,13 @@ impl LuaIndex for DbIndex {
         self.metatable_index.clear();
         self.global_index.clear();
         self.json_schema_index.clear();
+        // Derived caches have to go with the facts they were derived from.
+        // `clear` does not touch the VFS, so `content_revision` and the
+        // signature count both return to their old values once the same file
+        // set is re-indexed — the revision key would hand back a registry built
+        // against the discarded index.
+        self.helper_registry_cache = RevisionedCache::default();
+        self.file_has_call_expr.clear();
+        self.file_helper_scan_cache.clear();
     }
 }

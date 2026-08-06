@@ -1,6 +1,7 @@
 mod migrate_global_member;
 pub(super) use migrate_global_member::{
     migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
+    reconcile_parked_global_path_members,
 };
 use rowan::TextRange;
 
@@ -118,6 +119,7 @@ fn should_replace_uninformative_resolved_cache(
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
 }
 
+/// Whether a freshly inferred cache should displace what is already stored.
 fn should_replace_uninformative_inferred_cache(
     type_owner: &LuaTypeOwner,
     current_cache: &LuaTypeCache,
@@ -127,11 +129,28 @@ fn should_replace_uninformative_inferred_cache(
         return true;
     }
 
+    if should_replace_bottom_infer_type_cache(current_cache, new_cache) {
+        return true;
+    }
+
     if !matches!(type_owner, LuaTypeOwner::Member(_)) {
         return false;
     }
 
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
+}
+
+/// `nil` and `never` sit at the bottom of the type lattice: they record
+/// that no value was found, not that any value is allowed. A concrete
+/// inferred type is strictly more precise, so it has to win regardless of
+/// which round produced it — a local that an early round saw only as `nil`
+/// must not stay `nil` once the assignment that gives it a table has been
+/// analysed.
+fn should_replace_bottom_infer_type_cache(
+    current_cache: &LuaTypeCache,
+    new_cache: &LuaTypeCache,
+) -> bool {
+    new_cache.supersedes(current_cache)
 }
 
 fn should_replace_uninformative_infer_type_cache(
