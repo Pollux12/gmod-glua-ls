@@ -24,6 +24,9 @@ use member_write_policy::{
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
+pub(in crate::compilation::analyzer) use stats::{
+    has_multiple_distinct_index_expr_member_owners, is_guarded_table_assignment_index_expr,
+};
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
     analyze_table_field, flush_pending_dynamic_key_collection_widenings,

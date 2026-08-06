@@ -509,7 +509,15 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
         }
         Err(InferFailReason::None) => {}
         Err(reason) => {
-            // record unresolve
+            // Every other branch above reaches
+            // `apply_index_expr_member_owner`, which *creates* the
+            // `LuaMember` and then attaches it. This branch cannot: the
+            // prefix is not inferable yet, so there is no owner to attach
+            // to.
+            crate::compilation::analyzer::census::record(
+                "set_index_expr_owner.deferred",
+                crate::compilation::analyzer::unresolve::infer_fail_reason_label(&reason),
+            );
             let unresolve_member = UnResolveMember {
                 file_id: analyzer.file_id,
                 member_id: LuaMemberId::new(var_expr.get_syntax_id(), analyzer.file_id),
@@ -549,7 +557,9 @@ fn should_skip_ambiguous_unknown_key_table_owner(
     has_multiple_distinct_index_expr_member_owners(prefix_type)
 }
 
-fn has_multiple_distinct_index_expr_member_owners(typ: &LuaType) -> bool {
+pub(in crate::compilation::analyzer) fn has_multiple_distinct_index_expr_member_owners(
+    typ: &LuaType,
+) -> bool {
     let mut owners = HashSet::new();
     collect_distinct_index_expr_member_owners(typ, &mut owners);
     owners.len() > 1
@@ -1981,7 +1991,9 @@ fn is_guarded_table_assignment_member(db: &crate::DbIndex, member_id: LuaMemberI
     is_guarded_table_assignment_index_expr(&index_expr)
 }
 
-fn is_guarded_table_assignment_index_expr(index_expr: &LuaIndexExpr) -> bool {
+pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
+    index_expr: &LuaIndexExpr,
+) -> bool {
     let Some(var) = LuaVarExpr::cast(index_expr.syntax().clone()) else {
         return false;
     };

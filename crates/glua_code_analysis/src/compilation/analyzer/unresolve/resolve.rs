@@ -21,11 +21,15 @@ use crate::{
         common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
-            infer_for_range_iter_expr_func, resolve_index_expr_member_owner_for_file,
+            has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
+            is_guarded_table_assignment_index_expr, resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
-    db_index::{LuaFunctionType, LuaMemberOwner, LuaOutParamRoot, LuaSignature, LuaSignatureId},
+    db_index::{
+        LuaFunctionType, LuaMemberFeature, LuaMemberOwner, LuaOutParamRoot, LuaSignature,
+        LuaSignatureId,
+    },
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
@@ -63,6 +67,48 @@ pub fn try_resolve_decl(
 
     bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     Ok(())
+}
+
+/// `try_resolve_member` ends in `add_member`, which can only re-home a
+/// member that already exists. The Lua pass creates the member itself in
+/// `apply_index_expr_member_owner`, but the branch that queued this
+/// deferral never got that far — its prefix was not inferable while its own
+/// file was analysed — so `t[k] = v` would otherwise leave no member at
+/// all.
+fn create_deferred_index_expr_member(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    prefix_type: &LuaType,
+    owner: LuaMemberOwner,
+    member_id: LuaMemberId,
+) -> Option<()> {
+    let root = db
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)?
+        .get_red_root();
+    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let index_key = index_expr.get_index_key()?;
+    let member_key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key).ok()?;
+    // An unknown key cannot pick between candidate tables, so pinning the member
+    // to one of them would be a guess. Same skip as the Lua pass.
+    if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown())
+        && has_multiple_distinct_index_expr_member_owners(prefix_type)
+    {
+        return Some(());
+    }
+
+    let feature = if db.get_module_index().is_meta_file(&member_id.file_id) {
+        LuaMemberFeature::MetaDefine
+    } else {
+        LuaMemberFeature::FileDefine
+    };
+    if is_guarded_table_assignment_index_expr(&index_expr) {
+        db.get_member_index_mut()
+            .mark_non_overwriting_assignment_member(member_id);
+    }
+    let member = LuaMember::new(member_id, member_key, feature, None);
+    db.get_member_index_mut().add_member(owner, member);
+    Some(())
 }
 
 fn should_defer_guarded_index_alias_resolution(
@@ -174,6 +220,18 @@ pub fn try_resolve_member(
                     member_id,
                 );
             } else {
+                if db.get_member_index().get_member(&member_id).is_none() {
+                    super::census::record("try_resolve_member.add_member", "member_missing");
+                    create_deferred_index_expr_member(
+                        db,
+                        cache,
+                        &prefix_type,
+                        member_owner.clone(),
+                        member_id,
+                    );
+                } else {
+                    super::census::record("try_resolve_member.add_member", "member_present");
+                }
                 add_member(db, member_owner, member_id);
             }
         }
