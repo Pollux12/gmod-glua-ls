@@ -54,6 +54,17 @@ pub fn infer_name_expr(
         .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&range));
 
+    let reads_local = decl_id.is_some_and(|id| {
+        db.get_decl_index()
+            .get_decl(&id)
+            .is_some_and(|decl| decl.is_local())
+    });
+    if !reads_local
+        && let Some(result) = infer_local_init_global_read(db, file_id, &name_expr, name)
+    {
+        return result;
+    }
+
     let result = if let Some(decl_id) = decl_id {
         if db
             .get_decl_index()
@@ -1959,11 +1970,52 @@ fn find_param_type_from_union(
     }
 }
 
+/// `local x = foo` runs before any `function foo` / `foo = ...` statement
+/// that appears later in the same file, so those declarations cannot be the
+/// value it captures. Without this, the classic wrapper idiom (`local orig
+/// = foo` + `function foo(...) return orig(...) end`) binds `orig` to the
+/// wrapper itself, making it self-recursive and collapsing its return type.
+fn infer_local_init_global_read(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    name: &str,
+) -> Option<InferResult> {
+    name_expr.get_parent::<LuaLocalStat>()?;
+
+    let position = name_expr.get_position();
+    let decl_ids = db.get_global_index().get_global_decl_ids(name)?;
+    if !decl_ids
+        .iter()
+        .any(|id| id.file_id == file_id && id.position > position)
+    {
+        return None;
+    }
+
+    Some(infer_global_type_impl(
+        db,
+        Some(file_id),
+        Some(position),
+        name,
+        true,
+    ))
+}
+
 pub fn infer_global_type(
     db: &DbIndex,
     current_file_id: Option<FileId>,
     call_offset: Option<TextSize>,
     name: &str,
+) -> InferResult {
+    infer_global_type_impl(db, current_file_id, call_offset, name, false)
+}
+
+fn infer_global_type_impl(
+    db: &DbIndex,
+    current_file_id: Option<FileId>,
+    call_offset: Option<TextSize>,
+    name: &str,
+    skip_later_decls_in_current_file: bool,
 ) -> InferResult {
     if db.get_emmyrc().gmod.enabled && name == "NULL" {
         let null_decl_id = LuaTypeDeclId::global("NULL");
@@ -2012,6 +2064,29 @@ pub fn infer_global_type(
 
     if priority_tiers.is_empty() {
         return Err(InferFailReason::None);
+    }
+
+    // Drop declarations that the reference cannot have seen yet (see
+    // `infer_local_init_global_read`). If nothing is left, no earlier
+    // declaration exists at all and the normal resolution stands.
+    let mut priority_tiers = priority_tiers;
+    if skip_later_decls_in_current_file
+        && let Some((file_id, offset)) = current_file_id.zip(call_offset)
+    {
+        let filtered: Vec<_> = priority_tiers
+            .iter()
+            .filter_map(|(priority, decl_ids)| {
+                let decl_ids: Vec<_> = decl_ids
+                    .iter()
+                    .copied()
+                    .filter(|id| !(id.file_id == file_id && id.position > offset))
+                    .collect();
+                (!decl_ids.is_empty()).then_some((*priority, decl_ids))
+            })
+            .collect();
+        if !filtered.is_empty() {
+            priority_tiers = filtered;
+        }
     }
 
     // A top-priority global can exist before its type cache is resolved while
