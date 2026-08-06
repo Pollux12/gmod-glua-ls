@@ -59,11 +59,16 @@ pub fn infer_name_expr(
             .get_decl(&id)
             .is_some_and(|decl| decl.is_local())
     });
-    if !reads_local
-        && let Some(result) = infer_local_init_global_read(db, file_id, &name_expr, name)
-    {
-        return result;
-    }
+    // `local x = foo` cannot see a `foo` declared further down the same file,
+    // so those declarations are filtered out of every global lookup below —
+    // including the one the resolved `decl_id` would otherwise point at.
+    let skip_later_decls_in_current_file =
+        !reads_local && reads_global_declared_later_in_file(db, file_id, &name_expr, name);
+    let decl_id = decl_id.filter(|id| {
+        !(skip_later_decls_in_current_file
+            && id.file_id == file_id
+            && id.position > name_expr.get_position())
+    });
 
     let result = if let Some(decl_id) = decl_id {
         if db
@@ -99,41 +104,59 @@ pub fn infer_name_expr(
             return Ok(LuaType::Def(class_decl_id));
         }
 
-        match get_name_expr_var_ref_id(db, cache, &name_expr) {
-            Some(var_ref_id) => {
-                let narrow_res = infer_expr_narrow_type(
-                    db,
-                    cache,
-                    LuaExpr::NameExpr(name_expr.clone()),
-                    var_ref_id,
-                );
-                if decl_id.is_none() {
-                    if let Ok(ref typ) = narrow_res {
-                        let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
-                        if should_fallback {
-                            if let Ok(global_type) = infer_global_type(
-                                db,
-                                Some(file_id),
-                                Some(name_expr.get_position()),
-                                name,
-                            ) {
-                                if global_type.is_custom_type()
-                                    || (!global_type.is_nil()
-                                        && !global_type.is_nullable()
-                                        && !global_type.is_unknown()
-                                        && !matches!(global_type, LuaType::Any | LuaType::Never))
-                                {
-                                    return Ok(global_type);
+        // The var-ref path narrows through the decl the reference index found,
+        // which here is the very declaration this read cannot have seen, so it
+        // would reintroduce what the filter removes. Go straight to the
+        // filtered global lookup.
+        if skip_later_decls_in_current_file {
+            infer_global_type_impl(
+                db,
+                Some(file_id),
+                Some(name_expr.get_position()),
+                name,
+                true,
+            )
+        } else {
+            match get_name_expr_var_ref_id(db, cache, &name_expr) {
+                Some(var_ref_id) => {
+                    let narrow_res = infer_expr_narrow_type(
+                        db,
+                        cache,
+                        LuaExpr::NameExpr(name_expr.clone()),
+                        var_ref_id,
+                    );
+                    if decl_id.is_none() {
+                        if let Ok(ref typ) = narrow_res {
+                            let should_fallback =
+                                typ.is_nil() || matches!(typ, LuaType::TableConst(_));
+                            if should_fallback {
+                                if let Ok(global_type) = infer_global_type(
+                                    db,
+                                    Some(file_id),
+                                    Some(name_expr.get_position()),
+                                    name,
+                                ) {
+                                    if global_type.is_custom_type()
+                                        || (!global_type.is_nil()
+                                            && !global_type.is_nullable()
+                                            && !global_type.is_unknown()
+                                            && !matches!(
+                                                global_type,
+                                                LuaType::Any | LuaType::Never
+                                            ))
+                                    {
+                                        return Ok(global_type);
+                                    }
                                 }
                             }
                         }
                     }
+                    narrow_res.or_else(|_| {
+                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
+                    })
                 }
-                narrow_res.or_else(|_| {
-                    infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                })
+                None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
             }
-            None => infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name),
         }
     };
 
@@ -1975,30 +1998,31 @@ fn find_param_type_from_union(
 /// value it captures. Without this, the classic wrapper idiom (`local orig
 /// = foo` + `function foo(...) return orig(...) end`) binds `orig` to the
 /// wrapper itself, making it self-recursive and collapsing its return type.
-fn infer_local_init_global_read(
+fn reads_global_declared_later_in_file(
     db: &DbIndex,
     file_id: FileId,
     name_expr: &LuaNameExpr,
     name: &str,
-) -> Option<InferResult> {
-    name_expr.get_parent::<LuaLocalStat>()?;
-
-    let position = name_expr.get_position();
-    let decl_ids = db.get_global_index().get_global_decl_ids(name)?;
-    if !decl_ids
-        .iter()
-        .any(|id| id.file_id == file_id && id.position > position)
+) -> bool {
+    if name_expr.get_parent::<LuaLocalStat>().is_none() {
+        return false;
+    }
+    if name_expr
+        .syntax()
+        .ancestors()
+        .any(|ancestor| LuaClosureExpr::can_cast(ancestor.kind().into()))
     {
-        return None;
+        return false;
     }
 
-    Some(infer_global_type_impl(
-        db,
-        Some(file_id),
-        Some(position),
-        name,
-        true,
-    ))
+    let position = name_expr.get_position();
+    db.get_global_index()
+        .get_global_decl_ids(name)
+        .is_some_and(|decl_ids| {
+            decl_ids
+                .iter()
+                .any(|id| id.file_id == file_id && id.position > position)
+        })
 }
 
 pub fn infer_global_type(
@@ -2067,7 +2091,7 @@ fn infer_global_type_impl(
     }
 
     // Drop declarations that the reference cannot have seen yet (see
-    // `infer_local_init_global_read`). If nothing is left, no earlier
+    // `reads_global_declared_later_in_file`). If nothing is left, no earlier
     // declaration exists at all and the normal resolution stands.
     let mut priority_tiers = priority_tiers;
     if skip_later_decls_in_current_file
