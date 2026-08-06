@@ -199,6 +199,7 @@ async fn main() {
     // Phase 4b: Incremental edit latency (simulates a keystroke re-index of a
     // single already-indexed file — the interactive-editing hot path). Optional,
     // enabled with BENCH_INCREMENTAL=1.
+    let mut incremental_worst: Option<std::time::Duration> = None;
     if std::env::var("BENCH_INCREMENTAL").is_ok() {
         let main_ids = analysis
             .compilation
@@ -249,6 +250,7 @@ async fn main() {
                 total.as_secs_f64() / edited as f64,
                 worst.as_secs_f64()
             );
+            incremental_worst = Some(worst);
         }
     }
 
@@ -409,5 +411,25 @@ async fn main() {
         target_status
     );
     eprintln!("Target: ≤10s");
+
+    // A single-file edit is the interactive hot path: the user is typing, and
+    // every keystroke that lands pays this. Budget it separately from the cold
+    // index — a workspace that indexes in 10s is useless if each edit costs a
+    // second.
+    if let Some(worst) = incremental_worst {
+        let incremental_target = std::time::Duration::from_secs(1);
+        let status = if worst <= incremental_target {
+            "✅ TARGET MET"
+        } else {
+            "❌ TARGET NOT MET"
+        };
+        eprintln!(
+            "{:<45} {:>10.3}s  {}",
+            "INCREMENTAL EDIT (worst)",
+            worst.as_secs_f64(),
+            status
+        );
+        eprintln!("Target: ≤1s per single-file edit");
+    }
     eprintln!("========================================");
 }
