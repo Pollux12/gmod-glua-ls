@@ -13009,6 +13009,28 @@ fn dynamic_file_find_targets(
     usage: &DynamicLoadUsage,
     relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
 ) -> Vec<(FileId, String)> {
+    // `targets` is consumed in order by `apply_dynamic_loaders`, which feeds the
+    // load-graph fixpoint, so the order has to be a property of the source. The
+    // directory branch walks a `HashSet` of suffixes and a `HashMap` keyed by
+    // parent path — doubly hash-random per process. Same policy as
+    // `build_call_roles_and_registry`: order by normalized path, then file id.
+    let mut targets =
+        dynamic_file_find_targets_unordered(glob, result_kind, usage, relative_paths_by_parent);
+    targets.sort_by_cached_key(|(file_id, target_path)| {
+        (
+            crate::vfs::normalize_path_for_ordering(target_path),
+            file_id.id,
+        )
+    });
+    targets
+}
+
+fn dynamic_file_find_targets_unordered(
+    glob: &DynamicLoadGlob,
+    result_kind: DynamicFileFindResultKind,
+    usage: &DynamicLoadUsage,
+    relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
+) -> Vec<(FileId, String)> {
     match result_kind {
         DynamicFileFindResultKind::Files => relative_paths_by_parent
             .get(&glob.base)

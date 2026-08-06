@@ -665,6 +665,9 @@ impl GmodClassMetadataIndex {
     }
 
     fn recompute_vgui_panel_parent_chains(&mut self) {
+        // Order-free despite the hash-ordered walk: a chain survives only if
+        // every relation agrees on it — any disagreement marks the child
+        // incomplete and the entry is dropped below, whichever one landed first.
         let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::new();
         let mut incomplete = HashSet::new();
         for metadata in self.file_metadata.values() {
