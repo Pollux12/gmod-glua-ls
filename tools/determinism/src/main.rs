@@ -347,6 +347,22 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         );
     }
 
+    if let Ok(want) = std::env::var("DET_DUMP_MEMBERS") {
+        for entry in &members {
+            if entry.contains(&want) {
+                println!("  [{label}] member {entry}");
+            }
+        }
+    }
+
+    if let Ok(want) = std::env::var("DET_DUMP_PARAMS") {
+        for (key, value) in &inferred_params {
+            if key.contains(&want) {
+                println!("  [{label}] param {key} = {value}");
+            }
+        }
+    }
+
     eprintln!(
         "[{label}] index type_caches={} members={} net_flows={}",
         type_caches.len(),
