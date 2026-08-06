@@ -38,6 +38,12 @@
 //!                               the expansion the LSP actually applies
 //!                     allreindex   re-analyse every file, library included,
 //!                               via per-file removal rather than `clear_index`
+//!                     restabilize  re-run analysis over every file *without*
+//!                               removing anything first, three times. This is
+//!                               the only stage that gives a full build the same
+//!                               retained state a partial re-index inherits. It
+//!                               diverges wildly and does not converge, which is
+//!                               why "just run it again" is not a fix
 //!                     fresh     build a second analysis in-process
 //!   DET_INDEX_DIFF  also diff type caches, members, signatures, class members,
 //!                   super types, net flows and inferred params
@@ -790,6 +796,27 @@ fn main() {
         diff_index("cold", &cold_index, "after_allreindex", &after_index);
         let after = collect(&analysis, "after_allreindex");
         diff("cold", &cold, "after_allreindex", &after);
+    }
+
+    // Re-run analysis over every file *without* removing anything first, so each
+    // file re-infers against the settled index while every existing fact is
+    // retained. This is the only stage that gives a full build the same
+    // advantage a partial re-index gets from the state it inherits, so it says
+    // whether the cold answer is simply under-converged.
+    if stages.iter().any(|s| s == "restabilize") {
+        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
+        for round in 0..3 {
+            let t = Instant::now();
+            analysis.compilation.update_index(all_ids.clone());
+            let label = format!("after_restabilize_{round}");
+            eprintln!(
+                "[restabilize] round {round} over {} files ({:.2}s)",
+                all_ids.len(),
+                t.elapsed().as_secs_f64()
+            );
+            let after = collect(&analysis, &label);
+            diff("cold", &cold, &label, &after);
+        }
     }
 
     // The production incremental path: `reindex_files` runs the same re-analysis
