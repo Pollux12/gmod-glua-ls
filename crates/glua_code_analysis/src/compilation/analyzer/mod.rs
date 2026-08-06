@@ -125,6 +125,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             // dynamic pass still runs afterward.
             run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
         }
+        // Every pass above ran against an empty dynamic-field index on a cold
+        // build; a warm re-index must not let retained facts leak into them.
+        context.infer_manager.set_dynamic_fields_visible();
 
         // Seed direct parent-to-child evidence before function returns are
         // resolved. The later pass still captures evidence unlocked by unresolve.
@@ -323,14 +326,20 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.sort();
     let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
     // Initializer inference reads the stabilized indexes and records candidate
     // cache writes without mutating the database. Process that read-only work
     // per file, then merge inference side effects and type writes in stable file
     // and source order on the caller thread.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache =
-            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+            },
+        );
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -452,10 +461,16 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.sort();
     let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache =
-            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+            },
+        );
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)

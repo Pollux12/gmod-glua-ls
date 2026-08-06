@@ -307,7 +307,10 @@ pub(crate) fn resolve_dynamic_field_member(
     member_key: &LuaMemberKey,
     access_position: Option<TextSize>,
 ) -> Option<DynamicFieldResolution> {
-    if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
+    if !db.get_emmyrc().gmod.enabled
+        || !db.get_emmyrc().gmod.infer_dynamic_fields
+        || !cache.get_config().dynamic_fields_visible
+    {
         return None;
     }
 

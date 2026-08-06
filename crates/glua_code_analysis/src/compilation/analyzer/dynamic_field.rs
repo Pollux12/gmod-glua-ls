@@ -216,6 +216,7 @@ fn collect_dynamic_fields_for_file(
         file_id,
         crate::CacheOptions {
             analysis_phase: crate::LuaAnalysisPhase::Force,
+            dynamic_fields_visible: true,
         },
     );
     let cache = &mut cache;

@@ -11,6 +11,7 @@ use crate::{
 pub struct InferCacheManager {
     infer_map: FxHashMap<FileId, LuaInferCache>,
     current_phase: LuaAnalysisPhase,
+    dynamic_fields_visible: bool,
 }
 
 impl InferCacheManager {
@@ -18,23 +19,40 @@ impl InferCacheManager {
         InferCacheManager {
             infer_map: FxHashMap::default(),
             current_phase: LuaAnalysisPhase::Ordered,
+            dynamic_fields_visible: false,
         }
     }
 
     pub fn get_infer_cache(&mut self, file_id: FileId) -> &mut LuaInferCache {
         let phase = self.current_phase;
+        let dynamic_fields_visible = self.dynamic_fields_visible;
         self.infer_map.entry(file_id).or_insert_with(|| {
             LuaInferCache::new(
                 file_id,
                 crate::CacheOptions {
                     analysis_phase: phase,
+                    dynamic_fields_visible,
                 },
             )
         })
     }
 
+    /// Called once the dynamic-field index has been populated for this batch.
+    /// Until then inference must not read it — see [`crate::CacheOptions`].
+    pub fn set_dynamic_fields_visible(&mut self) {
+        self.dynamic_fields_visible = true;
+        for infer_cache in self.infer_map.values_mut() {
+            infer_cache.config_mut().dynamic_fields_visible = true;
+            infer_cache.dynamic_field_resolution_cache.clear();
+        }
+    }
+
     pub fn current_phase(&self) -> LuaAnalysisPhase {
         self.current_phase
+    }
+
+    pub fn dynamic_fields_visible(&self) -> bool {
+        self.dynamic_fields_visible
     }
 
     pub fn merge_inference_side_effects(
