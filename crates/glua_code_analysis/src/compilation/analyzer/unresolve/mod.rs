@@ -11,7 +11,9 @@ use std::time::Duration;
 use crate::{
     FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
     LuaTypeFlag,
-    compilation::analyzer::{AnalysisPipeline, unresolve::resolve::try_resolve_special_call},
+    compilation::analyzer::{
+        AnalysisPipeline, census, unresolve::resolve::try_resolve_special_call,
+    },
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
     profile::Profile,
 };
@@ -353,12 +355,16 @@ fn try_resolve(
                     Err(InferFailReason::FieldNotFound) => {
                         if !cache.get_config().analysis_phase.is_force() {
                             retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
+                        } else {
+                            census::record("try_resolve.force_died", "field_not_found");
                         }
                     }
                     Err(InferFailReason::UnResolveOperatorCall) => {
                         if !cache.get_config().analysis_phase.is_force() {
                             retain_unresolve
                                 .push((unresolve, InferFailReason::UnResolveOperatorCall));
+                        } else {
+                            census::record("try_resolve.force_died", "operator_call");
                         }
                     }
                     Err(reason) => {
@@ -366,6 +372,11 @@ fn try_resolve(
                             changed = true;
                             retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
+                        } else {
+                            census::record(
+                                "try_resolve.same_reason_drop",
+                                infer_fail_reason_label(&reason),
+                            );
                         }
                     }
                 }
@@ -499,7 +510,7 @@ impl TryResolveProfile {
     }
 }
 
-fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
+pub(crate) fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
     match reason {
         InferFailReason::None => "none",
         InferFailReason::RecursiveInfer => "recursive_infer",

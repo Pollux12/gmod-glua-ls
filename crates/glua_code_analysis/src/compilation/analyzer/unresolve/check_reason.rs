@@ -83,6 +83,10 @@ pub fn resolve_as_unknown(
     reason: &InferFailReason,
     loop_count: usize,
 ) -> Option<()> {
+    super::census::record(
+        "resolve_as_unknown.called",
+        super::infer_fail_reason_label(reason),
+    );
     match reason {
         InferFailReason::None
         | InferFailReason::FieldNotFound
@@ -92,6 +96,7 @@ pub fn resolve_as_unknown(
             return Some(());
         }
         InferFailReason::UnResolveDeclType(decl_id) => {
+            super::census::record("resolve_as_unknown.floor", "decl_type");
             write_type_cache(
                 db,
                 (*decl_id).into(),
@@ -109,6 +114,7 @@ pub fn resolve_as_unknown(
             // asked a different question — a member parked on its global
             // path resolves through the parked item, so this arm wrote
             // nothing and the blocked member kept no type forever.
+            super::census::record("resolve_as_unknown.floor", "member_type");
             write_type_cache(
                 db,
                 (*member_id).into(),
@@ -117,6 +123,7 @@ pub fn resolve_as_unknown(
             );
         }
         InferFailReason::UnResolveExpr(expr) => {
+            super::census::record("resolve_as_unknown.floor", "expr");
             let key = InFiled::new(expr.file_id, expr.value.get_syntax_id());
             write_type_cache(
                 db,
@@ -128,6 +135,7 @@ pub fn resolve_as_unknown(
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
             let signature = db.get_signature_index_mut().get_mut(signature_id)?;
             if !signature.is_resolve_return() {
+                super::census::record("resolve_as_unknown.floor", "signature_return");
                 signature.return_docs = vec![LuaDocReturnInfo {
                     name: None,
                     type_ref: LuaType::Unknown,
@@ -142,6 +150,7 @@ pub fn resolve_as_unknown(
         InferFailReason::UnResolveModuleExport(file_id) => {
             let module = db.get_module_index_mut().get_module_mut(*file_id)?;
             if module.export_type.is_none() {
+                super::census::record("resolve_as_unknown.floor", "module_export");
                 module.export_type = Some(LuaType::Unknown);
             }
         }

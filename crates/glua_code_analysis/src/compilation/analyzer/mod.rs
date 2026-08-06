@@ -1,4 +1,5 @@
 mod call_site_params;
+pub(crate) mod census;
 mod common;
 mod decl;
 mod doc;
