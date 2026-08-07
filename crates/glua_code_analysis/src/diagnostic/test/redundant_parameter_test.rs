@@ -568,4 +568,62 @@ mod test {
             "#
         ));
     }
+
+    /// StarfallEx's `Privilege` literal carries a 0-arg `check`
+    /// placeholder, and every real writer is `self.check =
+    /// function(instance, target)` inside `buildcheck = function(self)` —
+    /// an unannotated table-field param, so the write resolves to no owner
+    /// and never joins the member item.
+    #[test]
+    fn test_member_with_unattributable_writers_is_not_called_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Privilege = {
+                buildcheck = function(self)
+                    self.check = function(instance, target)
+                        return instance, target
+                    end
+                end,
+            }
+            return Privilege
+            "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            local privilege = { check = function() error("not set") end }
+            privilege.check(1, 2)
+            "#,
+        ));
+    }
+
+    /// An annotated member keeps its authority: an unattributed write to some
+    /// unrelated table sharing the name must not excuse a real arity error.
+    #[test]
+    fn test_annotated_member_still_reports_despite_unattributable_writers() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Holder = {
+                build = function(self)
+                    self.abs = function(a, b) return a, b end
+                end,
+            }
+            return Holder
+            "#,
+        );
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            local fade = math.abs(1, 0)
+            "#,
+        ));
+    }
 }

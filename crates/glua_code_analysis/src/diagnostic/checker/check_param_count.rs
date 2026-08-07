@@ -424,6 +424,21 @@ fn has_override_callable_accepting_call(
     let Some(member) = context.db.get_member_index().get_member(&member_id) else {
         return false;
     };
+
+    // The member's own history is not the whole set of writers when some
+    // `<unresolvable>.name = function(...)` write could not be attributed
+    // to any owner: those closures never join the item, so the arity
+    // elected here is one of several the slot holds at runtime.
+    if !member.get_feature().is_meta_decl()
+        && let LuaMemberKey::Name(field_name) = member.get_key()
+        && context
+            .db
+            .get_dynamic_field_index()
+            .has_unattributed_field(field_name)
+    {
+        return true;
+    }
+
     let Some(owner) = context.db.get_member_index().get_current_owner(&member_id) else {
         return false;
     };
