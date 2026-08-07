@@ -3366,4 +3366,39 @@ marauth.character = marauth.character or {}
             "child guarded field assignment should attach to the current file's table owner"
         );
     }
+
+    #[gtest]
+    fn loop_var_reassigned_from_its_own_member_keeps_the_element_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/autorun/sit.lua",
+            r#"
+            ---@class Ent1
+            ---@field GetClass fun(self: Ent1): string
+            local Ent1 = {}
+
+            ---@return Ent1[]
+            local function FindAll() end
+
+            for k, v in pairs(FindAll()) do
+                if k then
+                    v = v.SittingOnMe
+                end
+                print(v:GetClass())
+            end
+            "#,
+        );
+
+        // The reassignment makes inferring `v` depend on `v`, so the flow walk
+        // reaches `v`'s declaration position unresolved. A loop variable is
+        // assigned by the `for` header, so that must not be read as "nil here".
+        assert_that!(
+            file_diagnostic_messages(&mut ws, file_id, DiagnosticCode::UncheckedNilAccess),
+            is_empty(),
+        );
+    }
 }

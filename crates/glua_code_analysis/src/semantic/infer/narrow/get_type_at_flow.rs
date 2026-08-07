@@ -1071,16 +1071,22 @@ fn with_flow_query_realm<T>(
     result
 }
 
+/// Whether `decl` is a local that holds no value at its declaration
+/// position.
+fn is_uninitialized_local(decl: &crate::LuaDecl) -> bool {
+    matches!(
+        &decl.extra,
+        crate::LuaDeclExtra::Local { attrib, .. }
+            if *attrib != Some(crate::LocalAttribute::IterConst)
+    ) && !decl.has_initializer()
+}
+
 fn should_treat_unresolved_decl_as_nil(db: &DbIndex, decl_id: crate::LuaDeclId) -> bool {
     let Some(decl) = db.get_decl_index().get_decl(&decl_id) else {
         return false;
     };
 
-    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. }) {
-        return false;
-    }
-
-    if decl.has_initializer() {
+    if !is_uninitialized_local(decl) {
         return false;
     }
 
@@ -1095,11 +1101,7 @@ fn should_defer_uninitialized_local_decl_type(db: &DbIndex, decl_id: crate::LuaD
         return false;
     };
 
-    if !matches!(decl.extra, crate::LuaDeclExtra::Local { .. }) {
-        return false;
-    }
-
-    if decl.has_initializer() {
+    if !is_uninitialized_local(decl) {
         return false;
     }
 
