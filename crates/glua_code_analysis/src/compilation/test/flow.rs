@@ -8401,4 +8401,165 @@ _2 = a[1]
             desc
         );
     }
+
+    /// A `while` loop exits only when its condition is false, so the code
+    /// after the loop must see the variable narrowed by the negated condition.
+    #[gtest]
+    fn test_while_not_isvalid_exit_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    print(p)
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// Same for a plain `== nil` loop condition.
+    #[gtest]
+    fn test_while_nil_compare_exit_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local q = GetRow()
+                while q == nil do
+                    print(q)
+                end
+                local narrowed = q
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// The loop body may reassign the variable back to a nullable value; the
+    /// exit edge still guarantees exactly what the negated condition says.
+    #[gtest]
+    fn test_while_exit_narrows_after_body_reassignment() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    p = GetRow()
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// The retry-loop shape must not report a nil-check diagnostic afterwards.
+    #[gtest]
+    fn test_while_exit_narrow_does_not_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    p = GetRow()
+                end
+                p:GetText()
+            end
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::NeedCheckNil
+        ));
+    }
+
+    /// Control: a `while true do ... break end` loop exits without proving
+    /// anything about the variable, so it must stay nullable.
+    #[gtest]
+    fn test_while_true_break_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while true do
+                    print(p)
+                    break
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert!(
+            desc.contains("nil") || desc.contains('?'),
+            "while true/break must not narrow, got: {}",
+            desc
+        );
+    }
 }
