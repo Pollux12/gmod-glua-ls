@@ -320,6 +320,15 @@ fn check_index_expr(
 
     let field_name = SmolStr::new(index_key.get_path_part());
 
+    if code == DiagnosticCode::UndefinedField
+        && db
+            .get_dynamic_field_index()
+            .has_unattributed_field(&field_name)
+        && is_shapeless_table_const(db, &prefix_typ)
+    {
+        return Some(());
+    }
+
     if is_dynamic_field(db, &prefix_typ, &field_name) {
         if let Some(profile) = profile.as_mut() {
             profile.dynamic_field_skips += 1;
@@ -2135,6 +2144,28 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
         }
     }
     false
+}
+
+/// A table literal with no members and no dynamic fields at all: nothing
+/// whatsoever is known about its shape.
+fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
+    let LuaType::TableConst(table_range) = typ else {
+        return false;
+    };
+
+    let owner = crate::LuaMemberOwner::Element(table_range.clone());
+    if db
+        .get_member_index()
+        .get_members(&owner)
+        .is_some_and(|members| !members.is_empty())
+    {
+        return false;
+    }
+
+    let dynamic_owner = crate::DynamicFieldOwner::Table(table_range.clone());
+    db.get_dynamic_field_index()
+        .get_fields(&dynamic_owner)
+        .is_none_or(|fields| fields.is_empty())
 }
 
 fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, field_name: &SmolStr) -> bool {

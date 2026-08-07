@@ -33,6 +33,13 @@ pub struct DynamicFieldIndex {
     wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
     /// file → wildcard assignments contributed by this file.
     wildcard_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
+    /// field_name → files containing an `X.field_name = ...` write whose
+    /// receiver could not be resolved to any owner, so the write landed
+    /// nowhere. Names here are known to be assigned *somewhere* at runtime even
+    /// though no table in the index can claim them.
+    unattributed_fields: HashMap<SmolStr, HashSet<FileId>>,
+    /// file → unattributed field names contributed by this file.
+    unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
 }
 
 impl DynamicFieldIndex {
@@ -120,6 +127,24 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push((owner, range));
         }
+    }
+
+    pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
+        if self
+            .unattributed_fields
+            .entry(field_name.clone())
+            .or_default()
+            .insert(file_id)
+        {
+            self.unattributed_file_contributions
+                .entry(file_id)
+                .or_default()
+                .push(field_name);
+        }
+    }
+
+    pub fn has_unattributed_field(&self, field_name: &str) -> bool {
+        self.unattributed_fields.contains_key(field_name)
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
@@ -406,6 +431,17 @@ impl LuaIndex for DynamicFieldIndex {
         // `file_contributions` is an internal removal index only; no downstream consumer
         // observes its Vec order, and `rebuild_derived_state` may repopulate it through
         // HashMap iteration.
+        if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
+            for field_name in field_names {
+                if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
+                    files.remove(&file_id);
+                    if files.is_empty() {
+                        self.unattributed_fields.remove(&field_name);
+                    }
+                }
+            }
+        }
+
         let (had_field_contributions, had_wildcard_contributions) =
             self.erase_file_from_derived(file_id);
 
@@ -424,6 +460,8 @@ impl LuaIndex for DynamicFieldIndex {
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
+        self.unattributed_fields.clear();
+        self.unattributed_file_contributions.clear();
     }
 }
 

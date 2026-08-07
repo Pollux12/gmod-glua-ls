@@ -1505,4 +1505,66 @@ mod test {
             not(is_empty())
         );
     }
+
+    /// StarfallEx builds `instance.data = {}` and then fills it from
+    /// library files whose receiver arrives as an unannotated closure param
+    /// (`SF.Modules[..][..].init(self)` after a `CompileFile` round trip),
+    /// so every `instance.data.<x> = ...` write is attributed to nothing.
+    #[gtest]
+    fn test_shapeless_table_stays_quiet_only_for_unattributably_written_fields() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/holder.lua",
+            r#"
+            Holder = {}
+            Holder.data = {}
+            Holder.shaped = {}
+            Holder.shaped.known = 1
+            "#,
+        );
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            return function(instance)
+                instance.data.filledElsewhere = {}
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "lua/reader.lua",
+            r#"
+            print(Holder.data.filledElsewhere)
+            print(Holder.data.neverWrittenAnywhere)
+            print(Holder.shaped.neverWritten)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, reader, DiagnosticCode::UndefinedField),
+            vec![
+                // No unattributed writer for this name.
+                "Undefined field `neverWrittenAnywhere`. ",
+                // `shaped` has a known member, so it has a shape.
+                "Undefined field `neverWritten`. ",
+            ]
+        );
+    }
+
+    /// The plain typo case must keep reporting: nothing writes `meow` anywhere.
+    #[gtest]
+    fn test_empty_local_table_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/same_file.lua",
+            r#"
+            local test = {}
+            print(test.meow)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `meow`. "]
+        );
+    }
 }
