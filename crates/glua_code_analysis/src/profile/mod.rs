@@ -1,6 +1,49 @@
 use log::info;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`.
+pub fn phase_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_PHASE").is_some())
+}
+
+static PHASES: Mutex<Vec<(&'static str, Duration, u64)>> = Mutex::new(Vec::new());
+
+/// Run `f`, accumulating its elapsed time under `name` when phase profiling is on.
+pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    if !phase_enabled() {
+        return f();
+    }
+    let start = Instant::now();
+    let out = f();
+    let elapsed = start.elapsed();
+    let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+    match phases.iter_mut().find(|(phase, _, _)| *phase == name) {
+        Some((_, total, count)) => {
+            *total += elapsed;
+            *count += 1;
+        }
+        None => phases.push((name, elapsed, 1)),
+    }
+    out
+}
+
+/// Print and clear the accumulated sub-phase table.
+pub fn phase_report(label: &str) {
+    if !phase_enabled() {
+        return;
+    }
+    let mut phases =
+        std::mem::take(&mut *PHASES.lock().unwrap_or_else(|poison| poison.into_inner()));
+    phases.sort_unstable_by_key(|(_, total, _)| std::cmp::Reverse(*total));
+    for (name, total, count) in phases {
+        eprintln!(
+            "  [phase] {label:<22} {name:<44} {:>8.3}s ({count} calls)",
+            total.as_secs_f64()
+        );
+    }
+}
 
 pub struct Profile<'a> {
     name: &'a str,

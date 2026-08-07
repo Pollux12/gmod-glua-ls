@@ -137,7 +137,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
             let resolve_start = log_enabled.then(std::time::Instant::now);
-            let profile = try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled);
+            let profile = crate::profile::phase("unresolve/try_resolve", || {
+                try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled)
+            });
             if let Some(resolve_start) = resolve_start {
                 log::info!(
                     "unresolve: loop {} try_resolve cost {:?}",
@@ -150,7 +152,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
 
             let mat_start = log_enabled.then(std::time::Instant::now);
-            materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
+            crate::profile::phase("unresolve/materialize_pending", || {
+                materialize_pending_str_tpl_type_decls(db, &mut infer_manager)
+            });
             if let Some(mat_start) = mat_start {
                 log::info!(
                     "unresolve: loop {} materialize_pending cost {:?}",
@@ -184,7 +188,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
 
             let reason_start = log_enabled.then(std::time::Instant::now);
-            resolve_all_reason(db, &mut reason_resolve, loop_count);
+            crate::profile::phase("unresolve/resolve_all_reason", || {
+                resolve_all_reason(db, &mut reason_resolve, loop_count)
+            });
             if let Some(reason_start) = reason_start {
                 log::info!(
                     "unresolve: loop {} resolve_all_reason cost {:?}",
@@ -218,7 +224,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // Resolving deferred items mutates type/member indexes, so any inference
         // cached while resolution was still in progress can be stale.
         if had_unresolves {
-            infer_manager.clear();
+            crate::profile::phase("unresolve/infer_manager_clear", || infer_manager.clear());
         }
 
         // Return the infer_manager so later phases (e.g. dynamic field) can

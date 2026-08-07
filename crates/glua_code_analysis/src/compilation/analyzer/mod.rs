@@ -749,6 +749,12 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
             t.elapsed().as_secs_f64(),
             context.tree_list.len()
         );
+        crate::profile::phase_report(
+            std::any::type_name::<T>()
+                .rsplit("::")
+                .next()
+                .unwrap_or_default(),
+        );
         return;
     }
     T::analyze(db, context);
