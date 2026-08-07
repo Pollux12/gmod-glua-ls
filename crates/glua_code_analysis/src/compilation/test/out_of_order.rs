@@ -158,4 +158,53 @@ mod test {
         // let expected = ws.ty("Subject");
         // assert_eq!(ty, expected);
     }
+
+    /// `SF = {}` lives in a file analysed *after* the one declaring
+    /// `SF.Instance`, so `self` inside `function SF.Instance:Build()` is
+    /// still `Unknown` during that file's own pass and none of the three
+    /// member-write forms can be attached to `SF.Instance`. The
+    /// dynamic-field index is what rescues the read sites — and it only
+    /// walked `LuaAssignStat`, so the `function self.x() end` form was
+    /// reported `undefined-field` while the two assignment forms were fine.
+    #[test]
+    fn test_self_member_writes_attach_when_global_root_is_in_another_file() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = crate::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/autorun/a.lua",
+                r#"
+                SF.Instance = {}
+                SF.Instance.__index = SF.Instance
+
+                function SF.Instance:BuildEnvironment()
+                    self.viaAssign = {}
+                    self.viaAssignFn = function(x) return x end
+                    function self.viaFuncStat(x) return x end
+                end
+
+                "#,
+            ),
+            // Analysed after `a.lua` (file ids follow normalized path order).
+            ("lua/starfall/sflib.lua", "SF = {}"),
+        ]);
+
+        let instance = ws.expr_ty("SF.Instance");
+        assert!(
+            matches!(instance, crate::LuaType::TableConst(_)),
+            "SF.Instance should be a table const, got {instance:?}"
+        );
+
+        for field in ["viaAssign", "viaAssignFn", "viaFuncStat"] {
+            let ty = ws.expr_ty(&format!("SF.Instance.{field}"));
+            assert!(
+                !ty.is_unknown() && !ty.is_nil(),
+                "SF.Instance.{field} did not attach: {ty:?}"
+            );
+        }
+    }
 }

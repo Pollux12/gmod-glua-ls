@@ -187,6 +187,43 @@ impl DynamicFieldAnalysisMode {
     }
 }
 
+/// The field-definition sites a statement contributes, as `(indexed target,
+/// assigned value)` pairs.
+fn field_definition_sites(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    node: &LuaSyntaxNode,
+) -> Vec<(glua_parser::LuaIndexExpr, Option<LuaExpr>)> {
+    if let Some(assign) = LuaAssignStat::cast(node.clone()) {
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        return vars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, var)| match var {
+                LuaVarExpr::IndexExpr(index_expr) => {
+                    Some((index_expr.clone(), exprs.get(idx).cloned()))
+                }
+                _ => None,
+            })
+            .collect();
+    }
+
+    if let Some(func_stat) = LuaFuncStat::cast(node.clone())
+        && let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name()
+        && index_expr
+            .get_index_token()
+            .is_some_and(|token| !token.is_colon())
+        && db
+            .get_member_index()
+            .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
+            .is_none()
+    {
+        return vec![(index_expr, None)];
+    }
+
+    Vec::new()
+}
+
 /// Per-file dynamic-field collection. Reads only immutable `&DbIndex` state
 /// (lua/unresolve analysis is complete) plus the file's own AST, and writes
 /// nothing to the db — all results are returned for sequential merge. Uses a
@@ -222,13 +259,9 @@ fn collect_dynamic_fields_for_file(
     let cache = &mut cache;
     let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
     let mut local_reassignment_positions = None;
-    for assign in root.descendants::<LuaAssignStat>() {
-        let (vars, exprs) = assign.get_var_and_expr_list();
-        for (idx, var) in vars.iter().enumerate() {
-            let LuaVarExpr::IndexExpr(index_expr) = var else {
-                continue;
-            };
-            let value_expr = exprs.get(idx);
+    for node in root.syntax().descendants() {
+        for (index_expr, value_expr) in field_definition_sites(db, file_id, &node) {
+            let value_expr = value_expr.as_ref();
             let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                 continue;
             };
