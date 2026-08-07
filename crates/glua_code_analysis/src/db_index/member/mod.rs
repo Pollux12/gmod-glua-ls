@@ -757,6 +757,22 @@ impl LuaMemberIndex {
             .collect()
     }
 
+    /// Every member ever keyed under `owner`, including ones hidden by the
+    /// latest-assignment view and ones since re-homed to a concrete owner.
+    pub fn get_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            return Vec::new();
+        };
+
+        let mut member_ids = owner_items.values().flatten().copied().collect::<Vec<_>>();
+        member_ids.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        member_ids.dedup();
+        member_ids
+            .into_iter()
+            .filter_map(|member_id| self.get_member(&member_id))
+            .collect()
+    }
+
     pub(crate) fn iter_current_owner_keys(
         &self,
     ) -> impl Iterator<Item = (&LuaMemberOwner, &LuaMemberKey)> {

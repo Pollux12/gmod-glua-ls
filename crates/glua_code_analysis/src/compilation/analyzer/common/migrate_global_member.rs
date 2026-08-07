@@ -1,3 +1,5 @@
+use std::collections::HashSet;
+
 use crate::{DbIndex, GlobalId, InFiled, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaTypeOwner};
 
 use super::get_owner_id;
@@ -109,6 +111,7 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
         if members.is_empty() {
             continue;
         }
+        let declaring_files = declaring_files(db, &global_id);
 
         for (member_id, needs_rehome) in members {
             // A file that declares the global itself owns the members it
@@ -116,12 +119,17 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             // runtime table, but each file's fields belong to the table literal
             // that file wrote. Falling back to the elected owner covers files
             // that only extend a global they never declare.
-            let target_owner = candidates
+            let target_owner = match candidates
                 .iter()
                 .find(|(file_id, _)| *file_id == member_id.file_id)
-                .map(|(_, owner)| owner)
-                .unwrap_or(canonical_owner)
-                .clone();
+            {
+                Some((_, owner)) => owner.clone(),
+                // See `migrate_global_path_members`: a file that declares the
+                // global but has not resolved its table keeps its members parked
+                // rather than sharing a sibling file's overwrite slot.
+                None if declaring_files.contains(&member_id.file_id) => continue,
+                None => canonical_owner.clone(),
+            };
 
             let member_index = db.get_member_index_mut();
             if needs_rehome
@@ -157,17 +165,7 @@ fn elected_global_owners(
 ) -> Option<Vec<(crate::FileId, LuaMemberOwner)>> {
     match global_id.get_prev_id() {
         Some(parent_id) => {
-            let declaring_member_ids = db
-                .get_member_index()
-                .get_members(&LuaMemberOwner::GlobalPath(parent_id))
-                .map(|members| {
-                    members
-                        .iter()
-                        .filter(|member| member.get_global_id() == Some(global_id))
-                        .map(|member| member.get_id())
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
+            let declaring_member_ids = declaring_member_ids(db, global_id, parent_id);
 
             elect_owners(declaring_member_ids.into_iter().filter_map(|member_id| {
                 let owner = get_owner_id(db, &member_id.into())?;
@@ -308,6 +306,7 @@ fn migrate_global_path_members(
     owners: &[(crate::FileId, LuaMemberOwner)],
 ) -> Option<()> {
     let (_, canonical_owner) = owners.first()?;
+    let declaring_files = declaring_files(db, global_id);
     let member_index = db.get_member_index();
     let members = member_index
         .get_members(&LuaMemberOwner::GlobalPath(global_id.clone()))?
@@ -327,12 +326,18 @@ fn migrate_global_path_members(
         // declares the global owns the fields it writes, and only files
         // that merely extend a global they never declare fall back to the
         // elected owner.
-        let target_owner = owners
+        let target_owner = match owners
             .iter()
             .find(|(file_id, _)| *file_id == member_id.file_id)
-            .map(|(_, owner)| owner)
-            .unwrap_or(canonical_owner)
-            .clone();
+        {
+            Some((_, owner)) => owner.clone(),
+            // The member's own file declares the global but has not resolved a
+            // table for it yet. Leave it parked rather than re-homing it onto a
+            // sibling's table; it re-enters through its own declaration's
+            // resolution event, or through the end-of-batch reconciliation.
+            None if declaring_files.contains(&member_id.file_id) => continue,
+            None => canonical_owner.clone(),
+        };
 
         let member_index = db.get_member_index_mut();
         member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
@@ -364,25 +369,18 @@ fn resolved_global_member_owners(
         return get_owner_id(db, &member_id.into()).map(|owner| vec![(member_id.file_id, owner)]);
     };
 
-    let declaring_member_ids = db
-        .get_member_index()
-        .get_members(&LuaMemberOwner::GlobalPath(parent_id))
-        .map(|members| {
-            members
-                .iter()
-                .filter(|member| member.get_global_id() == Some(global_id))
-                .map(|member| member.get_id())
-                .collect::<Vec<_>>()
-        })
-        .unwrap_or_default();
+    let declaring_member_ids = declaring_member_ids(db, global_id, parent_id);
 
     // See `resolved_global_decl_owners`: the resolution of `member_id` is the
     // event being handled, so it must have produced an owner for this call to
     // carry information.
     let triggering_owner = get_owner_id(db, &member_id.into())?;
-    if declaring_member_ids.len() <= 1 {
-        return Some(vec![(member_id.file_id, triggering_owner)]);
-    }
+
+    // No shortcut for the single-declaration case, for the reason spelled out in
+    // `resolved_global_decl_owners`: returning the *triggering* member's owner
+    // unranked hands the whole path to whichever file happened to fire, and every
+    // other file's members then fall back to it as the canonical owner.
+    let _ = triggering_owner;
 
     // See `resolved_global_decl_owners`: rank every declaring member up front so
     // the canonical owner is decided by source position, not by arrival.
@@ -398,6 +396,36 @@ fn resolved_global_member_owners(
         let owner = get_owner_id(db, &declaring_id.into())?;
         Some((sort_key, declaring_id.file_id, owner))
     }))
+}
+
+/// The members that declare the nested path `global_id` under `parent_id`.
+fn declaring_member_ids(
+    db: &DbIndex,
+    global_id: &GlobalId,
+    parent_id: GlobalId,
+) -> Vec<LuaMemberId> {
+    db.get_member_index()
+        .get_member_history(&LuaMemberOwner::GlobalPath(parent_id))
+        .iter()
+        .filter(|member| member.get_global_id() == Some(global_id))
+        .map(|member| member.get_id())
+        .collect()
+}
+
+/// The files that declare `global_id` themselves, whether or not their
+/// declaration has resolved an owner yet.
+fn declaring_files(db: &DbIndex, global_id: &GlobalId) -> HashSet<crate::FileId> {
+    match global_id.get_prev_id() {
+        Some(parent_id) => declaring_member_ids(db, global_id, parent_id)
+            .into_iter()
+            .map(|member_id| member_id.file_id)
+            .collect(),
+        None => db
+            .get_global_index()
+            .get_global_decl_ids(global_id.get_name())
+            .map(|decl_ids| decl_ids.iter().map(|decl_id| decl_id.file_id).collect())
+            .unwrap_or_default(),
+    }
 }
 
 /// Stable ordering key for a member that declares a nested global path.
