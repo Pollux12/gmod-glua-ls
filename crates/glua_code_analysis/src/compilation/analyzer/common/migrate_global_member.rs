@@ -123,19 +123,21 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 .iter()
                 .find(|(file_id, _)| *file_id == member_id.file_id)
             {
-                Some((_, owner)) => owner.clone(),
-                // See `migrate_global_path_members`: a file that declares the
-                // global but has not resolved its table keeps its members parked
-                // rather than sharing a sibling file's overwrite slot.
-                None if declaring_files.contains(&member_id.file_id) => continue,
-                None => canonical_owner.clone(),
+                Some((_, owner)) => Some(owner.clone()),
+                // See `migrate_global_path_members`: a file that declares
+                // the global but has not resolved its table keeps its
+                // members parked rather than sharing a sibling file's
+                // overwrite slot.
+                None if declaring_files.contains(&member_id.file_id) => None,
+                None => Some(canonical_owner.clone()),
             };
 
             let member_index = db.get_member_index_mut();
-            if needs_rehome
+            if let Some(target_owner) = &target_owner
+                && needs_rehome
                 && member_index
                     .get_member_owner(&member_id)
-                    .is_none_or(|owner| *owner != target_owner)
+                    .is_none_or(|owner| owner != target_owner)
             {
                 member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
                 member_index.add_member_to_owner(target_owner.clone(), member_id);
@@ -149,7 +151,7 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             // were only ever rebuilt for members still parked on the global
             // path.
             for (_, alias_owner) in &candidates {
-                if *alias_owner != target_owner {
+                if Some(alias_owner) != target_owner.as_ref() {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
                 }
             }
@@ -244,15 +246,7 @@ fn resolved_global_decl_owners(
 
     // Almost every global is declared exactly once. Keep that path
     // allocation free and identical in cost to electing by arrival.
-    let triggering_owner = get_owner_id(db, &triggering_decl_id.into())?;
-
-    // No shortcut for the single-declaration case. It used to return the
-    // *triggering* declaration's owner without ranking, which is only the
-    // same answer when the global index already knows every sibling — and
-    // during a partial re-index it does not, so the shortcut could hand a
-    // global to whichever declaration happened to fire while the index was
-    // still being rebuilt.
-    let _ = triggering_owner;
+    get_owner_id(db, &triggering_decl_id.into())?;
 
     // Rank every declaration up front so the canonical owner is decided by
     // source position rather than by which declaration this event arrived
@@ -371,16 +365,14 @@ fn resolved_global_member_owners(
 
     let declaring_member_ids = declaring_member_ids(db, global_id, parent_id);
 
-    // See `resolved_global_decl_owners`: the resolution of `member_id` is the
-    // event being handled, so it must have produced an owner for this call to
-    // carry information.
-    let triggering_owner = get_owner_id(db, &member_id.into())?;
-
-    // No shortcut for the single-declaration case, for the reason spelled out in
-    // `resolved_global_decl_owners`: returning the *triggering* member's owner
-    // unranked hands the whole path to whichever file happened to fire, and every
-    // other file's members then fall back to it as the canonical owner.
-    let _ = triggering_owner;
+    // See `resolved_global_decl_owners`: the resolution of `member_id` is
+    // the event being handled, so it must have produced an owner for this
+    // call to carry information. The owner itself is not used as an answer
+    // — there is no shortcut for the single-declaration case, because
+    // returning the triggering member's owner unranked hands the whole path
+    // to whichever file happened to fire, and every other file's members
+    // then fall back to it as the canonical owner.
+    get_owner_id(db, &member_id.into())?;
 
     // See `resolved_global_decl_owners`: rank every declaring member up front so
     // the canonical owner is decided by source position, not by arrival.
@@ -520,6 +512,72 @@ mod tests {
                 .get_member_item(&resolved_owner, &LuaMemberKey::Name("AddonOnly".into()))
                 .is_none(),
             "non-meta global-path members should not be aliased by the late meta bridge"
+        );
+    }
+
+    fn add_global_decl(db: &mut DbIndex, name: &str, file_id: FileId, start: u32) -> LuaDeclId {
+        let decl = LuaDecl::new(
+            name,
+            file_id,
+            TextRange::new(TextSize::new(start), TextSize::new(start + 1)),
+            LuaDeclExtra::Global {
+                kind: LuaSyntaxKind::NameExpr.into(),
+            },
+            None,
+        );
+        let decl_id = decl.get_id();
+        let mut decl_tree = LuaDeclarationTree::new(file_id);
+        decl_tree.add_decl(decl);
+        db.get_decl_index_mut().add_decl_tree(decl_tree);
+        db.get_global_index_mut().add_global_decl(name, decl_id);
+        decl_id
+    }
+
+    /// A declaring file whose own table has not resolved keeps its members
+    /// parked — but reconciliation is the batch's last pass, so parking may not
+    /// also cost the member its reachability through the elected table.
+    #[test]
+    fn reconcile_aliases_parked_members_of_an_unresolved_declaring_file() {
+        let mut db = DbIndex::new();
+        let resolved_file = FileId::new(1);
+        let unresolved_file = FileId::new(2);
+
+        let resolved_decl_id = add_global_decl(&mut db, "cityrp", resolved_file, 0);
+        add_global_decl(&mut db, "cityrp", unresolved_file, 0);
+
+        let table_type_id = LuaTypeDeclId::global("cityrptable");
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Decl(resolved_decl_id),
+            LuaTypeCache::DocType(LuaType::Ref(table_type_id.clone())),
+        );
+
+        let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 10), unresolved_file);
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("menu".into()),
+                LuaMemberFeature::FileFieldDecl,
+                None,
+            ),
+        );
+
+        reconcile_parked_global_path_members(&mut db);
+
+        let member_index = db.get_member_index();
+        assert!(
+            member_index
+                .get_member_item(
+                    &LuaMemberOwner::Type(table_type_id),
+                    &LuaMemberKey::Name("menu".into())
+                )
+                .is_some(),
+            "a parked member must stay reachable through the elected owner"
+        );
+        assert_eq!(
+            member_index.get_member_owner(&member_id),
+            Some(&LuaMemberOwner::GlobalPath(GlobalId::new("cityrp"))),
+            "aliasing must not re-home the member onto a sibling file's table"
         );
     }
 }
