@@ -326,7 +326,6 @@ fn migrate_global_path_members(
     owners: &[(crate::FileId, LuaMemberOwner)],
 ) -> Option<()> {
     let (_, canonical_owner) = owners.first()?;
-    let declaring_files = declaring_files(db, global_id);
     let member_index = db.get_member_index();
     let members = member_index
         .get_members(&LuaMemberOwner::GlobalPath(global_id.clone()))?
@@ -343,6 +342,14 @@ fn migrate_global_path_members(
                 && !file_hands_global_to_scripted_class(db, member_id.file_id, global_id)
         })
         .collect::<Vec<_>>();
+
+    if members.is_empty() {
+        return Some(());
+    }
+    // Only needed to place members, so it is computed after the early-outs
+    // above: on a cold build the overwhelming majority of these events find
+    // nothing parked, and this walks every declaration of the global.
+    let declaring_files = declaring_files(db, global_id);
 
     for member_id in members {
         // Same rule the end-of-batch reconciliation uses: a file that
@@ -426,11 +433,7 @@ fn declaring_member_ids(
     parent_id: GlobalId,
 ) -> Vec<LuaMemberId> {
     db.get_member_index()
-        .get_member_history(&LuaMemberOwner::GlobalPath(parent_id))
-        .iter()
-        .filter(|member| member.get_global_id() == Some(global_id))
-        .map(|member| member.get_id())
-        .collect()
+        .get_member_history_for_global_path(&LuaMemberOwner::GlobalPath(parent_id), global_id)
 }
 
 /// Whether `file_id` hands the global `global_id` to a scripted-class

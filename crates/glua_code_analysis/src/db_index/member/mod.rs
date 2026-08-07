@@ -777,6 +777,32 @@ impl LuaMemberIndex {
             .collect()
     }
 
+    /// The subset of [`get_member_history`](Self::get_member_history) whose
+    /// own global path is `global_id`, in the same order.
+    pub fn get_member_history_for_global_path(
+        &self,
+        owner: &LuaMemberOwner,
+        global_id: &GlobalId,
+    ) -> Vec<LuaMemberId> {
+        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            return Vec::new();
+        };
+
+        let mut member_ids = owner_items
+            .values()
+            .flatten()
+            .copied()
+            .filter(|member_id| {
+                self.get_member(member_id)
+                    .and_then(|member| member.get_global_id())
+                    == Some(global_id)
+            })
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        member_ids.dedup();
+        member_ids
+    }
+
     pub(crate) fn iter_current_owner_keys(
         &self,
     ) -> impl Iterator<Item = (&LuaMemberOwner, &LuaMemberKey)> {
