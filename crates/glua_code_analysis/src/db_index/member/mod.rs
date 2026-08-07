@@ -356,7 +356,11 @@ impl LuaMemberIndex {
                 }
             }
             LuaMemberIndexItem::Many(ids) => {
-                if ids.last() == Some(&id) {
+                // `Many` is not guaranteed sorted — `classify_member_insert`
+                // appends in arrival order — so the ordered fast paths below
+                // cannot themselves rule out a duplicate. Enumerating a member
+                // twice is worse than the linear scan; these lists are short.
+                if ids.contains(&id) {
                     return;
                 }
                 if ids
@@ -1095,6 +1099,7 @@ impl LuaIndex for LuaMemberIndex {
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
         self.non_overwriting_assignment_members.clear();
+        self.synthesized_owner_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
     }
@@ -1766,6 +1771,99 @@ mod tests {
                 first_member_id,
                 second_member_id,
             ]))
+        );
+    }
+
+    #[test]
+    fn alias_merge_does_not_duplicate_an_id_already_in_an_unsorted_item() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("field".into());
+        let earlier_member_id = make_member_id(FileId::new(1), 10);
+        let later_member_id = make_member_id(FileId::new(2), 20);
+
+        // Decl inserts append in arrival order, so adding the later id first
+        // leaves the stored item unsorted.
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_member(later_member_id, "field"));
+        index.add_member(owner.clone(), make_member(earlier_member_id, "field"));
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                later_member_id,
+                earlier_member_id,
+            ]))
+        );
+
+        index.add_member_alias_to_owner(owner.clone(), later_member_id);
+
+        let Some(LuaMemberIndexItem::Many(member_ids)) = index.get_member_item(&owner, &key) else {
+            panic!("the item should still hold both members");
+        };
+        assert_eq!(
+            member_ids.len(),
+            2,
+            "aliasing an id already in the item must not add it again"
+        );
+        assert_eq!(owner_member_ids(&index, &owner).len(), 2);
+    }
+
+    #[test]
+    fn alias_adds_to_an_existing_file_define_without_displacing_it() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
+        let key = LuaMemberKey::Name("field".into());
+        let own_member_id = make_index_member_id(FileId::new(1), 10);
+        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            other_owner,
+            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                own_member_id,
+                aliased_member_id,
+            ])),
+            "an alias only ever adds; it must never replace the owner's own writer"
+        );
+    }
+
+    #[test]
+    fn global_path_key_keeps_every_writer_in_history_while_one_wins_the_visible_slot() {
+        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("cityrp"));
+        let first_member_id = make_member_id(FileId::new(1), 10);
+        let second_member_id = make_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        for member_id in [first_member_id, second_member_id] {
+            index.add_member(
+                owner.clone(),
+                make_member_with_feature(member_id, "menu", LuaMemberFeature::FileDefine),
+            );
+        }
+
+        assert_eq!(
+            index
+                .get_member_history(&owner)
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![first_member_id, second_member_id],
+            "history must enumerate every file that wrote the key"
+        );
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![second_member_id],
+            "the visible slot is still last-writer-wins"
         );
     }
 
