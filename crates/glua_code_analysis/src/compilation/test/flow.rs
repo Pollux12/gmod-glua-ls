@@ -2914,6 +2914,102 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_nil_guard_reassignment_join_keeps_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if x == nil then
+                    x = AddRow()
+                end
+                local narrowed = x
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    #[gtest]
+    fn test_isvalid_guard_reassignment_join_keeps_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if not IsValid(x) then
+                    x = AddRow()
+                end
+                local narrowed = x
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    #[gtest]
+    fn test_isvalid_guard_reassignment_join_does_not_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if not IsValid(x) then
+                    x = AddRow()
+                end
+                x:GetText()
+            end
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::NeedCheckNil
+        ));
+    }
+
+    #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
