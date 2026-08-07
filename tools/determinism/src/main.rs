@@ -453,7 +453,11 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         for (key, value) in &snapshot.signatures {
             out.push_str(&format!("SIG {key} = {value}\n"));
         }
-        let _ = std::fs::write(format!("{dir}/{label}.idx"), out);
+        let file_name = label
+            .chars()
+            .map(|c| if c.is_alphanumeric() { c } else { '_' })
+            .collect::<String>();
+        let _ = std::fs::write(format!("{dir}/{file_name}.idx"), out);
     }
 
     snapshot

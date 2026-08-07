@@ -107,8 +107,18 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             let members = member_index
                 .get_member_history(&global_path_owner)
                 .iter()
-                .map(|member| {
-                    let member_id = member.get_id();
+                .map(|member| member.get_id())
+                // The same exclusion `migrate_global_path_members` applies,
+                // and for the same reason: a member scripted-class
+                // synthesis claimed belongs to that class. Reconciliation
+                // ran without it, so a derma file's `PANEL` methods were
+                // aliased onto every panel class the file's `PANEL`
+                // declaration had been rewritten to.
+                .filter(|member_id| {
+                    !member_index.has_synthesized_owner(member_id)
+                        && !file_hands_global_to_scripted_class(db, member_id.file_id, &global_id)
+                })
+                .map(|member_id| {
                     if !visible.contains(&member_id) {
                         hidden.insert(member_id);
                         return (member_id, false);
@@ -328,7 +338,10 @@ fn migrate_global_path_members(
         // its methods stay enumerable under `GlobalPath("PANEL")`, so
         // without this every derma file's methods would be re-homed onto
         // whichever `PANEL` declaration won the election.
-        .filter(|member_id| !member_index.has_synthesized_owner(member_id))
+        .filter(|member_id| {
+            !member_index.has_synthesized_owner(member_id)
+                && !file_hands_global_to_scripted_class(db, member_id.file_id, global_id)
+        })
         .collect::<Vec<_>>();
 
     for member_id in members {
@@ -418,6 +431,40 @@ fn declaring_member_ids(
         .filter(|member| member.get_global_id() == Some(global_id))
         .map(|member| member.get_id())
         .collect()
+}
+
+/// Whether `file_id` hands the global `global_id` to a scripted-class
+/// registration, i.e. uses it as a scratch table the way derma files use
+/// `PANEL = {} … vgui.Register("X", PANEL, …)`.
+pub(crate) fn file_hands_global_to_scripted_class(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    global_id: &GlobalId,
+) -> bool {
+    if global_id.get_prev_id().is_some() {
+        return false;
+    }
+    let Some(metadata) = db
+        .get_gmod_class_metadata_index()
+        .get_file_metadata(&file_id)
+    else {
+        return false;
+    };
+
+    metadata
+        .vgui_register_calls
+        .iter()
+        .chain(metadata.vgui_register_table_calls.iter())
+        .chain(metadata.derma_define_control_calls.iter())
+        .chain(metadata.scripted_ent_register_calls.iter())
+        .any(|call| {
+            call.args
+                .iter()
+                .filter_map(|arg| arg.value.as_ref())
+                .any(|value| {
+                    matches!(value, crate::GmodClassCallLiteral::NameRef(name) if name == global_id.get_name())
+                })
+        })
 }
 
 /// The files that declare `global_id` themselves, whether or not their
