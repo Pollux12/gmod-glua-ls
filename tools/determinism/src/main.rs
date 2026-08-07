@@ -295,6 +295,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
 
     let member_index = db.get_member_index();
     let mut members = BTreeSet::new();
+    let mut all_owners = std::collections::HashMap::new();
     for file_id in db.get_vfs().get_all_file_ids() {
         let file = file_label(analysis, file_id);
         for member in member_index.get_file_members(file_id) {
@@ -304,6 +305,9 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 member.get_key(),
                 member_index.get_member_owner(&member_id),
             ));
+            if let Some(owner) = member_index.get_member_owner(&member_id) {
+                all_owners.insert(format!("{owner:?}"), owner.clone());
+            }
         }
     }
     // Net flows are stored per file; keep raw insertion order so ordering
@@ -347,6 +351,19 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 }
             }
             class_members.insert(format!("{decl_id:?}"), ordered.join(","));
+        }
+    }
+
+    // Same visible-item view for *non-type* owners (table constants, element
+    // owners, global paths). Those decide member lookup on anonymous tables,
+    // and drift there is invisible to `class_members`.
+    for (key, owner) in &all_owners {
+        if let Some(members) = db.get_member_index().get_members(owner) {
+            let ordered = members
+                .iter()
+                .map(|member| format!("{:?}@{:?}", member.get_key(), member.get_id()))
+                .collect::<Vec<_>>();
+            class_members.insert(format!("OWNER {key}"), ordered.join(","));
         }
     }
 

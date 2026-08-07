@@ -52,7 +52,14 @@ pub(super) fn stabilize_unknown_locals(
                 && db
                     .get_type_index()
                     .get_type_cache(&(*decl_id).into())
-                    .is_none_or(|cache| cache.is_infer() && cache.as_type().is_unknown())
+                    // `never` is the bottom of the same uninformative band
+                    // as `unknown` (see `LuaTypeCache::supersedes`), and it
+                    // is what an initialiser resolves to when the member it
+                    // reads is not in the index *yet*.
+                    .is_none_or(|cache| {
+                        cache.is_infer()
+                            && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
+                    })
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
