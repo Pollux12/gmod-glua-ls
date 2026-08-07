@@ -90,6 +90,8 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             continue;
         }
 
+        alias_guarded_assignment_members_across_candidates(db, &candidates);
+
         // Every member of the global path, and whether it still needs
         // re-homing.
         let (members, hidden) = {
@@ -181,6 +183,36 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
                 }
             }
+        }
+    }
+}
+
+/// Makes every guarded `X.k = X.k or …` write reachable through every table
+/// literal `X` is declared with.
+fn alias_guarded_assignment_members_across_candidates(
+    db: &mut DbIndex,
+    candidates: &[(crate::FileId, LuaMemberOwner)],
+) {
+    if candidates.len() < 2 {
+        return;
+    }
+
+    let member_index = db.get_member_index();
+    let guarded = candidates
+        .iter()
+        .filter_map(|(_, owner)| member_index.get_members(owner))
+        .flatten()
+        .map(|member| member.get_id())
+        .filter(|member_id| member_index.is_non_overwriting_assignment_member(*member_id))
+        .collect::<Vec<_>>();
+    if guarded.is_empty() {
+        return;
+    }
+
+    let member_index = db.get_member_index_mut();
+    for member_id in guarded {
+        for (_, owner) in candidates {
+            member_index.add_member_alias_to_owner(owner.clone(), member_id);
         }
     }
 }
@@ -597,6 +629,80 @@ mod tests {
         db.get_decl_index_mut().add_decl_tree(decl_tree);
         db.get_global_index_mut().add_global_decl(name, decl_id);
         decl_id
+    }
+
+    /// Two files write `cityrp.type = cityrp.type or …` and each landed on a
+    /// different `cityrp = cityrp or {}` literal, because the merged table the
+    /// Lua pass elected from was still partial in the file analysed first.
+    /// Neither writer can preserve the other while they sit under different
+    /// owners, so both have to be aliased onto every literal.
+    #[test]
+    fn reconcile_aliases_guarded_assignment_members_onto_every_declared_table() {
+        let mut db = DbIndex::new();
+        let util_file = FileId::new(1);
+        let shared_file = FileId::new(2);
+
+        for (file_id, start) in [(util_file, 0), (shared_file, 0)] {
+            let decl_id = add_global_decl(&mut db, "cityrp", file_id, start);
+            db.get_decl_index_mut().set_global_initializer_table(
+                decl_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            );
+        }
+
+        let owner_of = |file_id| {
+            LuaMemberOwner::Element(InFiled::new(
+                file_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            ))
+        };
+
+        // Each file's `cityrp.type` write, already homed on the literal its own
+        // Lua pass elected.
+        let mut writers = Vec::new();
+        for file_id in [util_file, shared_file] {
+            let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 20), file_id);
+            db.get_member_index_mut().add_member(
+                owner_of(file_id),
+                LuaMember::new(
+                    member_id,
+                    LuaMemberKey::Name("type".into()),
+                    LuaMemberFeature::FileDefine,
+                    None,
+                ),
+            );
+            db.get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            writers.push(member_id);
+        }
+
+        // Reconciliation is driven by the global still having something parked.
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
+            LuaMember::new(
+                LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 30), shared_file),
+                LuaMemberKey::Name("LoadedOnce".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        reconcile_parked_global_path_members(&mut db);
+
+        let member_index = db.get_member_index();
+        for file_id in [util_file, shared_file] {
+            let item = member_index
+                .get_member_item(&owner_of(file_id), &LuaMemberKey::Name("type".into()))
+                .expect("expected a `type` item on every declared `cityrp` table");
+            let stored = match item {
+                crate::LuaMemberIndexItem::One(id) => vec![*id],
+                crate::LuaMemberIndexItem::Many(ids) => ids.clone(),
+            };
+            assert!(
+                writers.iter().all(|writer| stored.contains(writer)),
+                "both guarded `cityrp.type` writers should be visible through {file_id:?}, got {item:?}"
+            );
+        }
     }
 
     /// A declaring file whose own table has not resolved keeps its members
