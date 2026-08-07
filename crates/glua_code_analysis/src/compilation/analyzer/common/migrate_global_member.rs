@@ -111,9 +111,6 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
         }
 
         for (member_id, needs_rehome) in members {
-            if !needs_rehome {
-                continue;
-            }
             // A file that declares the global itself owns the members it
             // contributes: `marauth = marauth or {}` in two files describes one
             // runtime table, but each file's fields belong to the table literal
@@ -127,15 +124,22 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 .clone();
 
             let member_index = db.get_member_index_mut();
-            if member_index
-                .get_member_owner(&member_id)
-                .is_none_or(|owner| *owner != target_owner)
+            if needs_rehome
+                && member_index
+                    .get_member_owner(&member_id)
+                    .is_none_or(|owner| *owner != target_owner)
             {
                 member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
                 member_index.add_member_to_owner(target_owner.clone(), member_id);
             }
-            // Aliasing the remaining candidates is what makes a global declared
-            // once per realm behave like the single table it is at runtime.
+            // Aliasing the remaining candidates is what makes a global
+            // declared once per realm behave like the single table it is at
+            // runtime, and it has to run for members that already reached a
+            // concrete owner too. Re-indexing a file rebuilds its members
+            // from scratch, so the aliases the original migration created
+            // are gone; gating the repair behind `needs_rehome` meant they
+            // were only ever rebuilt for members still parked on the global
+            // path.
             for (_, alias_owner) in &candidates {
                 if *alias_owner != target_owner {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
