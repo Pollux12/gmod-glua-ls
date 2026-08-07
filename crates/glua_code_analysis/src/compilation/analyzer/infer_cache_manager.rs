@@ -129,3 +129,19 @@ impl InferCacheManager {
             .collect()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two halves of the dynamic-field gate pull in opposite directions and
+    /// only work together: a batch starts with the index invisible and opens it
+    /// once populated, while everything outside a batch (hover, completion,
+    /// diagnostics) must see it. Flipping either default silently changes what a
+    /// cold build infers.
+    #[test]
+    fn dynamic_field_visibility_defaults_are_opposite() {
+        assert!(crate::CacheOptions::default().dynamic_fields_visible);
+        assert!(!InferCacheManager::new().dynamic_fields_visible());
+    }
+}
