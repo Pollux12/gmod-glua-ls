@@ -92,21 +92,34 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
 
         // Every member of the global path, and whether it still needs
         // re-homing.
-        let members = {
+        let (members, hidden) = {
             let member_index = db.get_member_index();
-            match member_index.get_members(&global_path_owner) {
-                Some(members) => members
-                    .iter()
-                    .map(|member| {
-                        let member_id = member.get_id();
-                        let needs_rehome = member_index
-                            .get_member_owner(&member_id)
-                            .is_none_or(|owner| *owner == global_path_owner);
-                        (member_id, needs_rehome)
-                    })
-                    .collect::<Vec<_>>(),
-                None => continue,
-            }
+            let visible = member_index
+                .get_members(&global_path_owner)
+                .map(|members| {
+                    members
+                        .iter()
+                        .map(|member| member.get_id())
+                        .collect::<HashSet<_>>()
+                })
+                .unwrap_or_default();
+            let mut hidden = HashSet::new();
+            let members = member_index
+                .get_member_history(&global_path_owner)
+                .iter()
+                .map(|member| {
+                    let member_id = member.get_id();
+                    if !visible.contains(&member_id) {
+                        hidden.insert(member_id);
+                        return (member_id, false);
+                    }
+                    let needs_rehome = member_index
+                        .get_member_owner(&member_id)
+                        .is_none_or(|owner| *owner == global_path_owner);
+                    (member_id, needs_rehome)
+                })
+                .collect::<Vec<_>>();
+            (members, hidden)
         };
         if members.is_empty() {
             continue;
@@ -150,7 +163,10 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             // are gone; gating the repair behind `needs_rehome` meant they
             // were only ever rebuilt for members still parked on the global
             // path.
-            for (_, alias_owner) in &candidates {
+            for (alias_file_id, alias_owner) in &candidates {
+                if hidden.contains(&member_id) && *alias_file_id != member_id.file_id {
+                    continue;
+                }
                 if Some(alias_owner) != target_owner.as_ref() {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
                 }
