@@ -1,6 +1,55 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, LuaType, LuaUnionType, TypeOps, VirtualWorkspace};
+    use crate::{DiagnosticCode, FileId, InFiled, LuaType, LuaUnionType, TypeOps, VirtualWorkspace};
+    use internment::ArcIntern;
+    use rowan::TextRange;
+    use smol_str::SmolStr;
+
+    /// `LuaType::from_vec` and repeated `TypeOps::Union` must agree on the
+    /// same member set, in any assembly order.
+    #[test]
+    fn union_normal_form_is_assembly_order_free() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+
+        let sets: Vec<Vec<LuaType>> = vec![
+            // absorption families the structural path used to miss
+            vec![LuaType::Number, LuaType::IntegerConst(1)],
+            vec![LuaType::Integer, LuaType::IntegerConst(7)],
+            vec![LuaType::String, LuaType::StringConst(ArcIntern::from(SmolStr::new("x")))],
+            vec![LuaType::Boolean, LuaType::BooleanConst(true)],
+            vec![LuaType::BooleanConst(true), LuaType::BooleanConst(false)],
+            vec![LuaType::Table, LuaType::TableConst(InFiled::new(FileId { id: 1 }, TextRange::default()))],
+            vec![LuaType::Never, LuaType::String],
+            vec![LuaType::Unknown, LuaType::String],
+            // sets that must stay untouched
+            vec![LuaType::String, LuaType::Nil],
+            vec![LuaType::String, LuaType::Integer, LuaType::Boolean],
+            // three members, so order matters to the fold as well as the set
+            vec![LuaType::Number, LuaType::IntegerConst(1), LuaType::Nil],
+            vec![LuaType::String, LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))), LuaType::Boolean],
+        ];
+
+        for set in sets {
+            let folded = set
+                .iter()
+                .fold(LuaType::Never, |acc, ty| TypeOps::Union.apply(db, &acc, ty));
+            assert_eq!(
+                LuaType::from_vec(set.clone()),
+                folded,
+                "from_vec disagreed with pairwise TypeOps::Union for {set:?}"
+            );
+
+            // ...and the answer must not depend on the order the members arrived in.
+            let mut reversed = set.clone();
+            reversed.reverse();
+            assert_eq!(
+                LuaType::from_vec(set.clone()),
+                LuaType::from_vec(reversed),
+                "from_vec was assembly-order dependent for {set:?}"
+            );
+        }
+    }
 
     #[test]
     fn test_custom_ops() {

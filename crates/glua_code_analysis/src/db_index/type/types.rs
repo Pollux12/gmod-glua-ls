@@ -496,7 +496,21 @@ impl LuaType {
         matches!(self, LuaType::MultiLineUnion(_))
     }
 
+    /// Builds the canonical union of `types`.
     pub fn from_vec(types: Vec<LuaType>) -> Self {
+        if types.len() < 2 {
+            return Self::from_vec_structural(types);
+        }
+
+        crate::db_index::r#type::type_ops::union_type::union_type_all(types)
+    }
+
+    /// Flatten-and-deduplicate only, with no absorption rules.
+    ///
+    /// The terminal constructor used *inside* the pairwise union rules, where
+    /// routing back through [`from_vec`](Self::from_vec) would recurse forever.
+    /// Everywhere else, use `from_vec`.
+    pub(crate) fn from_vec_structural(types: Vec<LuaType>) -> Self {
         match types.len() {
             0 => LuaType::Nil,
             1 => types[0].clone(),
