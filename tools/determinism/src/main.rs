@@ -67,6 +67,12 @@
 //!                     fresh     build a second analysis in-process
 //!   DET_INDEX_DIFF  also diff type caches, members, signatures, class members,
 //!                   super types, net flows and inferred params
+//!   DET_DUMP_INDEX  directory to write each index snapshot to as `<label>.idx`.
+//!                   The stage diffs only compare snapshots *within* one process;
+//!                   this writes them out so two runs of the same binary on the
+//!                   same input can be diffed against each other, which is the
+//!                   only way to see a per-process divergence (hash seeds,
+//!                   allocation addresses) rather than an ordering one.
 //!   DET_SHOW_EXPANSION  print the reindex expansion set for each edit
 //!   DET_DUMP        write the cold diagnostic set to this path
 //!   DET_DUMP_FILE_IDS   print the main-workspace file id table
@@ -395,7 +401,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         members.len(),
         net_flows.len()
     );
-    IndexSnapshot {
+    let snapshot = IndexSnapshot {
         type_caches,
         members,
         net_flows,
@@ -403,7 +409,37 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         super_types,
         class_members,
         signatures,
+    };
+
+    // Cross-process comparison: write the whole snapshot so two runs of the same
+    // binary on the same input can be diffed against each other.
+    if let Ok(dir) = std::env::var("DET_DUMP_INDEX") {
+        let mut out = String::new();
+        for (key, value) in &snapshot.type_caches {
+            out.push_str(&format!("TC {key} = {value}\n"));
+        }
+        for entry in &snapshot.members {
+            out.push_str(&format!("MEM {entry}\n"));
+        }
+        for entry in &snapshot.net_flows {
+            out.push_str(&format!("NET {entry}\n"));
+        }
+        for (key, value) in &snapshot.inferred_params {
+            out.push_str(&format!("PARAM {key} = {value}\n"));
+        }
+        for (key, value) in &snapshot.super_types {
+            out.push_str(&format!("SUPER {key} = {value}\n"));
+        }
+        for (key, value) in &snapshot.class_members {
+            out.push_str(&format!("CLSMEM {key} = {value}\n"));
+        }
+        for (key, value) in &snapshot.signatures {
+            out.push_str(&format!("SIG {key} = {value}\n"));
+        }
+        let _ = std::fs::write(format!("{dir}/{label}.idx"), out);
     }
+
+    snapshot
 }
 
 fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &IndexSnapshot) {
@@ -730,6 +766,12 @@ fn main() {
             .join("\n");
         std::fs::write(&dump_path, rendered).expect("dump write should succeed");
         eprintln!("[cold] dumped to {dump_path}");
+    }
+
+    // A cross-process comparison needs the cold snapshot even when no stage runs
+    // that would otherwise collect one.
+    if std::env::var_os("DET_DUMP_INDEX").is_some() && std::env::var_os("DET_INDEX_DIFF").is_none() {
+        collect_index(&analysis, "cold");
     }
 
     if stages.iter().any(|s| s == "repeat") {

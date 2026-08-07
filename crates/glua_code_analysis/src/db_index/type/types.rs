@@ -137,6 +137,13 @@ impl PartialEq for LuaType {
 
 impl Eq for LuaType {}
 
+/// `PartialEq` compares contents, so `Hash` must be derived from contents
+/// too. The `Arc`-wrapped variants used to hash `Arc::as_ptr` instead,
+/// which broke the `k1 == k2 => hash(k1) == hash(k2)` contract: two
+/// content-equal types allocated separately landed in different buckets, so
+/// a lookup hit or missed depending on where the allocator happened to
+/// place them — per process, ~1 run in 10 resolved a dynamic member
+/// differently and shifted a diagnostic.
 impl Hash for LuaType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
@@ -165,69 +172,36 @@ impl Hash for LuaType {
             LuaType::Call(a) => (23, a).hash(state),
             LuaType::Tuple(a) => (25, a).hash(state),
             LuaType::DocFunction(a) => (26, a).hash(state),
-            LuaType::Object(a) => {
-                let ptr = Arc::as_ptr(a);
-                (27, ptr).hash(state)
-            }
-            LuaType::Union(a) => {
-                let ptr = Arc::as_ptr(a);
-                (28, ptr).hash(state)
-            }
-            LuaType::Intersection(a) => {
-                let ptr = Arc::as_ptr(a);
-                (29, ptr).hash(state)
-            }
+            LuaType::Object(a) => (27, a.fields.len(), a.index_access.len()).hash(state),
+            LuaType::Union(a) => match a.as_ref() {
+                LuaUnionType::Nullable(_) => (28, 2usize).hash(state),
+                LuaUnionType::Multi(types) => (28, types.len()).hash(state),
+            },
+            LuaType::Intersection(a) => (29, a.types.len()).hash(state),
             LuaType::MergedTable(a) => (54, a).hash(state),
-            LuaType::Generic(a) => {
-                let ptr = Arc::as_ptr(a);
-                (30, ptr).hash(state)
-            }
-            LuaType::TableGeneric(a) => {
-                let ptr = Arc::as_ptr(a);
-                (31, ptr).hash(state)
-            }
-            LuaType::TplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (32, ptr).hash(state)
-            }
-            LuaType::StrTplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (33, ptr).hash(state)
-            }
-            LuaType::Variadic(a) => {
-                let ptr = Arc::as_ptr(a);
-                (34, ptr).hash(state)
-            }
+            LuaType::Generic(a) => (30, &a.base, a.params.len()).hash(state),
+            LuaType::TableGeneric(a) => (31, a.len()).hash(state),
+            LuaType::TplRef(a) => (32, a.tpl_id).hash(state),
+            LuaType::StrTplRef(a) => (33, a.tpl_id).hash(state),
+            LuaType::Variadic(a) => match a.as_ref() {
+                VariadicType::Multi(types) => (34, 0u8, types.len()).hash(state),
+                VariadicType::Base(_) => (34, 1u8, 0usize).hash(state),
+            },
             LuaType::DocBooleanConst(a) => (35, a).hash(state),
             LuaType::Signature(a) => (36, a).hash(state),
             LuaType::Instance(a) => (37, a).hash(state),
             LuaType::DocStringConst(a) => (38, a).hash(state),
             LuaType::DocIntegerConst(a) => (39, a).hash(state),
             LuaType::Namespace(a) => (40, a).hash(state),
-            LuaType::MultiLineUnion(a) => {
-                let ptr = Arc::as_ptr(a);
-                (43, ptr).hash(state)
-            }
-            LuaType::TypeGuard(a) => {
-                let ptr = Arc::as_ptr(a);
-                (44, ptr).hash(state)
-            }
+            LuaType::MultiLineUnion(a) => (43, a.unions.len()).hash(state),
+            LuaType::TypeGuard(a) => (44, a.as_ref()).hash(state),
             LuaType::Never => 45.hash(state),
-            LuaType::ConstTplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (46, ptr).hash(state)
-            }
+            LuaType::ConstTplRef(a) => (46, a.tpl_id).hash(state),
             LuaType::Language(a) => (47, a).hash(state),
             LuaType::ModuleRef(a) => (48, a).hash(state),
-            LuaType::Conditional(a) => {
-                let ptr = Arc::as_ptr(a);
-                (49, ptr).hash(state)
-            }
+            LuaType::Conditional(a) => (49, a.has_new).hash(state),
             LuaType::ConditionalInfer(a) => (50, a).hash(state),
-            LuaType::Mapped(a) => {
-                let ptr = Arc::as_ptr(a);
-                (51, ptr).hash(state)
-            }
+            LuaType::Mapped(a) => (51, a.param.0, a.is_readonly, a.is_optional).hash(state),
             LuaType::DocAttribute(a) => (52, a).hash(state),
             LuaType::TableOf(a) => (53, a).hash(state),
         }
