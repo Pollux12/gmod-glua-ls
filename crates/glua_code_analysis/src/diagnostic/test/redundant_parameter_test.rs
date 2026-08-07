@@ -601,6 +601,58 @@ mod test {
         ));
     }
 
+    /// StarfallEx `permissions/core.lua` builds `checks` with
+    /// `checks[#checks+1] = check`, an append write under a computed key.
+    #[test]
+    fn test_computed_key_collection_element_is_not_called_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/collection.lua",
+            r#"
+            ---@param src any
+            local function build(src, key, instance, target)
+                local checks = {}
+                local check = src.checks[key]
+                if check == "block" then
+                    check = function() return false, "blocked!" end
+                end
+                if check ~= "allow" then
+                    checks[#checks+1] = check
+                end
+                for _, v in ipairs(checks) do
+                    local ok, reason = v(instance, target)
+                    if not ok then return false, reason end
+                end
+                return true
+            end
+            return build
+            "#,
+        ));
+    }
+
+    /// A container with only literal keys keeps its authority — nothing about it
+    /// is sampled, so a real arity error still has to be reported.
+    #[test]
+    fn test_literal_key_collection_element_still_reports_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/literal_collection.lua",
+            r#"
+            local checks = { function() return true end }
+            local function run(instance, target)
+                for _, v in ipairs(checks) do
+                    local ok = v(instance, target)
+                    if not ok then return false end
+                end
+                return true
+            end
+            return run
+            "#,
+        ));
+    }
+
     /// An annotated member keeps its authority: an unattributed write to some
     /// unrelated table sharing the name must not excuse a real arity error.
     #[test]

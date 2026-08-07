@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaGeneralToken,
-    LuaIndexKey, LuaLiteralToken, LuaNameExpr,
+    LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
+    LuaGeneralToken, LuaIndexKey, LuaLiteralToken, LuaNameExpr,
 };
 
 use crate::{
@@ -230,6 +230,10 @@ fn check_call_expr(
             return Some(());
         }
 
+        if callee_is_computed_key_collection_element(context, semantic_model, &call_expr) {
+            return Some(());
+        }
+
         // 参数定义中最后一个参数是 `...`
         if fake_params.last().is_some_and(|(name, typ)| {
             name == "..." || typ.as_ref().is_some_and(|typ| typ.is_variadic())
@@ -402,6 +406,60 @@ fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
         }
     }
     false
+}
+
+/// Whether the callee is a loop variable over an inferred table that is
+/// written under a *computed* key, i.e. an append-style collection.
+fn callee_is_computed_key_collection_element(
+    context: &DiagnosticContext,
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+) -> bool {
+    let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(callee_name) = name_expr.get_name_text() else {
+        return false;
+    };
+
+    call_expr
+        .ancestors::<LuaForRangeStat>()
+        .filter(|for_range| {
+            for_range
+                .get_var_name_list()
+                .any(|var| var.get_name_text() == callee_name)
+        })
+        .any(|for_range| {
+            iterated_container_expr(&for_range).is_some_and(|container_expr| {
+                semantic_model
+                    .infer_expr(container_expr)
+                    .is_ok_and(|typ| has_computed_key_member(context.db, &typ))
+            })
+        })
+}
+
+/// The table a `for ... in <iter>` walks: the sole argument of `pairs(t)` /
+/// `ipairs(t)`, or the expression itself when it is not a call.
+fn iterated_container_expr(for_range: &LuaForRangeStat) -> Option<LuaExpr> {
+    let iter_expr = for_range.get_expr_list().next()?;
+    let LuaExpr::CallExpr(call_expr) = &iter_expr else {
+        return Some(iter_expr);
+    };
+
+    let mut args = call_expr.get_args_list()?.get_args();
+    let arg = args.next()?;
+    args.next().is_none().then_some(arg)
+}
+
+fn has_computed_key_member(db: &DbIndex, typ: &LuaType) -> bool {
+    let LuaType::TableConst(inst) = typ else {
+        return false;
+    };
+
+    let owner = LuaMemberOwner::Element(inst.clone());
+    db.get_member_index()
+        .get_member_keys(&owner)
+        .any(|key| matches!(key, LuaMemberKey::ExprType(_)))
 }
 
 fn has_override_callable_accepting_call(
