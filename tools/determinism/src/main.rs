@@ -12,6 +12,26 @@
 //! state behind. `mainexpand` is the production path — it is the one that has to
 //! be identical.
 //!
+//! # Release gates vs bisect stages
+//!
+//! Only some stages are pass/fail. The gates are `repeat`, `edit`, `mainexpand`,
+//! `allreindex`, `reindex`, `order` and `fresh`: each of these runs a path the
+//! language server actually takes (or a ground-truth rebuild), so any divergence
+//!
+//! `mainreindex`, `exact` and `split:N` are **bisect stages** — diagnostic
+//! instruments, not gates, and they are expected to diverge. Both `mainreindex`
+//! and `exact` go through `reindex_files_without_expansion`, which deliberately
+//! skips three convergence passes that production's `reindex_files` performs
+//! (`refresh_file_source_dependencies`,
+//! `reindex_changed_inferred_guard_references` and
+//! `reindex_changed_inferred_param_consumers`). They are "production minus its
+//! fixpoint": a divergence there localises which file's re-analysis perturbs a
+//! fact, and is only a defect if `mainexpand` diverges too. `split:N` likewise
+//! only answers whether a fact depends on batch composition.
+//!
+//! `restabilize` is its own thing: it is a demonstration that re-running does
+//! not converge, not a stage anything is expected to pass.
+//!
 //! Example:
 //!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
 //!     DET_STAGES=repeat,edit,mainexpand DET_TARGETS=lua/autorun/init.lua \
