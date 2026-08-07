@@ -255,7 +255,7 @@ impl LuaMemberIndex {
                     .add_member(key, item);
             }
             MemberInsertAction::PushPreservedAssignment => {
-                self.push_preserved_assignment_member(owner, key, id);
+                self.merge_member_into_owner_item(owner, key, id);
             }
         }
     }
@@ -270,13 +270,32 @@ impl LuaMemberIndex {
         self.synthesized_owner_members.contains(id)
     }
 
+    /// Makes `id` *also* reachable through `owner`, without ever displacing
+    /// what is already there.
     pub fn add_member_alias_to_owner(
         &mut self,
         owner: LuaMemberOwner,
         id: LuaMemberId,
     ) -> Option<()> {
-        let file_id = self.get_member(&id)?.get_file_id();
-        self.add_member_to_owner(owner.clone(), id)?;
+        let member = self.get_member(&id)?;
+        let file_id = member.get_file_id();
+        let key = member.get_key().clone();
+
+        if self.member_current_owner.get(&id) != Some(&owner) {
+            self.add_member_to_owner_key_index(owner.clone(), id);
+            self.add_member_to_owner_key_history_index(owner.clone(), id);
+        }
+
+        let owner_members = self
+            .owner_members
+            .entry(owner.clone())
+            .or_insert_with(LuaOwnerMembers::new);
+        if owner_members.contains_member(&key) {
+            self.merge_member_into_owner_item(owner.clone(), key, id);
+        } else {
+            owner_members.add_member(key, LuaMemberIndexItem::One(id));
+        }
+
         self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
         Some(())
     }
@@ -312,7 +331,10 @@ impl LuaMemberIndex {
         }
     }
 
-    fn push_preserved_assignment_member(
+    /// Adds `id` to the item already stored at `owner`/`key`, keeping the item a
+    /// set ordered by `member_id_sort_key`. Never removes an existing id, and is
+    /// a no-op when `id` is already present.
+    fn merge_member_into_owner_item(
         &mut self,
         owner: LuaMemberOwner,
         key: LuaMemberKey,
@@ -1719,8 +1741,8 @@ mod tests {
             );
         }
 
-        index.push_preserved_assignment_member(owner.clone(), key.clone(), second_member_id);
-        index.push_preserved_assignment_member(owner.clone(), key.clone(), first_member_id);
+        index.merge_member_into_owner_item(owner.clone(), key.clone(), second_member_id);
+        index.merge_member_into_owner_item(owner.clone(), key.clone(), first_member_id);
 
         assert_eq!(
             index.get_member_item(&owner, &key),
