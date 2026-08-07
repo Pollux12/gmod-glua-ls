@@ -243,6 +243,8 @@ impl LuaInferCache {
         self.vgui_parent_fallback_calls.clear();
     }
 
+    /// Discards the inference a wave of deferred resolution can have
+    /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
         self.expr_cache.clear();
         self.call_cache.clear();

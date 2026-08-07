@@ -363,6 +363,12 @@ fn try_resolve(
                             retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
                         } else {
                             census::record("try_resolve.force_died", "field_not_found");
+                            record_drop(
+                                db,
+                                "force_died",
+                                &unresolve,
+                                &InferFailReason::FieldNotFound,
+                            );
                         }
                     }
                     Err(InferFailReason::UnResolveOperatorCall) => {
@@ -371,6 +377,12 @@ fn try_resolve(
                                 .push((unresolve, InferFailReason::UnResolveOperatorCall));
                         } else {
                             census::record("try_resolve.force_died", "operator_call");
+                            record_drop(
+                                db,
+                                "force_died",
+                                &unresolve,
+                                &InferFailReason::UnResolveOperatorCall,
+                            );
                         }
                     }
                     Err(reason) => {
@@ -379,10 +391,14 @@ fn try_resolve(
                             retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
                         } else {
+                            // The item re-failed naming the dependency its
+                            // group was just reached on, so the fact it
+                            // would have written is never produced.
                             census::record(
                                 "try_resolve.same_reason_drop",
                                 infer_fail_reason_label(&reason),
                             );
+                            record_drop(db, "same_reason_drop", &unresolve, &reason);
                         }
                     }
                 }
@@ -514,6 +530,107 @@ impl TryResolveProfile {
             );
         }
     }
+}
+
+/// Census-gated detail for a dropped work-list item: what kind it was, which
+/// dependency it re-failed on, and whether the fact it would have written is
+/// present in the index anyway (`fact=present` means the drop was benign).
+fn record_drop(db: &DbIndex, site: &str, unresolve: &UnResolve, reason: &InferFailReason) {
+    if !census::enabled() {
+        return;
+    }
+
+    let kind = match unresolve {
+        UnResolve::Decl(_) => "decl",
+        UnResolve::IterDecl(_) => "iter_decl",
+        UnResolve::Member(_) => "member",
+        UnResolve::Module(_) => "module",
+        UnResolve::Return(_) => "return",
+        UnResolve::ClosureParams(_) => "closure_params",
+        UnResolve::ClosureReturn(_) => "closure_return",
+        UnResolve::ClosureParentParams(_) => "closure_parent_params",
+        UnResolve::ModuleRef(_) => "module_ref",
+        UnResolve::TableField(_) => "table_field",
+        UnResolve::SpecialCall(_) => "special_call",
+    };
+
+    let fact = match unresolve {
+        UnResolve::Decl(d) => bool_fact(
+            db.get_type_index()
+                .get_type_cache(&d.decl_id.into())
+                .is_some(),
+        ),
+        UnResolve::Member(d) => bool_fact(
+            db.get_type_index()
+                .get_type_cache(&d.member_id.into())
+                .is_some(),
+        ),
+        UnResolve::Return(d) => bool_fact(
+            db.get_signature_index()
+                .get(&d.signature_id)
+                .is_some_and(|s| s.is_resolve_return()),
+        ),
+        UnResolve::ClosureReturn(d) => bool_fact(
+            db.get_signature_index()
+                .get(&d.signature_id)
+                .is_some_and(|s| s.is_resolve_return()),
+        ),
+        UnResolve::Module(d) => bool_fact(
+            db.get_module_index()
+                .get_module(d.file_id)
+                .is_some_and(|m| m.export_type.is_some()),
+        ),
+        _ => "unknown",
+    };
+
+    let dep = match reason {
+        InferFailReason::UnResolveSignatureReturn(sig) => {
+            let resolved = db
+                .get_signature_index()
+                .get(sig)
+                .map(|s| s.is_resolve_return());
+            format!(
+                "sig={}:{} dep_resolved={}",
+                sig.get_file_id().id,
+                u32::from(sig.get_position()),
+                match resolved {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "missing",
+                }
+            )
+        }
+        InferFailReason::UnResolveMemberType(member_id) => format!(
+            "member={}:{} dep_resolved={}",
+            member_id.file_id.id,
+            u32::from(member_id.get_position()),
+            bool_fact(
+                db.get_type_index()
+                    .get_type_cache(&(*member_id).into())
+                    .is_some()
+            )
+        ),
+        InferFailReason::UnResolveDeclType(decl_id) => format!(
+            "decl={}:{} dep_resolved={}",
+            decl_id.file_id.id,
+            u32::from(decl_id.position),
+            bool_fact(
+                db.get_type_index()
+                    .get_type_cache(&(*decl_id).into())
+                    .is_some()
+            )
+        ),
+        _ => String::new(),
+    };
+
+    eprintln!(
+        "[census-drop] site={site} kind={kind} reason={} fact={fact} {dep}",
+        infer_fail_reason_label(reason)
+    );
+}
+
+fn bool_fact(present: bool) -> &'static str {
+    if present { "present" } else { "absent" }
 }
 
 pub(crate) fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
