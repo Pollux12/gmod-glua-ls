@@ -580,6 +580,10 @@ fn collect_file_network_flows(
 
     let mut local_fns = LocalFnCache::default();
     let mut net = NetCallResolver::default();
+    // One memo for both walks: the receive walk and the three send walks start
+    // from the same call expressions and reach the same helpers, so resolving
+    // them twice was pure repeat work.
+    let mut resolve_memo = ResolveMemo::default();
 
     let (_, _, _, receive_flows) = collect_hook_and_receive_metadata(
         db,
@@ -591,6 +595,7 @@ fn collect_file_network_flows(
         annotated_global_call_roles,
         &mut local_fns,
         &mut net,
+        &mut resolve_memo,
         reach,
     );
 
@@ -602,6 +607,7 @@ fn collect_file_network_flows(
         helper_registry,
         &mut local_fns,
         &mut net,
+        &mut resolve_memo,
         reach,
     )
 }
@@ -1316,6 +1322,7 @@ fn collect_file_gmod_metadata(
                 annotated_global_call_roles,
                 &mut local_fns,
                 &mut net,
+                &mut ResolveMemo::default(),
                 &reach,
             );
         (hook_sites, system_metadata, gm_method_realms)
@@ -1367,6 +1374,7 @@ fn collect_hook_and_receive_metadata(
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
+    resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
 ) -> (
     Vec<GmodHookSiteMetadata>,
@@ -1383,6 +1391,19 @@ fn collect_hook_and_receive_metadata(
     let net_site = NetWalkSite {
         root: root.clone(),
         file_id,
+    };
+    // Built once for the whole walk. `resolve_memo` is a pure function of
+    // `(file_id, call range)` for a fixed registry and index — see the
+    // field's own doc — but this context used to be constructed *inside*
+    // the loop, so every call expression started with an empty memo and
+    // paid a fresh `FxHashMap` allocation.
+    let mut net_ctx = NetCollectCtx {
+        db,
+        helper_registry,
+        local_fns,
+        net,
+        resolve_memo,
+        reach,
     };
 
     // Single descendants walk dispatching by node kind. Avoids two separate
@@ -1405,14 +1426,6 @@ fn collect_hook_and_receive_metadata(
             }
 
             if collect_receive_flows {
-                let mut net_ctx = NetCollectCtx {
-                    db,
-                    helper_registry,
-                    local_fns,
-                    net,
-                    resolve_memo: FxHashMap::default(),
-                    reach,
-                };
                 if let Some(receive_flow) =
                     collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
                 {
@@ -1458,6 +1471,7 @@ fn collect_network_flow_metadata(
     helper_registry: &HelperRegistry,
     local_fns: &mut LocalFnCache,
     net: &mut NetCallResolver,
+    resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
 ) -> crate::db_index::FileNetworkData {
     let site = NetWalkSite { root, file_id };
@@ -1466,7 +1480,7 @@ fn collect_network_flow_metadata(
         helper_registry,
         local_fns,
         net,
-        resolve_memo: FxHashMap::default(),
+        resolve_memo,
         reach,
     };
     let mut send_flows = collect_net_send_flows(&mut ctx, &site);
@@ -2355,12 +2369,17 @@ struct NetCollectCtx<'a> {
     net: &'a mut NetCallResolver,
     /// Memo for [`resolve_call_to_function_block`], keyed by the calling
     /// site.
-    resolve_memo: FxHashMap<(FileId, TextRange), Option<ResolvedHelperFn>>,
+    resolve_memo: &'a mut ResolveMemo,
     /// Shared across files; see [`HelperStartReachCache`].
     reach: &'a HelperStartReachCache,
 }
 
 type ResolvedHelperFn = (String, LuaBlock, LuaChunk, FileId);
+
+/// See [`NetCollectCtx::resolve_memo`]. Owned per file by the collector that
+/// drives both the receive walk and the send walks, so one file's helper
+/// resolutions are computed once instead of once per walk.
+type ResolveMemo = FxHashMap<(FileId, TextRange), Option<ResolvedHelperFn>>;
 
 type HelperId = (FileId, String);
 
