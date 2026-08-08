@@ -3401,4 +3401,68 @@ marauth.character = marauth.character or {}
             is_empty(),
         );
     }
+
+    /// Two plain cross-file assignments to the same global field make the
+    /// member item `Many` with all-file-define members, so
+    /// `should_widen_file_defines` and `should_widen_table_literals` both hold
+    /// and each `TableConst` collapses to `table`.
+    #[test]
+    fn test_cross_file_member_merge_widens_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/widen_table/a.lua", "Store = {}\nStore.cfg = { a = 1 }\n");
+        ws.def_file("lua/widen_table/b.lua", "Store.cfg = { b = 2 }\n");
+        let consumer = ws.def_file("lua/widen_table/c.lua", "local cfg = Store.cfg\n");
+
+        let cfg_type = local_name_type(&mut ws, consumer, "cfg");
+        assert!(
+            matches!(cfg_type, LuaType::Table),
+            "cross-file member merge should widen table literals to `table`, got {cfg_type:?}"
+        );
+    }
+
+    /// The same merge widens scalar literals through
+    /// `widen_literal_type_for_assignment`, so `1` and `2` become `integer`
+    /// rather than a literal union.
+    #[test]
+    fn test_cross_file_member_merge_widens_scalar_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/widen_scalar/a.lua", "Store = {}\nStore.n = 1\n");
+        ws.def_file("lua/widen_scalar/b.lua", "Store.n = 2\n");
+        let consumer = ws.def_file("lua/widen_scalar/c.lua", "local n = Store.n\n");
+
+        let n_type = local_name_type(&mut ws, consumer, "n");
+        assert!(
+            matches!(n_type, LuaType::Integer),
+            "cross-file member merge should widen scalar literals, got {n_type:?}"
+        );
+    }
+
+    /// `X = X or {}` members are non-overwriting assignments, which clears
+    /// `should_widen_table_literals`. The merged fields must stay as concrete
+    /// `TableConst`s so the guarded bootstrap keeps its shape.
+    #[test]
+    fn test_guarded_cross_file_member_merge_keeps_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/no_widen_guarded/a.lua",
+            "Store = Store or {}\nStore.cfg = { a = 1 }\n",
+        );
+        ws.def_file(
+            "lua/no_widen_guarded/b.lua",
+            "Store = Store or {}\nStore.cfg = Store.cfg or { b = 2 }\n",
+        );
+        let consumer = ws.def_file("lua/no_widen_guarded/c.lua", "local cfg = Store.cfg\n");
+
+        let cfg_type = local_name_type(&mut ws, consumer, "cfg");
+        let LuaType::MergedTable(merged) = &cfg_type else {
+            panic!("guarded merge should keep concrete tables, got {cfg_type:?}");
+        };
+        assert!(
+            merged
+                .get_types()
+                .iter()
+                .all(|typ| matches!(typ, LuaType::TableConst(_))),
+            "guarded merge must not widen its table literals, got {cfg_type:?}"
+        );
+    }
 }
