@@ -45,6 +45,12 @@
 //!                     repeat    re-collect diagnostics with no change at all
 //!                     edit      no-op edit each DET_TARGETS entry, through the
 //!                               same `update_file_by_uri` path the LSP uses
+//!                     editmid   offset-shifting no-op edit pair (newline at the
+//!                               front of the file, then removed): the semantic
+//!                               no-op gate cannot fire, so both edits run the
+//!                               full re-index expansion. Bisect stage for the
+//!                               batch-composition convergence gap; expected to
+//!                               diverge until re-analysis is confluent.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
@@ -729,6 +735,49 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
     true
 }
 
+/// Like `noop_edit`, but the inserted newline goes at the *front* of the file,
+/// so every token offset shifts and the semantic no-op gate cannot fire: both
+/// halves of the pair run the full re-index expansion. Content ends
+/// byte-identical to cold, which makes this the instrument for the remaining
+/// batch-composition convergence gap (warm fixpoint != cold fixpoint).
+fn noop_edit_midfile(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
+    let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
+        eprintln!("[editmid] cannot build uri for {}", target.display());
+        return false;
+    };
+    let Some(file_id) = analysis.get_file_id(&uri) else {
+        eprintln!("[editmid] file not indexed: {}", target.display());
+        return false;
+    };
+    let Some(original) = analysis
+        .compilation
+        .get_db()
+        .get_vfs()
+        .get_file_content(&file_id)
+        .cloned()
+    else {
+        eprintln!("[editmid] no content for {}", target.display());
+        return false;
+    };
+
+    let expanded = analysis.diagnostic_reindex_scope(vec![file_id]);
+    eprintln!(
+        "[editmid] {} expands to {} files",
+        target.display(),
+        expanded.len()
+    );
+
+    let t = Instant::now();
+    analysis.update_file_by_uri(&uri, Some(format!("\n{original}")));
+    analysis.update_file_by_uri(&uri, Some(original));
+    eprintln!(
+        "[editmid] no-op offset-shifting edit pair on {} ({:.2}s)",
+        target.display(),
+        t.elapsed().as_secs_f64()
+    );
+    true
+}
+
 /// Reindex an explicit set of workspace-relative paths without any text change.
 /// Isolates "reindexing this set loses information" from "the edit changed text".
 fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[String]) -> bool {
@@ -822,6 +871,18 @@ fn main() {
             }
             previous = after;
             previous_label = label;
+        }
+    }
+
+    if stages.iter().any(|s| s == "editmid") {
+        for target in &targets {
+            let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+            if !noop_edit_midfile(&mut analysis, &path) {
+                continue;
+            }
+            let label = format!("after_editmid[{target}]");
+            let after = collect(&analysis, &label);
+            diff("cold", &cold, &label, &after);
         }
     }
 
