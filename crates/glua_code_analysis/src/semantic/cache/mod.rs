@@ -60,6 +60,11 @@ impl From<&VarRefId> for VarRefCacheKey {
     }
 }
 
+fn purge_stale_errors_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("GLUALS_PURGE_STALE_ERRORS").is_some())
+}
+
 #[derive(Debug, Clone)]
 pub enum CacheEntry<T> {
     Ready,
@@ -249,6 +254,18 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        if purge_stale_errors_enabled() {
+            self.flow_node_cache.retain(|_, inner| {
+                inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+                !inner.is_empty()
+            });
+            self.param_type_cache
+                .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+            self.param_type_source_cache
+                .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+            self.for_range_iter_var_type_cache
+                .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+        }
     }
 
     /// Clears inference results that can become stale as deferred declarations,
