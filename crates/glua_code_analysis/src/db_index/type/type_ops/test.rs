@@ -51,6 +51,31 @@ mod tests {
         }
     }
 
+    /// Unioning an alias into an existing union must keep the *alias*, not
+    /// the type it dereferences to.
+    #[test]
+    fn union_with_a_union_keeps_the_alias_member() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@alias Seconds string
+        "#,
+        );
+
+        let alias = LuaType::Ref(crate::LuaTypeDeclId::global("Seconds"));
+        let union = LuaType::from_vec(vec![LuaType::Integer, LuaType::Boolean]);
+        let merged = TypeOps::Union.apply(ws.get_db_mut(), &alias, &union);
+
+        let members = match &merged {
+            LuaType::Union(union) => union.into_vec(),
+            other => panic!("expected a union, got {other:?}"),
+        };
+        assert!(
+            members.contains(&alias),
+            "the alias must survive into the union, got {members:?}"
+        );
+    }
+
     #[test]
     fn test_custom_ops() {
         let mut ws = VirtualWorkspace::new();

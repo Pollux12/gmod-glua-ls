@@ -129,9 +129,15 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
             absorb(&mut members, right.clone());
             LuaType::from_vec_structural(members)
         }
+        // The *source* joins the union, not the dereferenced view of it:
+        // the alias is what the caller passed and what has to survive into
+        // the rendered type, exactly as the sibling arms keep their
+        // operands. The dereference is only ever a matching aid (see
+        // `try_collapse`), and `absorb` matches an alias by identity, which
+        // is the same answer the other two union arms give.
         (left, LuaType::Union(right)) if !left.is_union() => {
             let mut members = right.deref().clone().into_vec();
-            absorb(&mut members, left.clone());
+            absorb(&mut members, source.clone());
             LuaType::from_vec_structural(members)
         }
         // two union

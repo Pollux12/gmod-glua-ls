@@ -173,8 +173,13 @@ impl Hash for LuaType {
             LuaType::Tuple(a) => (25, a).hash(state),
             LuaType::DocFunction(a) => (26, a).hash(state),
             LuaType::Object(a) => (27, a.fields.len(), a.index_access.len()).hash(state),
+            // The inner variant tag widens the summary at no cost: `T?` is by
+            // far the most common union, so arity alone puts every nullable in
+            // one bucket.
             LuaType::Union(a) => match a.as_ref() {
-                LuaUnionType::Nullable(_) => (28, 2usize).hash(state),
+                LuaUnionType::Nullable(inner) => {
+                    (28, 2usize, std::mem::discriminant(inner)).hash(state)
+                }
                 LuaUnionType::Multi(types) => (28, types.len()).hash(state),
             },
             LuaType::Intersection(a) => (29, a.types.len()).hash(state),
@@ -199,7 +204,9 @@ impl Hash for LuaType {
             LuaType::ConstTplRef(a) => (46, a.tpl_id).hash(state),
             LuaType::Language(a) => (47, a).hash(state),
             LuaType::ModuleRef(a) => (48, a).hash(state),
-            LuaType::Conditional(a) => (49, a.has_new).hash(state),
+            LuaType::Conditional(a) => {
+                (49, a.has_new, std::mem::discriminant(a.get_condition())).hash(state)
+            }
             LuaType::ConditionalInfer(a) => (50, a).hash(state),
             LuaType::Mapped(a) => (51, a.param.0, a.is_readonly, a.is_optional).hash(state),
             LuaType::DocAttribute(a) => (52, a).hash(state),
@@ -2035,4 +2042,137 @@ fn hash_str_content(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GenericParam;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_of(ty: &LuaType) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        ty.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `k1 == k2` must imply `hash(k1) == hash(k2)`, for separately
+    /// allocated values.
+    #[test]
+    fn content_equal_types_hash_equal() {
+        let builders: Vec<(&str, fn() -> LuaType)> = vec![
+            ("TplRef", || {
+                LuaType::TplRef(Arc::new(GenericTpl::new(
+                    GenericTplId::Type(3),
+                    ArcIntern::new(SmolStr::new("T")),
+                    Some(LuaType::String),
+                )))
+            }),
+            ("ConstTplRef", || {
+                LuaType::ConstTplRef(Arc::new(GenericTpl::new(
+                    GenericTplId::Func(1),
+                    ArcIntern::new(SmolStr::new("K")),
+                    None,
+                )))
+            }),
+            ("Array", || {
+                LuaType::Array(Arc::new(LuaArrayType::from_base_type(LuaType::String)))
+            }),
+            ("StrTplRef", || {
+                LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+                    "pre",
+                    "T",
+                    GenericTplId::Type(0),
+                    "suf",
+                    None,
+                )))
+            }),
+            ("Variadic::Multi", || {
+                LuaType::Variadic(Arc::new(VariadicType::Multi(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                ])))
+            }),
+            ("Variadic::Base", || {
+                LuaType::Variadic(Arc::new(VariadicType::Base(LuaType::Number)))
+            }),
+            ("MultiLineUnion", || {
+                LuaType::MultiLineUnion(Arc::new(LuaMultiLineUnion::new(vec![
+                    (
+                        LuaType::DocStringConst(ArcIntern::new(SmolStr::new("a"))),
+                        None,
+                    ),
+                    (
+                        LuaType::DocStringConst(ArcIntern::new(SmolStr::new("b"))),
+                        None,
+                    ),
+                ])))
+            }),
+            ("TypeGuard", || {
+                LuaType::TypeGuard(Arc::new(LuaType::String))
+            }),
+            ("Union::Nullable", || {
+                LuaType::Union(Arc::new(LuaUnionType::Nullable(LuaType::String)))
+            }),
+            ("Union::Multi", || {
+                LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                    LuaType::Boolean,
+                ])))
+            }),
+            ("Object", || {
+                LuaType::Object(Arc::new(LuaObjectType::new(vec![(
+                    LuaIndexAccessKey::String(SmolStr::new("field")),
+                    LuaType::String,
+                )])))
+            }),
+            ("Intersection", || {
+                LuaType::Intersection(Arc::new(LuaIntersectionType::new(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                ])))
+            }),
+            ("Generic", || {
+                LuaType::Generic(Arc::new(LuaGenericType::new(
+                    LuaTypeDeclId::global("Box"),
+                    vec![LuaType::String],
+                )))
+            }),
+            ("TableGeneric", || {
+                LuaType::TableGeneric(Arc::new(vec![LuaType::String, LuaType::Integer]))
+            }),
+            ("Conditional", || {
+                LuaType::Conditional(Arc::new(LuaConditionalType::new(
+                    LuaType::String,
+                    LuaType::Integer,
+                    LuaType::Number,
+                    vec![],
+                    false,
+                )))
+            }),
+            ("Mapped", || {
+                LuaType::Mapped(Arc::new(LuaMappedType::new(
+                    (
+                        GenericTplId::Type(0),
+                        GenericParam::new(SmolStr::new("K"), None, None),
+                    ),
+                    LuaType::String,
+                    false,
+                    false,
+                )))
+            }),
+        ];
+
+        for (name, build) in builders {
+            let (left, right) = (build(), build());
+            assert_eq!(left, right, "{name} builders disagreed");
+            assert_eq!(
+                hash_of(&left),
+                hash_of(&right),
+                "{name} hashed its allocation, not its contents"
+            );
+        }
+    }
 }

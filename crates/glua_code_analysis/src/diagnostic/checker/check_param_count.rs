@@ -438,8 +438,10 @@ fn callee_is_computed_key_collection_element(
         })
 }
 
-/// The table a `for ... in <iter>` walks: the sole argument of `pairs(t)` /
-/// `ipairs(t)`, or the expression itself when it is not a call.
+/// The table a `for ... in <iter>` walks: the sole argument of a single-argument
+/// call (`pairs(t)`, `ipairs(t)`, or any custom iterator factory), or the
+/// expression itself when it is not a call. A call taking more than one argument
+/// has no single container to name, so it yields nothing.
 fn iterated_container_expr(for_range: &LuaForRangeStat) -> Option<LuaExpr> {
     let iter_expr = for_range.get_expr_list().next()?;
     let LuaExpr::CallExpr(call_expr) = &iter_expr else {

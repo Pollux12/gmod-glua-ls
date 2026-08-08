@@ -2393,6 +2393,12 @@ fn resolve_call_to_function_block(
 /// Shared state for a file's net collection walk. Bundled so the recursive
 /// helpers stay readable: they already carried 11 positional arguments before
 /// `file_id` and the call resolver had to be threaded for annotation lookup.
+///
+/// The three `&mut` fields are pure memo state: `local_fns`, `net` and
+/// `resolve_memo` are all keyed by syntax position and each entry is a function
+/// of the file's own text and the index, so a walk can only ever fill them in a
+/// different order — never with a different answer, and never with one that
+/// makes a later lookup depend on the walk that preceded it.
 struct NetCollectCtx<'a> {
     db: &'a DbIndex,
     helper_registry: &'a HelperRegistry,
