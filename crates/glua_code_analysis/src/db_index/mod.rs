@@ -206,6 +206,10 @@ impl DbIndex {
         }
 
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
+        // Same reasoning as in `clear`: both halves of the revision key can
+        // return to a previously cached value after a remove + update while the
+        // underlying index has changed.
+        self.helper_registry_cache = RevisionedCache::default();
         for &file_id in &file_ids {
             self.file_has_call_expr.remove(&file_id);
             self.file_helper_scan_cache.remove(&file_id);
@@ -609,5 +613,28 @@ impl LuaIndex for DbIndex {
         self.helper_registry_cache = RevisionedCache::default();
         self.file_has_call_expr.clear();
         self.file_helper_scan_cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::DbIndex;
+    use crate::FileId;
+
+    #[test]
+    fn remove_index_resets_the_helper_registry_cache() {
+        let mut db = DbIndex::new();
+        let revision = 7u64;
+        db.set_cached_helper_registry(revision, Arc::new(42u32));
+        assert_eq!(
+            db.get_cached_helper_registry::<u32>(revision).as_deref(),
+            Some(&42)
+        );
+
+        db.remove_index(vec![FileId::new(1)]);
+
+        assert!(db.get_cached_helper_registry::<u32>(revision).is_none());
     }
 }
