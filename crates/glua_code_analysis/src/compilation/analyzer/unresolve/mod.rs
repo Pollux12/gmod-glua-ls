@@ -97,12 +97,20 @@ fn partition_pre_dynamic_unresolves(
     (ready, deferred)
 }
 
+/// Per-reason unresolve attribution, gated on `GLUALS_PROFILE_UNRESOLVE`. Kept
+/// off `GLUALS_PROFILE_PHASE` because the per-attempt `Instant` pairs inflate
+/// the pass by ~50%, which would distort every other phase reading.
+fn unresolve_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_UNRESOLVE").is_some())
+}
+
 pub struct UnResolveAnalysisPipeline;
 
 impl AnalysisPipeline for UnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
-        let log_enabled = log::log_enabled!(log::Level::Info);
+        let log_enabled = log::log_enabled!(log::Level::Info) || unresolve_profile_enabled();
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
 
         let mat_start = log_enabled.then(std::time::Instant::now);
@@ -509,6 +517,19 @@ impl TryResolveProfile {
             .collect::<Vec<_>>();
         stats.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.attempt_time + stats.reach_time));
         for (reason, stats) in stats.into_iter().take(12) {
+            if unresolve_profile_enabled() {
+                eprintln!(
+                    "  [unres] loop {loop_count} {reason:<28} groups={} unres={} reach={}/{} reach_t={:>7.3}s attempts={} ok={} attempt_t={:>7.3}s",
+                    stats.groups_seen,
+                    stats.unresolves_seen,
+                    stats.reach_hits,
+                    stats.reach_checks,
+                    stats.reach_time.as_secs_f64(),
+                    stats.attempts,
+                    stats.ok,
+                    stats.attempt_time.as_secs_f64(),
+                );
+            }
             log::info!(
                 "unresolve: loop {} reason {} groups={} unresolves={} reach={}/{} reach_time={:?} attempts={} ok={} same_err={} other_err={} field_err={} op_err={} none_err={} recursive_err={} attempt_time={:?}",
                 loop_count,
