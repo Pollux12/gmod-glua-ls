@@ -797,7 +797,11 @@ pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &AnalyzeContext
         )
         .map(|prefix| format!("{prefix}:"))
         .collect();
-    let (_, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
+    let (_, annotated_global_call_roles, _) = {
+        let _p = Profile::new("  ccs: build_call_roles_and_registry");
+        build_call_roles_and_registry(db)
+    };
+    let _p = Profile::new("  ccs: walk");
     collect_annotated_gmod_call_sites_with(
         db,
         context,
@@ -972,41 +976,59 @@ fn build_call_roles_and_registry(
         )
     });
 
+    // A file's scan reads only its own signatures plus immutable db state, so
+    // the uncached ones are derived concurrently. On a cold index that is every
+    // file in the workspace, and the per-file syntax-tree walk behind
+    // `has_calls` dominates. Results are stored and merged below in exactly the
+    // previous fixed file order, so the fold is unchanged.
+    let uncached = scan_files
+        .iter()
+        .copied()
+        .filter(|file_id| {
+            db.get_cached_file_helper_scan::<FileHelperScan>(*file_id)
+                .is_none()
+        })
+        .collect::<Vec<_>>();
+    let sorted_signatures = uncached
+        .iter()
+        .map(|file_id| {
+            let mut signature_ids = signatures_by_file.remove(file_id).unwrap_or_default();
+            signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
+            (*file_id, signature_ids)
+        })
+        .collect::<HashMap<_, _>>();
+    let scanned = super::parallel::map_files_collect(db, &uncached, |db, file_id| {
+        let has_calls = match db.get_file_has_call_expr(file_id) {
+            Some(cached) => cached,
+            None => db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| {
+                    tree.get_chunk_node()
+                        .syntax()
+                        .descendants()
+                        .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+                })
+                .unwrap_or(false),
+        };
+        let scan = Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
+            db,
+            &sorted_signatures[&file_id],
+            has_calls,
+        ));
+        (has_calls, scan)
+    });
+    let rescanned = scanned.len();
+    for (file_id, (has_calls, scan)) in uncached.iter().zip(scanned) {
+        db.set_file_has_call_expr(*file_id, has_calls);
+        db.set_cached_file_helper_scan(*file_id, scan);
+    }
+
     let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
     let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
-    let mut rescanned = 0usize;
     for file_id in scan_files {
-        let scan = match db.get_cached_file_helper_scan::<FileHelperScan>(file_id) {
-            Some(cached) => cached,
-            None => {
-                let has_calls = match db.get_file_has_call_expr(file_id) {
-                    Some(cached) => cached,
-                    None => {
-                        let computed = db
-                            .get_vfs()
-                            .get_syntax_tree(&file_id)
-                            .map(|tree| {
-                                tree.get_chunk_node()
-                                    .syntax()
-                                    .descendants()
-                                    .any(|node| LuaCallExpr::can_cast(node.kind().into()))
-                            })
-                            .unwrap_or(false);
-                        db.set_file_has_call_expr(file_id, computed);
-                        computed
-                    }
-                };
-                let mut signature_ids = signatures_by_file.remove(&file_id).unwrap_or_default();
-                signature_ids.sort_unstable_by_key(|signature_id| signature_id.get_position());
-                let scan = Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
-                    db,
-                    &signature_ids,
-                    has_calls,
-                ));
-                db.set_cached_file_helper_scan(file_id, scan.clone());
-                rescanned += 1;
-                scan
-            }
+        let Some(scan) = db.get_cached_file_helper_scan::<FileHelperScan>(file_id) else {
+            continue;
         };
         role_map.merge_from(&scan.role_map);
         if cached_helper_registry.is_none() {

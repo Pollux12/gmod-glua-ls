@@ -10,6 +10,7 @@ use crate::{
 };
 
 pub fn synthesize_setmetatable_factory_members(db: &mut DbIndex, file_ids: &[FileId]) {
+    let _p = crate::profile::Profile::new("setmetatable_factory");
     let mut bindings = file_ids
         .iter()
         .filter_map(|file_id| db.get_metatable_index().factory_bindings_for_file(*file_id))

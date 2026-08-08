@@ -1564,20 +1564,32 @@ impl EmmyLuaAnalysis {
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
-        for file_id in &old_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
+        {
+            let _p = Profile::new("post: stabilize_cross_file_type_caches");
+            self.stabilize_cross_file_type_caches(&updated_files);
         }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &updated_files,
-            &old_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
+        {
+            let _p = Profile::new("post: refresh_file_source_dependencies");
+            for file_id in &old_source_file_ids {
+                self.compilation
+                    .get_db_mut()
+                    .get_call_site_param_index_mut()
+                    .refresh_file_source_dependencies(*file_id);
+            }
+        }
+        {
+            let _p = Profile::new("post: reindex_changed_inferred_guard_references");
+            self.reindex_changed_inferred_guard_references(
+                &guard_fact_file_ids,
+                &old_guard_facts,
+                &updated_files,
+                &old_source_file_ids,
+            );
+        }
+        {
+            let _p = Profile::new("post: reindex_changed_inferred_param_consumers");
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
+        }
         updated_files
     }
 

@@ -74,7 +74,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         return;
     }
 
-    let mut contexts = module_analyze(db, need_analyzed_files);
+    let mut contexts = {
+        let _p = Profile::new("module_analyze");
+        module_analyze(db, need_analyzed_files)
+    };
 
     // Declaration and documentation indexing runs for *every* workspace
     // group before any group enters resolution. Both passes are per-file
@@ -95,8 +98,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
     // here, for the same reason declaration and documentation indexing is
     // hoisted: they are per-file syntactic walks, and the passes that read
     // them are not per-group.
-    for (_, context) in contexts.iter_mut() {
-        gmod::collect_gmod_call_sites(db, context);
+    {
+        let _p = Profile::new("collect_gmod_call_sites");
+        for (_, context) in contexts.iter_mut() {
+            gmod::collect_gmod_call_sites(db, context);
+        }
     }
 
     for (workspace_id, mut context) in contexts {
@@ -109,13 +115,21 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .collect::<Vec<_>>();
 
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
-        let early_signature_owners = publish_callable_signatures(db, &context);
+        let early_signature_owners = {
+            let _p = Profile::new("publish_callable_signatures");
+            publish_callable_signatures(db, &context)
+        };
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
 
-        let early_member_owners = resolve_early_member_owners(db, &mut context);
+        let early_member_owners = {
+            let _p = Profile::new("resolve_early_member_owners");
+            resolve_early_member_owners(db, &mut context)
+        };
+        let _p_guards = Profile::new("early inferred guards");
         local_inference::prepare_inferred_positive_guards(db, &context);
         let guard_candidates = context.inferred_guard_candidates.len();
         let early_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
+        drop(_p_guards);
 
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
@@ -123,7 +137,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         // during lua_analyze (AccessorFunc, NetworkVar, VGUI register calls).
         run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
-        synthesize_accessorfunc_members(db, &workspace_file_ids);
+        {
+            let _p = Profile::new("synthesize_accessorfunc_members");
+            synthesize_accessorfunc_members(db, &workspace_file_ids);
+        }
         let infer_dynamic_fields =
             db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
         if infer_dynamic_fields {
@@ -205,7 +222,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         // Members that landed on a global path before the global's owner was
         // known are attached now that it is. See
         // `reconcile_parked_global_path_members`.
-        common::reconcile_parked_global_path_members(db);
+        {
+            let _p = Profile::new("reconcile_parked_global_path_members");
+            common::reconcile_parked_global_path_members(db);
+        }
 
         // Net flows are collected last: the collector resolves wrappers through
         // signatures, receiver types and members, none of which exist yet when
