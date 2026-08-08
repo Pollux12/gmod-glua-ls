@@ -486,6 +486,24 @@ fn analyze_dynamic_fields(
     let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     if mode.propagate_to_super_types() {
+        // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
+        // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
+        // scoped class, so propagating there pools each file's fields onto
+        // one table the whole workspace writes. Those scopes are per-file
+        // by design: a `---@type SWEP` read is a read of the generic
+        // authoring table, not of any one weapon, so it should see the
+        // annotated `SWEP` fields and not every weapon's private ones.
+        let scoped_globals: FxHashSet<&str> = db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions_slice()
+            .iter()
+            .flat_map(|definition| {
+                std::iter::once(definition.class_global.as_str())
+                    .chain(definition.aliases.iter().map(String::as_str))
+            })
+            .collect();
         for (owner, field_name, file_id, range) in &collected {
             let DynamicFieldOwner::Type(type_id) = owner else {
                 continue;
@@ -493,7 +511,9 @@ fn analyze_dynamic_fields(
             let mut super_types = Vec::new();
             type_id.collect_super_types(&*db, &mut super_types);
             for super_type in super_types {
-                if let LuaType::Ref(super_id) = &super_type {
+                if let LuaType::Ref(super_id) = &super_type
+                    && !scoped_globals.contains(super_id.get_name())
+                {
                     propagated.push((
                         DynamicFieldOwner::Type(super_id.clone()),
                         field_name.clone(),

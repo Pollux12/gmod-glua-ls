@@ -1597,9 +1597,9 @@ mod test {
         end
         "#;
         let consumer_source = r#"
-        ---@type SWEP
-        local obj
-        A = obj.Target
+        function SWEP:Consume()
+            A = self.Target
+        end
         "#;
 
         let mut body_then_player_ws = VirtualWorkspace::new();
