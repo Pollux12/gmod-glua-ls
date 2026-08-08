@@ -775,6 +775,37 @@ fn collect_annotated_scripted_class_calls_with(
     }
 }
 
+/// Scripted-class registration and `load`-style call sites for one
+/// workspace group, collected before *any* group resolves.
+pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &AnalyzeContext) {
+    if !db.get_emmyrc().gmod.enabled {
+        return;
+    }
+
+    let formatted_hook_prefixes: Vec<String> = db
+        .get_emmyrc()
+        .gmod
+        .hook_mappings
+        .method_prefixes
+        .iter()
+        .cloned()
+        .chain(
+            db.get_emmyrc()
+                .gmod
+                .scripted_class_scopes
+                .hook_owner_globals(),
+        )
+        .map(|prefix| format!("{prefix}:"))
+        .collect();
+    let (_, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
+    collect_annotated_gmod_call_sites_with(
+        db,
+        context,
+        &formatted_hook_prefixes,
+        &annotated_global_call_roles,
+    );
+}
+
 fn collect_annotated_gmod_call_sites_with(
     db: &mut DbIndex,
     context: &AnalyzeContext,

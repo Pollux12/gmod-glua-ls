@@ -91,6 +91,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         run_analysis::<doc::DocAnalysisPipeline>(db, context);
     }
 
+    // Scripted-class and load call sites are collected for *every* group
+    // here, for the same reason declaration and documentation indexing is
+    // hoisted: they are per-file syntactic walks, and the passes that read
+    // them are not per-group.
+    for (_, context) in contexts.iter_mut() {
+        gmod::collect_gmod_call_sites(db, context);
+    }
+
     for (workspace_id, mut context) in contexts {
         let profile_log = format!("analyze workspace {}", workspace_id);
         let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
