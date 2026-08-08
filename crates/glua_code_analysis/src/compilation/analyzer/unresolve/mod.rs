@@ -666,6 +666,7 @@ pub(crate) fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str 
         InferFailReason::UnResolveSignatureReturn(_) => "signature_return",
         InferFailReason::UnResolveTypeDecl(_) => "type_decl",
         InferFailReason::UnResolveModuleExport(_) => "module_export",
+        InferFailReason::UnSealedDynamicFields => "unsealed_dynamic_fields",
     }
 }
 
@@ -689,6 +690,7 @@ fn infer_fail_reason_kind_rank(reason: &InferFailReason) -> u8 {
         InferFailReason::UnResolveSignatureReturn(_) => 7,
         InferFailReason::UnResolveTypeDecl(_) => 8,
         InferFailReason::UnResolveModuleExport(_) => 9,
+        InferFailReason::UnSealedDynamicFields => 10,
     }
 }
 

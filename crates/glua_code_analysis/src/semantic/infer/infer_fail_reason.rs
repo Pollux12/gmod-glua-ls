@@ -14,6 +14,10 @@ pub enum InferFailReason {
     UnResolveMemberType(LuaMemberId),
     UnResolveOperatorCall,
     UnResolveModuleExport(FileId),
+    /// The dynamic-field index is still being built, so a read of it would
+    /// answer from however far the batch walk happened to get. Clears when the
+    /// index seals.
+    UnSealedDynamicFields,
 }
 
 impl InferFailReason {
@@ -28,6 +32,7 @@ impl InferFailReason {
                 | InferFailReason::UnResolveMemberType(_)
                 | InferFailReason::UnResolveOperatorCall
                 | InferFailReason::UnResolveModuleExport(_)
+                | InferFailReason::UnSealedDynamicFields
         )
     }
 }

@@ -306,22 +306,24 @@ pub(crate) fn resolve_dynamic_field_member(
     prefix_type: &LuaType,
     member_key: &LuaMemberKey,
     access_position: Option<TextSize>,
-) -> Option<DynamicFieldResolution> {
+) -> Result<Option<DynamicFieldResolution>, InferFailReason> {
     if !db.get_emmyrc().gmod.enabled
         || !db.get_emmyrc().gmod.infer_dynamic_fields
         || !cache.get_config().dynamic_fields_visible
     {
-        return None;
+        return Ok(None);
     }
 
     let cache_key = (prefix_type.clone(), member_key.clone(), access_position);
     if let Some(cached) = cache.dynamic_field_resolution_cache.get(&cache_key) {
-        return cached
+        return Ok(cached
             .clone()
-            .map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl });
+            .map(|(typ, semantic_decl)| DynamicFieldResolution { typ, semantic_decl }));
     }
 
-    let field_name = member_key.get_name()?;
+    let Some(field_name) = member_key.get_name() else {
+        return Ok(None);
+    };
     let definitions = dynamic_field_definitions(
         db,
         cache.get_file_id(),
@@ -330,8 +332,14 @@ pub(crate) fn resolve_dynamic_field_member(
         access_position,
     );
     if definitions.is_empty() {
+        // Absence is only knowable once the index is complete: until then the
+        // walk may simply not have reached the defining file yet. Never memoise
+        // this — the answer is about build state, not about the field.
+        if !db.get_dynamic_field_index().is_sealed() {
+            return Err(InferFailReason::UnSealedDynamicFields);
+        }
         cache.dynamic_field_resolution_cache.insert(cache_key, None);
-        return None;
+        return Ok(None);
     }
 
     let mut member_types = Vec::new();
@@ -365,7 +373,7 @@ pub(crate) fn resolve_dynamic_field_member(
     cache
         .dynamic_field_resolution_cache
         .insert(cache_key, Some((typ.clone(), semantic_decl.clone())));
-    Some(DynamicFieldResolution { typ, semantic_decl })
+    Ok(Some(DynamicFieldResolution { typ, semantic_decl }))
 }
 
 pub(crate) fn resolve_dynamic_field_member_for_file(
@@ -375,7 +383,8 @@ pub(crate) fn resolve_dynamic_field_member_for_file(
     member_key: &LuaMemberKey,
 ) -> Option<DynamicFieldResolution> {
     let mut cache = LuaInferCache::new(caller_file_id, Default::default());
-    resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key, None)
+    // unsealed: pre-deferral behavior, replaced per-consumer
+    resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key, None).unwrap_or_default()
 }
 
 fn dynamic_field_member_type(

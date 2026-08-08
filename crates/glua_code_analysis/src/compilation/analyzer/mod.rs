@@ -114,6 +114,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .map(|in_filed_tree| in_filed_tree.file_id)
             .collect::<Vec<_>>();
 
+        // Mirrors the per-group lifecycle of the infer-cache visibility flag:
+        // this group's dynamic-field facts are not complete until its own
+        // dynamic-field pass has run.
+        db.get_dynamic_field_index_mut().set_sealed(false);
+
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
         let early_signature_owners = {
             let _p = Profile::new("publish_callable_signatures");
@@ -180,6 +185,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         if infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
+            db.get_dynamic_field_index_mut().set_sealed(true);
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);

@@ -446,7 +446,10 @@ fn infer_custom_type_member_semantic_decl(
         &LuaType::Ref(prefix_type_id.clone()),
         member_key,
         member_access_position,
-    ) {
+    )
+    // unsealed: pre-deferral behavior, replaced per-consumer
+    .unwrap_or_default()
+    {
         return dynamic_field.semantic_decl;
     }
 

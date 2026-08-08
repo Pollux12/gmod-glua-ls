@@ -40,6 +40,7 @@ pub struct DynamicFieldIndex {
     unattributed_fields: HashMap<SmolStr, HashSet<FileId>>,
     /// file → unattributed field names contributed by this file.
     unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
+    sealed: bool,
 }
 
 fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
@@ -155,6 +156,17 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push(field_name);
         }
+    }
+
+    /// Whether the index has finished being built for the current analysis
+    /// round. A read taken before that answers from however far the batch walk
+    /// happened to get, so an absent field is not yet known to be absent.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub fn set_sealed(&mut self, sealed: bool) {
+        self.sealed = sealed;
     }
 
     pub fn has_unattributed_field(&self, field_name: &str) -> bool {
@@ -476,6 +488,7 @@ impl LuaIndex for DynamicFieldIndex {
         self.wildcard_file_contributions.clear();
         self.unattributed_fields.clear();
         self.unattributed_file_contributions.clear();
+        self.sealed = false;
     }
 }
 

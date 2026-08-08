@@ -594,6 +594,8 @@ fn infer_table_member_owner(
                 &key,
                 Some(index_expr.get_position()),
             )
+            // unsealed: pre-deferral behavior, replaced per-consumer
+            .unwrap_or_default()
             && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
         {
             return Ok(dynamic_field.typ);
@@ -662,7 +664,10 @@ fn infer_table_member_owner(
             &LuaType::TableConst(inst.clone()),
             &key,
             Some(index_expr.get_position()),
-        ) && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
+        )
+        // unsealed: pre-deferral behavior, replaced per-consumer
+        .unwrap_or_default()
+            && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
         {
             return Ok(dynamic_field.typ);
         }
@@ -703,7 +708,10 @@ fn infer_table_member_owner(
                 &LuaType::TableConst(inst.clone()),
                 &key,
                 Some(index_expr.get_position()),
-            ) {
+            )
+            // unsealed: pre-deferral behavior, replaced per-consumer
+            .unwrap_or_default()
+            {
                 if !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown) {
                     return Ok(dynamic_field.typ);
                 }
@@ -1482,6 +1490,8 @@ fn infer_gmod_plain_table_dynamic_field(
         &member_key,
         Some(index_expr.get_position()),
     )
+    // unsealed: pre-deferral behavior, replaced per-consumer
+    .unwrap_or_default()
     .map(|resolution| resolution.typ)
 }
 
@@ -1762,7 +1772,10 @@ fn infer_custom_type_member(
         &LuaType::Ref(prefix_type_id.clone()),
         &key,
         Some(index_expr.get_position()),
-    ) {
+    )
+    // unsealed: pre-deferral behavior, replaced per-consumer
+    .unwrap_or_default()
+    {
         if type_decl.is_class()
             && let Some(super_types) =
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)

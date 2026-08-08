@@ -63,6 +63,7 @@ pub fn check_reach_reason(
             let module = db.get_module_index().get_module(*file_id)?;
             Some(module.export_type.is_some())
         }
+        InferFailReason::UnSealedDynamicFields => Some(db.get_dynamic_field_index().is_sealed()),
     }
 }
 
@@ -92,6 +93,9 @@ pub fn resolve_as_unknown(
         | InferFailReason::FieldNotFound
         | InferFailReason::UnResolveTypeDecl(_)
         | InferFailReason::UnResolveOperatorCall
+        // Names no owner to floor: the reason is the index's build state, and it
+        // always clears before the last unresolve rounds.
+        | InferFailReason::UnSealedDynamicFields
         | InferFailReason::RecursiveInfer => {
             return Some(());
         }

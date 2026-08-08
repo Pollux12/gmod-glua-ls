@@ -431,7 +431,8 @@ pub(super) fn stabilize_unguarded_children(
                             &member_key,
                             None,
                         )
-                        .is_some();
+                        // unsealed: pre-deferral behavior, replaced per-consumer
+                        .is_ok_and(|resolution| resolution.is_some());
                     if !visible {
                         continue;
                     }
