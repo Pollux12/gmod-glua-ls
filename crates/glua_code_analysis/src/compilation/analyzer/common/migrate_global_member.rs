@@ -90,8 +90,6 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             continue;
         }
 
-        alias_guarded_assignment_members_across_candidates(db, &candidates);
-
         // Every member of the global path, and whether it still needs
         // re-homing.
         let (members, hidden) = {
@@ -136,6 +134,11 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
         if members.is_empty() {
             continue;
         }
+
+        // After the early-out: the guarded repair is part of reconciling a
+        // global that still has parked members, not a pass of its own.
+        alias_guarded_assignment_members_across_candidates(db, &candidates);
+
         let declaring_files = declaring_files(db, &global_id);
 
         for (member_id, needs_rehome) in members {
@@ -200,8 +203,7 @@ fn alias_guarded_assignment_members_across_candidates(
     let member_index = db.get_member_index();
     let guarded = candidates
         .iter()
-        .filter_map(|(_, owner)| member_index.get_members(owner))
-        .flatten()
+        .flat_map(|(_, owner)| member_index.get_member_history(owner))
         .map(|member| member.get_id())
         .filter(|member_id| member_index.is_non_overwriting_assignment_member(*member_id))
         .collect::<Vec<_>>();
