@@ -60,7 +60,8 @@
 //!                               ALONE (or last): it leaves diverged warm state
 //!                               behind, so any in-place stage listed after it
 //!                               inherits that state and its diff is
-//!                               meaningless.
+//!                               meaningless. Honours DET_INDEX_DIFF (cold index
+//!                               snapshot vs the state each target leaves behind).
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
@@ -94,6 +95,10 @@
 //!   DET_DUMP_FILE_IDS   print the main-workspace file id table
 //!   DET_DUMP_CLASS  print the member list of this class at each snapshot
 //!   DET_LIMIT       max diff lines printed per bucket (default 40)
+//!   DET_FILTER      substring an index-diff entry line must contain to be
+//!                   printed. Bucket headers still print in full. Setting it
+//!                   lifts DET_LIMIT: the filter is the limit, so a match never
+//!                   hides behind the first 40 unrelated entries.
 
 use mimalloc::MiMalloc;
 
@@ -480,10 +485,21 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
 }
 
 fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &IndexSnapshot) {
-    let limit = std::env::var("DET_LIMIT")
+    let filter = std::env::var("DET_FILTER")
         .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(40);
+        .filter(|value| !value.is_empty());
+    let limit = match &filter {
+        Some(_) => usize::MAX,
+        None => std::env::var("DET_LIMIT")
+            .ok()
+            .and_then(|value| value.parse::<usize>().ok())
+            .unwrap_or(40),
+    };
+    let emit = |line: String| {
+        if filter.as_ref().is_none_or(|want| line.contains(want)) {
+            println!("{line}");
+        }
+    };
 
     let base_keys = base.type_caches.keys().collect::<BTreeSet<_>>();
     let other_keys = other.type_caches.keys().collect::<BTreeSet<_>>();
@@ -500,17 +516,23 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         changed.len()
     );
     for key in dropped.iter().take(limit) {
-        println!("  TC_DROPPED {key} = {:?}", base.type_caches.get(**key));
+        emit(format!(
+            "  TC_DROPPED {key} = {:?}",
+            base.type_caches.get(**key)
+        ));
     }
     for key in gained.iter().take(limit) {
-        println!("  TC_GAINED  {key} = {:?}", other.type_caches.get(**key));
+        emit(format!(
+            "  TC_GAINED  {key} = {:?}",
+            other.type_caches.get(**key)
+        ));
     }
     for key in changed.iter().take(limit) {
-        println!(
+        emit(format!(
             "  TC_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
             base.type_caches.get(**key),
             other.type_caches.get(**key)
-        );
+        ));
     }
 
     let member_dropped = base.members.difference(&other.members).collect::<Vec<_>>();
@@ -521,10 +543,10 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         member_gained.len()
     );
     for entry in member_dropped.iter().take(limit) {
-        println!("  MEM_DROPPED {entry}");
+        emit(format!("  MEM_DROPPED {entry}"));
     }
     for entry in member_gained.iter().take(limit) {
-        println!("  MEM_GAINED  {entry}");
+        emit(format!("  MEM_GAINED  {entry}"));
     }
 
     let base_supers = base.super_types.keys().collect::<BTreeSet<_>>();
@@ -542,17 +564,23 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         super_changed.len()
     );
     for key in super_dropped.iter().take(limit) {
-        println!("  SUPER_DROPPED {key} = {:?}", base.super_types.get(**key));
+        emit(format!(
+            "  SUPER_DROPPED {key} = {:?}",
+            base.super_types.get(**key)
+        ));
     }
     for key in super_gained.iter().take(limit) {
-        println!("  SUPER_GAINED  {key} = {:?}", other.super_types.get(**key));
+        emit(format!(
+            "  SUPER_GAINED  {key} = {:?}",
+            other.super_types.get(**key)
+        ));
     }
     for key in super_changed.iter().take(limit) {
-        println!(
+        emit(format!(
             "  SUPER_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
             base.super_types.get(**key),
             other.super_types.get(**key)
-        );
+        ));
     }
 
     let base_sig = base.signatures.keys().collect::<BTreeSet<_>>();
@@ -568,11 +596,11 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         sig_changed.len()
     );
     for key in sig_changed.iter().take(limit) {
-        println!(
+        emit(format!(
             "  SIG_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
             base.signatures.get(**key),
             other.signatures.get(**key)
-        );
+        ));
     }
 
     let base_cm = base.class_members.keys().collect::<BTreeSet<_>>();
@@ -586,13 +614,13 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         cm_changed.len()
     );
     for key in cm_changed.iter().take(limit) {
-        println!(
+        emit(format!(
             "  CM_CHANGED {key}
       before = {:?}
       after  = {:?}",
             base.class_members.get(**key),
             other.class_members.get(**key)
-        );
+        ));
     }
 
     let base_params = base.inferred_params.keys().collect::<BTreeSet<_>>();
@@ -610,16 +638,16 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         param_changed.len()
     );
     for key in param_dropped.iter().chain(param_gained.iter()).take(limit) {
-        println!("  PARAM_SET {key}");
+        emit(format!("  PARAM_SET {key}"));
     }
     for key in param_changed.iter().take(limit) {
-        println!(
+        emit(format!(
             "  PARAM_CHANGED {key}
       before = {:?}
       after  = {:?}",
             base.inferred_params.get(**key),
             other.inferred_params.get(**key)
-        );
+        ));
     }
 
     let base_net = base.net_flows.iter().collect::<BTreeSet<_>>();
@@ -633,10 +661,10 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         net_gained.len()
     );
     for entry in net_dropped.iter().take(limit) {
-        println!("  NET_DROPPED {}", &entry[..entry.len().min(400)]);
+        emit(format!("  NET_DROPPED {}", &entry[..entry.len().min(400)]));
     }
     for entry in net_gained.iter().take(limit) {
-        println!("  NET_GAINED  {}", &entry[..entry.len().min(400)]);
+        emit(format!("  NET_GAINED  {}", &entry[..entry.len().min(400)]));
     }
 }
 
@@ -850,7 +878,8 @@ fn main() {
 
     // A cross-process comparison needs the cold snapshot even when no stage runs
     // that would otherwise collect one.
-    if std::env::var_os("DET_DUMP_INDEX").is_some() && std::env::var_os("DET_INDEX_DIFF").is_none() {
+    if std::env::var_os("DET_DUMP_INDEX").is_some() && std::env::var_os("DET_INDEX_DIFF").is_none()
+    {
         collect_index(&analysis, "cold");
     }
 
@@ -885,12 +914,18 @@ fn main() {
     }
 
     if stages.iter().any(|s| s == "editmid") {
+        let cold_index =
+            std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
             if !noop_edit_midfile(&mut analysis, &path) {
                 continue;
             }
             let label = format!("after_editmid[{target}]");
+            if let Some(cold_index) = &cold_index {
+                let after_index = collect_index(&analysis, &label);
+                diff_index("cold", cold_index, &label, &after_index);
+            }
             let after = collect(&analysis, &label);
             diff("cold", &cold, &label, &after);
         }
