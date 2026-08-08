@@ -54,6 +54,7 @@ use reference::is_reference_to;
 use rowan::{NodeOrToken, TextRange};
 pub(crate) use semantic_info::{
     SemanticDeclGuard, infer_expr_semantic_decl, infer_node_semantic_decl, resolve_global_decl_id,
+    try_infer_expr_semantic_decl,
 };
 pub use semantic_info::{SemanticInfo, SemanticInfoOrigin};
 use semantic_info::{

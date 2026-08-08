@@ -96,6 +96,11 @@ pub struct CallSiteParamIndex {
     mutated_params: HashMap<LuaSignatureId, Vec<usize>>,
     /// file → observed call-site param evidence contributed by calls in that file.
     file_contributions: HashMap<FileId, Vec<CallSiteParamContribution>>,
+    /// Contributions recovered by deferred resolution after this file's batch
+    /// collection already ran. Buffered rather than applied directly because
+    /// every apply rebuilds the whole derived state; see
+    /// `flush_deferred_contributions`.
+    deferred_contributions: Vec<(FileId, CallSiteParamContribution)>,
     /// signature → param index → union of all observed types from current file contributions.
     inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
     pending_previous_params: HashMap<(LuaSignatureId, usize), LuaTypeFact>,
@@ -236,6 +241,41 @@ impl CallSiteParamIndex {
                 (previous.get(&(signature_id, param_idx)) != Some(&current)).then_some(signature_id)
             })
             .collect()
+    }
+
+    /// Queue one call-site contribution recovered by deferred resolution.
+    pub(crate) fn queue_deferred_contribution(
+        &mut self,
+        file_id: FileId,
+        signature_id: LuaSignatureId,
+        param_idx: usize,
+        param_fact: LuaTypeFact,
+    ) {
+        self.deferred_contributions.push((
+            file_id,
+            CallSiteParamContribution {
+                signature_id,
+                param_idx,
+                param_fact,
+            },
+        ));
+    }
+
+    /// Apply every queued deferred contribution and rebuild derived state once.
+    pub(crate) fn flush_deferred_contributions(&mut self) -> usize {
+        if self.deferred_contributions.is_empty() {
+            return 0;
+        }
+        let queued = std::mem::take(&mut self.deferred_contributions);
+        let count = queued.len();
+        for (file_id, contribution) in queued {
+            self.file_contributions
+                .entry(file_id)
+                .or_default()
+                .push(contribution);
+        }
+        self.rebuild_derived_state();
+        count
     }
 
     /// The inferred parameter facts of every signature that `file_ids`
@@ -625,6 +665,8 @@ impl LuaIndex for CallSiteParamIndex {
                     .or_insert(fact);
             }
         }
+        self.deferred_contributions
+            .retain(|(file_id, _)| !file_ids.contains(file_id));
         for &file_id in file_ids {
             self.file_source_signatures.remove(&file_id);
             self.file_return_consumers.remove(&file_id);
@@ -640,6 +682,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.file_source_signatures.clear();
         self.source_signatures_by_path.clear();
         self.file_contributions.clear();
+        self.deferred_contributions.clear();
         self.inferred_params.clear();
         self.pending_previous_params.clear();
         self.file_return_consumers.clear();

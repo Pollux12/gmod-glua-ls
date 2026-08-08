@@ -23,8 +23,8 @@ use glua_parser::{
     LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
-    try_resolve_decl, try_resolve_iter_var, try_resolve_member, try_resolve_module,
-    try_resolve_module_ref, try_resolve_return_point, try_resolve_table_field,
+    try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_member,
+    try_resolve_module, try_resolve_module_ref, try_resolve_return_point, try_resolve_table_field,
 };
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
@@ -221,6 +221,11 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             loop_count += 1;
         }
 
+        // Applied once per pipeline run rather than per resolution: every apply
+        // rebuilds the index's whole derived contribution state.
+        db.get_call_site_param_index_mut()
+            .flush_deferred_contributions();
+
         for (reason, unresolves) in reason_resolve {
             context.unresolves.extend(
                 unresolves
@@ -352,6 +357,9 @@ fn try_resolve(
                     UnResolve::SpecialCall(un_resolve_special_call) => {
                         try_resolve_special_call(db, cache, un_resolve_special_call)
                     }
+                    UnResolve::CallSiteContribution(contribution) => {
+                        try_resolve_call_site_contribution(db, cache, contribution)
+                    }
                 };
                 if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
                     profile.record_attempt(
@@ -401,7 +409,12 @@ fn try_resolve(
                         } else {
                             // The item re-failed naming the dependency its
                             // group was just reached on, so the fact it
-                            // would have written is never produced.
+                            // would have written is never produced. The
+                            // drops that remain here are genuine: the ones
+                            // that named an *already satisfied* dependency
+                            // came from a memoised `CacheEntry::Error`,
+                            // which `clear_deferred_inference_results` now
+                            // purges.
                             census::record(
                                 "try_resolve.same_reason_drop",
                                 infer_fail_reason_label(&reason),
@@ -573,6 +586,7 @@ fn record_drop(db: &DbIndex, site: &str, unresolve: &UnResolve, reason: &InferFa
         UnResolve::ModuleRef(_) => "module_ref",
         UnResolve::TableField(_) => "table_field",
         UnResolve::SpecialCall(_) => "special_call",
+        UnResolve::CallSiteContribution(_) => "call_site_contribution",
     };
 
     let fact = match unresolve {
@@ -756,6 +770,7 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::ModuleRef(_) => 8,
         UnResolve::TableField(_) => 9,
         UnResolve::SpecialCall(_) => 10,
+        UnResolve::CallSiteContribution(_) => 11,
     }
 }
 
@@ -778,6 +793,7 @@ pub enum UnResolve {
     ModuleRef(Box<UnResolveModuleRef>),
     TableField(Box<UnResolveTableField>),
     SpecialCall(Box<UnResolveSpecialCall>),
+    CallSiteContribution(Box<UnResolveCallSiteContribution>),
 }
 
 #[allow(dead_code)]
@@ -803,6 +819,9 @@ impl UnResolve {
             UnResolve::SpecialCall(un_resolve_special_call) => {
                 Some(un_resolve_special_call.file_id)
             }
+            // The retry infers in the file the expression lives in, which is the
+            // callee's file for callback snapshots.
+            UnResolve::CallSiteContribution(contribution) => Some(contribution.expr_file_id),
         }
     }
 
@@ -844,6 +863,10 @@ impl UnResolve {
             UnResolve::SpecialCall(d) => (
                 d.file_id.id,
                 u32::from(d.call_expr.syntax().text_range().start()),
+            ),
+            UnResolve::CallSiteContribution(d) => (
+                d.expr_file_id.id,
+                u32::from(d.expr_syntax_id.get_range().start()),
             ),
         }
     }
@@ -1003,6 +1026,42 @@ pub struct UnResolveSpecialCall {
 impl From<UnResolveSpecialCall> for UnResolve {
     fn from(un_resolve_special_call: UnResolveSpecialCall) -> Self {
         UnResolve::SpecialCall(Box::new(un_resolve_special_call))
+    }
+}
+
+/// Which call-site collection produced a contribution, and therefore how the
+/// retry re-derives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSiteContributionKind {
+    /// Receiver of an exact `obj:method()` call bound to an explicit `self` param.
+    ExactReceiver,
+    /// A supported argument shape bound to a named callee parameter.
+    Argument,
+    /// A concrete table passed to a callback, snapshotted structurally.
+    CallbackTable,
+}
+
+/// A call-site parameter contribution whose type was not inferable yet.
+///
+/// Carries only ids so it can cross the per-file parallel collection boundary
+/// (rowan red nodes are `!Send`); the retry re-materializes the expression from
+/// `expr_file_id`'s red root and re-runs exactly that one collection.
+#[derive(Debug, Clone)]
+pub struct UnResolveCallSiteContribution {
+    /// File whose contribution set receives the recovered fact. Equal to
+    /// `expr_file_id` except for callback snapshots, which are attributed to the
+    /// caller file while the expression lives in the callee's.
+    pub file_id: FileId,
+    pub expr_file_id: FileId,
+    pub expr_syntax_id: glua_parser::LuaSyntaxId,
+    pub signature_id: LuaSignatureId,
+    pub param_idx: usize,
+    pub kind: CallSiteContributionKind,
+}
+
+impl From<UnResolveCallSiteContribution> for UnResolve {
+    fn from(contribution: UnResolveCallSiteContribution) -> Self {
+        UnResolve::CallSiteContribution(Box::new(contribution))
     }
 }
 

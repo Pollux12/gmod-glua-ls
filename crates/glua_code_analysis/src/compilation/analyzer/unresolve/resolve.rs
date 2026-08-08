@@ -17,7 +17,13 @@ use crate::{
     LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
     LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
     SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
+    LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
+    LuaInferenceStep, LuaTypeFact,
     compilation::analyzer::{
+        call_site_params::{
+            exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
+            snapshot_callback_table_type,
+        },
         common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
@@ -34,17 +40,100 @@ use crate::{
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
-        get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, infer_expr_semantic_decl,
+        get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, try_infer_expr_semantic_decl,
         resolve_dynamic_field_member,
     },
 };
 use smol_str::SmolStr;
 
 use super::{
-    ResolveResult, UnResolveDecl, UnResolveIterVar, UnResolveMember, UnResolveModule,
-    UnResolveModuleRef, UnResolveReturn, UnResolveTableField,
-    resolve_closure::inferred_return_tail_matching_documented_first,
+    CallSiteContributionKind, ResolveResult, UnResolveCallSiteContribution, UnResolveDecl,
+    UnResolveIterVar, UnResolveMember, UnResolveModule, UnResolveModuleRef, UnResolveReturn,
+    UnResolveTableField, resolve_closure::inferred_return_tail_matching_documented_first,
 };
+
+/// Re-derive one call-site parameter contribution whose type was not
+/// buildable when its file was walked, and merge it into that file's
+/// contribution set.
+pub fn try_resolve_call_site_contribution(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    contribution: &mut UnResolveCallSiteContribution,
+) -> ResolveResult {
+    let Some(expr) = db
+        .get_vfs()
+        .get_syntax_tree(&contribution.expr_file_id)
+        .map(|tree| tree.get_red_root())
+        .and_then(|root| contribution.expr_syntax_id.to_node_from_root(&root))
+        .and_then(LuaExpr::cast)
+    else {
+        return Err(InferFailReason::None);
+    };
+    let Ok(param_idx) = u16::try_from(contribution.param_idx) else {
+        return Err(InferFailReason::None);
+    };
+
+    let (typ, confidence, provenance_kind, carries_inferred_type) = match contribution.kind {
+        CallSiteContributionKind::ExactReceiver => {
+            let typ = infer_expr(db, cache, expr)?;
+            if !exact_receiver_type_is_usable(&typ) {
+                return Err(InferFailReason::None);
+            }
+            (
+                typ,
+                LuaInferenceConfidence::Anchored,
+                LuaInferenceProvenanceKind::ContextualUnknown,
+                true,
+            )
+        }
+        CallSiteContributionKind::Argument => {
+            let typ =
+                infer_supported_call_site_arg_type(db, cache, contribution.expr_file_id, expr)?;
+            if typ.is_unknown() || typ.is_never() {
+                return Err(InferFailReason::None);
+            }
+            (
+                typ,
+                LuaInferenceConfidence::Anchored,
+                LuaInferenceProvenanceKind::ContextualUnknown,
+                true,
+            )
+        }
+        CallSiteContributionKind::CallbackTable => {
+            let inferred = infer_expr(db, cache, expr)?;
+            let Some(typ) = snapshot_callback_table_type(db, &inferred) else {
+                return Err(InferFailReason::None);
+            };
+            (
+                typ,
+                LuaInferenceConfidence::Certain,
+                LuaInferenceProvenanceKind::ConcreteValue,
+                false,
+            )
+        }
+    };
+
+    let step = LuaInferenceStep {
+        event: LuaInferenceEventId {
+            node: LuaInferenceNodeId::SignatureParam {
+                signature_id: contribution.signature_id,
+                param_idx,
+            },
+            kind: provenance_kind,
+            source: InFiled::new(contribution.expr_file_id, contribution.expr_syntax_id),
+        },
+        support: Arc::from([]),
+        inferred_type: carries_inferred_type.then(|| Arc::new(typ.clone())),
+        found_type: None,
+    };
+    db.get_call_site_param_index_mut().queue_deferred_contribution(
+        contribution.file_id,
+        contribution.signature_id,
+        contribution.param_idx,
+        LuaTypeFact::new(typ, confidence, Arc::from([step])),
+    );
+    Ok(())
+}
 
 pub fn try_resolve_decl(
     db: &mut DbIndex,
@@ -710,13 +799,13 @@ fn collect_special_call_param_infos_for_prefix_inner(
     prefix_expr: &LuaExpr,
     visited_wrapped_decls: &mut HashSet<LuaSemanticDeclId>,
 ) -> Result<Vec<SpecialCallParamInfo>, InferFailReason> {
-    let semantic_decl = infer_expr_semantic_decl(
+    let semantic_decl = try_infer_expr_semantic_decl(
         db,
         cache,
         prefix_expr.clone(),
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    );
+    )?;
 
     if let Some(semantic_decl) = semantic_decl {
         let param_infos =
@@ -799,13 +888,13 @@ fn collect_special_call_out_param_infos_for_prefix_inner(
     prefix_expr: &LuaExpr,
     visited_wrapped_decls: &mut HashSet<LuaSemanticDeclId>,
 ) -> Result<Vec<SpecialCallOutParamInfo>, InferFailReason> {
-    let semantic_decl = infer_expr_semantic_decl(
+    let semantic_decl = try_infer_expr_semantic_decl(
         db,
         cache,
         prefix_expr.clone(),
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    );
+    )?;
 
     if let Some(semantic_decl) = semantic_decl {
         let out_params =
@@ -1666,7 +1755,8 @@ fn apply_out_param_from_call(
         arg_expr,
         &out_param_info.field_path,
         &mut visited,
-    ) else {
+    )?
+    else {
         return Ok(());
     };
 
@@ -1677,7 +1767,7 @@ fn apply_out_param_from_call(
         &out_param_info.field_path,
         &target,
         matches!(out_param_info.root, LuaOutParamRoot::Param(_)),
-    );
+    )?;
     for effect_target in effect_targets {
         db.get_flow_index_mut().add_special_call_effect(
             file_id,
@@ -1719,12 +1809,12 @@ fn resolve_out_param_target(
     expr: LuaExpr,
     field_path: &[String],
     visited: &mut HashSet<LuaSemanticDeclId>,
-) -> Option<ResolvedOutParamTarget> {
+) -> Result<Option<ResolvedOutParamTarget>, InferFailReason> {
     if field_path.is_empty() {
-        return Some(ResolvedOutParamTarget {
-            owner: expr_type_owner(db, cache, expr.clone()),
+        return Ok(Some(ResolvedOutParamTarget {
+            owner: expr_type_owner(db, cache, expr.clone())?,
             value_expr: Some(expr),
-        });
+        }));
     }
 
     if let LuaExpr::TableExpr(table_expr) = expr.clone()
@@ -1733,7 +1823,7 @@ fn resolve_out_param_target(
         let owner = Some(LuaMemberId::new(field.get_syntax_id(), file_id).into());
         let value_expr = field.get_value_expr();
         if field_path.len() == 1 {
-            return Some(ResolvedOutParamTarget { owner, value_expr });
+            return Ok(Some(ResolvedOutParamTarget { owner, value_expr }));
         }
 
         if let Some(value_expr) = value_expr {
@@ -1748,26 +1838,31 @@ fn resolve_out_param_target(
         }
     }
 
-    if let Some(semantic_decl) = infer_expr_semantic_decl(
+    if let Some(semantic_decl) = try_infer_expr_semantic_decl(
         db,
         cache,
         expr.clone(),
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    ) && visited.insert(semantic_decl.clone())
+    )? && visited.insert(semantic_decl.clone())
         && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
         && let Some(target) =
-            resolve_out_param_target(db, cache, file_id, value_expr, field_path, visited)
+            resolve_out_param_target(db, cache, file_id, value_expr, field_path, visited)?
     {
-        return Some(target);
+        return Ok(Some(target));
     }
 
-    let target = resolve_out_param_target_from_member_lookup(db, cache, expr, &field_path[0])?;
+    let Some(target) = resolve_out_param_target_from_member_lookup(db, cache, expr, &field_path[0])?
+    else {
+        return Ok(None);
+    };
     if field_path.len() == 1 {
-        return Some(target);
+        return Ok(Some(target));
     }
 
-    let value_expr = target.value_expr.clone()?;
+    let Some(value_expr) = target.value_expr.clone() else {
+        return Ok(None);
+    };
     resolve_out_param_target(db, cache, file_id, value_expr, &field_path[1..], visited)
 }
 
@@ -1776,18 +1871,21 @@ fn resolve_out_param_target_from_member_lookup(
     cache: &mut LuaInferCache,
     expr: LuaExpr,
     field_name: &str,
-) -> Option<ResolvedOutParamTarget> {
-    let expr_type = infer_expr(db, cache, expr).ok()?;
-    let member_infos =
-        find_members_with_key(db, &expr_type, LuaMemberKey::Name(field_name.into()), true)?;
+) -> Result<Option<ResolvedOutParamTarget>, InferFailReason> {
+    let expr_type = infer_expr(db, cache, expr)?;
+    let Some(member_infos) =
+        find_members_with_key(db, &expr_type, LuaMemberKey::Name(field_name.into()), true)
+    else {
+        return Ok(None);
+    };
 
-    member_infos.into_iter().find_map(|member_info| {
+    Ok(member_infos.into_iter().find_map(|member_info| {
         let semantic_decl = member_info.property_owner_id?;
         Some(ResolvedOutParamTarget {
             owner: semantic_decl_to_type_owner(semantic_decl.clone()),
             value_expr: get_semantic_decl_value_expr(db, semantic_decl),
         })
-    })
+    }))
 }
 
 fn find_table_field_by_name(table_expr: &LuaTableExpr, field_name: &str) -> Option<LuaTableField> {
@@ -1800,15 +1898,19 @@ fn find_table_field_by_name(table_expr: &LuaTableExpr, field_name: &str) -> Opti
         })
 }
 
-fn expr_type_owner(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Option<LuaTypeOwner> {
-    infer_expr_semantic_decl(
+fn expr_type_owner(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    expr: LuaExpr,
+) -> Result<Option<LuaTypeOwner>, InferFailReason> {
+    Ok(try_infer_expr_semantic_decl(
         db,
         cache,
         expr,
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    )
-    .and_then(semantic_decl_to_type_owner)
+    )?
+    .and_then(semantic_decl_to_type_owner))
 }
 
 fn semantic_decl_to_type_owner(semantic_decl: LuaSemanticDeclId) -> Option<LuaTypeOwner> {
@@ -1826,7 +1928,7 @@ fn collect_out_param_effect_targets(
     field_path: &[String],
     target: &ResolvedOutParamTarget,
     include_resolved_targets: bool,
-) -> Vec<VarRefId> {
+) -> Result<Vec<VarRefId>, InferFailReason> {
     let mut targets = Vec::new();
     let mut visited_aliases = HashSet::new();
     let call_position = arg_expr.get_range().start();
@@ -1839,7 +1941,7 @@ fn collect_out_param_effect_targets(
         field_path,
         &mut targets,
         &mut visited_aliases,
-    );
+    )?;
 
     if include_resolved_targets
         && let Some(owner) = target.owner.clone()
@@ -1857,7 +1959,7 @@ fn collect_out_param_effect_targets(
         targets.push(value_target);
     }
 
-    targets
+    Ok(targets)
 }
 
 fn collect_out_param_effect_path_targets(
@@ -1868,7 +1970,7 @@ fn collect_out_param_effect_path_targets(
     field_path: &[String],
     targets: &mut Vec<VarRefId>,
     visited_aliases: &mut HashSet<LuaSemanticDeclId>,
-) {
+) -> Result<(), InferFailReason> {
     let arg_access_path = get_expr_access_path(&arg_expr);
     if let Some(base_var_ref_id) = get_var_expr_var_ref_id(db, cache, arg_expr.clone()) {
         if let Some(path_target) = extend_var_ref_id_with_path(
@@ -1893,18 +1995,18 @@ fn collect_out_param_effect_path_targets(
                 field_path,
                 targets,
                 visited_aliases,
-            );
+            )?;
         }
-        return;
+        return Ok(());
     }
 
-    if let Some(semantic_decl) = infer_expr_semantic_decl(
+    if let Some(semantic_decl) = try_infer_expr_semantic_decl(
         db,
         cache,
         arg_expr,
         SemanticDeclGuard::default(),
         SemanticDeclLevel::default(),
-    ) && visited_aliases.insert(semantic_decl.clone())
+    )? && visited_aliases.insert(semantic_decl.clone())
         && !semantic_decl_has_write_before_position(db, &semantic_decl, call_position)
         && let Some(value_expr) = get_semantic_decl_value_expr(db, semantic_decl)
     {
@@ -1916,8 +2018,10 @@ fn collect_out_param_effect_path_targets(
             field_path,
             targets,
             visited_aliases,
-        );
+        )?;
     }
+
+    Ok(())
 }
 
 fn semantic_decl_has_write_before_position(

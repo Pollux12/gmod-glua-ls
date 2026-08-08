@@ -4,12 +4,48 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, InFiled, LuaMemberId, LuaTypeDeclId};
+use crate::{DbIndex, FileId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum DynamicFieldOwner {
     Type(LuaTypeDeclId),
     Table(InFiled<TextRange>),
+}
+
+impl DynamicFieldOwner {
+    fn as_member_owner(&self) -> LuaMemberOwner {
+        match self {
+            Self::Type(id) => LuaMemberOwner::Type(id.clone()),
+            Self::Table(range) => LuaMemberOwner::Element(range.clone()),
+        }
+    }
+}
+
+/// True when a wildcard (computed-key) assignment is the *only* thing known
+/// about `owner`: no named dynamic fields and no statically-known named
+/// members.
+pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> bool {
+    let index = db.get_dynamic_field_index();
+    if !index.has_wildcard_definitions(owner) {
+        return false;
+    }
+    if index
+        .get_fields(owner)
+        .is_some_and(|fields| !fields.is_empty())
+    {
+        return false;
+    }
+
+    db.get_member_index()
+        .get_members(&owner.as_member_owner())
+        .is_none_or(|members| {
+            !members.iter().any(|member| {
+                matches!(
+                    member.get_key(),
+                    LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)
+                )
+            })
+        })
 }
 
 /// Index tracking dynamically-assigned fields on typed variables.

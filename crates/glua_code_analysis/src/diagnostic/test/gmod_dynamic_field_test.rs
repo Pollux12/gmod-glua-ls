@@ -1567,4 +1567,62 @@ mod test {
             vec!["Undefined field `meow`. "]
         );
     }
+
+    /// A table populated only through computed keys has no statically knowable
+    /// field names, so reads off it are never actionable typos.
+    #[gtest]
+    fn test_pure_computed_key_registry_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/registry.lua",
+            r#"
+            ---@class WildReg.Registry
+
+            ---@type WildReg.Registry
+            local registry
+
+            ---@param name string
+            local function add(name, value)
+                registry[name] = value
+            end
+
+            add("a", 1)
+            print(registry.Anything)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+    }
+
+    /// One named write gives the table a shape again, so bogus names still report.
+    #[gtest]
+    fn test_mixed_computed_key_table_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/mixed_registry.lua",
+            r#"
+            ---@class WildRegMixed.Registry
+            ---@field known number
+
+            ---@type WildRegMixed.Registry
+            local registry
+
+            ---@param name string
+            local function add(name, value)
+                registry[name] = value
+            end
+
+            add("a", 1)
+            print(registry.bogus)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `bogus`. "]
+        );
+    }
 }

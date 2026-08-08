@@ -248,6 +248,7 @@ pub(super) fn stabilize_unguarded_children(
         return Vec::new();
     }
     let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::new();
+    let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
         HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::new();
     let mut sources =
@@ -423,16 +424,27 @@ pub(super) fn stabilize_unguarded_children(
                                     index_expr.get_position(),
                                 )
                                 .is_empty()
-                        })
-                        || resolve_dynamic_field_member(
+                        });
+                    let visible = visible
+                        || match resolve_dynamic_field_member(
                             db,
                             cache,
                             &LuaType::Ref(child_id.clone()),
                             &member_key,
                             None,
-                        )
-                        // unsealed: pre-deferral behavior, replaced per-consumer
-                        .is_ok_and(|resolution| resolution.is_some());
+                        ) {
+                            Ok(resolution) => resolution.is_some(),
+                            // The index is still unsealed, so this child's
+                            // membership is unknown. Scoring the definition now
+                            // would publish a narrowed fact that the sealed pass
+                            // can no longer revise, so defer the whole definition
+                            // to that pass instead.
+                            Err(reason) if reason.is_need_resolve() => {
+                                deferred_definitions.extend(definitions.iter().cloned());
+                                break;
+                            }
+                            Err(_) => false,
+                        };
                     if !visible {
                         continue;
                     }
@@ -487,6 +499,11 @@ pub(super) fn stabilize_unguarded_children(
     }
     if let (Some(profile), Some(start)) = (&mut profile, reference_scan_start) {
         profile.reference_scan = start.elapsed();
+    }
+
+    if !deferred_definitions.is_empty() {
+        scores.retain(|definition, _| !deferred_definitions.contains(definition));
+        sources.retain(|(definition, _), _| !deferred_definitions.contains(definition));
     }
 
     let mut updates = Vec::new();

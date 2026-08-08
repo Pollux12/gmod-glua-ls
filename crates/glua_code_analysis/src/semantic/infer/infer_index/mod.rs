@@ -1176,7 +1176,7 @@ fn infer_cross_file_matching_expr_key_member_type(
         .unwrap_or(crate::GmodRealm::Unknown);
 
     let allow_wildcard_expr_literal_match =
-        is_literal_member_key(key) && owner_has_named_dynamic_fields_and_wildcards(db, owner);
+        is_literal_member_key(key) && owner_wildcard_covers_literal_key(db, owner);
     let members = db.get_member_index().get_members(owner)?;
     let mut result = LuaType::Unknown;
 
@@ -1314,7 +1314,7 @@ fn member_key_is_unknown_expr(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::ExprType(typ) if typ.is_unknown())
 }
 
-fn owner_has_named_dynamic_fields_and_wildcards(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
+fn owner_wildcard_covers_literal_key(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
     let Some(dynamic_owner) = dynamic_field_owner(owner) else {
         return false;
     };
@@ -1324,6 +1324,7 @@ fn owner_has_named_dynamic_fields_and_wildcards(db: &DbIndex, owner: &LuaMemberO
         .get_fields(&dynamic_owner)
         .is_some_and(|fields| !fields.is_empty())
         && index.has_wildcard_definitions(&dynamic_owner)
+        || crate::is_pure_wildcard_registry(db, &dynamic_owner)
 }
 
 fn is_precise_unknown_wildcard_value_type(typ: &LuaType) -> bool {
