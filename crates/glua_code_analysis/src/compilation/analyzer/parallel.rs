@@ -61,17 +61,26 @@ where
     let slots = SlotsPtr(results.as_mut_ptr());
     let next = AtomicUsize::new(0);
 
+    // Longest-processing-time-first dispatch. Per-file cost spans orders of
+    // magnitude, so handing work out in slice order let a large file drawn last
+    // run alone while every other worker idled. Only the order in which slots
+    // are claimed changes; each still holds its own file's result, so callers
+    // see the same index-aligned `Vec` as before.
+    let dispatch = dispatch_order(db, file_ids);
+
     std::thread::scope(|scope| {
         for _ in 0..workers {
             let next = &next;
             let f = &f;
             let slots = &slots;
+            let dispatch = &dispatch;
             scope.spawn(move || {
                 loop {
-                    let idx = next.fetch_add(1, Ordering::Relaxed);
-                    if idx >= n {
+                    let seq = next.fetch_add(1, Ordering::Relaxed);
+                    if seq >= n {
                         break;
                     }
+                    let idx = dispatch[seq];
                     let file_id = file_ids[idx];
                     let value = f(db, file_id);
                     // SAFETY: each `idx` is handed to exactly one worker via the
@@ -89,6 +98,21 @@ where
         .into_iter()
         .map(|slot| slot.expect("slot written"))
         .collect()
+}
+
+/// Indices into `file_ids`, ordered largest source first so the long poles are
+/// started before the short ones. Ties break on the index, keeping the order a
+/// pure function of the input.
+fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
+    let vfs = db.get_vfs();
+    let mut order: Vec<usize> = (0..file_ids.len()).collect();
+    order.sort_unstable_by_key(|&idx| {
+        let size = vfs
+            .get_file_content(&file_ids[idx])
+            .map_or(0, |text| text.len());
+        (std::cmp::Reverse(size), idx)
+    });
+    order
 }
 
 /// Wrapper making a `*mut Option<T>` shareable across the scoped threads. Safe
