@@ -737,10 +737,44 @@ fn collect_annotated_scripted_class_calls_with(
     formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
-    for in_filed_tree in &context.tree_list {
+    collect_annotated_call_sites_with(
+        db,
+        context,
+        formatted_hook_prefixes,
+        annotated_global_call_roles,
+        false,
+    );
+}
+
+/// A db write produced by the per-file annotated call-site scan.
+///
+/// The scan itself reads only the file's own AST plus immutable db state; the
+/// writes are buffered so the scan can run off the caller's thread and be
+/// applied afterwards in the original file-then-call order.
+enum PendingCallSite {
+    VguiParent(GmodVguiParentCallMetadata),
+    ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
+    Dependency(LuaDependencySite),
+}
+
+/// Scripted-class registration (and, when `include_load`, `load`-style
+/// dependency) call sites for every file in one workspace group.
+fn collect_annotated_call_sites_with(
+    db: &mut DbIndex,
+    context: &AnalyzeContext,
+    formatted_hook_prefixes: &[String],
+    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
+    include_load: bool,
+) {
+    let file_ids = context
+        .tree_list
+        .iter()
+        .map(|in_filed_tree| in_filed_tree.file_id)
+        .collect::<Vec<_>>();
+    let per_file = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
         let keywords = db
             .get_vfs()
-            .get_file_content(&in_filed_tree.file_id)
+            .get_file_content(&file_id)
             .map(|content| {
                 scan_gmod_keywords(
                     content,
@@ -749,28 +783,57 @@ fn collect_annotated_scripted_class_calls_with(
                 )
             })
             .unwrap_or_default();
-        if !keywords.has_scripted_class_call {
-            continue;
+        let scan_load = include_load && keywords.has_load_call;
+        if !keywords.has_scripted_class_call && !scan_load {
+            return Vec::new();
         }
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_chunk_node())
+        else {
+            return Vec::new();
+        };
 
-        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
-            db,
-            in_filed_tree.file_id,
-            &in_filed_tree.value,
-            annotated_global_call_roles,
-        );
-        for call_expr in in_filed_tree
-            .value
-            .syntax()
-            .descendants()
-            .filter_map(LuaCallExpr::cast)
-        {
-            collect_annotated_scripted_class_call_metadata(
-                db,
-                in_filed_tree.file_id,
-                &annotated_call_roles,
-                call_expr,
-            );
+        let annotated_call_roles =
+            AnnotatedGmodCallRoleMap::build(db, file_id, &root, annotated_global_call_roles);
+        let mut pending = Vec::new();
+        for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
+            if keywords.has_scripted_class_call {
+                collect_annotated_scripted_class_call_metadata(
+                    db,
+                    file_id,
+                    &annotated_call_roles,
+                    call_expr.clone(),
+                    &mut pending,
+                );
+            }
+            if scan_load {
+                collect_annotated_load_dependency_site(
+                    db,
+                    file_id,
+                    &annotated_call_roles,
+                    call_expr,
+                    &mut pending,
+                );
+            }
+        }
+        pending
+    });
+
+    for (file_id, pending) in file_ids.iter().zip(per_file) {
+        for write in pending {
+            match write {
+                PendingCallSite::VguiParent(call) => db
+                    .get_gmod_class_metadata_index_mut()
+                    .add_vgui_parent_call(*file_id, call),
+                PendingCallSite::ScriptedClass(kind, call) => db
+                    .get_gmod_class_metadata_index_mut()
+                    .add_call(*file_id, kind, call),
+                PendingCallSite::Dependency(site) => db
+                    .get_file_dependencies_index_mut()
+                    .add_dependency_site(site),
+            }
         }
     }
 }
@@ -816,59 +879,21 @@ fn collect_annotated_gmod_call_sites_with(
     formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
-    for in_filed_tree in &context.tree_list {
-        let keywords = db
-            .get_vfs()
-            .get_file_content(&in_filed_tree.file_id)
-            .map(|content| {
-                scan_gmod_keywords(
-                    content,
-                    formatted_hook_prefixes,
-                    annotated_global_call_roles,
-                )
-            })
-            .unwrap_or_default();
-        if !keywords.has_scripted_class_call && !keywords.has_load_call {
-            continue;
-        }
-
-        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
-            db,
-            in_filed_tree.file_id,
-            &in_filed_tree.value,
-            annotated_global_call_roles,
-        );
-        for call_expr in in_filed_tree
-            .value
-            .syntax()
-            .descendants()
-            .filter_map(LuaCallExpr::cast)
-        {
-            if keywords.has_scripted_class_call {
-                collect_annotated_scripted_class_call_metadata(
-                    db,
-                    in_filed_tree.file_id,
-                    &annotated_call_roles,
-                    call_expr.clone(),
-                );
-            }
-            if keywords.has_load_call {
-                collect_annotated_load_dependency_site(
-                    db,
-                    in_filed_tree.file_id,
-                    &annotated_call_roles,
-                    call_expr,
-                );
-            }
-        }
-    }
+    collect_annotated_call_sites_with(
+        db,
+        context,
+        formatted_hook_prefixes,
+        annotated_global_call_roles,
+        true,
+    );
 }
 
 fn collect_annotated_load_dependency_site(
-    db: &mut DbIndex,
+    db: &DbIndex,
     file_id: FileId,
     annotated_roles: &AnnotatedGmodCallRoleMap,
     call_expr: LuaCallExpr,
+    pending: &mut Vec<PendingCallSite>,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
     let (kind, path_arg_idx) = annotated_roles.load_call(db, file_id, &call_expr, &call_path)?;
@@ -884,17 +909,16 @@ fn collect_annotated_load_dependency_site(
         .map(|path| crate::dependency_site_path_keys(db, file_id, path))
         .unwrap_or_default();
 
-    db.get_file_dependencies_index_mut()
-        .add_dependency_site(LuaDependencySite {
-            source_file_id: file_id,
-            target_file_id,
-            kind,
-            path,
-            path_keys,
-            original_expr: call_expr.syntax().text().to_string(),
-            call_range: call_expr.get_range(),
-            range: arg_expr.get_range(),
-        });
+    pending.push(PendingCallSite::Dependency(LuaDependencySite {
+        source_file_id: file_id,
+        target_file_id,
+        kind,
+        path,
+        path_keys,
+        original_expr: call_expr.syntax().text().to_string(),
+        call_range: call_expr.get_range(),
+        range: arg_expr.get_range(),
+    }));
     Some(())
 }
 
@@ -9759,10 +9783,11 @@ fn collect_system_call_metadata_into(
 }
 
 fn collect_annotated_scripted_class_call_metadata(
-    db: &mut DbIndex,
+    db: &DbIndex,
     file_id: FileId,
     annotated_roles: &AnnotatedGmodCallRoleMap,
     call_expr: LuaCallExpr,
+    pending: &mut Vec<PendingCallSite>,
 ) -> Option<()> {
     let call_path = call_expr.get_access_path()?;
 
@@ -9784,16 +9809,13 @@ fn collect_annotated_scripted_class_call_metadata(
                     .then_some(GmodVguiParentSource::Unknown)
                 });
         if let (Some(child), Some(parent)) = (child, parent) {
-            db.get_gmod_class_metadata_index_mut().add_vgui_parent_call(
-                file_id,
-                GmodVguiParentCallMetadata {
-                    syntax_id: call_expr.get_syntax_id(),
-                    child,
-                    parent,
-                    relations: Vec::new(),
-                    origin: GmodVguiParentCallOrigin::Annotated,
-                },
-            );
+            pending.push(PendingCallSite::VguiParent(GmodVguiParentCallMetadata {
+                syntax_id: call_expr.get_syntax_id(),
+                child,
+                parent,
+                relations: Vec::new(),
+                origin: GmodVguiParentCallOrigin::Annotated,
+            }));
         }
     }
 
@@ -9802,8 +9824,7 @@ fn collect_annotated_scripted_class_call_metadata(
     {
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
-        db.get_gmod_class_metadata_index_mut().add_call(
-            file_id,
+        pending.push(PendingCallSite::ScriptedClass(
             kind,
             GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
@@ -9815,7 +9836,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
             },
-        );
+        ));
         return Some(());
     }
 
@@ -9824,8 +9845,7 @@ fn collect_annotated_scripted_class_call_metadata(
     {
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
-        db.get_gmod_class_metadata_index_mut().add_call(
-            file_id,
+        pending.push(PendingCallSite::ScriptedClass(
             kind,
             GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
@@ -9837,7 +9857,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: None,
             },
-        );
+        ));
         return Some(());
     }
 
@@ -9847,8 +9867,7 @@ fn collect_annotated_scripted_class_call_metadata(
         let field_sources = vgui_panel_field_sources(&vgui_panel_roles);
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &field_sources);
-        db.get_gmod_class_metadata_index_mut().add_call(
-            file_id,
+        pending.push(PendingCallSite::ScriptedClass(
             kind,
             GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
@@ -9860,7 +9879,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: Some(vgui_panel_roles),
                 derma_skin_roles: None,
             },
-        );
+        ));
         return Some(());
     }
 
@@ -9869,8 +9888,7 @@ fn collect_annotated_scripted_class_call_metadata(
     {
         let (literal_args, args, field_args) =
             extract_gmod_class_call_args(db, file_id, &call_expr, &[]);
-        db.get_gmod_class_metadata_index_mut().add_call(
-            file_id,
+        pending.push(PendingCallSite::ScriptedClass(
             GmodScriptedClassCallKind::DermaDefineSkin,
             GmodScriptedClassCallMetadata {
                 syntax_id: call_expr.get_syntax_id(),
@@ -9882,7 +9900,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 vgui_panel_roles: None,
                 derma_skin_roles: Some(derma_skin_roles),
             },
-        );
+        ));
         return Some(());
     }
 
