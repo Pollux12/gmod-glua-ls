@@ -44,13 +44,23 @@
 //!   DET_STAGES      comma separated subset of:
 //!                     repeat    re-collect diagnostics with no change at all
 //!                     edit      no-op edit each DET_TARGETS entry, through the
-//!                               same `update_file_by_uri` path the LSP uses
+//!                               same `update_file_by_uri` path the LSP uses.
+//!                               NOTE: the EOF-newline pair is semantically
+//!                               unchanged, so since the no-op gate landed this
+//!                               stage verifies the gate SKIPS the re-index (and
+//!                               that skipping preserves state) — it no longer
+//!                               exercises re-analysis at all. `editmid` is the
+//!                               stage that forces real re-analysis.
 //!                     editmid   offset-shifting no-op edit pair (newline at the
 //!                               front of the file, then removed): the semantic
 //!                               no-op gate cannot fire, so both edits run the
 //!                               full re-index expansion. Bisect stage for the
 //!                               batch-composition convergence gap; expected to
-//!                               diverge until re-analysis is confluent.
+//!                               diverge until re-analysis is confluent. Run it
+//!                               ALONE (or last): it leaves diverged warm state
+//!                               behind, so any in-place stage listed after it
+//!                               inherits that state and its diff is
+//!                               meaningless.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
