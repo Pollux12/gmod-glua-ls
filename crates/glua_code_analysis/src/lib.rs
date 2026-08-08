@@ -487,6 +487,31 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
+        // An edit whose significant token stream is unchanged — same kinds,
+        // same offsets, same texts, comments included — cannot change any
+        // derived fact, so re-indexing it (and its whole dependency
+        // expansion) would only re-derive facts the index already holds.
+        // Store the text and stop.
+        if let (Some(file_id), Some(new_text)) = (existing_file_id, text.as_deref())
+            && self
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_some()
+            && self
+                .compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .content_semantically_matches(file_id, new_text)
+        {
+            self.compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(uri, text);
+            return Some(file_id);
+        }
+
         let is_removed = text.is_none();
         let removed_file_ids = existing_file_id
             .filter(|_| is_removed)
