@@ -9,7 +9,7 @@ pub(crate) mod gmod;
 mod infer_cache_manager;
 mod local_inference;
 mod lua;
-mod parallel;
+pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 

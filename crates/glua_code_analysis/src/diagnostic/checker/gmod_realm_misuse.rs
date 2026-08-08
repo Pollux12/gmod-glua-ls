@@ -1704,48 +1704,82 @@ pub fn precompute_callee_realm_data_for_workspace(
     let mut callee_realms = FxHashMap::default();
     let mut realm_call_candidates = PrecomputedRealmCallCandidates::default();
     let mut decl_annotation_cache = FxHashMap::default();
-    for &file_id in workspace_file_ids {
-        let candidate_workspace_id = module_index
-            .get_workspace_id(file_id)
-            .unwrap_or(WorkspaceId::MAIN);
-        if module_index
-            .workspace_resolution_priority(workspace_id, candidate_workspace_id)
-            .is_none()
-        {
-            continue;
-        }
 
-        if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
-            let mut decl_ids: Vec<_> = decl_tree.get_decls().keys().copied().collect();
-            decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
-            for decl_id in decl_ids {
-                let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
-                if let Some(resolved) =
-                    resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
-                {
-                    if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
-                        realm_call_candidates.insert_realm(decl.get_name(), resolved);
-                        if decl.is_global() {
-                            realm_call_candidates.insert_access_path(decl.get_name(), resolved);
-                        }
+    // Resolving one file's declaration and member realms reads only
+    // immutable `&DbIndex` state, so the resolution is derived
+    // concurrently. The annotation cache is a pure memo, so giving each
+    // worker its own only costs repeated lookups.
+    let resolve_files: Vec<FileId> = workspace_file_ids
+        .iter()
+        .copied()
+        .filter(|&file_id| {
+            let candidate_workspace_id = module_index
+                .get_workspace_id(file_id)
+                .unwrap_or(WorkspaceId::MAIN);
+            module_index
+                .workspace_resolution_priority(workspace_id, candidate_workspace_id)
+                .is_some()
+        })
+        .collect();
+    let resolved_by_file = crate::compilation::analyzer::parallel::map_files_collect(
+        db,
+        &resolve_files,
+        |db, file_id| {
+            let mut cache = FxHashMap::default();
+            let mut resolved = Vec::new();
+            if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
+                let mut decl_ids: Vec<_> = decl_tree.get_decls().keys().copied().collect();
+                decl_ids.sort_unstable_by_key(|decl_id| decl_id.position);
+                for decl_id in decl_ids {
+                    let semantic_decl = LuaSemanticDeclId::LuaDecl(decl_id);
+                    if let Some(realm) =
+                        resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache)
+                    {
+                        resolved.push((semantic_decl, realm));
                     }
-                    callee_realms.insert(semantic_decl, vec![resolved]);
                 }
             }
-        }
 
-        let mut member_ids: Vec<_> = db
-            .get_member_index()
-            .get_file_members(file_id)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect();
-        member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
-        for member_id in member_ids {
-            let semantic_decl = LuaSemanticDeclId::Member(member_id);
-            if let Some(resolved) =
-                resolve_precomputed_decl_realm(db, &semantic_decl, &mut decl_annotation_cache)
-            {
+            let mut member_ids: Vec<_> = db
+                .get_member_index()
+                .get_file_members(file_id)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect();
+            member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
+            for member_id in member_ids {
+                let semantic_decl = LuaSemanticDeclId::Member(member_id);
+                if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache) {
+                    resolved.push((semantic_decl, realm));
+                }
+            }
+            (resolved, cache)
+        },
+    );
+
+    // The annotation memo the workers filled is keyed by file and holds the same
+    // value for the same key whoever computed it, so folding the fragments back
+    // in leaves the signature pass below reading a warm cache, exactly as it did
+    // when the whole function ran on one thread.
+    let resolved_by_file = resolved_by_file
+        .into_iter()
+        .map(|(resolved, cache)| {
+            decl_annotation_cache.extend(cache);
+            resolved
+        })
+        .collect::<Vec<_>>();
+
+    for (semantic_decl, resolved) in resolved_by_file.into_iter().flatten() {
+        match semantic_decl {
+            LuaSemanticDeclId::LuaDecl(decl_id) => {
+                if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
+                    realm_call_candidates.insert_realm(decl.get_name(), resolved);
+                    if decl.is_global() {
+                        realm_call_candidates.insert_access_path(decl.get_name(), resolved);
+                    }
+                }
+            }
+            LuaSemanticDeclId::Member(member_id) => {
                 if let Some(member) = db.get_member_index().get_member(&member_id)
                     && let Some(name) = member.get_key().get_name()
                 {
@@ -1754,9 +1788,10 @@ pub fn precompute_callee_realm_data_for_workspace(
                         realm_call_candidates.insert_access_path(global_id.get_name(), resolved);
                     }
                 }
-                callee_realms.insert(semantic_decl, vec![resolved]);
             }
+            _ => {}
         }
+        callee_realms.insert(semantic_decl, vec![resolved]);
     }
 
     let mut signature_ids: Vec<_> = db
