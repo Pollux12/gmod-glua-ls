@@ -198,27 +198,26 @@ impl DebouncedAnalysis {
     }
 
     async fn reindex_files_without_queuing(&self, file_ids: Vec<FileId>) -> bool {
-        let mut retries = 0u32;
+        let analysis = self.analysis.clone();
+        let cache = self.shared_diagnostic_data_cache.clone();
 
-        loop {
-            if let Ok(mut analysis) = self.analysis.try_write() {
-                analysis.reindex_files(file_ids);
-                self.shared_diagnostic_data_cache.invalidate();
-                return true;
+        // Re-index under a blocking write lock on a blocking thread: the wait
+        // for the lock and the CPU work both stay off the Tokio workers.
+        tokio::select! {
+            _ = self.shutdown.cancelled() => false,
+            result = tokio::task::spawn_blocking(move || {
+                let mut guard = analysis.blocking_write();
+                guard.reindex_files(file_ids);
+                // Invalidate under the write lock so no reader can observe the
+                // fresh index next to the stale shared diagnostic data.
+                cache.invalidate();
+            }) => {
+                if let Err(err) = result {
+                    log::error!("reindex task failed: {}", err);
+                    return false;
+                }
+                true
             }
-
-            tokio::select! {
-                _ = self.shutdown.cancelled() => return false,
-                _ = async {
-                    if retries <= 20 {
-                        tokio::task::yield_now().await;
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(2)).await;
-                    }
-                } => {}
-            }
-
-            retries += 1;
         }
     }
 
