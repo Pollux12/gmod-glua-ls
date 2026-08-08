@@ -134,12 +134,7 @@ pub fn infer_index_expr(
     }
 
     if pass_flow {
-        match infer_member_type_fallback_pass_flow(
-            db,
-            cache,
-            index_expr,
-            prefix_is_unresolved_param,
-        ) {
+        match infer_member_type_fallback_pass_flow(db, cache, index_expr) {
             Ok(member_type) => return Ok(member_type),
             Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
             Err(err) => return Err(err),
@@ -186,7 +181,6 @@ fn infer_member_type_fallback_pass_flow(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: LuaIndexExpr,
-    unknown_truthy_as_any: bool,
 ) -> InferResult {
     if !index_expr_has_flow_node(db, cache, &index_expr) {
         return Err(InferFailReason::FieldNotFound);
@@ -216,10 +210,7 @@ fn infer_member_type_fallback_pass_flow(
         )
         .cloned()
     {
-        return finalize_fallback_result(
-            cache_entry_to_infer_result(&counterfactual_entry),
-            unknown_truthy_as_any,
-        );
+        return finalize_fallback_result(cache_entry_to_infer_result(&counterfactual_entry));
     }
 
     let result = run_legacy_fallback_narrow_raw(db, cache, index_expr, &var_ref_id);
@@ -233,7 +224,7 @@ fn infer_member_type_fallback_pass_flow(
         );
     }
 
-    finalize_fallback_result(result, unknown_truthy_as_any)
+    finalize_fallback_result(result)
 }
 
 fn run_legacy_fallback_narrow_raw(
@@ -285,10 +276,9 @@ fn infer_result_to_cache_entry(
     }
 }
 
-fn finalize_fallback_result(result: InferResult, unknown_truthy_as_any: bool) -> InferResult {
+fn finalize_fallback_result(result: InferResult) -> InferResult {
     match result {
         Ok(member_type) if !member_type.is_nil() && !member_type.is_unknown() => Ok(member_type),
-        Ok(member_type) if member_type.is_unknown() && unknown_truthy_as_any => Ok(LuaType::Any),
         Ok(_) | Err(InferFailReason::None) => Err(InferFailReason::FieldNotFound),
         Err(err) => Err(err),
     }
