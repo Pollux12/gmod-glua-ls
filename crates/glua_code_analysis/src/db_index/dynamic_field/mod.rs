@@ -42,6 +42,14 @@ pub struct DynamicFieldIndex {
     unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
 }
 
+fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
+    (
+        definition.file_id.id,
+        definition.value.start().into(),
+        definition.value.end().into(),
+    )
+}
+
 impl DynamicFieldIndex {
     pub fn new() -> Self {
         Self::default()
@@ -98,9 +106,15 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let definition = InFiled::new(file_id, range);
-        let is_new_definition = !field_definitions.contains(&definition);
+        // Kept in canonical order: `get_field_definitions` feeds a union of
+        // overloads, so insertion order would make the elected arm depend on the
+        // batch walk order rather than on the workspace.
+        let insert_at = field_definitions.partition_point(|existing| {
+            definition_sort_key(existing) < definition_sort_key(&definition)
+        });
+        let is_new_definition = field_definitions.get(insert_at) != Some(&definition);
         if is_new_definition {
-            field_definitions.push(definition);
+            field_definitions.insert(insert_at, definition);
         }
 
         if is_new_definition {
@@ -564,6 +578,39 @@ mod tests {
         assert!(!index.has_field(&owner, &field));
         assert!(index.get_fields(&owner).is_none());
         assert!(index.get_field_definitions(&owner, &field).is_empty());
+    }
+
+    #[test]
+    fn field_definitions_are_canonically_ordered_regardless_of_insertion_order() {
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let field = SmolStr::new("value");
+        let inserts = [
+            (FileId::new(2), range(5, 6)),
+            (FileId::new(1), range(9, 10)),
+            (FileId::new(1), range(3, 4)),
+        ];
+
+        let mut forward = DynamicFieldIndex::new();
+        for (file_id, range) in inserts {
+            forward.add_field(owner.clone(), field.clone(), file_id, range);
+        }
+        let mut reverse = DynamicFieldIndex::new();
+        for (file_id, range) in inserts.into_iter().rev() {
+            reverse.add_field(owner.clone(), field.clone(), file_id, range);
+        }
+
+        assert_eq!(
+            forward.get_field_definitions(&owner, &field),
+            vec![
+                InFiled::new(FileId::new(1), range(3, 4)),
+                InFiled::new(FileId::new(1), range(9, 10)),
+                InFiled::new(FileId::new(2), range(5, 6)),
+            ]
+        );
+        assert_eq!(
+            forward.get_field_definitions(&owner, &field),
+            reverse.get_field_definitions(&owner, &field)
+        );
     }
 
     #[test]

@@ -4465,6 +4465,28 @@ mod test {
     }
 
     #[test]
+    fn test_colon_receiver_accepted_by_any_callee_arm() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        // Overload resolution never consults the implicit receiver, so it elects
+        // the first arm — whose `self` is unrelated to the receiver. The second
+        // arm accepts it, so the mismatch is an artifact of the election order.
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class RecvElect.Other
+
+            ---@class RecvElect.Holder
+            ---@field paint fun(self: RecvElect.Other, w: integer)|fun(self: RecvElect.Holder, w: integer)
+
+            ---@type RecvElect.Holder
+            local holder
+            holder:paint(1)
+            "#
+        ));
+    }
+
+    #[test]
     fn test_inferred_dynamic_string_key_field_does_not_report_param_mismatch() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = ws.get_emmyrc();
