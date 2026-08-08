@@ -32,17 +32,10 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
-    // Wait for any pending reindex to finish so we compute against
-    // consistent tree + index data. Cancel-aware: bails out when a
-    // new didChange fires cancel_all_requests().
-    if !context
-        .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "textDocument/semanticTokens/full")
-        .await
-    {
-        return None;
-    }
-
+    // Deliberately not waiting for a pending reindex: against a stale index the
+    // builder omits the tokens it cannot resolve (TextMate colours them
+    // instead) rather than emitting wrong ones, and the post-reindex
+    // `refresh_semantic_tokens` drives the corrective re-pull.
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?
