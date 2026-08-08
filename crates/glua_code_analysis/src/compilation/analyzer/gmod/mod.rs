@@ -534,23 +534,25 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         let (helper_registry, annotated_global_call_roles) = match (cached_registry, reusable_roles)
         {
             (Some(registry), Some(roles)) => (registry, roles),
-            _ => {
+            _ => crate::profile::phase("gmodnet/build_registry", || {
                 let (registry, roles, _) = build_call_roles_and_registry(db);
                 context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
                 (registry, roles)
-            }
+            }),
         };
 
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let reach = HelperStartReachCache::default();
-        let collected = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
-            collect_file_network_flows(
-                db,
-                file_id,
-                &helper_registry,
-                &annotated_global_call_roles,
-                &reach,
-            )
+        let collected = crate::profile::phase("gmodnet/collect_flows", || {
+            super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
+                collect_file_network_flows(
+                    db,
+                    file_id,
+                    &helper_registry,
+                    &annotated_global_call_roles,
+                    &reach,
+                )
+            })
         });
 
         for (file_id, network_data) in file_ids.iter().zip(collected) {
@@ -585,19 +587,21 @@ fn collect_file_network_flows(
     // them twice was pure repeat work.
     let mut resolve_memo = ResolveMemo::default();
 
-    let (_, _, _, receive_flows) = collect_hook_and_receive_metadata(
-        db,
-        file_id,
-        root.clone(),
-        false,
-        true,
-        helper_registry,
-        annotated_global_call_roles,
-        &mut local_fns,
-        &mut net,
-        &mut resolve_memo,
-        reach,
-    );
+    let (_, _, _, receive_flows) = crate::profile::phase("gmodnet/receive_walk", || {
+        collect_hook_and_receive_metadata(
+            db,
+            file_id,
+            root.clone(),
+            false,
+            true,
+            helper_registry,
+            annotated_global_call_roles,
+            &mut local_fns,
+            &mut net,
+            &mut resolve_memo,
+            reach,
+        )
+    });
 
     collect_network_flow_metadata(
         db,
@@ -1560,9 +1564,14 @@ fn collect_network_flow_metadata(
         resolve_memo,
         reach,
     };
-    let mut send_flows = collect_net_send_flows(&mut ctx, &site);
-    send_flows.extend(collect_wrapped_net_send_flows(&mut ctx, &site));
-    send_flows.extend(collect_unannotated_net_wrapper_send_flows(&mut ctx, &site));
+    let mut send_flows =
+        crate::profile::phase("gmodnet/send_direct", || collect_net_send_flows(&mut ctx, &site));
+    send_flows.extend(crate::profile::phase("gmodnet/send_wrapped", || {
+        collect_wrapped_net_send_flows(&mut ctx, &site)
+    }));
+    send_flows.extend(crate::profile::phase("gmodnet/send_unannotated", || {
+        collect_unannotated_net_wrapper_send_flows(&mut ctx, &site)
+    }));
     send_flows.sort_by_key(|flow| flow.start_range.start());
     let mut unique_send_flows = Vec::with_capacity(send_flows.len());
     for flow in send_flows {
@@ -1995,11 +2004,12 @@ fn collect_send_flows_from_helper_call(
     // Answering that once per helper instead of walking its body once per
     // calling file is the difference between ~438k body scans and ~2k.
     let helper_id = (helper_file_id, helper_key.clone());
-    let (reaches_start, _) = helper_reaches_net_start(
+    let (reaches_start, _) = helper_reaches_net_role(
         ctx,
         &helper_site,
         &helper_block,
         &helper_id,
+        NetReachKind::Start,
         &mut Vec::new(),
     );
     if !reaches_start {
@@ -2259,11 +2269,31 @@ fn collect_receive_flows_from_helper_call(
         return;
     }
 
-    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
     let helper_site = NetWalkSite {
         root: helper_root,
         file_id: helper_file_id,
     };
+
+    // Mirror of the send walk's prune: a receive flow always originates at a
+    // `net.Receive` somewhere in the expansion, so a helper that cannot reach
+    // one contributes nothing however it is called. Without this, every call
+    // with a literal string argument re-walked the full body of whatever it
+    // resolved to, once per calling site.
+    let helper_id = (helper_file_id, helper_key.clone());
+    let (reaches_receive, _) = helper_reaches_net_role(
+        ctx,
+        &helper_site,
+        &helper_block,
+        &helper_id,
+        NetReachKind::Receive,
+        &mut Vec::new(),
+    );
+    if !reaches_receive {
+        visited.remove(&helper_id);
+        return;
+    }
+
+    let bindings = helper_call_string_bindings(helper_call, &helper_block, caller_bindings);
     for nested_call in helper_block
         .syntax()
         .descendants()
@@ -2468,39 +2498,53 @@ type HelperId = (FileId, String);
 
 const HELPER_REACH_SHARDS: usize = 32;
 
-/// Whether a helper body can transitively reach a `net.Start`.
+/// Which `net` role a wrapper expansion is being asked to reach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NetReachKind {
+    Start,
+    Receive,
+}
+
+/// Whether a helper body can transitively reach a `net.Start` /
+/// `net.Receive`.
 #[derive(Default)]
 struct HelperStartReachCache {
-    shards: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
+    start: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
+    receive: [Mutex<FxHashMap<HelperId, bool>>; HELPER_REACH_SHARDS],
 }
 
 impl HelperStartReachCache {
-    fn shard(&self, helper: &HelperId) -> &Mutex<FxHashMap<HelperId, bool>> {
+    fn shard(&self, kind: NetReachKind, helper: &HelperId) -> &Mutex<FxHashMap<HelperId, bool>> {
         let mut hasher = rustc_hash::FxHasher::default();
         helper.hash(&mut hasher);
-        &self.shards[hasher.finish() as usize % HELPER_REACH_SHARDS]
+        let shards = match kind {
+            NetReachKind::Start => &self.start,
+            NetReachKind::Receive => &self.receive,
+        };
+        &shards[hasher.finish() as usize % HELPER_REACH_SHARDS]
     }
 
-    fn get(&self, helper: &HelperId) -> Option<bool> {
-        self.shard(helper).lock().ok()?.get(helper).copied()
+    fn get(&self, kind: NetReachKind, helper: &HelperId) -> Option<bool> {
+        self.shard(kind, helper).lock().ok()?.get(helper).copied()
     }
 
-    fn insert(&self, helper: HelperId, reaches: bool) {
-        if let Ok(mut shard) = self.shard(&helper).lock() {
+    fn insert(&self, kind: NetReachKind, helper: HelperId, reaches: bool) {
+        if let Ok(mut shard) = self.shard(kind, &helper).lock() {
             shard.insert(helper, reaches);
         }
     }
 }
 
 /// Whether expanding `helper_block` can reach a `NetCallRole::Start`.
-fn helper_reaches_net_start(
+fn helper_reaches_net_role(
     ctx: &mut NetCollectCtx<'_>,
     helper_site: &NetWalkSite,
     helper_block: &LuaBlock,
     helper: &HelperId,
+    kind: NetReachKind,
     stack: &mut Vec<HelperId>,
 ) -> (bool, bool) {
-    if let Some(cached) = ctx.reach.get(helper) {
+    if let Some(cached) = ctx.reach.get(kind, helper) {
         return (cached, false);
     }
     if stack.contains(helper) {
@@ -2515,10 +2559,12 @@ fn helper_reaches_net_start(
         .descendants()
         .filter_map(LuaCallExpr::cast)
     {
-        if matches!(
-            ctx.net.role(ctx.db, helper_site.file_id, &call),
-            Some(NetCallRole::Start { .. })
-        ) {
+        let role = ctx.net.role(ctx.db, helper_site.file_id, &call);
+        let hit = match kind {
+            NetReachKind::Start => matches!(role, Some(NetCallRole::Start { .. })),
+            NetReachKind::Receive => matches!(role, Some(NetCallRole::Receive { .. })),
+        };
+        if hit {
             reaches = true;
             break;
         }
@@ -2537,11 +2583,12 @@ fn helper_reaches_net_start(
                 root: nested_root,
                 file_id: nested_file_id,
             };
-            let (nested_reaches, nested_cut) = helper_reaches_net_start(
+            let (nested_reaches, nested_cut) = helper_reaches_net_role(
                 ctx,
                 &nested_site,
                 &nested_block,
                 &(nested_file_id, nested_key),
+                kind,
                 stack,
             );
             cycle_cut |= nested_cut;
@@ -2554,7 +2601,7 @@ fn helper_reaches_net_start(
 
     stack.pop();
     if reaches || !cycle_cut {
-        ctx.reach.insert(helper.clone(), reaches);
+        ctx.reach.insert(kind, helper.clone(), reaches);
     }
     (reaches, cycle_cut)
 }
