@@ -201,6 +201,21 @@ impl LuaMemberIndex {
                 return MemberInsertAction::Store(item);
             }
 
+            // A guarded self-assignment (`t.k = t.k or {}`) is a
+            // placeholder: its `{}` carries no member information of its
+            // own, so it must not take the visible slot from a real writer
+            // in another file -- which one survived would then depend on
+            // load order. Only across files: statements in one file run in
+            // source order, so a later write there genuinely supersedes.
+            if self.non_overwriting_assignment_members.contains(&id)
+                && old_member_ids.iter().any(|old_id| {
+                    old_id.file_id != id.file_id
+                        && !self.non_overwriting_assignment_members.contains(old_id)
+                })
+            {
+                return MemberInsertAction::Noop;
+            }
+
             return match item {
                 LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
                 LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
@@ -2080,6 +2095,71 @@ mod tests {
             index.get_member_item(&owner, &key),
             Some(&LuaMemberIndexItem::One(guarded_assignment_id))
         );
+    }
+
+    /// A guarded bootstrap in one file and a plain assignment in another is
+    /// the order-dependent case: whichever was processed last used to take the
+    /// visible slot, so the surviving writer followed load order. The
+    /// bootstrap contributes no type of its own, so the plain writer must win
+    /// either way.
+    #[test]
+    fn cross_file_bootstrap_never_displaces_a_plain_writer() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("stock".into());
+        let plain_id = make_index_member_id(FileId::new(1), 10);
+        let bootstrap_id = make_index_member_id(FileId::new(2), 20);
+
+        let visible_after = |bootstrap_first: bool| {
+            let mut index = LuaMemberIndex::new();
+            let order = if bootstrap_first {
+                [bootstrap_id, plain_id]
+            } else {
+                [plain_id, bootstrap_id]
+            };
+            for member_id in order {
+                if member_id == bootstrap_id {
+                    index.mark_non_overwriting_assignment_member(member_id);
+                }
+                index.add_member(
+                    owner.clone(),
+                    LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
+                );
+            }
+            owner_member_ids(&index, &owner)
+        };
+
+        assert_eq!(
+            visible_after(false),
+            vec![plain_id],
+            "plain writer analysed first"
+        );
+        assert_eq!(
+            visible_after(true),
+            vec![plain_id],
+            "bootstrap analysed first"
+        );
+    }
+
+    /// Transparency only applies when a real writer exists. With nothing but
+    /// bootstraps across files there is no placeholder to see through, so the
+    /// existing merge still has to keep every writer visible.
+    #[test]
+    fn cross_file_all_bootstrap_writers_still_merge() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let key = LuaMemberKey::Name("stock".into());
+        let first_id = make_index_member_id(FileId::new(1), 10);
+        let second_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        for member_id in [first_id, second_id] {
+            index.mark_non_overwriting_assignment_member(member_id);
+            index.add_member(
+                owner.clone(),
+                LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
+            );
+        }
+
+        assert_eq!(owner_member_ids(&index, &owner), vec![first_id, second_id]);
     }
 
     #[test]
