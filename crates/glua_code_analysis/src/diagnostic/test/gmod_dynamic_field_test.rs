@@ -1425,6 +1425,65 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_written_through_another_dynamic_field_is_collected() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+
+            ---@class Panel
+            ---@class DPanel : Panel
+            ---@class DFrame : DPanel
+
+            ---@class DTextEntry : DPanel
+            function DTextEntry:SetText(text) end
+
+            ---@class DPropertySheetSheet
+            ---@field Name string
+
+            ---@class DPropertySheet : DPanel
+            ---@param name string
+            ---@param pnl Panel
+            ---@return DPropertySheetSheet? sheet
+            function DPropertySheet:AddSheet(name, pnl) end
+            "#,
+        );
+        let target_path = "lua/starfall/editor/nested_dynamic_field.lua";
+        let target_file = ws.def_file(
+            target_path,
+            r#"
+            local PANEL = {}
+            vgui.Register("StarfallEditor", PANEL, "DPanel")
+
+            function PANEL:CreateFindWindow()
+                self.FindWindow = vgui.Create("DFrame", self)
+                local pnl = self.FindWindow
+                pnl.TabHolder = vgui.Create("DPropertySheet", pnl)
+                local findtab = vgui.Create("DPanel", pnl)
+                local FindEntry = vgui.Create("DTextEntry", findtab)
+                pnl.FindTab = pnl.TabHolder:AddSheet("Find", findtab)
+                pnl.FindTab.Entry = FindEntry
+            end
+
+            function PANEL:OpenFindWindow()
+                self.FindWindow.FindTab.Entry:SetText("")
+            end
+            "#,
+        );
+
+        // `Entry` is written through `pnl.FindTab`, itself a dynamic field of a
+        // panel. The collection pass runs before the dynamic-field index seals,
+        // so it must not defer on the unsealed index — deferring there drops the
+        // write and every read of `Entry` reports `undefined-field`.
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_deferred_uninformative_member_rhs_stays_any_without_owner_pollution() {
         let mut ws = VirtualWorkspace::new();
         let target_path = "lua/vgui/unresolved_member_rhs.lua";

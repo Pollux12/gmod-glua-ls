@@ -136,6 +136,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
                 crate::CacheOptions {
                     analysis_phase: crate::LuaAnalysisPhase::Force,
                     dynamic_fields_visible: true,
+                    building_dynamic_field_index: false,
                 },
             );
             for call_expr in root.syntax().descendants().filter_map(LuaCallExpr::cast) {
@@ -1615,6 +1616,7 @@ fn signature_has_authoritative_receiver(db: &DbIndex, signature_id: LuaSignature
         crate::CacheOptions {
             analysis_phase: crate::LuaAnalysisPhase::Force,
             dynamic_fields_visible: true,
+            building_dynamic_field_index: false,
         },
     );
     infer_authoritative_method_self_type(db, &mut cache, &func_stat).is_some()

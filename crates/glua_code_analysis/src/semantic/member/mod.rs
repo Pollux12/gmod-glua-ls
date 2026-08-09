@@ -332,10 +332,13 @@ pub(crate) fn resolve_dynamic_field_member(
         access_position,
     );
     if definitions.is_empty() {
-        // Absence is only knowable once the index is complete: until then the
-        // walk may simply not have reached the defining file yet. Never memoise
-        // this — the answer is about build state, not about the field.
-        if !db.get_dynamic_field_index().is_sealed() {
+        // Absence is only knowable once the index is complete: until then
+        // the walk may simply not have reached the defining file yet. Never
+        // memoise this — the answer is about build state, not about the
+        // field.
+        if !db.get_dynamic_field_index().is_sealed()
+            && !cache.get_config().building_dynamic_field_index
+        {
             return Err(InferFailReason::UnSealedDynamicFields);
         }
         cache.dynamic_field_resolution_cache.insert(cache_key, None);

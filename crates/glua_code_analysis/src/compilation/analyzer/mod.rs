@@ -372,6 +372,7 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             crate::CacheOptions {
                 analysis_phase,
                 dynamic_fields_visible,
+                building_dynamic_field_index: false,
             },
         );
         let Some(root) = db
@@ -503,6 +504,7 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
             crate::CacheOptions {
                 analysis_phase,
                 dynamic_fields_visible,
+                building_dynamic_field_index: false,
             },
         );
         let Some(root) = db

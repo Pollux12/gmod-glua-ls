@@ -32,6 +32,7 @@ impl InferCacheManager {
                 crate::CacheOptions {
                     analysis_phase: phase,
                     dynamic_fields_visible,
+                    building_dynamic_field_index: false,
                 },
             )
         })
