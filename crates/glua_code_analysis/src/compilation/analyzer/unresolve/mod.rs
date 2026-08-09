@@ -61,6 +61,18 @@ fn partition_pre_dynamic_unresolves(
     let mut deferred = Vec::new();
     let mut ready = Vec::new();
     for (unresolve, reason) in candidates {
+        // An unbound `pairs` generic is missing exactly the keys the dynamic-field
+        // pass synthesizes. Retrying it here reaches a weaker answer, force-writes
+        // it over the template placeholder and retires the item, so the type ends
+        // up a function of whether this pass had run yet. Hold it for the pass
+        // after.
+        if matches!(unresolve, UnResolve::IterDecl(_))
+            && matches!(reason, InferFailReason::UnResolveIterTemplate)
+        {
+            deferred.push((unresolve, reason));
+            continue;
+        }
+
         let UnResolve::Member(mut member) = unresolve else {
             ready.push((unresolve, reason));
             continue;
@@ -1100,7 +1112,10 @@ mod tests {
 
     use crate::{FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaTypeDeclId};
 
-    use super::{UnResolve, UnResolveMember, partition_pre_dynamic_unresolves, sorted_reason_keys};
+    use super::{
+        UnResolve, UnResolveIterVar, UnResolveMember, partition_pre_dynamic_unresolves,
+        sorted_reason_keys,
+    };
 
     #[test]
     fn reason_group_order_is_stable_across_hashmap_insertion_order() {
@@ -1124,6 +1139,43 @@ mod tests {
         }
 
         assert_eq!(sorted_reason_keys(&forward), sorted_reason_keys(&reverse));
+    }
+
+    #[test]
+    fn pre_dynamic_partition_defers_only_template_iter_vars() {
+        let tree = LuaParser::parse("for k, v in pairs(t) do end", ParserConfig::default());
+        let for_range = tree
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaForRangeStat>()
+            .next()
+            .expect("for range stat");
+        let iter_var = |file_id| UnResolveIterVar {
+            file_id,
+            iter_exprs: for_range.get_expr_list().collect(),
+            iter_vars: for_range.get_var_name_list().collect(),
+        };
+
+        let (ready, deferred) = partition_pre_dynamic_unresolves(vec![
+            (
+                iter_var(FileId::new(1)).into(),
+                InferFailReason::UnResolveIterTemplate,
+            ),
+            (
+                iter_var(FileId::new(2)).into(),
+                InferFailReason::FieldNotFound,
+            ),
+        ]);
+
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(
+            deferred[0],
+            (UnResolve::IterDecl(_), InferFailReason::UnResolveIterTemplate)
+        ));
+        assert_eq!(ready.len(), 1);
+        assert!(matches!(
+            ready[0],
+            (UnResolve::IterDecl(_), InferFailReason::FieldNotFound)
+        ));
     }
 
     #[test]
