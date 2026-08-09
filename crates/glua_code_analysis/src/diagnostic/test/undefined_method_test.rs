@@ -152,6 +152,51 @@ mod tests {
     }
 
     #[test]
+    fn loop_body_write_does_not_type_its_own_iteration_variable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class LoopWrite.Player
+            local Player = {}
+            function Player:Name() end
+
+            local targets = {}
+            for id, tgt in ipairs(targets) do
+                targets[id] = string.format("%s", tgt:Name())
+            end
+            "#,
+        );
+
+        let stat = ws.get_node::<glua_parser::LuaForRangeStat>(file_id);
+        let element_type = {
+            let model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model");
+            let element = stat
+                .get_var_name_list()
+                .nth(1)
+                .expect("iteration value variable");
+            model
+                .get_semantic_info(element.syntax().clone().into())
+                .expect("semantic info")
+                .display_typ()
+                .clone()
+        };
+        assert!(
+            !element_type.is_string(),
+            "loop body write leaked into its own element type: {element_type:?}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
     fn explicit_table_key_type_allows_pairs_receiver_method() {
         let diagnostics = diagnostics(
             &mut VirtualWorkspace::new(),

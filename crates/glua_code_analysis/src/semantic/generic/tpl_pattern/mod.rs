@@ -3,14 +3,14 @@ mod lambda_tpl_pattern;
 
 use std::{ops::Deref, sync::Arc};
 
-use glua_parser::LuaAstNode;
+use glua_parser::{LuaAstNode, LuaForRangeStat};
 use itertools::Itertools;
-use rowan::NodeOrToken;
+use rowan::{NodeOrToken, TextRange};
 use smol_str::SmolStr;
 
 use crate::{
-    InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaStringTplType, LuaTupleType, LuaTypeDeclId, LuaUnionType,
+    FileId, InferFailReason, LuaFunctionType, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
+    LuaObjectType, LuaSemanticDeclId, LuaStringTplType, LuaTupleType, LuaTypeDeclId, LuaUnionType,
     SemanticDeclLevel, VariadicType, check_type_compact,
     db_index::{DbIndex, LuaGenericType, LuaType},
     infer_node_semantic_decl,
@@ -537,6 +537,7 @@ fn table_generic_tpl_pattern_member_owner_match(
         return Ok(());
     }
 
+    let self_written = iterated_for_range_body(context);
     let target_key_type = table_generic_params[0].clone();
     let mut keys = Vec::new();
     let mut values = Vec::new();
@@ -551,6 +552,17 @@ fn table_generic_tpl_pattern_member_owner_match(
         if !target_key_type.is_generic()
             && check_type_compact(context.db, &target_key_type, &key_type).is_err()
         {
+            continue;
+        }
+
+        let v = match self_written {
+            Some((file_id, range)) => v
+                .iter()
+                .filter(|member| !is_defined_in(member, file_id, range))
+                .collect::<Vec<_>>(),
+            None => v.iter().collect::<Vec<_>>(),
+        };
+        if self_written.is_some() && v.is_empty() {
             continue;
         }
 
@@ -579,6 +591,11 @@ fn table_generic_tpl_pattern_member_owner_match(
                 if target_key_type.is_generic() {
                     return;
                 }
+                if let Some((file_id, range)) = self_written
+                    && is_defined_in(m, file_id, range)
+                {
+                    return;
+                }
                 let key_type = match &m.key {
                     LuaMemberKey::ExprType(typ) => typ.clone(),
                     _ => return,
@@ -604,6 +621,32 @@ fn table_generic_tpl_pattern_member_owner_match(
     tpl_pattern_match(context, &table_generic_params[1], &value_type)?;
 
     Ok(())
+}
+
+/// The statement range of the `for ... in` loop this call drives, when the call is
+/// that loop's iterator expression.
+///
+/// A loop reads the values the table held when it started, so members the loop body
+/// itself writes must not define the element type its own iteration variables get.
+fn iterated_for_range_body(context: &TplContext) -> Option<(FileId, TextRange)> {
+    let call_expr = context.call_expr.as_ref()?;
+    let for_range = call_expr
+        .syntax()
+        .ancestors()
+        .find_map(LuaForRangeStat::cast)?;
+    for_range
+        .get_expr_list()
+        .any(|expr| expr.syntax() == call_expr.syntax())
+        .then(|| (context.cache.get_file_id(), for_range.get_range()))
+}
+
+fn is_defined_in(member: &LuaMemberInfo, file_id: FileId, range: TextRange) -> bool {
+    matches!(
+        &member.property_owner_id,
+        Some(LuaSemanticDeclId::Member(member_id))
+            if member_id.file_id == file_id
+                && range.contains_range(member_id.get_syntax_id().get_range())
+    )
 }
 
 fn union_tpl_pattern_match(
