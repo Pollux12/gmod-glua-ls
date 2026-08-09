@@ -418,6 +418,65 @@ mod test {
     }
 
     #[test]
+    fn pairs_defers_iter_vars_when_generic_leaves_template_refs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_ids = ws.def_files(vec![
+            (
+                "a_loop.lua",
+                r#"
+                local packages = Store.packages or {}
+
+                for pkg, data in pairs(packages) do
+                    pkg_out = pkg
+                    data_out = data
+                end
+                "#,
+            ),
+            (
+                "b_writer.lua",
+                r#"
+                Store = Store or {}
+                Store.packages = Store.packages or {}
+
+                ---@class Package
+                ---@field id number
+
+                ---@param pkg Package
+                function AddPackage(pkg)
+                    Store.packages[pkg.id] = pkg
+                end
+                "#,
+            ),
+        ]);
+
+        let loop_file = file_ids[0];
+        let db = ws.get_db_mut();
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&loop_file)
+            .expect("loop file decl tree");
+        let iter_decls = decl_tree
+            .get_decls()
+            .values()
+            .filter(|decl| matches!(decl.get_name(), "pkg" | "data"))
+            .map(|decl| (decl.get_name().to_string(), decl.get_id()))
+            .collect::<Vec<_>>();
+        assert_eq!(iter_decls.len(), 2, "expected both iterator var decls");
+
+        for (name, decl_id) in iter_decls {
+            let cached = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|cache| cache.as_type().clone());
+            assert!(
+                cached.as_ref().is_some_and(|typ| !typ.contain_tpl()),
+                "iter var `{name}` froze as a raw template ref: {cached:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_pairs_nil_only_values_fall_back_to_unknown() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 

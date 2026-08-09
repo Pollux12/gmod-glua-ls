@@ -18,7 +18,7 @@ pub fn analyze_for_range_stat(
     analyzer: &mut LuaAnalyzer,
     for_range_stat: LuaForRangeStat,
 ) -> Option<()> {
-    let var_name_list = for_range_stat.get_var_name_list();
+    let var_name_list = for_range_stat.get_var_name_list().collect::<Vec<_>>();
     let iter_exprs = for_range_stat.get_expr_list().collect::<Vec<_>>();
     let cache = analyzer
         .context
@@ -28,7 +28,7 @@ pub fn analyze_for_range_stat(
 
     match iter_var_types {
         Ok(iter_var_types) => {
-            for (idx, var_name) in var_name_list.enumerate() {
+            for (idx, var_name) in var_name_list.iter().enumerate() {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 let ret_type = iter_var_types
@@ -42,6 +42,22 @@ pub fn analyze_for_range_stat(
                     LuaTypeCache::InferType(ret_type),
                     TypeCacheWriteMode::InsertOnly,
                 );
+            }
+
+            if iter_var_types.contain_tpl() {
+                // Nothing bound the generic, so the vars hold raw template refs: the
+                // table's members were not indexed when this ran, and which of them
+                // were is order-dependent. Keep the placeholder so dependants still
+                // see a type at the usual time, and queue a retry that replaces it
+                // once the member map is populated.
+                let unresolved = UnResolveIterVar {
+                    file_id: analyzer.file_id,
+                    iter_exprs: iter_exprs.clone(),
+                    iter_vars: var_name_list,
+                };
+                analyzer
+                    .context
+                    .add_unresolve(unresolved.into(), InferFailReason::UnResolveIterTemplate);
             }
         }
         Err(InferFailReason::None) => {
@@ -60,7 +76,7 @@ pub fn analyze_for_range_stat(
             let unresolved = UnResolveIterVar {
                 file_id: analyzer.file_id,
                 iter_exprs: iter_exprs.clone(),
-                iter_vars: var_name_list.collect::<Vec<_>>(),
+                iter_vars: var_name_list,
             };
 
             analyzer

@@ -629,7 +629,22 @@ pub fn try_resolve_iter_var(
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
 ) -> ResolveResult {
-    let iter_var_types = infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs)?;
+    let iter_var_types = match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs)
+    {
+        Ok(types) => types,
+        // Placeholder items have nothing to add on a failed retry: the template
+        // ref is already cached. Keep the failure in this reason's own group
+        // rather than injecting the item into another group's fixpoint.
+        Err(reason) => {
+            return Err(
+                if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
+                    InferFailReason::UnResolveIterTemplate
+                } else {
+                    reason
+                },
+            );
+        }
+    };
     for (idx, var_name) in unresolve_iter_var.iter_vars.iter().enumerate() {
         let position = var_name.get_position();
         let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, position);
@@ -639,14 +654,36 @@ pub fn try_resolve_iter_var(
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
-        write_type_cache(
-            db,
-            decl_id.into(),
-            LuaTypeCache::InferType(ret_type),
-            TypeCacheWriteMode::InsertOnly,
-        );
+        // A raw template ref is a placeholder left by an unbound generic, never a
+        // valid fact, so a real type replaces it. Anything else keeps insert-only
+        // precedence.
+        let owner: LuaTypeOwner = decl_id.into();
+        let mode = if !ret_type.contain_tpl()
+            && iter_var_holds_tpl_placeholder(db, unresolve_iter_var, idx)
+        {
+            TypeCacheWriteMode::ForceOverwrite
+        } else {
+            TypeCacheWriteMode::InsertOnly
+        };
+        write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
     }
     Ok(())
+}
+
+/// Whether the iterator var at `idx` still caches a raw template ref, the
+/// placeholder an unbound generic leaves behind.
+fn iter_var_holds_tpl_placeholder(
+    db: &DbIndex,
+    unresolve_iter_var: &UnResolveIterVar,
+    idx: usize,
+) -> bool {
+    let Some(var_name) = unresolve_iter_var.iter_vars.get(idx) else {
+        return false;
+    };
+    let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, var_name.get_position());
+    db.get_type_index()
+        .get_type_cache(&decl_id.into())
+        .is_some_and(|cache| cache.as_type().contain_tpl())
 }
 
 pub fn try_resolve_module_ref(

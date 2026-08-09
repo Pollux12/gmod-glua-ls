@@ -23,6 +23,9 @@ pub fn check_reach_reason(
         InferFailReason::None
         | InferFailReason::FieldNotFound
         | InferFailReason::UnResolveOperatorCall
+        // The member map these items read is fully indexed before this pipeline
+        // runs, so the first wave is already the wave it fills.
+        | InferFailReason::UnResolveIterTemplate
         | InferFailReason::RecursiveInfer => Some(true),
         InferFailReason::UnResolveDeclType(decl_id) => {
             let decl = db.get_decl_index().get_decl(decl_id)?;
@@ -96,6 +99,10 @@ pub fn resolve_as_unknown(
         // Names no owner to floor: the reason is the index's build state, and it
         // always clears before the last unresolve rounds.
         | InferFailReason::UnSealedDynamicFields
+        // The template-ref placeholder these items would floor is already in the
+        // cache and is what the flow fallback re-derives from, so the graceful
+        // floor is leaving it alone.
+        | InferFailReason::UnResolveIterTemplate
         | InferFailReason::RecursiveInfer => {
             return Some(());
         }

@@ -681,6 +681,7 @@ pub(crate) fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str 
         InferFailReason::UnResolveTypeDecl(_) => "type_decl",
         InferFailReason::UnResolveModuleExport(_) => "module_export",
         InferFailReason::UnSealedDynamicFields => "unsealed_dynamic_fields",
+        InferFailReason::UnResolveIterTemplate => "iter_template",
     }
 }
 
@@ -704,13 +705,17 @@ fn infer_fail_reason_kind_rank(reason: &InferFailReason) -> u8 {
         InferFailReason::None => 1,
         InferFailReason::RecursiveInfer => 2,
         InferFailReason::FieldNotFound => 3,
-        InferFailReason::UnResolveOperatorCall => 4,
-        InferFailReason::UnResolveDeclType(_) => 5,
-        InferFailReason::UnResolveMemberType(_) => 6,
-        InferFailReason::UnResolveExpr(_) => 7,
-        InferFailReason::UnResolveSignatureReturn(_) => 8,
-        InferFailReason::UnResolveTypeDecl(_) => 9,
-        InferFailReason::UnResolveModuleExport(_) => 10,
+        // Ordered where these items sat while they shared the `FieldNotFound`
+        // group: they only upgrade their own placeholders, so the rank exists to
+        // keep that timing, not to express a dependency.
+        InferFailReason::UnResolveIterTemplate => 4,
+        InferFailReason::UnResolveOperatorCall => 5,
+        InferFailReason::UnResolveDeclType(_) => 6,
+        InferFailReason::UnResolveMemberType(_) => 7,
+        InferFailReason::UnResolveExpr(_) => 8,
+        InferFailReason::UnResolveSignatureReturn(_) => 9,
+        InferFailReason::UnResolveTypeDecl(_) => 10,
+        InferFailReason::UnResolveModuleExport(_) => 11,
     }
 }
 
