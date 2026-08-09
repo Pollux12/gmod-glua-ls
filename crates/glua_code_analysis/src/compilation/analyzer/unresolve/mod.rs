@@ -278,6 +278,45 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
     }
 }
 
+fn attempt_resolve(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    file_id: FileId,
+    unresolve: &mut UnResolve,
+) -> ResolveResult {
+    let cache = infer_manager.get_infer_cache(file_id);
+    match unresolve {
+        UnResolve::Decl(un_resolve_decl) => try_resolve_decl(db, cache, un_resolve_decl),
+        UnResolve::Member(un_resolve_member) => try_resolve_member(db, cache, un_resolve_member),
+        UnResolve::Module(un_resolve_module) => try_resolve_module(db, cache, un_resolve_module),
+        UnResolve::Return(un_resolve_return) => {
+            try_resolve_return_point(db, cache, un_resolve_return)
+        }
+        UnResolve::ClosureParams(un_resolve_closure_params) => {
+            try_resolve_call_closure_params(db, cache, un_resolve_closure_params)
+        }
+        UnResolve::ClosureReturn(un_resolve_closure_return) => {
+            try_resolve_closure_return(db, cache, un_resolve_closure_return)
+        }
+        UnResolve::IterDecl(un_resolve_iter_var) => {
+            try_resolve_iter_var(db, cache, un_resolve_iter_var)
+        }
+        UnResolve::ModuleRef(module_ref) => try_resolve_module_ref(db, cache, module_ref),
+        UnResolve::ClosureParentParams(un_resolve_closure_params) => {
+            try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
+        }
+        UnResolve::TableField(un_resolve_table_field) => {
+            try_resolve_table_field(db, cache, un_resolve_table_field)
+        }
+        UnResolve::SpecialCall(un_resolve_special_call) => {
+            try_resolve_special_call(db, cache, un_resolve_special_call)
+        }
+        UnResolve::CallSiteContribution(contribution) => {
+            try_resolve_call_site_contribution(db, cache, contribution)
+        }
+    }
+}
+
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
@@ -290,6 +329,7 @@ fn try_resolve(
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
+        let mut parked = Vec::new();
         let mut retry_file_ids = HashSet::new();
 
         // Only re-sort keys when the set of reason groups has changed.
@@ -321,46 +361,9 @@ fn try_resolve(
             unresolves.sort_unstable_by(unresolve_stable_cmp);
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
-                let cache = infer_manager.get_infer_cache(file_id);
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
-                let resolve_result = match &mut unresolve {
-                    UnResolve::Decl(un_resolve_decl) => {
-                        try_resolve_decl(db, cache, un_resolve_decl)
-                    }
-                    UnResolve::Member(un_resolve_member) => {
-                        try_resolve_member(db, cache, un_resolve_member)
-                    }
-                    UnResolve::Module(un_resolve_module) => {
-                        try_resolve_module(db, cache, un_resolve_module)
-                    }
-                    UnResolve::Return(un_resolve_return) => {
-                        try_resolve_return_point(db, cache, un_resolve_return)
-                    }
-                    UnResolve::ClosureParams(un_resolve_closure_params) => {
-                        try_resolve_call_closure_params(db, cache, un_resolve_closure_params)
-                    }
-                    UnResolve::ClosureReturn(un_resolve_closure_return) => {
-                        try_resolve_closure_return(db, cache, un_resolve_closure_return)
-                    }
-                    UnResolve::IterDecl(un_resolve_iter_var) => {
-                        try_resolve_iter_var(db, cache, un_resolve_iter_var)
-                    }
-                    UnResolve::ModuleRef(module_ref) => {
-                        try_resolve_module_ref(db, cache, module_ref)
-                    }
-                    UnResolve::ClosureParentParams(un_resolve_closure_params) => {
-                        try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
-                    }
-                    UnResolve::TableField(un_resolve_table_field) => {
-                        try_resolve_table_field(db, cache, un_resolve_table_field)
-                    }
-                    UnResolve::SpecialCall(un_resolve_special_call) => {
-                        try_resolve_special_call(db, cache, un_resolve_special_call)
-                    }
-                    UnResolve::CallSiteContribution(contribution) => {
-                        try_resolve_call_site_contribution(db, cache, contribution)
-                    }
-                };
+                let resolve_result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                let cache = infer_manager.get_infer_cache(file_id);
                 if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
                     profile.record_attempt(
                         &check_reason,
@@ -407,19 +410,23 @@ fn try_resolve(
                             retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
                         } else {
-                            // The item re-failed naming the dependency its
-                            // group was just reached on, so the fact it
-                            // would have written is never produced. The
-                            // drops that remain here are genuine: the ones
-                            // that named an *already satisfied* dependency
-                            // came from a memoised `CacheEntry::Error`,
-                            // which `clear_deferred_inference_results` now
-                            // purges.
+                            // Re-failing on the dependency the group was
+                            // reached on usually means the attempt replayed
+                            // a memoised `CacheEntry::Error` from before
+                            // that dependency landed, so the reason names a
+                            // stale fact. Purging the file and parking the
+                            // item gives it one genuine look per wave
+                            // against the settled index — dying here writes
+                            // no type cache at all, which leaves a decl
+                            // owner with none and lets
+                            // `stabilize_unknown_locals` fabricate a usage
+                            // guess.
                             census::record(
-                                "try_resolve.same_reason_drop",
+                                "try_resolve.same_reason_park",
                                 infer_fail_reason_label(&reason),
                             );
-                            record_drop(db, "same_reason_drop", &unresolve, &reason);
+                            retry_file_ids.insert(file_id);
+                            parked.push((unresolve, reason));
                         }
                     }
                 }
@@ -432,11 +439,14 @@ fn try_resolve(
             reason_resolve.remove(&reason);
         }
 
-        let keys_changed = !retain_unresolve.is_empty();
+        let mut keys_changed = !retain_unresolve.is_empty();
         for (unresolve, reason) in retain_unresolve {
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
+        // Anything still parked is dropped with the wave: it never joins
+        // `reason_resolve` here, so it cannot keep a reason group alive into the
+        // outer round.
         if !changed || reason_resolve.is_empty() {
             break;
         }
@@ -446,6 +456,11 @@ fn try_resolve(
         // but discard inference results computed against the previous DB state.
         materialize_pending_str_tpl_type_decls(db, infer_manager);
         infer_manager.clear_files_deferred_results(&retry_file_ids);
+
+        keys_changed |= !parked.is_empty();
+        for (unresolve, reason) in parked {
+            reason_resolve.entry(reason).or_default().push(unresolve);
+        }
 
         // Re-use cached sorted keys if no new reason groups were added.
         // When retain_unresolve adds items to new/existing groups, the key
