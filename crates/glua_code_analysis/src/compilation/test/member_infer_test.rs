@@ -2391,6 +2391,62 @@ mod test {
         );
     }
 
+    /// A guarded bootstrap in one file and a real writer in another: the
+    /// bootstrap contributes only `{}`, so it must never replace the
+    /// writer's class, cold or after a re-index.
+    #[gtest]
+    fn test_incremental_edit_keeps_a_cross_file_bootstrap_off_the_visible_member() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let bootstrap_path = "lua/deco/sh_stock.lua";
+        let bootstrap_source = r#"
+        cityrp = cityrp or {}
+        cityrp.deco = cityrp.deco or {}
+        cityrp.deco.stock = cityrp.deco.stock or {}
+        "#;
+
+        ws.def_file(bootstrap_path, bootstrap_source);
+        ws.def_file(
+            "lua/deco/cl_stock.lua",
+            r#"
+            ---@class DecoStock
+            local Stock = {}
+
+            function Stock.Count()
+                return 1
+            end
+
+            cityrp.deco.stock = Stock
+            "#,
+        );
+
+        let consumer_file = ws.def_file(
+            "lua/deco/cl_use.lua",
+            r#"
+            local stock = cityrp.deco.stock
+            "#,
+        );
+
+        let baseline_type = local_name_type(&mut ws, consumer_file, "stock");
+        let baseline = ws.humanize_type(baseline_type);
+        assert_that!(baseline.as_str(), contains_substring("DecoStock"));
+
+        let bootstrap_uri = ws.virtual_url_generator.new_uri(bootstrap_path);
+        ws.analysis
+            .update_file_by_uri(&bootstrap_uri, Some(format!("{bootstrap_source}\n")));
+
+        let after_edit_type = local_name_type(&mut ws, consumer_file, "stock");
+        let after_edit = ws.humanize_type(after_edit_type);
+        assert_that!(
+            after_edit.as_str(),
+            eq(baseline.as_str()),
+            "re-indexing the bootstrap file must not hand it the visible member"
+        );
+    }
+
     #[gtest]
     fn test_global_class_annotation_allows_cross_file_extension_without_reedit() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();

@@ -2002,7 +2002,10 @@ pub(super) fn is_assignment_file_define_member(
         })
 }
 
-fn is_guarded_table_assignment_member(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {
+pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+) -> bool {
     let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
         return false;
     };

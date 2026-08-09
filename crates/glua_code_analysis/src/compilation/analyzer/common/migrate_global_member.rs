@@ -3,6 +3,16 @@ use std::collections::HashSet;
 use crate::{DbIndex, GlobalId, InFiled, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaTypeOwner};
 
 use super::get_owner_id;
+use crate::compilation::analyzer::lua::is_guarded_table_assignment_member;
+
+/// Re-derives the non-overwriting mark before a re-home elects a visible
+/// member.
+fn restore_non_overwriting_mark(db: &mut DbIndex, member_id: LuaMemberId) {
+    if is_guarded_table_assignment_member(db, member_id) {
+        db.get_member_index_mut()
+            .mark_non_overwriting_assignment_member(member_id);
+    }
+}
 
 /// The owner a global declaration resolves to, falling back to the table
 /// literal it is written with when inference has not reached it yet.
@@ -160,16 +170,20 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 None => Some(canonical_owner.clone()),
             };
 
-            let member_index = db.get_member_index_mut();
-            if let Some(target_owner) = &target_owner
-                && needs_rehome
-                && member_index
-                    .get_member_owner(&member_id)
-                    .is_none_or(|owner| owner != target_owner)
-            {
+            let rehome_target = target_owner.clone().filter(|target_owner| {
+                needs_rehome
+                    && db
+                        .get_member_index()
+                        .get_member_owner(&member_id)
+                        .is_none_or(|owner| owner != target_owner)
+            });
+            if let Some(target_owner) = rehome_target {
+                restore_non_overwriting_mark(db, member_id);
+                let member_index = db.get_member_index_mut();
                 member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
-                member_index.add_member_to_owner(target_owner.clone(), member_id);
+                member_index.add_member_to_owner(target_owner, member_id);
             }
+            let member_index = db.get_member_index_mut();
             // Aliasing the remaining candidates is what makes a global
             // declared once per realm behave like the single table it is at
             // runtime, and it has to run for members that already reached a
@@ -403,6 +417,7 @@ fn migrate_global_path_members(
             None => canonical_owner.clone(),
         };
 
+        restore_non_overwriting_mark(db, member_id);
         let member_index = db.get_member_index_mut();
         member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
         member_index.add_member_to_owner(target_owner.clone(), member_id);

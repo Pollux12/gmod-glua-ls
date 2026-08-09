@@ -26,7 +26,7 @@ use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
 pub(in crate::compilation::analyzer) use stats::{
     has_multiple_distinct_index_expr_member_owners, is_guarded_table_assignment_index_expr,
-    preserve_guarded_table_assignment_members,
+    is_guarded_table_assignment_member, preserve_guarded_table_assignment_members,
 };
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
