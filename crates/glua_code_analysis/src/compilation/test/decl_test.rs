@@ -60,6 +60,57 @@ mod test {
         );
     }
 
+    /// An unknown-from-field initializer followed by a call assignment must land
+    /// the call's type whether the call resolves eagerly or defers to the
+    /// unresolve pass — the two write paths apply different acceptance rules, so
+    /// the assignment is routed through the deferred one either way.
+    #[test]
+    fn decl_assignment_from_call_narrows_unknown_initializer() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "annotations/narrowing-call.lua",
+            r#"
+            ---@meta
+            ---@return string
+            function narrowing_localise() end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/autorun/narrowing-call.lua",
+            r#"
+            local function register(item)
+                local name = item.name
+                if name then
+                    name = narrowing_localise()
+                end
+            end
+            "#,
+        );
+
+        let db = ws.analysis.compilation.get_db();
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("syntax tree")
+            .get_chunk_node();
+        let name_decl = root
+            .descendants::<LuaNameExpr>()
+            .find(|name| name.get_name_text().as_deref() == Some("name"))
+            .expect("decl name expr");
+        let decl_id = db
+            .get_reference_index()
+            .get_local_reference(&file_id)
+            .and_then(|refs| refs.get_decl_id(&name_decl.get_range()))
+            .expect("local decl");
+
+        assert_eq!(
+            db.get_type_index()
+                .get_type_cache(&crate::LuaTypeOwner::Decl(decl_id))
+                .map(|cache| cache.as_type().clone()),
+            Some(LuaType::String)
+        );
+    }
+
     #[test]
     fn stabilized_local_respects_assignment_regions() {
         let mut ws = VirtualWorkspace::new();

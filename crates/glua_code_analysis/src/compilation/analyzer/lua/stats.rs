@@ -898,7 +898,14 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     // is `nil` at runtime, not "unknown".
                     LuaType::Nil
                 } else {
-                    if should_retry_uninformative_initializer(expr, &expr_type) {
+                    if should_retry_uninformative_initializer(expr, &expr_type)
+                        || should_retry_narrowing_decl_assignment(
+                            analyzer,
+                            &type_owner,
+                            expr,
+                            &expr_type,
+                        )
+                    {
                         add_unresolve_for_assignment(
                             analyzer,
                             type_owner.clone(),
@@ -1345,6 +1352,25 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
 /// has to be queued for the unresolve pass as well as committed here.
 fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
     is_call_or_index_expr(expr) && !crate::db_index::is_informative_type(expr_type)
+}
+
+/// Whether an assignment that *would* narrow an uninformative decl cache
+/// has to go through the unresolve pass instead of being committed here.
+fn should_retry_narrowing_decl_assignment(
+    analyzer: &LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+    expr_type: &LuaType,
+) -> bool {
+    if !is_call_or_index_expr(expr) || !crate::db_index::is_informative_type(expr_type) {
+        return false;
+    }
+
+    matches!(type_owner, LuaTypeOwner::Decl(_))
+        && matches!(
+            analyzer.db.get_type_index().get_type_cache(type_owner),
+            Some(LuaTypeCache::InferType(LuaType::Any | LuaType::Unknown))
+        )
 }
 
 fn should_defer_nil_gmod_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
