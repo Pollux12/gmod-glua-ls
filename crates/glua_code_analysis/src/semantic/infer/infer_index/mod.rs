@@ -50,7 +50,9 @@ use crate::{
     },
 };
 
-use super::{InferFailReason, InferResult, infer_expr, infer_name::infer_global_type};
+use super::{
+    InferFailReason, InferResult, infer_expr, infer_name::infer_global_type, type_decl_is_vgui_panel,
+};
 
 type TableMemberLookupGuard = HashSet<InFiled<TextRange>>;
 
@@ -1757,16 +1759,27 @@ fn infer_custom_type_member(
         }
     }
 
-    if let Some(dynamic_field) = resolve_dynamic_field_member(
+    let dynamic_field_result = resolve_dynamic_field_member(
         db,
         cache,
         &LuaType::Ref(prefix_type_id.clone()),
         &key,
         Some(index_expr.get_position()),
-    )
-    // unsealed: pre-deferral behavior, replaced per-consumer
-    .unwrap_or_default()
+    );
+
+    // A panel field written by a dynamic `self.X = ...` is only knowable once the
+    // dynamic-field index seals. Falling through to the fallbacks below would elect a
+    // wrong member (typically a 0-arity signature) and memoise it, so defer instead.
+    if matches!(
+        dynamic_field_result,
+        Err(InferFailReason::UnSealedDynamicFields)
+    ) && type_decl_is_vgui_panel(db, &prefix_type_id, 0)
     {
+        return Err(InferFailReason::UnSealedDynamicFields);
+    }
+
+    // unsealed: pre-deferral behavior, replaced per-consumer
+    if let Some(dynamic_field) = dynamic_field_result.unwrap_or_default() {
         if type_decl.is_class()
             && let Some(super_types) =
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
