@@ -25,6 +25,7 @@ pub fn analyze_for_range_stat(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let iter_var_types = infer_for_range_iter_expr_func(analyzer.db, cache, &iter_exprs);
+    let enumerates_member_map = iterates_table_member_map(analyzer.db, cache, &iter_exprs);
 
     match iter_var_types {
         Ok(iter_var_types) => {
@@ -44,12 +45,12 @@ pub fn analyze_for_range_stat(
                 );
             }
 
-            if iter_var_types.contain_tpl() {
-                // Nothing bound the generic, so the vars hold raw template refs: the
-                // table's members were not indexed when this ran, and which of them
-                // were is order-dependent. Keep the placeholder so dependants still
-                // see a type at the usual time, and queue a retry that replaces it
-                // once the member map is populated.
+            if iter_var_types.contain_tpl() || enumerates_member_map {
+                // Either nothing bound the generic, so the vars hold raw
+                // template refs, or the types came from enumerating a
+                // table's member map. Either way the answer only covers the
+                // members indexed when this ran, and which those are
+                // depends on the order files were analysed in.
                 let unresolved = UnResolveIterVar {
                     file_id: analyzer.file_id,
                     iter_exprs: iter_exprs.clone(),
@@ -86,6 +87,20 @@ pub fn analyze_for_range_stat(
     }
 
     Some(())
+}
+
+/// Whether this loop's variable types come from enumerating a table's
+/// member map, the union [`try_infer_pairs_iter_types_from_table_members`]
+/// builds.
+fn iterates_table_member_map(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    iter_exprs: &[LuaExpr],
+) -> bool {
+    let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first() else {
+        return false;
+    };
+    is_global_pairs_call(db, cache, call_expr)
 }
 
 pub fn infer_for_range_iter_expr_func(

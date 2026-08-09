@@ -674,7 +674,8 @@ pub fn try_resolve_iter_var(
         // precedence.
         let owner: LuaTypeOwner = decl_id.into();
         let mode = if !ret_type.contain_tpl()
-            && iter_var_holds_tpl_placeholder(db, unresolve_iter_var, idx)
+            && (iter_var_holds_tpl_placeholder(db, unresolve_iter_var, idx)
+                || settled_union_widens_cache(db, &owner, &ret_type))
         {
             TypeCacheWriteMode::ForceOverwrite
         } else {
@@ -683,6 +684,16 @@ pub fn try_resolve_iter_var(
         write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
     }
     Ok(())
+}
+
+/// Whether the settled type is a union that already contains everything the
+/// cache holds, plus more.
+fn settled_union_widens_cache(db: &DbIndex, owner: &LuaTypeOwner, settled: &LuaType) -> bool {
+    db.get_type_index()
+        .get_type_cache(owner)
+        .is_some_and(|cached| {
+            crate::compilation::analyzer::union_widens_cached_type(settled, cached.as_type())
+        })
 }
 
 /// Whether the iterator var at `idx` still caches a raw template ref, the

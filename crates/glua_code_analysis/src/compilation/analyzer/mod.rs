@@ -496,6 +496,26 @@ fn union_widens_arm(inferred: &LuaType, current: &LuaType) -> bool {
     }
 }
 
+/// Whether the re-derived union contains everything the cached type holds, plus
+/// more — the union-to-union counterpart of [`union_widens_arm`].
+///
+/// A cached union is as much a subset snapshot as a cached single arm is: both
+/// are decided by which contributors happened to be indexed first.
+pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    let LuaType::Union(inferred_union) = inferred else {
+        return false;
+    };
+    let inferred_arms = inferred_union.into_vec();
+    match current {
+        LuaType::Union(current_union) => {
+            let current_arms = current_union.into_vec();
+            current_arms.len() < inferred_arms.len()
+                && current_arms.iter().all(|arm| inferred_arms.contains(arm))
+        }
+        current => inferred_arms.contains(current),
+    }
+}
+
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if context.member_initializer_reinfer_candidates.is_empty() {
         return;
@@ -1356,5 +1376,60 @@ fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) 
             .iter()
             .any(|expr| expr.get_range().contains_range(range)),
         LuaReturnPoint::Nil | LuaReturnPoint::Error => false,
+    }
+}
+
+#[cfg(test)]
+mod union_widening_tests {
+    use super::union_widens_cached_type;
+    use crate::LuaType;
+
+    fn union(arms: Vec<LuaType>) -> LuaType {
+        LuaType::from_vec(arms)
+    }
+
+    #[test]
+    fn widens_a_cached_union_the_settled_one_contains() {
+        let settled = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::IntegerConst(5),
+            LuaType::Number,
+            LuaType::Any,
+        ]);
+        let cached = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::IntegerConst(5),
+            LuaType::Any,
+        ]);
+        assert!(union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn widens_a_cached_single_arm() {
+        let settled = union(vec![LuaType::Number, LuaType::Any]);
+        assert!(union_widens_cached_type(&settled, &LuaType::Number));
+    }
+
+    #[test]
+    fn rejects_a_cached_union_with_an_arm_the_settled_one_lacks() {
+        let settled = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::Number,
+            LuaType::Any,
+        ]);
+        let cached = union(vec![LuaType::IntegerConst(4), LuaType::String]);
+        assert!(!union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn rejects_an_equal_union() {
+        let settled = union(vec![LuaType::Number, LuaType::Any]);
+        let cached = union(vec![LuaType::Number, LuaType::Any]);
+        assert!(!union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn rejects_a_non_union_settled_type() {
+        assert!(!union_widens_cached_type(&LuaType::Number, &LuaType::Number));
     }
 }
