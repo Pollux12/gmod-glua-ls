@@ -1,4 +1,5 @@
 mod migrate_global_member;
+use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 pub(super) use migrate_global_member::{
     migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
     reconcile_parked_global_path_members,
@@ -6,9 +7,31 @@ pub(super) use migrate_global_member::{
 use rowan::TextRange;
 
 use crate::{
-    InFiled, LuaMemberId, LuaTypeCache, LuaTypeOwner,
+    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
     db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
 };
+
+/// Whether `typ` is a raw template placeholder inherited from a generic-for
+/// variable that nothing has bound yet.
+pub fn holds_unbound_iter_template(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    typ: &LuaType,
+) -> bool {
+    if !typ.contain_tpl() {
+        return false;
+    }
+
+    expr.ancestors::<LuaForRangeStat>().any(|for_range_stat| {
+        for_range_stat.get_var_name_list().any(|var_name| {
+            let decl_id = LuaDeclId::new(file_id, var_name.get_position());
+            db.get_type_index()
+                .get_type_cache(&decl_id.into())
+                .is_some_and(|cache| cache.as_type().contain_tpl())
+        })
+    })
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeCacheWriteMode {

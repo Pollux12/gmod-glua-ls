@@ -4,7 +4,10 @@ use crate::{
     CacheEntry, DbIndex, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
     LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
-        common::{TypeCacheWriteMode, add_member, bind_type, write_type_cache},
+        common::{
+            TypeCacheWriteMode, add_member, bind_type, holds_unbound_iter_template,
+            write_type_cache,
+        },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
     },
@@ -114,6 +117,18 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     analyzer
                         .context
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
+                    continue;
+                }
+                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, &expr, &expr_type) {
+                    let unresolve = UnResolveDecl {
+                        file_id: analyzer.file_id,
+                        decl_id,
+                        expr: expr.clone(),
+                        ret_idx: 0,
+                    };
+                    analyzer
+                        .context
+                        .add_unresolve(unresolve.into(), InferFailReason::UnResolveIterTemplate);
                     continue;
                 }
                 if should_defer_pending_local_alias(analyzer, &expr, &expr_type) {
@@ -855,6 +870,16 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         &var,
                         expr.clone(),
                         InferFailReason::FieldNotFound,
+                    );
+                    continue;
+                }
+                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, expr, &expr_type) {
+                    add_unresolve_for_assignment(
+                        analyzer,
+                        type_owner,
+                        &var,
+                        expr.clone(),
+                        InferFailReason::UnResolveIterTemplate,
                     );
                     continue;
                 }

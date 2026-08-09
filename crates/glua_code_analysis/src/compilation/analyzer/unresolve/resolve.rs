@@ -24,7 +24,10 @@ use crate::{
             exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
             snapshot_callback_table_type,
         },
-        common::{TypeCacheWriteMode, add_member, bind_resolved_type, write_type_cache},
+        common::{
+            TypeCacheWriteMode, add_member, bind_resolved_type, holds_unbound_iter_template,
+            write_type_cache,
+        },
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
             has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
@@ -154,6 +157,10 @@ pub fn try_resolve_decl(
             .unwrap_or(LuaType::Unknown),
         _ => expr_type,
     };
+
+    if holds_unbound_iter_template(db, decl.file_id, &expr, &expr_type) {
+        return Err(InferFailReason::UnResolveIterTemplate);
+    }
 
     bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     Ok(())
@@ -371,6 +378,10 @@ pub fn try_resolve_member(
                 .unwrap_or(LuaType::Unknown),
             _ => expr_type,
         };
+
+        if holds_unbound_iter_template(db, unresolve_member.file_id, &expr, &expr_type) {
+            return Err(InferFailReason::UnResolveIterTemplate);
+        }
 
         let member_id = unresolve_member.member_id;
         bind_resolved_type(db, member_id.into(), LuaTypeCache::InferType(expr_type));

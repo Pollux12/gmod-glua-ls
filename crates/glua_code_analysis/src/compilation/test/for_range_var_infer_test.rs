@@ -496,4 +496,32 @@ mod test {
 
         assert_eq!(ws.expr_ty("value_out"), LuaType::Unknown);
     }
+
+    /// A loop variable that still holds a raw template ref is a placeholder, and
+    /// facts derived from it inside the body are deferred rather than committed.
+    /// The deferral must not swallow a body whose template really is bound by
+    /// the enclosing generic: those types still have to be published.
+    #[test]
+    fn generic_iterator_body_still_publishes_its_loop_derived_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@generic K, V
+            ---@param source table<K, V>
+            local function walk(source)
+                for key, value in pairs(source) do
+                    local seen_key = key
+                    local seen_value = value
+                    return seen_key, seen_value
+                end
+            end
+
+            key_out, value_out = walk({ [1] = "a" })
+        "#,
+        );
+
+        assert!(!ws.expr_ty("key_out").contain_tpl());
+        assert!(!ws.expr_ty("value_out").contain_tpl());
+    }
 }
