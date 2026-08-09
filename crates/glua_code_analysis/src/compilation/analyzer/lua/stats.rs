@@ -1453,8 +1453,22 @@ fn should_defer_pending_local_alias(
     analyzer.context.has_pending_decl_unresolve(decl_id)
 }
 
-/// Whether `expr` reads a field out of `decl_id` itself, the `x = x.field` shape.
+/// Whether `expr` reads out of `decl_id` itself: the `x = x.field` shape,
+/// and the same read buried in an operand or call argument (`width =
+/// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
+/// self-contradiction — the value still cannot be the decl's lifetime type,
+/// because it was computed from a read that type would reject.
 fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+    if index_chain_roots_at_decl(analyzer, decl_id, expr) {
+        return true;
+    }
+
+    expr.descendants::<LuaIndexExpr>().any(|index_expr| {
+        index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
+    })
+}
+
+fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
     let mut current = expr.clone();
     loop {
         match current {
