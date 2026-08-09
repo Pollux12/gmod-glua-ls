@@ -1970,18 +1970,22 @@ fn get_widened_member_assignment_type(
             return None;
         }
 
-        let Some(existing_cache) = analyzer
+        let existing_state = match analyzer
             .db
             .get_type_index()
             .get_type_cache(&related_member_id.into())
             .cloned()
-        else {
-            continue;
+        {
+            Some(existing_cache) => MemberAssignmentWideningState::from_type_cache(&existing_cache),
+            None => match guarded_table_bootstrap_member_type(analyzer.db, related_member_id) {
+                Some(bootstrap_type) => {
+                    MemberAssignmentWideningState::from_assigned_type(&bootstrap_type, None)
+                }
+                None => continue,
+            },
         };
 
-        previous_states.push(MemberAssignmentWideningState::from_type_cache(
-            &existing_cache,
-        ));
+        previous_states.push(existing_state);
     }
 
     if !saw_previous_assignment {
@@ -2068,45 +2072,58 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    let Some(var) = LuaVarExpr::cast(index_expr.syntax().clone()) else {
-        return false;
-    };
-    let Some(access_path) = var.get_access_path() else {
-        return false;
-    };
-    let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
-        return false;
-    };
+    guarded_table_assignment_bootstrap_range(index_expr).is_some()
+}
+
+/// Range of the `{}` arm of a self-referential guarded bootstrap
+/// (`x.y = x.y or {}`), which is what the assignment's type is when the guard
+/// falls through.
+fn guarded_table_assignment_bootstrap_range(index_expr: &LuaIndexExpr) -> Option<rowan::TextRange> {
+    let var = LuaVarExpr::cast(index_expr.syntax().clone())?;
+    let access_path = var.get_access_path()?;
+    let assign_stat = index_expr.get_parent::<LuaAssignStat>()?;
     let syntax_id = index_expr.get_syntax_id();
     let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
 
     var_list
         .iter()
         .zip(expr_list.iter())
-        .any(|(candidate_var, expr)| {
-            candidate_var.get_syntax_id() == syntax_id
-                && guarded_assignment_expr_matches_path(expr, &access_path)
-        })
+        .find(|(candidate_var, _)| candidate_var.get_syntax_id() == syntax_id)
+        .and_then(|(_, expr)| guarded_assignment_table_arm_range(expr, &access_path))
 }
 
-fn guarded_assignment_expr_matches_path(expr: &LuaExpr, access_path: &str) -> bool {
+fn guarded_assignment_table_arm_range(
+    expr: &LuaExpr,
+    access_path: &str,
+) -> Option<rowan::TextRange> {
     let LuaExpr::BinaryExpr(binary_expr) = expr else {
-        return false;
+        return None;
     };
     if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
-        return false;
+        return None;
     }
 
-    let Some((left, right)) = binary_expr.get_exprs() else {
-        return false;
+    let (left, right) = binary_expr.get_exprs()?;
+    let LuaExpr::TableExpr(table_expr) = &right else {
+        return None;
     };
-    if !matches!(right, LuaExpr::TableExpr(_)) {
-        return false;
-    }
 
-    LuaVarExpr::cast(left.syntax().clone())
-        .and_then(|left_var| left_var.get_access_path())
-        .is_some_and(|left_path| left_path == access_path)
+    let left_path = LuaVarExpr::cast(left.syntax().clone())?.get_access_path()?;
+    (left_path == access_path).then(|| table_expr.get_range())
+}
+
+/// The type a self-referential guarded bootstrap (`x.y = x.y or {}`)
+/// assigns, derived from syntax alone.
+fn guarded_table_bootstrap_member_type(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
+    let root = tree.get_red_root();
+    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
+    let range = guarded_table_assignment_bootstrap_range(&index_expr)?;
+
+    Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
 }
 
 fn merge_type_owner_and_unresolve_expr(
@@ -2597,6 +2614,24 @@ mod tests {
             FileId::new(0),
             TextRange::new(TextSize::new(start), TextSize::new(end)),
         ))
+    }
+
+    /// A sibling assignment that has not been analysed carries no type cache, so
+    /// the cross-file merge can only keep it by deriving its type from syntax.
+    /// Only the self-referential bootstrap has a syntax-determined type.
+    #[test]
+    fn guarded_table_bootstrap_range_names_only_the_self_referential_arm() {
+        let source = "lib.store = lib.store or {}\nlib.other = fetch() or {}\n";
+        let tree = glua_parser::LuaParser::parse(source, glua_parser::ParserConfig::default());
+
+        let ranges = tree
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .filter_map(|index_expr| guarded_table_assignment_bootstrap_range(&index_expr))
+            .collect::<Vec<_>>();
+
+        assert_eq!(ranges.len(), 1, "only the bootstrap assignment qualifies");
+        assert_eq!(&source[ranges[0]], "{}");
     }
 
     fn member_id_at(start: u32) -> LuaMemberId {
