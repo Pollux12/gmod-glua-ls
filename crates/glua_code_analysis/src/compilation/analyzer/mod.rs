@@ -449,12 +449,18 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                 && current_cache.as_ref().is_some_and(|current| {
                     is_strict_nominal_refinement(db, &inferred_type, current.as_type())
                 });
+            let is_settled_widening = current_cache
+                .as_ref()
+                .is_some_and(|current| union_widens_arm(&inferred_type, current.as_type()));
             if current_is_uninformative {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
                     fact: inferred_fact,
                 });
-            } else if has_stronger_declared_authority || is_nominal_refinement {
+            } else if has_stronger_declared_authority
+                || is_nominal_refinement
+                || is_settled_widening
+            {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
                     fact: inferred_fact,
@@ -476,6 +482,18 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
         updates.extend(result.updates);
     }
     apply_initializer_cache_updates(db, updates);
+}
+
+/// Whether the re-derived type is a union that already contains the cached one.
+///
+/// The cache then holds a subset snapshot taken before the other arms were
+/// visible, so replacing it widens to the settled answer instead of guessing a
+/// different one.
+fn union_widens_arm(inferred: &LuaType, current: &LuaType) -> bool {
+    match inferred {
+        LuaType::Union(union) => union.types().any(|arm| arm == current),
+        _ => false,
+    }
 }
 
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
