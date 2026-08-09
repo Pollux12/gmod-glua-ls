@@ -1453,6 +1453,28 @@ fn should_defer_pending_local_alias(
     analyzer.context.has_pending_decl_unresolve(decl_id)
 }
 
+/// Whether `expr` reads a field out of `decl_id` itself, the `x = x.field` shape.
+fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+    let mut current = expr.clone();
+    loop {
+        match current {
+            LuaExpr::IndexExpr(index_expr) => match index_expr.get_prefix_expr() {
+                Some(prefix) => current = prefix,
+                None => return false,
+            },
+            LuaExpr::NameExpr(name_expr) => {
+                return analyzer
+                    .db
+                    .get_reference_index()
+                    .get_local_reference(&analyzer.file_id)
+                    .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+                    == Some(decl_id);
+            }
+            _ => return false,
+        }
+    }
+}
+
 fn add_unresolve_for_assignment(
     analyzer: &mut LuaAnalyzer,
     type_owner: LuaTypeOwner,
@@ -1462,6 +1484,15 @@ fn add_unresolve_for_assignment(
 ) {
     match type_owner {
         LuaTypeOwner::Decl(decl_id) => {
+            // A read out of the decl being assigned (`limit =
+            // limit.maximum`) must not queue a deferred write. The decl
+            // slot is empty until one of the file's deferred writes
+            // resolves, and `bind_type` has no acceptance rule for an empty
+            // slot, so whichever lands first owns the decl's lifetime type.
+            if expr_reads_out_of_decl(analyzer, decl_id, &expr) {
+                return;
+            }
+
             let unresolve_decl = UnResolveDecl {
                 file_id: analyzer.file_id,
                 decl_id,
