@@ -144,6 +144,14 @@ pub fn resolve_as_unknown(
             );
         }
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
+            // Same deferral as the member-type arm above, for the same
+            // reason. A return this round could not infer is usually one
+            // whose own `UnResolveReturn` item is still queued; flooring it
+            // publishes `unknown` as a *resolved* return, which every
+            // caller waiting on this reason then commits as a final fact.
+            if loop_count == 0 {
+                return Some(());
+            }
             let signature = db.get_signature_index_mut().get_mut(signature_id)?;
             if !signature.is_resolve_return() {
                 super::census::record("resolve_as_unknown.floor", "signature_return");
@@ -168,4 +176,41 @@ pub fn resolve_as_unknown(
     }
 
     Some(())
+}
+
+#[cfg(test)]
+mod test {
+    use crate::{
+        DbIndex, FileId, InferFailReason, LuaSignatureId, SignatureReturnStatus,
+        compilation::analyzer::unresolve::check_reason::resolve_as_unknown,
+    };
+
+    /// The signature-return floor may not fire on the first round: the return's
+    /// own deferred item has not had a retry yet, and a floored return is
+    /// published as `InferResolve`, which callers commit as a final type.
+    #[test]
+    fn signature_return_floor_is_deferred_past_the_first_round() {
+        let mut db = DbIndex::new();
+        let signature_id = LuaSignatureId::new(FileId { id: 1 }, 0.into());
+        db.get_signature_index_mut().get_or_create(signature_id);
+        let reason = InferFailReason::UnResolveSignatureReturn(signature_id);
+
+        resolve_as_unknown(&mut db, &reason, 0);
+        assert_eq!(
+            db.get_signature_index()
+                .get(&signature_id)
+                .unwrap()
+                .resolve_return,
+            SignatureReturnStatus::UnResolve
+        );
+
+        resolve_as_unknown(&mut db, &reason, 1);
+        assert_eq!(
+            db.get_signature_index()
+                .get(&signature_id)
+                .unwrap()
+                .resolve_return,
+            SignatureReturnStatus::InferResolve
+        );
+    }
 }
