@@ -2729,6 +2729,48 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_param_name_hint_yields_to_unread_call_site_arg() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@class Vector
+
+            local config = { spots = { } }
+
+            local function place(ent)
+                B = ent
+                for _, v in pairs(ent) do
+                    A = v
+                end
+            end
+
+            place(config.spots)
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let param_type = ws.expr_ty("B");
+        let param = ws.humanize_type(param_type);
+        assert_ne!(
+            param, "Entity",
+            "a name guess must not beat a call site that fills the param with a table"
+        );
+
+        let element_type = ws.expr_ty("A");
+        let element = ws.humanize_type(element_type);
+        assert!(
+            !element.contains("fun("),
+            "pairs over that param must not enumerate the guessed class's members: {element}"
+        );
+    }
+
+    #[test]
     fn test_gmod_func_param_name_hint_infers_function_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();

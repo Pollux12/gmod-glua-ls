@@ -910,6 +910,12 @@ fn infer_param_inner(
     }
 
     if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
+        if let Some(cache) = cache.as_mut()
+            && let Some(arg_type) =
+                infer_unread_local_call_site_args(db, cache, signature_id, param_idx)?
+        {
+            return Ok((arg_type, ParamInferenceSource::Contextual));
+        }
         return Ok((param_hint_type, ParamInferenceSource::NameFallback));
     }
 
@@ -1024,6 +1030,64 @@ fn infer_supported_non_param_call_arg_type(
         }
         _ => None,
     }
+}
+
+/// A parameter name hint is a guess for a parameter nothing else describes. Call
+/// sites can pass argument shapes local param inference does not read (index
+/// expressions, computed calls), and a guess must not outrank one, so read them
+/// here rather than name the parameter from a table it never holds.
+fn infer_unread_local_call_site_args(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    param_idx: usize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let Some(target_decl_id) = db.get_signature_index().local_func_decl_for(&signature_id) else {
+        return Ok(None);
+    };
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&signature_id.get_file_id())
+        .map(|tree| tree.get_red_root())
+    else {
+        return Ok(None);
+    };
+
+    let unread_args =
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
+            .into_iter()
+            .filter_map(|(_, call_expr)| {
+                call_expr
+                    .get_args_list()
+                    .and_then(|args| args.get_args().nth(param_idx))
+            })
+            .filter(|arg| !is_local_call_site_arg_shape_supported(arg));
+
+    let mut inferred_type: Option<LuaType> = None;
+    for arg in unread_args {
+        let arg_type = match infer_expr(db, cache, arg) {
+            Ok(arg_type) => arg_type,
+            Err(reason) if reason.is_need_resolve() => return Err(reason),
+            Err(_) => continue,
+        };
+        // An argument keeps only the first value of a multi-return call.
+        let arg_type = match &arg_type {
+            LuaType::Variadic(multi) => match multi.get_type(0) {
+                Some(first) => first.clone(),
+                None => continue,
+            },
+            _ => arg_type,
+        };
+        if arg_type.is_unknown() || arg_type.is_never() || arg_type.is_any() {
+            continue;
+        }
+        inferred_type = Some(match inferred_type {
+            Some(current) => TypeOps::Union.apply(db, &current, &arg_type),
+            None => arg_type,
+        });
+    }
+
+    Ok(inferred_type)
 }
 
 fn is_local_call_site_arg_shape_supported(arg: &LuaExpr) -> bool {
