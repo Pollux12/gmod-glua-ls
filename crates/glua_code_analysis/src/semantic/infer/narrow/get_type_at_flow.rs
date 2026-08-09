@@ -1813,7 +1813,7 @@ fn get_type_at_assign_stat(
             .map(|tc| tc.as_type().clone());
 
         let guarded_global_type = exprs.get(i).and_then(|expr| {
-            guarded_global_self_assignment_type(db, cache, type_owner.as_ref(), &maybe_ref_id, expr)
+            guarded_self_assignment_type(db, cache, type_owner.as_ref(), &maybe_ref_id, expr)
         });
 
         let expr_type = match guarded_global_type {
@@ -3098,7 +3098,8 @@ fn expr_is_table_constructor(expr: &LuaExpr) -> bool {
     }
 }
 
-fn guarded_global_self_assignment_type(
+/// The narrowed type of a `X = X or {}` bootstrap assignment.
+fn guarded_self_assignment_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     type_owner: Option<&LuaTypeOwner>,
@@ -3109,23 +3110,67 @@ fn guarded_global_self_assignment_type(
         return None;
     }
 
-    let Some(LuaTypeOwner::Decl(decl_id)) = type_owner else {
-        return None;
+    match type_owner? {
+        LuaTypeOwner::Decl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            if !decl.is_global() {
+                return None;
+            }
+
+            let type_cache = db
+                .get_type_index()
+                .get_type_cache(&LuaTypeOwner::Decl(*decl_id))?;
+            if !type_cache.is_infer() || !type_cache.as_type().is_table() {
+                return None;
+            }
+
+            Some(type_cache.as_type().clone())
+        }
+        // The member's own cache holds only this write's table. That table
+        // is the live value only while nothing else replaces it, so when a
+        // sibling assignment sits inside a function — which can run at any
+        // time relative to this read — the aggregate over every writer is
+        // read through the ordinary member resolution instead.
+        type_owner @ LuaTypeOwner::Member(member_id) => {
+            let type_cache = db.get_type_index().get_type_cache(type_owner)?;
+            if !type_cache.is_infer() || !type_cache.as_type().is_table() {
+                return None;
+            }
+            if !has_function_scoped_sibling_assignment(db, *member_id) {
+                return None;
+            }
+
+            get_var_ref_type(db, cache, var_ref_id)
+                .ok()
+                .map(remove_false_or_nil)
+        }
+        _ => None,
+    }
+}
+
+/// True when some other writer of the same owner and key assigns the whole
+/// value from inside a function body, so its write is unordered with respect to
+/// any read outside that body.
+fn has_function_scoped_sibling_assignment(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_current_owner(&member_id) else {
+        return false;
+    };
+    let Some(member) = member_index.get_member(&member_id) else {
+        return false;
     };
 
-    let decl = db.get_decl_index().get_decl(decl_id)?;
-    if !decl.is_global() {
-        return None;
-    }
-
-    let type_cache = db
-        .get_type_index()
-        .get_type_cache(&LuaTypeOwner::Decl(*decl_id))?;
-    if !type_cache.is_infer() || !type_cache.as_type().is_table() {
-        return None;
-    }
-
-    Some(type_cache.as_type().clone())
+    member_index
+        .get_members_for_owner_key(owner, member.get_key())
+        .into_iter()
+        .any(|sibling| {
+            sibling.get_id() != member_id
+                && sibling.get_feature().is_file_define()
+                && sibling.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+                && member_index
+                    .member_function_scope_range(sibling.get_id())
+                    .is_some()
+        })
 }
 
 fn assignment_flow_info_cannot_match(

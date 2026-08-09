@@ -3465,4 +3465,83 @@ marauth.character = marauth.character or {}
             "guarded merge must not widen its table literals, got {cfg_type:?}"
         );
     }
+
+    /// Two files bootstrap the same global and each adds its own field. A read
+    /// in a third file must see both contributions, not whichever bootstrap
+    /// happened to settle first.
+    #[test]
+    fn test_cross_file_guarded_bootstrap_read_sees_every_contribution() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/bootstrap_read/a.lua",
+            "Store = Store or {}\nStore.a = 1\n",
+        );
+        ws.def_file(
+            "lua/bootstrap_read/b.lua",
+            "Store = Store or {}\nStore.b = 2\n",
+        );
+        let consumer = ws.def_file(
+            "lua/bootstrap_read/c.lua",
+            "local a = Store.a\nlocal b = Store.b\n",
+        );
+
+        assert_that!(
+            local_name_type(&mut ws, consumer, "a"),
+            eq(&LuaType::IntegerConst(1))
+        );
+        assert_that!(
+            local_name_type(&mut ws, consumer, "b"),
+            eq(&LuaType::IntegerConst(2))
+        );
+        assert_that!(
+            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::UndefinedField),
+            is_empty(),
+        );
+    }
+
+    /// `X.k = X.k or {}` installs an empty table, but a sibling assignment
+    /// inside a function can replace it at any time. A read outside that
+    /// function must not narrow to the empty bootstrap table.
+    #[test]
+    fn test_guarded_member_bootstrap_read_sees_function_scoped_reassignment() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_fn/a.lua", "holdem = holdem or {}\n");
+        let file_id = ws.def_file(
+            "lua/bootstrap_fn/b.lua",
+            r#"
+holdem.action = holdem.action or {}
+
+net.Receive("holdem.action", function()
+    holdem.action = { action = 1, time = CurTime() }
+end)
+
+hook.Add("Think", "x", function()
+    print(holdem.action.time)
+end)
+"#,
+        );
+
+        assert_that!(
+            file_diagnostic_messages(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            is_empty(),
+        );
+    }
+
+    /// The same bootstrap still narrows normally when every writer is ordered
+    /// with the read: the last top-level assignment wins.
+    #[test]
+    fn test_guarded_member_bootstrap_keeps_top_level_reassignment_narrowing() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_top/a.lua", "holdem = holdem or {}\n");
+        let file_id = ws.def_file(
+            "lua/bootstrap_top/b.lua",
+            "holdem.action = holdem.action or {}\nholdem.action = { time = 1 }\nlocal act = holdem.action\n",
+        );
+
+        let act_type = local_name_type(&mut ws, file_id, "act");
+        assert!(
+            matches!(act_type, LuaType::TableConst(_)),
+            "an ordered reassignment must still narrow to its own table, got {act_type:?}"
+        );
+    }
 }
