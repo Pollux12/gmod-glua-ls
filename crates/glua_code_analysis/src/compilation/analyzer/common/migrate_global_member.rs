@@ -148,6 +148,7 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
         // After the early-out: the guarded repair is part of reconciling a
         // global that still has parked members, not a pass of its own.
         alias_guarded_assignment_members_across_candidates(db, &candidates);
+        rehome_members_onto_their_own_files_table(db, &candidates);
 
         let declaring_files = declaring_files(db, &global_id);
 
@@ -201,6 +202,53 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 }
             }
         }
+    }
+}
+
+/// Moves a member that landed on a *sibling* file's table literal onto the
+/// one its own file declares.
+fn rehome_members_onto_their_own_files_table(
+    db: &mut DbIndex,
+    candidates: &[(crate::FileId, LuaMemberOwner)],
+) {
+    if candidates.len() < 2 {
+        return;
+    }
+
+    let member_index = db.get_member_index();
+    let mut seen = HashSet::new();
+    let moves = candidates
+        .iter()
+        .flat_map(|(_, owner)| member_index.get_member_history(owner))
+        .map(|member| member.get_id())
+        .filter(|member_id| !member_index.has_synthesized_owner(member_id))
+        .filter_map(|member_id| {
+            // "The table its own file declares" only names one table when the
+            // file declares the path once. `bullet = {} … bullet.Src = …`
+            // written twice in one weapon file is two unrelated tables, and
+            // collapsing the second block's fields onto the first erases them.
+            let mut own = candidates
+                .iter()
+                .filter(|(file_id, _)| *file_id == member_id.file_id);
+            let (_, target_owner) = own.next()?;
+            if own.next().is_some() {
+                return None;
+            }
+            let current_owner = member_index.get_member_owner(&member_id)?;
+            (current_owner != target_owner
+                && candidates
+                    .iter()
+                    .any(|(_, candidate)| candidate == current_owner)
+                && seen.insert(member_id))
+            .then(|| (member_id, target_owner.clone()))
+        })
+        .collect::<Vec<_>>();
+
+    for (member_id, target_owner) in moves {
+        restore_non_overwriting_mark(db, member_id);
+        let member_index = db.get_member_index_mut();
+        member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
+        member_index.add_member_to_owner(target_owner, member_id);
     }
 }
 
@@ -720,6 +768,64 @@ mod tests {
                 "both guarded `cityrp.type` writers should be visible through {file_id:?}, got {item:?}"
             );
         }
+    }
+
+    /// A member homed on a *sibling* file's table belongs to the table its own
+    /// file declares. Which one it reached during analysis depends on how much
+    /// of the path had resolved at that moment, so the final index has to decide
+    /// it instead.
+    #[test]
+    fn reconcile_rehomes_a_member_onto_its_own_files_table() {
+        let mut db = DbIndex::new();
+        let own_file = FileId::new(1);
+        let sibling_file = FileId::new(2);
+
+        for file_id in [own_file, sibling_file] {
+            let decl_id = add_global_decl(&mut db, "cityrp", file_id, 0);
+            db.get_decl_index_mut().set_global_initializer_table(
+                decl_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            );
+        }
+
+        let owner_of = |file_id| {
+            LuaMemberOwner::Element(InFiled::new(
+                file_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            ))
+        };
+
+        // `own_file`'s field, placed on `sibling_file`'s literal because that is
+        // what the prefix resolved to when the deferred write was handled.
+        let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 20), own_file);
+        db.get_member_index_mut().add_member(
+            owner_of(sibling_file),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("menu".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        // Reconciliation is driven by the global still having something parked.
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
+            LuaMember::new(
+                LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 30), sibling_file),
+                LuaMemberKey::Name("LoadedOnce".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        reconcile_parked_global_path_members(&mut db);
+
+        assert_eq!(
+            db.get_member_index().get_member_owner(&member_id),
+            Some(&owner_of(own_file)),
+            "a member of a declaring file belongs to that file's own table"
+        );
     }
 
     /// A declaring file whose own table has not resolved keeps its members
