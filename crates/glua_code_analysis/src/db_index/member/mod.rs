@@ -31,6 +31,9 @@ pub struct LuaMemberIndex {
     /// Members whose owner was decided by scripted-class synthesis rather
     /// than by name resolution.
     synthesized_owner_members: HashSet<LuaMemberId>,
+    /// Members `try_resolve_member` had to create itself, from a prefix
+    /// type read mid-fixpoint.
+    deferred_index_expr_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
 }
@@ -71,6 +74,7 @@ impl LuaMemberIndex {
             current_members_by_key: HashMap::new(),
             non_overwriting_assignment_members: HashSet::new(),
             synthesized_owner_members: HashSet::new(),
+            deferred_index_expr_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
             member_function_scope_ranges: HashMap::new(),
         }
@@ -283,6 +287,45 @@ impl LuaMemberIndex {
 
     pub fn has_synthesized_owner(&self, id: &LuaMemberId) -> bool {
         self.synthesized_owner_members.contains(id)
+    }
+
+    /// Records that `id` was created by deferred resolution, so its first home
+    /// was decided from a mid-fixpoint prefix type. See
+    /// [`Self::deferred_index_expr_members`].
+    pub fn mark_deferred_index_expr_member(&mut self, id: LuaMemberId) {
+        self.deferred_index_expr_members.insert(id);
+    }
+
+    pub fn is_deferred_index_expr_member(&self, id: &LuaMemberId) -> bool {
+        self.deferred_index_expr_members.contains(id)
+    }
+
+    /// Removes `id` from `owner` entirely, including the item
+    /// `set_member_owner` leaves behind.
+    pub fn detach_member_from_owner(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        self.remove_member_from_all_owner_key_indexes(owner, id);
+        self.remove_current_owner_member(owner, id);
+
+        let Some(owner_members) = self.owner_members.get_mut(owner) else {
+            return;
+        };
+        let drop_key = match owner_members.get_member_mut(&key) {
+            Some(LuaMemberIndexItem::One(existing)) => *existing == id,
+            Some(LuaMemberIndexItem::Many(ids)) => {
+                ids.retain(|member_id| *member_id != id);
+                ids.is_empty()
+            }
+            None => false,
+        };
+        if drop_key {
+            owner_members.remove_member(&key);
+        }
+        if owner_members.is_empty() {
+            self.owner_members.remove(owner);
+        }
     }
 
     /// Makes `id` *also* reachable through `owner`, without ever displacing
@@ -1082,6 +1125,7 @@ impl LuaIndex for LuaMemberIndex {
                         self.member_current_owner.remove(&member_id);
                         self.non_overwriting_assignment_members.remove(&member_id);
                         self.synthesized_owner_members.remove(&member_id);
+                        self.deferred_index_expr_members.remove(&member_id);
                         self.member_function_scope_ranges.remove(&member_id);
                     }
                     MemberOrOwner::Owner(owner) => {
@@ -1141,6 +1185,7 @@ impl LuaIndex for LuaMemberIndex {
         self.current_members_by_key.clear();
         self.non_overwriting_assignment_members.clear();
         self.synthesized_owner_members.clear();
+        self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
     }

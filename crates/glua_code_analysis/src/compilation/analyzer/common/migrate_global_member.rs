@@ -240,11 +240,25 @@ fn rehome_members_onto_their_own_files_table(
                     .iter()
                     .any(|(_, candidate)| candidate == current_owner)
                 && seen.insert(member_id))
-            .then(|| (member_id, target_owner.clone()))
+            .then(|| (member_id, current_owner.clone(), target_owner.clone()))
         })
         .collect::<Vec<_>>();
 
-    for (member_id, target_owner) in moves {
+    for (member_id, current_owner, target_owner) in moves {
+        // A member deferred resolution created never belonged to the table
+        // it was provisionally placed on, so the move has to take its
+        // enumerability with it: `set_member_owner` rewrites the current
+        // owner but leaves the item, and that leftover is a fact the other
+        // analysis order never produced. Every other member reached its
+        // owner from a settled fact and is reachable through several tables
+        // on purpose — detaching those cost real facts.
+        if db
+            .get_member_index()
+            .is_deferred_index_expr_member(&member_id)
+        {
+            db.get_member_index_mut()
+                .detach_member_from_owner(&current_owner, member_id);
+        }
         restore_non_overwriting_mark(db, member_id);
         let member_index = db.get_member_index_mut();
         member_index.set_member_owner(target_owner.clone(), member_id.file_id, member_id);
@@ -825,6 +839,76 @@ mod tests {
             db.get_member_index().get_member_owner(&member_id),
             Some(&owner_of(own_file)),
             "a member of a declaring file belongs to that file's own table"
+        );
+        assert!(
+            db.get_member_index()
+                .get_members(&owner_of(sibling_file))
+                .is_some_and(|members| members.iter().any(|member| member.get_id() == member_id)),
+            "a member that reached the sibling table from a settled fact stays \
+             enumerable through it"
+        );
+    }
+
+    /// The move has to take enumerability with it when the first placement was
+    /// provisional: leaving the member listed under the sibling table is a fact
+    /// only the analysis order that mis-placed it ever produced.
+    #[test]
+    fn reconcile_detaches_a_deferred_member_from_the_table_it_left() {
+        let mut db = DbIndex::new();
+        let own_file = FileId::new(1);
+        let sibling_file = FileId::new(2);
+
+        for file_id in [own_file, sibling_file] {
+            let decl_id = add_global_decl(&mut db, "cityrp", file_id, 0);
+            db.get_decl_index_mut().set_global_initializer_table(
+                decl_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            );
+        }
+
+        let owner_of = |file_id| {
+            LuaMemberOwner::Element(InFiled::new(
+                file_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            ))
+        };
+
+        let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 20), own_file);
+        db.get_member_index_mut().add_member(
+            owner_of(sibling_file),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("menu".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+        db.get_member_index_mut()
+            .mark_deferred_index_expr_member(member_id);
+
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
+            LuaMember::new(
+                LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 30), sibling_file),
+                LuaMemberKey::Name("LoadedOnce".into()),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        reconcile_parked_global_path_members(&mut db);
+
+        assert_eq!(
+            db.get_member_index().get_member_owner(&member_id),
+            Some(&owner_of(own_file)),
+            "a member of a declaring file belongs to that file's own table"
+        );
+        assert!(
+            db.get_member_index()
+                .get_members(&owner_of(sibling_file))
+                .is_none_or(|members| members.iter().all(|member| member.get_id() != member_id)),
+            "a provisionally placed member is not enumerable through the table \
+             it was moved off"
         );
     }
 

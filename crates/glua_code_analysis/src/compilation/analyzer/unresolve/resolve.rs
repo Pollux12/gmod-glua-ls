@@ -200,6 +200,10 @@ fn create_deferred_index_expr_member(
     let member = LuaMember::new(member_id, member_key, feature, None);
     let member_index = db.get_member_index_mut();
     member_index.add_member(owner, member);
+    // The owner above came from a prefix type read mid-fixpoint, so this
+    // placement is provisional: the post-settle re-home is the authority on
+    // where the member ends up, and it needs to know it may detach this one.
+    member_index.mark_deferred_index_expr_member(member_id);
     // `add_member` records the enclosing function scope for `FileDefine`
     // index-expr members only; for the rest it stores `None`. Same follow-up
     // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
