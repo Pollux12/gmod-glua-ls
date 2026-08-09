@@ -694,17 +694,23 @@ fn sorted_reason_keys(
 
 fn infer_fail_reason_kind_rank(reason: &InferFailReason) -> u8 {
     match reason {
-        InferFailReason::None => 0,
-        InferFailReason::RecursiveInfer => 1,
-        InferFailReason::FieldNotFound => 2,
-        InferFailReason::UnResolveOperatorCall => 3,
-        InferFailReason::UnResolveDeclType(_) => 4,
-        InferFailReason::UnResolveMemberType(_) => 5,
-        InferFailReason::UnResolveExpr(_) => 6,
-        InferFailReason::UnResolveSignatureReturn(_) => 7,
-        InferFailReason::UnResolveTypeDecl(_) => 8,
-        InferFailReason::UnResolveModuleExport(_) => 9,
-        InferFailReason::UnSealedDynamicFields => 10,
+        // Unlike every other reason, this one names the index's build state
+        // rather than another item's fact: it is unreachable until the
+        // seal, and once it is reachable the facts these items produce are
+        // *inputs* to the other groups. Ordering it last let a consumer
+        // resolve against the pre-seal picture and commit a floor, which is
+        // terminal — the item is gone before the fact it needed lands.
+        InferFailReason::UnSealedDynamicFields => 0,
+        InferFailReason::None => 1,
+        InferFailReason::RecursiveInfer => 2,
+        InferFailReason::FieldNotFound => 3,
+        InferFailReason::UnResolveOperatorCall => 4,
+        InferFailReason::UnResolveDeclType(_) => 5,
+        InferFailReason::UnResolveMemberType(_) => 6,
+        InferFailReason::UnResolveExpr(_) => 7,
+        InferFailReason::UnResolveSignatureReturn(_) => 8,
+        InferFailReason::UnResolveTypeDecl(_) => 9,
+        InferFailReason::UnResolveModuleExport(_) => 10,
     }
 }
 
