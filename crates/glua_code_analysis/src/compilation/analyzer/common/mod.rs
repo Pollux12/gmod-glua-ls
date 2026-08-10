@@ -8,6 +8,7 @@ use rowan::TextRange;
 
 use crate::{
     FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
+    compilation::analyzer::lua::iterates_table_member_map,
     db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
 };
 
@@ -31,6 +32,41 @@ pub fn holds_unbound_iter_template(
                 .is_some_and(|cache| cache.as_type().contain_tpl())
         })
     })
+}
+
+/// Whether `expr` is a plain read of a variable of an enclosing `pairs` loop.
+///
+/// Those loops take their variable types from the iterated table's member map,
+/// so [`analyze_for_range_stat`] queues a retry that re-derives them once the
+/// map settles. A fact that copies the variable holds the same pre-settlement
+/// snapshot, but nothing retries it, so committing one here would freeze
+/// whichever members happened to be indexed first. Queue it behind the retry
+/// instead.
+///
+/// Only a direct read qualifies. An expression that merely mentions the variable
+/// — a concatenation, a call argument — has a type its own operator decides, so
+/// deferring it buys nothing and costs a retry.
+///
+/// [`analyze_for_range_stat`]: super::lua::analyze_for_range_stat
+pub fn reads_settling_iter_var(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    let Some(decl) = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, name_expr.get_position()))
+    else {
+        return false;
+    };
+
+    expr.ancestors::<LuaForRangeStat>()
+        .filter(|for_range_stat| iterates_table_member_map(db, file_id, for_range_stat))
+        .flat_map(|for_range_stat| for_range_stat.get_var_name_list())
+        .any(|var_name| LuaDeclId::new(file_id, var_name.get_position()) == decl.get_id())
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

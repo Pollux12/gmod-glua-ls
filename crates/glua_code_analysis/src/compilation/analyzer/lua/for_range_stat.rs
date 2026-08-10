@@ -2,7 +2,7 @@ use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DbIndex, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
+    DbIndex, FileId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
     TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
@@ -25,7 +25,8 @@ pub fn analyze_for_range_stat(
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let iter_var_types = infer_for_range_iter_expr_func(analyzer.db, cache, &iter_exprs);
-    let enumerates_member_map = iterates_table_member_map(analyzer.db, cache, &iter_exprs);
+    let enumerates_member_map =
+        iterates_table_member_map(analyzer.db, analyzer.file_id, &for_range_stat);
 
     match iter_var_types {
         Ok(iter_var_types) => {
@@ -92,15 +93,15 @@ pub fn analyze_for_range_stat(
 /// Whether this loop's variable types come from enumerating a table's
 /// member map, the union [`try_infer_pairs_iter_types_from_table_members`]
 /// builds.
-fn iterates_table_member_map(
+pub fn iterates_table_member_map(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
-    iter_exprs: &[LuaExpr],
+    file_id: FileId,
+    for_range_stat: &LuaForRangeStat,
 ) -> bool {
-    let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first() else {
+    let Some(LuaExpr::CallExpr(call_expr)) = for_range_stat.get_expr_list().next() else {
         return false;
     };
-    is_global_pairs_call(db, cache, call_expr)
+    is_global_pairs_call(db, file_id, &call_expr)
 }
 
 pub fn infer_for_range_iter_expr_func(
@@ -230,7 +231,7 @@ fn try_infer_pairs_iter_types_from_table_members(
     let LuaExpr::CallExpr(call_expr) = iter_expr else {
         return Ok(None);
     };
-    if !is_global_pairs_call(db, cache, call_expr) {
+    if !is_global_pairs_call(db, cache.get_file_id(), call_expr) {
         return Ok(None);
     }
 
@@ -487,7 +488,7 @@ fn member_key_stable_key(key: &LuaMemberKey) -> (u8, String) {
 
 fn is_global_pairs_call(
     db: &DbIndex,
-    cache: &LuaInferCache,
+    file_id: FileId,
     call_expr: &glua_parser::LuaCallExpr,
 ) -> bool {
     let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
@@ -498,7 +499,7 @@ fn is_global_pairs_call(
     }
 
     db.get_reference_index()
-        .get_local_reference(&cache.get_file_id())
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .is_none()
 }

@@ -6,7 +6,7 @@ use crate::{
     compilation::analyzer::{
         common::{
             TypeCacheWriteMode, add_member, bind_type, holds_unbound_iter_template,
-            write_type_cache,
+            reads_settling_iter_var, write_type_cache,
         },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -119,7 +119,9 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         .add_unresolve(unresolve.into(), InferFailReason::FieldNotFound);
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, &expr, &expr_type) {
+                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, &expr, &expr_type)
+                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
+                {
                     let unresolve = UnResolveDecl {
                         file_id: analyzer.file_id,
                         decl_id,
@@ -873,7 +875,9 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     );
                     continue;
                 }
-                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, expr, &expr_type) {
+                if holds_unbound_iter_template(analyzer.db, analyzer.file_id, expr, &expr_type)
+                    || reads_settling_iter_var(analyzer.db, analyzer.file_id, expr)
+                {
                     add_unresolve_for_assignment(
                         analyzer,
                         type_owner,

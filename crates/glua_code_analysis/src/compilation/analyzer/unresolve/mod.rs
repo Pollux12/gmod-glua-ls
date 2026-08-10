@@ -61,14 +61,12 @@ fn partition_pre_dynamic_unresolves(
     let mut deferred = Vec::new();
     let mut ready = Vec::new();
     for (unresolve, reason) in candidates {
-        // An unbound `pairs` generic is missing exactly the keys the dynamic-field
-        // pass synthesizes. Retrying it here reaches a weaker answer, force-writes
-        // it over the template placeholder and retires the item, so the type ends
-        // up a function of whether this pass had run yet. Hold it for the pass
-        // after.
-        if matches!(unresolve, UnResolve::IterDecl(_))
-            && matches!(reason, InferFailReason::UnResolveIterTemplate)
-        {
+        // An unbound `pairs` generic is missing exactly the keys the
+        // dynamic-field pass synthesizes. Retrying it here reaches a weaker
+        // answer, force-writes it over the template placeholder and retires
+        // the item, so the type ends up a function of whether this pass had
+        // run yet.
+        if matches!(reason, InferFailReason::UnResolveIterTemplate) {
             deferred.push((unresolve, reason));
             continue;
         }
@@ -797,8 +795,10 @@ fn infer_fail_reason_stable_cmp(a: &InferFailReason, b: &InferFailReason) -> Ord
 
 fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
     match unresolve {
-        UnResolve::Decl(_) => 0,
-        UnResolve::IterDecl(_) => 1,
+        // Ahead of every consumer: a loop variable is an input to the facts the
+        // body derives from it, and both sit in the same reason group.
+        UnResolve::IterDecl(_) => 0,
+        UnResolve::Decl(_) => 1,
         UnResolve::Member(_) => 2,
         UnResolve::Module(_) => 3,
         UnResolve::Return(_) => 4,

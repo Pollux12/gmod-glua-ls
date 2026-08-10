@@ -13,7 +13,7 @@ use std::sync::Arc;
 use closure::analyze_closure;
 pub use closure::{analyze_return_correlations, analyze_return_point};
 use for_range_stat::analyze_for_range_stat;
-pub use for_range_stat::infer_for_range_iter_expr_func;
+pub use for_range_stat::{infer_for_range_iter_expr_func, iterates_table_member_map};
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
