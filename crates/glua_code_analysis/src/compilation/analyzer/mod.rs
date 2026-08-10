@@ -581,6 +581,24 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             );
             let inferred_type = inferred_fact.typ().clone();
             if type_is_uninformative(&inferred_type) {
+                // When the cache and the settled re-derivation disagree
+                // over *which* bottom an unresolvable initializer has, both
+                // are false certainties — `nil` and `never` are only ever
+                // reached here by giving up, so which one is cached is
+                // decided by arrival order. Canonicalize to `unknown`,
+                // which is the honest answer and is opaque to the checkers,
+                // so it neither silences a real report nor invents one.
+                if is_bottom(&inferred_type)
+                    && current_cache
+                        .as_ref()
+                        .is_some_and(|current| is_bottom(current.as_type()))
+                    && current_cache.as_ref().map(LuaTypeCache::as_type) != Some(&inferred_type)
+                {
+                    result.updates.push(InitializerCacheUpdate::Overwrite {
+                        owner: type_owner,
+                        fact: inferred_fact.with_runtime_type(LuaType::Unknown),
+                    });
+                }
                 continue;
             }
             if current_cache
@@ -912,6 +930,13 @@ fn type_cache_is_uninformative(type_cache: Option<&LuaTypeCache>) -> bool {
         Some(LuaTypeCache::DocType(_)) => false,
         None => true,
     }
+}
+
+/// The two lattice bottoms. Both are reached by giving up on an expression, so
+/// neither carries evidence about the value — unlike `any`/`unknown`, which the
+/// checkers already treat as opaque.
+fn is_bottom(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Nil | LuaType::Never)
 }
 
 fn type_is_uninformative(typ: &LuaType) -> bool {
