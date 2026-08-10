@@ -867,7 +867,7 @@ fn infer_table_dynamic_key_member_type(
 
     let access_key_type = member_key_as_type(key)?;
     let members = db.get_member_index().get_members(owner)?;
-    let mut result_type = LuaType::Unknown;
+    let mut result_type = LuaType::Never;
 
     for member in members {
         let dynamic_key = member.get_key();
@@ -894,7 +894,7 @@ fn infer_table_dynamic_key_member_type(
         }
     }
 
-    (!result_type.is_unknown()).then_some(result_type)
+    (!result_type.is_never()).then_some(result_type)
 }
 
 fn owner_has_precise_dynamic_value(
@@ -1887,7 +1887,7 @@ pub(crate) fn resolve_decl_backed_global_path_member_type(
         }
         None => member_item.visible_member_ids_with_realm(db, caller_file_id),
     };
-    let mut result = LuaType::Unknown;
+    let mut result = LuaType::Never;
 
     for member_id in visible_member_ids {
         let decl_id = crate::LuaDeclId::new(member_id.file_id, member_id.get_position());
@@ -1912,7 +1912,7 @@ pub(crate) fn resolve_decl_backed_global_path_member_type(
         result = TypeOps::Union.apply(db, &result, &decl_type);
     }
 
-    (!result.is_unknown()).then_some(result)
+    (!result.is_never()).then_some(result)
 }
 
 fn get_expr_key_members(
@@ -2044,7 +2044,7 @@ fn infer_tuple_member(
                 };
             }
             LuaType::Integer | LuaType::Number => {
-                let mut result = LuaType::Unknown;
+                let mut result = LuaType::Never;
                 for typ in tuple_type.get_types() {
                     result = TypeOps::Union.apply(db, &result, typ);
                 }
@@ -2649,7 +2649,7 @@ fn infer_member_by_index_table(
             let members = db.get_member_index().get_members(&owner);
             if let Some(mut members) = members {
                 members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
-                let mut result_type = LuaType::Unknown;
+                let mut result_type = LuaType::Never;
                 let mut matched_inferred_index_key = false;
                 // Track matches independently of the union being non-Unknown:
                 // a matched member whose type is (temporarily) Unknown must not
@@ -2760,7 +2760,7 @@ fn resolve_table_const_array_base(
     let Some(members) = db.get_member_index().get_members(owner) else {
         return Ok(None);
     };
-    let mut ty = LuaType::Unknown;
+    let mut ty = LuaType::Never;
     let mut saw_integer_member = false;
     for member in members {
         if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {

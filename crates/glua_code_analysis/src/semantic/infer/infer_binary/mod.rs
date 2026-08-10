@@ -84,7 +84,7 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    let mut result = LuaType::Unknown;
+    let mut result = LuaType::Never;
     let mut any_inferred = false;
     for ty in u.types() {
         // 只在实际调用时才 clone，而不是预先 clone

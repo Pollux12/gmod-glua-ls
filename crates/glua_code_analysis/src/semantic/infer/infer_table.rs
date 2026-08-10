@@ -326,7 +326,7 @@ fn infer_call_arg_should_be(
 
 /// 移除掉一些非`table`类型
 fn union_remove_non_table_type(db: &DbIndex, union: &Arc<LuaUnionType>) -> LuaType {
-    let mut result = LuaType::Unknown;
+    let mut result = LuaType::Never;
     let mut any_kept = false;
     for typ in union.into_set().into_iter() {
         match typ {
@@ -459,7 +459,7 @@ fn infer_table_type_from_local_call_references(
         .ok_or(InferFailReason::None)?
         .get_chunk_node();
 
-    let mut typ = LuaType::Unknown;
+    let mut typ = LuaType::Never;
     for cell in &references.cells {
         if cell.is_write {
             continue;
@@ -492,7 +492,7 @@ fn infer_table_type_from_local_call_references(
         typ = TypeOps::Union.apply(db, &typ, &call_arg_type);
     }
 
-    if typ.is_unknown() {
+    if typ.is_never() {
         Err(InferFailReason::None)
     } else {
         Ok(typ)
