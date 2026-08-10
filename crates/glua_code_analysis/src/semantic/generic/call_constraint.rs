@@ -351,7 +351,7 @@ fn rebuild_constraint_union(
     if constraint_types.is_empty() {
         return Some(LuaType::Unknown);
     }
-    let mut result = LuaType::Unknown;
+    let mut result = LuaType::Never;
     for constraint_type in constraint_types {
         result = TypeOps::Union.apply(semantic_model.get_db(), &result, &constraint_type);
     }

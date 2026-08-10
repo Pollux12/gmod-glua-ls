@@ -107,7 +107,7 @@ pub fn get_tpl_ref_extend_type(
             if union_type.types().next().is_none() {
                 return Some(LuaType::Unknown);
             }
-            let mut result = LuaType::Unknown;
+            let mut result = LuaType::Never;
             for union_member_type in union_type.types() {
                 let extend_type = get_tpl_ref_extend_type(
                     db,

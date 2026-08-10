@@ -171,7 +171,7 @@ fn infer_owner_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    let mut result_type = LuaType::Unknown;
+    let mut result_type = LuaType::Never;
     for member in owner_members {
         if !member_key_matches_type(db, &access_key_type, member.get_key()) {
             continue;
@@ -185,7 +185,7 @@ fn infer_owner_raw_member_type(
         result_type = TypeOps::Union.apply(db, &result_type, &member_type);
     }
 
-    if result_type.is_unknown() {
+    if result_type.is_never() {
         return Err(InferFailReason::FieldNotFound);
     }
 

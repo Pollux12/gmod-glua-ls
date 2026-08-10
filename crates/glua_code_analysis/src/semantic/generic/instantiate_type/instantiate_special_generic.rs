@@ -286,7 +286,7 @@ fn instantiate_unpack_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
                         multi_types.push(LuaType::Unknown);
                         continue;
                     }
-                    let mut member_type = LuaType::Unknown;
+                    let mut member_type = LuaType::Never;
                     for sub_member_info in member_info {
                         member_type = TypeOps::Union.apply(db, &member_type, &sub_member_info.typ);
                     }
