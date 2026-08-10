@@ -180,6 +180,19 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 };
 
                 let (owner, global_id) = find_index_owner(analyzer, index_expr.clone());
+                // The `{}` this nested global path is written with, recorded for
+                // the same reason the `NameExpr` branch above records a root
+                // global's: the election that ranks a path's declarations must
+                // see all of them from decl analysis onward, not only the ones
+                // inference has already reached.
+                if global_id.is_some()
+                    && let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr)
+                {
+                    analyzer
+                        .db
+                        .get_decl_index_mut()
+                        .set_global_member_initializer_table(member_id, table_expr.get_range());
+                }
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
 
                 analyzer.add_member(owner, member);

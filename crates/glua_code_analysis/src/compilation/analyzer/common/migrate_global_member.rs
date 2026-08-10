@@ -29,6 +29,22 @@ fn declaration_owner(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaMemberOwner>
     resolved
 }
 
+/// The nested-path counterpart of [`declaration_owner`].
+fn member_declaration_owner(db: &DbIndex, member_id: LuaMemberId) -> Option<LuaMemberOwner> {
+    let resolved = get_owner_id(db, &member_id.into());
+    if matches!(resolved, None | Some(LuaMemberOwner::Element(_)))
+        && let Some(range) = db
+            .get_decl_index()
+            .get_global_member_initializer_table(&member_id)
+    {
+        return Some(LuaMemberOwner::Element(InFiled::new(
+            member_id.file_id,
+            range,
+        )));
+    }
+    resolved
+}
+
 pub fn migrate_global_members_when_type_resolve(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
@@ -309,7 +325,7 @@ fn elected_global_owners(
             let declaring_member_ids = declaring_member_ids(db, global_id, parent_id);
 
             elect_owners(declaring_member_ids.into_iter().filter_map(|member_id| {
-                let owner = get_owner_id(db, &member_id.into())?;
+                let owner = member_declaration_owner(db, member_id)?;
                 Some((
                     global_member_sort_key(db, member_id),
                     member_id.file_id,
@@ -535,7 +551,7 @@ fn resolved_global_member_owners(
     ranked.dedup_by(|(_, left), (_, right)| left == right);
 
     elect_owners(ranked.into_iter().filter_map(|(sort_key, declaring_id)| {
-        let owner = get_owner_id(db, &declaring_id.into())?;
+        let owner = member_declaration_owner(db, declaring_id)?;
         Some((sort_key, declaring_id.file_id, owner))
     }))
 }
@@ -840,6 +856,61 @@ mod tests {
                 "both guarded `cityrp.type` writers should be visible through {file_id:?}, got {item:?}"
             );
         }
+    }
+
+    /// Three files bootstrap `cityrp.configuration = cityrp.configuration or {}`.
+    /// A nested path elects from its declaring *members*, and only one of them
+    /// has resolved a type here — the state a partial re-index leaves behind.
+    /// The other two must still stand for the tables they syntactically write,
+    /// or the election answers differently than it does on a cold build.
+    #[test]
+    fn nested_path_election_sees_declarations_that_have_not_resolved() {
+        let mut db = DbIndex::new();
+        let files = [FileId::new(1), FileId::new(2), FileId::new(3)];
+        let parent_owner = LuaMemberOwner::GlobalPath(GlobalId::new("cityrp"));
+        let nested_id = GlobalId::new("cityrp.configuration");
+
+        let literal = |file_id| {
+            InFiled::new(
+                file_id,
+                TextRange::new(TextSize::new(40), TextSize::new(42)),
+            )
+        };
+
+        let mut declaring = Vec::new();
+        for file_id in files {
+            let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 10), file_id);
+            db.get_member_index_mut().add_member(
+                parent_owner.clone(),
+                LuaMember::new(
+                    member_id,
+                    LuaMemberKey::Name("configuration".into()),
+                    LuaMemberFeature::FileDefine,
+                    Some(nested_id.clone()),
+                ),
+            );
+            db.get_decl_index_mut()
+                .set_global_member_initializer_table(member_id, literal(file_id).value);
+            declaring.push(member_id);
+        }
+
+        // Only the middle file's declaration has been inferred, and — as the
+        // `or` chain does in practice — it names the *first* file's literal.
+        db.get_type_index_mut().bind_type(
+            LuaTypeOwner::Member(declaring[1]),
+            LuaTypeCache::InferType(LuaType::TableConst(literal(files[0]))),
+        );
+
+        let elected = elected_global_owners(&db, &nested_id).expect("expected an election");
+
+        assert_eq!(
+            elected,
+            files
+                .iter()
+                .map(|file_id| (*file_id, LuaMemberOwner::Element(literal(*file_id))))
+                .collect::<Vec<_>>(),
+            "every declaring file must stand for the table it writes, resolved or not"
+        );
     }
 
     /// A member homed on a *sibling* file's table belongs to the table its own
