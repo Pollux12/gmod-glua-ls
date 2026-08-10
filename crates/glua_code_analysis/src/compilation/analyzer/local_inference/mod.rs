@@ -234,10 +234,16 @@ fn compare_unguarded_child_candidates(
         .then_with(|| left.stable_cmp(right))
 }
 
+/// The evidence sites of one declaration, with whether each sits inside a
+/// `return`.
+pub(super) type UnguardedChildSiteCache =
+    HashMap<(crate::FileId, crate::LuaDeclId), Vec<(LuaNameExpr, LuaIndexExpr, bool)>>;
+
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
     only_return_evidence: bool,
+    site_cache: &mut UnguardedChildSiteCache,
 ) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
@@ -293,35 +299,38 @@ pub(super) fn stabilize_unguarded_children(
             // that is the prefix of an index expression — are pure tree
             // lookups, while `declaration_base_type` infers a parameter's
             // type.
-            let sites = references
-                .cells
-                .iter()
-                .filter(|cell| !cell.is_write)
-                .filter_map(|cell| {
-                    let name_expr = root
-                        .covering_element(cell.range)
-                        .ancestors()
-                        .find_map(LuaNameExpr::cast)
-                        .filter(|name| name.get_range() == cell.range)?;
-                    let index_expr = name_expr
-                        .syntax()
-                        .ancestors()
-                        .find_map(LuaIndexExpr::cast)
-                        .filter(|index| {
-                            index
-                                .get_prefix_expr()
-                                .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                        })?;
-                    if only_return_evidence
-                        && !index_expr
+            let all_sites = site_cache.entry((file_id, decl_id)).or_insert_with(|| {
+                references
+                    .cells
+                    .iter()
+                    .filter(|cell| !cell.is_write)
+                    .filter_map(|cell| {
+                        let name_expr = root
+                            .covering_element(cell.range)
+                            .ancestors()
+                            .find_map(LuaNameExpr::cast)
+                            .filter(|name| name.get_range() == cell.range)?;
+                        let index_expr = name_expr
                             .syntax()
                             .ancestors()
-                            .any(|node| LuaReturnStat::cast(node).is_some())
-                    {
-                        return None;
-                    }
-                    Some((name_expr, index_expr))
-                })
+                            .find_map(LuaIndexExpr::cast)
+                            .filter(|index| {
+                                index
+                                    .get_prefix_expr()
+                                    .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+                            })?;
+                        let in_return = index_expr
+                            .syntax()
+                            .ancestors()
+                            .any(|node| LuaReturnStat::cast(node).is_some());
+                        Some((name_expr, index_expr, in_return))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let sites = all_sites
+                .iter()
+                .filter(|(_, _, in_return)| !only_return_evidence || *in_return)
+                .map(|(name_expr, index_expr, _)| (name_expr.clone(), index_expr.clone()))
                 .collect::<Vec<_>>();
             if sites.is_empty() {
                 continue;

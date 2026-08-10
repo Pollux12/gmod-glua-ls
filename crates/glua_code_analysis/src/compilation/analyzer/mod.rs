@@ -161,8 +161,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         // Seed direct parent-to-child evidence before function returns are
         // resolved. The later pass still captures evidence unlocked by unresolve.
-        let early_child_sources =
-            local_inference::stabilize_unguarded_children(db, &mut context, true);
+        // Both passes read the same declaration references and syntax trees, so
+        // the first one's site walk is shared with the second.
+        let mut unguarded_child_sites = local_inference::UnguardedChildSiteCache::new();
+        let early_child_sources = local_inference::stabilize_unguarded_children(
+            db,
+            &mut context,
+            true,
+            &mut unguarded_child_sites,
+        );
         context.invalidate_inferred_returns_for_sources(db, &early_child_sources);
 
         if infer_dynamic_fields {
@@ -204,8 +211,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         // Unguarded-child inference is a fallback. Run it only after dynamic
         // fields and retained unresolves have stabilized declaration types.
-        let late_child_sources =
-            local_inference::stabilize_unguarded_children(db, &mut context, false);
+        let late_child_sources = local_inference::stabilize_unguarded_children(
+            db,
+            &mut context,
+            false,
+            &mut unguarded_child_sites,
+        );
         let late_child_local_changed = if late_child_sources.is_empty() {
             false
         } else {
