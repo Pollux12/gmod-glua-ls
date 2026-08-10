@@ -1662,6 +1662,19 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
+    // A self-referential guarded bootstrap (`x.y = x.y or {}`) assigns its
+    // own `{}` whatever the self-read resolves to, which is what
+    // `special_or_rule` folds it to. The inferred expression type can still
+    // carry that self-read when it was memoised before the fold ran, and
+    // what the read resolved to is whichever sibling file the batch
+    // analysed first.
+    if let LuaTypeOwner::Member(member_id) = &type_owner
+        && let Some(bootstrap_type) =
+            guarded_table_bootstrap_member_type(analyzer.db, *member_id, true)
+    {
+        expr_type = bootstrap_type;
+    }
+
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     if !dynamic_expr_key_member {
         if let Some(widened_type) =
@@ -2099,7 +2112,7 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
             .cloned()
         {
             Some(existing_cache) => MemberAssignmentWideningState::from_type_cache(&existing_cache),
-            None => match guarded_table_bootstrap_member_type(db, related_member_id) {
+            None => match guarded_table_bootstrap_member_type(db, related_member_id, false) {
                 Some(bootstrap_type) => {
                     MemberAssignmentWideningState::from_assigned_type(&bootstrap_type, None)
                 }
@@ -2197,13 +2210,16 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
     index_expr: &LuaIndexExpr,
 ) -> bool {
-    guarded_table_assignment_bootstrap_range(index_expr).is_some()
+    guarded_table_assignment_bootstrap_range(index_expr, false).is_some()
 }
 
-/// Range of the `{}` arm of a self-referential guarded bootstrap
-/// (`x.y = x.y or {}`), which is what the assignment's type is when the guard
-/// falls through.
-fn guarded_table_assignment_bootstrap_range(index_expr: &LuaIndexExpr) -> Option<rowan::TextRange> {
+/// Range of the table arm of a self-referential guarded bootstrap (`x.y =
+/// x.y or {}`), which is what the assignment's type is when the guard falls
+/// through.
+fn guarded_table_assignment_bootstrap_range(
+    index_expr: &LuaIndexExpr,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
     let var = LuaVarExpr::cast(index_expr.syntax().clone())?;
     let access_path = var.get_access_path()?;
     let assign_stat = index_expr.get_parent::<LuaAssignStat>()?;
@@ -2214,12 +2230,13 @@ fn guarded_table_assignment_bootstrap_range(index_expr: &LuaIndexExpr) -> Option
         .iter()
         .zip(expr_list.iter())
         .find(|(candidate_var, _)| candidate_var.get_syntax_id() == syntax_id)
-        .and_then(|(_, expr)| guarded_assignment_table_arm_range(expr, &access_path))
+        .and_then(|(_, expr)| guarded_assignment_table_arm_range(expr, &access_path, empty_only))
 }
 
 fn guarded_assignment_table_arm_range(
     expr: &LuaExpr,
     access_path: &str,
+    empty_only: bool,
 ) -> Option<rowan::TextRange> {
     let LuaExpr::BinaryExpr(binary_expr) = expr else {
         return None;
@@ -2232,6 +2249,9 @@ fn guarded_assignment_table_arm_range(
     let LuaExpr::TableExpr(table_expr) = &right else {
         return None;
     };
+    if empty_only && !table_expr.is_empty() {
+        return None;
+    }
 
     let left_path = LuaVarExpr::cast(left.syntax().clone())?.get_access_path()?;
     (left_path == access_path).then(|| table_expr.get_range())
@@ -2242,11 +2262,12 @@ fn guarded_assignment_table_arm_range(
 fn guarded_table_bootstrap_member_type(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
+    empty_only: bool,
 ) -> Option<LuaType> {
     let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
     let root = tree.get_red_root();
     let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
-    let range = guarded_table_assignment_bootstrap_range(&index_expr)?;
+    let range = guarded_table_assignment_bootstrap_range(&index_expr, empty_only)?;
 
     Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
 }
@@ -2752,7 +2773,7 @@ mod tests {
         let ranges = tree
             .get_chunk_node()
             .descendants::<LuaIndexExpr>()
-            .filter_map(|index_expr| guarded_table_assignment_bootstrap_range(&index_expr))
+            .filter_map(|index_expr| guarded_table_assignment_bootstrap_range(&index_expr, false))
             .collect::<Vec<_>>();
 
         assert_eq!(ranges.len(), 1, "only the bootstrap assignment qualifies");
