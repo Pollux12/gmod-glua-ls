@@ -658,21 +658,21 @@ impl LuaMemberIndex {
         }
     }
 
-    fn remove_file_members_from_owner_key_indexes(&mut self, file_id: FileId) {
-        Self::remove_file_members_from_owner_key_map(&mut self.member_owner_key_index, file_id);
-        Self::remove_file_members_from_owner_key_map(
+    fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
+        Self::remove_files_members_from_owner_key_map(&mut self.member_owner_key_index, removed);
+        Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_history_index,
-            file_id,
+            removed,
         );
     }
 
-    fn remove_file_members_from_owner_key_map(
+    fn remove_files_members_from_owner_key_map(
         owner_key_index: &mut HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
-        file_id: FileId,
+        removed: &HashSet<FileId>,
     ) {
         owner_key_index.retain(|_, key_members| {
             key_members.retain(|_, member_ids| {
-                member_ids.retain(|member_id| member_id.file_id != file_id);
+                member_ids.retain(|member_id| !removed.contains(&member_id.file_id));
                 !member_ids.is_empty()
             });
             !key_members.is_empty()
@@ -1216,8 +1216,12 @@ fn sorted_member_pair(first: LuaMemberId, second: LuaMemberId) -> Vec<LuaMemberI
     }
 }
 
-impl LuaIndex for LuaMemberIndex {
-    fn remove(&mut self, file_id: FileId) {
+impl LuaMemberIndex {
+    /// The per-file half of removal: erase every entry keyed or owned by
+    /// `file_id`. The whole-index owner-key sweeps are done once per batch in
+    /// `remove_files`, not here — running them per file made removal cost
+    /// O(files × index) and dominated incremental edits of high fan-in files.
+    fn remove_file_owned_entries(&mut self, file_id: FileId) {
         if let Some(member_ids) = self.in_filed.remove(&file_id) {
             let mut owners = HashSet::new();
             for member_id_or_owner in member_ids {
@@ -1276,10 +1280,23 @@ impl LuaIndex for LuaMemberIndex {
                 self.owner_members.remove(&owner);
             }
         }
-        self.remove_file_members_from_owner_key_indexes(file_id);
         self.function_scope_ranges.remove(&file_id);
+    }
+}
+
+impl LuaIndex for LuaMemberIndex {
+    fn remove(&mut self, file_id: FileId) {
+        self.remove_files(&[file_id]);
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
+            self.remove_file_owned_entries(file_id);
+        }
+        let removed: HashSet<FileId> = file_ids.iter().copied().collect();
+        self.remove_files_members_from_owner_key_indexes(&removed);
         self.member_function_scope_ranges
-            .retain(|member_id, _| member_id.file_id != file_id);
+            .retain(|member_id, _| !removed.contains(&member_id.file_id));
     }
 
     fn clear(&mut self) {
@@ -1412,6 +1429,61 @@ mod tests {
         expected_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
 
         assert_eq!(owner_member_ids(&index, &owner), expected_ids);
+    }
+
+    #[test]
+    fn batch_removal_matches_sequential_removal_for_surviving_members() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("BatchRemoveType"));
+        let first = FileId::new(1);
+        let second = FileId::new(2);
+        let survivor = FileId::new(3);
+
+        let populate = || {
+            let mut index = LuaMemberIndex::new();
+            index.add_member(owner.clone(), make_member(make_member_id(first, 10), "alpha"));
+            index.add_member(owner.clone(), make_member(make_member_id(second, 20), "alpha"));
+            index.add_member(owner.clone(), make_member(make_member_id(second, 30), "beta"));
+            index.add_member(
+                owner.clone(),
+                make_member(make_member_id(survivor, 40), "alpha"),
+            );
+            index.add_member(
+                owner.clone(),
+                make_member(make_member_id(survivor, 50), "gamma"),
+            );
+            index
+        };
+
+        let mut sequential = populate();
+        sequential.remove(first);
+        sequential.remove(second);
+
+        let mut batched = populate();
+        batched.remove_files(&[second, first, second]);
+
+        assert_eq!(
+            owner_member_ids(&sequential, &owner),
+            owner_member_ids(&batched, &owner)
+        );
+        assert_eq!(
+            owner_member_ids(&batched, &owner),
+            vec![make_member_id(survivor, 40), make_member_id(survivor, 50)]
+        );
+        for index in [&sequential, &batched] {
+            assert!(index.get_file_members(first).is_empty());
+            assert!(index.get_file_members(second).is_empty());
+            assert!(index.get_member(&make_member_id(first, 10)).is_none());
+            assert!(index.get_member(&make_member_id(second, 20)).is_none());
+            assert!(index.get_member(&make_member_id(survivor, 40)).is_some());
+        }
+        assert_eq!(
+            sequential.member_owner_key_index,
+            batched.member_owner_key_index
+        );
+        assert_eq!(
+            sequential.member_owner_key_history_index,
+            batched.member_owner_key_history_index
+        );
     }
 
     #[test]

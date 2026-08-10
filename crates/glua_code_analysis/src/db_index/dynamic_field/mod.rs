@@ -460,56 +460,81 @@ fn normalize_field_definitions(
 
 impl LuaIndex for DynamicFieldIndex {
     fn remove(&mut self, file_id: FileId) {
-        let mut removed_field_definitions = false;
+        self.remove_files(&[file_id]);
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed: HashSet<FileId> = file_ids.iter().copied().collect();
+        // The definition maps are swept once for the whole batch: retaining
+        // per file made removal cost O(files × index) on high fan-in edits.
+        let mut files_with_removed_fields: HashSet<FileId> = HashSet::new();
         self.field_definitions.retain(|_, fields| {
             fields.retain(|_, definitions| {
-                let definition_count_before = definitions.len();
-                definitions.retain(|definition| definition.file_id != file_id);
-                removed_field_definitions |= definitions.len() != definition_count_before;
+                definitions.retain(|definition| {
+                    if removed.contains(&definition.file_id) {
+                        files_with_removed_fields.insert(definition.file_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 !definitions.is_empty()
             });
             !fields.is_empty()
         });
         self.direct_field_definitions.retain(|_, fields| {
             fields.retain(|_, definitions| {
-                definitions.retain(|definition| definition.file_id != file_id);
+                definitions.retain(|definition| !removed.contains(&definition.file_id));
                 !definitions.is_empty()
             });
             !fields.is_empty()
         });
         self.finite_named_members.retain(|_, members| {
-            members.retain(|member_id| member_id.file_id != file_id);
+            members.retain(|member_id| !removed.contains(&member_id.file_id));
             !members.is_empty()
         });
 
-        let mut removed_wildcard_definitions = false;
+        let mut files_with_removed_wildcards: HashSet<FileId> = HashSet::new();
         self.wildcard_definitions.retain(|_, definitions| {
-            let definition_count_before = definitions.len();
-            definitions.retain(|definition| definition.file_id != file_id);
-            removed_wildcard_definitions |= definitions.len() != definition_count_before;
+            definitions.retain(|definition| {
+                if removed.contains(&definition.file_id) {
+                    files_with_removed_wildcards.insert(definition.file_id);
+                    false
+                } else {
+                    true
+                }
+            });
             !definitions.is_empty()
         });
 
         // `file_contributions` is an internal removal index only; no downstream consumer
         // observes its Vec order, and `rebuild_derived_state` may repopulate it through
         // HashMap iteration.
-        if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
-            for field_name in field_names {
-                if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
-                    files.remove(&file_id);
-                    if files.is_empty() {
-                        self.unattributed_fields.remove(&field_name);
+        for &file_id in file_ids {
+            if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
+                for field_name in field_names {
+                    if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
+                        files.remove(&file_id);
+                        if files.is_empty() {
+                            self.unattributed_fields.remove(&field_name);
+                        }
                     }
                 }
             }
         }
 
-        let (had_field_contributions, had_wildcard_contributions) =
-            self.erase_file_from_derived(file_id);
-
-        if (removed_field_definitions && !had_field_contributions)
-            || (removed_wildcard_definitions && !had_wildcard_contributions)
-        {
+        let mut need_rebuild = false;
+        for &file_id in file_ids {
+            let (had_field_contributions, had_wildcard_contributions) =
+                self.erase_file_from_derived(file_id);
+            need_rebuild |= (files_with_removed_fields.contains(&file_id)
+                && !had_field_contributions)
+                || (files_with_removed_wildcards.contains(&file_id)
+                    && !had_wildcard_contributions);
+        }
+        // Rebuilding is a pure function of the primary maps, so one rebuild at
+        // batch end is equivalent to the per-file rebuilds it replaces.
+        if need_rebuild {
             self.rebuild_derived_state();
         }
     }
