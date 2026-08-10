@@ -17,13 +17,16 @@ fn restore_non_overwriting_mark(db: &mut DbIndex, member_id: LuaMemberId) {
 /// The owner a global declaration resolves to, falling back to the table
 /// literal it is written with when inference has not reached it yet.
 fn declaration_owner(db: &DbIndex, decl_id: LuaDeclId) -> Option<LuaMemberOwner> {
-    get_owner_id(db, &decl_id.into()).or_else(|| {
-        let range = db.get_decl_index().get_global_initializer_table(&decl_id)?;
-        Some(LuaMemberOwner::Element(InFiled::new(
+    let resolved = get_owner_id(db, &decl_id.into());
+    if matches!(resolved, None | Some(LuaMemberOwner::Element(_)))
+        && let Some(range) = db.get_decl_index().get_global_initializer_table(&decl_id)
+    {
+        return Some(LuaMemberOwner::Element(InFiled::new(
             decl_id.file_id,
             range,
-        )))
-    })
+        )));
+    }
+    resolved
 }
 
 pub fn migrate_global_members_when_type_resolve(
@@ -708,6 +711,61 @@ mod tests {
         db.get_decl_index_mut().add_decl_tree(decl_tree);
         db.get_global_index_mut().add_global_decl(name, decl_id);
         decl_id
+    }
+
+    /// Two files bootstrap `cityrp = cityrp or {}`. The `or` reads the global,
+    /// so each declaration's *resolved* type is a union over both literals and
+    /// names whichever arm arrived first — modelled here by both resolving to
+    /// `first_file`'s. The election must still hand each declaring file the
+    /// table it actually writes, and keep every member reachable through both.
+    #[test]
+    fn election_gives_each_bootstrap_file_its_own_table() {
+        let mut db = DbIndex::new();
+        let first_file = FileId::new(1);
+        let second_file = FileId::new(2);
+
+        let literal = |file_id| {
+            InFiled::new(
+                file_id,
+                TextRange::new(TextSize::new(10), TextSize::new(12)),
+            )
+        };
+
+        for file_id in [first_file, second_file] {
+            let decl_id = add_global_decl(&mut db, "cityrp", file_id, 0);
+            db.get_decl_index_mut()
+                .set_global_initializer_table(decl_id, literal(file_id).value);
+            db.get_type_index_mut().bind_type(
+                LuaTypeOwner::Decl(decl_id),
+                LuaTypeCache::InferType(LuaType::TableConst(literal(first_file))),
+            );
+        }
+
+        let key = LuaMemberKey::Name("progresshud".into());
+        let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 20), second_file);
+        db.get_member_index_mut().add_member(
+            LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
+            LuaMember::new(
+                member_id,
+                key.clone(),
+                LuaMemberFeature::FileDefine,
+                None,
+            ),
+        );
+
+        reconcile_parked_global_path_members(&mut db);
+
+        assert_eq!(
+            db.get_member_index().get_member_owner(&member_id),
+            Some(&LuaMemberOwner::Element(literal(second_file))),
+            "a bootstrap file's member belongs to the table that file writes"
+        );
+        assert!(
+            db.get_member_index()
+                .get_member_item(&LuaMemberOwner::Element(literal(first_file)), &key)
+                .is_some(),
+            "and stays reachable through the sibling bootstrap table"
+        );
     }
 
     /// Two files write `cityrp.type = cityrp.type or …` and each landed on a
