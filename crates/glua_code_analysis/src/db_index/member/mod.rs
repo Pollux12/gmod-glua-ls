@@ -291,30 +291,63 @@ impl LuaMemberIndex {
         if !candidates.contains(&id) {
             candidates.push(id);
         }
-        if !candidates
-            .iter()
-            .any(|candidate| self.conditional_branch_assignment_members.contains(candidate))
-        {
-            return None;
-        }
-
-        let (mut kept, plain): (Vec<_>, Vec<_>) = candidates
-            .into_iter()
-            .partition(|candidate| self.conditional_branch_assignment_members.contains(candidate));
-        if let Some(latest_plain) = plain.into_iter().max_by_key(|id| member_id_sort_key(*id)) {
-            kept.push(latest_plain);
-        }
-        kept.sort_by_key(|id| member_id_sort_key(*id));
-
-        let new_item = match kept.as_slice() {
-            [only] => LuaMemberIndexItem::One(*only),
-            _ => LuaMemberIndexItem::Many(kept),
-        };
+        let new_item = self.conditional_branch_item(&candidates)?;
         Some(if &new_item == item {
             MemberInsertAction::Noop
         } else {
             MemberInsertAction::Store(new_item)
         })
+    }
+
+    /// The visible item for a slot that `candidates` write to, when at least one
+    /// of them is a conditional-branch write: every conditional writer, plus the
+    /// latest plain one because plain writers do dominate each other. Ordered by
+    /// [`member_id_sort_key`], so it is a pure function of the candidate set.
+    fn conditional_branch_item(&self, candidates: &[LuaMemberId]) -> Option<LuaMemberIndexItem> {
+        let (mut kept, plain): (Vec<_>, Vec<_>) = candidates
+            .iter()
+            .copied()
+            .partition(|candidate| self.conditional_branch_assignment_members.contains(candidate));
+        if kept.is_empty() {
+            return None;
+        }
+        if let Some(latest_plain) = plain.into_iter().max_by_key(|id| member_id_sort_key(*id)) {
+            kept.push(latest_plain);
+        }
+        kept.sort_by_key(|id| member_id_sort_key(*id));
+
+        Some(match kept.as_slice() {
+            [only] => LuaMemberIndexItem::One(*only),
+            _ => LuaMemberIndexItem::Many(kept),
+        })
+    }
+
+    /// Re-resolves the slot `member_id` writes to, now that it is known to
+    /// be a conditional-branch write.
+    fn resolve_conditional_branch_owner_key_item(&mut self, member_id: LuaMemberId) -> Option<()> {
+        let owner = self.member_current_owner.get(&member_id)?.clone();
+        if matches!(owner, LuaMemberOwner::GlobalPath(_)) {
+            return None;
+        }
+        let key = self.get_member(&member_id)?.get_key().clone();
+        let candidates = self
+            .get_current_owner_members_for_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        if !candidates
+            .iter()
+            .all(|candidate| self.is_assignment_file_define_member(*candidate))
+        {
+            return None;
+        }
+
+        let item = self.conditional_branch_item(&candidates)?;
+        let owner_members = self.owner_members.get_mut(&owner)?;
+        if owner_members.get_member(&key) != Some(&item) {
+            owner_members.add_member(key, item);
+        }
+        Some(())
     }
 
     fn apply_member_insert_action(
@@ -988,6 +1021,7 @@ impl LuaMemberIndex {
     pub fn mark_conditional_branch_assignment_member(&mut self, member_id: LuaMemberId) {
         self.non_overwriting_assignment_members.insert(member_id);
         self.conditional_branch_assignment_members.insert(member_id);
+        self.resolve_conditional_branch_owner_key_item(member_id);
     }
 
     pub fn get_current_owner_members_for_key(
