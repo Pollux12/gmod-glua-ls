@@ -230,6 +230,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             attach_settled_index_expr_members(db, &mut context);
         }
 
+        {
+            let _p = Profile::new("rederive_settled_inferred_returns");
+            rederive_settled_inferred_returns(db, &mut context);
+        }
+
         // Members that landed on a global path before the global's owner was
         // known are attached now that it is. See
         // `reconcile_parked_global_path_members`.
@@ -325,6 +330,47 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
         };
         let cache = context.infer_manager.get_infer_cache(file_id);
         let _ = unresolve::try_resolve_member(db, cache, &mut unresolve_member);
+    }
+}
+
+/// Cap on how many uninformative inferred returns one batch re-derives, for the
+/// same reason [`SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT`] exists: the pass is a
+/// best-effort retry, so a pathological workspace bounds its cost.
+const SETTLED_INFERRED_RETURN_CANDIDATE_LIMIT: usize = 8192;
+
+/// Re-resolves inferred returns that settled on `any`/`unknown`.
+fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = context
+        .inferred_return_candidates
+        .iter()
+        .filter(|return_| {
+            db.get_signature_index()
+                .get(&return_.signature_id)
+                .is_some_and(|signature| {
+                    signature.resolve_return == crate::SignatureReturnStatus::InferResolve && {
+                        let current = signature.get_return_type();
+                        current.is_any() || current.is_unknown()
+                    }
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
+    candidates.truncate(SETTLED_INFERRED_RETURN_CANDIDATE_LIMIT);
+
+    // Only the candidate files are re-inferred, so only their caches are stale.
+    let candidate_files = candidates
+        .iter()
+        .map(|return_| return_.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&candidate_files);
+
+    for mut return_ in candidates {
+        let cache = context.infer_manager.get_infer_cache(return_.file_id);
+        let _ = unresolve::try_resolve_return_point(db, cache, &mut return_);
     }
 }
 

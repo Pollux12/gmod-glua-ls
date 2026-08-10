@@ -24,14 +24,14 @@ use glua_parser::{
 };
 use resolve::{
     try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_module,
-    try_resolve_module_ref, try_resolve_return_point, try_resolve_table_field,
+    try_resolve_module_ref, try_resolve_table_field,
 };
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
 };
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
-pub(crate) use resolve::try_resolve_member;
+pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
 pub use resolve_closure::extract_hook_name;
 pub use resolve_closure::{
     resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
