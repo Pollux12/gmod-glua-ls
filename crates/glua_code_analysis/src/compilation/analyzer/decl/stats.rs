@@ -87,6 +87,12 @@ fn initializer_table_expr(expr: &LuaExpr) -> Option<LuaTableExpr> {
 }
 
 pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> Option<()> {
+    // An incomplete statement (`SKIN.Field` with no `=`, common mid-edit) also
+    // parses as an assignment. It defines no member, so registering one here
+    // would add a valueless definition that shadows the real one for that key
+    // and makes hover/completion report `unknown`.
+    let defines_members = stat.get_assign_op().is_some();
+
     let (vars, value_exprs) = stat.get_var_and_expr_list();
     for (idx, var) in vars.iter().enumerate() {
         let value_expr_id = value_exprs.get(idx).map(|expr| expr.get_syntax_id());
@@ -154,6 +160,9 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 }
             }
             LuaVarExpr::IndexExpr(index_expr) => {
+                if !defines_members {
+                    continue;
+                }
                 let index_key = index_expr.get_index_key()?;
                 let key: LuaMemberKey = match index_key {
                     LuaIndexKey::Name(name) => LuaMemberKey::Name(name.get_name_text().into()),
