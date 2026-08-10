@@ -196,9 +196,12 @@ async fn main() {
         duration: indexing_duration,
     });
 
-    // Phase 4b: Incremental edit latency (simulates a keystroke re-index of a
-    // single already-indexed file — the interactive-editing hot path). Optional,
-    // enabled with BENCH_INCREMENTAL=1.
+    // Phase 4b: Incremental edit latency — the full cost a keystroke pays
+    // once it lands: reindex of the edited file plus its whole dependency
+    // expansion, then the post-edit diagnostics pass (shared-data recompute
+    // + the edited file), matching the production LS flow. Worst-case
+    // biased: files are ranked by reindex-expansion size and the top hubs
+    // are edited.
     let mut incremental_worst: Option<std::time::Duration> = None;
     if std::env::var("BENCH_INCREMENTAL").is_ok() {
         let main_ids = analysis
@@ -206,17 +209,95 @@ async fn main() {
             .get_db()
             .get_module_index()
             .get_main_workspace_file_ids();
-        // Pick a handful of representative files spread across the workspace.
-        let sample: Vec<FileId> = {
-            let n = main_ids.len();
-            (0..5)
-                .filter_map(|i| main_ids.get(i * n / 5).copied())
-                .collect()
+        let path_of = |id: &FileId| {
+            analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_path(id)
+                .map(|p| p.to_string_lossy().replace('\\', "/"))
         };
+        // Ranking every file costs ~30s on a large workspace, but the worst
+        // hubs are stable properties of the codebase — cache them per codebase
+        // and only re-rank when the cache is missing or stale.
+        let cache_path = PathBuf::from("target/bench_incremental_targets.txt");
+        let mut sample: Vec<(FileId, usize)> = Vec::new();
+        if let Ok(cached) = std::fs::read_to_string(&cache_path) {
+            let mut lines = cached.lines();
+            if lines.next() == Some(large_codebase.as_str()) {
+                let by_path: std::collections::HashMap<String, FileId> = main_ids
+                    .iter()
+                    .filter_map(|id| path_of(id).map(|p| (p, *id)))
+                    .collect();
+                let entries: Vec<Option<(FileId, usize)>> = lines
+                    .map(|line| {
+                        let (n, path) = line.split_once('\t')?;
+                        Some((*by_path.get(path)?, n.parse::<usize>().ok()?))
+                    })
+                    .collect();
+                if !entries.is_empty() && entries.iter().all(Option::is_some) {
+                    sample = entries.into_iter().flatten().collect();
+                    eprintln!(
+                        "  [incremental] using {} cached edit targets from {}",
+                        sample.len(),
+                        cache_path.display()
+                    );
+                }
+            }
+        }
+        if sample.is_empty() {
+            let t_rank = Instant::now();
+            let mut ranked: Vec<(FileId, usize)> = main_ids
+                .iter()
+                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
+                .collect();
+            ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            eprintln!(
+                "  [incremental] ranked {} files by reindex expansion in {:.3}s",
+                ranked.len(),
+                t_rank.elapsed().as_secs_f64()
+            );
+
+            // Top-3 hubs (worst ripple), the median file, and the largest file
+            // by bytes (worst parse).
+            sample = ranked.iter().take(3).copied().collect();
+            for extra in [
+                ranked.get(ranked.len() / 2).copied(),
+                main_ids
+                    .iter()
+                    .max_by_key(|id| {
+                        analysis
+                            .compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_content(id)
+                            .map_or(0, |text| text.len())
+                    })
+                    .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !sample.iter().any(|(id, _)| *id == extra.0) {
+                    sample.push(extra);
+                }
+            }
+
+            let mut out = format!("{large_codebase}\n");
+            for (id, n) in &sample {
+                if let Some(path) = path_of(id) {
+                    out.push_str(&format!("{n}\t{path}\n"));
+                }
+            }
+            if let Err(err) = std::fs::write(&cache_path, out) {
+                eprintln!("  [incremental] failed to write target cache: {err}");
+            }
+        }
+
         let mut total = std::time::Duration::ZERO;
         let mut worst = std::time::Duration::ZERO;
         let mut edited = 0usize;
-        for file_id in sample {
+        for (file_id, expansion) in sample {
             let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
                 continue;
             };
@@ -229,19 +310,34 @@ async fn main() {
             else {
                 continue;
             };
-            // Append a trivially-different comment to force a real re-index.
+            let name = analysis
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_file_path(&file_id)
+                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                .unwrap_or_else(|| format!("{file_id:?}"));
+            // Append a comment: defeats the token-identity no-op gate, so the
+            // full production edit path (expansion + remove + rebuild) runs.
             let edited_text = format!("{text}\n-- bench incremental edit\n");
             let t = Instant::now();
             analysis.update_file_by_uri(&uri, Some(edited_text));
-            let elapsed = t.elapsed();
+            let reindex = t.elapsed();
+            let t = Instant::now();
+            let shared = analysis.precompute_diagnostic_shared_data();
+            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
+            let diagnostics = t.elapsed();
+            let elapsed = reindex + diagnostics;
             total += elapsed;
             worst = worst.max(elapsed);
             edited += 1;
             eprintln!(
-                "  [incremental] re-index {:?}: {:.3}s",
-                file_id,
-                elapsed.as_secs_f64()
+                "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
+                elapsed.as_secs_f64(),
+                reindex.as_secs_f64(),
+                diagnostics.as_secs_f64()
             );
+            analysis.update_file_by_uri(&uri, Some(text));
         }
         if edited > 0 {
             eprintln!(
@@ -413,9 +509,9 @@ async fn main() {
     eprintln!("Target: ≤10s");
 
     // A single-file edit is the interactive hot path: the user is typing, and
-    // every keystroke that lands pays this. Budget it separately from the cold
-    // index — a workspace that indexes in 10s is useless if each edit costs a
-    // second.
+    // every keystroke that lands pays reindex + diagnostics. Budget it
+    // separately from the cold index — a workspace that indexes in 10s is
+    // useless if each edit costs a second.
     if let Some(worst) = incremental_worst {
         let incremental_target = std::time::Duration::from_secs(1);
         let status = if worst <= incremental_target {
@@ -429,7 +525,7 @@ async fn main() {
             worst.as_secs_f64(),
             status
         );
-        eprintln!("Target: ≤1s per single-file edit");
+        eprintln!("Target: ≤1s per edit (reindex ripple + edited-file diagnostics)");
     }
     eprintln!("========================================");
 }
