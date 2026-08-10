@@ -1647,6 +1647,34 @@ mod test {
         assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
     }
 
+    /// `if c then t.k = v end` does not dominate the other writes of `t.k`, so
+    /// re-indexing an unrelated writer must not evict it from the member index.
+    #[gtest]
+    fn conditional_member_writes_survive_partial_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/food/a.lua", "Food = { amount = 50 }");
+        let plain_path = "lua/food/b.lua";
+        let plain_source = "Food.amount = 1";
+        let plain_file = ws.def_file(plain_path, plain_source);
+        ws.def_file("lua/food/c.lua", "if Food then Food.amount = \"c\" end");
+        ws.def_file("lua/food/d.lua", "if Food then Food.amount = true end");
+
+        let baseline_ty = ws.expr_ty("Food.amount");
+        let baseline = ws.humanize_type(baseline_ty);
+        assert!(
+            baseline.contains("boolean"),
+            "the conditional writers must be visible on a cold build, got {baseline}"
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(plain_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{plain_source}\n"));
+        ws.analysis.reindex_files(vec![plain_file]);
+
+        let after_ty = ws.expr_ty("Food.amount");
+        assert_eq!(ws.humanize_type(after_ty), baseline);
+    }
+
     #[gtest]
     fn phase_c0_member_or_write_chained_rhs_uses_all_arms() {
         let mut ws = VirtualWorkspace::new();

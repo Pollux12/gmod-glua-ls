@@ -28,6 +28,9 @@ pub struct LuaMemberIndex {
         HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     non_overwriting_assignment_members: HashSet<LuaMemberId>,
+    /// Assignment members written inside a conditional construct (`if c
+    /// then t.k = v end`).
+    conditional_branch_assignment_members: HashSet<LuaMemberId>,
     /// Members whose owner was decided by scripted-class synthesis rather
     /// than by name resolution.
     synthesized_owner_members: HashSet<LuaMemberId>,
@@ -73,6 +76,7 @@ impl LuaMemberIndex {
             current_owner_member_history: HashMap::new(),
             current_members_by_key: HashMap::new(),
             non_overwriting_assignment_members: HashSet::new(),
+            conditional_branch_assignment_members: HashSet::new(),
             synthesized_owner_members: HashSet::new(),
             deferred_index_expr_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
@@ -157,6 +161,10 @@ impl LuaMemberIndex {
                     MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
                 }
             };
+        }
+
+        if let Some(action) = self.classify_conditional_branch_insert(id, item) {
+            return action;
         }
 
         if self.should_preserve_assignment_file_define_member(owner, key, id) {
@@ -247,6 +255,50 @@ impl LuaMemberIndex {
                 }
             }
         }
+    }
+
+    /// Resolves an owner/key slot that any conditional-branch write
+    /// contributes to, as a function of the members involved rather than of
+    /// their arrival order.
+    fn classify_conditional_branch_insert(
+        &self,
+        id: LuaMemberId,
+        item: &LuaMemberIndexItem,
+    ) -> Option<MemberInsertAction> {
+        if !self.is_item_only_file_define(item)
+            || !self.is_item_only_file_define(&LuaMemberIndexItem::One(id))
+        {
+            return None;
+        }
+
+        let mut candidates = member_ids_from_item(item);
+        if !candidates.contains(&id) {
+            candidates.push(id);
+        }
+        if !candidates
+            .iter()
+            .any(|candidate| self.conditional_branch_assignment_members.contains(candidate))
+        {
+            return None;
+        }
+
+        let (mut kept, plain): (Vec<_>, Vec<_>) = candidates
+            .into_iter()
+            .partition(|candidate| self.conditional_branch_assignment_members.contains(candidate));
+        if let Some(latest_plain) = plain.into_iter().max_by_key(|id| member_id_sort_key(*id)) {
+            kept.push(latest_plain);
+        }
+        kept.sort_by_key(|id| member_id_sort_key(*id));
+
+        let new_item = match kept.as_slice() {
+            [only] => LuaMemberIndexItem::One(*only),
+            _ => LuaMemberIndexItem::Many(kept),
+        };
+        Some(if &new_item == item {
+            MemberInsertAction::Noop
+        } else {
+            MemberInsertAction::Store(new_item)
+        })
     }
 
     fn apply_member_insert_action(
@@ -917,6 +969,11 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 
+    pub fn mark_conditional_branch_assignment_member(&mut self, member_id: LuaMemberId) {
+        self.non_overwriting_assignment_members.insert(member_id);
+        self.conditional_branch_assignment_members.insert(member_id);
+    }
+
     pub fn get_current_owner_members_for_key(
         &self,
         owner: &LuaMemberOwner,
@@ -1124,6 +1181,7 @@ impl LuaIndex for LuaMemberIndex {
                         self.members.remove(&member_id);
                         self.member_current_owner.remove(&member_id);
                         self.non_overwriting_assignment_members.remove(&member_id);
+                        self.conditional_branch_assignment_members.remove(&member_id);
                         self.synthesized_owner_members.remove(&member_id);
                         self.deferred_index_expr_members.remove(&member_id);
                         self.member_function_scope_ranges.remove(&member_id);
@@ -1184,6 +1242,7 @@ impl LuaIndex for LuaMemberIndex {
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
         self.non_overwriting_assignment_members.clear();
+        self.conditional_branch_assignment_members.clear();
         self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();

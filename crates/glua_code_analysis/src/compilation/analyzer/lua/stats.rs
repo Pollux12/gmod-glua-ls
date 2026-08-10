@@ -1649,7 +1649,7 @@ fn assign_merge_type_owner_and_expr_type(
             analyzer
                 .db
                 .get_member_index_mut()
-                .mark_non_overwriting_assignment_member(*member_id);
+                .mark_conditional_branch_assignment_member(*member_id);
         } else if !dynamic_expr_key_member
             && analyzer
                 .db
