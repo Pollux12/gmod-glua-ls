@@ -289,6 +289,44 @@ pub(super) fn stabilize_unguarded_children(
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
 
         for (decl_id, references) in references {
+            // The syntactic prerequisites for evidence — a read reference
+            // that is the prefix of an index expression — are pure tree
+            // lookups, while `declaration_base_type` infers a parameter's
+            // type.
+            let sites = references
+                .cells
+                .iter()
+                .filter(|cell| !cell.is_write)
+                .filter_map(|cell| {
+                    let name_expr = root
+                        .covering_element(cell.range)
+                        .ancestors()
+                        .find_map(LuaNameExpr::cast)
+                        .filter(|name| name.get_range() == cell.range)?;
+                    let index_expr = name_expr
+                        .syntax()
+                        .ancestors()
+                        .find_map(LuaIndexExpr::cast)
+                        .filter(|index| {
+                            index
+                                .get_prefix_expr()
+                                .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+                        })?;
+                    if only_return_evidence
+                        && !index_expr
+                            .syntax()
+                            .ancestors()
+                            .any(|node| LuaReturnStat::cast(node).is_some())
+                    {
+                        return None;
+                    }
+                    Some((name_expr, index_expr))
+                })
+                .collect::<Vec<_>>();
+            if sites.is_empty() {
+                continue;
+            }
+
             let Some(base_type) = declaration_base_type(db, context, decl_id) else {
                 continue;
             };
@@ -299,35 +337,7 @@ pub(super) fn stabilize_unguarded_children(
                 continue;
             };
 
-            for cell in references.cells.into_iter().filter(|cell| !cell.is_write) {
-                let Some(name_expr) = root
-                    .covering_element(cell.range)
-                    .ancestors()
-                    .find_map(LuaNameExpr::cast)
-                    .filter(|name| name.get_range() == cell.range)
-                else {
-                    continue;
-                };
-                let Some(index_expr) = name_expr
-                    .syntax()
-                    .ancestors()
-                    .find_map(LuaIndexExpr::cast)
-                    .filter(|index| {
-                        index
-                            .get_prefix_expr()
-                            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                    })
-                else {
-                    continue;
-                };
-                if only_return_evidence
-                    && !index_expr
-                        .syntax()
-                        .ancestors()
-                        .any(|node| LuaReturnStat::cast(node).is_some())
-                {
-                    continue;
-                }
+            for (name_expr, index_expr) in sites {
                 if let Some(profile) = &mut profile {
                     profile.references_scanned += 1;
                 }
