@@ -520,11 +520,33 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             if should_skip_ambiguous_unknown_key_table_owner(analyzer, &prefix_type, &index_expr) {
                 return Some(());
             }
-            let (member_owner, set_owner_only) =
-                resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))?;
+            let Some((member_owner, set_owner_only)) =
+                resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
+            else {
+                // The prefix inferred, but to nothing that names an owner. That
+                // is not a property of the source: the prefix may simply not
+                // have settled yet, and nothing revisits this attach. Record it
+                // so the settled pass can retry it once the batch is done.
+                if prefix_carries_no_owner_information(&prefix_type) {
+                    analyzer
+                        .context
+                        .add_settled_member_attach_candidate(InFiled::new(
+                            analyzer.file_id,
+                            var_expr.get_syntax_id(),
+                        ));
+                }
+                return None;
+            };
             apply_index_expr_member_owner(analyzer, index_expr, member_owner, set_owner_only);
         }
-        Err(InferFailReason::None) => {}
+        Err(InferFailReason::None) => {
+            analyzer
+                .context
+                .add_settled_member_attach_candidate(InFiled::new(
+                    analyzer.file_id,
+                    var_expr.get_syntax_id(),
+                ));
+        }
         Err(reason) => {
             // Every other branch above reaches
             // `apply_index_expr_member_owner`, which *creates* the
@@ -549,6 +571,21 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     }
 
     Some(())
+}
+
+/// Whether a prefix type says nothing about which table a member write lands on.
+///
+/// Distinguishes "this prefix has no owner" (a number, a string — a real answer)
+/// from "this prefix has not settled yet", which is the only case worth retrying
+/// after the batch is done.
+fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
+    match prefix_type {
+        LuaType::Unknown | LuaType::Any => true,
+        LuaType::Union(union) => union
+            .types()
+            .all(|arm| matches!(arm, LuaType::Nil | LuaType::Unknown | LuaType::Any)),
+        _ => false,
+    }
 }
 
 fn should_skip_ambiguous_unknown_key_table_owner(

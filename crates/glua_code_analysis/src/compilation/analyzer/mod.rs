@@ -225,6 +225,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             refresh_initializer_caches(db, &mut context);
         }
 
+        {
+            let _p = Profile::new("attach_settled_index_expr_members");
+            attach_settled_index_expr_members(db, &mut context);
+        }
+
         // Members that landed on a global path before the global's owner was
         // known are attached now that it is. See
         // `reconcile_parked_global_path_members`.
@@ -261,6 +266,65 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 early_member_owners,
             );
         }
+    }
+}
+
+/// Cap on how many dropped attaches one batch remembers. The pass is a
+/// best-effort retry, so a pathological workspace bounds its cost instead of
+/// growing the batch's memory without limit.
+const SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT: usize = 8192;
+
+/// Retries the index-expression member attaches `set_index_expr_owner`
+/// dropped.
+fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = std::mem::take(&mut context.settled_member_attach_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
+    candidates.dedup();
+
+    // Only the candidate files are re-inferred, so only their caches are stale.
+    // Clearing the whole manager would also discard caches the passes that ran
+    // before this one built for files this pass never touches.
+    let candidate_files = candidates
+        .iter()
+        .map(|candidate| candidate.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&candidate_files);
+
+    for candidate in candidates {
+        let file_id = candidate.file_id;
+        let member_id = LuaMemberId::new(candidate.value, file_id);
+        // A member that already found a real owner is not the gap this pass
+        // exists for: some other authority decided where it lives, and re-homing
+        // it here would overrule that decision with a later, weaker read.
+        if db
+            .get_member_index()
+            .get_current_owner(&member_id)
+            .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve))
+        {
+            continue;
+        }
+        let Some(prefix_expr) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+            .and_then(|root| candidate.value.to_node_from_root(&root))
+            .and_then(glua_parser::LuaIndexExpr::cast)
+            .and_then(|index_expr| index_expr.get_prefix_expr())
+        else {
+            continue;
+        };
+        let mut unresolve_member = unresolve::UnResolveMember {
+            file_id,
+            member_id,
+            expr: None,
+            prefix: Some(prefix_expr),
+            ret_idx: 0,
+        };
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let _ = unresolve::try_resolve_member(db, cache, &mut unresolve_member);
     }
 }
 
@@ -955,6 +1019,10 @@ pub struct AnalyzeContext {
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
     early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
+    /// Index-expression member attaches that `set_index_expr_owner` dropped
+    /// because the prefix carried no owner information yet. See
+    /// [`attach_settled_index_expr_members`].
+    settled_member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -979,6 +1047,7 @@ impl AnalyzeContext {
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
+            settled_member_attach_candidates: Vec::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1023,6 +1092,12 @@ impl AnalyzeContext {
     pub fn add_early_member_owner_candidate(&mut self, member_id: LuaMemberId, decl_id: LuaDeclId) {
         self.early_member_owner_candidates
             .push((member_id, decl_id));
+    }
+
+    pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
+        if self.settled_member_attach_candidates.len() < SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT {
+            self.settled_member_attach_candidates.push(candidate);
+        }
     }
 
     pub(crate) fn requeue_call_site_inferred_returns(
