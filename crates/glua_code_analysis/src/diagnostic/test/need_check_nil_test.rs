@@ -14458,4 +14458,42 @@ mod test {
 
         assert_that!(diagnostics.len(), eq(2_usize));
     }
+
+    /// A local whose initializer only resolves to `unknown?` (an unresolved or
+    /// self-recursive callee) is still discharged by a plain truthiness guard.
+    /// The narrowed type must survive: re-reading the declaration's initializer
+    /// would put the `nil` arm back and report inside the guard.
+    #[test]
+    fn guarded_local_from_unresolved_initializer_keeps_narrowed_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            local M = {}
+
+            function M.Make(flag)
+                if flag then return nil end
+                return M.Make(flag)
+            end
+
+            local Channel = M.Make(true)
+            local other = false
+
+            if other and Channel then
+                Channel:Stop()
+            end
+
+            if Channel then
+                Channel:Stop()
+            end
+
+            Channel:Stop()
+            "#,
+        );
+
+        // Only the unguarded trailing call is reported.
+        assert_that!(diagnostics.len(), eq(1_usize));
+        assert_that!(diagnostics[0].range.start.line, eq(19_u32));
+    }
 }

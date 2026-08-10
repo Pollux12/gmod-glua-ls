@@ -221,7 +221,10 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    let mut result_type = LuaType::Unknown;
+    let mut result_type = LuaType::Never;
+    // A member that resolves to Unknown is still a resolved member, so "did
+    // anything match" is tracked separately from the accumulated type.
+    let mut saw_match = false;
     for member in owner_members {
         if !member_key_matches_type(db, &access_key_type, member.get_key()) {
             continue;
@@ -231,11 +234,12 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         if let Ok(member_type) =
             resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
         {
+            saw_match = true;
             result_type = TypeOps::Union.apply(db, &result_type, &member_type);
         }
     }
 
-    if result_type.is_unknown() {
+    if !saw_match {
         return Err(InferFailReason::FieldNotFound);
     }
 

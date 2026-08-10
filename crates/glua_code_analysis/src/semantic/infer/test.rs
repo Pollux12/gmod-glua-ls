@@ -836,7 +836,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("boolean"));
+        assert_eq!(ty, ws.ty("boolean|unknown"));
     }
 
     #[test]

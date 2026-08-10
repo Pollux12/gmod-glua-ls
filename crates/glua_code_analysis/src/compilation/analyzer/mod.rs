@@ -24,7 +24,7 @@ use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
     LuaFunctionType, LuaInferenceNodeId, LuaInferredGuardOwner, LuaMember, LuaMemberFeature,
     LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact,
-    LuaTypeOwner, WorkspaceId,
+    LuaTypeOwner, LuaUnionType, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
@@ -505,15 +505,25 @@ pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) ->
     let LuaType::Union(inferred_union) = inferred else {
         return false;
     };
-    let inferred_arms = inferred_union.into_vec();
+    let inferred_arms = known_arms(inferred_union);
     match current {
         LuaType::Union(current_union) => {
-            let current_arms = current_union.into_vec();
+            let current_arms = known_arms(current_union);
             current_arms.len() < inferred_arms.len()
                 && current_arms.iter().all(|arm| inferred_arms.contains(arm))
         }
         current => inferred_arms.contains(current),
     }
+}
+
+/// The union arms that carry information. An `unknown` arm stands for a type
+/// that has not settled yet, so it can neither widen a cache nor block one.
+fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
+    union
+        .types()
+        .filter(|arm| !matches!(arm, LuaType::Unknown))
+        .cloned()
+        .collect()
 }
 
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {

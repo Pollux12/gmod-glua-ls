@@ -526,10 +526,6 @@ impl LuaType {
                     );
                 }
 
-                if result_types.len() > 1 && hash_set.remove(&LuaType::Unknown) {
-                    result_types.retain(|typ| !matches!(typ, LuaType::Unknown));
-                }
-
                 match result_types.len() {
                     0 => LuaType::Nil,
                     1 => result_types[0].clone(),
@@ -1076,10 +1072,6 @@ impl TypeVisitTrait for LuaUnionType {
 
 impl LuaUnionType {
     pub fn from_set(mut set: HashSet<LuaType>) -> Self {
-        if set.len() > 1 {
-            set.remove(&LuaType::Unknown);
-        }
-
         if set.len() == 2 && set.contains(&LuaType::Nil) {
             set.remove(&LuaType::Nil);
             if let Some(first) = set.iter().next() {
@@ -1097,10 +1089,6 @@ impl LuaUnionType {
     }
 
     pub fn from_vec(mut types: Vec<LuaType>) -> Self {
-        if types.len() > 1 && types.iter().any(|typ| !matches!(typ, LuaType::Unknown)) {
-            types.retain(|typ| !matches!(typ, LuaType::Unknown));
-        }
-
         // Member order in a union is only ever consulted for members that
         // take part in ordered resolution: overloads are matched and
         // displayed in declaration order, and `` `T` ``|T resolves the
@@ -1199,10 +1187,14 @@ impl LuaUnionType {
         }
     }
 
+    /// An `unknown` arm is a type that has not settled yet, not a statement that
+    /// the value may be absent, so it never makes the union optional on its own.
     pub fn is_optional(&self) -> bool {
         match self {
             LuaUnionType::Nullable(_) => true,
-            LuaUnionType::Multi(types) => types.iter().any(|t| t.is_optional()),
+            LuaUnionType::Multi(types) => types
+                .iter()
+                .any(|t| !matches!(t, LuaType::Unknown) && t.is_optional()),
         }
     }
 

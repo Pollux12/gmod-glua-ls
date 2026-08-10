@@ -195,6 +195,7 @@ impl std::ops::Deref for LuaTypeCache {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::LuaUnionType;
 
     fn union(types: Vec<LuaType>) -> LuaType {
         LuaType::from_vec(types)
@@ -236,15 +237,19 @@ mod tests {
     /// sticky or displaceable.
     #[test]
     fn supersedes_is_a_total_order_inside_the_uninformative_band() {
-        // `unknown|nil` is not in the list because it does not exist: union
-        // construction drops `unknown` next to any other member, so it is just
-        // `nil`. `any|nil` is the tie that does occur.
-        assert_eq!(union(vec![LuaType::Unknown, LuaType::Nil]), LuaType::Nil);
+        // `unknown|nil` survives construction now that an `unknown` arm is kept,
+        // so it is a real member of the band and ties with bare `unknown` on
+        // rank — exactly the tie `uninformative_key` breaks with `is_nullable`.
+        assert_eq!(
+            union(vec![LuaType::Unknown, LuaType::Nil]),
+            LuaType::from(LuaUnionType::Nullable(LuaType::Unknown))
+        );
 
         let band = [
             ("never", LuaType::Never),
             ("nil", LuaType::Nil),
             ("unknown", LuaType::Unknown),
+            ("unknown|nil", union(vec![LuaType::Unknown, LuaType::Nil])),
             ("any", LuaType::Any),
             ("any|nil", union(vec![LuaType::Any, LuaType::Nil])),
         ];

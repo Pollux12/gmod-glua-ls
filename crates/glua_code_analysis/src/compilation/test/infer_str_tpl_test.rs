@@ -584,7 +584,7 @@ mod test {
         );
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
-        let expected = ws.ty("glide_wheel");
+        let expected = ws.ty("glide_wheel|unknown");
         assert_eq!(wheel_ty, expected);
     }
 
@@ -643,7 +643,9 @@ mod test {
         );
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
-        let expected = ws.ty("glide_wheel");
+        // The unresolved branch keeps its own arm rather than replacing the
+        // precise one — the precise type stays reachable either way.
+        let expected = ws.ty("glide_wheel|unknown");
         assert_eq!(wheel_ty, expected);
     }
 
@@ -682,7 +684,7 @@ mod test {
         );
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
-        let expected = ws.ty("glide_wheel");
+        let expected = ws.ty("glide_wheel|unknown");
         assert_eq!(wheel_ty, expected);
     }
 
@@ -846,7 +848,7 @@ mod test {
             "#,
         );
 
-        let expected = LuaType::Ref(LuaTypeDeclId::global("glide_wheel"));
+        let expected = ws.ty("glide_wheel|unknown");
         let signature_return = signature_return_type_for_function(&mut ws, file_id, "CreateWheel");
         assert_eq!(signature_return, expected);
     }

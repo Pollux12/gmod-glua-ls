@@ -22,6 +22,7 @@ use crate::{
     semantic::{
         infer::narrow::{
             SelfRefId, VarRefId, infer_expr_narrow_type, infer_expr_narrow_type_with_self_base,
+            remove_false_or_nil,
         },
         member::{
             find_members_with_key, find_members_with_key_in_workspace_for_file_at_offset,
@@ -360,8 +361,17 @@ pub(crate) fn try_local_decl_initializer_fallback_type(
     }
 
     let initializer_type = try_infer_local_initializer_type(db, cache, decl_id)?;
-    (!initializer_type.is_never() && !initializer_type.is_nil() && !initializer_type.is_unknown())
-        .then_some(initializer_type)
+    initializer_type_is_informative(&initializer_type).then_some(initializer_type)
+}
+
+/// Whether re-reading the declaration's initializer can improve on a narrowed
+/// type. A type whose only content once the falsy arms are removed is `unknown`
+/// says nothing the narrowed type does not already say, and substituting it
+/// would put back the `nil` a guard has just discharged.
+fn initializer_type_is_informative(initializer_type: &LuaType) -> bool {
+    !initializer_type.is_never()
+        && !initializer_type.is_nil()
+        && !remove_false_or_nil(initializer_type.clone()).is_unknown()
 }
 
 fn try_infer_flow_sensitive_alias_initializer_type(
@@ -398,11 +408,8 @@ fn try_infer_flow_sensitive_alias_initializer_type(
     }
 
     let initializer_type = infer_expr(db, cache, initializer_expr).ok()?;
-    (!initializer_type.is_never()
-        && !initializer_type.is_nil()
-        && !initializer_type.is_unknown()
-        && !initializer_type.is_table())
-    .then_some(initializer_type)
+    (initializer_type_is_informative(&initializer_type) && !initializer_type.is_table())
+        .then_some(initializer_type)
 }
 
 fn has_local_reassignment_between(

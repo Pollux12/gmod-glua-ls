@@ -221,7 +221,15 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
         return Ok(right);
     }
 
-    Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &right))
+    // Mirror of the `and` case: an unresolved left operand has no enumerable
+    // truthy half, so it contributes nothing rather than widening to
+    // `x|unknown`.
+    let truthy_left = remove_false_or_nil(left);
+    if truthy_left.is_unknown() {
+        return Ok(right);
+    }
+
+    Ok(TypeOps::Union.apply(db, &truthy_left, &right))
 }
 
 /// True when `left_expr` is a field read that is also the target of the assignment

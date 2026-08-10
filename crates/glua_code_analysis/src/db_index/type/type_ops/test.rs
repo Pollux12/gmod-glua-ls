@@ -211,14 +211,19 @@ mod tests {
             );
         }
         {
+            // An `unknown` arm is an unsettled type, not an absent one, so it
+            // stays in the union instead of being dropped as noise.
             assert_eq!(
                 LuaType::from_vec(vec![LuaType::Unknown, LuaType::String]),
-                LuaType::String
+                LuaType::from(LuaUnionType::Multi(vec![LuaType::String, LuaType::Unknown]))
             );
         }
         {
             let union = LuaUnionType::from_vec(vec![LuaType::Unknown, LuaType::String]);
-            assert_eq!(union.into_vec(), vec![LuaType::String]);
+            assert_eq!(
+                union.into_vec(),
+                vec![LuaType::String, LuaType::Unknown]
+            );
         }
         {
             let type_string_number = ws.ty("string | number");

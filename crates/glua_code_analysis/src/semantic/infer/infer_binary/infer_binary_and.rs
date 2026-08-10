@@ -59,5 +59,14 @@ pub fn infer_binary_expr_and(
         return Ok(right);
     }
 
-    Ok(TypeOps::Union.apply(db, &narrow_false_or_nil(db, left), &right))
+    // An unresolved left operand has no enumerable falsy half — `unknown` there
+    // means "not settled yet", not "may be false". Unioning the placeholder in
+    // would widen every `unresolved and x` to `x|unknown` and, through
+    // `is_always_truthy`, keep a `false` arm alive in the enclosing `or`.
+    let falsy_left = narrow_false_or_nil(db, left);
+    if falsy_left.is_unknown() {
+        return Ok(right);
+    }
+
+    Ok(TypeOps::Union.apply(db, &falsy_left, &right))
 }

@@ -85,7 +85,10 @@ mod test {
         );
 
         let ty = ws.expr_ty("OnlyHere('1')");
-        assert_eq!(ws.humanize_type(ty), "nil");
+        // The explicit `return nil` and the unresolved self-recursive return
+        // both survive: `nil` alone would claim a certainty the body does not
+        // have.
+        assert_eq!(ws.humanize_type(ty), "unknown?");
     }
 
     #[test]

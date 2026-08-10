@@ -158,8 +158,6 @@ fn try_collapse(match_source: &LuaType, source: &LuaType, target: &LuaType) -> O
     Some(match (match_source, target) {
         (LuaType::Never, _) => target.clone(),
         (_, LuaType::Never) => source.clone(),
-        (LuaType::Unknown, _) => target.clone(),
-        (_, LuaType::Unknown) => source.clone(),
         // int | int const
         (LuaType::Integer, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)) => {
             LuaType::Integer
