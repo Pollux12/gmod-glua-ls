@@ -659,7 +659,7 @@ impl LuaTupleType {
         if self.types.is_empty() {
             return LuaType::Unknown;
         }
-        let mut ty = LuaType::Unknown;
+        let mut ty = LuaType::Never;
         for t in &self.types {
             match t {
                 LuaType::IntegerConst(i) => {
@@ -738,7 +738,7 @@ pub fn table_const_array_base(db: &DbIndex, range: &InFiled<TextRange>) -> Optio
     let member_index = db.get_member_index();
     let members = member_index.get_members(&owner)?;
 
-    let mut ty = LuaType::Unknown;
+    let mut ty = LuaType::Never;
     let mut saw_integer_member = false;
     for member in members {
         if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {
@@ -1008,7 +1008,7 @@ impl LuaObjectType {
             for (key, value_type) in self.index_access.iter() {
                 if matches!(key, LuaType::Integer) {
                     if ty.is_none() {
-                        ty = Some(LuaType::Unknown);
+                        ty = Some(LuaType::Never);
                     }
                     if let Some(t) = ty {
                         ty = Some(TypeOps::Union.apply(db, &t, value_type));
@@ -1023,7 +1023,7 @@ impl LuaObjectType {
             return Some(LuaType::Unknown);
         }
 
-        let mut ty = LuaType::Unknown;
+        let mut ty = LuaType::Never;
         let mut fields = self.fields.iter().collect::<Vec<_>>();
 
         fields.sort_by_key(|(a, _)| *a);

@@ -497,7 +497,7 @@ fn resolve_member_type(
 
             match resolve_state {
                 MemberTypeResolveState::All => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let member_type_cache = db
                             .get_type_index()
@@ -529,7 +529,7 @@ fn resolve_member_type(
                     Ok(typ)
                 }
                 MemberTypeResolveState::Meta => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let feature = member.get_feature();
                         if feature.is_meta_decl() {
@@ -553,7 +553,7 @@ fn resolve_member_type(
                     Ok(typ)
                 }
                 MemberTypeResolveState::FileDecl => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let feature = member.get_feature();
                         if feature.is_file_decl() {
