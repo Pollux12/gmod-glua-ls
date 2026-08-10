@@ -41,17 +41,13 @@ fn can_use_structural_union(types: &[LuaType]) -> bool {
     let (mut string, mut string_const) = (false, false);
     let (mut boolean, mut bool_consts) = (false, 0u32);
     let (mut table, mut table_const) = (false, false);
+    let (mut function, mut callable) = (false, false);
 
     for typ in types {
         match typ {
-            LuaType::Never
-            | LuaType::Unknown
-            | LuaType::Union(_)
-            | LuaType::Ref(_)
-            | LuaType::MultiLineUnion(_)
-            | LuaType::Function
-            | LuaType::DocFunction(_)
-            | LuaType::Signature(_) => return false,
+            LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_) => return false,
+            LuaType::Function => function = true,
+            LuaType::DocFunction(_) | LuaType::Signature(_) => callable = true,
             LuaType::Number => num = true,
             LuaType::Integer => {
                 num_variant = true;
@@ -77,6 +73,7 @@ fn can_use_structural_union(types: &[LuaType]) -> bool {
             || boolean && bool_consts > 0
             || bool_consts > 1
             || table && table_const
+            || function && callable
         {
             return false;
         }
