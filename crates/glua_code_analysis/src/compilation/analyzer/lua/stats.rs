@@ -15,9 +15,9 @@ use crate::{
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, LuaFuncStat, LuaIndexExpr, LuaIndexKey,
-    LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind, LuaTableExpr,
-    LuaTableField, LuaVarExpr, PathTrait,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind,
+    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rustc_hash::FxHashMap;
 
@@ -968,6 +968,10 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             }
         };
 
+        if seeds_empty_decl_from_own_read(analyzer, &type_owner, expr) {
+            continue;
+        }
+
         // 如果具有延迟定义属性, 则先绑定最初的定义
         if let LuaVarExpr::NameExpr(name_expr) = var {
             if let Some(decl_id) = get_delayed_definition_decl_id(analyzer, name_expr) {
@@ -1492,9 +1496,16 @@ fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &Lua
         return true;
     }
 
-    expr.descendants::<LuaIndexExpr>().any(|index_expr| {
-        index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
-    })
+    let expr_range = expr.get_range();
+    expr.descendants::<LuaIndexExpr>()
+        .filter(|index_expr| {
+            !index_expr
+                .ancestors::<LuaClosureExpr>()
+                .any(|closure| expr_range.contains_range(closure.get_range()))
+        })
+        .any(|index_expr| {
+            index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
+        })
 }
 
 fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
@@ -1516,6 +1527,25 @@ fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &
             _ => return false,
         }
     }
+}
+
+/// Whether this assignment would seed an empty decl slot from a read out of
+/// that same decl.
+fn seeds_empty_decl_from_own_read(
+    analyzer: &LuaAnalyzer,
+    type_owner: &LuaTypeOwner,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaTypeOwner::Decl(decl_id) = type_owner else {
+        return false;
+    };
+
+    analyzer
+        .db
+        .get_type_index()
+        .get_type_cache(type_owner)
+        .is_none()
+        && expr_reads_out_of_decl(analyzer, *decl_id, expr)
 }
 
 fn add_unresolve_for_assignment(
