@@ -1632,6 +1632,16 @@ fn add_unresolve_for_assignment(
                 prefix,
                 ret_idx: 0,
             };
+            // The deferred write resolves against whatever the index held
+            // when its retry ran, and an attempt that reaches `unknown`
+            // succeeds: the item retires and the placeholder becomes the
+            // member's final type. Whether the retry was early or late is a
+            // property of batch order, not of the source, so record the
+            // member for the settled re-infer in
+            // `refresh_member_initializer_caches`.
+            analyzer
+                .context
+                .request_member_initializer_reinfer(member_id);
             analyzer
                 .context
                 .add_unresolve(unresolve_member.into(), reason);

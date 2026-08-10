@@ -679,7 +679,11 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
             else {
                 continue;
             };
-            if current_cache.is_doc() || single_nominal_type_id(current_cache.as_type()).is_none() {
+            let current_is_uninformative = type_is_uninformative(current_cache.as_type());
+            if current_cache.is_doc()
+                || (!current_is_uninformative
+                    && single_nominal_type_id(current_cache.as_type()).is_none())
+            {
                 continue;
             }
             let Some(expr) = member_initializer_expr(&root, *member_id) else {
@@ -688,9 +692,19 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
             let Ok(inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
                 continue;
             };
-            if inferred_type == *current_cache.as_type()
-                || !is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
-            {
+            if inferred_type == *current_cache.as_type() {
+                continue;
+            }
+            let takes_inferred_type = if current_is_uninformative {
+                // A placeholder is not an answer: it only records that the
+                // member's initializer had not been inferred yet when the write
+                // landed. Re-inferring it against the settled index is the same
+                // question, asked once the facts exist.
+                !type_is_uninformative(&inferred_type)
+            } else {
+                is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
+            };
+            if !takes_inferred_type {
                 continue;
             }
 
