@@ -1681,12 +1681,27 @@ fn assign_merge_type_owner_and_expr_type(
             }
             Some(None) => {}
             None => {
+                // Whether every sibling writer already carried a type is a
+                // property of how far the batch has run, not of the source.
+                // Where one did not, the merge below is provisional and the
+                // settled pass re-derives it against the complete writer set.
+                let mut skipped_uncached_sibling = false;
                 if let Some(widened_type) = get_widened_member_assignment_type(
-                    analyzer,
+                    analyzer.db,
                     &type_owner,
                     &expr_type,
                     preserve_table_literals,
+                    &mut skipped_uncached_sibling,
                 ) {
+                    if skipped_uncached_sibling
+                        && let LuaTypeOwner::Member(member_id) = &type_owner
+                    {
+                        analyzer.context.record_settled_member_widening_candidate(
+                            *member_id,
+                            expr_type.clone(),
+                            preserve_table_literals,
+                        );
+                    }
                     expr_type = widened_type;
                 }
             }
@@ -2029,25 +2044,27 @@ fn guarded_table_assignment_member_ids_for_owner_key(
     (member_ids.len() >= 2).then_some(member_ids)
 }
 
-fn get_widened_member_assignment_type(
-    analyzer: &mut LuaAnalyzer,
+/// Widens a member assignment against its same-owner/key siblings.
+pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
+    db: &DbIndex,
     type_owner: &LuaTypeOwner,
     incoming_type: &LuaType,
     preserve_table_literals: bool,
+    skipped_uncached_sibling: &mut bool,
 ) -> Option<LuaType> {
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return None;
     };
-    if !is_assignment_file_define_member(analyzer.db, *member_id) {
+    if !is_assignment_file_define_member(db, *member_id) {
         return None;
     }
 
-    let member_index = analyzer.db.get_member_index();
+    let member_index = db.get_member_index();
     let owner = member_index.get_member_owner(member_id)?.clone();
     let key = member_index.get_member(member_id)?.get_key().clone();
     let related_members = if preserve_table_literals {
         let related_member_ids =
-            guarded_table_assignment_member_ids_for_owner_key(analyzer.db, *member_id)?;
+            guarded_table_assignment_member_ids_for_owner_key(db, *member_id)?;
         related_member_ids
             .into_iter()
             .filter_map(|related_member_id| member_index.get_member(&related_member_id))
@@ -2067,27 +2084,29 @@ fn get_widened_member_assignment_type(
         if related_member_id == *member_id {
             continue;
         }
-        if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
+        if !is_member_realm_compatible(db, *member_id, related_member_id) {
             continue;
         }
         saw_previous_assignment = true;
 
-        if !is_assignment_file_define_member(analyzer.db, related_member_id) {
+        if !is_assignment_file_define_member(db, related_member_id) {
             return None;
         }
 
-        let existing_state = match analyzer
-            .db
+        let existing_state = match db
             .get_type_index()
             .get_type_cache(&related_member_id.into())
             .cloned()
         {
             Some(existing_cache) => MemberAssignmentWideningState::from_type_cache(&existing_cache),
-            None => match guarded_table_bootstrap_member_type(analyzer.db, related_member_id) {
+            None => match guarded_table_bootstrap_member_type(db, related_member_id) {
                 Some(bootstrap_type) => {
                     MemberAssignmentWideningState::from_assigned_type(&bootstrap_type, None)
                 }
-                None => continue,
+                None => {
+                    *skipped_uncached_sibling = true;
+                    continue;
+                }
             },
         };
 
@@ -2099,7 +2118,7 @@ fn get_widened_member_assignment_type(
     }
 
     let widened_type = match decide_member_assignment_widening(
-        analyzer.db,
+        db,
         incoming_type,
         !preserve_table_literals,
         previous_states.iter(),
@@ -2107,7 +2126,7 @@ fn get_widened_member_assignment_type(
         MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
         MemberAssignmentWideningDecision::ClassBootstrapRejected => {
             union_member_assignment_widening(
-                analyzer.db,
+                db,
                 incoming_type,
                 !preserve_table_literals,
                 previous_states.iter(),
@@ -2119,7 +2138,7 @@ fn get_widened_member_assignment_type(
     };
 
     Some(if preserve_table_literals {
-        crate::prune_redundant_guarded_table_bootstrap_type(analyzer.db, widened_type)
+        crate::prune_redundant_guarded_table_bootstrap_type(db, widened_type)
     } else {
         widened_type
     })
@@ -3094,10 +3113,11 @@ mod tests {
             );
 
             let widened = get_widened_member_assignment_type(
-                analyzer,
+                analyzer.db,
                 &LuaTypeOwner::Member(third_member),
                 &LuaType::Boolean,
                 false,
+                &mut false,
             )
             .expect("fallback scan should find prior same-key assignments");
 
@@ -3161,10 +3181,11 @@ mod tests {
             );
 
             let widened = get_widened_member_assignment_type(
-                analyzer,
+                analyzer.db,
                 &LuaTypeOwner::Member(third_member),
                 &second_class,
                 false,
+                &mut false,
             )
             .expect("fallback scan should widen incompatible class assignments");
             let expected = TypeOps::Union.apply(analyzer.db, &first_class, &second_class);
@@ -3264,10 +3285,11 @@ mod tests {
             );
 
             get_widened_member_assignment_type(
-                analyzer,
+                analyzer.db,
                 &LuaTypeOwner::Member(third_member),
                 &LuaType::String,
                 false,
+                &mut false,
             )
             .expect("fallback scalar assignment should widen")
         });

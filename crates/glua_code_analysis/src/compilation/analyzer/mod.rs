@@ -235,6 +235,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             rederive_settled_inferred_returns(db, &mut context);
         }
 
+        {
+            let _p = Profile::new("rewiden_settled_member_assignments");
+            rewiden_settled_member_assignments(db, &mut context);
+        }
+
         // Members that landed on a global path before the global's owner was
         // known are attached now that it is. See
         // `reconcile_parked_global_path_members`.
@@ -371,6 +376,51 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
     for mut return_ in candidates {
         let cache = context.infer_manager.get_infer_cache(return_.file_id);
         let _ = unresolve::try_resolve_return_point(db, cache, &mut return_);
+    }
+}
+
+/// Cap on how many partial widenings one batch re-derives, matching the other
+/// settled retries: the pass is best-effort, so a pathological workspace bounds
+/// its cost. The cap is applied after the canonical sort, so which candidates it
+/// drops does not depend on the order they were recorded in.
+const SETTLED_MEMBER_WIDENING_CANDIDATE_LIMIT: usize = 8192;
+
+/// Re-derives member assignment widenings that ran against an incomplete
+/// set of sibling writers.
+fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let candidates = std::mem::take(&mut context.settled_member_widening_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_by_key(|(member_id, _)| (member_id.file_id, member_id.get_position()));
+    candidates.truncate(SETTLED_MEMBER_WIDENING_CANDIDATE_LIMIT);
+
+    for (member_id, (assigned_type, preserve_table_literals)) in candidates {
+        // Only an inferred assignment cache is this pass' to rewrite: a doc type
+        // outranks inference, and anything else reaching the slot was written by
+        // an authority this pass has no evidence to overrule.
+        if !db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .is_some_and(|cache| cache.is_infer())
+        {
+            continue;
+        }
+
+        let type_owner = LuaTypeOwner::Member(member_id);
+        let Some(widened_type) = lua::get_widened_member_assignment_type(
+            db,
+            &type_owner,
+            &assigned_type,
+            preserve_table_literals,
+            &mut false,
+        ) else {
+            continue;
+        };
+
+        db.get_type_index_mut()
+            .force_bind_type(type_owner, LuaTypeCache::InferType(widened_type));
     }
 }
 
@@ -1083,6 +1133,10 @@ pub struct AnalyzeContext {
     /// because the prefix carried no owner information yet. See
     /// [`attach_settled_index_expr_members`].
     settled_member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
+    /// Member assignments whose widening ran against an incomplete sibling set,
+    /// with the type each one actually assigned. See
+    /// [`rewiden_settled_member_assignments`].
+    settled_member_widening_candidates: HashMap<LuaMemberId, (LuaType, bool)>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -1108,6 +1162,7 @@ impl AnalyzeContext {
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
             settled_member_attach_candidates: Vec::new(),
+            settled_member_widening_candidates: HashMap::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1134,6 +1189,19 @@ impl AnalyzeContext {
 
     pub(crate) fn analyzed_file_ids(&self) -> HashSet<FileId> {
         self.tree_list.iter().map(|tree| tree.file_id).collect()
+    }
+
+    /// Remembers an assignment whose widening skipped a sibling that had no type
+    /// yet. The assigned type is kept as written, not as widened, so the settled
+    /// pass can re-derive the merge instead of growing the partial answer.
+    pub(crate) fn record_settled_member_widening_candidate(
+        &mut self,
+        member_id: LuaMemberId,
+        assigned_type: LuaType,
+        preserve_table_literals: bool,
+    ) {
+        self.settled_member_widening_candidates
+            .insert(member_id, (assigned_type, preserve_table_literals));
     }
 
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
