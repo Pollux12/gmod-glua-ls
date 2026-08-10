@@ -331,11 +331,11 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             }
         }
     }
-    // Net flows are stored per file; keep raw insertion order so ordering
-    // differences (not just membership) show up in the diff.
+    // Net flows are stored per file; the index yields them in canonical file
+    // order so ordering differences (not just membership) show up in the diff.
     let network = db.get_gmod_network_index();
     let mut net_flows = Vec::new();
-    for (file_id, flow) in network.iter_send_flows() {
+    for (file_id, _, flow) in network.iter_send_flows() {
         net_flows.push(format!("send {}|{flow:?}", file_label(analysis, file_id)));
     }
     for (file_id, flow) in network.iter_receive_flows() {
