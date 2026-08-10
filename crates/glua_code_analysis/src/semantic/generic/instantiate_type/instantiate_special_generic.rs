@@ -281,6 +281,11 @@ fn instantiate_unpack_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
             for i in 1..10 {
                 let member_key = LuaMemberKey::Integer(i);
                 if let Some(member_info) = members.get(&member_key) {
+                    // Nothing to union: pin the escape value, not the seed.
+                    if member_info.is_empty() {
+                        multi_types.push(LuaType::Unknown);
+                        continue;
+                    }
                     let mut member_type = LuaType::Unknown;
                     for sub_member_info in member_info {
                         member_type = TypeOps::Union.apply(db, &member_type, &sub_member_info.typ);

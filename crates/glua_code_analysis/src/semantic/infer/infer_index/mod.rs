@@ -2048,6 +2048,11 @@ fn infer_tuple_member(
                 for typ in tuple_type.get_types() {
                     result = TypeOps::Union.apply(db, &result, typ);
                 }
+                if tuple_type.get_types().is_empty() {
+                    // Nothing contributed: pin the escape value, not the seed.
+                    // `result` still flows through the `Nil` union below.
+                    result = LuaType::Unknown;
+                }
 
                 let index_prefix_expr = match index_expr {
                     LuaIndexMemberExpr::TableField(_) => {

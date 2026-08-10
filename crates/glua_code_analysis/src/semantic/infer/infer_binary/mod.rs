@@ -85,6 +85,7 @@ fn infer_union_binary_expr(
     };
 
     let mut result = LuaType::Unknown;
+    let mut any_inferred = false;
     for ty in u.types() {
         // 只在实际调用时才 clone，而不是预先 clone
         let ty_result = if is_left_union {
@@ -95,7 +96,12 @@ fn infer_union_binary_expr(
 
         if let Ok(ty) = ty_result {
             result = TypeOps::Union.apply(db, &result, &ty);
+            any_inferred = true;
         }
+    }
+    // Every member failed: pin the escape value instead of returning the seed.
+    if !any_inferred {
+        return Some(LuaType::Unknown);
     }
     Some(result)
 }
