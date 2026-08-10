@@ -2498,6 +2498,10 @@ type HelperId = (FileId, String);
 
 const HELPER_REACH_SHARDS: usize = 32;
 
+/// [`helper_reaches_net_role`] `low` value for an answer that assumed nothing
+/// about a still-open helper.
+const NO_CYCLE: usize = usize::MAX;
+
 /// Which `net` role a wrapper expansion is being asked to reach.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum NetReachKind {
@@ -2543,13 +2547,14 @@ fn helper_reaches_net_role(
     helper: &HelperId,
     kind: NetReachKind,
     stack: &mut Vec<HelperId>,
-) -> (bool, bool) {
+) -> (bool, usize) {
     if let Some(cached) = ctx.reach.get(kind, helper) {
-        return (cached, false);
+        return (cached, NO_CYCLE);
     }
-    if stack.contains(helper) {
-        return (false, true);
+    if let Some(open_depth) = stack.iter().position(|open| open == helper) {
+        return (false, open_depth);
     }
+    let depth = stack.len();
     stack.push(helper.clone());
 
     let mut nested = Vec::new();
@@ -2571,7 +2576,7 @@ fn helper_reaches_net_role(
         nested.push(call);
     }
 
-    let mut cycle_cut = false;
+    let mut low = NO_CYCLE;
     if !reaches {
         for call in nested {
             let Some((nested_key, nested_block, nested_root, nested_file_id)) =
@@ -2583,7 +2588,7 @@ fn helper_reaches_net_role(
                 root: nested_root,
                 file_id: nested_file_id,
             };
-            let (nested_reaches, nested_cut) = helper_reaches_net_role(
+            let (nested_reaches, nested_low) = helper_reaches_net_role(
                 ctx,
                 &nested_site,
                 &nested_block,
@@ -2591,7 +2596,7 @@ fn helper_reaches_net_role(
                 kind,
                 stack,
             );
-            cycle_cut |= nested_cut;
+            low = low.min(nested_low);
             if nested_reaches {
                 reaches = true;
                 break;
@@ -2600,10 +2605,11 @@ fn helper_reaches_net_role(
     }
 
     stack.pop();
-    if reaches || !cycle_cut {
+    if reaches || low >= depth {
         ctx.reach.insert(kind, helper.clone(), reaches);
+        return (reaches, NO_CYCLE);
     }
-    (reaches, cycle_cut)
+    (reaches, low)
 }
 
 /// [`resolve_call_to_function_block`] memoised on [`NetCollectCtx`].
