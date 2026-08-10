@@ -498,7 +498,7 @@ fn resolve_closure_member_type(
                 .get(&closure_params.signature_id)
                 .ok_or(InferFailReason::None)?;
             let mut final_params = signature.get_type_params().to_vec();
-            let mut final_ret = LuaType::Unknown;
+            let mut final_ret = LuaType::Never;
 
             let mut multi_function_type = Vec::new();
             for typ in union_types.into_vec() {
@@ -572,6 +572,12 @@ fn resolve_closure_member_type(
                 }
 
                 final_ret = TypeOps::Union.apply(db, &final_ret, doc_func.get_ret());
+            }
+
+            // Nothing contributed a return type: pin the escape value instead of
+            // letting the seed reach the synthesized signature.
+            if final_ret.is_never() {
+                final_ret = LuaType::Unknown;
             }
 
             if !variadic_type.is_unknown()
