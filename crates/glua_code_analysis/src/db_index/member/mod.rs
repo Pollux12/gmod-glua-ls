@@ -228,10 +228,26 @@ impl LuaMemberIndex {
                 return MemberInsertAction::Noop;
             }
 
+            // The surviving write is the *latest defined* one, not the one
+            // that arrived last -- the rule the mixed-feature fall-through
+            // below already applies. Within a file the two agree, because
+            // the sort key leads with source position.
+            let candidates = || old_member_ids.iter().copied().chain(std::iter::once(id));
+            let winner = candidates()
+                .filter(|candidate| {
+                    !self.non_overwriting_assignment_members.contains(candidate)
+                        || !candidates().any(|other| {
+                            other.file_id != candidate.file_id
+                                && !self.non_overwriting_assignment_members.contains(&other)
+                        })
+                })
+                .max_by_key(|candidate| member_id_sort_key(*candidate))
+                .unwrap_or_else(|| latest_defined_member(&old_member_ids, id));
+
             return match item {
                 LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
                 LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
-                _ => MemberInsertAction::Store(LuaMemberIndexItem::One(id)),
+                _ => MemberInsertAction::Store(LuaMemberIndexItem::One(winner)),
             };
         }
 
@@ -2010,6 +2026,37 @@ mod tests {
             vec![second_member_id],
             "the visible slot is still last-writer-wins"
         );
+    }
+
+    /// `cityrp.progresshud = {}` is written by both `cl_progress_hud.lua` and
+    /// `sv_progress_hud.lua`. Only one can hold the visible slot, and the
+    /// global-path reconciliation re-homes whichever one that is onto the
+    /// elected table — so if arrival decided the survivor, a re-index moved the
+    /// member's owner on unchanged source.
+    #[test]
+    fn cross_file_assignment_writers_elect_the_visible_slot_by_source_order() {
+        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("cityrp"));
+        let earlier_member_id = make_index_member_id(FileId::new(1), 10);
+        let later_member_id = make_index_member_id(FileId::new(2), 20);
+
+        for arrival in [
+            [earlier_member_id, later_member_id],
+            [later_member_id, earlier_member_id],
+        ] {
+            let mut index = LuaMemberIndex::new();
+            for member_id in arrival {
+                index.add_member(
+                    owner.clone(),
+                    make_member_with_feature(member_id, "progresshud", LuaMemberFeature::FileDefine),
+                );
+            }
+
+            assert_eq!(
+                owner_member_ids(&index, &owner),
+                vec![later_member_id],
+                "the visible writer must not depend on which file was analysed first"
+            );
+        }
     }
 
     #[test]
