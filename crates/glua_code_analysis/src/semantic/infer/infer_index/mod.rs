@@ -14,7 +14,10 @@ use std::collections::HashSet;
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
     LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
-    compilation::{get_scripted_class_info_for_file, get_scripted_class_type_decl_id},
+    compilation::{
+        analyzer::dominating_guarded_table_bootstrap_range, get_scripted_class_info_for_file,
+        get_scripted_class_type_decl_id,
+    },
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMember, LuaMemberIndexItem, LuaMemberKey,
         LuaMergedTableType, LuaObjectType, LuaOperatorMetaMethod, LuaTupleType, LuaType,
@@ -81,6 +84,17 @@ pub fn infer_index_expr(
     index_expr: LuaIndexExpr,
     pass_flow: bool,
 ) -> InferResult {
+    // A dynamic-key read that a `t[k] = t[k] or {}` bootstrap dominates is
+    // answered by that statement.
+    if matches!(index_expr.get_index_key(), Some(LuaIndexKey::Expr(_)))
+        && let Some(bootstrap_range) = dominating_guarded_table_bootstrap_range(&index_expr)
+    {
+        return Ok(LuaType::TableConst(InFiled::new(
+            cache.get_file_id(),
+            bootstrap_range,
+        )));
+    }
+
     if pass_flow
         && let Some(populated_type) =
             try_get_cross_file_numeric_range_population_type_for_index(db, cache, &index_expr)

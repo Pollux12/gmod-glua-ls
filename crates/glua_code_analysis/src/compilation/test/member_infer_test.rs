@@ -3628,4 +3628,30 @@ end)
             "an ordered reassignment must still narrow to its own table, got {act_type:?}"
         );
     }
+
+    /// A read that a `t[k] = t[k] or {}` bootstrap dominates is answered by that
+    /// statement, not by whichever sibling file's writer is attached to the
+    /// owner at the moment the read is inferred.
+    #[test]
+    fn test_dominating_guarded_bootstrap_answers_its_own_dynamic_key_read() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_dyn/a.lua", "orders = orders or {}\n");
+        ws.def_file(
+            "lua/bootstrap_dyn/sibling.lua",
+            "local other = \"k\"\norders[other] = orders[other] or {}\n",
+        );
+        let file_id = ws.def_file(
+            "lua/bootstrap_dyn/b.lua",
+            "local function get(key)\n    orders[key] = orders[key] or {}\n    local held = orders[key]\n    return held\nend\n",
+        );
+
+        let held_type = local_name_type(&mut ws, file_id, "held");
+        let LuaType::TableConst(table) = &held_type else {
+            panic!("expected the dominating bootstrap's table, got {held_type:?}");
+        };
+        assert_eq!(
+            table.file_id, file_id,
+            "the read must resolve to its own file's bootstrap, got {held_type:?}"
+        );
+    }
 }

@@ -2257,6 +2257,48 @@ fn guarded_assignment_table_arm_range(
     (left_path == access_path).then(|| table_expr.get_range())
 }
 
+/// Range of the table arm of the nearest `t[k] = t[k] or {}` bootstrap that
+/// dominates a *read* of the same access path in the same function.
+pub(crate) fn dominating_guarded_table_bootstrap_range(
+    read_index_expr: &LuaIndexExpr,
+) -> Option<rowan::TextRange> {
+    let access_path = LuaVarExpr::cast(read_index_expr.syntax().clone())?.get_access_path()?;
+    let read_start = read_index_expr.get_range().start();
+    let mut node = read_index_expr.syntax().clone();
+
+    while let Some(parent) = node.parent() {
+        if LuaClosureExpr::cast(parent.clone()).is_some() {
+            return None;
+        }
+
+        // Only the *nearest* preceding write decides: a plain write between the
+        // bootstrap and the read supersedes it, so bail rather than answer.
+        let nearest_write = parent
+            .children()
+            .take_while(|sibling| sibling.text_range().end() <= read_start)
+            .filter_map(LuaAssignStat::cast)
+            .filter_map(|assign_stat| {
+                let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+                var_list
+                    .iter()
+                    .zip(expr_list.iter())
+                    .filter(|(var, _)| {
+                        var.get_access_path().as_deref() == Some(access_path.as_str())
+                    })
+                    .map(|(_, expr)| guarded_assignment_table_arm_range(expr, &access_path, true))
+                    .next_back()
+            })
+            .last();
+        if let Some(bootstrap_range) = nearest_write {
+            return bootstrap_range;
+        }
+
+        node = parent;
+    }
+
+    None
+}
+
 /// The type a self-referential guarded bootstrap (`x.y = x.y or {}`)
 /// assigns, derived from syntax alone.
 fn guarded_table_bootstrap_member_type(

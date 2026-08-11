@@ -13,7 +13,7 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
-pub(crate) use lua::infer_for_range_iter_expr_func;
+pub(crate) use lua::{dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func};
 
 use std::{
     collections::{HashMap, HashSet},
