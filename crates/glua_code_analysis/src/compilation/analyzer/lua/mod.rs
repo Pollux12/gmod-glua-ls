@@ -5,6 +5,7 @@ pub(in crate::compilation::analyzer) mod func_body;
 mod member_write_policy;
 mod metatable;
 mod module;
+mod settled_contributions;
 mod stats;
 
 use rustc_hash::FxHashMap;
@@ -24,6 +25,9 @@ use member_write_policy::{
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
+pub(in crate::compilation::analyzer) use settled_contributions::{
+    member_assignment_contribution_entries, rederive_contributed_member_assignments,
+};
 pub(in crate::compilation::analyzer) use stats::{
     get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
     is_guarded_table_assignment_index_expr, is_guarded_table_assignment_member,

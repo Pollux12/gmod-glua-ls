@@ -259,6 +259,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             common::reconcile_parked_global_path_members(db);
         }
 
+        // Runs last of the settled passes: it needs every member to have reached
+        // its final owner, because the writer set it merges is grouped by owner.
+        {
+            let _p = Profile::new("rederive_contributed_member_assignments");
+            let analyzed_files = context.analyzed_file_ids();
+            lua::rederive_contributed_member_assignments(db, &analyzed_files);
+        }
+
         // Net flows are collected last: the collector resolves wrappers through
         // signatures, receiver types and members, none of which exist yet when
         // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
@@ -274,6 +282,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         if std::env::var_os("GLUALS_PROFILE").is_some() {
+            eprintln!(
+                "[profile] member_assignment_contributions entries={}",
+                lua::member_assignment_contribution_entries(db),
+            );
             eprintln!(
                 "[profile] inferred_guard candidates={} candidate_attempts={} candidate_iterations={} early_published={} late_retries={} late_published={} pending={} early_signature_owners={} early_member_owners={}",
                 guard_candidates,
