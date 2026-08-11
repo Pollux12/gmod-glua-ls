@@ -11,7 +11,10 @@ use crate::{
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
     },
-    db_index::{LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType},
+    db_index::{
+        LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType,
+        MemberAssignmentContribution,
+    },
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
 use glua_parser::{
@@ -1676,11 +1679,16 @@ fn assign_merge_type_owner_and_expr_type(
     }
 
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
+    // What this write carries on its own, before any sibling merge widens it.
+    let mut source_type = None;
     if !dynamic_expr_key_member {
         if let Some(widened_type) =
             get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
         {
             expr_type = widened_type;
+        }
+        if matches!(type_owner, LuaTypeOwner::Member(_)) {
+            source_type = Some(expr_type.clone());
         }
 
         match get_cached_widened_member_assignment_type(
@@ -1738,6 +1746,17 @@ fn assign_merge_type_owner_and_expr_type(
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         let conditional_branch_assignment =
             is_member_assignment_in_conditional_branch(analyzer, *member_id);
+        if !dynamic_expr_key_member {
+            record_member_assignment_contribution(
+                analyzer,
+                *member_id,
+                &expr_type,
+                source_type,
+                guarded_table_assignment,
+                conditional_branch_assignment,
+                preserve_table_literals,
+            );
+        }
         if guarded_table_assignment {
             let already_preserved = analyzer
                 .db
@@ -1933,6 +1952,39 @@ fn get_cached_widened_member_assignment_type(
         MemberAssignmentWideningDecision::ClassBootstrapRejected => None,
         MemberAssignmentWideningDecision::NoPreviousAssignments => Some(None),
     }
+}
+
+/// Stores this write's own evidence so the settled re-derivation can merge the
+/// complete writer set. See [`MemberAssignmentContribution`].
+fn record_member_assignment_contribution(
+    analyzer: &mut LuaAnalyzer,
+    member_id: LuaMemberId,
+    bound_type: &LuaType,
+    source_type: Option<LuaType>,
+    guarded_bootstrap: bool,
+    conditional_branch: bool,
+    preserve_table_literals: bool,
+) {
+    let state_mask = member_assignment_state_mask(analyzer, member_id);
+    let doc_type = analyzer
+        .db
+        .get_type_index()
+        .get_type_cache(&member_id.into())
+        .filter(|cache| cache.is_doc())
+        .map(|cache| cache.as_type().clone());
+    let contribution = MemberAssignmentContribution {
+        state_mask,
+        bound_type: bound_type.clone(),
+        source_type: source_type.unwrap_or_else(|| bound_type.clone()),
+        doc_type,
+        guarded_bootstrap,
+        conditional_branch,
+        preserve_table_literals,
+    };
+    analyzer
+        .db
+        .get_member_index_mut()
+        .record_member_assignment_contribution(member_id, contribution);
 }
 
 fn record_member_assignment_widening_cache(

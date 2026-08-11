@@ -1,3 +1,4 @@
+mod assignment_contribution;
 mod lua_member;
 mod lua_member_feature;
 mod lua_member_item;
@@ -10,6 +11,10 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use super::traits::LuaIndex;
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+pub use assignment_contribution::{
+    MemberAssignmentContribution, MemberAssignmentContributionKey,
+    MemberAssignmentContributionStore,
+};
 pub use lua_member::{LuaMember, LuaMemberId, LuaMemberKey};
 pub use lua_member_feature::LuaMemberFeature;
 pub use lua_member_item::LuaMemberIndexItem;
@@ -39,6 +44,9 @@ pub struct LuaMemberIndex {
     deferred_index_expr_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
+    /// Per-writer evidence for the member assignment widening merge. See
+    /// [`MemberAssignmentContribution`].
+    assignment_contributions: MemberAssignmentContributionStore,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -81,7 +89,25 @@ impl LuaMemberIndex {
             deferred_index_expr_members: HashSet::new(),
             function_scope_ranges: HashMap::new(),
             member_function_scope_ranges: HashMap::new(),
+            assignment_contributions: MemberAssignmentContributionStore::default(),
         }
+    }
+
+    /// Records this write's own evidence for the settled widening re-derivation.
+    pub fn record_member_assignment_contribution(
+        &mut self,
+        member_id: LuaMemberId,
+        contribution: MemberAssignmentContribution,
+    ) -> Option<()> {
+        let owner = self.member_current_owner.get(&member_id)?.clone();
+        let key = self.get_member(&member_id)?.get_key().clone();
+        self.assignment_contributions
+            .record(owner, key, member_id, contribution);
+        Some(())
+    }
+
+    pub fn member_assignment_contributions(&self) -> &MemberAssignmentContributionStore {
+        &self.assignment_contributions
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
@@ -1295,6 +1321,7 @@ impl LuaIndex for LuaMemberIndex {
         }
         let removed: HashSet<FileId> = file_ids.iter().copied().collect();
         self.remove_files_members_from_owner_key_indexes(&removed);
+        self.assignment_contributions.remove_files(&removed);
         self.member_function_scope_ranges
             .retain(|member_id, _| !removed.contains(&member_id.file_id));
     }
@@ -1314,6 +1341,7 @@ impl LuaIndex for LuaMemberIndex {
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
         self.member_function_scope_ranges.clear();
+        self.assignment_contributions.clear();
     }
 }
 
