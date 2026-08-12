@@ -2,6 +2,112 @@
 mod tests {
     use crate::{DiagnosticCode, VirtualWorkspace};
 
+    /// A literal completed by the statements right after it is complete, on every
+    /// path that reaches the check. The last two must keep reporting: nothing
+    /// completes them before the value is used.
+    #[test]
+    fn literal_completed_before_first_use_is_complete() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairT
+            ---@field exterior string
+            ---@field interior string
+
+            ---@type pairT
+            local p = {}
+            p.exterior = "a"
+            p.interior = "b"
+        "#
+            ),
+            "---@type path"
+        );
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairF
+            ---@field exterior string
+            ---@field interior string
+
+            ---@class holderF
+            ---@field portals pairF
+            local H = {}
+
+            function H:make()
+                self.portals = {}
+                self.portals.exterior = "a"
+                self.portals.interior = "b"
+            end
+        "#
+            ),
+            "declared-field path"
+        );
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairL
+            ---@field exterior string
+            ---@field interior string
+
+            ---@param v pairL
+            local function take(v) return v end
+
+            local t = {}
+            t.exterior = "a"
+            t.interior = "b"
+            take(t)
+        "#
+            ),
+            "plain local path"
+        );
+
+        assert!(
+            !ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairN
+            ---@field exterior string
+            ---@field interior string
+
+            ---@type pairN
+            local p = {}
+            p.exterior = "a"
+        "#
+            ),
+            "still missing `interior`"
+        );
+
+        assert!(
+            !ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairB
+            ---@field exterior string
+            ---@field interior string
+
+            ---@param cond boolean
+            local function build(cond)
+                ---@type pairB
+                local p = {}
+                if cond then
+                    p.exterior = "a"
+                    p.interior = "b"
+                end
+                return p
+            end
+        "#
+            ),
+            "a nested branch does not always run"
+        );
+    }
+
     #[test]
     fn test_missing_fields() {
         let mut ws = VirtualWorkspace::new();

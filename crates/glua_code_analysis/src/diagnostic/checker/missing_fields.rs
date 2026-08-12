@@ -3,7 +3,10 @@ use std::{
     sync::Arc,
 };
 
-use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr, LuaTableField};
+use glua_parser::{
+    LuaAssignStat, LuaAstNode, LuaExpr, LuaIndexKey, LuaStat, LuaTableExpr, LuaTableField,
+    LuaVarExpr, PathTrait,
+};
 
 use crate::{
     DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
@@ -161,27 +164,117 @@ fn check_table_expr(
         _ => return Some(()),
     };
 
-    let missing_fields = required_fields
+    let mut missing: HashSet<&str> = required_fields
         .difference(&current_fields)
-        .map(|s| format!("`{}`", s))
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Some(());
+    }
+
+    remove_fields_completed_after(expr, &mut missing);
+    if missing.is_empty() {
+        return Some(());
+    }
+
+    let missing_fields = missing
+        .iter()
+        .map(|name| format!("`{}`", name))
         .sorted()
         .join(", ");
 
-    if !missing_fields.is_empty() {
-        context.add_diagnostic(
-            DiagnosticCode::MissingFields,
-            expr.get_range(),
-            format!(
-                "Missing required fields in type `{typ}`: {fields}",
-                typ = humanize_lint_type(db, &table_type),
-                fields = missing_fields
-            )
-            .to_string(),
-            None,
-        );
+    context.add_diagnostic(
+        DiagnosticCode::MissingFields,
+        expr.get_range(),
+        format!(
+            "Missing required fields in type `{typ}`: {fields}",
+            typ = humanize_lint_type(db, &table_type),
+            fields = missing_fields
+        )
+        .to_string(),
+        None,
+    );
+
+    Some(())
+}
+
+/// A literal is often written empty and filled in by the statements after it, so
+/// the fields those statements assign onto the same target are not missing:
+/// `self.portals = {}` followed by `self.portals.exterior = ...` is complete.
+///
+/// Restricted to the literal's own block. An assignment nested in a branch does
+/// not always run, and the report is still correct there.
+fn remove_fields_completed_after(expr: &LuaTableExpr, missing: &mut HashSet<&str>) -> Option<()> {
+    let stat = expr.ancestors::<LuaStat>().next()?;
+    let target = assigned_target_path(expr, &stat)?;
+
+    let mut next = stat.syntax().next_sibling();
+    while let Some(node) = next {
+        if missing.is_empty() {
+            break;
+        }
+
+        let mut written_prefixes = Vec::new();
+        if let Some(assign) = LuaAssignStat::cast(node.clone()) {
+            for var in assign.get_var_and_expr_list().0 {
+                let LuaVarExpr::IndexExpr(index) = var else {
+                    continue;
+                };
+                let Some(prefix) = index.get_prefix_expr() else {
+                    continue;
+                };
+                if LuaVarExpr::cast(prefix.syntax().clone())
+                    .and_then(|prefix| prefix.get_access_path())
+                    .as_deref()
+                    != Some(target.as_str())
+                {
+                    continue;
+                }
+                written_prefixes.push(prefix.syntax().clone());
+                if let Some(key) = index.get_index_key() {
+                    missing.remove(key.get_path_part().as_str());
+                }
+            }
+        }
+
+        // Anything else touching the target consumes it while it is still
+        // incomplete, so later writes no longer make the literal complete.
+        let escapes = node
+            .descendants()
+            .filter_map(LuaVarExpr::cast)
+            .any(|var| {
+                var.get_access_path().as_deref() == Some(target.as_str())
+                    && !written_prefixes.contains(var.syntax())
+            });
+        if escapes {
+            break;
+        }
+
+        next = node.next_sibling();
     }
 
     Some(())
+}
+
+/// The path the literal is assigned to, e.g. `self.portals` or `cfg`.
+fn assigned_target_path(expr: &LuaTableExpr, stat: &LuaStat) -> Option<String> {
+    match stat {
+        LuaStat::AssignStat(assign) => {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            let index = exprs
+                .iter()
+                .position(|value| value.syntax() == expr.syntax())?;
+            vars.get(index)?.get_access_path()
+        }
+        LuaStat::LocalStat(local) => Some(
+            local
+                .get_local_name_by_value(LuaExpr::TableExpr(expr.clone()))?
+                .get_name_token()?
+                .get_name_text()
+                .to_string(),
+        ),
+        _ => None,
+    }
 }
 
 pub fn precompute_missing_required_fields(db: &DbIndex) -> PrecomputedMissingRequiredFields {
