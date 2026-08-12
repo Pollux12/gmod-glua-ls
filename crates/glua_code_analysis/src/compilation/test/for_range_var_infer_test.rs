@@ -524,4 +524,51 @@ mod test {
         assert!(!ws.expr_ty("key_out").contain_tpl());
         assert!(!ws.expr_ty("value_out").contain_tpl());
     }
+
+    /// The container is declared in a file analysed *after* the loop, so the
+    /// iteration variable starts as a placeholder and is repaired once the
+    /// member map settles. A plain local copying it — taken after a conditional
+    /// early exit, which is what splits the copy off into its own flow branch —
+    /// has to be repaired with it. Copying the placeholder instead left the
+    /// alias at `nil` while the variable it copied resolved correctly, so the
+    /// same value held two incompatible types two lines apart.
+    #[test]
+    fn pairs_alias_after_early_exit_matches_the_loop_variable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def_files(vec![
+            (
+                "a_use.lua",
+                r#"
+                for k, def in pairs(MCP.KNOBS) do
+                    if k == "" then return end
+
+                    local alias = def
+
+                    def_out = def
+                    alias_out = alias
+                end
+                "#,
+            ),
+            (
+                "z_decl.lua",
+                r#"
+                MCP = {}
+
+                ---@type table<string, { a: string }>
+                MCP.KNOBS = {}
+                "#,
+            ),
+        ]);
+
+        let def_ty = ws.expr_ty("def_out");
+        let alias_ty = ws.expr_ty("alias_out");
+
+        // Guards against passing vacuously: if the container stopped resolving,
+        // both sides would agree on `unknown` and the assertion below would hold
+        // for the wrong reason.
+        assert_eq!(ws.humanize_type(def_ty.clone()), "{ a: string }");
+        assert_eq!(ws.humanize_type(alias_ty.clone()), "{ a: string }");
+        assert_eq!(def_ty, alias_ty);
+    }
 }
