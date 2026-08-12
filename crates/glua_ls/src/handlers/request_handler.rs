@@ -96,11 +96,19 @@ fn extract_uri_from_value(value: &serde_json::Value) -> Option<Uri> {
     .find_map(|uri| Uri::from_str(uri.as_str()?).ok())
 }
 
+fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
+    Some(Response::new_err(
+        id,
+        lsp_server::ErrorCode::ContentModified as i32,
+        "content modified".to_owned(),
+    ))
+}
+
 macro_rules! dispatch_request {
     ($request:expr, $context:expr, {
         $($req_type:ty => $handler:expr),* $(,)?
-    }, content_modified_if_dirty: {
-        $($dirty_req_type:ty => $dirty_handler:expr),* $(,)?
+    }, content_modified_if_client_retries: {
+        $($retry_req_type:ty => $retry_handler:expr),* $(,)?
     }) => {
         match $request.method.as_str() {
             $(
@@ -117,22 +125,43 @@ macro_rules! dispatch_request {
                 }
             )*
             $(
-                <$dirty_req_type>::METHOD => {
-                    if let Ok((id, params)) = $request.extract::<<$dirty_req_type as LspRequest>::Params>(<$dirty_req_type>::METHOD) {
+                <$retry_req_type>::METHOD => {
+                    if let Ok((id, params)) = $request.extract::<<$retry_req_type as LspRequest>::Params>(<$retry_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
-                        let task_metadata = request_task_metadata(<$dirty_req_type>::METHOD, &params);
+                        let task_metadata = request_task_metadata(<$retry_req_type>::METHOD, &params);
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // When changes are pending reindex, return ContentModified
-                            // so the client keeps its previous results instead of
-                            // clearing them (which causes flickering / layout shifts).
-                            if snapshot.debounced_analysis().is_dirty() {
-                                return Some(Response::new_err(
-                                    id,
-                                    lsp_server::ErrorCode::ContentModified as i32,
-                                    "content modified".to_owned(),
-                                ));
+                            // ContentModified is only useful to a client that
+                            // re-sends afterwards. Anyone else reads it as "no
+                            // result" and clears the feature, so they get
+                            // whatever can be computed from the current state.
+                            if !snapshot
+                                .lsp_features()
+                                .retries_on_content_modified(<$retry_req_type>::METHOD)
+                            {
+                                let result = $retry_handler(snapshot, params, cancel_token).await;
+                                return Some(Response::new_ok(id, result));
                             }
-                            let result = $dirty_handler(snapshot, params, cancel_token).await;
+
+                            // A pending reindex means the index still describes
+                            // the previous text, and unresolved symbols are
+                            // silently dropped from the result rather than
+                            // reported. Answering would repaint the file with a
+                            // near-empty result; the refresh after reindex
+                            // drives the corrective re-pull instead.
+                            if snapshot.debounced_analysis().is_dirty() {
+                                return content_modified(id);
+                            }
+
+                            let result =
+                                $retry_handler(snapshot.clone(), params, cancel_token).await;
+
+                            // An edit landed while we worked, so this result
+                            // describes neither the text the client asked
+                            // about nor the text it now holds.
+                            if snapshot.debounced_analysis().is_dirty() {
+                                return content_modified(id);
+                            }
+
                             Some(Response::new_ok(id, result))
                         }).await;
                         return Ok(());
@@ -196,10 +225,10 @@ pub async fn on_request_handler(
         CallHierarchyPrepare => on_prepare_call_hierarchy_handler,
         CallHierarchyIncomingCalls => on_incoming_calls_handler,
         CallHierarchyOutgoingCalls => on_outgoing_calls_handler,
-        SemanticTokensFullRequest => on_semantic_token_handler,
         DocumentDiagnosticRequest => on_pull_document_diagnostic,
         WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
-    }, content_modified_if_dirty: {
+    }, content_modified_if_client_retries: {
+        SemanticTokensFullRequest => on_semantic_token_handler,
     });
 
     Ok(())

@@ -32,7 +32,11 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
-    // Wait for the parse, but not for the reindex.
+    // Index freshness is gated in `dispatch_request!`, but only for clients
+    // that re-send on ContentModified. Everyone else reaches here on any
+    // state, so still refuse to build against a superseded tree: token
+    // offsets are relative, and every one past the edit would land on the
+    // wrong word.
     if !context
         .wait_until_latest_document_version_applied(&uri, &cancel_token)
         .await
@@ -96,6 +100,26 @@ pub fn semantic_token(
     }))
 }
 
+pub struct SemanticTokenCapabilities;
+
+impl RegisterCapabilities for SemanticTokenCapabilities {
+    fn register_capabilities(
+        server_capabilities: &mut ServerCapabilities,
+        _client_capabilities: &ClientCapabilities,
+    ) {
+        server_capabilities.semantic_tokens_provider = Some(
+            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
+                legend: SemanticTokensLegend {
+                    token_modifiers: SEMANTIC_TOKEN_MODIFIERS.to_vec(),
+                    token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
+                },
+                full: Some(SemanticTokensFullOptions::Bool(true)),
+                ..Default::default()
+            }),
+        );
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::on_semantic_token_handler;
@@ -154,25 +178,5 @@ mod tests {
                 .expect("handler should join successfully");
             Ok(())
         })
-    }
-}
-
-pub struct SemanticTokenCapabilities;
-
-impl RegisterCapabilities for SemanticTokenCapabilities {
-    fn register_capabilities(
-        server_capabilities: &mut ServerCapabilities,
-        _client_capabilities: &ClientCapabilities,
-    ) {
-        server_capabilities.semantic_tokens_provider = Some(
-            SemanticTokensServerCapabilities::SemanticTokensOptions(SemanticTokensOptions {
-                legend: SemanticTokensLegend {
-                    token_modifiers: SEMANTIC_TOKEN_MODIFIERS.to_vec(),
-                    token_types: SEMANTIC_TOKEN_TYPES.to_vec(),
-                },
-                full: Some(SemanticTokensFullOptions::Bool(true)),
-                ..Default::default()
-            }),
-        );
     }
 }

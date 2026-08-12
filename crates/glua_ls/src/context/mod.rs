@@ -142,17 +142,20 @@ fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     )
 }
 
-fn cancel_error_code(method: &str) -> ErrorCode {
-    // LSP 3.17 implementation considerations: "Use ContentModified only
-    // when the server's own internal state invalidates an in-flight
-    // result." A cancelled semantic token request is exactly that —
-    // `didChange` fired `cancel_all_requests_except`, so the text the
-    // tokens describe is gone. Clients must not surface ContentModified to
-    // the user and may re-request, which keeps the previously painted
-    // tokens on screen until fresh ones arrive.
-    match method {
-        "textDocument/semanticTokens/full" => ErrorCode::ContentModified,
-        _ => ErrorCode::RequestCanceled,
+fn cancel_error_code(features: &LspFeatures, method: &str) -> ErrorCode {
+    // LSP 3.17 implementation considerations: "Use ContentModified only when
+    // the server's own internal state invalidates an in-flight result." A
+    // cancelled request is exactly that — `didChange` fired
+    // `cancel_all_requests_except`, so the text it describes is gone.
+    //
+    // Only worth saying to a client that re-sends the request afterwards.
+    // `retryOnContentModified` is the client's own per-method declaration of
+    // that; for anything absent from it, ContentModified reads as "no result"
+    // and clears the feature's UI, so those keep RequestCanceled.
+    if features.retries_on_content_modified(method) {
+        ErrorCode::ContentModified
+    } else {
+        ErrorCode::RequestCanceled
     }
 }
 
@@ -279,6 +282,7 @@ impl ServerContext {
 
         let sender = self.conn.sender.clone();
         let requests = self.requests.clone();
+        let lsp_features = self.inner.lsp_features.clone();
 
         tokio::spawn(async move {
             let res = exec(cancel_token.clone()).await;
@@ -295,7 +299,7 @@ impl ServerContext {
                 } else {
                     let response = Response::new_err(
                         req_id.clone(),
-                        cancel_error_code(&request_method) as i32,
+                        cancel_error_code(&lsp_features, &request_method) as i32,
                         "cancel".to_string(),
                     );
                     let _ = sender.send(Message::Response(response));
@@ -374,8 +378,8 @@ impl ServerContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        RequestTaskMetadata, ServerContext, cancel_error_code, keep_stale_editor_data_on_cancel,
-        should_send_stale_response_on_cancel,
+        LspFeatures, RequestTaskMetadata, ServerContext, cancel_error_code,
+        keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
     };
     use googletest::prelude::*;
     use lsp_server::{ErrorCode, RequestId, Response};
@@ -415,12 +419,34 @@ mod tests {
             keep_stale_editor_data_on_cancel("textDocument/semanticTokens/full"),
             eq(false)
         )?;
+
+        // ContentModified only for what the client says it re-sends. Inlay
+        // hints are absent from VS Code's list, and answering them with it
+        // clears the hints instead of preserving them.
+        let features = LspFeatures::new(
+            serde_json::from_value(json!({
+                "general": {
+                    "staleRequestSupport": {
+                        "cancel": true,
+                        "retryOnContentModified": ["textDocument/semanticTokens/full"],
+                    }
+                }
+            }))
+            .expect("capabilities should deserialize"),
+        );
         verify_that!(
-            cancel_error_code("textDocument/semanticTokens/full") as i32,
+            cancel_error_code(&features, "textDocument/semanticTokens/full") as i32,
             eq(ErrorCode::ContentModified as i32)
         )?;
         verify_that!(
-            cancel_error_code("textDocument/inlayHint") as i32,
+            cancel_error_code(&features, "textDocument/inlayHint") as i32,
+            eq(ErrorCode::RequestCanceled as i32)
+        )?;
+        verify_that!(
+            cancel_error_code(
+                &LspFeatures::new(ClientCapabilities::default()),
+                "textDocument/semanticTokens/full"
+            ) as i32,
             eq(ErrorCode::RequestCanceled as i32)
         )?;
         Ok(())
