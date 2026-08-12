@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 
 use lsp_types::{
-    FullDocumentDiagnosticReport, WorkspaceDiagnosticParams, WorkspaceDiagnosticReport,
-    WorkspaceFullDocumentDiagnosticReport,
+    FullDocumentDiagnosticReport, UnchangedDocumentDiagnosticReport, WorkspaceDiagnosticParams,
+    WorkspaceDiagnosticReport, WorkspaceFullDocumentDiagnosticReport,
+    WorkspaceUnchangedDocumentDiagnosticReport,
 };
 use tokio_util::sync::CancellationToken;
 
+use super::diagnostic_result_id;
 use crate::context::{ServerContextSnapshot, WorkspaceDiagnosticLevel};
 
 pub async fn on_pull_workspace_diagnostic(
     context: ServerContextSnapshot,
-    _: WorkspaceDiagnosticParams,
+    params: WorkspaceDiagnosticParams,
     token: CancellationToken,
 ) -> WorkspaceDiagnosticReport {
     // Wait for any pending/in-flight document changes to finish before diagnosing.
@@ -79,20 +81,43 @@ pub async fn on_pull_workspace_diagnostic(
             .collect::<HashMap<_, _>>()
     };
 
+    // A full report replaces the client's diagnostics for that URI, so report
+    // `unchanged` for every file whose set still matches the id the client
+    // holds. Without this every workspace pull repaints the whole workspace.
+    let previous_result_ids: HashMap<_, _> = params
+        .previous_result_ids
+        .into_iter()
+        .map(|previous| (previous.uri, previous.value))
+        .collect();
+
     WorkspaceDiagnosticReport {
         items: file_diagnostics
             .into_iter()
             .map(|(uri, diagnostics)| {
+                let version = open_file_versions
+                    .get(&uri)
+                    .copied()
+                    .flatten()
+                    .map(i64::from);
+                let result_id = diagnostic_result_id(&diagnostics);
+
+                if previous_result_ids.get(&uri) == Some(&result_id) {
+                    return WorkspaceUnchangedDocumentDiagnosticReport {
+                        version,
+                        uri,
+                        unchanged_document_diagnostic_report: UnchangedDocumentDiagnosticReport {
+                            result_id,
+                        },
+                    }
+                    .into();
+                }
+
                 WorkspaceFullDocumentDiagnosticReport {
-                    version: open_file_versions
-                        .get(&uri)
-                        .copied()
-                        .flatten()
-                        .map(i64::from),
+                    version,
                     uri,
                     full_document_diagnostic_report: FullDocumentDiagnosticReport {
                         items: diagnostics,
-                        result_id: None,
+                        result_id: Some(result_id),
                     },
                 }
                 .into()

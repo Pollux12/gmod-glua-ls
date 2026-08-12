@@ -37,7 +37,7 @@ use crate::context::snapshot::ServerContextInner;
 // ## Global Lock Order (Low to High Priority):
 // 1. **diagnostic_tokens** (Mutex) - File diagnostic task tokens
 // 2. **workspace_diagnostic_token** (Mutex) - Workspace diagnostic task token
-// 3. **cached_file_diagnostics / recently_edited_lines** (Mutex) - UI state
+// 3. **cached_file_diagnostics** (Mutex) - UI state
 // 4. **update_token** (Mutex) - Reindex/config update token
 // 5. **analysis** (RwLock - READ) - Read-only access to EmmyLuaAnalysis
 // 6. **workspace_manager** (RwLock - READ) - Read-only access to WorkspaceManager
