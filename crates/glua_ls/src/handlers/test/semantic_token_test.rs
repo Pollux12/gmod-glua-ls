@@ -1535,7 +1535,10 @@ function my_global.action() end
 
         // VFS-only update: the tree offsets shift while the index still points
         // at the old ones, exactly the state the handler now serves from.
-        let uri = ws.analysis.get_uri(file_id).expect("file should have a uri");
+        let uri = ws
+            .analysis
+            .get_uri(file_id)
+            .expect("file should have a uri");
         ws.analysis
             .update_file_text_only(
                 &uri,
