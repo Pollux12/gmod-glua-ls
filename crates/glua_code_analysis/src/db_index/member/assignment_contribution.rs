@@ -2,7 +2,7 @@ use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use super::{LuaMemberId, LuaMemberKey, LuaMemberOwner};
-use crate::{FileId, GmodStateMask, LuaType};
+use crate::{FileId, LuaType};
 
 /// The group a member assignment contributes its evidence to.
 pub type MemberAssignmentContributionKey = (LuaMemberOwner, LuaMemberKey);
@@ -10,7 +10,6 @@ pub type MemberAssignmentContributionKey = (LuaMemberOwner, LuaMemberKey);
 /// What one writer of `owner.key = value` knows on its own.
 #[derive(Debug, Clone)]
 pub struct MemberAssignmentContribution {
-    pub state_mask: GmodStateMask,
     /// What this write bound — what a sibling reads out of the type cache.
     pub bound_type: LuaType,
     /// What this write carried before it was merged with any sibling.
@@ -18,8 +17,6 @@ pub struct MemberAssignmentContribution {
     pub doc_type: Option<LuaType>,
     /// Taken from syntax at the write, so it does not change with batch phase.
     pub guarded_bootstrap: bool,
-    /// Taken from syntax at the write, so it does not change with batch phase.
-    pub conditional_branch: bool,
     /// Whether the write asked the merge to keep table literals unwidened.
     pub preserve_table_literals: bool,
 }

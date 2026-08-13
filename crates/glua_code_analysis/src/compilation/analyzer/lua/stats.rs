@@ -1748,7 +1748,6 @@ fn assign_merge_type_owner_and_expr_type(
                 &expr_type,
                 source_type,
                 guarded_table_assignment,
-                conditional_branch_assignment,
                 preserve_table_literals,
             );
         }
@@ -1957,10 +1956,8 @@ fn record_member_assignment_contribution(
     bound_type: &LuaType,
     source_type: Option<LuaType>,
     guarded_bootstrap: bool,
-    conditional_branch: bool,
     preserve_table_literals: bool,
 ) {
-    let state_mask = member_assignment_state_mask(analyzer, member_id);
     let doc_type = analyzer
         .db
         .get_type_index()
@@ -1968,12 +1965,10 @@ fn record_member_assignment_contribution(
         .filter(|cache| cache.is_doc())
         .map(|cache| cache.as_type().clone());
     let contribution = MemberAssignmentContribution {
-        state_mask,
         bound_type: bound_type.clone(),
         source_type: source_type.unwrap_or_else(|| bound_type.clone()),
         doc_type,
         guarded_bootstrap,
-        conditional_branch,
         preserve_table_literals,
     };
     analyzer
