@@ -162,7 +162,8 @@ impl Vfs {
     /// Whether `data` parses to the same significant token stream (kind,
     /// range and text) as the tree currently stored for `file_id`. Comments
     /// count as significant — annotations live in them — so only pure
-    /// whitespace changes that shift no offset (e.g.
+    /// whitespace changes that shift no offset (e.g. a trailing newline at
+    /// end of file) can match.
     pub fn content_semantically_matches(&mut self, file_id: FileId, data: &str) -> bool {
         if !self.tree_map.contains_key(&file_id) {
             return false;

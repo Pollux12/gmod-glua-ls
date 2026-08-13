@@ -112,7 +112,8 @@ const NIL_RANK: u8 = 1;
 
 /// Rank within the "carries no type information" band, ordered by how much
 /// the value could be: `never` (nothing) through `any` (anything). `None`
-/// means the type carries information, i.e.
+/// means the type carries information, i.e. it names an actual type and so
+/// sits outside this band entirely.
 pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     match typ {
         LuaType::Never => Some(0),
