@@ -1042,27 +1042,13 @@ trait AnalysisPipeline {
 }
 
 fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    if std::env::var_os("GLUALS_PROFILE_PIPELINE").is_some() {
-        let t = std::time::Instant::now();
-        T::analyze(db, context);
-        eprintln!(
-            "  [pipeline] {:<44} {:.3}s ({} files)",
-            std::any::type_name::<T>()
-                .rsplit("::")
-                .next()
-                .unwrap_or_default(),
-            t.elapsed().as_secs_f64(),
-            context.tree_list.len()
-        );
-        crate::profile::phase_report(
-            std::any::type_name::<T>()
-                .rsplit("::")
-                .next()
-                .unwrap_or_default(),
-        );
-        return;
-    }
+    let name = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or_default();
+    let _p = Profile::new(name);
     T::analyze(db, context);
+    crate::profile::phase_report(name);
 }
 
 fn module_analyze(
@@ -1690,6 +1676,9 @@ mod union_widening_tests {
 
     #[test]
     fn rejects_a_non_union_settled_type() {
-        assert!(!union_widens_cached_type(&LuaType::Number, &LuaType::Number));
+        assert!(!union_widens_cached_type(
+            &LuaType::Number,
+            &LuaType::Number
+        ));
     }
 }

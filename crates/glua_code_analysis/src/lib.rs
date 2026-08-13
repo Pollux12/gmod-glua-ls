@@ -512,19 +512,6 @@ impl EmmyLuaAnalysis {
             return Some(file_id);
         }
 
-        let profile_edit = std::env::var_os("GLUALS_PROFILE_EDIT").is_some();
-        let mut lap_start = std::time::Instant::now();
-        let mut lap = move |label: &str| {
-            if profile_edit {
-                let now = std::time::Instant::now();
-                eprintln!(
-                    "  [edit-profile] {label}: {:.3}s",
-                    (now - lap_start).as_secs_f64()
-                );
-                lap_start = now;
-            }
-        };
-
         let is_removed = text.is_none();
         let removed_file_ids = existing_file_id
             .filter(|_| is_removed)
@@ -535,14 +522,12 @@ impl EmmyLuaAnalysis {
         if let Some(reindex_file_ids) = &mut existing_reindex_file_ids {
             self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
         }
-        lap("expand");
         let old_guard_fact_file_ids = existing_reindex_file_ids
             .iter()
             .flatten()
             .copied()
             .collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-        lap("guard_snapshot");
 
         let file_id = self
             .compilation
@@ -554,7 +539,6 @@ impl EmmyLuaAnalysis {
         let reindex_file_ids = existing_reindex_file_ids
             .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
         self.compilation.remove_index(reindex_file_ids.clone());
-        lap("remove_index");
 
         let update_file_ids = reindex_file_ids
             .iter()
@@ -563,9 +547,7 @@ impl EmmyLuaAnalysis {
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
             self.compilation.update_index(update_file_ids.clone());
-            lap("update_index");
             self.stabilize_cross_file_type_caches(&update_file_ids);
-            lap("stabilize_type_caches");
         }
         self.compilation
             .get_db_mut()
@@ -578,9 +560,7 @@ impl EmmyLuaAnalysis {
             &reindex_file_ids,
             &incremental_source_file_ids,
         );
-        lap("guard_reference_reindex");
         self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
-        lap("param_consumer_reindex");
 
         Some(file_id)
     }
@@ -829,12 +809,9 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let profile = std::env::var_os("GLUALS_PROFILE_EXPAND").is_some();
-        let expand_start = std::time::Instant::now();
-        let mut rounds = 0usize;
+        let _p = Profile::new("expand_reindex_file_ids");
         let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
         loop {
-            rounds += 1;
             // Include/require callers must be rebuilt with their changed target.
             // Traverse the indexed dependency graph; never rescan workspace ASTs.
             let dependency_dependents = self
@@ -887,14 +864,6 @@ impl EmmyLuaAnalysis {
 
         let mut expanded = expanded.into_iter().collect::<Vec<_>>();
         expanded.sort_unstable();
-        if profile {
-            eprintln!(
-                "  [expand] {} files in {} rounds, {:.3}s",
-                expanded.len(),
-                rounds,
-                expand_start.elapsed().as_secs_f64()
-            );
-        }
         expanded
     }
 

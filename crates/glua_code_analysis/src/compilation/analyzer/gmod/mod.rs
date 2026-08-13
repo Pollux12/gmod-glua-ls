@@ -157,16 +157,8 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let tree_list = context.tree_list.clone();
         let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
-        let profile_pre = std::env::var_os("GLUALS_PROFILE_PIPELINE").is_some();
-        let t_scope = std::time::Instant::now();
         // Pre-compute scripted class scope for all files (compile globs once)
         let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
-        if profile_pre {
-            eprintln!(
-                "    [pre] scoped_scope_files {:.3}s",
-                t_scope.elapsed().as_secs_f64()
-            );
-        }
 
         let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
@@ -189,15 +181,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // syntax tree of every file that owns a signature. Resolving it
         // against the db-level cache first keeps that work proportional to
         // the files actually re-analysed.
-        let t_roles = std::time::Instant::now();
-        let (helper_registry, annotated_global_call_roles, rescanned) =
-            build_call_roles_and_registry(db);
-        if profile_pre {
-            eprintln!(
-                "    [pre] helper scan {:.3}s ({rescanned} files rescanned)",
-                t_roles.elapsed().as_secs_f64()
-            );
-        }
+        let (helper_registry, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
         // Publish the canonical op-name table so diagnostics and completions can
         // name a net op they have no call expression for.
         db.get_gmod_network_index_mut()
@@ -865,10 +849,10 @@ pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &AnalyzeContext
         .map(|prefix| format!("{prefix}:"))
         .collect();
     let (_, annotated_global_call_roles, _) = {
-        let _p = Profile::new("  ccs: build_call_roles_and_registry");
+        let _p = Profile::new("ccs: build_call_roles_and_registry");
         build_call_roles_and_registry(db)
     };
-    let _p = Profile::new("  ccs: walk");
+    let _p = Profile::new("ccs: walk");
     collect_annotated_gmod_call_sites_with(
         db,
         context,
@@ -1564,8 +1548,9 @@ fn collect_network_flow_metadata(
         resolve_memo,
         reach,
     };
-    let mut send_flows =
-        crate::profile::phase("gmodnet/send_direct", || collect_net_send_flows(&mut ctx, &site));
+    let mut send_flows = crate::profile::phase("gmodnet/send_direct", || {
+        collect_net_send_flows(&mut ctx, &site)
+    });
     send_flows.extend(crate::profile::phase("gmodnet/send_wrapped", || {
         collect_wrapped_net_send_flows(&mut ctx, &site)
     }));
