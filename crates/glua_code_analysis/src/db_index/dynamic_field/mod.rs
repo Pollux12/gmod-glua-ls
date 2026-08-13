@@ -12,15 +12,6 @@ pub enum DynamicFieldOwner {
     Table(InFiled<TextRange>),
 }
 
-impl DynamicFieldOwner {
-    fn as_member_owner(&self) -> LuaMemberOwner {
-        match self {
-            Self::Type(id) => LuaMemberOwner::Type(id.clone()),
-            Self::Table(range) => LuaMemberOwner::Element(range.clone()),
-        }
-    }
-}
-
 /// True when a wildcard (computed-key) assignment is the *only* thing known
 /// about `owner`: no named dynamic fields and no statically-known named
 /// members.
@@ -36,8 +27,12 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
         return false;
     }
 
+    let member_owner = match owner {
+        DynamicFieldOwner::Type(id) => LuaMemberOwner::Type(id.clone()),
+        DynamicFieldOwner::Table(range) => LuaMemberOwner::Element(range.clone()),
+    };
     db.get_member_index()
-        .get_members(&owner.as_member_owner())
+        .get_members(&member_owner)
         .is_none_or(|members| {
             !members.iter().any(|member| {
                 matches!(

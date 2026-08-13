@@ -70,27 +70,15 @@ impl LuaTypeCache {
         matches!(self, LuaTypeCache::DocType(_))
     }
 
-    /// Whether this cache records "no value was found" rather than a type.
-    pub fn is_bottom_infer(&self) -> bool {
-        match self {
-            LuaTypeCache::DocType(_) => false,
-            LuaTypeCache::InferType(typ) => is_bottom_type(typ),
-        }
-    }
-
-    /// Whether this cache carries usable type information — the counterpart of
-    /// [`is_bottom_infer`](Self::is_bottom_infer) at the other end of the
-    /// lattice. `any`/`unknown` are authoritative statements that a value is
-    /// unconstrained, so they are not "informative" for replacement purposes.
-    pub fn is_informative(&self) -> bool {
-        is_informative_type(self.as_type())
-    }
-
     /// Whether a write of `self` should displace `existing`.
     pub fn supersedes(&self, existing: &LuaTypeCache) -> bool {
         // A real type always beats a "no value found" placeholder. Declared
         // types may do this too — an annotation outranks a stale inference.
-        if existing.is_bottom_infer() && self.is_informative() {
+        // `any`/`unknown` are authoritative statements that a value is
+        // unconstrained, so they do not count as informative here.
+        if matches!(existing, LuaTypeCache::InferType(typ) if is_bottom_type(typ))
+            && is_informative_type(self.as_type())
+        {
             return true;
         }
 
