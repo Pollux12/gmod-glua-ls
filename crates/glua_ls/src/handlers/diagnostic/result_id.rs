@@ -10,24 +10,41 @@ use std::hash::{Hash, Hasher};
 ///
 /// Derived purely from content, so no bookkeeping can go stale, and computed
 /// order-insensitively so a reordered-but-equal set does not look changed.
+///
 /// Each item is hashed from its serialized form so every field counts,
 /// including ones added to `Diagnostic` later.
 pub fn diagnostic_result_id(diagnostics: &[Diagnostic]) -> String {
-    let mut item_hashes: Vec<u64> = diagnostics
-        .iter()
-        .map(|diagnostic| {
-            let mut hasher = DefaultHasher::new();
-            serde_json::to_string(diagnostic)
-                .unwrap_or_default()
-                .hash(&mut hasher);
-            hasher.finish()
-        })
-        .collect();
+    let mut item_hashes: Vec<u64> = diagnostics.iter().map(hash_diagnostic).collect();
     item_hashes.sort_unstable();
 
     let mut hasher = DefaultHasher::new();
     item_hashes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
+}
+
+fn hash_diagnostic(diagnostic: &Diagnostic) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    // Serialize straight into the hasher: every field counts, including ones
+    // added to `Diagnostic` later, without materialising a `String` per
+    // diagnostic on the request path. Serialization of a diagnostic cannot
+    // realistically fail; a partial hash would only cost a spurious `full`
+    // report.
+    let _ = serde_json::to_writer(HashWriter(&mut hasher), diagnostic);
+    hasher.finish()
+}
+
+/// Feeds serialized bytes to a hasher without buffering them.
+struct HashWriter<'a>(&'a mut DefaultHasher);
+
+impl std::io::Write for HashWriter<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        buf.hash(self.0);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
