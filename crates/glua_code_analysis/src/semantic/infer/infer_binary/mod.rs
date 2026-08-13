@@ -163,6 +163,12 @@ fn infer_binary_custom_operator(
         | LuaOperatorMetaMethod::Div
         | LuaOperatorMetaMethod::Mod
         | LuaOperatorMetaMethod::Pow => {
+            // GMod overloads arithmetic on Vector/Angle/VMatrix, so unlike
+            // plain Lua the answer is not necessarily a number. An unresolved
+            // operand stays `any` here on purpose: routing it to `unknown`
+            // hands it to the usage-context stabilizer, which fabricates a
+            // guess and reports `infer-unknown` for it (measured: +94 hints
+            // across CityRP and StarfallEx, no new findings).
             let has_ambiguous_operand = left.is_nil()
                 || right.is_nil()
                 || left.is_any()
