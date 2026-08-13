@@ -705,6 +705,13 @@ pub fn expr_has_inferred_type(semantic_model: &SemanticModel, expr: &LuaExpr) ->
     }
 }
 
+/// The certain part of an inferred type, with uncertain positions widened to
+/// `any` so a mismatch probe ignores them.
+///
+/// The `any` here is a throwaway: the result feeds one `type_check_detail`
+/// comparison and is never stored, returned or cached. It must stay that way —
+/// this is not an inference site, and treating it as one would put a
+/// failure-shaped `any` back into the type lattice.
 fn strip_inferred_uncertainty(typ: &LuaType) -> LuaType {
     match typ {
         LuaType::Union(union) => {
