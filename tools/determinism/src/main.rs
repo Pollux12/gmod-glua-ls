@@ -63,6 +63,15 @@
 //!                               inherits that state and its diff is
 //!                               meaningless. Honours DET_INDEX_DIFF (cold index
 //!                               snapshot vs the state each target leaves behind).
+//!                     realedit  apply a real edit (DET_EDIT_FIND replaced by
+//!                               DET_EDIT_REPLACE) to each DET_TARGETS entry and
+//!                               compare the incremental result against a cold
+//!                               build of the same edited source. The only stage
+//!                               whose edit changes what the file means, so it is
+//!                               the only one that measures how much of the index
+//!                               an edit actually moves — which bounds what a
+//!                               cheaper re-index mechanism has to reproduce.
+//!                               Always diffs the index, DET_INDEX_DIFF or not.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
@@ -172,7 +181,14 @@ enum Order {
 }
 
 fn build_analysis(codebase: &Path, annotations: &Path) -> EmmyLuaAnalysis {
-    build_analysis_with(codebase, annotations, Order::Natural, 1)
+    build_analysis_with(codebase, annotations, Order::Natural, 1, &[])
+}
+
+/// Comparison key for a workspace file path. The override list is written by
+/// hand from `DET_TARGETS`, so it has to match what the loader collected
+/// regardless of separator or case.
+fn path_key(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
 
 fn build_analysis_with(
@@ -180,6 +196,7 @@ fn build_analysis_with(
     annotations: &Path,
     order: Order,
     batches: usize,
+    overrides: &[(PathBuf, String)],
 ) -> EmmyLuaAnalysis {
     let config_files = discover_config_files(codebase);
     let mut emmyrc = if config_files.is_empty() {
@@ -215,6 +232,26 @@ fn build_analysis_with(
         .collect::<Vec<_>>();
     if order == Order::Reverse {
         files.reverse();
+    }
+    if !overrides.is_empty() {
+        let mut applied = 0;
+        for (path, content) in overrides {
+            let want = path_key(path);
+            for file in files.iter_mut() {
+                if path_key(&file.0) == want {
+                    file.1 = Some(content.clone());
+                    applied += 1;
+                }
+            }
+        }
+        // A silently unapplied override would make this build a copy of the
+        // baseline, and every diff taken against it would read as "identical".
+        assert_eq!(
+            applied,
+            overrides.len(),
+            "content override did not match a collected workspace file"
+        );
+        eprintln!("[setup] applied {applied} content override(s)");
     }
     eprintln!(
         "[setup] collected {} files (order={} batches={batches})",
@@ -710,6 +747,85 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
     true
 }
 
+/// Applies a **real** edit and compares the incremental result against a cold
+/// build of the same edited source.
+///
+/// Every other edit stage perturbs a file without changing what it means, so
+/// they answer "does re-analysis preserve state". This one answers the question
+/// the others cannot: when an edit genuinely changes a published fact, does the
+/// incremental path land where a full build of the edited workspace lands, and
+/// how much of the index does that edit actually move? The second number bounds
+/// what any cheaper re-index mechanism has to reproduce.
+fn real_edit(
+    analysis: &mut EmmyLuaAnalysis,
+    codebase: &Path,
+    annotations: &Path,
+    targets: &[String],
+    cold: &BTreeSet<Snapshot>,
+) {
+    let find = std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required by realedit");
+    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
+    let cold_index = collect_index(analysis, "cold");
+
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[realedit] file not indexed: {}", path.display());
+            continue;
+        };
+        let Some(original) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let matches = original.matches(find.as_str()).count();
+        if matches == 0 {
+            eprintln!("[realedit] {find:?} not present in {}", path.display());
+            continue;
+        }
+        let edited = original.replace(find.as_str(), replace.as_str());
+
+        let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
+        let t = Instant::now();
+        analysis.update_file_by_uri(&uri, Some(edited.clone()));
+        eprintln!(
+            "[realedit] {} ({matches} site(s)) expands to {} files ({:.2}s)",
+            target,
+            expanded.len(),
+            t.elapsed().as_secs_f64()
+        );
+
+        let warm_index = collect_index(analysis, "warm");
+        let warm = collect(analysis, "warm");
+
+        let ground_truth = build_analysis_with(
+            codebase,
+            annotations,
+            Order::Natural,
+            1,
+            &[(path.clone(), edited)],
+        );
+        let truth_index = collect_index(&ground_truth, "cold_edited");
+        let truth = collect(&ground_truth, "cold_edited");
+
+        // What the edit genuinely moves: the work any mechanism must reproduce.
+        diff_index("cold", &cold_index, "cold_edited", &truth_index);
+        diff("cold", cold, "cold_edited", &truth);
+        // What today's incremental path gets wrong about it.
+        diff_index("cold_edited", &truth_index, "warm", &warm_index);
+        diff("cold_edited", &truth, "warm", &warm);
+
+        analysis.update_file_by_uri(&uri, Some(original));
+    }
+}
+
 fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[String]) -> bool {
     let mut file_ids = Vec::new();
     for relative in relatives {
@@ -933,6 +1049,10 @@ fn main() {
         diff("cold", &cold, "after_full_reindex", &after);
     }
 
+    if stages.iter().any(|s| s == "realedit") {
+        real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+    }
+
     if stages.iter().any(|s| s == "fresh") {
         let fresh_analysis = build_analysis(&codebase, &annotations);
         let fresh = collect(&fresh_analysis, "fresh_process");
@@ -940,14 +1060,16 @@ fn main() {
     }
 
     if stages.iter().any(|s| s == "order") {
-        let reversed_analysis = build_analysis_with(&codebase, &annotations, Order::Reverse, 1);
+        let reversed_analysis =
+            build_analysis_with(&codebase, &annotations, Order::Reverse, 1, &[]);
         let reversed = collect(&reversed_analysis, "reverse_order");
         diff("cold", &cold, "reverse_order", &reversed);
     }
 
     if let Some(batches) = stages.iter().find_map(|s| s.strip_prefix("split:")) {
         let batches = batches.parse::<usize>().unwrap_or(2);
-        let split_analysis = build_analysis_with(&codebase, &annotations, Order::Natural, batches);
+        let split_analysis =
+            build_analysis_with(&codebase, &annotations, Order::Natural, batches, &[]);
         if std::env::var_os("DET_INDEX_DIFF").is_some() {
             let cold_index = collect_index(&analysis, "cold");
             let split_index = collect_index(&split_analysis, "split_batches");
