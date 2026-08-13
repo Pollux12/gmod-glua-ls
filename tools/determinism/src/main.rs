@@ -17,8 +17,9 @@
 //! Only some stages are pass/fail. The gates are `repeat`, `edit`, `mainexpand`,
 //! `allreindex`, `reindex`, `order` and `fresh`: each of these runs a path the
 //! language server actually takes (or a ground-truth rebuild), so any divergence
+//! one of them reports is a defect that ships.
 //!
-//! `mainreindex`, `exact` and `split:N` are **bisect stages** — diagnostic
+//! `mainreindex`, `exact`, `editmid` and `split:N` are **bisect stages** — diagnostic
 //! instruments, not gates, and they are expected to diverge. Both `mainreindex`
 //! and `exact` go through `reindex_files_without_expansion`, which deliberately
 //! skips three convergence passes that production's `reindex_files` performs
@@ -415,22 +416,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ),
             format!("{:?}", fact.typ()),
         );
-    }
-
-    if let Ok(want) = std::env::var("DET_DUMP_MEMBERS") {
-        for entry in &members {
-            if entry.contains(&want) {
-                println!("  [{label}] member {entry}");
-            }
-        }
-    }
-
-    if let Ok(want) = std::env::var("DET_DUMP_PARAMS") {
-        for (key, value) in &inferred_params {
-            if key.contains(&want) {
-                println!("  [{label}] param {key} = {value}");
-            }
-        }
     }
 
     eprintln!(
