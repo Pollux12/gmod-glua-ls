@@ -484,16 +484,21 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     snapshot
 }
 
+/// Max diff lines printed per bucket.
+fn diff_limit() -> usize {
+    std::env::var("DET_LIMIT")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .unwrap_or(40)
+}
+
 fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &IndexSnapshot) {
     let filter = std::env::var("DET_FILTER")
         .ok()
         .filter(|value| !value.is_empty());
     let limit = match &filter {
         Some(_) => usize::MAX,
-        None => std::env::var("DET_LIMIT")
-            .ok()
-            .and_then(|value| value.parse::<usize>().ok())
-            .unwrap_or(40),
+        None => diff_limit(),
     };
     let emit = |line: String| {
         if filter.as_ref().is_none_or(|want| line.contains(want)) {
@@ -700,10 +705,7 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
         added.len()
     );
 
-    let limit = std::env::var("DET_LIMIT")
-        .ok()
-        .and_then(|value| value.parse::<usize>().ok())
-        .unwrap_or(40);
+    let limit = diff_limit();
 
     for (bucket, entries) in [("REMOVED", &removed), ("ADDED", &added)] {
         if entries.is_empty() {
@@ -979,8 +981,12 @@ fn main() {
         let cold_index = collect_index(&analysis, "cold");
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
         let t = Instant::now();
+        let file_count = all_ids.len();
         analysis.reindex_files_without_expansion(all_ids);
-        eprintln!("[allreindex] {:.2}s", t.elapsed().as_secs_f64());
+        eprintln!(
+            "[allreindex] reindexed {file_count} files ({:.2}s)",
+            t.elapsed().as_secs_f64()
+        );
         let after_index = collect_index(&analysis, "after_allreindex");
         diff_index("cold", &cold_index, "after_allreindex", &after_index);
         let after = collect(&analysis, "after_allreindex");
@@ -1027,24 +1033,6 @@ fn main() {
         diff_index("cold", &cold_index, "after_mainexpand", &after_index);
         let after = collect(&analysis, "after_mainexpand");
         diff("cold", &cold, "after_mainexpand", &after);
-    }
-
-    // Re-run the pipeline over *every* file, library included, with the
-    // full DB already populated.
-    if stages.iter().any(|s| s == "allreindex") {
-        let cold_index = collect_index(&analysis, "cold");
-        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
-        let t = Instant::now();
-        analysis.reindex_files_without_expansion(all_ids.clone());
-        eprintln!(
-            "[allreindex] reindexed {} files ({:.2}s)",
-            all_ids.len(),
-            t.elapsed().as_secs_f64()
-        );
-        let after_index = collect_index(&analysis, "after_allreindex");
-        diff_index("cold", &cold_index, "after_allreindex", &after_index);
-        let after = collect(&analysis, "after_allreindex");
-        diff("cold", &cold, "after_allreindex", &after);
     }
 
     if stages.iter().any(|s| s == "reindex") {
