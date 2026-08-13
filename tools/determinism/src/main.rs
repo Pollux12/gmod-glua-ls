@@ -453,26 +453,22 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     // binary on the same input can be diffed against each other.
     if let Ok(dir) = std::env::var("DET_DUMP_INDEX") {
         let mut out = String::new();
-        for (key, value) in &snapshot.type_caches {
-            out.push_str(&format!("TC {key} = {value}\n"));
+        for (tag, map) in [
+            ("TC", &snapshot.type_caches),
+            ("PARAM", &snapshot.inferred_params),
+            ("SUPER", &snapshot.super_types),
+            ("CLSMEM", &snapshot.class_members),
+            ("SIG", &snapshot.signatures),
+        ] {
+            for (key, value) in map {
+                out.push_str(&format!("{tag} {key} = {value}\n"));
+            }
         }
         for entry in &snapshot.members {
             out.push_str(&format!("MEM {entry}\n"));
         }
         for entry in &snapshot.net_flows {
             out.push_str(&format!("NET {entry}\n"));
-        }
-        for (key, value) in &snapshot.inferred_params {
-            out.push_str(&format!("PARAM {key} = {value}\n"));
-        }
-        for (key, value) in &snapshot.super_types {
-            out.push_str(&format!("SUPER {key} = {value}\n"));
-        }
-        for (key, value) in &snapshot.class_members {
-            out.push_str(&format!("CLSMEM {key} = {value}\n"));
-        }
-        for (key, value) in &snapshot.signatures {
-            out.push_str(&format!("SIG {key} = {value}\n"));
         }
         let file_name = label
             .chars()
@@ -552,9 +548,19 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
 
     for (name, prefix, base_map, other_map) in [
         ("type_caches", "TC", &base.type_caches, &other.type_caches),
-        ("super_types", "SUPER", &base.super_types, &other.super_types),
+        (
+            "super_types",
+            "SUPER",
+            &base.super_types,
+            &other.super_types,
+        ),
         ("signatures", "SIG", &base.signatures, &other.signatures),
-        ("class_members", "CM", &base.class_members, &other.class_members),
+        (
+            "class_members",
+            "CM",
+            &base.class_members,
+            &other.class_members,
+        ),
         (
             "inferred_params",
             "PARAM",
@@ -658,13 +664,20 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
     }
 }
 
-fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
+/// Applies a semantically-neutral edit pair and lets the analysis settle.
+///
+/// `at_front` decides which kind: appending a trailing newline is a semantic
+/// no-op the update gate can skip outright, while inserting one at the front
+/// shifts every offset in the file, so the gate cannot fire and the full
+/// re-index expansion runs.
+fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> bool {
+    let tag = if at_front { "editmid" } else { "edit" };
     let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
-        eprintln!("[edit] cannot build uri for {}", target.display());
+        eprintln!("[{tag}] cannot build uri for {}", target.display());
         return false;
     };
     let Some(file_id) = analysis.get_file_id(&uri) else {
-        eprintln!("[edit] file not indexed: {}", target.display());
+        eprintln!("[{tag}] file not indexed: {}", target.display());
         return false;
     };
     let Some(original) = analysis
@@ -674,78 +687,44 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
         .get_file_content(&file_id)
         .cloned()
     else {
-        eprintln!("[edit] no content for {}", target.display());
+        eprintln!("[{tag}] no content for {}", target.display());
         return false;
     };
 
     let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
     eprintln!(
-        "[edit] {} expands to {} files",
+        "[{tag}] {} expands to {} files",
         target.display(),
         expanded.len()
     );
     if std::env::var_os("DET_SHOW_EXPANSION").is_some() {
         for expanded_id in &expanded {
-            eprintln!("[edit]   {}", file_label(analysis, *expanded_id));
+            eprintln!("[{tag}]   {}", file_label(analysis, *expanded_id));
         }
     }
 
     let t = Instant::now();
-    analysis.update_file_by_uri(&uri, Some(format!("{original}\n")));
+    let edited = if at_front {
+        format!(
+            "
+{original}"
+        )
+    } else {
+        format!(
+            "{original}
+"
+        )
+    };
+    analysis.update_file_by_uri(&uri, Some(edited));
     analysis.update_file_by_uri(&uri, Some(original));
     eprintln!(
-        "[edit] no-op add+remove newline on {} ({:.2}s)",
+        "[{tag}] no-op newline edit pair on {} ({:.2}s)",
         target.display(),
         t.elapsed().as_secs_f64()
     );
     true
 }
 
-/// Like `noop_edit`, but the inserted newline goes at the *front* of the file,
-/// so every token offset shifts and the semantic no-op gate cannot fire: both
-/// halves of the pair run the full re-index expansion. Content ends
-/// byte-identical to cold, which makes this the instrument for the remaining
-/// batch-composition convergence gap (warm fixpoint != cold fixpoint).
-fn noop_edit_midfile(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
-    let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
-        eprintln!("[editmid] cannot build uri for {}", target.display());
-        return false;
-    };
-    let Some(file_id) = analysis.get_file_id(&uri) else {
-        eprintln!("[editmid] file not indexed: {}", target.display());
-        return false;
-    };
-    let Some(original) = analysis
-        .compilation
-        .get_db()
-        .get_vfs()
-        .get_file_content(&file_id)
-        .cloned()
-    else {
-        eprintln!("[editmid] no content for {}", target.display());
-        return false;
-    };
-
-    let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
-    eprintln!(
-        "[editmid] {} expands to {} files",
-        target.display(),
-        expanded.len()
-    );
-
-    let t = Instant::now();
-    analysis.update_file_by_uri(&uri, Some(format!("\n{original}")));
-    analysis.update_file_by_uri(&uri, Some(original));
-    eprintln!(
-        "[editmid] no-op offset-shifting edit pair on {} ({:.2}s)",
-        target.display(),
-        t.elapsed().as_secs_f64()
-    );
-    true
-}
-
-/// Reindex an explicit set of workspace-relative paths without any text change.
-/// Isolates "reindexing this set loses information" from "the edit changed text".
 fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[String]) -> bool {
     let mut file_ids = Vec::new();
     for relative in relatives {
@@ -823,7 +802,7 @@ fn main() {
             std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if !noop_edit(&mut analysis, &path) {
+            if !noop_edit(&mut analysis, &path, false) {
                 continue;
             }
             let label = format!("after_edit[{target}]");
@@ -846,7 +825,7 @@ fn main() {
             std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
         for target in &targets {
             let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
-            if !noop_edit_midfile(&mut analysis, &path) {
+            if !noop_edit(&mut analysis, &path, true) {
                 continue;
             }
             let label = format!("after_editmid[{target}]");
