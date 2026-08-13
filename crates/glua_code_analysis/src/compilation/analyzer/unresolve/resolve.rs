@@ -332,7 +332,6 @@ pub fn try_resolve_member(
             // re-home a member that does not exist, and a `Ref` prefix would
             // otherwise leave the cold build with no member at all.
             if db.get_member_index().get_member(&member_id).is_none() {
-                super::census::record("try_resolve_member.add_member", "member_missing");
                 create_deferred_index_expr_member(
                     db,
                     cache,
@@ -340,8 +339,6 @@ pub fn try_resolve_member(
                     member_owner.clone(),
                     member_id,
                 );
-            } else {
-                super::census::record("try_resolve_member.add_member", "member_present");
             }
 
             if set_owner_only {

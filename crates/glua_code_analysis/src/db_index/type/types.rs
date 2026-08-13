@@ -10,7 +10,6 @@ use std::{
 
 use crate::{
     AsyncState, DbIndex, FileId, InFiled, LuaCallArgRole, SemanticModel,
-    compilation::analyzer::census,
     db_index::{LuaMemberKey, LuaSignatureId, r#type::type_visit_trait::TypeVisitTrait},
     first_param_may_not_self,
 };
@@ -514,16 +513,6 @@ impl LuaType {
                             }
                         }
                     }
-                }
-
-                if census::enabled()
-                    && result_types.len() > 1
-                    && hash_set.contains(&LuaType::Unknown)
-                {
-                    census::record(
-                        "union.surviving_unknown_arm",
-                        &format!("arity={}", result_types.len()),
-                    );
                 }
 
                 match result_types.len() {
