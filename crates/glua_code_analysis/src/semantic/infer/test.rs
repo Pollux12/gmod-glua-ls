@@ -1441,4 +1441,25 @@ mod test {
              (first={first_range:?}, last={last_range:?}); each region must keep its own table"
         );
     }
+
+    /// A call shape the reader cannot interpret leaves the type unresolved.
+    /// `any` would claim the author opted out of checking instead.
+    #[test]
+    fn test_setmetatable_with_wrong_arity_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        assert_eq!(ws.expr_ty("setmetatable({})"), LuaType::Unknown);
+    }
+
+    /// Same for a module path the analyzer cannot identify: the export type is
+    /// unresolved, not unconstrained.
+    #[test]
+    fn test_require_with_computed_path_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            some_computed_path = nil
+            "#,
+        );
+        assert_eq!(ws.expr_ty("require(some_computed_path)"), LuaType::Unknown);
+    }
 }

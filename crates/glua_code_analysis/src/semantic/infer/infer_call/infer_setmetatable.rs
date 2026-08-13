@@ -20,8 +20,10 @@ pub fn infer_setmetatable_call(
     let arg_list = call_expr.get_args_list().ok_or(InferFailReason::None)?;
     let args = arg_list.get_args().collect::<Vec<LuaExpr>>();
 
+    // Not a call shape this can read: that is a statement about the analyzer,
+    // not a promise that the result accepts anything.
     if args.len() != 2 {
-        return Ok(LuaType::Any);
+        return Ok(LuaType::Unknown);
     }
 
     let basic_table = args[0].clone();
