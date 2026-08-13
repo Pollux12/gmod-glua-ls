@@ -118,6 +118,11 @@ pub fn load_workspace_files(
                 let Ok(relative) = path.strip_prefix(&root_path) else {
                     return WalkState::Continue;
                 };
+                // The root itself strips to an empty path, which an empty
+                // exclude set matches — skipping it would prune the whole walk.
+                if relative.as_os_str().is_empty() {
+                    return WalkState::Continue;
+                }
                 if exclude_set.is_match(relative) {
                     if file_type.is_some_and(|t| t.is_dir()) {
                         return WalkState::Skip;
@@ -280,5 +285,20 @@ mod tests {
         fs::remove_dir_all(&workspace).expect("test workspace should be removed");
 
         assert_eq!(loaded_paths, vec![PathBuf::from("main.lua")]);
+    }
+
+    #[test]
+    fn load_workspace_files_loads_with_empty_exclude_glob() {
+        let workspace = temp_workspace();
+        fs::create_dir_all(workspace.join("lua")).expect("test directory should be created");
+        fs::write(workspace.join("lua").join("main.lua"), "return true")
+            .expect("main test file should be written");
+
+        let files = load_workspace_files(&workspace, &["**/*.lua".to_string()], &[], &[], None)
+            .expect("workspace files should load");
+
+        fs::remove_dir_all(&workspace).expect("test workspace should be removed");
+
+        assert_eq!(files.len(), 1);
     }
 }
