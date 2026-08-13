@@ -6,10 +6,8 @@ publish = false
 
 [dependencies]
 glua_code_analysis.workspace = true
-glua_parser.workspace = true
 
 tokio-util.workspace = true
-log.workspace = true
 lsp_types.workspace = true
 mimalloc.workspace = true
 

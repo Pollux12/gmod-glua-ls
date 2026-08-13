@@ -545,8 +545,6 @@ version = "0.1.0"
 dependencies = [
  "emmy_lsp_types",
  "glua_code_analysis",
- "glua_parser",
- "log",
  "mimalloc",
  "tokio-util",
 ]
