@@ -209,88 +209,40 @@ async fn main() {
             .get_db()
             .get_module_index()
             .get_main_workspace_file_ids();
-        let path_of = |id: &FileId| {
-            analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_path(id)
-                .map(|p| p.to_string_lossy().replace('\\', "/"))
-        };
-        // Ranking every file costs ~30s on a large workspace, but the worst
-        // hubs are stable properties of the codebase — cache them per codebase
-        // and only re-rank when the cache is missing or stale.
-        let cache_path = PathBuf::from("target/bench_incremental_targets.txt");
-        let mut sample: Vec<(FileId, usize)> = Vec::new();
-        if let Ok(cached) = std::fs::read_to_string(&cache_path) {
-            let mut lines = cached.lines();
-            if lines.next() == Some(large_codebase.as_str()) {
-                let by_path: std::collections::HashMap<String, FileId> = main_ids
-                    .iter()
-                    .filter_map(|id| path_of(id).map(|p| (p, *id)))
-                    .collect();
-                let entries: Vec<Option<(FileId, usize)>> = lines
-                    .map(|line| {
-                        let (n, path) = line.split_once('\t')?;
-                        Some((*by_path.get(path)?, n.parse::<usize>().ok()?))
-                    })
-                    .collect();
-                if !entries.is_empty() && entries.iter().all(Option::is_some) {
-                    sample = entries.into_iter().flatten().collect();
-                    eprintln!(
-                        "  [incremental] using {} cached edit targets from {}",
-                        sample.len(),
-                        cache_path.display()
-                    );
-                }
-            }
-        }
-        if sample.is_empty() {
-            let t_rank = Instant::now();
-            let mut ranked: Vec<(FileId, usize)> = main_ids
+        let t_rank = Instant::now();
+        let mut ranked: Vec<(FileId, usize)> = main_ids
+            .iter()
+            .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
+            .collect();
+        ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+        eprintln!(
+            "  [incremental] ranked {} files by reindex expansion in {:.3}s",
+            ranked.len(),
+            t_rank.elapsed().as_secs_f64()
+        );
+
+        // Top-3 hubs (worst ripple), the median file, and the largest file
+        // by bytes (worst parse).
+        let mut sample: Vec<(FileId, usize)> = ranked.iter().take(3).copied().collect();
+        for extra in [
+            ranked.get(ranked.len() / 2).copied(),
+            main_ids
                 .iter()
-                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
-                .collect();
-            ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-            eprintln!(
-                "  [incremental] ranked {} files by reindex expansion in {:.3}s",
-                ranked.len(),
-                t_rank.elapsed().as_secs_f64()
-            );
-
-            // Top-3 hubs (worst ripple), the median file, and the largest file
-            // by bytes (worst parse).
-            sample = ranked.iter().take(3).copied().collect();
-            for extra in [
-                ranked.get(ranked.len() / 2).copied(),
-                main_ids
-                    .iter()
-                    .max_by_key(|id| {
-                        analysis
-                            .compilation
-                            .get_db()
-                            .get_vfs()
-                            .get_file_content(id)
-                            .map_or(0, |text| text.len())
-                    })
-                    .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                if !sample.iter().any(|(id, _)| *id == extra.0) {
-                    sample.push(extra);
-                }
-            }
-
-            let mut out = format!("{large_codebase}\n");
-            for (id, n) in &sample {
-                if let Some(path) = path_of(id) {
-                    out.push_str(&format!("{n}\t{path}\n"));
-                }
-            }
-            if let Err(err) = std::fs::write(&cache_path, out) {
-                eprintln!("  [incremental] failed to write target cache: {err}");
+                .max_by_key(|id| {
+                    analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_content(id)
+                        .map_or(0, |text| text.len())
+                })
+                .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
+        ]
+        .into_iter()
+        .flatten()
+        {
+            if !sample.iter().any(|(id, _)| *id == extra.0) {
+                sample.push(extra);
             }
         }
 
