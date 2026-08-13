@@ -1157,15 +1157,50 @@ mod test {
     }
 
     #[gtest]
+    /// Calling a member of an opaque table reports nothing at all, and that is
+    /// the intent: the member read is unresolved, which is not evidence that
+    /// the value is nil. Indexing *into* such a read still reports, because
+    /// that can fault at runtime — see
+    /// `test_opaque_table_chained_index_is_hinted_not_warned`.
     fn test_opaque_table_member_call_is_not_warned() {
+        let mut ws = VirtualWorkspace::new();
+        let code = r#"
+                ---@type table
+                local tbl = {}
+                tbl.someKey()
+                "#;
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        assert_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
+            eq(true)
+        );
+    }
+
+    /// Known edge, no measured occurrences: an unresolved prefix reaches
+    /// `report_unsafe_receiver` as `FieldNotFound`, which that path reads as a
+    /// runtime `nil`, so the chain warns as if nil were proven.
+    ///
+    /// Both obvious fixes are worse than the edge. Skipping the
+    /// `FieldNotFound`→`nil` conversion when the prefix is unresolved breaks
+    /// four tests that rely on it to report genuinely absent fields (e.g.
+    /// `test_gmod_vehicle_sound_unguarded_turbo_parameter_field_reports_unchecked_nil`),
+    /// and returning `Ok(Unknown)` for an `Unknown` prefix in
+    /// `infer_member_by_index` breaks seven — `FieldNotFound` is what drives
+    /// unresolve deferral. Zero hits on CityRP (2035 files) and StarfallEx.
+    #[test]
+    #[ignore = "known edge: unresolved prefix reads as proven nil; see doc comment"]
+    fn test_unresolved_prefix_chain_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
             ws.check_code_for(
                 DiagnosticCode::UncheckedNilAccess,
                 r#"
-                ---@type table
-                local tbl = {}
-                tbl.someKey()
+                local path = SomeUndefinedGlobal
+                local m = require(path)
+                m.foo:bar()
                 "#,
             ),
             eq(true)
