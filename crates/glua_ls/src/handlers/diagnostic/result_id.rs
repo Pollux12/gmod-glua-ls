@@ -10,24 +10,24 @@ use std::hash::{Hash, Hasher};
 ///
 /// Derived purely from content, so no bookkeeping can go stale, and computed
 /// order-insensitively so a reordered-but-equal set does not look changed.
+/// Each item is hashed from its serialized form so every field counts,
+/// including ones added to `Diagnostic` later.
 pub fn diagnostic_result_id(diagnostics: &[Diagnostic]) -> String {
-    let mut item_hashes: Vec<u64> = diagnostics.iter().map(hash_diagnostic).collect();
+    let mut item_hashes: Vec<u64> = diagnostics
+        .iter()
+        .map(|diagnostic| {
+            let mut hasher = DefaultHasher::new();
+            serde_json::to_string(diagnostic)
+                .unwrap_or_default()
+                .hash(&mut hasher);
+            hasher.finish()
+        })
+        .collect();
     item_hashes.sort_unstable();
 
     let mut hasher = DefaultHasher::new();
     item_hashes.hash(&mut hasher);
     format!("{:016x}", hasher.finish())
-}
-
-/// Hashes the serialized form so every field counts, including ones added to
-/// `Diagnostic` later. Serialization of a diagnostic cannot realistically
-/// fail; an empty string on failure only costs a spurious `full` report.
-fn hash_diagnostic(diagnostic: &Diagnostic) -> u64 {
-    let mut hasher = DefaultHasher::new();
-    serde_json::to_string(diagnostic)
-        .unwrap_or_default()
-        .hash(&mut hasher);
-    hasher.finish()
 }
 
 #[cfg(test)]
