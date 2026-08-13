@@ -84,26 +84,20 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    let mut result = LuaType::Never;
-    let mut any_inferred = false;
-    for ty in u.types() {
-        // 只在实际调用时才 clone，而不是预先 clone
-        let ty_result = if is_left_union {
-            infer_binary_expr_type(db, ty.clone(), other.clone(), op)
-        } else {
-            infer_binary_expr_type(db, other.clone(), ty.clone(), op)
-        };
-
-        if let Ok(ty) = ty_result {
-            result = TypeOps::Union.apply(db, &result, &ty);
-            any_inferred = true;
-        }
-    }
+    // 只在实际调用时才 clone，而不是预先 clone
+    let inferred = u
+        .types()
+        .filter_map(|ty| {
+            if is_left_union {
+                infer_binary_expr_type(db, ty.clone(), other.clone(), op)
+            } else {
+                infer_binary_expr_type(db, other.clone(), ty.clone(), op)
+            }
+            .ok()
+        })
+        .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
     // Every member failed: pin the escape value instead of returning the seed.
-    if !any_inferred {
-        return Some(LuaType::Unknown);
-    }
-    Some(result)
+    Some(inferred.unwrap_or(LuaType::Unknown))
 }
 
 fn infer_binary_expr_type(

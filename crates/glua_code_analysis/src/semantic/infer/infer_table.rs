@@ -326,23 +326,18 @@ fn infer_call_arg_should_be(
 
 /// 移除掉一些非`table`类型
 fn union_remove_non_table_type(db: &DbIndex, union: &Arc<LuaUnionType>) -> LuaType {
-    let mut result = LuaType::Never;
-    let mut any_kept = false;
-    for typ in union.into_set().into_iter() {
-        match typ {
-            LuaType::Signature(_) | LuaType::DocFunction(_) => {}
-            _ if typ.is_string() || typ.is_number() || typ.is_boolean() => {}
-            _ => {
-                result = TypeOps::Union.apply(db, &result, &typ);
-                any_kept = true;
-            }
-        }
-    }
-    // Everything was filtered out: pin the escape value instead of the seed.
-    if !any_kept {
-        return LuaType::Unknown;
-    }
-    result
+    union
+        .into_set()
+        .into_iter()
+        .filter(|typ| {
+            !matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+                && !typ.is_string()
+                && !typ.is_number()
+                && !typ.is_boolean()
+        })
+        .reduce(|left, right| TypeOps::Union.apply(db, &left, &right))
+        // Everything was filtered out: pin the escape value instead of the seed.
+        .unwrap_or(LuaType::Unknown)
 }
 
 fn infer_table_field_type_by_parent(
