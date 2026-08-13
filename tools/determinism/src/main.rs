@@ -492,6 +492,50 @@ fn diff_limit() -> usize {
         .unwrap_or(40)
 }
 
+/// One `BTreeMap` bucket of the index snapshot: keys only in `base`, keys only
+/// in `other`, and keys whose value changed.
+#[allow(clippy::too_many_arguments)]
+fn diff_map(
+    base_label: &str,
+    label: &str,
+    name: &str,
+    prefix: &str,
+    base: &BTreeMap<String, String>,
+    other: &BTreeMap<String, String>,
+    limit: usize,
+    emit: &impl Fn(String),
+) {
+    let base_keys = base.keys().collect::<BTreeSet<_>>();
+    let other_keys = other.keys().collect::<BTreeSet<_>>();
+    let dropped = base_keys.difference(&other_keys).collect::<Vec<_>>();
+    let gained = other_keys.difference(&base_keys).collect::<Vec<_>>();
+    let changed = base_keys
+        .intersection(&other_keys)
+        .filter(|key| base.get(**key) != other.get(**key))
+        .collect::<Vec<_>>();
+    println!(
+        "INDEX {base_label} -> {label}: {name} dropped={} gained={} changed={}",
+        dropped.len(),
+        gained.len(),
+        changed.len()
+    );
+    for key in dropped.iter().take(limit) {
+        emit(format!("  {prefix}_DROPPED {key} = {:?}", base.get(**key)));
+    }
+    for key in gained.iter().take(limit) {
+        emit(format!("  {prefix}_GAINED  {key} = {:?}", other.get(**key)));
+    }
+    for key in changed.iter().take(limit) {
+        emit(format!(
+            "  {prefix}_CHANGED {key}
+      before = {:?}
+      after  = {:?}",
+            base.get(**key),
+            other.get(**key)
+        ));
+    }
+}
+
 fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &IndexSnapshot) {
     let filter = std::env::var("DET_FILTER")
         .ok()
@@ -506,38 +550,21 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         }
     };
 
-    let base_keys = base.type_caches.keys().collect::<BTreeSet<_>>();
-    let other_keys = other.type_caches.keys().collect::<BTreeSet<_>>();
-    let dropped = base_keys.difference(&other_keys).collect::<Vec<_>>();
-    let gained = other_keys.difference(&base_keys).collect::<Vec<_>>();
-    let changed = base_keys
-        .intersection(&other_keys)
-        .filter(|key| base.type_caches.get(**key) != other.type_caches.get(**key))
-        .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: type_caches dropped={} gained={} changed={}",
-        dropped.len(),
-        gained.len(),
-        changed.len()
-    );
-    for key in dropped.iter().take(limit) {
-        emit(format!(
-            "  TC_DROPPED {key} = {:?}",
-            base.type_caches.get(**key)
-        ));
-    }
-    for key in gained.iter().take(limit) {
-        emit(format!(
-            "  TC_GAINED  {key} = {:?}",
-            other.type_caches.get(**key)
-        ));
-    }
-    for key in changed.iter().take(limit) {
-        emit(format!(
-            "  TC_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
-            base.type_caches.get(**key),
-            other.type_caches.get(**key)
-        ));
+    for (name, prefix, base_map, other_map) in [
+        ("type_caches", "TC", &base.type_caches, &other.type_caches),
+        ("super_types", "SUPER", &base.super_types, &other.super_types),
+        ("signatures", "SIG", &base.signatures, &other.signatures),
+        ("class_members", "CM", &base.class_members, &other.class_members),
+        (
+            "inferred_params",
+            "PARAM",
+            &base.inferred_params,
+            &other.inferred_params,
+        ),
+    ] {
+        diff_map(
+            base_label, label, name, prefix, base_map, other_map, limit, &emit,
+        );
     }
 
     let member_dropped = base.members.difference(&other.members).collect::<Vec<_>>();
@@ -552,107 +579,6 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     }
     for entry in member_gained.iter().take(limit) {
         emit(format!("  MEM_GAINED  {entry}"));
-    }
-
-    let base_supers = base.super_types.keys().collect::<BTreeSet<_>>();
-    let other_supers = other.super_types.keys().collect::<BTreeSet<_>>();
-    let super_dropped = base_supers.difference(&other_supers).collect::<Vec<_>>();
-    let super_gained = other_supers.difference(&base_supers).collect::<Vec<_>>();
-    let super_changed = base_supers
-        .intersection(&other_supers)
-        .filter(|key| base.super_types.get(**key) != other.super_types.get(**key))
-        .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: super_types dropped={} gained={} changed={}",
-        super_dropped.len(),
-        super_gained.len(),
-        super_changed.len()
-    );
-    for key in super_dropped.iter().take(limit) {
-        emit(format!(
-            "  SUPER_DROPPED {key} = {:?}",
-            base.super_types.get(**key)
-        ));
-    }
-    for key in super_gained.iter().take(limit) {
-        emit(format!(
-            "  SUPER_GAINED  {key} = {:?}",
-            other.super_types.get(**key)
-        ));
-    }
-    for key in super_changed.iter().take(limit) {
-        emit(format!(
-            "  SUPER_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
-            base.super_types.get(**key),
-            other.super_types.get(**key)
-        ));
-    }
-
-    let base_sig = base.signatures.keys().collect::<BTreeSet<_>>();
-    let other_sig = other.signatures.keys().collect::<BTreeSet<_>>();
-    let sig_changed = base_sig
-        .intersection(&other_sig)
-        .filter(|key| base.signatures.get(**key) != other.signatures.get(**key))
-        .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: signatures dropped={} gained={} changed={}",
-        base_sig.difference(&other_sig).count(),
-        other_sig.difference(&base_sig).count(),
-        sig_changed.len()
-    );
-    for key in sig_changed.iter().take(limit) {
-        emit(format!(
-            "  SIG_CHANGED {key}\n      before = {:?}\n      after  = {:?}",
-            base.signatures.get(**key),
-            other.signatures.get(**key)
-        ));
-    }
-
-    let base_cm = base.class_members.keys().collect::<BTreeSet<_>>();
-    let other_cm = other.class_members.keys().collect::<BTreeSet<_>>();
-    let cm_changed = base_cm
-        .intersection(&other_cm)
-        .filter(|key| base.class_members.get(**key) != other.class_members.get(**key))
-        .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: class_members changed={}",
-        cm_changed.len()
-    );
-    for key in cm_changed.iter().take(limit) {
-        emit(format!(
-            "  CM_CHANGED {key}
-      before = {:?}
-      after  = {:?}",
-            base.class_members.get(**key),
-            other.class_members.get(**key)
-        ));
-    }
-
-    let base_params = base.inferred_params.keys().collect::<BTreeSet<_>>();
-    let other_params = other.inferred_params.keys().collect::<BTreeSet<_>>();
-    let param_dropped = base_params.difference(&other_params).collect::<Vec<_>>();
-    let param_gained = other_params.difference(&base_params).collect::<Vec<_>>();
-    let param_changed = base_params
-        .intersection(&other_params)
-        .filter(|key| base.inferred_params.get(**key) != other.inferred_params.get(**key))
-        .collect::<Vec<_>>();
-    println!(
-        "INDEX {base_label} -> {label}: inferred_params dropped={} gained={} changed={}",
-        param_dropped.len(),
-        param_gained.len(),
-        param_changed.len()
-    );
-    for key in param_dropped.iter().chain(param_gained.iter()).take(limit) {
-        emit(format!("  PARAM_SET {key}"));
-    }
-    for key in param_changed.iter().take(limit) {
-        emit(format!(
-            "  PARAM_CHANGED {key}
-      before = {:?}
-      after  = {:?}",
-            base.inferred_params.get(**key),
-            other.inferred_params.get(**key)
-        ));
     }
 
     let base_net = base.net_flows.iter().collect::<BTreeSet<_>>();
