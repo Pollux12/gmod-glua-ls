@@ -2439,7 +2439,7 @@ pub fn infer_member_by_operator(
     infer_guard: &InferGuardRef,
 ) -> InferResult {
     match &prefix_type {
-        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Table => Ok(LuaType::Unknown),
         LuaType::TableConst(in_filed) => {
             infer_member_by_index_table(db, cache, in_filed, index_expr)
         }

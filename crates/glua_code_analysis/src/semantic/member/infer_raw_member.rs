@@ -44,7 +44,7 @@ fn infer_raw_member_type_guard(
     infer_guard: &InferGuardRef,
 ) -> RawGetMemberTypeResult {
     match prefix_type {
-        LuaType::Table => Ok(nullable_any_type()),
+        LuaType::Table => Ok(LuaType::Unknown),
         LuaType::Any => Ok(LuaType::Any),
         LuaType::Unknown => Err(InferFailReason::FieldNotFound),
         LuaType::TableConst(id) => {
