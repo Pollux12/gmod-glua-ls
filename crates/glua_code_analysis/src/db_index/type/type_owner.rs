@@ -134,12 +134,11 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
         LuaType::Union(union) => union
             .types()
             .try_fold(0, |rank: u8, typ| Some(rank.max(uninformative_rank(typ)?))),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .try_fold(0, |rank: u8, (typ, _)| {
+        LuaType::MultiLineUnion(union) => {
+            union.get_unions().iter().try_fold(0, |rank: u8, (typ, _)| {
                 Some(rank.max(uninformative_rank(typ)?))
-            }),
+            })
+        }
         _ => None,
     }
 }
@@ -213,7 +212,10 @@ mod tests {
             uninformative_rank(&union(vec![LuaType::Any, LuaType::Nil, LuaType::Never])),
             Some(3)
         );
-        assert!(!is_informative_type(&union(vec![LuaType::Any, LuaType::Nil])));
+        assert!(!is_informative_type(&union(vec![
+            LuaType::Any,
+            LuaType::Nil
+        ])));
 
         // One informative member makes the whole union informative.
         assert_eq!(

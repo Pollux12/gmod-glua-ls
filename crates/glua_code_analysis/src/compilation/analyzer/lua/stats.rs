@@ -1710,8 +1710,7 @@ fn assign_merge_type_owner_and_expr_type(
                     preserve_table_literals,
                     &mut skipped_uncached_sibling,
                 ) {
-                    if skipped_uncached_sibling
-                        && let LuaTypeOwner::Member(member_id) = &type_owner
+                    if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner
                     {
                         analyzer.context.record_settled_member_widening_candidate(
                             *member_id,
@@ -2124,8 +2123,7 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
     let owner = member_index.get_member_owner(member_id)?.clone();
     let key = member_index.get_member(member_id)?.get_key().clone();
     let related_members = if preserve_table_literals {
-        let related_member_ids =
-            guarded_table_assignment_member_ids_for_owner_key(db, *member_id)?;
+        let related_member_ids = guarded_table_assignment_member_ids_for_owner_key(db, *member_id)?;
         related_member_ids
             .into_iter()
             .filter_map(|related_member_id| member_index.get_member(&related_member_id))

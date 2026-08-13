@@ -1,6 +1,8 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, FileId, InFiled, LuaType, LuaUnionType, TypeOps, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, FileId, InFiled, LuaType, LuaUnionType, TypeOps, VirtualWorkspace,
+    };
     use internment::ArcIntern;
     use rowan::TextRange;
     use smol_str::SmolStr;
@@ -16,10 +18,16 @@ mod tests {
             // absorption families the structural path used to miss
             vec![LuaType::Number, LuaType::IntegerConst(1)],
             vec![LuaType::Integer, LuaType::IntegerConst(7)],
-            vec![LuaType::String, LuaType::StringConst(ArcIntern::from(SmolStr::new("x")))],
+            vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("x"))),
+            ],
             vec![LuaType::Boolean, LuaType::BooleanConst(true)],
             vec![LuaType::BooleanConst(true), LuaType::BooleanConst(false)],
-            vec![LuaType::Table, LuaType::TableConst(InFiled::new(FileId { id: 1 }, TextRange::default()))],
+            vec![
+                LuaType::Table,
+                LuaType::TableConst(InFiled::new(FileId { id: 1 }, TextRange::default())),
+            ],
             vec![LuaType::Never, LuaType::String],
             vec![LuaType::Unknown, LuaType::String],
             // sets that must stay untouched
@@ -27,7 +35,11 @@ mod tests {
             vec![LuaType::String, LuaType::Integer, LuaType::Boolean],
             // three members, so order matters to the fold as well as the set
             vec![LuaType::Number, LuaType::IntegerConst(1), LuaType::Nil],
-            vec![LuaType::String, LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))), LuaType::Boolean],
+            vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))),
+                LuaType::Boolean,
+            ],
         ];
 
         for set in sets {
@@ -220,10 +232,7 @@ mod tests {
         }
         {
             let union = LuaUnionType::from_vec(vec![LuaType::Unknown, LuaType::String]);
-            assert_eq!(
-                union.into_vec(),
-                vec![LuaType::String, LuaType::Unknown]
-            );
+            assert_eq!(union.into_vec(), vec![LuaType::String, LuaType::Unknown]);
         }
         {
             let type_string_number = ws.ty("string | number");

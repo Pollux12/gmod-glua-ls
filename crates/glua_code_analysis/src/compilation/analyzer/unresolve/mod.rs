@@ -1046,7 +1046,10 @@ mod tests {
         assert_eq!(deferred.len(), 1);
         assert!(matches!(
             deferred[0],
-            (UnResolve::IterDecl(_), InferFailReason::UnResolveIterTemplate)
+            (
+                UnResolve::IterDecl(_),
+                InferFailReason::UnResolveIterTemplate
+            )
         ));
         assert_eq!(ready.len(), 1);
         assert!(matches!(

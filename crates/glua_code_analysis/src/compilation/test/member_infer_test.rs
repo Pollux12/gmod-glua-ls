@@ -3493,7 +3493,10 @@ marauth.character = marauth.character or {}
     #[test]
     fn test_cross_file_member_merge_widens_table_literals() {
         let mut ws = VirtualWorkspace::new();
-        ws.def_file("lua/widen_table/a.lua", "Store = {}\nStore.cfg = { a = 1 }\n");
+        ws.def_file(
+            "lua/widen_table/a.lua",
+            "Store = {}\nStore.cfg = { a = 1 }\n",
+        );
         ws.def_file("lua/widen_table/b.lua", "Store.cfg = { b = 2 }\n");
         let consumer = ws.def_file("lua/widen_table/c.lua", "local cfg = Store.cfg\n");
 

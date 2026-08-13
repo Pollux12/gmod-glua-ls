@@ -6,13 +6,12 @@ use std::{
 use crate::db_index::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
 use crate::{
     DbIndex, FileId, InFiled, InferFailReason, LuaDeclExtra, LuaDeclId, LuaDependencyKind,
-    LuaInferCache,
-    LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
-    LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaObjectType,
-    LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact, LuaTypeOwner,
-    WorkspaceId, find_signature_attribute_use, get_member_map, get_member_value_expr,
-    get_prefix_expr_signature_id, infer_authoritative_method_self_type, infer_expr,
-    infer_expr_semantic_decl, profile::Profile,
+    LuaInferCache, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
+    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaMemberIndexItem, LuaMemberKey,
+    LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaSignatureId, LuaType, LuaTypeDeclId,
+    LuaTypeFact, LuaTypeOwner, WorkspaceId, find_signature_attribute_use, get_member_map,
+    get_member_value_expr, get_prefix_expr_signature_id, infer_authoritative_method_self_type,
+    infer_expr, infer_expr_semantic_decl, profile::Profile,
 };
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,

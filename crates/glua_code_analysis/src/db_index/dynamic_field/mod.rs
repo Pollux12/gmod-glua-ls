@@ -529,8 +529,7 @@ impl LuaIndex for DynamicFieldIndex {
                 self.erase_file_from_derived(file_id);
             need_rebuild |= (files_with_removed_fields.contains(&file_id)
                 && !had_field_contributions)
-                || (files_with_removed_wildcards.contains(&file_id)
-                    && !had_wildcard_contributions);
+                || (files_with_removed_wildcards.contains(&file_id) && !had_wildcard_contributions);
         }
         // Rebuilding is a pure function of the primary maps, so one rebuild at
         // batch end is equivalent to the per-file rebuilds it replaces.

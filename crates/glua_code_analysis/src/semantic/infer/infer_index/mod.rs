@@ -54,7 +54,8 @@ use crate::{
 };
 
 use super::{
-    InferFailReason, InferResult, infer_expr, infer_name::infer_global_type, type_decl_is_vgui_panel,
+    InferFailReason, InferResult, infer_expr, infer_name::infer_global_type,
+    type_decl_is_vgui_panel,
 };
 
 type TableMemberLookupGuard = HashSet<InFiled<TextRange>>;

@@ -330,10 +330,11 @@ impl LuaMemberIndex {
     /// latest plain one because plain writers do dominate each other. Ordered by
     /// [`member_id_sort_key`], so it is a pure function of the candidate set.
     fn conditional_branch_item(&self, candidates: &[LuaMemberId]) -> Option<LuaMemberIndexItem> {
-        let (mut kept, plain): (Vec<_>, Vec<_>) = candidates
-            .iter()
-            .copied()
-            .partition(|candidate| self.conditional_branch_assignment_members.contains(candidate));
+        let (mut kept, plain): (Vec<_>, Vec<_>) =
+            candidates.iter().copied().partition(|candidate| {
+                self.conditional_branch_assignment_members
+                    .contains(candidate)
+            });
         if kept.is_empty() {
             return None;
         }
@@ -1261,7 +1262,8 @@ impl LuaMemberIndex {
                         self.members.remove(&member_id);
                         self.member_current_owner.remove(&member_id);
                         self.non_overwriting_assignment_members.remove(&member_id);
-                        self.conditional_branch_assignment_members.remove(&member_id);
+                        self.conditional_branch_assignment_members
+                            .remove(&member_id);
                         self.synthesized_owner_members.remove(&member_id);
                         self.deferred_index_expr_members.remove(&member_id);
                         self.member_function_scope_ranges.remove(&member_id);
@@ -1468,9 +1470,18 @@ mod tests {
 
         let populate = || {
             let mut index = LuaMemberIndex::new();
-            index.add_member(owner.clone(), make_member(make_member_id(first, 10), "alpha"));
-            index.add_member(owner.clone(), make_member(make_member_id(second, 20), "alpha"));
-            index.add_member(owner.clone(), make_member(make_member_id(second, 30), "beta"));
+            index.add_member(
+                owner.clone(),
+                make_member(make_member_id(first, 10), "alpha"),
+            );
+            index.add_member(
+                owner.clone(),
+                make_member(make_member_id(second, 20), "alpha"),
+            );
+            index.add_member(
+                owner.clone(),
+                make_member(make_member_id(second, 30), "beta"),
+            );
             index.add_member(
                 owner.clone(),
                 make_member(make_member_id(survivor, 40), "alpha"),
@@ -2181,7 +2192,11 @@ mod tests {
             for member_id in arrival {
                 index.add_member(
                     owner.clone(),
-                    make_member_with_feature(member_id, "progresshud", LuaMemberFeature::FileDefine),
+                    make_member_with_feature(
+                        member_id,
+                        "progresshud",
+                        LuaMemberFeature::FileDefine,
+                    ),
                 );
             }
 

@@ -239,13 +239,10 @@ fn remove_fields_completed_after(expr: &LuaTableExpr, missing: &mut HashSet<&str
 
         // Anything else touching the target consumes it while it is still
         // incomplete, so later writes no longer make the literal complete.
-        let escapes = node
-            .descendants()
-            .filter_map(LuaVarExpr::cast)
-            .any(|var| {
-                var.get_access_path().as_deref() == Some(target.as_str())
-                    && !written_prefixes.contains(var.syntax())
-            });
+        let escapes = node.descendants().filter_map(LuaVarExpr::cast).any(|var| {
+            var.get_access_path().as_deref() == Some(target.as_str())
+                && !written_prefixes.contains(var.syntax())
+        });
         if escapes {
             break;
         }

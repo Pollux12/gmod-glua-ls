@@ -13,12 +13,12 @@ use rowan::TextSize;
 
 use crate::{
     DbIndex, FileId, InFiled, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaDeclTypeKind,
-    LuaDocReturnInfo, LuaMember, LuaMemberId, LuaMemberInfo, LuaMemberKey, LuaOperator,
-    LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType, LuaTypeCache, LuaTypeDecl,
-    LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner, OperatorFunction, RenderLevel, ReturnTypeKind,
-    SemanticDeclLevel, SignatureReturnStatus, TypeOps, VariadicType,
-    LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId, LuaInferenceProvenanceKind,
-    LuaInferenceStep, LuaTypeFact,
+    LuaDocReturnInfo, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
+    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMember, LuaMemberId, LuaMemberInfo,
+    LuaMemberKey, LuaOperator, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFlag, LuaTypeOwner,
+    OperatorFunction, RenderLevel, ReturnTypeKind, SemanticDeclLevel, SignatureReturnStatus,
+    TypeOps, VariadicType,
     compilation::analyzer::{
         call_site_params::{
             exact_receiver_type_is_usable, infer_supported_call_site_arg_type,
@@ -43,8 +43,8 @@ use crate::{
     find_members_with_key, get_member_value_expr, humanize_type,
     semantic::{
         InferGuard, LuaInferCache, SelfRefId, SemanticDeclGuard, VarRefId, VarRefRootId,
-        get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, try_infer_expr_semantic_decl,
-        resolve_dynamic_field_member,
+        get_var_expr_var_ref_id, infer_call_expr_func, infer_expr, resolve_dynamic_field_member,
+        try_infer_expr_semantic_decl,
     },
 };
 use smol_str::SmolStr;
@@ -129,12 +129,13 @@ pub fn try_resolve_call_site_contribution(
         inferred_type: carries_inferred_type.then(|| Arc::new(typ.clone())),
         found_type: None,
     };
-    db.get_call_site_param_index_mut().queue_deferred_contribution(
-        contribution.file_id,
-        contribution.signature_id,
-        contribution.param_idx,
-        LuaTypeFact::new(typ, confidence, Arc::from([step])),
-    );
+    db.get_call_site_param_index_mut()
+        .queue_deferred_contribution(
+            contribution.file_id,
+            contribution.signature_id,
+            contribution.param_idx,
+            LuaTypeFact::new(typ, confidence, Arc::from([step])),
+        );
     Ok(())
 }
 
@@ -215,8 +216,8 @@ fn create_deferred_index_expr_member(
     // index-expr members only; for the rest it stores `None`. Same follow-up
     // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
     if !matches!(feature, LuaMemberFeature::FileDefine) {
-        let function_scope =
-            member_index.enclosing_function_scope_range(member_id.file_id, member_id.get_position());
+        let function_scope = member_index
+            .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
         member_index.set_member_function_scope_range(member_id, function_scope);
         if guarded {
             preserve_guarded_table_assignment_members(db, member_id);
@@ -641,22 +642,22 @@ pub fn try_resolve_iter_var(
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
 ) -> ResolveResult {
-    let iter_var_types = match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs)
-    {
-        Ok(types) => types,
-        // Placeholder items have nothing to add on a failed retry: the template
-        // ref is already cached. Keep the failure in this reason's own group
-        // rather than injecting the item into another group's fixpoint.
-        Err(reason) => {
-            return Err(
-                if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
-                    InferFailReason::UnResolveIterTemplate
-                } else {
-                    reason
-                },
-            );
-        }
-    };
+    let iter_var_types =
+        match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs) {
+            Ok(types) => types,
+            // Placeholder items have nothing to add on a failed retry: the template
+            // ref is already cached. Keep the failure in this reason's own group
+            // rather than injecting the item into another group's fixpoint.
+            Err(reason) => {
+                return Err(
+                    if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
+                        InferFailReason::UnResolveIterTemplate
+                    } else {
+                        reason
+                    },
+                );
+            }
+        };
     for (idx, var_name) in unresolve_iter_var.iter_vars.iter().enumerate() {
         let position = var_name.get_position();
         let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, position);
@@ -1912,7 +1913,8 @@ fn resolve_out_param_target(
         return Ok(Some(target));
     }
 
-    let Some(target) = resolve_out_param_target_from_member_lookup(db, cache, expr, &field_path[0])?
+    let Some(target) =
+        resolve_out_param_target_from_member_lookup(db, cache, expr, &field_path[0])?
     else {
         return Ok(None);
     };

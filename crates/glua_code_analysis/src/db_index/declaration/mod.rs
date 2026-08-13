@@ -49,11 +49,19 @@ impl LuaDeclIndex {
         self.global_initializer_tables.get(decl_id).copied()
     }
 
-    pub fn set_global_member_initializer_table(&mut self, member_id: LuaMemberId, range: TextRange) {
-        self.global_member_initializer_tables.insert(member_id, range);
+    pub fn set_global_member_initializer_table(
+        &mut self,
+        member_id: LuaMemberId,
+        range: TextRange,
+    ) {
+        self.global_member_initializer_tables
+            .insert(member_id, range);
     }
 
-    pub fn get_global_member_initializer_table(&self, member_id: &LuaMemberId) -> Option<TextRange> {
+    pub fn get_global_member_initializer_table(
+        &self,
+        member_id: &LuaMemberId,
+    ) -> Option<TextRange> {
         self.global_member_initializer_tables
             .get(member_id)
             .copied()

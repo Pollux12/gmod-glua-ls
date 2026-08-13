@@ -1749,7 +1749,8 @@ pub fn precompute_callee_realm_data_for_workspace(
             member_ids.sort_unstable_by_key(|member_id| member_id.get_position());
             for member_id in member_ids {
                 let semantic_decl = LuaSemanticDeclId::Member(member_id);
-                if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache) {
+                if let Some(realm) = resolve_precomputed_decl_realm(db, &semantic_decl, &mut cache)
+                {
                     resolved.push((semantic_decl, realm));
                 }
             }

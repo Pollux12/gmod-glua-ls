@@ -28,16 +28,16 @@ pub use module::compute_module_semantic_id;
 pub(in crate::compilation::analyzer) use settled_contributions::{
     member_assignment_contribution_entries, rederive_contributed_member_assignments,
 };
+pub(crate) use stats::dominating_guarded_table_bootstrap_range;
+use stats::{
+    analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
+    analyze_table_field, flush_pending_dynamic_key_collection_widenings,
+};
 pub(in crate::compilation::analyzer) use stats::{
     get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
     is_guarded_table_assignment_index_expr, is_guarded_table_assignment_member,
     preserve_guarded_table_assignment_members,
 };
-use stats::{
-    analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
-    analyze_table_field, flush_pending_dynamic_key_collection_widenings,
-};
-pub(crate) use stats::dominating_guarded_table_bootstrap_range;
 
 use log::info;
 use std::time::{Duration, Instant};

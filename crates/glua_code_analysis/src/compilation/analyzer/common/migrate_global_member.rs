@@ -761,12 +761,7 @@ mod tests {
         let member_id = LuaMemberId::new(syntax_id(LuaSyntaxKind::IndexExpr, 20), second_file);
         db.get_member_index_mut().add_member(
             LuaMemberOwner::GlobalPath(GlobalId::new("cityrp")),
-            LuaMember::new(
-                member_id,
-                key.clone(),
-                LuaMemberFeature::FileDefine,
-                None,
-            ),
+            LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
         );
 
         reconcile_parked_global_path_members(&mut db);

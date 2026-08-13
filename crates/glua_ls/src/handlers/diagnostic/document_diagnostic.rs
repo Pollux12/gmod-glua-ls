@@ -8,7 +8,10 @@ use tokio_util::sync::CancellationToken;
 use super::diagnostic_result_id;
 use crate::context::ServerContextSnapshot;
 
-fn full_report(result_id: Option<String>, items: Vec<Diagnostic>) -> DocumentDiagnosticReportResult {
+fn full_report(
+    result_id: Option<String>,
+    items: Vec<Diagnostic>,
+) -> DocumentDiagnosticReportResult {
     DocumentDiagnosticReport::Full(RelatedFullDocumentDiagnosticReport {
         related_documents: None,
         full_document_diagnostic_report: FullDocumentDiagnosticReport { result_id, items },

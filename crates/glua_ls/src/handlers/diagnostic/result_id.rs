@@ -39,14 +39,8 @@ mod tests {
     fn diagnostic(line: u32, message: &str) -> Diagnostic {
         Diagnostic {
             range: Range {
-                start: Position {
-                    line,
-                    character: 0,
-                },
-                end: Position {
-                    line,
-                    character: 4,
-                },
+                start: Position { line, character: 0 },
+                end: Position { line, character: 4 },
             },
             severity: Some(DiagnosticSeverity::WARNING),
             message: message.to_string(),
