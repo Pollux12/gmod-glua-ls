@@ -163,19 +163,20 @@ fn infer_binary_custom_operator(
         | LuaOperatorMetaMethod::Div
         | LuaOperatorMetaMethod::Mod
         | LuaOperatorMetaMethod::Pow => {
+            // An operand we could not resolve leaves the result unresolved
+            // too; `any` would claim the author opted out of checking.
+            if left.is_unknown() || right.is_unknown() {
+                return Ok(LuaType::Unknown);
+            }
             // GMod overloads arithmetic on Vector/Angle/VMatrix, so unlike
-            // plain Lua the answer is not necessarily a number. An unresolved
-            // operand stays `any` here on purpose: routing it to `unknown`
-            // hands it to the usage-context stabilizer, which fabricates a
-            // guess and reports `infer-unknown` for it (measured: +94 hints
-            // across CityRP and StarfallEx, no new findings).
-            let has_ambiguous_operand = left.is_nil()
+            // plain Lua the answer is not necessarily a number.
+            let unconstrained_operand = left.is_nil()
                 || right.is_nil()
                 || left.is_any()
                 || right.is_any()
-                || left.is_unknown()
-                || right.is_unknown();
-            if has_ambiguous_operand || left.is_custom_type() || right.is_custom_type() {
+                || left.is_custom_type()
+                || right.is_custom_type();
+            if unconstrained_operand {
                 Ok(LuaType::Any)
             } else {
                 Ok(LuaType::Number)
