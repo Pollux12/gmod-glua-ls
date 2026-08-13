@@ -9,7 +9,7 @@ use rowan::TextRange;
 use crate::{
     DiagnosticCode, GMOD_ATTR_SELF_CALL_VALID, GMOD_CALL_ARG_DOMAINS, GMOD_ROLE_EXISTS,
     GMOD_ROLE_REFERENCE, InferFailReason, LuaDeclId, LuaInferenceProvenanceKind, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType, LuaUnionType,
+    LuaMemberOwner, LuaSemanticDeclId, LuaSignatureCast, LuaSignatureId, LuaType,
     SemanticDeclLevel, SemanticModel, find_best_direct_call_arg_role_from_type,
     find_signature_attribute_use, get_var_expr_var_ref_id,
     semantic::{
@@ -119,14 +119,7 @@ fn check_call_expr(
 
     let func = semantic_model.infer_expr(prefix.clone()).ok()?;
     if func.is_nullable() {
-        if should_report_unchecked_nil_access(&prefix, &func) {
-            context.add_diagnostic(
-                DiagnosticCode::UncheckedNilAccess,
-                prefix.get_range(),
-                format!("{name} may be nil", name = prefix.syntax().text()).to_string(),
-                None,
-            );
-        } else if nullable_callable_is_from_non_nullable_receiver(semantic_model, &prefix) {
+        if nullable_callable_is_from_non_nullable_receiver(semantic_model, &prefix) {
             return Some(());
         } else if nullable_callable_is_from_guarded_receiver(semantic_model, &prefix) {
             // The receiver is nil-checked by a prior type-guard early-return (e.g.
@@ -329,9 +322,7 @@ fn report_unsafe_receiver(
 
         // Definite nil receivers should be warning-level unchecked access.
         // Nullable-but-not-definite receivers remain NeedCheckNil.
-        let diagnostic_code = if receiver_type.is_nil()
-            || should_report_unchecked_nil_access(receiver, &receiver_type)
-        {
+        let diagnostic_code = if receiver_type.is_nil() {
             DiagnosticCode::UncheckedNilAccess
         } else {
             DiagnosticCode::NeedCheckNil
@@ -735,14 +726,8 @@ fn check_index_expr(
             return Some(());
         }
 
-        let diagnostic_code = if should_report_unchecked_nil_access(&prefix, &prefix_type) {
-            DiagnosticCode::UncheckedNilAccess
-        } else {
-            DiagnosticCode::NeedCheckNil
-        };
-
         context.add_diagnostic(
-            diagnostic_code,
+            DiagnosticCode::NeedCheckNil,
             prefix.get_range(),
             format!("{name} may be nil", name = prefix.syntax().text()).to_string(),
             None,
@@ -3184,18 +3169,6 @@ fn return_type_is_non_nullable_type_guard(return_type: &LuaType) -> bool {
         LuaType::TypeGuard(inner) => !inner.is_nullable(),
         _ => false,
     }
-}
-
-fn should_report_unchecked_nil_access(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> bool {
-    matches!(prefix_expr, LuaExpr::IndexExpr(_)) && is_opaque_nullable_any(prefix_type)
-}
-
-fn is_opaque_nullable_any(ty: &LuaType) -> bool {
-    let LuaType::Union(union) = ty else {
-        return false;
-    };
-
-    matches!(union.as_ref(), LuaUnionType::Nullable(LuaType::Any))
 }
 
 fn check_binary_expr(

@@ -1136,7 +1136,7 @@ mod test {
     }
 
     #[gtest]
-    fn test_unchecked_nil_access_for_opaque_table_chained_index() {
+    fn test_opaque_table_chained_index_is_hinted_not_warned() {
         let mut ws = VirtualWorkspace::new();
         let code = r##"
             ---@type table
@@ -1144,18 +1144,20 @@ mod test {
             print(tbl.someKey.test)
         "##;
 
+        // An unresolvable type is not nil evidence, so this is the hint-level
+        // code rather than the warning reserved for a definite nil.
         assert_that!(
             ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
-            eq(false)
+            eq(true)
         );
         assert_that!(
             ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
-            eq(true)
+            eq(false)
         );
     }
 
     #[gtest]
-    fn test_unchecked_nil_access_for_opaque_table_member_call() {
+    fn test_opaque_table_member_call_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
             ws.check_code_for(
@@ -1166,12 +1168,12 @@ mod test {
                 tbl.someKey()
                 "#,
             ),
-            eq(false)
+            eq(true)
         );
     }
 
     #[gtest]
-    fn test_unchecked_nil_access_for_opaque_table_method_call() {
+    fn test_opaque_table_method_call_is_not_warned() {
         let mut ws = VirtualWorkspace::new();
         assert_that!(
             ws.check_code_for(
@@ -1182,7 +1184,7 @@ mod test {
                 tbl:someMethod()
                 "#,
             ),
-            eq(false)
+            eq(true)
         );
     }
 
