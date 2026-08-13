@@ -369,7 +369,9 @@ pub(crate) fn resolve_dynamic_field_member(
     }
 
     let typ = match member_types.as_slice() {
-        [] => LuaType::Any,
+        // Finding no contributing member says nothing about what the field
+        // holds, so the honest answer is unresolved rather than unconstrained.
+        [] => LuaType::Unknown,
         [only] => only.clone(),
         _ => LuaType::from_vec(member_types),
     };
