@@ -88,7 +88,6 @@ pub struct DbIndex {
     /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
-    file_has_call_expr: HashMap<FileId, bool>,
     file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
 }
 
@@ -141,18 +140,8 @@ impl DbIndex {
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_registry_cache: RevisionedCache::default(),
-            file_has_call_expr: HashMap::new(),
             file_helper_scan_cache: HashMap::new(),
         }
-    }
-
-    /// Whether a file contains any call expression at all.
-    pub fn get_file_has_call_expr(&self, file_id: FileId) -> Option<bool> {
-        self.file_has_call_expr.get(&file_id).copied()
-    }
-
-    pub fn set_file_has_call_expr(&mut self, file_id: FileId, has_calls: bool) {
-        self.file_has_call_expr.insert(file_id, has_calls);
     }
 
     /// One file's contribution to the gmod net-helper scan.
@@ -211,7 +200,6 @@ impl DbIndex {
         // underlying index has changed.
         self.helper_registry_cache = RevisionedCache::default();
         for &file_id in &file_ids {
-            self.file_has_call_expr.remove(&file_id);
             self.file_helper_scan_cache.remove(&file_id);
         }
         for &file_id in &file_ids {
@@ -611,7 +599,6 @@ impl LuaIndex for DbIndex {
         // set is re-indexed — the revision key would hand back a registry built
         // against the discarded index.
         self.helper_registry_cache = RevisionedCache::default();
-        self.file_has_call_expr.clear();
         self.file_helper_scan_cache.clear();
     }
 }

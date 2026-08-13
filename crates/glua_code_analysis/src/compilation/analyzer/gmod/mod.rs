@@ -1010,29 +1010,24 @@ fn build_call_roles_and_registry(
         })
         .collect::<HashMap<_, _>>();
     let scanned = super::parallel::map_files_collect(db, &uncached, |db, file_id| {
-        let has_calls = match db.get_file_has_call_expr(file_id) {
-            Some(cached) => cached,
-            None => db
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .map(|tree| {
-                    tree.get_chunk_node()
-                        .syntax()
-                        .descendants()
-                        .any(|node| LuaCallExpr::can_cast(node.kind().into()))
-                })
-                .unwrap_or(false),
-        };
-        let scan = Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
+        let has_calls = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| {
+                tree.get_chunk_node()
+                    .syntax()
+                    .descendants()
+                    .any(|node| LuaCallExpr::can_cast(node.kind().into()))
+            })
+            .unwrap_or(false);
+        Arc::new(AnnotatedGmodGlobalCallRoleMap::build_for_file(
             db,
             &sorted_signatures[&file_id],
             has_calls,
-        ));
-        (has_calls, scan)
+        ))
     });
     let rescanned = scanned.len();
-    for (file_id, (has_calls, scan)) in uncached.iter().zip(scanned) {
-        db.set_file_has_call_expr(*file_id, has_calls);
+    for (file_id, scan) in uncached.iter().zip(scanned) {
         db.set_cached_file_helper_scan(*file_id, scan);
     }
 
