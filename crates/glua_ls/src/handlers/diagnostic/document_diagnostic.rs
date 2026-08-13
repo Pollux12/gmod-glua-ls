@@ -81,11 +81,9 @@ pub async fn on_pull_document_diagnostic(
         };
     };
 
-    context
-        .file_diagnostic()
-        .cache_fresh_file_diagnostics(&uri, &diagnostics)
-        .await;
-
+    // The push-path cache is deliberately not written here: its only reader is
+    // gated on `!supports_pull`, so for a pull client this would clone every
+    // diagnostic on every request for nothing.
     let result_id = diagnostic_result_id(&diagnostics);
     if previous_result_id.as_deref() == Some(result_id.as_str()) {
         return unchanged_report(result_id);
