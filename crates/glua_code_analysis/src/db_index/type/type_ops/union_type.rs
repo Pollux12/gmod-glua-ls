@@ -17,12 +17,17 @@ pub(crate) fn union_type_shallow(source: &LuaType, target: &LuaType) -> LuaType 
 
 /// Normalise a whole member set the same way repeated `union_type` would.
 pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
-    // `any` is the one member that deliberately does NOT absorb its
-    // siblings here. The pairwise rule collapses `any | T` to `any`, but a
-    // declared `---@type any|string` has to keep the `string` arm or param
-    // checking stops flagging it (see the any-union family in
-    // `param_type_check_test`), and bare `any` is not treated as nullable
-    // by `NeedCheckNil`.
+    // `any` is the one member that deliberately does NOT absorb its siblings
+    // here, unlike the pairwise rule and upstream. A declared
+    // `---@type any|string` has to keep its `string` arm — the arms are the
+    // author's text, and dropping them stops param checking flagging the ones
+    // that do not fit.
+    //
+    // Absorbing was measured twice and rejected both times: on every path it
+    // takes the arm that carries a callable's real signature with it, which
+    // cost 9 false `redundant-parameter` reports on StarfallEx (a method
+    // resolving to a 0-parameter arm), and it buys no determinism — the
+    // re-index gates already pass without it.
     if types.iter().any(|typ| matches!(typ, LuaType::Any)) || can_use_structural_union(&types) {
         return LuaType::from_vec_structural(types);
     }
