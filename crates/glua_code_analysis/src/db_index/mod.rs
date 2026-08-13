@@ -542,31 +542,70 @@ impl LuaIndex for DbIndex {
             return;
         }
 
-        self.decl_index.remove_files(file_ids);
-        self.references_index.remove_files(file_ids);
-        self.types_index.remove_files(file_ids);
-        self.modules_index.remove_files(file_ids);
-        self.members_index.remove_files(file_ids);
-        self.property_index.remove_files(file_ids);
-        self.signature_index.remove_files(file_ids);
-        self.diagnostic_index.remove_files(file_ids);
-        self.operator_index.remove_files(file_ids);
-        self.flow_index.remove_files(file_ids);
-        self.accessor_func_index.remove_files(file_ids);
-        self.accessor_func_call_index.remove_files(file_ids);
-        self.call_site_param_index.remove_files(file_ids);
-        self.gmod_class_index.remove_files(file_ids);
-        self.gmod_infer_index.remove_files(file_ids);
-        self.gmod_load_index.remove_files(file_ids);
-        self.gmod_network_index.remove_files(file_ids);
-        self.dynamic_field_index.remove_files(file_ids);
-        self.file_dependencies_index.remove_files(file_ids);
-        for &file_id in file_ids {
-            self.numeric_range_population_index.remove(file_id);
-        }
-        self.metatable_index.remove_files(file_ids);
-        self.global_index.remove_files(file_ids);
-        self.json_schema_index.remove_files(file_ids);
+        use crate::profile::phase;
+        phase("remove/decl", || self.decl_index.remove_files(file_ids));
+        phase("remove/references", || {
+            self.references_index.remove_files(file_ids)
+        });
+        phase("remove/types", || self.types_index.remove_files(file_ids));
+        phase("remove/modules", || {
+            self.modules_index.remove_files(file_ids)
+        });
+        phase("remove/members", || {
+            self.members_index.remove_files(file_ids)
+        });
+        phase("remove/property", || {
+            self.property_index.remove_files(file_ids)
+        });
+        phase("remove/signature", || {
+            self.signature_index.remove_files(file_ids)
+        });
+        phase("remove/diagnostic", || {
+            self.diagnostic_index.remove_files(file_ids)
+        });
+        phase("remove/operator", || {
+            self.operator_index.remove_files(file_ids)
+        });
+        phase("remove/flow", || self.flow_index.remove_files(file_ids));
+        phase("remove/accessor_func", || {
+            self.accessor_func_index.remove_files(file_ids)
+        });
+        phase("remove/accessor_func_call", || {
+            self.accessor_func_call_index.remove_files(file_ids)
+        });
+        phase("remove/call_site_param", || {
+            self.call_site_param_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_class", || {
+            self.gmod_class_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_infer", || {
+            self.gmod_infer_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_load", || {
+            self.gmod_load_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_network", || {
+            self.gmod_network_index.remove_files(file_ids)
+        });
+        phase("remove/dynamic_field", || {
+            self.dynamic_field_index.remove_files(file_ids)
+        });
+        phase("remove/file_dependencies", || {
+            self.file_dependencies_index.remove_files(file_ids)
+        });
+        phase("remove/numeric_range", || {
+            for &file_id in file_ids {
+                self.numeric_range_population_index.remove(file_id);
+            }
+        });
+        phase("remove/metatable", || {
+            self.metatable_index.remove_files(file_ids)
+        });
+        phase("remove/global", || self.global_index.remove_files(file_ids));
+        phase("remove/json_schema", || {
+            self.json_schema_index.remove_files(file_ids)
+        });
     }
 
     fn clear(&mut self) {

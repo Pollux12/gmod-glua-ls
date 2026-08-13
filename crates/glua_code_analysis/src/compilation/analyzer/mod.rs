@@ -1030,8 +1030,10 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    let _p = Profile::new(name);
-    T::analyze(db, context);
+    // Timed through the phase accumulator rather than a `Profile`: several
+    // pipelines already carry their own `Profile`, and an unconditional one
+    // here would add a log line per pipeline per batch on a live server.
+    crate::profile::phase(name, || T::analyze(db, context));
     crate::profile::phase_report(name);
 }
 

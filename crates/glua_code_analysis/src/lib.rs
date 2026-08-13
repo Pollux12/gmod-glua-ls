@@ -517,8 +517,9 @@ impl EmmyLuaAnalysis {
             .filter(|_| is_removed)
             .into_iter()
             .collect::<HashSet<_>>();
-        let mut existing_reindex_file_ids =
-            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+        let mut existing_reindex_file_ids = profile::phase("edit/expand", || {
+            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]))
+        });
         if let Some(reindex_file_ids) = &mut existing_reindex_file_ids {
             self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
         }
@@ -527,7 +528,9 @@ impl EmmyLuaAnalysis {
             .flatten()
             .copied()
             .collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
+        let old_guard_facts = profile::phase("edit/guard_snapshot", || {
+            self.inferred_guard_snapshot(&old_guard_fact_file_ids)
+        });
 
         let file_id = self
             .compilation
@@ -538,7 +541,9 @@ impl EmmyLuaAnalysis {
 
         let reindex_file_ids = existing_reindex_file_ids
             .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
-        self.compilation.remove_index(reindex_file_ids.clone());
+        profile::phase("edit/remove_index", || {
+            self.compilation.remove_index(reindex_file_ids.clone())
+        });
 
         let update_file_ids = reindex_file_ids
             .iter()
@@ -546,21 +551,30 @@ impl EmmyLuaAnalysis {
             .filter(|id| !is_removed || *id != file_id)
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
+            profile::phase("edit/update_index", || {
+                self.compilation.update_index(update_file_ids.clone())
+            });
+            profile::phase("edit/stabilize_type_caches", || {
+                self.stabilize_cross_file_type_caches(&update_file_ids)
+            });
         }
         self.compilation
             .get_db_mut()
             .get_call_site_param_index_mut()
             .refresh_file_source_dependencies(file_id);
         let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &reindex_file_ids,
-            &incremental_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
+        profile::phase("edit/guard_reference_reindex", || {
+            self.reindex_changed_inferred_guard_references(
+                &guard_fact_file_ids,
+                &old_guard_facts,
+                &reindex_file_ids,
+                &incremental_source_file_ids,
+            )
+        });
+        profile::phase("edit/param_consumer_reindex", || {
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids)
+        });
+        profile::phase_report("update_file_by_uri");
 
         Some(file_id)
     }
