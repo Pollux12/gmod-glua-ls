@@ -1762,15 +1762,10 @@ pub fn precompute_callee_realm_data_for_workspace(
     // value for the same key whoever computed it, so folding the fragments back
     // in leaves the signature pass below reading a warm cache, exactly as it did
     // when the whole function ran on one thread.
-    let resolved_by_file = resolved_by_file
-        .into_iter()
-        .map(|(resolved, cache)| {
-            decl_annotation_cache.extend(cache);
-            resolved
-        })
-        .collect::<Vec<_>>();
-
-    for (semantic_decl, resolved) in resolved_by_file.into_iter().flatten() {
+    for (semantic_decl, resolved) in resolved_by_file.into_iter().flat_map(|(resolved, cache)| {
+        decl_annotation_cache.extend(cache);
+        resolved
+    }) {
         match semantic_decl {
             LuaSemanticDeclId::LuaDecl(decl_id) => {
                 if let Some(decl) = db.get_decl_index().get_decl(&decl_id) {
