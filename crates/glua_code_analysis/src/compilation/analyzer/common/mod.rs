@@ -188,7 +188,13 @@ fn should_replace_uninformative_inferred_cache(
         return true;
     }
 
-    if should_replace_bottom_infer_type_cache(current_cache, new_cache) {
+    // `nil` and `never` sit at the bottom of the type lattice: they record
+    // that no value was found, not that any value is allowed. A concrete
+    // inferred type is strictly more precise, so it has to win regardless of
+    // which round produced it — a local that an early round saw only as `nil`
+    // must not stay `nil` once the assignment that gives it a table has been
+    // analysed.
+    if new_cache.supersedes(current_cache) {
         return true;
     }
 
@@ -212,19 +218,6 @@ fn should_replace_uninformative_inferred_cache(
     }
 
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
-}
-
-/// `nil` and `never` sit at the bottom of the type lattice: they record
-/// that no value was found, not that any value is allowed. A concrete
-/// inferred type is strictly more precise, so it has to win regardless of
-/// which round produced it — a local that an early round saw only as `nil`
-/// must not stay `nil` once the assignment that gives it a table has been
-/// analysed.
-fn should_replace_bottom_infer_type_cache(
-    current_cache: &LuaTypeCache,
-    new_cache: &LuaTypeCache,
-) -> bool {
-    new_cache.supersedes(current_cache)
 }
 
 fn should_replace_uninformative_infer_type_cache(
