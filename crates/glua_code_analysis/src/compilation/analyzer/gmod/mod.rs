@@ -181,7 +181,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // syntax tree of every file that owns a signature. Resolving it
         // against the db-level cache first keeps that work proportional to
         // the files actually re-analysed.
-        let (helper_registry, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
+        let (helper_registry, annotated_global_call_roles) = build_call_roles_and_registry(db);
         // Publish the canonical op-name table so diagnostics and completions can
         // name a net op they have no call expression for.
         db.get_gmod_network_index_mut()
@@ -189,29 +189,15 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         context.gmod_global_call_roles =
             Some((helper_revision, annotated_global_call_roles.clone()));
 
-        // Pre-format hook method prefixes once to avoid per-file `format!("{p}:")` allocations
-        let formatted_hook_prefixes: Vec<String> = db
-            .get_emmyrc()
-            .gmod
-            .hook_mappings
-            .method_prefixes
-            .iter()
-            .cloned()
-            .chain(
-                db.get_emmyrc()
-                    .gmod
-                    .scripted_class_scopes
-                    .hook_owner_globals(),
-            )
-            .map(|prefix| format!("{prefix}:"))
-            .collect();
+        let prefixes = formatted_hook_prefixes(db);
 
         let t_class = do_profile.then(std::time::Instant::now);
-        collect_annotated_gmod_call_sites_with(
+        collect_annotated_call_sites_with(
             db,
             context,
-            &formatted_hook_prefixes,
+            &prefixes,
             &annotated_global_call_roles,
+            true,
         );
         if let Some(t_class) = t_class {
             log::info!(
@@ -243,7 +229,7 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 db,
                 file_id,
                 &helper_registry,
-                &formatted_hook_prefixes,
+                &prefixes,
                 &annotated_global_call_roles,
             )
         });
@@ -519,7 +505,7 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         {
             (Some(registry), Some(roles)) => (registry, roles),
             _ => crate::profile::phase("gmodnet/build_registry", || {
-                let (registry, roles, _) = build_call_roles_and_registry(db);
+                let (registry, roles) = build_call_roles_and_registry(db);
                 context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
                 (registry, roles)
             }),
@@ -632,7 +618,7 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         // Same per-file cached scan the net pass uses. Folding the signature
         // index directly here took its `HashMap` iteration order, so a call path
         // defined by two files resolved differently between processes.
-        let (_, annotated_global_call_roles, _) = build_call_roles_and_registry(db);
+        let (_, annotated_global_call_roles) = build_call_roles_and_registry(db);
         collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles);
         update_compilefile_execution_environments(db, context, &annotated_global_call_roles);
         if let Some(t_class) = t_class {
@@ -691,13 +677,10 @@ fn collect_numeric_range_table_populations(db: &mut DbIndex, context: &AnalyzeCo
     }
 }
 
-fn collect_annotated_scripted_class_calls(
-    db: &mut DbIndex,
-    context: &AnalyzeContext,
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) {
-    let formatted_hook_prefixes: Vec<String> = db
-        .get_emmyrc()
+/// Hook method prefixes, pre-formatted once to avoid a per-file
+/// `format!("{prefix}:")` allocation in the call-site scan.
+fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
+    db.get_emmyrc()
         .gmod
         .hook_mappings
         .method_prefixes
@@ -710,28 +693,16 @@ fn collect_annotated_scripted_class_calls(
                 .hook_owner_globals(),
         )
         .map(|prefix| format!("{prefix}:"))
-        .collect();
-    collect_annotated_scripted_class_calls_with(
-        db,
-        context,
-        &formatted_hook_prefixes,
-        annotated_global_call_roles,
-    );
+        .collect()
 }
 
-fn collect_annotated_scripted_class_calls_with(
+fn collect_annotated_scripted_class_calls(
     db: &mut DbIndex,
     context: &AnalyzeContext,
-    formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
-    collect_annotated_call_sites_with(
-        db,
-        context,
-        formatted_hook_prefixes,
-        annotated_global_call_roles,
-        false,
-    );
+    let prefixes = formatted_hook_prefixes(db);
+    collect_annotated_call_sites_with(db, context, &prefixes, annotated_global_call_roles, false);
 }
 
 /// A db write produced by the per-file annotated call-site scan.
@@ -833,47 +804,13 @@ pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &AnalyzeContext
         return;
     }
 
-    let formatted_hook_prefixes: Vec<String> = db
-        .get_emmyrc()
-        .gmod
-        .hook_mappings
-        .method_prefixes
-        .iter()
-        .cloned()
-        .chain(
-            db.get_emmyrc()
-                .gmod
-                .scripted_class_scopes
-                .hook_owner_globals(),
-        )
-        .map(|prefix| format!("{prefix}:"))
-        .collect();
-    let (_, annotated_global_call_roles, _) = {
+    let prefixes = formatted_hook_prefixes(db);
+    let (_, annotated_global_call_roles) = {
         let _p = Profile::new("ccs: build_call_roles_and_registry");
         build_call_roles_and_registry(db)
     };
     let _p = Profile::new("ccs: walk");
-    collect_annotated_gmod_call_sites_with(
-        db,
-        context,
-        &formatted_hook_prefixes,
-        &annotated_global_call_roles,
-    );
-}
-
-fn collect_annotated_gmod_call_sites_with(
-    db: &mut DbIndex,
-    context: &AnalyzeContext,
-    formatted_hook_prefixes: &[String],
-    annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
-) {
-    collect_annotated_call_sites_with(
-        db,
-        context,
-        formatted_hook_prefixes,
-        annotated_global_call_roles,
-        true,
-    );
+    collect_annotated_call_sites_with(db, context, &prefixes, &annotated_global_call_roles, true);
 }
 
 fn collect_annotated_load_dependency_site(
@@ -954,11 +891,7 @@ struct FileHelperScan {
 /// per-file cached scans.
 fn build_call_roles_and_registry(
     db: &mut DbIndex,
-) -> (
-    Arc<HelperRegistry>,
-    Arc<AnnotatedGmodGlobalCallRoleMap>,
-    usize,
-) {
+) -> (Arc<HelperRegistry>, Arc<AnnotatedGmodGlobalCallRoleMap>) {
     let helper_revision = helper_registry_revision(db);
     let cached_helper_registry = db.get_cached_helper_registry::<HelperRegistry>(helper_revision);
 
@@ -1026,7 +959,6 @@ fn build_call_roles_and_registry(
             has_calls,
         ))
     });
-    let rescanned = scanned.len();
     for (file_id, scan) in uncached.iter().zip(scanned) {
         db.set_cached_file_helper_scan(*file_id, scan);
     }
@@ -1057,31 +989,24 @@ fn build_call_roles_and_registry(
         }
     };
 
-    (registry, Arc::new(role_map), rescanned)
+    (registry, Arc::new(role_map))
 }
 
 #[derive(Default)]
 struct HelperRegistryBuilder {
     definitions: Vec<IndexedHelperDefinition>,
-    /// Whether each file contains any call expression at all. Computed once per
-    /// file so annotation libraries full of empty stubs are rejected before
-    /// resolving every signature back to a red-tree closure.
-    file_has_calls: HashMap<FileId, bool>,
+    /// Whether the scanned file contains any call expression at all. Computed
+    /// once per file so annotation libraries full of empty stubs are rejected
+    /// before resolving every signature back to a red-tree closure.
+    file_has_calls: bool,
 }
 
 impl HelperRegistryBuilder {
-    fn with_file_has_calls(file_has_calls: HashMap<FileId, bool>) -> Self {
-        Self {
-            definitions: Vec::new(),
-            file_has_calls,
-        }
-    }
-
     fn add_signature(&mut self, db: &DbIndex, signature_id: LuaSignatureId) {
-        let file_id = signature_id.get_file_id();
-        if !self.file_has_calls.get(&file_id).copied().unwrap_or(false) {
+        if !self.file_has_calls {
             return;
         }
+        let file_id = signature_id.get_file_id();
 
         let Some(closure) = closure_from_signature_id(db, signature_id) else {
             return;
@@ -8856,13 +8781,10 @@ impl AnnotatedGmodGlobalCallRoleMap {
         signature_ids: &[LuaSignatureId],
         file_has_calls: bool,
     ) -> FileHelperScan {
-        let mut builder = HelperRegistryBuilder::with_file_has_calls(
-            signature_ids
-                .first()
-                .map(|signature_id| (signature_id.get_file_id(), file_has_calls))
-                .into_iter()
-                .collect(),
-        );
+        let mut builder = HelperRegistryBuilder {
+            file_has_calls,
+            ..Default::default()
+        };
         let mut role_map = Self::default();
         for signature_id in signature_ids {
             builder.add_signature(db, *signature_id);
