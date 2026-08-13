@@ -750,7 +750,7 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
         return false;
     };
 
-    let expanded = analysis.diagnostic_reindex_scope(vec![file_id]);
+    let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
     eprintln!(
         "[edit] {} expands to {} files",
         target.display(),
@@ -798,7 +798,7 @@ fn noop_edit_midfile(analysis: &mut EmmyLuaAnalysis, target: &Path) -> bool {
         return false;
     };
 
-    let expanded = analysis.diagnostic_reindex_scope(vec![file_id]);
+    let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
     eprintln!(
         "[editmid] {} expands to {} files",
         target.display(),

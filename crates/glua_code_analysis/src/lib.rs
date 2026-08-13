@@ -796,11 +796,6 @@ impl EmmyLuaAnalysis {
         self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
     }
 
-    /// The set of files an edit to `file_ids` would re-analyse.
-    pub fn diagnostic_reindex_scope(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        self.expand_reindex_file_ids(file_ids)
-    }
-
     /// Re-analyses exactly `file_ids`, skipping dependency expansion.
     pub fn reindex_files_without_expansion(&mut self, file_ids: Vec<FileId>) {
         self.compilation.remove_index(file_ids.clone());
