@@ -403,7 +403,6 @@ fn infer_dynamic_index_expr_shape(
         .get_index_key()
         .ok_or(InferFailReason::FieldNotFound)?;
     let member_key = LuaMemberKey::from_index_key(db, cache, &index_key)?;
-    // unsealed: pre-deferral behavior, replaced per-consumer
     resolve_dynamic_field_member(db, cache, &prefix_type, &member_key, None)
         .unwrap_or_default()
         .map(|resolution| resolution.typ)

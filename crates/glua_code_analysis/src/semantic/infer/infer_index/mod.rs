@@ -601,7 +601,6 @@ fn infer_table_member_owner(
                 &key,
                 Some(index_expr.get_position()),
             )
-            // unsealed: pre-deferral behavior, replaced per-consumer
             .unwrap_or_default()
             && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
         {
@@ -672,7 +671,6 @@ fn infer_table_member_owner(
             &key,
             Some(index_expr.get_position()),
         )
-        // unsealed: pre-deferral behavior, replaced per-consumer
         .unwrap_or_default()
             && !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown)
         {
@@ -716,7 +714,6 @@ fn infer_table_member_owner(
                 &key,
                 Some(index_expr.get_position()),
             )
-            // unsealed: pre-deferral behavior, replaced per-consumer
             .unwrap_or_default()
             {
                 if !matches!(dynamic_field.typ, LuaType::Any | LuaType::Unknown) {
@@ -1502,7 +1499,6 @@ fn infer_gmod_plain_table_dynamic_field(
         &member_key,
         Some(index_expr.get_position()),
     )
-    // unsealed: pre-deferral behavior, replaced per-consumer
     .unwrap_or_default()
     .map(|resolution| resolution.typ)
 }
@@ -1797,7 +1793,6 @@ fn infer_custom_type_member(
         return Err(InferFailReason::UnSealedDynamicFields);
     }
 
-    // unsealed: pre-deferral behavior, replaced per-consumer
     if let Some(dynamic_field) = dynamic_field_result.unwrap_or_default() {
         if type_decl.is_class()
             && let Some(super_types) =

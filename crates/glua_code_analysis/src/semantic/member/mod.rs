@@ -386,7 +386,6 @@ pub(crate) fn resolve_dynamic_field_member_for_file(
     member_key: &LuaMemberKey,
 ) -> Option<DynamicFieldResolution> {
     let mut cache = LuaInferCache::new(caller_file_id, Default::default());
-    // unsealed: pre-deferral behavior, replaced per-consumer
     resolve_dynamic_field_member(db, &mut cache, prefix_type, member_key, None).unwrap_or_default()
 }
 
