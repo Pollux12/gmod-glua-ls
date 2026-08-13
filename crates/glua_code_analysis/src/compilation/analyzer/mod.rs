@@ -303,11 +303,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
     }
 }
 
-/// Cap on how many dropped attaches one batch remembers. The pass is a
-/// best-effort retry, so a pathological workspace bounds its cost instead of
-/// growing the batch's memory without limit.
-const SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT: usize = 8192;
-
 /// Retries the index-expression member attaches `set_index_expr_owner`
 /// dropped.
 fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -362,11 +357,6 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
     }
 }
 
-/// Cap on how many uninformative inferred returns one batch re-derives, for the
-/// same reason [`SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT`] exists: the pass is a
-/// best-effort retry, so a pathological workspace bounds its cost.
-const SETTLED_INFERRED_RETURN_CANDIDATE_LIMIT: usize = 8192;
-
 /// Re-resolves inferred returns that settled on `any`/`unknown`.
 fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) {
     let mut candidates = context
@@ -388,7 +378,6 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
         return;
     }
     candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
-    candidates.truncate(SETTLED_INFERRED_RETURN_CANDIDATE_LIMIT);
 
     // Only the candidate files are re-inferred, so only their caches are stale.
     let candidate_files = candidates
@@ -403,12 +392,6 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
     }
 }
 
-/// Cap on how many partial widenings one batch re-derives, matching the other
-/// settled retries: the pass is best-effort, so a pathological workspace bounds
-/// its cost. The cap is applied after the canonical sort, so which candidates it
-/// drops does not depend on the order they were recorded in.
-const SETTLED_MEMBER_WIDENING_CANDIDATE_LIMIT: usize = 8192;
-
 /// Re-derives member assignment widenings that ran against an incomplete
 /// set of sibling writers.
 fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeContext) {
@@ -418,7 +401,6 @@ fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeCon
     }
     let mut candidates = candidates.into_iter().collect::<Vec<_>>();
     candidates.sort_by_key(|(member_id, _)| (member_id.file_id, member_id.get_position()));
-    candidates.truncate(SETTLED_MEMBER_WIDENING_CANDIDATE_LIMIT);
 
     for (member_id, (assigned_type, preserve_table_literals)) in candidates {
         // Only an inferred assignment cache is this pass' to rewrite: a doc type
@@ -1258,9 +1240,7 @@ impl AnalyzeContext {
     }
 
     pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
-        if self.settled_member_attach_candidates.len() < SETTLED_MEMBER_ATTACH_CANDIDATE_LIMIT {
-            self.settled_member_attach_candidates.push(candidate);
-        }
+        self.settled_member_attach_candidates.push(candidate);
     }
 
     pub(crate) fn requeue_call_site_inferred_returns(
