@@ -143,6 +143,16 @@ fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
 }
 
 fn cancel_error_code(features: &LspFeatures, method: &str) -> ErrorCode {
+    // Pull diagnostics are explicitly server-cancellable. LSP 3.17: "A server
+    // is also allowed to return an error with code `ServerCancelled`
+    // indicating that the server can't compute the result right now... If no
+    // data is provided it defaults to `{ retriggerRequest: true }`." That is
+    // exactly this situation — our own state was invalidated and we want the
+    // client to ask again — and the default spares us a `data` payload.
+    if matches!(method, "textDocument/diagnostic" | "workspace/diagnostic") {
+        return ErrorCode::ServerCancelled;
+    }
+
     // LSP 3.17 implementation considerations: "Use ContentModified only when
     // the server's own internal state invalidates an in-flight result." A
     // cancelled request is exactly that — `didChange` fired
