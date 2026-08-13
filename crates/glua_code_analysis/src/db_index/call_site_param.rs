@@ -115,9 +115,6 @@ pub struct CallSiteParamIndex {
     /// These survive dependent reindexing while a producer is absent so reopening the producer
     /// can invalidate its consumers. Direct consumer edits refresh their entry exactly.
     file_source_dependencies: HashMap<FileId, HashSet<FileId>>,
-    /// signature-owning file → files whose call sites supplied the inferred
-    /// parameter types for signatures declared in it.
-    signature_param_contributors: HashMap<FileId, HashSet<FileId>>,
     source_dependents: HashMap<FileId, HashSet<FileId>>,
     source_paths: HashMap<FileId, PathBuf>,
     source_path_dependents: HashMap<PathBuf, HashSet<FileId>>,
@@ -477,7 +474,6 @@ impl CallSiteParamIndex {
         self.inferred_params.clear();
         self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
-        self.signature_param_contributors.clear();
 
         let mut accumulators =
             HashMap::<LuaSignatureId, HashMap<usize, CallSiteParamAccumulator>>::new();
@@ -495,20 +491,6 @@ impl CallSiteParamIndex {
                             .or_default()
                             .insert(step.event.source.file_id);
                     }
-                }
-                // The callee depends on this caller: its body is typed by the
-                // parameter fact contributed here. Only an informative fact can
-                // change how the callee's body types, so an `unknown`/`any`
-                // contribution buys nothing and would only widen every reindex
-                // that touches a call site.
-                let signature_file_id = contribution.signature_id.get_file_id();
-                if signature_file_id != file_id
-                    && crate::db_index::is_informative_type(contribution.param_fact.typ())
-                {
-                    self.signature_param_contributors
-                        .entry(signature_file_id)
-                        .or_default()
-                        .insert(file_id);
                 }
                 accumulators
                     .entry(contribution.signature_id)
@@ -691,7 +673,6 @@ impl LuaIndex for CallSiteParamIndex {
         self.concrete_structural_callback_files.clear();
         self.inference_events_by_file.clear();
         self.file_source_dependencies.clear();
-        self.signature_param_contributors.clear();
         self.source_dependents.clear();
         self.source_paths.clear();
         self.source_path_dependents.clear();
