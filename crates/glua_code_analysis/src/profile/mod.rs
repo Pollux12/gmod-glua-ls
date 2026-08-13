@@ -3,7 +3,7 @@ use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`.
-pub fn phase_enabled() -> bool {
+fn phase_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_PHASE").is_some())
 }
