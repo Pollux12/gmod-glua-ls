@@ -5,8 +5,8 @@ use glua_parser::{
 
 use crate::{
     DbIndex, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaInferCache,
-    LuaInstanceType, LuaIntersectionType, LuaMemberId, LuaMemberKey, LuaMemberOwner,
-    LuaMergedTableType, LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType,
+    LuaInstanceType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
+    LuaTypeDeclId,
     compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
         infer::find_self_decl_or_member_id,
@@ -366,10 +366,10 @@ fn infer_member_semantic_decl_by_member_key(
                 next_guard,
             )
         }
-        LuaType::Union(union_type) => infer_union_member_semantic_info(
+        LuaType::Union(union_type) => infer_composite_member_semantic_info(
             db,
             cache,
-            union_type,
+            union_type.types(),
             member_key,
             member_access_position,
             semantic_guard,
@@ -421,18 +421,18 @@ fn infer_member_semantic_decl_by_member_key(
                 next_guard,
             )
         }
-        LuaType::Intersection(intersection_type) => infer_intersection_member_semantic_info(
+        LuaType::Intersection(intersection_type) => infer_composite_member_semantic_info(
             db,
             cache,
-            intersection_type,
+            intersection_type.get_types(),
             member_key,
             member_access_position,
             semantic_guard,
         ),
-        LuaType::MergedTable(merged_table) => infer_merged_table_member_semantic_info(
+        LuaType::MergedTable(merged_table) => infer_composite_member_semantic_info(
             db,
             cache,
-            merged_table,
+            merged_table.get_types(),
             member_key,
             member_access_position,
             semantic_guard,
@@ -576,20 +576,22 @@ fn infer_custom_type_member_semantic_decl(
     pending.map_or(Ok(None), Err)
 }
 
-fn infer_union_member_semantic_info(
+/// The first arm of a composite type that owns `member_key`.
+///
+/// The guard is forked per arm so a long miss streak (NULL / unrelated Entity
+/// subclasses) cannot exhaust the depth budget and abort the whole scan.
+fn infer_composite_member_semantic_info<'a>(
     db: &DbIndex,
     cache: &mut LuaInferCache,
-    union_type: &LuaUnionType,
+    arms: impl IntoIterator<Item = &'a LuaType>,
     member_key: &LuaMemberKey,
     member_access_position: Option<rowan::TextSize>,
     semantic_guard: SemanticDeclGuard,
 ) -> DeclResult {
-    // Fork the guard per arm so a long miss streak (NULL / unrelated Entity
-    // subclasses) cannot exhaust the depth budget and abort the whole union.
     let mut pending = None;
-    for typ in union_type.types() {
+    for typ in arms {
         let Some(arm_guard) = semantic_guard.next_level() else {
-            continue;
+            break;
         };
         match infer_member_semantic_decl_by_member_key(
             db,
@@ -649,66 +651,6 @@ fn infer_global_member_semantic_decl_by_member_key(
 ) -> Option<LuaSemanticDeclId> {
     let name = member_key.get_name()?;
     resolve_global_decl_id(db, cache, name, None).map(LuaSemanticDeclId::LuaDecl)
-}
-
-fn infer_intersection_member_semantic_info(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    intersection_type: &LuaIntersectionType,
-    member_key: &LuaMemberKey,
-    member_access_position: Option<rowan::TextSize>,
-    semantic_guard: SemanticDeclGuard,
-) -> DeclResult {
-    let mut pending = None;
-    for typ in intersection_type.get_types() {
-        let Some(next_guard) = semantic_guard.next_level() else {
-            return pending.map_or(Ok(None), Err);
-        };
-        match infer_member_semantic_decl_by_member_key(
-            db,
-            cache,
-            typ,
-            member_key,
-            member_access_position,
-            next_guard,
-        ) {
-            Ok(Some(property_owner_id)) => return Ok(Some(property_owner_id)),
-            Ok(None) => {}
-            Err(reason) => pending = pending.or(Some(reason)),
-        }
-    }
-
-    pending.map_or(Ok(None), Err)
-}
-
-fn infer_merged_table_member_semantic_info(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    merged_table: &LuaMergedTableType,
-    member_key: &LuaMemberKey,
-    member_access_position: Option<rowan::TextSize>,
-    semantic_guard: SemanticDeclGuard,
-) -> DeclResult {
-    let mut pending = None;
-    for typ in merged_table.get_types() {
-        let Some(next_guard) = semantic_guard.next_level() else {
-            return pending.map_or(Ok(None), Err);
-        };
-        match infer_member_semantic_decl_by_member_key(
-            db,
-            cache,
-            typ,
-            member_key,
-            member_access_position,
-            next_guard,
-        ) {
-            Ok(Some(property_owner_id)) => return Ok(Some(property_owner_id)),
-            Ok(None) => {}
-            Err(reason) => pending = pending.or(Some(reason)),
-        }
-    }
-
-    pending.map_or(Ok(None), Err)
 }
 
 fn infer_namespace_member_semantic_decl(
