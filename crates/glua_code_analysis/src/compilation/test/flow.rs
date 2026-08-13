@@ -4971,7 +4971,7 @@ _2 = a[1]
     }
 
     #[test]
-    fn test_local_cached_isvalid_narrows_unknown_to_any() {
+    fn test_local_cached_isvalid_keeps_unknown_unresolved() {
         let mut ws = VirtualWorkspace::new();
         def_isvalid_guard(&mut ws);
 
@@ -4991,7 +4991,9 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        assert_eq!(a, LuaType::Any);
+        // The guard proves the value is valid, not what type it is, so the
+        // narrowed type stays unresolved instead of widening to `any`.
+        assert_eq!(a, LuaType::Unknown);
     }
 
     #[test]

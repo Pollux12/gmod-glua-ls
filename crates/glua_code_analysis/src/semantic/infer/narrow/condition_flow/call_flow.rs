@@ -708,7 +708,10 @@ fn narrow_valid_guard_true_branch(
         return narrowed_type;
     }
 
-    if antecedent_type.is_unknown() || antecedent_type.is_any() {
+    if antecedent_type.is_unknown() {
+        return LuaType::Unknown;
+    }
+    if antecedent_type.is_any() {
         return LuaType::Any;
     }
 

@@ -123,11 +123,7 @@ pub fn special_or_rule(
         && call_expr.is_error()
     {
         let narrowed = remove_false_or_nil(left_type.clone());
-        return Some(if narrowed.is_unknown() {
-            LuaType::Any
-        } else {
-            narrowed
-        });
+        return Some(narrowed);
     }
 
     if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {
@@ -195,20 +191,18 @@ pub fn special_or_rule(
             }
 
             if check_type_compact(db, left_type, right_type).is_ok() {
-                let narrowed = remove_false_or_nil(left_type.clone());
-                return Some(if narrowed.is_unknown() {
-                    LuaType::Any
-                } else {
-                    narrowed
-                });
+                return Some(remove_false_or_nil(left_type.clone()));
             }
         }
 
         _ => {}
     }
 
+    // `X = X or {}` with an unresolved `X`: the fallback arm is real
+    // evidence, the left arm is not, so keep both rather than widening the
+    // pair to `any`.
     if left_type.is_unknown() {
-        return Some(TypeOps::Union.apply(db, &LuaType::Any, right_type));
+        return Some(TypeOps::Union.apply(db, &LuaType::Unknown, right_type));
     }
 
     None

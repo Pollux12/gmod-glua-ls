@@ -566,7 +566,8 @@ fn infer_table_member_owner(
             if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
         {
             if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
-                return Ok(LuaType::Any);
+                // Presence is proven, the element type is not.
+                return Ok(LuaType::Unknown);
             }
             return Ok(nullable_any_type());
         }
@@ -759,7 +760,8 @@ fn infer_table_member_owner(
 
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
                 if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
-                    return Ok(LuaType::Any);
+                    // Presence is proven, the element type is not.
+                    return Ok(LuaType::Unknown);
                 }
                 return Ok(nullable_any_type());
             }
@@ -1458,7 +1460,8 @@ fn infer_plain_table_member(
     };
 
     if matches!(index_key, LuaIndexKey::Expr(_)) && check_index_in_range(db, cache, &index_expr) {
-        return Ok(LuaType::Any);
+        // Presence is proven, the element type is not.
+        return Ok(LuaType::Unknown);
     }
 
     Ok(nullable_any_type())
