@@ -6,7 +6,7 @@ use smol_str::SmolStr;
 use crate::{
     DbIndex, FileId, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
     LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType,
-    LuaTupleType, LuaType, LuaTypeDeclId, LuaUnionType, TypeOps, check_type_compact,
+    LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, check_type_compact,
     semantic::{
         LuaInferCache,
         generic::{TypeSubstitutor, instantiate_type_generic},
@@ -264,10 +264,6 @@ pub(crate) fn resolve_member_item_with_realm(
     } else {
         member_item.resolve_type_with_realm(db, &caller_file_id)
     }
-}
-
-fn nullable_any_type() -> LuaType {
-    LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
 }
 
 fn infer_custom_type_raw_member_type(
