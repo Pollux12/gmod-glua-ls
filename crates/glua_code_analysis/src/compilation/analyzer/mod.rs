@@ -283,7 +283,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         if std::env::var_os("GLUALS_PROFILE").is_some() {
             eprintln!(
                 "[profile] member_assignment_contributions entries={}",
-                lua::member_assignment_contribution_entries(db),
+                db.get_member_index()
+                    .member_assignment_contributions()
+                    .entry_count(),
             );
             eprintln!(
                 "[profile] inferred_guard candidates={} candidate_attempts={} candidate_iterations={} early_published={} late_retries={} late_published={} pending={} early_signature_owners={} early_member_owners={}",

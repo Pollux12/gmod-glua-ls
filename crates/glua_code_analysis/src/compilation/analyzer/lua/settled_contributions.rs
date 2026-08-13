@@ -164,12 +164,3 @@ fn sort_key(member_id: LuaMemberId) -> (u32, u32, u32) {
         range.end().into(),
     )
 }
-
-/// Contribution entries currently held, for the profile report.
-pub(in crate::compilation::analyzer) fn member_assignment_contribution_entries(
-    db: &DbIndex,
-) -> usize {
-    db.get_member_index()
-        .member_assignment_contributions()
-        .entry_count()
-}
