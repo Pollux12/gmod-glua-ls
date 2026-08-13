@@ -2153,19 +2153,13 @@ fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
         return false;
     };
 
-    let owner = crate::LuaMemberOwner::Element(table_range.clone());
-    if db
-        .get_member_index()
-        .get_members(&owner)
-        .is_some_and(|members| !members.is_empty())
-    {
-        return false;
-    }
-
-    let dynamic_owner = crate::DynamicFieldOwner::Table(table_range.clone());
-    db.get_dynamic_field_index()
-        .get_fields(&dynamic_owner)
-        .is_none_or(|fields| fields.is_empty())
+    db.get_member_index()
+        .get_members(&crate::LuaMemberOwner::Element(table_range.clone()))
+        .is_none_or(|members| members.is_empty())
+        && db
+            .get_dynamic_field_index()
+            .get_fields(&crate::DynamicFieldOwner::Table(table_range.clone()))
+            .is_none_or(|fields| fields.is_empty())
 }
 
 fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, field_name: &SmolStr) -> bool {
