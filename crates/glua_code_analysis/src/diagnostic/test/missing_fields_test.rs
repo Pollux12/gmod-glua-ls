@@ -108,6 +108,46 @@ mod tests {
         );
     }
 
+    /// A documented default says the value arrives before anything reads it, so
+    /// the literal may leave it out while the read type stays non-nullable — the
+    /// reason the `@field` docs point users at `= value` rather than `?`. The
+    /// `---@type` and call-argument paths are covered above; the declared-field
+    /// assignment path and the read type are not.
+    #[test]
+    fn documented_default_satisfies_the_check_without_nulling_the_read() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class defcfg
+            ---@field a number
+            ---@field b number = 2
+
+            ---@class defowner
+            ---@field cfg defcfg
+            local O = {}
+
+            O.cfg = { a = 1 }
+        "#
+        ));
+
+        let mut read_ws = VirtualWorkspace::new();
+        read_ws.def(
+            r#"
+            ---@class defread
+            ---@field a number
+            ---@field b number = 2
+
+            ---@type defread
+            local v = { a = 1 }
+            default_read_out = v.b
+        "#,
+        );
+        let read_type = read_ws.expr_ty("default_read_out");
+        assert_eq!(read_ws.humanize_type(read_type), "number");
+    }
+
     #[test]
     fn test_missing_fields() {
         let mut ws = VirtualWorkspace::new();

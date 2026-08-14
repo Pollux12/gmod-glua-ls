@@ -80,6 +80,8 @@ Use the [interactive settings panel](/configuration/overview#settings-panel-reco
 
 `need-check-nil` and `unchecked-nil-access` understand validity guards such as `IsValid` and annotated guard wrappers. See [Guard metadata](/annotations/guard-metadata) for custom wrappers.
 
+`missing-fields` and `missing-parameter` skip anything with a documented default. Write `---@field clipSize number = 30` or `---@param times number = 1` when a base class, a setup function, or the function itself fills the value in. See [@field](/annotations/field#default-values) and [@param](/annotations/param#default-values).
+
 ### Code quality
 
 | Code | Default | Description |

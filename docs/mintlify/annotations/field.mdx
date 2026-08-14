@@ -14,6 +14,7 @@ description: Add typed fields to a class definition.
 ```lua
 ---@field [access] fieldName type [description]
 ---@field [access] fieldName? type [description]
+---@field [access] fieldName type = default [description]
 ---@field [access] [keyType] valueType [description]
 ```
 
@@ -45,6 +46,37 @@ Add `?` after the field name to mark it as `nil` sometimes:
 ```
 
 If you access an optional field without a nil check, GLuaLS reports `need-check-nil` when you enable strict nil checking.
+
+---
+
+## Default values
+
+Add `= value` after the type when something else fills the field in later, such as a base class or a setup function:
+
+```lua
+---@class WeaponConfig
+---@field damage number
+---@field clipSize number = 30
+---@field recoil number = 1.5
+
+---@type WeaponConfig
+local cfg = { damage = 25 }   -- no warning: clipSize and recoil have defaults
+```
+
+You can leave a field with a default out of a table, and GLuaLS does not report `missing-fields`. When you read it, the type stays `number` — not `number?` — so you do not need a nil check.
+
+<Tip>
+Use `= value` when the field is always there by the time you read it. Use `?` when it can still be `nil` at read time. Picking `?` for this case forces nil checks everywhere you read the field.
+</Tip>
+
+Defaults accept numbers, strings, `true`, `false`, `nil`, and a name or call such as `Color(255, 255, 255)`:
+
+```lua
+---@class PanelStyle
+---@field label string = "Untitled"
+---@field visible boolean = true
+---@field colour Color = Color(255, 255, 255)
+```
 
 ---
 

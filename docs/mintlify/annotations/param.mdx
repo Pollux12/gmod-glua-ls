@@ -14,6 +14,7 @@ description: Document function parameter types and descriptions.
 ```lua
 ---@param paramName type [description]
 ---@param paramName? type [description]
+---@param paramName type = default [description]
 ```
 
 ---
@@ -37,6 +38,29 @@ Add `?` after the name to mark the parameter as `nil` in some calls:
 ---@param attacker? Entity The attacking entity (may be nil)
 function TakeDamage(victim, damage, attacker) end
 ```
+
+---
+
+## Default values
+
+Add `= value` after the type when the function fills the argument in itself:
+
+```lua
+---@param message string Text to print
+---@param times number = 1 How many times to print it
+function Repeat(message, times)
+    times = times or 1
+    for _ = 1, times do print(message) end
+end
+
+Repeat("hello")   -- no warning: times has a default
+```
+
+Callers can leave the argument out without GLuaLS reporting `missing-parameter`. Inside the function the type stays `number` — not `number?` — because the default always fills it in.
+
+<Tip>
+Use `= value` when your function supplies the value. Use `?` when the parameter can still be `nil` inside the function body.
+</Tip>
 
 ---
 
