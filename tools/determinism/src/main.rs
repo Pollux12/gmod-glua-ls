@@ -33,6 +33,9 @@
 //! `restabilize` is its own thing: it is a demonstration that re-running does
 //! not converge, not a stage anything is expected to pass.
 //!
+//! `expandwhy` and `faithful` are measurements, not comparisons: they report
+//! numbers rather than diff two snapshots, so they pass or fail nothing.
+//!
 //! Example:
 //!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
 //!     DET_STAGES=repeat,edit,mainexpand DET_TARGETS=lua/autorun/init.lua \
@@ -91,6 +94,12 @@
 //!                               retained state a partial re-index inherits. It
 //!                               diverges wildly and does not converge, which is
 //!                               why "just run it again" is not a fix
+//!                     expandwhy attribute the reindex expansion of each
+//!                               DET_TARGETS entry to the dependent source that
+//!                               contributed each file, per fixpoint round
+//!                     faithful  re-infer every member initializer in isolation
+//!                               and report how often it reproduces the cached
+//!                               type, split by single- vs multi-writer members
 //!                     fresh     build a second analysis in-process
 //!   DET_INDEX_DIFF  also diff type caches, members, signatures, class members,
 //!                   super types, net flows and inferred params
@@ -115,7 +124,7 @@ use mimalloc::MiMalloc;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -747,6 +756,218 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
     true
 }
 
+/// Reports whether re-inferring a member's initializer in isolation reproduces
+/// the type the full pipeline settled on, split by single- vs multi-writer
+/// members.
+///
+/// A member with several writers holds the merge of those writes, so
+/// re-inferring one initializer answers a different question and is expected to
+/// disagree.
+fn refresh_faithfulness(analysis: &EmmyLuaAnalysis) {
+    let db = analysis.compilation.get_db();
+    let member_index = db.get_member_index();
+    let mut stats = [Faithfulness::default(); 2];
+    let mut samples = Vec::new();
+    let t = Instant::now();
+
+    for file_id in db.get_vfs().get_all_file_ids() {
+        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+            continue;
+        };
+        let root = tree.get_red_root();
+        let Some(model) = analysis.compilation.get_semantic_model(file_id) else {
+            continue;
+        };
+        for member in member_index.get_file_members(file_id) {
+            let member_id = member.get_id();
+            let Some(current) = db.get_type_index().get_type_cache(&member_id.into()) else {
+                continue;
+            };
+            // Annotated caches were never derived from the initializer, so
+            // re-inferring one is not the same question.
+            if current.is_doc() {
+                continue;
+            }
+            let Some(expr) = member_initializer_expr(&root, member_id) else {
+                continue;
+            };
+            let writers = member_index
+                .get_member_owner(&member_id)
+                .and_then(|owner| {
+                    member_index
+                        .member_assignment_contributions()
+                        .contributions(&(owner.clone(), member.get_key().clone()))
+                        .map(|group| group.len())
+                })
+                .unwrap_or(1);
+            let stat = &mut stats[usize::from(writers > 1)];
+            stat.derivable += 1;
+            match model.infer_expr(expr).map(first_result_type) {
+                Ok(inferred) if &inferred == current.as_type() => stat.agree += 1,
+                Ok(inferred) => {
+                    stat.mismatched += 1;
+                    if writers <= 1 && samples.len() < 15 {
+                        samples.push(format!(
+                            "  DISAGREE(1 writer) {}|{member_id:?}\n      cached     = {:?}\n      reinferred = {inferred:?}",
+                            file_label(analysis, file_id),
+                            current.as_type()
+                        ));
+                    }
+                }
+                Err(_) => stat.infer_failed += 1,
+            }
+        }
+    }
+
+    for (label, stat) in [("single_writer", &stats[0]), ("multi_writer", &stats[1])] {
+        println!(
+            "REFRESH faithfulness {label}: derivable={} agree={} mismatched={} infer_failed={}",
+            stat.derivable, stat.agree, stat.mismatched, stat.infer_failed
+        );
+    }
+    println!(
+        "REFRESH faithfulness took {:.2}s",
+        t.elapsed().as_secs_f64()
+    );
+    for sample in &samples {
+        println!("{sample}");
+    }
+}
+
+#[derive(Clone, Copy, Default)]
+struct Faithfulness {
+    derivable: usize,
+    agree: usize,
+    mismatched: usize,
+    infer_failed: usize,
+}
+
+/// A single-value assignment takes the first result of a multi-return call, the
+/// way the analyzer's `select_result_fact` does.
+fn first_result_type(typ: glua_code_analysis::LuaType) -> glua_code_analysis::LuaType {
+    match &typ {
+        glua_code_analysis::LuaType::Variadic(variadic) => variadic
+            .get_type(0)
+            .cloned()
+            .unwrap_or(glua_code_analysis::LuaType::Nil),
+        _ => typ,
+    }
+}
+
+/// The expression a member's cached type was derived from, for the
+/// `t.k = <expr>` shape. Mirrors the analyzer's own initializer lookup.
+fn member_initializer_expr(
+    root: &glua_parser::LuaSyntaxNode,
+    member_id: glua_code_analysis::LuaMemberId,
+) -> Option<glua_parser::LuaExpr> {
+    use glua_parser::{LuaAstNode, LuaIndexExpr};
+
+    let node = member_id.get_syntax_id().to_node_from_root(root)?;
+    let index_expr = LuaIndexExpr::cast(node)?;
+    let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let value_idx = vars
+        .iter()
+        .position(|var| var.syntax().text_range() == index_expr.get_range())?;
+    exprs.get(value_idx).cloned()
+}
+
+/// Attributes the re-index expansion to the source that produced each file.
+///
+/// `expand_reindex_file_ids` unions the dependent sets to a fixpoint and returns
+/// only the total. This mirrors that loop and reports, per round, how many files
+/// each source contributed that no earlier source already had.
+fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[expandwhy] not indexed: {}", path.display());
+            continue;
+        };
+
+        let db = analysis.compilation.get_db();
+        let mut expanded = HashSet::from([file_id]);
+        let mut round = 0;
+        loop {
+            round += 1;
+            let seed = expanded.iter().copied().collect::<Vec<_>>();
+            let sources: [(&str, Vec<FileId>); 5] = [
+                (
+                    "include/require dependents",
+                    db.get_file_dependencies_index()
+                        .get_file_dependencies()
+                        .collect_file_dependents(seed.clone()),
+                ),
+                (
+                    "type-cache references",
+                    db.get_type_index()
+                        .files_with_type_caches_referencing_files(&expanded)
+                        .into_iter()
+                        .collect(),
+                ),
+                (
+                    "inference support",
+                    db.get_type_index()
+                        .files_depending_on_inference_support(&expanded)
+                        .into_iter()
+                        .collect(),
+                ),
+                (
+                    "callback source",
+                    db.get_call_site_param_index()
+                        .collect_source_dependents(&expanded),
+                ),
+                (
+                    "callback source path",
+                    db.get_call_site_param_index()
+                        .collect_source_path_dependents(
+                            expanded
+                                .iter()
+                                .filter_map(|id| db.get_vfs().get_file_path(id))
+                                .collect::<Vec<_>>(),
+                        ),
+                ),
+            ];
+
+            let mut added_this_round = 0;
+            for (name, files) in sources {
+                let fresh = files
+                    .into_iter()
+                    .filter(|id| !expanded.contains(id))
+                    .collect::<HashSet<_>>();
+                if !fresh.is_empty() {
+                    println!(
+                        "EXPAND {target} round {round}: {name} added {}",
+                        fresh.len()
+                    );
+                    if round == 1 || std::env::var_os("DET_SHOW_EXPANSION").is_some() {
+                        let mut labels = fresh
+                            .iter()
+                            .map(|id| file_label(analysis, *id))
+                            .collect::<Vec<_>>();
+                        labels.sort();
+                        for label in labels {
+                            println!("    {label}");
+                        }
+                    }
+                    added_this_round += fresh.len();
+                    expanded.extend(fresh);
+                }
+            }
+            if added_this_round == 0 {
+                break;
+            }
+        }
+        println!(
+            "EXPAND {target}: total {} files after {round} round(s)",
+            expanded.len()
+        );
+    }
+}
+
 /// Applies a **real** edit and compares the incremental result against a cold
 /// build of the same edited source.
 ///
@@ -1047,6 +1268,14 @@ fn main() {
         eprintln!("[reindex] full reindex {:.2}s", t.elapsed().as_secs_f64());
         let after = collect(&analysis, "after_full_reindex");
         diff("cold", &cold, "after_full_reindex", &after);
+    }
+
+    if stages.iter().any(|s| s == "expandwhy") {
+        expand_why(&analysis, &codebase, &targets);
+    }
+
+    if stages.iter().any(|s| s == "faithful") {
+        refresh_faithfulness(&analysis);
     }
 
     if stages.iter().any(|s| s == "realedit") {
