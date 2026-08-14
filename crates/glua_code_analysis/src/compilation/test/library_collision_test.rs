@@ -347,7 +347,10 @@ mod tests {
 
         let warning = collision.warning_message();
 
-        assert!(warning.contains("earlier workspace.library entry takes precedence"));
+        assert!(
+            warning
+                .contains("The earlier entry in .gluarc.json (workspace.library) takes priority")
+        );
         assert!(warning.contains("2 types, 2 members"));
         assert!(warning.contains("Critter:IsBird"));
     }

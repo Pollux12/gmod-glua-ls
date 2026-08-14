@@ -895,12 +895,9 @@ pub fn validate_gmod_annotations_for_ls(
 
     let Some(annotations_path) = resolve_gmod_annotations_path(client_config, emmyrc) else {
         return Err(
-            "GMod mode is enabled but no GMod annotations path was resolved. \
-             Set `gmod.annotationsPath` in `.gluarc.json`, pass a path via the \
-             client/CLI (`--gmod-annotations-path`), explicitly disable \
-             annotations with `--gmod-annotations-path none` or \
-             `gmod.autoLoadAnnotations: false`, or disable GMod mode with \
-             `gmod.enabled: false`."
+            "GMod annotations could not be found. Try restarting VS Code or the \
+             language server. If you are using custom annotations, set \
+             \"gluals.gmod.annotationsPath\" in settings or .gluarc.json."
                 .to_string(),
         );
     };
@@ -908,17 +905,16 @@ pub fn validate_gmod_annotations_for_ls(
     let path = PathBuf::from(&annotations_path);
     if !path.exists() {
         return Err(format!(
-            "GMod annotations path does not exist: {annotations_path}. \
-             Ensure the VSCode extension downloaded annotations, or set \
-             `gmod.annotationsPath` to a valid directory, or disable GMod \
-             mode with `gmod.enabled: false`."
+            "GMod annotations folder does not exist at \"{annotations_path}\". If you set a \
+             custom path in settings or .gluarc.json, verify the folder exists; \
+             otherwise, restart VS Code to download them automatically."
         ));
     }
     if !path.is_dir() {
         return Err(format!(
-            "GMod annotations path is not a directory: {annotations_path}. \
-             Set `gmod.annotationsPath` to a directory containing `.lua` \
-             annotation files, or disable GMod mode with `gmod.enabled: false`."
+            "GMod annotations path is a file instead of a folder: \"{annotations_path}\". \
+             Please point \"gluals.gmod.annotationsPath\" in settings or .gluarc.json to \
+             a folder containing .lua annotation files."
         ));
     }
 
@@ -927,10 +923,9 @@ pub fn validate_gmod_annotations_for_ls(
     // recursively but stop as soon as the first `.lua` file is found.
     if !directory_contains_lua_file(&path) {
         return Err(format!(
-            "GMod annotations directory is empty (no `.lua` files found): \
-             {annotations_path}. Re-download annotations, point \
-             `gmod.annotationsPath` at a populated directory, or disable \
-             GMod mode with `gmod.enabled: false`."
+            "GMod annotations folder at \"{annotations_path}\" contains no .lua files. \
+             If using a custom path in settings, verify the folder; otherwise, run \
+             \"GLua: Download GMod Annotations\" from the Command Palette or restart VS Code."
         ));
     }
 
@@ -2442,7 +2437,7 @@ mod tests {
         assert!(result.is_err(), "enabled + no path must fail");
         let reason = result.unwrap_err();
         assert!(
-            reason.contains("no GMod annotations path was resolved"),
+            reason.contains("GMod annotations could not be found"),
             "reason should explain missing path: {reason}"
         );
     }
@@ -2528,8 +2523,8 @@ mod tests {
         assert!(result.is_err());
         let reason = result.unwrap_err();
         assert!(
-            reason.contains("not a directory"),
-            "reason should mention not-a-directory: {reason}"
+            reason.contains("is a file instead of a folder"),
+            "reason should mention file instead of folder: {reason}"
         );
 
         let _ = fs::remove_dir_all(dir);
@@ -2549,7 +2544,7 @@ mod tests {
         assert!(result.is_err());
         let reason = result.unwrap_err();
         assert!(
-            reason.contains("no `.lua` files found"),
+            reason.contains("contains no .lua files"),
             "reason should mention empty-of-lua: {reason}"
         );
 
