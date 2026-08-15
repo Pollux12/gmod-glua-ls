@@ -210,8 +210,10 @@ pub enum IgnoreDirDefaultEntry {
 #[derive(Serialize, Deserialize, Debug, JsonSchema, Clone, Hash, PartialEq, Eq)]
 #[serde(rename_all = "camelCase")]
 pub struct IgnoreDirDefaultDefinition {
-    /// Stable identifier. Built-in ids: `"wire-expression2"`, `"wire-expression-files"`,
-    /// `"tests"`, `"test"`. Custom ids can be any non-empty string.
+    /// Stable identifier. Built-in ids: `"git"`, `"github"`, `"claude"`, `"agents"`,
+    /// `"gemini"`, `"vscode"`, `"idea"`, `"svn"`, `"hg"`, `"node-modules"`,
+    /// `"wire-expression2"`, `"wire-expression-files"`, `"tests"`, `"test"`.
+    /// Custom ids can be any non-empty string.
     pub id: String,
     /// Optional human-readable label (informational only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -232,6 +234,46 @@ struct BuiltinIgnoreDirDefault {
 
 fn builtin_ignore_dir_defaults() -> Vec<BuiltinIgnoreDirDefault> {
     vec![
+        BuiltinIgnoreDirDefault {
+            id: "git",
+            glob: "**/.git/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "github",
+            glob: "**/.github/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "claude",
+            glob: "**/.claude/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "agents",
+            glob: "**/.agents/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "gemini",
+            glob: "**/.gemini/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "vscode",
+            glob: "**/.vscode/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "idea",
+            glob: "**/.idea/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "svn",
+            glob: "**/.svn/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "hg",
+            glob: "**/.hg/**",
+        },
+        BuiltinIgnoreDirDefault {
+            id: "node-modules",
+            glob: "**/node_modules/**",
+        },
         BuiltinIgnoreDirDefault {
             id: "wire-expression2",
             glob: "**/gmod_wire_expression2/**",
