@@ -4,13 +4,13 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaExpr, LuaIndexKey, LuaStat, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaExpr, LuaIndexKey, LuaStat, LuaTableExpr, LuaTableField,
     LuaVarExpr, PathTrait,
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeCache, LuaTypeDeclId, SemanticModel,
+    DbIndex, DiagnosticCode, LuaDeclId, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId,
+    LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel,
 };
 
 use super::{Checker, DiagnosticContext, PrecomputedMissingRequiredFields, humanize_lint_type};
@@ -45,6 +45,28 @@ fn check_table_expr(
     }
 
     let db = context.db;
+
+    // If the table literal is initializing a local variable, only check missing-fields
+    // if that local variable declaration has an explicit type annotation.
+    // Unannotated local tables (e.g. `local layout = {}`) may be used as out-parameters
+    // or buffers whose inferred type comes purely from downstream call references.
+    if let Some(LuaAst::LuaLocalStat(local_stat)) = expr.get_parent::<LuaAst>() {
+        let num = local_stat
+            .get_value_exprs()
+            .position(|val| val.get_position() == expr.get_position());
+        if let Some(num) = num
+            && let Some(local_name) = local_stat.get_local_name_list().nth(num)
+        {
+            let decl_id = LuaDeclId::new(semantic_model.get_file_id(), local_name.get_position());
+            let has_explicit_type = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .is_some_and(|tc| tc.is_doc());
+            if !has_explicit_type {
+                return Some(());
+            }
+        }
+    }
 
     let mut union_has_array_type = false;
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {

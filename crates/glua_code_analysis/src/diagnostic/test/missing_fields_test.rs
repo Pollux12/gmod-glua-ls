@@ -693,9 +693,33 @@ foo({})
             ---@param value Full
             local function consume_typed(value) end
 
+            ---@type Full
             local value = {}
             consume_typed(value)
             value.required = "ready"
+            "#,
+        ));
+    }
+
+    #[test]
+    fn unannotated_local_table_out_param_skips_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class GlideHUDStackLayout
+            ---@field width number
+            ---@field height number
+
+            ---@param out GlideHUDStackLayout
+            local function GetHUDStackLayout(out)
+                out.width = 100
+                out.height = 50
+            end
+
+            local layout = {}
+            GetHUDStackLayout(layout)
             "#,
         ));
     }
