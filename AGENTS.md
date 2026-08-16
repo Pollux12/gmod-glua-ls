@@ -17,6 +17,7 @@
 - `crates/glua_doc_cli`, `crates/schema_to_glua`, and `tools/schema_json_gen`: documentation and schema tooling.
 - `tools/benchmark`: large-workspace benchmark. It requires `BENCH_CODEBASE` and `BENCH_ANNOTATIONS`.
 - `tools/determinism`: diagnostic determinism harness. It requires `DET_CODEBASE` and `DET_ANNOTATIONS`, and answers whether re-analysing a workspace yields the same diagnostics as building it cold. See the module docs for the stage list.
+- `tools/lsp_latency.js`: interactive latency harness. It requires `LSP_CODEBASE` and `LSP_ANNOTATIONS`, and drives a real `glua_ls` binary over stdio using the capabilities and cancellation behaviour VS Code actually uses. Reports completion and diagnostic latency settled versus mid-edit, and asserts that a cancelled diagnostic pull never returns an empty full report (which clears a file's diagnostics in VS Code). Use it before and after any change to reindexing or to the freshness gates — those costs are invisible to unit tests.
 - `docs/mintlify`: user documentation. Follow its nested `AGENTS.md` for changes under that tree.
 
 ## Analysis Architecture
