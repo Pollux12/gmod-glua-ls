@@ -16,9 +16,31 @@ impl<'a> FileDependencyRelation<'a> {
         file_ids: &[FileId],
         metas: &HashSet<FileId>,
     ) -> Vec<FileId> {
+        self.get_analysis_levels(file_ids, metas)
+            .into_iter()
+            .flatten()
+            .collect()
+    }
+
+    /// The same order as [`Self::get_best_analysis_order`], grouped into
+    /// dependency levels: no file in a level depends on another file in the same
+    /// level, and every level only depends on earlier ones.
+    ///
+    /// Flattening the result reproduces `get_best_analysis_order` exactly, so a
+    /// caller can switch between the two without changing analysis order. The
+    /// grouping is free: Kahn's algorithm with a FIFO queue already pops nodes
+    /// in breadth-first layers, so a level is a contiguous run of the flat order.
+    ///
+    /// Files left over from a dependency cycle each become their own level, so a
+    /// caller that parallelizes within a level never runs a cycle concurrently.
+    pub fn get_analysis_levels(
+        &self,
+        file_ids: &[FileId],
+        metas: &HashSet<FileId>,
+    ) -> Vec<Vec<FileId>> {
         let n = file_ids.len();
         if n < 2 {
-            return file_ids.to_vec();
+            return file_ids.iter().map(|&f| vec![f]).collect();
         }
 
         let file_to_idx: HashMap<FileId, usize> =
@@ -37,8 +59,10 @@ impl<'a> FileDependencyRelation<'a> {
                 }
             }
         }
-        let mut result = Vec::with_capacity(n);
+        let mut levels: Vec<Vec<FileId>> = Vec::new();
+        let mut node_level = vec![0usize; n];
         let mut queue = VecDeque::with_capacity(n);
+        let mut popped = 0usize;
 
         // 入度为0的节点，按优先级排序：meta文件优先，然后按FileId排序
         let mut zero_in_degree: Vec<usize> = (0..n).filter(|&i| in_degree[i] == 0).collect();
@@ -58,13 +82,21 @@ impl<'a> FileDependencyRelation<'a> {
         }
 
         while let Some(idx) = queue.pop_front() {
-            result.push(file_ids[idx]);
+            let level = node_level[idx];
+            if levels.len() == level {
+                levels.push(Vec::new());
+            }
+            levels[level].push(file_ids[idx]);
+            popped += 1;
 
             // 收集新的入度为0的节点
             let mut new_zero: Vec<usize> = Vec::new();
             for &neighbor in &adjacency[idx] {
                 in_degree[neighbor] -= 1;
                 if in_degree[neighbor] == 0 {
+                    // A FIFO queue pops in breadth-first layers, so `idx` is the
+                    // deepest dependency of `neighbor`: the last one to be popped.
+                    node_level[neighbor] = level + 1;
                     new_zero.push(neighbor);
                 }
             }
@@ -87,15 +119,16 @@ impl<'a> FileDependencyRelation<'a> {
         }
 
         // 处理循环依赖
-        if result.len() < n {
+        if popped < n {
             for (idx, &deg) in in_degree.iter().enumerate() {
                 if deg > 0 {
-                    result.push(file_ids[idx]);
+                    // One file per level: a cycle has no safe concurrent order.
+                    levels.push(vec![file_ids[idx]]);
                 }
             }
         }
 
-        result
+        levels
     }
 
     /// Get all direct and indirect dependencies for the file list
@@ -208,6 +241,64 @@ mod tests {
         // 文件1和2有循环依赖，在后面
         assert!(result.contains(&FileId::new(1)));
         assert!(result.contains(&FileId::new(2)));
+    }
+
+    #[test]
+    fn levels_flatten_to_the_analysis_order() {
+        let mut map = HashMap::new();
+        map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
+        map.insert(2.into(), [3.into()].into_iter().collect());
+        map.insert(3.into(), HashSet::new());
+        map.insert(4.into(), [1.into()].into_iter().collect());
+        map.insert(5.into(), HashSet::new());
+        let rel = FileDependencyRelation::new(&map);
+        let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
+        let metas = HashSet::from_iter([FileId::new(5)]);
+
+        let levels = rel.get_analysis_levels(&files, &metas);
+        let flat: Vec<FileId> = levels.iter().flatten().copied().collect();
+
+        assert_eq!(flat, rel.get_best_analysis_order(&files, &metas));
+    }
+
+    #[test]
+    fn a_level_never_contains_a_file_depending_on_a_sibling() {
+        let mut map = HashMap::new();
+        map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
+        map.insert(2.into(), [3.into()].into_iter().collect());
+        map.insert(3.into(), HashSet::new());
+        map.insert(4.into(), [1.into()].into_iter().collect());
+        map.insert(5.into(), HashSet::new());
+        let rel = FileDependencyRelation::new(&map);
+        let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
+
+        let levels = rel.get_analysis_levels(&files, &HashSet::default());
+
+        for level in &levels {
+            for file in level {
+                let deps = &map[file];
+                assert!(
+                    !level.iter().any(|sibling| deps.contains(sibling)),
+                    "{file:?} depends on a file in its own level {level:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cyclic_files_each_get_their_own_level() {
+        let mut map = HashMap::new();
+        map.insert(1.into(), [2.into()].into_iter().collect());
+        map.insert(2.into(), [1.into()].into_iter().collect());
+        map.insert(3.into(), HashSet::new());
+        let rel = FileDependencyRelation::new(&map);
+        let files: Vec<FileId> = (1..=3).map(FileId::new).collect();
+
+        let levels = rel.get_analysis_levels(&files, &HashSet::default());
+
+        assert_eq!(levels[0], vec![FileId::new(3)]);
+        assert_eq!(levels[1], vec![FileId::new(1)]);
+        assert_eq!(levels[2], vec![FileId::new(2)]);
     }
 
     #[test]

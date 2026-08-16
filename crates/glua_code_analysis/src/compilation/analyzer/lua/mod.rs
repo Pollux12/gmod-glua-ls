@@ -78,7 +78,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         };
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
-        let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
+        let levels = file_dependency.get_analysis_levels(&file_ids, &context.metas);
         let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
         let slow_log_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
         let node_profile_enabled = stderr_profile_enabled;
@@ -86,7 +86,12 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let mut workspace_profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
         let mut slow_file_summary = slow_log_enabled.then(SlowLuaAnalyzeSummary::default);
         let mut file_count: usize = 0;
-        for file_id in order {
+        let mut level_shape = node_profile_enabled.then(LevelShape::default);
+        for level in levels {
+            if let Some(shape) = level_shape.as_mut() {
+                shape.begin_level(level.len());
+            }
+            for file_id in level {
             if let Some(root) = tree_map.get(&file_id) {
                 let file_start = slow_log_enabled.then(Instant::now);
                 let is_scripted = scripted_scope_files.contains(&file_id);
@@ -122,6 +127,9 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     if let Some(summary) = slow_file_summary.as_mut() {
                         summary.record(file_id, file_elapsed);
                     }
+                    if let Some(shape) = level_shape.as_mut() {
+                        shape.record_file(file_elapsed);
+                    }
 
                     // Detailed per-file logging is intentionally reserved for explicit profiling.
                     // Info logging can be enabled in normal server sessions, and logging every
@@ -154,6 +162,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                     }
                 }
             }
+            }
         }
         if let Some(total_start) = total_start {
             let total_elapsed = total_start.elapsed();
@@ -178,8 +187,78 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         workspace_profile.summary(8)
                     );
                 }
+                if let Some(level_shape) = level_shape.as_ref() {
+                    eprintln!("lua analyze level shape: {}", level_shape.summary());
+                }
             }
         }
+    }
+}
+
+/// Measures how much of `lua analyze` could overlap if each dependency level ran
+/// concurrently: the critical path is the sum of each level's slowest file.
+/// Profiling only (`GLUALS_PROFILE=1`).
+#[derive(Default)]
+struct LevelShape {
+    levels: usize,
+    widths: Vec<usize>,
+    maxes: Vec<Duration>,
+    total: Duration,
+    critical_path: Duration,
+    level_max: Duration,
+}
+
+impl LevelShape {
+    fn begin_level(&mut self, width: usize) {
+        let previous = std::mem::take(&mut self.level_max);
+        self.critical_path += previous;
+        if self.levels > 0 {
+            self.maxes.push(previous);
+        }
+        self.levels += 1;
+        self.widths.push(width);
+    }
+
+    fn record_file(&mut self, elapsed: Duration) {
+        self.total += elapsed;
+        self.level_max = self.level_max.max(elapsed);
+    }
+
+    fn summary(&self) -> String {
+        let critical_path = self.critical_path + self.level_max;
+        let widest = self.widths.iter().copied().max().unwrap_or(0);
+        let files: usize = self.widths.iter().sum();
+        let speedup = if critical_path.is_zero() {
+            0.0
+        } else {
+            self.total.as_secs_f64() / critical_path.as_secs_f64()
+        };
+        let mut heaviest: Vec<(usize, usize, Duration)> = self
+            .widths
+            .iter()
+            .zip(self.maxes.iter().chain(std::iter::once(&self.level_max)))
+            .enumerate()
+            .map(|(level, (&width, &max))| (level, width, max))
+            .collect();
+        heaviest.sort_unstable_by_key(|&(_, _, max)| std::cmp::Reverse(max));
+        let heaviest: Vec<String> = heaviest
+            .iter()
+            .take(6)
+            .map(|(level, width, max)| format!("L{level}(w={width}) {max:?}"))
+            .collect();
+        format!(
+            "{} levels over {} files (widest {}, mean width {:.1}); \
+             sequential {:?}, critical path {:?}, ideal speedup {:.1}x; \
+             heaviest levels: {}",
+            self.levels,
+            files,
+            widest,
+            files as f64 / self.levels.max(1) as f64,
+            self.total,
+            critical_path,
+            speedup,
+            heaviest.join(", "),
+        )
     }
 }
 
