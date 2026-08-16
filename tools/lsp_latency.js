@@ -39,8 +39,15 @@ function parseArgs(argv) {
     return opts;
 }
 
+/**
+ * Prefers the `dist` profile, which is what ships. `release` lacks its thin LTO
+ * and single codegen unit, so measuring it reports numbers no user experiences —
+ * an easy mistake to make for a whole session before noticing.
+ */
 function defaultServerPath() {
     const exe = process.platform === 'win32' ? 'glua_ls.exe' : 'glua_ls';
+    const dist = path.resolve(__dirname, '..', 'target', 'dist', exe);
+    if (fs.existsSync(dist)) return dist;
     return path.resolve(__dirname, '..', 'target', 'release', exe);
 }
 
@@ -257,6 +264,7 @@ async function main() {
     const report = {
         workspace: codebase,
         file: path.relative(codebase, target),
+        server,
         runs: opts.runs,
         measurements: {},
         checks: {},
@@ -429,6 +437,7 @@ async function main() {
     ];
     console.log(`workspace : ${report.workspace}`);
     console.log(`file      : ${report.file}`);
+    console.log(`server    : ${report.server}`);
     console.log(`runs      : ${report.runs}\n`);
     console.log('                             min      median       max');
     for (const [label, stats] of rows) {
