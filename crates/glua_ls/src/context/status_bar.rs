@@ -11,6 +11,7 @@ use super::ClientProxy;
 
 pub struct StatusBar {
     client: Arc<ClientProxy>,
+    supports_work_done_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,11 +37,22 @@ impl ProgressTask {
 }
 
 impl StatusBar {
-    pub fn new(client: Arc<ClientProxy>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<ClientProxy>, supports_work_done_progress: bool) -> Self {
+        Self {
+            client,
+            supports_work_done_progress,
+        }
     }
 
     pub async fn create_progress_task(&self, task: ProgressTask) {
+        // `window/workDoneProgress/create` is a server-initiated request and
+        // requires `window.workDoneProgress`. Without it the token is never
+        // registered, so every `$/progress` for this task would be orphaned —
+        // skip the whole task rather than send notifications into the void.
+        if !self.supports_work_done_progress {
+            return;
+        }
+
         let request_id = self.client.next_id();
         let cancel_token = time_cancel_token(std::time::Duration::from_secs(5));
         let _ = self

@@ -21,28 +21,22 @@ pub async fn on_pull_workspace_diagnostic(
         .wait_until_fresh_for(&token, "workspace/diagnostic")
         .await
     {
-        // Cancellation — return empty items rather than stale data,
-        // since workspace diagnostics replace per-URI state and
-        // returning stale could mask real issues. The client will
-        // re-pull after the next refresh signal.
+        // Cancelled. Return an empty workspace report indicating no files
+        // changed in this chunk, so the client retains its current per-URI state.
         return WorkspaceDiagnosticReport { items: vec![] };
     }
 
     let Some(workspace_manager) = context.read_workspace_manager(&token).await else {
         return WorkspaceDiagnosticReport { items: vec![] };
     };
-    let status = workspace_manager.get_workspace_diagnostic_level();
+    // Claim the pending level atomically — a load followed by a separate store
+    // is not serialised by the read guard we hold here.
+    let status = workspace_manager.claim_workspace_diagnostic_level();
     if status == WorkspaceDiagnosticLevel::None {
         return WorkspaceDiagnosticReport { items: vec![] };
     }
-    let client_id = workspace_manager.client_config.client_id;
     let open_files = workspace_manager.current_open_files.clone();
-    workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::None, false);
     drop(workspace_manager);
-
-    if client_id.is_vscode() && context.lsp_features().supports_refresh_diagnostic() {
-        context.client().refresh_workspace_diagnostics();
-    }
 
     // let emmyrc = context.analysis().read().await.get_emmyrc();
     let file_diagnostics = match status {
@@ -50,16 +44,25 @@ pub async fn on_pull_workspace_diagnostic(
         WorkspaceDiagnosticLevel::Fast => {
             context
                 .file_diagnostic()
-                .pull_workspace_diagnostics_fast(token)
+                .pull_workspace_diagnostics_fast(token.clone())
                 .await
         }
         WorkspaceDiagnosticLevel::Slow => {
             context
                 .file_diagnostic()
-                .pull_workspace_diagnostics_slow(token)
+                .pull_workspace_diagnostics_slow(token.clone())
                 .await
         }
     };
+
+    // The sweep was cut short, so the set above covers only part of the
+    // workspace. The level it claimed is already cleared, so put it back —
+    // otherwise the files this pass never reached stay stale until an unrelated
+    // edit happens to re-arm one.
+    if token.is_cancelled() {
+        let workspace_manager = context.workspace_manager().read().await;
+        workspace_manager.restore_workspace_diagnostic_level(status);
+    }
     let open_file_versions = {
         let analysis = context.analysis().read().await;
         file_diagnostics

@@ -105,6 +105,16 @@ pub async fn on_did_change_watched_files(
                 .clear_push_file_diagnostics(uri.clone())
                 .await;
         }
+    } else {
+        // Pull clients get no publish, but the remembered report must still go:
+        // replaying diagnostics computed against a file that no longer exists
+        // is the one way the replay path can state something untrue.
+        for uri in &deleted_lua_uris {
+            context
+                .file_diagnostic()
+                .forget_cached_file_diagnostics(uri)
+                .await;
+        }
     }
 
     context

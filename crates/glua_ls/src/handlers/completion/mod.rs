@@ -39,25 +39,11 @@ pub async fn on_completion_handler(
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
-    // For completion, briefly wait for fresh data (up to 50ms) so the user
-    // sees accurate results.  If the reindex takes longer, proceed with
-    // whatever data is available — a slightly stale completion list is
-    // better than a multi-second delay.
-    {
-        let fresh = tokio::select! {
-            biased;
-            _ = cancel_token.cancelled() => return None,
-            result = context.debounced_analysis().wait_until_fresh_for(&cancel_token, "textDocument/completion") => result,
-            _ = tokio::time::sleep(std::time::Duration::from_millis(50)) => false,
-        };
-        // If cancelled during wait, bail out
-        if cancel_token.is_cancelled() {
-            return None;
-        }
-        // `fresh` being false (timeout or cancel) is fine — we proceed
-        let _ = fresh;
-    }
-
+    // Freshness is guaranteed by the `wait_for_fresh_index` dispatch arm:
+    // completion resolves members and locals through the index, and a bounded
+    // wait would routinely expire inside the window where the index still
+    // describes the pre-edit tree, producing a list missing exactly the
+    // symbols the user just typed near.
     let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {

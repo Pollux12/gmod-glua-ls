@@ -142,6 +142,10 @@ impl FileDiagnostic {
         self.shared_diagnostic_data_cache.invalidate();
     }
 
+    pub fn is_workspace_loaded(&self) -> bool {
+        self.workspace_loaded_notified.load(Ordering::Acquire)
+    }
+
     pub fn notify_workspace_loaded(&self) {
         if self.workspace_loaded_notified.swap(true, Ordering::AcqRel) {
             return;
@@ -293,6 +297,13 @@ impl FileDiagnostic {
     }
 
     /// 清除指定文件的诊断信息
+    /// Drop the remembered report for a URI without telling the client
+    /// anything. Closing a document ends the only readership the cache has, so
+    /// this keeps it from growing with every file visited in a session.
+    pub async fn forget_cached_file_diagnostics(&self, uri: &Uri) {
+        self.cached_file_diagnostics.lock().await.remove(uri);
+    }
+
     pub async fn clear_push_file_diagnostics(&self, uri: lsp_types::Uri) {
         self.cached_file_diagnostics.lock().await.remove(&uri);
 
@@ -915,7 +926,7 @@ mod tests {
     fn workspace_loaded_notification_does_not_suppress_startup_complete() -> Result<()> {
         let (connection, peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
         let file_diagnostic = FileDiagnostic::new(analysis, status_bar, client);
 
@@ -975,7 +986,7 @@ mod tests {
 
         let (connection, _peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let analysis = Arc::new(RwLock::new(analysis));
         let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client);
 

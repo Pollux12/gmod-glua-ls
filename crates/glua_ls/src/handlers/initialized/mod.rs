@@ -432,13 +432,19 @@ pub async fn init_analysis(
         client.refresh_code_lens();
     }
 
-    if !lsp_features.supports_workspace_diagnostic() {
+    if lsp_features.supports_workspace_diagnostic() {
+        // Pull client. Nudge it to re-pull now that the index is ready — but
+        // only if it advertised refresh support; the request is not otherwise
+        // ours to send. Without it the client still re-pulls on its own
+        // triggers (open, edit, focus change).
+        if lsp_features.supports_refresh_diagnostic() {
+            client.refresh_workspace_diagnostics();
+        }
+    } else {
         log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
         file_diagnostic
             .add_workspace_diagnostic_task(0, false)
             .await;
-    } else {
-        log::info!("client supports workspace diagnostics; waiting for diagnostic pull requests");
     }
 }
 
@@ -560,8 +566,9 @@ mod tests {
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::{
-        ClientCapabilities, CodeLensWorkspaceClientCapabilities,
-        InlayHintWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        ClientCapabilities, CodeLensWorkspaceClientCapabilities, DiagnosticClientCapabilities,
+        DiagnosticWorkspaceClientCapabilities, InlayHintWorkspaceClientCapabilities,
+        SemanticTokensWorkspaceClientCapabilities, TextDocumentClientCapabilities,
         WorkspaceClientCapabilities,
     };
     use tokio::sync::RwLock;
@@ -589,13 +596,23 @@ mod tests {
                 code_lens: Some(CodeLensWorkspaceClientCapabilities {
                     refresh_support: Some(true),
                 }),
+                diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                diagnostic: Some(DiagnosticClientCapabilities {
+                    dynamic_registration: Some(true),
+                    related_document_support: Some(true),
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let lsp_features = LspFeatures::new(capabilities);
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let file_diagnostic = Arc::new(FileDiagnostic::new(
             analysis.clone(),
             status_bar.clone(),
@@ -616,7 +633,7 @@ mod tests {
         ));
 
         let mut methods = Vec::new();
-        while methods.len() < 3 {
+        while methods.len() < 4 {
             let message = peer_connection
                 .receiver
                 .recv_timeout(Duration::from_secs(1))
@@ -633,6 +650,7 @@ mod tests {
             methods,
             vec![
                 "workspace/codeLens/refresh".to_string(),
+                "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string(),
             ]

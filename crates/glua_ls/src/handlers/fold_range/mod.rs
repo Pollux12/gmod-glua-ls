@@ -33,6 +33,17 @@ pub async fn on_folding_range_handler(
         return None;
     }
     let uri = params.text_document.uri;
+
+    // Ranges are offsets into this document's tree, so the tree must be the one
+    // the client is asking about — the same gate the formatting handlers use.
+    // Index freshness is not needed here.
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?

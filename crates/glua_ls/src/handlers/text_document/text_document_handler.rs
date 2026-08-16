@@ -39,67 +39,67 @@ async fn apply_document_update_without_queuing(
     mut preparsed: Option<PreparsedDocument>,
     trigger_reindex: bool,
 ) -> Option<FileId> {
-    let mut pending_text = Some(text);
-    let mut retries = 0u32;
-
-    loop {
-        if should_drop_stale_version(context, uri, version).await {
-            return None;
-        }
-
-        if let Ok(mut analysis) = context.analysis().try_write() {
-            let text = pending_text
-                .take()
-                .expect("document text should still be available");
-            let (file_id, deferred_drop) = if let Some(preparsed) = preparsed.take() {
-                if trigger_reindex {
-                    (
-                        analysis.update_file_preparsed(
-                            uri.clone(),
-                            Some(text),
-                            preparsed.tree,
-                            preparsed.line_index,
-                            Some(version),
-                            true,
-                        ),
-                        None,
-                    )
-                } else {
-                    let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
-                        uri.clone(),
-                        Some(text),
-                        preparsed.tree,
-                        preparsed.line_index,
-                        Some(version),
-                    )?;
-                    (Some(file_id), Some(deferred_drop))
-                }
-            } else if trigger_reindex {
-                (analysis.update_file_by_uri(uri, Some(text)), None)
-            } else {
-                (analysis.update_file_text_only(uri, text), None)
-            };
-            if file_id.is_some() {
-                context
-                    .file_diagnostic()
-                    .invalidate_shared_diagnostic_data();
-            }
-            drop(analysis);
-
-            if let Some(deferred_drop) = deferred_drop {
-                spawn_deferred_drop(deferred_drop);
-            }
-
-            return file_id;
-        }
-
-        retries += 1;
-        if retries <= 20 {
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+    if should_drop_stale_version(context, uri, version).await {
+        return None;
     }
+
+    // `write().await` joins the RwLock's fair queue, so new readers line up
+    // behind this writer. A `try_write` spin does not: under the steady stream
+    // of `blocking_read()` diagnostic workers it can fail for seconds, and
+    // every request gated on document freshness stalls with it.
+    let mut analysis = context.analysis().write().await;
+
+    // The lock wait is unbounded, so re-check staleness now that we hold it.
+    if should_drop_stale_version(context, uri, version).await {
+        return None;
+    }
+
+    let (file_id, deferred_drop) = if let Some(preparsed) = preparsed.take() {
+        if trigger_reindex {
+            (
+                analysis.update_file_preparsed(
+                    uri.clone(),
+                    Some(text),
+                    preparsed.tree,
+                    preparsed.line_index,
+                    Some(version),
+                    true,
+                ),
+                None,
+            )
+        } else {
+            let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
+                uri.clone(),
+                Some(text),
+                preparsed.tree,
+                preparsed.line_index,
+                Some(version),
+            )?;
+            (Some(file_id), Some(deferred_drop))
+        }
+    } else if trigger_reindex {
+        (analysis.update_file_by_uri(uri, Some(text)), None)
+    } else {
+        (analysis.update_file_text_only(uri, text), None)
+    };
+
+    // Only an update that touched the index can invalidate the shared
+    // diagnostic data — precomputing it is a workspace-wide scan. The
+    // `trigger_reindex == false` paths write VFS text and the parsed tree and
+    // leave the index alone, and the debounced reindex that follows invalidates
+    // under its own write lock before any reader can see the new index.
+    if file_id.is_some() && trigger_reindex {
+        context
+            .file_diagnostic()
+            .invalidate_shared_diagnostic_data();
+    }
+    drop(analysis);
+
+    if let Some(deferred_drop) = deferred_drop {
+        spawn_deferred_drop(deferred_drop);
+    }
+
+    file_id
 }
 
 async fn check_schema_update(context: &ServerContextSnapshot) {
@@ -435,6 +435,17 @@ pub async fn on_did_close_document(
 ) -> Option<()> {
     let uri = &params.text_document.uri;
     let lsp_features = context.lsp_features();
+
+    // The pull path remembers each file's last report so it can replay it
+    // instead of claiming a file is clean. A closed document has no reader for
+    // that entry; the next pull recomputes it if the file comes back.
+    if lsp_features.supports_pull_diagnostic() {
+        context
+            .file_diagnostic()
+            .forget_cached_file_diagnostics(uri)
+            .await;
+    }
+
     let (encoding, interval) = {
         let analysis = context.analysis().read().await;
         let emmyrc = analysis.get_emmyrc();

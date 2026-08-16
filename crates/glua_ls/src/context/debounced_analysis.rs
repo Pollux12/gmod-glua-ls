@@ -1,7 +1,7 @@
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
 use std::collections::HashSet;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
@@ -9,6 +9,10 @@ use tokio_util::sync::CancellationToken;
 use super::{ClientProxy, file_diagnostic::SharedDiagnosticDataCache};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
+
+/// How long the user must stay idle after a reindex before the whole workspace
+/// is re-diagnosed.
+const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
@@ -27,6 +31,9 @@ pub struct DebouncedAnalysis {
     debounce_duration: Duration,
     shutdown: CancellationToken,
     client: Arc<ClientProxy>,
+    idle_workspace_diagnostic_token: Mutex<Option<CancellationToken>>,
+    workspace_diagnostic_level: Option<Arc<AtomicU8>>,
+    lsp_features: Option<Arc<crate::context::LspFeatures>>,
 }
 
 impl DebouncedAnalysis {
@@ -36,10 +43,13 @@ impl DebouncedAnalysis {
         shutdown: CancellationToken,
         client: Arc<ClientProxy>,
         shared_diagnostic_data_cache: SharedDiagnosticDataCache,
+        workspace_diagnostic_level: Option<Arc<AtomicU8>>,
+        lsp_features: Option<Arc<crate::context::LspFeatures>>,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
             reindexing_files: Mutex::new(HashSet::new()),
+            idle_workspace_diagnostic_token: Mutex::new(None),
             has_pending_changes: AtomicBool::new(false),
             in_flight_changes: AtomicUsize::new(0),
             notify: Notify::new(),
@@ -49,6 +59,8 @@ impl DebouncedAnalysis {
             debounce_duration: Duration::from_millis(debounce_ms),
             shutdown,
             client,
+            workspace_diagnostic_level,
+            lsp_features,
         }
     }
 
@@ -229,16 +241,26 @@ impl DebouncedAnalysis {
             // the previous reindex (the Notify signal may have been missed
             // because there was no active waiter at that point), or
             // begin_in_flight_change() was called without a corresponding schedule().
+            // Register for the wakeup BEFORE testing the condition. `schedule()`
+            // and `begin_in_flight_change()` signal with `notify_waiters()`,
+            // which stores no permit — it only wakes waiters already registered.
+            // Testing first and registering second drops any signal that lands
+            // in between, and the work it announced then waits for the *next*
+            // notification, which may never come if the user has stopped typing.
+            let notified = self.notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
             let needs_work = !self.pending_files.lock().await.is_empty()
                 || self.has_pending_changes.load(Ordering::Acquire);
             if !needs_work {
                 tokio::select! {
-                    _ = self.notify.notified() => {}
+                    _ = notified => {}
                     _ = self.shutdown.cancelled() => return,
                 }
             }
 
-            // Debounce: keep resetting the timer while new events arrive
+            // Debounce: keep resetting the timer while new events arrive.
             loop {
                 tokio::select! {
                     biased;
@@ -278,14 +300,80 @@ impl DebouncedAnalysis {
 
                 self.reindex_notify.notify_waiters();
                 if !reindex_completed {
-                    return;
+                    // Shutdown is the only reason to stop the loop. A panicked
+                    // reindex must not: `has_pending_changes` would stay true
+                    // forever, and every unbounded `wait_until_fresh_for` —
+                    // which is now how both diagnostic handlers wait — would
+                    // block until its request was cancelled, for the rest of
+                    // the session. Fall through so `refresh_dirty_state()`
+                    // below releases the waiters.
+                    if self.shutdown.is_cancelled() {
+                        return;
+                    }
+                    log::error!(
+                        "LS_REINDEX_FAILED reindex of {} file(s) did not complete; continuing so freshness waiters are released",
+                        file_ids.len()
+                    );
                 }
 
-                // Trigger diagnostic and semantic token refresh so the client
-                // re-pulls with fresh data after the reindex.
-                self.client.refresh_workspace_diagnostics();
-                self.client.refresh_semantic_tokens();
-                self.client.refresh_inlay_hints();
+                // Trigger semantic token and inlay hint refresh so the client
+                // re-pulls with fresh data after the reindex. Each refresh is a
+                // server-initiated request, so it may only be sent to a client
+                // that advertised support for it.
+                if let Some(lsp_features) = self.lsp_features.as_ref() {
+                    if lsp_features.supports_semantic_tokens_refresh() {
+                        self.client.refresh_semantic_tokens();
+                    }
+                    if lsp_features.supports_inlay_hint_refresh() {
+                        self.client.refresh_inlay_hints();
+                    }
+                }
+
+                // When reindex finishes from an edit, schedule an idle background workspace
+                // diagnostic refresh. If the user remains idle, this ensures any closed
+                // files affected by cross-file changes get re-diagnosed, without blocking
+                // or stalling active typing. `workspace/diagnostic/refresh` is a global
+                // invalidation signal, so the delay stays comfortably longer than a pause
+                // between two sentences.
+                if let (Some(status), Some(lsp_features)) = (
+                    self.workspace_diagnostic_level.as_ref(),
+                    self.lsp_features.as_ref(),
+                ) {
+                    let mut idle = self.idle_workspace_diagnostic_token.lock().await;
+                    if let Some(token) = idle.take() {
+                        token.cancel();
+                    }
+                    let cancel_token = CancellationToken::new();
+                    *idle = Some(cancel_token.clone());
+
+                    let client = self.client.clone();
+                    let status = status.clone();
+                    let lsp_features = lsp_features.clone();
+                    let shutdown = self.shutdown.clone();
+                    tokio::spawn(async move {
+                        tokio::select! {
+                            _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
+                                if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
+                                    // Raise, never lower: a save during the idle
+                                    // window asks for `Slow`, and storing `Fast`
+                                    // over it would drop the deep sweep.
+                                    status.fetch_max(
+                                        crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
+                                        Ordering::AcqRel,
+                                    );
+                                    // `workspace/diagnostic/refresh` requires
+                                    // `workspace.diagnostics.refreshSupport`,
+                                    // not merely a pull-capable client.
+                                    if lsp_features.supports_refresh_diagnostic() {
+                                        client.refresh_workspace_diagnostics();
+                                    }
+                                }
+                            }
+                            _ = cancel_token.cancelled() => {}
+                            _ = shutdown.cancelled() => {}
+                        }
+                    });
+                }
             }
 
             self.refresh_dirty_state().await;
@@ -298,16 +386,19 @@ impl DebouncedAnalysis {
     }
 
     async fn refresh_dirty_state(&self) {
-        let has_pending_file_work = {
-            let pending = self.pending_files.lock().await;
-            if !pending.is_empty() {
-                true
-            } else {
-                let reindexing = self.reindexing_files.lock().await;
-                !reindexing.is_empty()
-            }
-        };
+        // Read every input and publish the result while still holding the
+        // locks. Releasing them first makes this a read-modify-write that two
+        // callers — the `run()` loop tail and `finish_in_flight_changes` — can
+        // interleave, so the later store can publish the earlier reading. That
+        // resolves itself within a debounce interval, but "stale for 200ms" now
+        // means every index-reading handler parks for 200ms, so it is worth the
+        // slightly wider critical section.
+        let pending = self.pending_files.lock().await;
+        let reindexing = self.reindexing_files.lock().await;
+
+        let has_pending_file_work = !pending.is_empty() || !reindexing.is_empty();
         let has_in_flight_changes = self.in_flight_changes.load(Ordering::Acquire) > 0;
+
         self.has_pending_changes.store(
             has_pending_file_work || has_in_flight_changes,
             Ordering::Release,
@@ -378,7 +469,7 @@ mod tests {
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
         let (connection, _peer) = Connection::memory();
         let client = Arc::new(ClientProxy::new(connection));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let file_diagnostic = FileDiagnostic::new(analysis.clone(), status_bar, client.clone());
         Arc::new(DebouncedAnalysis::new(
             analysis,
@@ -386,6 +477,8 @@ mod tests {
             CancellationToken::new(),
             client,
             file_diagnostic.shared_diagnostic_data_cache(),
+            None,
+            None,
         ))
     }
 
@@ -480,7 +573,7 @@ mod tests {
 
             let (connection, _peer) = Connection::memory();
             let client = Arc::new(ClientProxy::new(connection));
-            let status_bar = Arc::new(StatusBar::new(client.clone()));
+            let status_bar = Arc::new(StatusBar::new(client.clone(), true));
             let analysis = Arc::new(RwLock::new(analysis));
             let file_diagnostic =
                 FileDiagnostic::new(analysis.clone(), status_bar.clone(), client.clone());
@@ -514,6 +607,8 @@ mod tests {
                 CancellationToken::new(),
                 client,
                 file_diagnostic.shared_diagnostic_data_cache(),
+                None,
+                None,
             );
             verify_that!(
                 debounced_analysis

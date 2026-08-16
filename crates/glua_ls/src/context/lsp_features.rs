@@ -24,6 +24,28 @@ impl LspFeatures {
         false
     }
 
+    /// Whether the server may create its own progress tokens via
+    /// `window/workDoneProgress/create`. Without it, a server-initiated
+    /// progress token is never registered, so the `$/progress` notifications
+    /// that follow have nothing to attach to.
+    pub fn supports_work_done_progress(&self) -> bool {
+        self.client_capabilities
+            .window
+            .as_ref()
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false)
+    }
+
+    /// Whether the server may send `workspace/applyEdit`. LSP 3.17 gates it on
+    /// `workspace.applyEdit`.
+    pub fn supports_apply_edit(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.apply_edit)
+            .unwrap_or(false)
+    }
+
     pub fn supports_config_request(&self) -> bool {
         if let Some(workspace) = &self.client_capabilities.workspace {
             if let Some(supports) = workspace.configuration {
