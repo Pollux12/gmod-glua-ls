@@ -1509,4 +1509,58 @@ mod test {
         );
         assert_eq!(ws.expr_ty("require(some_computed_path)"), LuaType::Unknown);
     }
+
+    /// An `__index` metamethod on a super that sits after a diamond in the
+    /// inheritance graph must still be found. `Leaf : Mid, Root, Store` reaches
+    /// `Root` twice — directly and through `Mid` — and the operator walk shares
+    /// one infer guard across siblings, so the second arrival reported recursion.
+    /// Treating that as fatal dropped the remaining siblings, losing `Store`'s
+    /// index operator entirely.
+    #[test]
+    fn test_index_operator_survives_super_diamond() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class DiamondRoot
+            local DiamondRoot = {}
+
+            ---@class DiamondMid : DiamondRoot
+            local DiamondMid = {}
+
+            ---@class DiamondStore
+            ---@field [string] number
+            local DiamondStore = {}
+
+            ---@class DiamondLeaf : DiamondMid, DiamondRoot, DiamondStore
+            local DiamondLeaf = {}
+
+            ---@type DiamondLeaf
+            leafValue = nil
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("leafValue.anythingAtAll"), LuaType::Number);
+    }
+
+    /// Sibling super branches get their own guard fork, so cycle detection now
+    /// rests entirely on the guard's parent chain. Mutually recursive classes
+    /// must still terminate rather than recurse forever.
+    #[test]
+    fn test_mutually_recursive_supers_terminate() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CycleFirst : CycleSecond
+            local CycleFirst = {}
+
+            ---@class CycleSecond : CycleFirst
+            local CycleSecond = {}
+
+            ---@type CycleFirst
+            cycleValue = nil
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Unknown);
+    }
 }

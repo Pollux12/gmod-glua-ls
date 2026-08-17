@@ -4277,4 +4277,72 @@ local EscapeStringMap: {
         );
         Ok(())
     }
+
+    /// A scripted class inherits both the GMod `ENT` annotation chain and its
+    /// own scripted base, so the super graph is a diamond: `ENT : ENTITY :
+    /// Entity` sits alongside a direct `Entity` super, and the real base comes
+    /// last. Walking the siblings with one shared infer guard marked `Entity`
+    /// visited in the `ENT` branch, so the direct `Entity` sibling failed with
+    /// `RecursiveInfer` and aborted the rest of the walk — the real base was
+    /// never searched and the inherited method lost its signature.
+    #[gtest]
+    fn test_inherited_scripted_method_survives_super_diamond() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/annotations/ent.lua",
+                r#"
+---@class Entity
+local Entity = {}
+---@class ENTITY : Entity
+ENTITY = Entity
+---@class ENT : ENTITY
+ENT = {}
+"#,
+            ),
+            (
+                "lua/entities/base_glide/shared.lua",
+                "ENT.Type = \"anim\"\nENT.Base = \"base_anim\"\n",
+            ),
+            (
+                "lua/entities/base_glide/sv_input.lua",
+                r#"
+--- Get the action's boolean value from a specific seat.
+---@param seatIndex number The seat index
+function ENT:GetInputBool(seatIndex)
+    return false
+end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                "ENT.Type = \"anim\"\nENT.Base = \"base_glide\"\n",
+            ),
+        ]);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+function ENT:OnSeatInput()
+    local held = self:GetInput<??>Bool(1)
+    return held
+end
+"#,
+        )?;
+        let file = ws.def_file("lua/entities/base_glide_car/init.lua", &content);
+        let hover = extract_hover_markdown(&ws, file, position);
+
+        assert!(
+            hover.contains("(method) base_glide:GetInputBool"),
+            "an inherited scripted-class method must keep its signature when the \
+             super graph forms a diamond, got: {hover}"
+        );
+        Ok(())
+    }
 }

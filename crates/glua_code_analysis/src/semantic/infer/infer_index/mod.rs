@@ -1807,7 +1807,7 @@ fn infer_custom_type_member(
                     cache,
                     &super_type,
                     index_expr.clone(),
-                    infer_guard,
+                    &infer_guard.fork(),
                     table_member_lookup_guard,
                 );
 
@@ -1868,13 +1868,19 @@ fn infer_custom_type_member(
         && let Some(super_types) =
             visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
     {
+        let mut saw_recursive = false;
         for super_type in super_types {
+            // Each sibling super is an independent branch of the inheritance DAG,
+            // so it gets its own guard fork. Sharing one guard lets a diamond
+            // (`ENT : ENTITY : Entity` alongside a direct `Entity` super) mark a
+            // type visited in one branch and abort the siblings after it —
+            // dropping the real parent that holds the member.
             let result = infer_member_by_member_key_with_table_guard(
                 db,
                 cache,
                 &super_type,
                 index_expr.clone(),
-                infer_guard,
+                &infer_guard.fork(),
                 table_member_lookup_guard,
             );
 
@@ -1882,9 +1888,16 @@ fn infer_custom_type_member(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
+                // A cycle in one branch has not disproved the member; a later
+                // sibling may still hold it. Recursion is transient, so report it
+                // rather than a permanent miss when no sibling answers.
+                Err(InferFailReason::RecursiveInfer) => saw_recursive = true,
                 Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
                 Err(err) => return Err(err),
             }
+        }
+        if saw_recursive {
+            return Err(InferFailReason::RecursiveInfer);
         }
     }
 
@@ -2852,16 +2865,32 @@ fn infer_member_by_index_custom_type(
         && let Some(super_types) =
             visible_super_types_for_index(db, cache, prefix_type_id, &index_expr)
     {
+        let mut saw_recursive = false;
         for super_type in super_types {
-            let result =
-                infer_member_by_operator(db, cache, &super_type, index_expr.clone(), infer_guard);
+            // Sibling supers are independent branches of the inheritance DAG and
+            // each gets its own guard fork, for the same reason as the member-key
+            // walk in `infer_custom_type_member`.
+            let result = infer_member_by_operator(
+                db,
+                cache,
+                &super_type,
+                index_expr.clone(),
+                &infer_guard.fork(),
+            );
             match result {
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
+                // A cycle in one branch has not disproved the member; a later
+                // sibling may still hold it. Recursion is transient, so report it
+                // rather than a permanent miss when no sibling answers.
+                Err(InferFailReason::RecursiveInfer) => saw_recursive = true,
                 Err(InferFailReason::FieldNotFound) => {}
                 Err(err) => return Err(err),
             }
+        }
+        if saw_recursive {
+            return Err(InferFailReason::RecursiveInfer);
         }
     }
 
