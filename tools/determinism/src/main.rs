@@ -629,11 +629,17 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         net_gained.len()
     );
     for entry in net_dropped.iter().take(limit) {
-        emit(format!("  NET_DROPPED {}", &entry[..entry.len().min(400)]));
+        emit(format!("  NET_DROPPED {}", clip(entry, 400)));
     }
     for entry in net_gained.iter().take(limit) {
-        emit(format!("  NET_GAINED  {}", &entry[..entry.len().min(400)]));
+        emit(format!("  NET_GAINED  {}", clip(entry, 400)));
     }
+}
+
+/// Truncates by characters — entries carry workspace paths and net message
+/// names, so a byte slice can land mid-codepoint and panic the whole run.
+fn clip(text: &str, chars: usize) -> String {
+    text.chars().take(chars).collect()
 }
 
 fn counts(set: &BTreeSet<Snapshot>) -> (usize, usize) {
