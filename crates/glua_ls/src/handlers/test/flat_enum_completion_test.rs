@@ -90,6 +90,40 @@ mod tests {
         Ok(())
     }
 
+    /// Mirrors the exact shape the annotation generator emits for a Garry's Mod
+    /// enum, so a change to that shape is caught here rather than in the editor.
+    #[gtest]
+    fn generated_annotation_shape_completes_member_names() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+
+        check!(ws.check_completion_with_kind(
+            r#"
+                ---@realm shared
+                ---@source https://wiki.facepunch.com/gmod/Enums/EF
+                --- Performs bone merge on client side.
+                ---@readonly
+                EF_BONEMERGE = 1
+                --- Prevents the entity from drawing and networking.
+                ---@readonly
+                EF_NODRAW = 32
+
+                ---@realm shared
+                ---@source https://wiki.facepunch.com/gmod/Enums/EF
+                ---@enum EF : number
+                ---| EF_BONEMERGE # Performs bone merge on client side.
+                ---| EF_NODRAW # Prevents the entity from drawing and networking.
+
+                ---@param effect EF
+                local function add_effects(effect) end
+
+                add_effects(<??>)
+            "#,
+            expected_members(),
+            CompletionTriggerKind::TRIGGER_CHARACTER,
+        ));
+        Ok(())
+    }
+
     #[gtest]
     fn table_enum_still_completes_qualified_members() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
