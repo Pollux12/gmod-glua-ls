@@ -124,7 +124,8 @@ struct BenchmarkResult {
 }
 
 /// Process start, so incremental edits can be located on a sampling profiler's
-/// timeline (`t+Ns` landmarks in the log).
+/// timeline. Set `BENCH_EDIT_LANDMARKS=1` to print a `t+Ns` landmark per edit
+/// and window the samples to just the edit.
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Edit each sampled file (append a comment, so the token-identity no-op gate
@@ -159,12 +160,14 @@ fn run_incremental_edits(
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| format!("{file_id:?}"));
         let edited_text = format!("{text}\n-- bench incremental edit\n");
-        eprintln!(
-            "  [incremental] BEGIN {name} at t+{:.3}s",
-            PROCESS_START
-                .get()
-                .map_or(0.0, |s| s.elapsed().as_secs_f64())
-        );
+        if std::env::var_os("BENCH_EDIT_LANDMARKS").is_some() {
+            eprintln!(
+                "  [incremental] BEGIN {name} at t+{:.3}s",
+                PROCESS_START
+                    .get()
+                    .map_or(0.0, |s| s.elapsed().as_secs_f64())
+            );
+        }
         let t = Instant::now();
         analysis.update_file_by_uri(&uri, Some(edited_text));
         let reindex = t.elapsed();

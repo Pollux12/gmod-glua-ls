@@ -11954,11 +11954,10 @@ fn collect_dynamic_loaders(
     // sequential build.
     let per_file = super::parallel::map_files_collect(db, file_ids, |db, source_file_id| {
         let mut patterns = Vec::new();
-        let source_file_id = &source_file_id;
-        let Some(tree) = db.get_vfs().get_syntax_tree(source_file_id) else {
+        let Some(tree) = db.get_vfs().get_syntax_tree(&source_file_id) else {
             return patterns;
         };
-        let Some(content) = db.get_vfs().get_file_content(source_file_id) else {
+        let Some(content) = db.get_vfs().get_file_content(&source_file_id) else {
             return patterns;
         };
         let annotated_candidates =
@@ -11968,18 +11967,14 @@ fn collect_dynamic_loaders(
         }
 
         let root = tree.get_chunk_node();
-        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
-            db,
-            *source_file_id,
-            &root,
-            annotated_global_call_roles,
-        );
+        let annotated_call_roles =
+            AnnotatedGmodCallRoleMap::build(db, source_file_id, &root, annotated_global_call_roles);
         let bindings = collect_static_string_bindings(&root);
         let wrappers = collect_dynamic_load_wrappers(&root);
 
         let file_find_patterns = collect_dynamic_file_find_patterns(
             db,
-            *source_file_id,
+            source_file_id,
             &root,
             &bindings,
             &annotated_call_roles,
@@ -11990,7 +11985,7 @@ fn collect_dynamic_loaders(
 
         let usages = collect_dynamic_load_usages(
             db,
-            *source_file_id,
+            source_file_id,
             &root,
             &file_find_patterns,
             &wrappers,
@@ -12018,7 +12013,7 @@ fn collect_dynamic_loaders(
                     .is_some_and(is_realm_file_prefix);
 
                 patterns.push(DynamicLoadPattern {
-                    source_file_id: *source_file_id,
+                    source_file_id,
                     result_kind,
                     glob: file_find_pattern.glob.clone(),
                     dispatch,
