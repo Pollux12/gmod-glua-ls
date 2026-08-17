@@ -728,10 +728,7 @@ pub fn get_name_expr_var_ref_id(
     let name_token = name_expr.get_name_token()?;
     let name = name_token.get_name_text();
     let var_ref_id = match name {
-        "self" => {
-            let self_ref_id = find_self_ref_id(db, cache, name_expr)?;
-            VarRefId::SelfRef(self_ref_id)
-        }
+        "self" => VarRefId::SelfRef(resolve_self(db, cache, name_expr)?.0),
         _ => {
             let file_id = cache.get_file_id();
             let references_index = db.get_reference_index();
@@ -2628,46 +2625,74 @@ fn select_realm_compatible_decl_ids_for_global_infer_tier(
         .collect()
 }
 
-/// Resolves the full `self` reference identity for a `self` name expression.
+/// Resolves a `self` name expression to its [`SelfRefId`], plus the scripted
+/// class the colon-method prefix stands for when that prefix is a scoped
+/// authoring table (`ENT`, `SWEP`, `GM`, ...).
 ///
-/// Returns a [`SelfRefId`] carrying:
-/// - `self_decl_id`: the (implicit or explicit) `self` declaration — unique per
-///   method body, used as the flow-cache / `VarRefId` identity.
-/// - `receiver`: the colon-method prefix owner used for base/member lookup.
-///
-/// For an explicit (shadowing) `self` local/param, the receiver is the `self`
-/// decl itself, so it behaves like an ordinary local.
-pub fn find_self_ref_id(
+/// Those tables are virtual, so they have no decl and `receiver` falls back to
+/// the enclosing method's member: a usable narrowing key, but the wrong answer
+/// to "what does `self` refer to". Hence the class rides alongside rather than
+/// folded into `receiver`.
+fn resolve_self(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
-) -> Option<SelfRefId> {
+) -> Option<(SelfRefId, Option<LuaTypeDeclId>)> {
     let file_id = cache.get_file_id();
     let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
     let self_decl = tree.find_local_decl("self", name_expr.get_position())?;
     let self_decl_id = self_decl.get_id();
     if !self_decl.is_implicit_self() {
-        return Some(SelfRefId {
-            self_decl_id,
-            receiver: LuaDeclOrMemberId::Decl(self_decl_id),
-        });
+        return Some((
+            SelfRefId {
+                self_decl_id,
+                receiver: LuaDeclOrMemberId::Decl(self_decl_id),
+            },
+            None,
+        ));
     }
 
-    let receiver = find_self_receiver_id(db, cache, &self_decl, name_expr)?;
-    Some(SelfRefId {
-        self_decl_id,
-        receiver,
+    let (receiver, scoped_authoring_type) =
+        find_self_receiver_id(db, cache, &self_decl, name_expr)?;
+    Some((
+        SelfRefId {
+            self_decl_id,
+            receiver,
+        },
+        scoped_authoring_type,
+    ))
+}
+
+/// Resolves what `self` refers to, for hover, goto-definition, references,
+/// implementation and rename.
+///
+/// Inside a scripted-class method this is the class the authoring table stands
+/// for, so `self` and the `ENT` / `SWEP` / `GM` token resolve to the same thing.
+pub(crate) fn find_self_semantic_decl_id(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaSemanticDeclId> {
+    let (self_ref_id, scoped_authoring_type) = resolve_self(db, cache, name_expr)?;
+    if let Some(type_decl_id) = scoped_authoring_type {
+        return Some(LuaSemanticDeclId::TypeDecl(type_decl_id));
+    }
+    Some(match self_ref_id.receiver {
+        LuaDeclOrMemberId::Decl(decl_id) => LuaSemanticDeclId::LuaDecl(decl_id),
+        LuaDeclOrMemberId::Member(member_id) => LuaSemanticDeclId::Member(member_id),
     })
 }
 
-/// Resolves the receiver owner (colon-method prefix) for an implicit `self`.
+/// Resolves the receiver owner (colon-method prefix) for an implicit `self`,
+/// plus the scripted class it stands for when the prefix is a scoped authoring
+/// table. See [`resolve_self`].
 fn find_self_receiver_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     self_decl: &LuaDecl,
     name_expr: &LuaNameExpr,
-) -> Option<LuaDeclOrMemberId> {
+) -> Option<(LuaDeclOrMemberId, Option<LuaTypeDeclId>)> {
     let file_id = cache.get_file_id();
     let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
@@ -2682,19 +2707,30 @@ fn find_self_receiver_id(
             let name = prefix_name.get_name_text()?;
             let decl = tree.find_local_decl(&name, prefix_name.get_position());
             if let Some(decl) = decl {
-                return Some(LuaDeclOrMemberId::Decl(decl.get_id()));
+                // `PLAYER` and `PLUGIN` author their class through a real local
+                // (`local PLAYER = {}`), unlike the virtual `ENT` / `SWEP` / `GM`
+                // tables. The local is still that file's scripted class, so the
+                // identity is the class even though the narrowing receiver stays
+                // the local decl. The resolver rejects a local that merely shadows
+                // the name, so a genuine shadow still resolves to the local.
+                return Some((
+                    LuaDeclOrMemberId::Decl(decl.get_id()),
+                    name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name),
+                ));
             }
 
-            if name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name).is_some() {
+            if let Some(type_decl_id) =
+                name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name)
+            {
                 let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
                 return db
                     .get_member_index()
                     .get_member(&member_id)
-                    .map(|_| LuaDeclOrMemberId::Member(member_id));
+                    .map(|_| (LuaDeclOrMemberId::Member(member_id), Some(type_decl_id)));
             }
 
             let id = resolve_global_decl_id(db, cache, &name, Some(&prefix_name))?;
-            Some(LuaDeclOrMemberId::Decl(id))
+            Some((LuaDeclOrMemberId::Decl(id), None))
         }
         LuaExpr::IndexExpr(prefix_index) => {
             let semantic_id = infer_node_semantic_decl(
@@ -2705,26 +2741,17 @@ fn find_self_receiver_id(
             )?;
 
             match semantic_id {
-                LuaSemanticDeclId::Member(member_id) => Some(LuaDeclOrMemberId::Member(member_id)),
-                LuaSemanticDeclId::LuaDecl(decl_id) => Some(LuaDeclOrMemberId::Decl(decl_id)),
+                LuaSemanticDeclId::Member(member_id) => {
+                    Some((LuaDeclOrMemberId::Member(member_id), None))
+                }
+                LuaSemanticDeclId::LuaDecl(decl_id) => {
+                    Some((LuaDeclOrMemberId::Decl(decl_id), None))
+                }
                 _ => None,
             }
         }
         _ => None,
     }
-}
-
-/// Resolves only the receiver owner of a `self` expression (decl or member).
-///
-/// Retained for callers that need the receiver owner (member/base lookup,
-/// unresolved-reference rewriting) and do not care about the per-method `self`
-/// identity.
-pub fn find_self_decl_or_member_id(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaDeclOrMemberId> {
-    Some(find_self_ref_id(db, cache, name_expr)?.receiver)
 }
 
 /// Returns true if the type contains an unresolved `SelfInfer`.

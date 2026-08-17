@@ -122,6 +122,14 @@ fn rename_references(
     token: LuaSyntaxToken,
     new_name: String,
 ) -> Option<WorkspaceEdit> {
+    // `self` lexes as a plain name, so it resolves to whatever it refers to --
+    // the enclosing class for a scripted method, the receiver otherwise. Renaming
+    // it would rewrite every reference to that target instead, so the implicit
+    // receiver is not a renameable binding.
+    if token.text() == "self" {
+        return None;
+    }
+
     let mut result = HashMap::new();
     let semantic_decl = match get_target_node(token.clone()) {
         Some(node) => semantic_model.find_decl(node.into(), SemanticDeclLevel::NoTrace),
