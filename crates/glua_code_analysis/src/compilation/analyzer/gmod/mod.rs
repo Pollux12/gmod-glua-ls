@@ -248,7 +248,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             let GmodFileMetadataResult {
                 keywords,
                 hook_metadata,
-                network_data,
                 member_ranges,
                 branch_ranges,
                 annotation_realm,
@@ -258,7 +257,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
                 profile.record_keywords(&keywords, is_in_scope);
-                profile.receive_flows += network_data.receive_flows.len();
             }
 
             if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
@@ -275,11 +273,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 }
             } else if let Some(profile) = profile.as_mut() {
                 profile.hook_metadata_skips += 1;
-            }
-
-            if !network_data.send_flows.is_empty() || !network_data.receive_flows.is_empty() {
-                db.get_gmod_network_index_mut()
-                    .add_file_data(file_id, network_data);
             }
 
             if is_in_scope {
@@ -432,7 +425,6 @@ struct GmodPreProfile {
     scoped_files: usize,
     hook_metadata_skips: usize,
     gm_method_realms: usize,
-    receive_flows: usize,
     scoped_class_matches: usize,
     branch_realm_ranges: usize,
     annotation_realms: usize,
@@ -451,7 +443,7 @@ impl GmodPreProfile {
 
     fn log(&self) {
         log::info!(
-            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
+            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
             self.files_scanned,
             self.hook_keyword_files,
             self.system_call_keyword_files,
@@ -461,7 +453,6 @@ impl GmodPreProfile {
             self.scoped_files,
             self.hook_metadata_skips,
             self.gm_method_realms,
-            self.receive_flows,
             self.scoped_class_matches,
             self.branch_realm_ranges,
             self.annotation_realms,
@@ -1279,7 +1270,6 @@ struct GmodFileMetadataResult {
         GmodSystemFileMetadata,
         Vec<(String, GmodRealm)>,
     )>,
-    network_data: crate::db_index::FileNetworkData,
     /// `---@realm` member ranges (only populated when `keywords.has_realm_anno`).
     member_ranges: Vec<GmodRealmRange>,
     /// Branch realm ranges (only populated when `keywords.has_realm_branch`).
@@ -1323,7 +1313,6 @@ fn collect_file_gmod_metadata(
         return GmodFileMetadataResult {
             keywords,
             hook_metadata: None,
-            network_data: crate::db_index::FileNetworkData::default(),
             member_ranges: Vec::new(),
             branch_ranges: Vec::new(),
             annotation_realm: None,
@@ -1364,8 +1353,6 @@ fn collect_file_gmod_metadata(
         (hook_sites, system_metadata, gm_method_realms)
     });
 
-    let network_data = crate::db_index::FileNetworkData::default();
-
     let branch_ranges = if keywords.has_realm_branch {
         collect_branch_realm_ranges(&root)
     } else {
@@ -1391,7 +1378,6 @@ fn collect_file_gmod_metadata(
     GmodFileMetadataResult {
         keywords,
         hook_metadata,
-        network_data,
         member_ranges,
         branch_ranges,
         annotation_realm,
