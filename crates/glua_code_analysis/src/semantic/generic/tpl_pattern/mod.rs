@@ -623,29 +623,21 @@ fn table_generic_tpl_pattern_member_owner_match(
     Ok(())
 }
 
-/// The body range of the `for ... in` loop this call drives, when the call is
+/// The statement range of the `for ... in` loop this call drives, when the call is
 /// that loop's iterator expression.
 ///
 /// A loop reads the values the table held when it started, so members the loop body
 /// itself writes must not define the element type its own iteration variables get.
-/// The body range excludes the iterator expression, so an inline table literal there
-/// still defines the element type.
 fn iterated_for_range_body(context: &TplContext) -> Option<(FileId, TextRange)> {
     let call_expr = context.call_expr.as_ref()?;
     let for_range = call_expr
         .syntax()
         .ancestors()
         .find_map(LuaForRangeStat::cast)?;
-    if !for_range
+    for_range
         .get_expr_list()
         .any(|expr| expr.syntax() == call_expr.syntax())
-    {
-        return None;
-    }
-
-    // No body means no self-writes to filter.
-    let body = for_range.get_block()?;
-    Some((context.cache.get_file_id(), body.get_range()))
+        .then(|| (context.cache.get_file_id(), for_range.get_range()))
 }
 
 fn is_defined_in(member: &LuaMemberInfo, file_id: FileId, range: TextRange) -> bool {
