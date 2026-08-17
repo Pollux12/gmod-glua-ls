@@ -413,7 +413,7 @@ struct LuaAnalyzer<'a> {
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
-    literal_index_member_owner_cache: FxHashMap<String, LuaMemberOwner>,
+    literal_index_member_owner_cache: FxHashMap<smol_str::SmolStr, LuaMemberOwner>,
 }
 
 impl LuaAnalyzer<'_> {

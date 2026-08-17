@@ -895,7 +895,7 @@ fn rewritten_collection_element_matches_param(
     last_matching_assignment_is_compatible == Some(true)
 }
 
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

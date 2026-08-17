@@ -72,7 +72,7 @@ pub(super) fn collect_numeric_range_table_populations_for_file(
                     if let LuaVarExpr::NameExpr(name_expr) = var
                         && let Some(name) = name_expr.get_name_text()
                     {
-                        local_helpers.remove(&name);
+                        local_helpers.remove(name.as_str());
                     }
                 }
             }
@@ -100,7 +100,7 @@ fn simple_func_stat_name(func_stat: &LuaFuncStat) -> Option<String> {
     let LuaVarExpr::NameExpr(name_expr) = func_stat.get_func_name()? else {
         return None;
     };
-    name_expr.get_name_text()
+    name_expr.get_name_text().map(Into::into)
 }
 
 fn numeric_range_populations_from_outer_call(
@@ -208,7 +208,7 @@ fn attach_exact_alias_assignment(
     }
     for population in populations {
         if population.table_global == source_root {
-            population.alias_roots.push(alias_root.clone());
+            population.alias_roots.push(alias_root.to_string());
             population.alias_roots.sort();
             population.alias_roots.dedup();
             return true;
@@ -259,7 +259,7 @@ fn root_name_from_expr(expr: &LuaExpr) -> Option<String> {
         prefix = index_expr.get_prefix_expr()?;
     }
     match prefix {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
         _ => None,
     }
 }
@@ -272,7 +272,7 @@ fn assign_writes_tracked_helper(
     vars.into_iter().any(|var| {
         matches!(var, LuaVarExpr::NameExpr(name_expr) if name_expr
             .get_name_text()
-            .is_some_and(|name| helpers.contains_key(&name)))
+            .is_some_and(|name| helpers.contains_key(name.as_str())))
     })
 }
 
@@ -299,7 +299,7 @@ fn reset_table_names(assign_stat: &LuaAssignStat) -> Vec<String> {
     let (vars, _) = assign_stat.get_var_and_expr_list();
     vars.into_iter()
         .filter_map(|var| match var {
-            LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text().map(String::from),
             _ => None,
         })
         .collect()
@@ -327,7 +327,7 @@ fn helper_invalidated_by_descendant_write(
         for var in vars {
             if let LuaVarExpr::NameExpr(name_expr) = var
                 && let Some(name) = name_expr.get_name_text()
-                && local_helpers.contains_key(&name)
+                && local_helpers.contains_key(name.as_str())
             {
                 return true;
             }
@@ -360,7 +360,7 @@ fn call_expr_name(call_expr: &LuaCallExpr) -> Option<String> {
     let LuaExpr::NameExpr(name_expr) = call_expr.get_prefix_expr()? else {
         return None;
     };
-    name_expr.get_name_text()
+    name_expr.get_name_text().map(Into::into)
 }
 
 fn call_name_shadowed_in_closure_before_call(
@@ -600,7 +600,7 @@ fn protected_pre_loop_names(
 fn collect_expr_name_texts(expr: &LuaExpr, names: &mut HashSet<String>) {
     for name_expr in expr.descendants::<LuaNameExpr>() {
         if let Some(name) = name_expr.get_name_text() {
-            names.insert(name);
+            names.insert(name.to_string());
         }
     }
 }
@@ -765,7 +765,7 @@ fn pre_loop_helper_body_is_safe(
                 }
                 LuaVarExpr::NameExpr(name_expr) => {
                     if name_expr.get_name_text().is_none_or(|name| {
-                        protected_names.contains(&name)
+                        protected_names.contains(name.as_str())
                             || !name_expr_resolves_to_local(db, file_id, &name_expr)
                     }) {
                         active_helpers.remove(helper_name);
@@ -976,7 +976,8 @@ fn branchy_assignment_is_safe(
             return false;
         };
         if name_expr.get_name_text().is_none_or(|name| {
-            protected_names.contains(&name) || !name_expr_resolves_to_local(db, file_id, &name_expr)
+            protected_names.contains(name.as_str())
+                || !name_expr_resolves_to_local(db, file_id, &name_expr)
         }) {
             return false;
         }
@@ -1319,7 +1320,7 @@ fn helper_body_mutates_or_shadows_params(
         if vars.into_iter().any(|var| {
             matches!(var, LuaVarExpr::NameExpr(name_expr) if name_expr
                 .get_name_text()
-                .is_some_and(|name| param_names.contains(&name)))
+                .is_some_and(|name| param_names.contains(name.as_str())))
         }) {
             return true;
         }

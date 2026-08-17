@@ -204,7 +204,7 @@ fn build_incoming_hierarchy_item(
                         };
 
                         let item = CallHierarchyItem {
-                            name: access_path,
+                            name: access_path.to_string(),
                             kind: SymbolKind::FUNCTION,
                             tags: None,
                             detail: None,

@@ -1504,7 +1504,11 @@ fn is_valid_global_path_table_member(
     .is_some()
 }
 
-fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
+fn global_expr_access_path(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> Option<smol_str::SmolStr> {
     if !expr_root_is_global(db, file_id, expr) {
         return None;
     }

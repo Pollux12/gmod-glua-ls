@@ -102,7 +102,7 @@ fn setmetatable_factory_binding(
         file_id: analyzer.file_id,
         table_range,
         metatable_range,
-        local_name: table_name.get_name_text()?.into(),
+        local_name: table_name.get_name_text()?,
         call_position: call_expr.get_position(),
         function_scope,
     })

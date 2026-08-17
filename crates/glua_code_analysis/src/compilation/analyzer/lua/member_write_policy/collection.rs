@@ -540,7 +540,9 @@ pub(in crate::compilation::analyzer::lua) fn is_collection_append_write(
     Some(expr_access_path(&prefix_expr) == expr_access_path(&len_expr))
 }
 
-pub(in crate::compilation::analyzer::lua) fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+pub(in crate::compilation::analyzer::lua) fn expr_access_path(
+    expr: &LuaExpr,
+) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

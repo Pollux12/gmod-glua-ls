@@ -1568,7 +1568,7 @@ fn member_receiver_name(func: &LuaFuncStat) -> Option<smol_str::SmolStr> {
     let LuaExpr::NameExpr(name_expr) = index_expr.get_prefix_expr()? else {
         return None;
     };
-    name_expr.get_name_text().map(Into::into)
+    name_expr.get_name_text()
 }
 
 fn find_overload_param_type_from_type(

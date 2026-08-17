@@ -760,7 +760,7 @@ fn extract_func_name_from_ast(ast: &LuaAst) -> Option<String> {
                     LuaIndexKey::String(string_token) => Some(string_token.get_value()),
                     _ => None,
                 },
-                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
             }
         }
         LuaAst::LuaLocalFuncStat(local_func) => local_func

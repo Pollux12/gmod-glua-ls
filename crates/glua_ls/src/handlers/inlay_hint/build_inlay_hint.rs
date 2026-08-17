@@ -352,7 +352,7 @@ fn build_call_args_for_func_type(
         if let LuaExpr::NameExpr(name_expr) = arg
             && let Some(param_name) = name_expr.get_name_text()
             // optimize like rust analyzer
-            && &param_name == name
+            && param_name == *name
         {
             continue;
         }

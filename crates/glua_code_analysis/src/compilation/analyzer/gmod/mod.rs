@@ -1145,7 +1145,7 @@ impl FileFunctionMap {
                 };
                 match func_stat.get_func_name() {
                     Some(LuaVarExpr::NameExpr(name_expr)) => {
-                        if let Some(name) = name_expr.get_name_text() {
+                        if let Some(name) = name_expr.get_name_text().map(String::from) {
                             if bare.insert(name.clone(), block.clone()).is_some() {
                                 duplicate_bare.insert(name);
                             }
@@ -1169,7 +1169,7 @@ impl FileFunctionMap {
                     if let Some(var) = vars.get(idx) {
                         match var {
                             LuaVarExpr::NameExpr(name_expr) => {
-                                if let Some(name) = name_expr.get_name_text() {
+                                if let Some(name) = name_expr.get_name_text().map(String::from) {
                                     if bare.insert(name.clone(), block.clone()).is_some() {
                                         duplicate_bare.insert(name);
                                     }
@@ -2267,7 +2267,11 @@ fn resolve_callback_block(
     };
     let target_name = name_expr.get_name_text()?;
 
-    local_fns.get(file_id, root).bare.get(&target_name).cloned()
+    local_fns
+        .get(file_id, root)
+        .bare
+        .get(target_name.as_str())
+        .cloned()
 }
 
 /// Resolve a call expression to a function definition, returning a
@@ -2338,7 +2342,11 @@ fn resolve_call_to_function_block(
     // written bare name identifies exactly one function body in that file.
     if let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
         && let Some(name) = name_expr.get_name_text()
-        && let Some(block) = local_fns.get(root_file_id, root).bare.get(&name).cloned()
+        && let Some(block) = local_fns
+            .get(root_file_id, root)
+            .bare
+            .get(name.as_str())
+            .cloned()
     {
         return Some((
             format!("unique-local:{name}"),
@@ -4223,7 +4231,7 @@ fn resolve_vgui_field_assignment_parent_type_ids(
     let owner = field_expr.get_prefix_expr()?;
     let owner_type_ids = resolve_vgui_parent_expr_type_ids(db, cache, owner);
     let mut candidates = field_assignment_parents
-        .get(&field_path)?
+        .get(field_path.as_str())?
         .iter()
         .filter(|assignment| {
             !field_type_ids.is_empty() && assignment.owner_type_ids == owner_type_ids
@@ -4269,7 +4277,10 @@ fn index_vgui_field_assignment_parents(
             if parent_type_ids.is_empty() {
                 continue;
             }
-            assignments.entry(field_path).or_insert_with(Vec::new).push(
+            assignments
+                .entry(field_path.to_string())
+                .or_insert_with(Vec::new)
+                .push(
                 VguiFieldAssignmentParent {
                     owner_type_ids: resolve_vgui_parent_expr_type_ids(db, cache, owner),
                     parent_type_ids,
@@ -4621,7 +4632,8 @@ fn find_and_resolve_getmember_delegations(
                 continue;
             };
 
-            let Some((target_class, target_method)) = getmember_locals.get(&caller_name) else {
+            let Some((target_class, target_method)) = getmember_locals.get(caller_name.as_str())
+            else {
                 continue;
             };
             if target_method != "SetupDataTables" {
@@ -5676,11 +5688,11 @@ fn extract_scoped_base_name(expr: &LuaExpr) -> Option<String> {
         },
         LuaExpr::NameExpr(name_expr) => {
             let value = name_expr.get_name_text()?;
-            (!value.trim().is_empty()).then_some(value)
+            (!value.trim().is_empty()).then(|| value.to_string())
         }
         LuaExpr::IndexExpr(index_expr) => {
             let value = index_expr.get_access_path()?;
-            (!value.trim().is_empty()).then_some(value)
+            (!value.trim().is_empty()).then(|| value.to_string())
         }
         _ => None,
     }
@@ -5973,7 +5985,7 @@ fn resolve_wrapper_arg_mapping(
         }
         LuaExpr::NameExpr(name_expr) => {
             if let Some(name) = name_expr.get_name_text() {
-                if let Some(idx) = param_names.iter().position(|p| p == &name) {
+                if let Some(idx) = param_names.iter().position(|p| *p == name) {
                     return (None, Some(idx));
                 }
             }
@@ -9040,7 +9052,7 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
             let Some(call_path) = func_name.get_access_path() else {
                 continue;
             };
-            role_map.add_local_path_roles(root_decl_id, call_path, roles);
+            role_map.add_local_path_roles(root_decl_id, call_path.to_string(), roles);
         }
 
         for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
@@ -9413,7 +9425,7 @@ fn global_call_path_for_signature_closure(
     if let Some(func_stat) = closure.get_parent::<LuaFuncStat>() {
         let func_name = func_stat.get_func_name()?;
         return var_expr_has_global_root(db, file_id, &func_name)
-            .then(|| func_name.get_access_path())?;
+            .then(|| func_name.get_access_path().map(Into::into))?;
     }
 
     let assign_stat = closure.get_parent::<LuaAssignStat>()?;
@@ -9422,7 +9434,8 @@ fn global_call_path_for_signature_closure(
         .iter()
         .position(|expr| expr.get_position() == closure.get_position())?;
     let var_expr = vars.get(value_idx)?;
-    var_expr_has_global_root(db, file_id, var_expr).then(|| var_expr.get_access_path())?
+    var_expr_has_global_root(db, file_id, var_expr)
+        .then(|| var_expr.get_access_path().map(Into::into))?
 }
 
 fn var_expr_has_global_root(db: &DbIndex, file_id: FileId, var_expr: &LuaVarExpr) -> bool {
@@ -12155,7 +12168,7 @@ fn collect_dynamic_wrapper_call_usage(
     let Some(path) = call_expr.get_access_path() else {
         return DynamicLoadUsage::default();
     };
-    let Some(wrapper) = wrappers.get(&path) else {
+    let Some(wrapper) = wrappers.get(path.as_str()) else {
         return DynamicLoadUsage::default();
     };
     let Some(args_list) = call_expr.get_args_list() else {
@@ -12219,7 +12232,7 @@ fn collect_dynamic_load_wrappers(root: &LuaChunk) -> HashMap<String, DynamicLoad
         else {
             continue;
         };
-        wrappers.insert(name, wrapper);
+        wrappers.insert(name.to_string(), wrapper);
     }
 
     wrappers
@@ -12366,7 +12379,7 @@ fn collect_dynamic_load_aliases_from_assign_stat(
         else {
             continue;
         };
-        changed |= merge_dynamic_load_alias(aliases, path, load_alias);
+        changed |= merge_dynamic_load_alias(aliases, path.to_string(), load_alias);
     }
     changed
 }
@@ -12410,7 +12423,7 @@ fn dynamic_load_alias_for_expr(
         LuaExpr::IndexExpr(index_expr) => {
             let path = index_expr.get_access_path()?;
             aliases
-                .get(&path)
+                .get(path.as_str())
                 .copied()
                 .or_else(|| annotated_roles.load_alias_for_reference_expr(db, file_id, expr))
         }
@@ -12704,7 +12717,7 @@ fn collect_dynamic_binding_writes(root: &LuaChunk) -> Vec<DynamicBindingWrite> {
                 continue;
             };
             writes.push(DynamicBindingWrite {
-                name: path,
+                name: path.to_string(),
                 scope,
                 range,
             });
@@ -12990,7 +13003,7 @@ fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {
                     continue;
                 };
                 if let Some(value) = static_string_expr(value, &bindings) {
-                    bindings.insert(name, value);
+                    bindings.insert(name.to_string(), value);
                 }
             }
         }

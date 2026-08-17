@@ -283,7 +283,7 @@ fn assigned_target_path(expr: &LuaTableExpr, stat: &LuaStat) -> Option<String> {
             let index = exprs
                 .iter()
                 .position(|value| value.syntax() == expr.syntax())?;
-            vars.get(index)?.get_access_path()
+            vars.get(index)?.get_access_path().map(Into::into)
         }
         LuaStat::LocalStat(local) => Some(
             local

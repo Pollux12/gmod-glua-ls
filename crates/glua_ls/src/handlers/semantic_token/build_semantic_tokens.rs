@@ -2117,7 +2117,7 @@ fn inferred_alias_target_token_type(
     }
 }
 
-fn expr_access_path(value_expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(value_expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match value_expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

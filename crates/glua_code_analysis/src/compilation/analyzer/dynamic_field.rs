@@ -911,7 +911,7 @@ fn param_expr_index(expr: &LuaExpr, param_names: &[String]) -> Option<usize> {
     let name = name_expr.get_name_text()?;
     param_names
         .iter()
-        .position(|param_name| param_name == &name)
+        .position(|param_name| *param_name == name)
 }
 
 #[derive(Default)]

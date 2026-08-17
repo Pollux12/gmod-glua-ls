@@ -17,5 +17,6 @@ workspace = true
 [dependencies]
 rowan.workspace = true
 rustc-hash.workspace = true
+smol_str.workspace = true
 serde.workspace = true
 

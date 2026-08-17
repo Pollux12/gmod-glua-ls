@@ -108,7 +108,10 @@ fn extend_global_path_members(
     }
 }
 
-fn global_expr_access_path(semantic_model: &SemanticModel, expr: &LuaExpr) -> Option<String> {
+fn global_expr_access_path(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> Option<smol_str::SmolStr> {
     if !expr_root_is_global(semantic_model, expr) {
         return None;
     }
@@ -221,7 +224,7 @@ fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<
     match prefix_type {
         LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
         _ => match prefix_expr {
-            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
             _ => None,
         },
     }

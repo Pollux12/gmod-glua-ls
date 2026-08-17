@@ -162,7 +162,8 @@ mod alloc_sample {
     /// Ordered stacks (innermost first) -> count. Kept alongside FRAMES because
     /// "which of our functions asked for this memory" needs frame order, which
     /// the flat per-frame tally throws away.
-    static STACKS: Mutex<Option<HashMap<Box<[usize]>, u64>>> = Mutex::new(None);
+    type StackCounts = HashMap<Box<[usize]>, u64>;
+    static STACKS: Mutex<Option<StackCounts>> = Mutex::new(None);
 
     thread_local! {
         /// Capturing a backtrace allocates; without this guard the sampler
@@ -194,7 +195,10 @@ mod alloc_sample {
         {
             return;
         }
-        if TICK.fetch_add(1, Ordering::Relaxed) % rate as u64 != 0 {
+        if !TICK
+            .fetch_add(1, Ordering::Relaxed)
+            .is_multiple_of(rate as u64)
+        {
             return;
         }
         SAMPLING.with(|sampling| {

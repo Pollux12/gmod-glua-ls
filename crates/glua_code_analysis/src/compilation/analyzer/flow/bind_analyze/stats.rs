@@ -177,8 +177,8 @@ fn collect_assignment_flow_info(binder: &FlowBinder, vars: &[LuaVarExpr]) -> Ass
     info
 }
 
-fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: String) {
-    let path = internment::ArcIntern::from(smol_str::SmolStr::new(&path));
+fn push_assignment_index_path(info: &mut AssignmentFlowInfo, path: smol_str::SmolStr) {
+    let path = internment::ArcIntern::from(path);
     if !info.index_paths.contains(&path) {
         info.index_paths.push(path);
     }
@@ -227,7 +227,7 @@ fn is_collection_append_write(index_expr: &LuaIndexExpr) -> bool {
     expr_access_path(&len_expr).is_some_and(|len_path| len_path == prefix_path)
 }
 
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

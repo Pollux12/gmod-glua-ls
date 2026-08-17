@@ -228,7 +228,7 @@ impl Checker for GmodRealmMisuseChecker {
             if let Some(callee_realm) = unknown_realm_candidate(call_realm, &callee_realms) {
                 let call_name = call_expr
                     .get_access_path()
-                    .unwrap_or_else(|| "function".to_string());
+                    .unwrap_or_else(|| "function".into());
                 context.add_diagnostic(
                     DiagnosticCode::GmodUnknownRealm,
                     call_expr.get_range(),
@@ -282,7 +282,7 @@ impl Checker for GmodRealmMisuseChecker {
 
             let call_name = call_expr
                 .get_access_path()
-                .unwrap_or_else(|| "function".to_string());
+                .unwrap_or_else(|| "function".into());
             context.add_diagnostic(
                 code,
                 call_expr.get_range(),
@@ -658,7 +658,7 @@ fn resolve_global_name_candidate_realms(
     };
 
     let mut realms = Vec::new();
-    let member_key = LuaMemberKey::Name(name.into());
+    let member_key = LuaMemberKey::Name(name);
     if let Some(member_infos) =
         semantic_model.get_member_info_with_key(&LuaType::Global, member_key, true)
     {

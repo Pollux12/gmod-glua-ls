@@ -1729,7 +1729,7 @@ fn get_type_at_assign_stat(
         };
 
         if numeric_table_index_query_key_name(var_ref_id)
-            .map(str::to_string)
+            .map(smol_str::SmolStr::new)
             .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
             .is_some_and(|key_name| var_ref_is_name(db, &maybe_ref_id, &key_name))
         {
@@ -1758,7 +1758,7 @@ fn get_type_at_assign_stat(
                 )?));
             }
             if numeric_table_index_query_key_name(var_ref_id)
-                .map(str::to_string)
+                .map(smol_str::SmolStr::new)
                 .or_else(|| {
                     numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id)
                 })
@@ -1787,7 +1787,7 @@ fn get_type_at_assign_stat(
         }
 
         if numeric_table_index_query_key_name(var_ref_id)
-            .map(str::to_string)
+            .map(smol_str::SmolStr::new)
             .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
             .is_some_and(|key_name| {
                 assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
@@ -1929,7 +1929,7 @@ fn try_get_numeric_range_table_arg_population_type(
         return Ok(None);
     };
     let key_name = numeric_table_index_query_key_name(var_ref_id)
-        .map(str::to_string)
+        .map(smol_str::SmolStr::new)
         .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id));
 
     let args = call_expr
@@ -2202,7 +2202,7 @@ fn numeric_global_table_index_query(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
-) -> Option<(String, i64, Option<String>)> {
+) -> Option<(smol_str::SmolStr, i64, Option<smol_str::SmolStr>)> {
     let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
         return None;
     };
@@ -2566,7 +2566,7 @@ fn var_expr_may_mutate_global_table(var: &LuaVarExpr, mutation_roots: &[&str]) -
     }
 }
 
-fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<String> {
+fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<smol_str::SmolStr> {
     let mut prefix = index_expr.get_prefix_expr()?;
     while let LuaExpr::IndexExpr(parent_index) = prefix {
         prefix = parent_index.get_prefix_expr()?;
@@ -2785,7 +2785,7 @@ fn numeric_table_index_query_key_name_from_initializer(
     db: &DbIndex,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
-) -> Option<String> {
+) -> Option<smol_str::SmolStr> {
     let decl_id = match var_ref_id {
         VarRefId::IndexRef(query_root, _) => query_root.as_decl_id(),
         _ => var_ref_id.get_decl_id_ref(),
@@ -3394,7 +3394,7 @@ fn infer_collection_base_types<'a>(
     base_type
 }
 
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

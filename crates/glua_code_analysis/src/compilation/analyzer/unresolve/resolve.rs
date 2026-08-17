@@ -2127,7 +2127,7 @@ fn semantic_decl_from_var_ref_id(var_ref_id: &VarRefId) -> Option<LuaSemanticDec
 fn get_expr_access_path(expr: &LuaExpr) -> Option<String> {
     match expr {
         LuaExpr::NameExpr(name_expr) => Some(name_expr.get_name_text()?.to_string()),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().map(Into::into),
         _ => None,
     }
 }
