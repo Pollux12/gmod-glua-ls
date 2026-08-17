@@ -812,7 +812,12 @@ impl LuaTypeIndex {
         self.full_name_type_map.get_mut(decl_id)
     }
 
-    /// Stores `cache` for `owner` unless the owner already holds a type.
+    /// Stores `cache` for `owner`, keeping any type already bound there unless
+    /// `cache` supersedes it.
+    ///
+    /// A superseding write discards the old type, so the metadata derived from
+    /// it has to go with it; otherwise [`get_type_fact`](Self::get_type_fact)
+    /// pairs the new type with the old confidence and provenance.
     pub fn bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
@@ -820,11 +825,14 @@ impl LuaTypeIndex {
             return;
         }
         let file_id = owner.get_file_id();
-        self.types.insert(owner.clone(), cache);
+        let replaced = self.types.insert(owner.clone(), cache).is_some();
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
-            .insert(owner);
+            .insert(owner.clone());
+        if replaced && self.fact_metadata.remove(&owner).is_some() {
+            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        }
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
