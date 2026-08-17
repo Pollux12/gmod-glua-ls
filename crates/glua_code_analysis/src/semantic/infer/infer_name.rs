@@ -917,9 +917,12 @@ fn infer_param_inner(
     }
 
     if let Some(param_hint_type) = infer_param_type_from_gmod_name_hint(db, decl.get_name()) {
+        // An unreadable argument only means no contextual type; the hint is still better
+        // than failing the parameter, and degrading here keeps the cached path in step
+        // with the no-cache path, which never reads call sites at all.
         if let Some(cache) = cache.as_mut()
-            && let Some(arg_type) =
-                infer_unread_local_call_site_args(db, cache, signature_id, param_idx)?
+            && let Ok(Some(arg_type)) =
+                infer_unread_local_call_site_args(db, cache, signature_id, param_idx)
         {
             return Ok((arg_type, ParamInferenceSource::Contextual));
         }
@@ -3279,6 +3282,36 @@ mod test {
         assert_eq!(param_types.len(), 2);
         assert!(ws.check_type(&param_types[0], &LuaType::String));
         assert!(ws.check_type(&param_types[1], &LuaType::Number));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_gmod_param_name_hint_survives_unresolvable_call_site_arg() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+
+            ---@class Owner
+
+            ---@type Owner
+            local owner
+
+            local function place(ent)
+                return ent
+            end
+
+            place(owner.missing)
+            "#,
+        );
+
+        let param_type = find_param_type_by_name(&ws, file_id, "ent");
+        assert_that!(ws.humanize_type(param_type), eq("Entity"));
 
         Ok(())
     }
