@@ -120,9 +120,186 @@
 //!                   hides behind the first 40 unrelated entries.
 
 use mimalloc::MiMalloc;
+use std::alloc::{GlobalAlloc, Layout};
+
+/// mimalloc, plus a count of every allocation it hands out.
+///
+/// A sampling profiler blames the allocator, never the code that asked for the
+/// memory, so it cannot answer "is this phase allocation-bound?". Counting can:
+/// `GLUALS_PROFILE=1` prints allocations alongside each phase's cost, and
+/// dividing by the phase's unit of work gives allocations-per-step directly.
+struct CountingMiMalloc;
+
+// SAFETY: every method forwards to MiMalloc with the same arguments; the
+// counters are plain relaxed atomics and do not affect allocation behavior.
+/// Sample one in every `DET_ALLOC_SAMPLE` allocations and record where it came
+/// from. This is a poor-man's allocation profiler: it attributes allocations to
+/// source locations, which a CPU sampling profiler cannot do (it blames the
+/// allocator) — and it works even where external profilers fail to read the PDB.
+mod alloc_sample {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+
+    const MAX_FRAMES: usize = 64;
+
+    // Documented in WinBase.h; returns the number of frames written.
+    unsafe extern "system" {
+        fn RtlCaptureStackBackTrace(
+            frames_to_skip: u32,
+            frames_to_capture: u32,
+            back_trace: *mut *mut std::ffi::c_void,
+            back_trace_hash: *mut u32,
+        ) -> u16;
+    }
+
+    static SAMPLE_RATE: AtomicUsize = AtomicUsize::new(0);
+    static PHASE_SCOPED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    static TICK: AtomicU64 = AtomicU64::new(0);
+    /// Frame address -> number of sampled allocations whose stack contained it.
+    /// Addresses are resolved to names once, at report time.
+    static FRAMES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+
+    thread_local! {
+        /// Capturing a backtrace allocates; without this guard the sampler
+        /// would recurse into itself.
+        static SAMPLING: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    }
+
+    pub fn init() {
+        let rate = std::env::var("DET_ALLOC_SAMPLE")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(0);
+        SAMPLE_RATE.store(rate, Ordering::Relaxed);
+        PHASE_SCOPED.store(
+            std::env::var_os("GLUALS_PROFILE_SAMPLE").is_some(),
+            Ordering::Relaxed,
+        );
+    }
+
+    #[inline]
+    pub fn maybe_sample() {
+        let rate = SAMPLE_RATE.load(Ordering::Relaxed);
+        if rate == 0 {
+            return;
+        }
+        // Sample one phase only (GLUALS_PROFILE_SAMPLE), when asked to.
+        if PHASE_SCOPED.load(Ordering::Relaxed)
+            && !glua_code_analysis::profile::SAMPLE_PHASE_ACTIVE.load(Ordering::Relaxed)
+        {
+            return;
+        }
+        if TICK.fetch_add(1, Ordering::Relaxed) % rate as u64 != 0 {
+            return;
+        }
+        SAMPLING.with(|sampling| {
+            if sampling.get() {
+                return;
+            }
+            sampling.set(true);
+            // Raw instruction pointers only — no symbol resolution here.
+            //
+            // `backtrace::trace` goes through dbghelp's StackWalkEx, which takes
+            // a process-wide lock and costs milliseconds per capture: a full run
+            // never finished. RtlCaptureStackBackTrace unwinds via the x64
+            // unwind tables instead and costs microseconds.
+            let mut buffer = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_FRAMES];
+            let captured = unsafe {
+                RtlCaptureStackBackTrace(1, MAX_FRAMES as u32, buffer.as_mut_ptr(), std::ptr::null_mut())
+            };
+            let mut ips: Vec<usize> = buffer[..captured as usize]
+                .iter()
+                .map(|&ip| ip as usize)
+                .collect();
+            let mut frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
+            let frames = frames.get_or_insert_with(HashMap::new);
+            // Count each frame once per sample, so the number reads as "share of
+            // sampled allocations made underneath this function".
+            ips.sort_unstable();
+            ips.dedup();
+            for ip in ips {
+                *frames.entry(ip).or_insert(0) += 1;
+            }
+            sampling.set(false);
+        });
+    }
+
+    /// Print the functions that appear most often across sampled allocations.
+    pub fn report(top: usize) {
+        let frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(frames) = frames.as_ref() else {
+            return;
+        };
+        // Samples, not frame hits: the most-hit frame is the allocator entry,
+        // which every sample passes through.
+        let total = frames.values().copied().max().unwrap_or(0);
+        if total == 0 {
+            return;
+        }
+
+        // Resolve once, then fold the per-address counts into per-function ones
+        // (a function inlined or spread over several addresses is one entry).
+        let mut by_name: HashMap<String, u64> = HashMap::new();
+        for (&ip, &count) in frames {
+            backtrace::resolve(ip as *mut _, |symbol| {
+                let Some(name) = symbol.name() else { return };
+                let name = name.to_string();
+                // Strip the trailing hash rustc appends to monomorphized names.
+                let name = name
+                    .rsplit_once("::h")
+                    .filter(|(_, hash)| hash.len() == 16)
+                    .map_or(name.as_str(), |(head, _)| head)
+                    .to_string();
+                *by_name.entry(name).or_insert(0) += count;
+            });
+        }
+
+        let mut rows: Vec<_> = by_name
+            .into_iter()
+            .filter(|(name, _)| {
+                !name.starts_with("core::")
+                    && !name.starts_with("alloc::")
+                    && !name.starts_with("std::")
+                    && !name.contains("hashbrown")
+                    && !name.contains("mi_")
+                    && !name.contains("CountingMiMalloc")
+                    && !name.contains("alloc_sample")
+            })
+            .collect();
+        rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        eprintln!("\n=== sampled allocation frames ({total} samples) ===");
+        eprintln!("share of sampled allocations made underneath each function:");
+        for (name, count) in rows.into_iter().take(top) {
+            eprintln!("{:>6.2}%  {name}", (count as f64 / total as f64) * 100.0);
+        }
+    }
+}
+
+unsafe impl GlobalAlloc for CountingMiMalloc {
+    unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+        glua_code_analysis::profile::record_alloc(layout.size());
+        alloc_sample::maybe_sample();
+        unsafe { MiMalloc.alloc(layout) }
+    }
+
+    unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+        unsafe { MiMalloc.dealloc(ptr, layout) }
+    }
+
+    unsafe fn alloc_zeroed(&self, layout: Layout) -> *mut u8 {
+        glua_code_analysis::profile::record_alloc(layout.size());
+        unsafe { MiMalloc.alloc_zeroed(layout) }
+    }
+
+    unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+        glua_code_analysis::profile::record_alloc(new_size);
+        unsafe { MiMalloc.realloc(ptr, layout, new_size) }
+    }
+}
 
 #[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
+static GLOBAL: CountingMiMalloc = CountingMiMalloc;
 
 use std::collections::{BTreeMap, BTreeSet, HashSet};
 use std::path::{Path, PathBuf};
@@ -1074,6 +1251,7 @@ fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[S
 }
 
 fn main() {
+    alloc_sample::init();
     let codebase =
         PathBuf::from(std::env::var("DET_CODEBASE").expect("DET_CODEBASE env var is required"));
     let annotations = PathBuf::from(
@@ -1307,4 +1485,11 @@ fn main() {
         let split = collect(&split_analysis, "split_batches");
         diff("cold", &cold, "split_batches", &split);
     }
+
+    alloc_sample::report(
+        std::env::var("DET_ALLOC_TOP")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(30),
+    );
 }

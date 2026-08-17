@@ -15,7 +15,7 @@ mod db_index;
 mod diagnostic;
 mod gamemode_base;
 mod library_collision;
-mod profile;
+pub mod profile;
 mod resources;
 mod semantic;
 mod test_lib;

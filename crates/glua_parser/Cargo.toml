@@ -16,5 +16,6 @@ workspace = true
 
 [dependencies]
 rowan.workspace = true
+rustc-hash.workspace = true
 serde.workspace = true
 
