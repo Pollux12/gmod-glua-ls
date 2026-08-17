@@ -11,7 +11,10 @@ use std::time::Duration;
 use crate::{
     FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
     LuaTypeFlag,
-    compilation::analyzer::{AnalysisPipeline, unresolve::resolve::try_resolve_special_call},
+    compilation::analyzer::{
+        AnalysisPipeline, call_site_params::materialize_call_result_consumer,
+        unresolve::resolve::try_resolve_special_call,
+    },
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
     profile::Profile,
 };
@@ -232,8 +235,28 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
 
         // Applied once per pipeline run rather than per resolution: every apply
         // rebuilds the index's whole derived contribution state.
-        db.get_call_site_param_index_mut()
+        let changed_signatures = db
+            .get_call_site_param_index_mut()
             .flush_deferred_contributions();
+        if !changed_signatures.is_empty() {
+            requeue_flushed_call_site_returns(
+                db,
+                context,
+                &mut infer_manager,
+                &mut reason_resolve,
+                &changed_signatures,
+                log_enabled,
+            );
+            // The requeued wave can defer contributions of its own. Applying
+            // them here keeps the queue empty when this pipeline returns, as it
+            // was before the wave existed. Their changed set is deliberately
+            // dropped: acting on it would make the flush re-entrant, and the
+            // returns it would requeue are exactly as stale as they were before
+            // this fix rather than newly wrong.
+            let _ = db
+                .get_call_site_param_index_mut()
+                .flush_deferred_contributions();
+        }
 
         for (reason, unresolves) in reason_resolve {
             context.unresolves.extend(
@@ -253,6 +276,60 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // reuse cached inference results rather than recomputing from scratch
         // when no deferred resolution changed the indexes.
         context.infer_manager = infer_manager;
+    }
+}
+
+/// Re-derives the inferred returns invalidated by the deferred-contribution
+/// flush.
+///
+/// A deferred call-site argument that only resolved in this run changes its
+/// callee's parameter type, which is an input to every return derived from it.
+/// The requeued items are serviced here rather than left in `context.unresolves`
+/// because no later wave is guaranteed to run, and a requeued signature parked
+/// at `SignatureReturnStatus::UnResolve` is worse than the stale answer.
+fn requeue_flushed_call_site_returns(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    infer_manager: &mut InferCacheManager,
+    reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
+    changed_signatures: &HashSet<LuaSignatureId>,
+    log_enabled: bool,
+) {
+    let consumers = db
+        .get_call_site_param_index()
+        .get_return_consumers(changed_signatures);
+    let consumers = consumers
+        .into_iter()
+        .filter_map(|consumer| materialize_call_result_consumer(db, consumer))
+        .collect();
+    context.requeue_call_site_inferred_returns(db, changed_signatures, consumers);
+
+    let mut requeued: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
+    for (unresolve, reason) in context.unresolves.drain(..) {
+        requeued.entry(reason).or_default().push(unresolve);
+    }
+    if requeued.is_empty() {
+        return;
+    }
+
+    // Pending template decls are index writes rather than cache entries, and
+    // `clear` drops them unmaterialized, so they are drained either side of it
+    // exactly as the main loop drains them around `clear_for_unresolve`.
+    materialize_pending_str_tpl_type_decls(db, infer_manager);
+    // The flush rewrote `inferred_params`, which is an input to every param type
+    // and so to every expression inferred from one. Replaying that memoised
+    // inference here would commit a pre-flush answer. Everything `clear` drops
+    // is derived from the indexes and recomputed on demand; the phase and
+    // dynamic-field visibility live on the manager and survive it.
+    infer_manager.clear();
+
+    let _ = try_resolve(db, infer_manager, &mut requeued, log_enabled);
+    materialize_pending_str_tpl_type_decls(db, infer_manager);
+
+    // Whatever is still unresolved rejoins the retained set, so it leaves this
+    // pipeline through the same path as the main loop's leftovers.
+    for (reason, unresolves) in requeued {
+        reason_resolve.entry(reason).or_default().extend(unresolves);
     }
 }
 

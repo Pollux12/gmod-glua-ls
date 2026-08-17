@@ -1294,7 +1294,7 @@ fn call_assignment_target(
     }
 }
 
-fn materialize_call_result_consumer(
+pub(crate) fn materialize_call_result_consumer(
     db: &DbIndex,
     consumer: CallSiteReturnConsumer,
 ) -> Option<(

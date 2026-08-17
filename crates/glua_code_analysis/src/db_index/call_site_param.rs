@@ -198,19 +198,11 @@ impl CallSiteParamIndex {
                 .iter()
                 .map(|(signature_id, param_idx, _)| (*signature_id, *param_idx))
         }));
-        affected_params.extend(self.pending_previous_params.keys().copied());
-        let mut previous = std::mem::take(&mut self.pending_previous_params)
+        let parked = std::mem::take(&mut self.pending_previous_params)
             .into_iter()
             .map(|(key, fact)| (key, Some(fact)))
             .collect::<HashMap<_, _>>();
-        for (signature_id, param_idx) in &affected_params {
-            previous
-                .entry((*signature_id, *param_idx))
-                .or_insert_with(|| {
-                    self.get_inferred_param_fact(signature_id, *param_idx)
-                        .cloned()
-                });
-        }
+        let previous = self.snapshot_param_facts(affected_params, parked);
 
         for (file_id, contributions) in updates {
             self.file_contributions.insert(
@@ -229,13 +221,35 @@ impl CallSiteParamIndex {
         }
         self.rebuild_derived_state();
 
-        affected_params
+        self.changed_signatures(previous)
+    }
+
+    /// The inferred fact each affected param currently holds, keeping whatever
+    /// `parked` already recorded for params a removal has since dropped.
+    fn snapshot_param_facts(
+        &self,
+        affected: HashSet<(LuaSignatureId, usize)>,
+        mut parked: HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>>,
+    ) -> HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>> {
+        for (signature_id, param_idx) in affected {
+            parked.entry((signature_id, param_idx)).or_insert_with(|| {
+                self.get_inferred_param_fact(&signature_id, param_idx)
+                    .cloned()
+            });
+        }
+        parked
+    }
+
+    /// The signatures whose inferred param facts differ from `previous`.
+    fn changed_signatures(
+        &self,
+        previous: HashMap<(LuaSignatureId, usize), Option<LuaTypeFact>>,
+    ) -> HashSet<LuaSignatureId> {
+        previous
             .into_iter()
-            .filter_map(|(signature_id, param_idx)| {
-                let current = self
-                    .get_inferred_param_fact(&signature_id, param_idx)
-                    .cloned();
-                (previous.get(&(signature_id, param_idx)) != Some(&current)).then_some(signature_id)
+            .filter_map(|((signature_id, param_idx), previous_fact)| {
+                let current = self.get_inferred_param_fact(&signature_id, param_idx);
+                (previous_fact.as_ref() != current).then_some(signature_id)
             })
             .collect()
     }
@@ -259,12 +273,19 @@ impl CallSiteParamIndex {
     }
 
     /// Apply every queued deferred contribution and rebuild derived state once.
-    pub(crate) fn flush_deferred_contributions(&mut self) -> usize {
+    ///
+    /// Returns the signatures whose inferred params actually changed, so the
+    /// caller can requeue the returns and consumers derived from them.
+    pub(crate) fn flush_deferred_contributions(&mut self) -> HashSet<LuaSignatureId> {
         if self.deferred_contributions.is_empty() {
-            return 0;
+            return HashSet::new();
         }
         let queued = std::mem::take(&mut self.deferred_contributions);
-        let count = queued.len();
+        let affected = queued
+            .iter()
+            .map(|(_, contribution)| (contribution.signature_id, contribution.param_idx))
+            .collect();
+        let previous = self.snapshot_param_facts(affected, HashMap::new());
         for (file_id, contribution) in queued {
             self.file_contributions
                 .entry(file_id)
@@ -272,7 +293,7 @@ impl CallSiteParamIndex {
                 .push(contribution);
         }
         self.rebuild_derived_state();
-        count
+        self.changed_signatures(previous)
     }
 
     /// The inferred parameter facts of every signature that `file_ids`
@@ -821,6 +842,40 @@ mod tests {
         let changed = index.set_files_fact_contributions(vec![(source_file, Vec::new())]);
 
         assert_eq!(changed, HashSet::from([signature_id]));
+    }
+
+    #[test]
+    fn flushing_a_deferred_contribution_reports_its_signature_as_changed() {
+        let source_file = FileId::new(1);
+        let signature_id = signature_id(FileId::new(2), 10);
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(
+            source_file,
+            vec![(signature_id, 0, LuaType::String)],
+        )]);
+
+        index.queue_deferred_contribution(
+            source_file,
+            signature_id,
+            0,
+            LuaTypeFact::certain(LuaType::Boolean),
+        );
+
+        assert_eq!(
+            index.flush_deferred_contributions(),
+            HashSet::from([signature_id])
+        );
+        assert_eq!(
+            inferred_union_members(&index, &signature_id),
+            vec![LuaType::Boolean, LuaType::String]
+        );
+    }
+
+    #[test]
+    fn flushing_an_empty_queue_reports_no_changed_signatures() {
+        let mut index = CallSiteParamIndex::new();
+
+        assert!(index.flush_deferred_contributions().is_empty());
     }
 
     #[test]
