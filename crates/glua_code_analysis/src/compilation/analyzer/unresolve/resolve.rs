@@ -666,31 +666,32 @@ pub fn try_resolve_iter_var(
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
-        // A raw template ref is a placeholder left by an unbound generic, never a
-        // valid fact, so a real type replaces it. Anything else keeps insert-only
-        // precedence.
         let owner: LuaTypeOwner = decl_id.into();
-        let mode = if !ret_type.contain_tpl()
-            && (iter_var_holds_tpl_placeholder(db, unresolve_iter_var, idx)
-                || settled_union_widens_cache(db, &owner, &ret_type))
-        {
-            TypeCacheWriteMode::ForceOverwrite
-        } else {
-            TypeCacheWriteMode::InsertOnly
-        };
+        let mode = iter_var_write_mode(db.get_type_index().get_type_cache(&owner), &ret_type);
         write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
     }
     Ok(())
 }
 
-/// Whether the settled type is a union that already contains everything the
-/// cache holds, plus more.
-fn settled_union_widens_cache(db: &DbIndex, owner: &LuaTypeOwner, settled: &LuaType) -> bool {
-    db.get_type_index()
-        .get_type_cache(owner)
-        .is_some_and(|cached| {
-            crate::compilation::analyzer::union_widens_cached_type(settled, cached.as_type())
-        })
+/// The write mode for a settled iterator-variable type.
+///
+/// A raw template ref is a placeholder left by an unbound generic, never a valid
+/// fact, so a real type replaces it, as does a settled union that already
+/// contains everything the cache holds. A documented type is an authority
+/// decision — `---@param` is legal on a `for ... in` variable — so it is never
+/// overwritten; anything else keeps insert-only precedence.
+fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> TypeCacheWriteMode {
+    let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
+        return TypeCacheWriteMode::InsertOnly;
+    };
+    if !settled.contain_tpl()
+        && (cached.as_type().contain_tpl()
+            || crate::compilation::analyzer::union_widens_cached_type(settled, cached.as_type()))
+    {
+        TypeCacheWriteMode::ForceOverwrite
+    } else {
+        TypeCacheWriteMode::InsertOnly
+    }
 }
 
 /// Whether the iterator var at `idx` still caches a raw template ref, the
@@ -2507,12 +2508,12 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::{
-        find_str_tpl_ref, get_operator_id_priority_tiers, local_cached_type_is_informative,
-        select_operator_ids_by_workspace_and_realm,
+        TypeCacheWriteMode, find_str_tpl_ref, get_operator_id_priority_tiers, iter_var_write_mode,
+        local_cached_type_is_informative, select_operator_ids_by_workspace_and_realm,
     };
     use crate::{
         DbIndex, FileId, GenericTplId, GmodRealm, GmodRealmFileMetadata, InFiled, LuaOperator,
-        LuaOperatorMetaMethod, LuaOperatorOwner, LuaType, LuaTypeDeclId, WorkspaceId,
+        LuaOperatorMetaMethod, LuaOperatorOwner, LuaType, LuaTypeCache, LuaTypeDeclId, WorkspaceId,
         db_index::{
             AsyncState, LuaFunctionType, LuaStringTplType, LuaUnionType, OperatorFunction,
             WorkspaceKind,
@@ -2588,6 +2589,64 @@ mod tests {
         );
 
         assert!(!local_cached_type_is_informative(&typ));
+    }
+
+    fn widening_union() -> LuaType {
+        LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+            LuaType::String,
+            LuaType::Integer,
+        ])))
+    }
+
+    fn tpl_placeholder() -> LuaType {
+        LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+            "",
+            "T",
+            GenericTplId::Func(0),
+            "",
+            None,
+        )))
+    }
+
+    #[test]
+    fn iter_var_doc_type_survives_a_settled_widening() {
+        // `---@param v string` is legal on a `for ... in` variable.
+        let cached = LuaTypeCache::DocType(LuaType::String);
+
+        assert_eq!(
+            iter_var_write_mode(Some(&cached), &widening_union()),
+            TypeCacheWriteMode::InsertOnly
+        );
+    }
+
+    #[test]
+    fn iter_var_doc_template_placeholder_survives_a_settled_type() {
+        let cached = LuaTypeCache::DocType(tpl_placeholder());
+
+        assert_eq!(
+            iter_var_write_mode(Some(&cached), &LuaType::String),
+            TypeCacheWriteMode::InsertOnly
+        );
+    }
+
+    #[test]
+    fn iter_var_inferred_type_is_replaced_by_a_settled_widening() {
+        let cached = LuaTypeCache::InferType(LuaType::String);
+
+        assert_eq!(
+            iter_var_write_mode(Some(&cached), &widening_union()),
+            TypeCacheWriteMode::ForceOverwrite
+        );
+    }
+
+    #[test]
+    fn iter_var_inferred_template_placeholder_is_replaced_by_a_settled_type() {
+        let cached = LuaTypeCache::InferType(tpl_placeholder());
+
+        assert_eq!(
+            iter_var_write_mode(Some(&cached), &LuaType::String),
+            TypeCacheWriteMode::ForceOverwrite
+        );
     }
 
     #[test]
