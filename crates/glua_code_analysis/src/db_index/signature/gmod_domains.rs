@@ -601,25 +601,37 @@ pub fn rebuild_effective_valid_guard_signatures(db: &mut DbIndex) {
         }
     }
 
-    for file_id in db.get_vfs().get_all_file_ids() {
-        let member_ids = db
-            .get_member_index()
-            .get_file_members(file_id)
-            .into_iter()
-            .map(|member| member.get_id())
-            .collect::<Vec<_>>();
-        for member_id in member_ids {
-            let semantic_decl = LuaSemanticDeclId::from(member_id);
-            let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
-                continue;
-            };
-            if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
-                && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
-            {
-                effective_signatures.push((signature_id, state_mask));
+    // The per-file member scan is read-only against `&DbIndex` and runs over
+    // every file in the workspace on every edit, so it is derived across files
+    // in parallel. Results are flattened in file order, so the marked set is
+    // identical to the previous sequential scan.
+    let all_file_ids = db.get_vfs().get_all_file_ids();
+    let per_file = crate::compilation::analyzer::parallel::map_files_collect(
+        db,
+        &all_file_ids,
+        |db, file_id| {
+            let mut found = Vec::new();
+            let member_ids = db
+                .get_member_index()
+                .get_file_members(file_id)
+                .into_iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>();
+            for member_id in member_ids {
+                let semantic_decl = LuaSemanticDeclId::from(member_id);
+                let Some(signature_id) = signature_id_for_semantic_decl(db, &semantic_decl) else {
+                    continue;
+                };
+                if let Some(state_mask) = member_identity_direct_valid_guard_mask(db, member_id)
+                    && state_mask.is_compatible_with(signature_realm_mask(db, signature_id))
+                {
+                    found.push((signature_id, state_mask));
+                }
             }
-        }
-    }
+            found
+        },
+    );
+    effective_signatures.extend(per_file.into_iter().flatten());
 
     let signature_index = db.get_signature_index_mut();
     for (signature_id, state_mask) in effective_signatures {

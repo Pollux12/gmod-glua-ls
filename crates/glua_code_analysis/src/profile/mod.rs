@@ -29,6 +29,39 @@ pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Scoped form of [`phase`], for regions that span too many locals to wrap in a
+/// closure. Accumulates from construction until drop.
+pub struct PhaseGuard {
+    name: &'static str,
+    start: Option<Instant>,
+}
+
+impl PhaseGuard {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: phase_enabled().then(Instant::now),
+        }
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        match phases.iter_mut().find(|(phase, _, _)| *phase == self.name) {
+            Some((_, total, count)) => {
+                *total += elapsed;
+                *count += 1;
+            }
+            None => phases.push((self.name, elapsed, 1)),
+        }
+    }
+}
+
 /// Print and clear the accumulated sub-phase table.
 pub fn phase_report(label: &str) {
     if !phase_enabled() {
