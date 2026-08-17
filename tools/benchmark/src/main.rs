@@ -5,9 +5,75 @@ static GLOBAL: dhat::Alloc = dhat::Alloc;
 #[cfg(not(feature = "dhat-heap"))]
 use mimalloc::MiMalloc;
 
-#[cfg(not(feature = "dhat-heap"))]
+/// Report allocator counters for the phase just finished (no-op without
+/// `--features alloc-stats`).
+macro_rules! alloc_report {
+    ($label:expr, $prev:expr) => {
+        #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+        {
+            $prev = alloc_stats::report($label, $prev);
+            let _ = &$prev;
+        }
+    };
+}
+
+#[cfg(all(not(feature = "dhat-heap"), not(feature = "alloc-stats")))]
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
+
+/// Counting wrapper over mimalloc. dhat is unusable here — its per-allocation
+/// backtrace capture costs ~150x on Windows — so `--features alloc-stats`
+/// buys allocation counts, bytes and live-peak for a couple of atomics.
+#[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+mod alloc_stats {
+    use std::alloc::{GlobalAlloc, Layout};
+    use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering::Relaxed};
+
+    pub static ALLOCS: AtomicU64 = AtomicU64::new(0);
+    pub static BYTES: AtomicU64 = AtomicU64::new(0);
+    pub static LIVE: AtomicUsize = AtomicUsize::new(0);
+    pub static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+    pub struct Counting(pub super::MiMalloc);
+
+    unsafe impl GlobalAlloc for Counting {
+        unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(layout.size() as u64, Relaxed);
+            let live = LIVE.fetch_add(layout.size(), Relaxed) + layout.size();
+            PEAK.fetch_max(live, Relaxed);
+            unsafe { self.0.alloc(layout) }
+        }
+        unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
+            LIVE.fetch_sub(layout.size(), Relaxed);
+            unsafe { self.0.dealloc(ptr, layout) }
+        }
+        unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
+            ALLOCS.fetch_add(1, Relaxed);
+            BYTES.fetch_add(new_size as u64, Relaxed);
+            let live = LIVE.fetch_add(new_size.saturating_sub(layout.size()), Relaxed) + new_size;
+            PEAK.fetch_max(live, Relaxed);
+            unsafe { self.0.realloc(ptr, layout, new_size) }
+        }
+    }
+
+    /// Snapshot counters, returning (allocs, bytes, live, peak) deltas since `prev`.
+    pub fn report(label: &str, prev: (u64, u64)) -> (u64, u64) {
+        let (a, b) = (ALLOCS.load(Relaxed), BYTES.load(Relaxed));
+        eprintln!(
+            "  [alloc] {label:<24} {:>12} allocations  {:>9.2} GiB allocated  live {:>7.1} MiB  peak {:>7.1} MiB",
+            a - prev.0,
+            (b - prev.1) as f64 / (1 << 30) as f64,
+            LIVE.load(Relaxed) as f64 / (1 << 20) as f64,
+            PEAK.load(Relaxed) as f64 / (1 << 20) as f64,
+        );
+        (a, b)
+    }
+}
+
+#[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
+#[global_allocator]
+static GLOBAL: alloc_stats::Counting = alloc_stats::Counting(MiMalloc);
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -57,6 +123,79 @@ struct BenchmarkResult {
     duration: std::time::Duration,
 }
 
+/// Process start, so incremental edits can be located on a sampling profiler's
+/// timeline (`t+Ns` landmarks in the log).
+static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+/// Edit each sampled file (append a comment, so the token-identity no-op gate
+/// does not skip the work), timing the full production keystroke cost: reindex
+/// of the file plus its dependency expansion, then the post-edit diagnostics
+/// pass. Restores the original text after each edit. Returns the worst edit.
+fn run_incremental_edits(
+    analysis: &mut EmmyLuaAnalysis,
+    sample: Vec<(FileId, usize)>,
+) -> Option<std::time::Duration> {
+    let mut total = std::time::Duration::ZERO;
+    let mut worst = std::time::Duration::ZERO;
+    let mut edited = 0usize;
+    for (file_id, expansion) in sample {
+        let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
+            continue;
+        };
+        let Some(text) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        let name = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_path(&file_id)
+            .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+            .unwrap_or_else(|| format!("{file_id:?}"));
+        let edited_text = format!("{text}\n-- bench incremental edit\n");
+        eprintln!(
+            "  [incremental] BEGIN {name} at t+{:.3}s",
+            PROCESS_START
+                .get()
+                .map_or(0.0, |s| s.elapsed().as_secs_f64())
+        );
+        let t = Instant::now();
+        analysis.update_file_by_uri(&uri, Some(edited_text));
+        let reindex = t.elapsed();
+        let t = Instant::now();
+        let shared = analysis.precompute_diagnostic_shared_data();
+        analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
+        let diagnostics = t.elapsed();
+        let elapsed = reindex + diagnostics;
+        total += elapsed;
+        worst = worst.max(elapsed);
+        edited += 1;
+        eprintln!(
+            "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
+            elapsed.as_secs_f64(),
+            reindex.as_secs_f64(),
+            diagnostics.as_secs_f64()
+        );
+        analysis.update_file_by_uri(&uri, Some(text));
+    }
+    if edited == 0 {
+        return None;
+    }
+    eprintln!(
+        "  [incremental] {} edits, avg {:.3}s, worst {:.3}s",
+        edited,
+        total.as_secs_f64() / edited as f64,
+        worst.as_secs_f64()
+    );
+    Some(worst)
+}
+
 fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     let gluarc = root.join(".gluarc.json");
     if gluarc.exists() {
@@ -74,6 +213,9 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
 
 #[tokio::main]
 async fn main() {
+    let _ = PROCESS_START.set(Instant::now());
+    #[allow(unused_mut, unused_assignments, unused_variables)]
+    let mut alloc_mark = (0u64, 0u64);
     setup_logger();
 
     let large_codebase = std::env::var("BENCH_CODEBASE").unwrap_or_else(|_| {
@@ -186,11 +328,15 @@ async fn main() {
     // Phase 4: Indexing (update_files_by_path runs parsing + full analysis pipeline)
     let t = Instant::now();
     #[cfg(feature = "dhat-heap")]
-    let dhat_profiler = dhat::Profiler::new_heap();
+    let dhat_profiler = dhat::Profiler::builder()
+        .file_name("dhat-index.json")
+        .trim_backtraces(Some(24))
+        .build();
     analysis.update_files_by_path(files);
     #[cfg(feature = "dhat-heap")]
     drop(dhat_profiler);
     let indexing_duration = t.elapsed();
+    alloc_report!("indexing", alloc_mark);
     results.push(BenchmarkResult {
         phase: "indexing (total)".into(),
         duration: indexing_duration,
@@ -209,96 +355,72 @@ async fn main() {
             .get_db()
             .get_module_index()
             .get_main_workspace_file_ids();
-        let t_rank = Instant::now();
-        let mut ranked: Vec<(FileId, usize)> = main_ids
-            .iter()
-            .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
-            .collect();
-        ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
-        eprintln!(
-            "  [incremental] ranked {} files by reindex expansion in {:.3}s",
-            ranked.len(),
-            t_rank.elapsed().as_secs_f64()
-        );
-
-        // Top-3 hubs (worst ripple), the median file, and the largest file
-        // by bytes (worst parse).
-        let mut sample: Vec<(FileId, usize)> = ranked.iter().take(3).copied().collect();
-        for extra in [
-            ranked.get(ranked.len() / 2).copied(),
-            main_ids
+        // `BENCH_EDIT_TARGETS=a.lua,b.lua` edits exactly those files and skips
+        // the ranking pass, which costs ~27s and swamps a CPU profile.
+        let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
+        if let Some(targets) = &explicit_targets {
+            let wanted: Vec<&str> = targets.split(',').map(str::trim).collect();
+            let sample: Vec<(FileId, usize)> = main_ids
                 .iter()
-                .max_by_key(|id| {
+                .filter(|id| {
                     analysis
                         .compilation
                         .get_db()
                         .get_vfs()
-                        .get_file_content(id)
-                        .map_or(0, |text| text.len())
+                        .get_file_path(id)
+                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
+                        .is_some_and(|name| wanted.iter().any(|w| name == *w))
                 })
-                .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
-        ]
-        .into_iter()
-        .flatten()
-        {
-            if !sample.iter().any(|(id, _)| *id == extra.0) {
-                sample.push(extra);
-            }
-        }
+                .map(|id| (*id, 0))
+                .collect();
+            #[cfg(feature = "dhat-heap")]
+            let dhat_edit = dhat::Profiler::builder()
+                .file_name("dhat-edit.json")
+                .trim_backtraces(Some(24))
+                .build();
+            incremental_worst = run_incremental_edits(&mut analysis, sample);
+            alloc_report!("incremental edits", alloc_mark);
+            #[cfg(feature = "dhat-heap")]
+            drop(dhat_edit);
+        } else {
+            let t_rank = Instant::now();
+            let mut ranked: Vec<(FileId, usize)> = main_ids
+                .iter()
+                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
+                .collect();
+            ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            eprintln!(
+                "  [incremental] ranked {} files by reindex expansion in {:.3}s",
+                ranked.len(),
+                t_rank.elapsed().as_secs_f64()
+            );
 
-        let mut total = std::time::Duration::ZERO;
-        let mut worst = std::time::Duration::ZERO;
-        let mut edited = 0usize;
-        for (file_id, expansion) in sample {
-            let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
-                continue;
-            };
-            let Some(text) = analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_content(&file_id)
-                .cloned()
-            else {
-                continue;
-            };
-            let name = analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_path(&file_id)
-                .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                .unwrap_or_else(|| format!("{file_id:?}"));
-            // Append a comment: defeats the token-identity no-op gate, so the
-            // full production edit path (expansion + remove + rebuild) runs.
-            let edited_text = format!("{text}\n-- bench incremental edit\n");
-            let t = Instant::now();
-            analysis.update_file_by_uri(&uri, Some(edited_text));
-            let reindex = t.elapsed();
-            let t = Instant::now();
-            let shared = analysis.precompute_diagnostic_shared_data();
-            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
-            let diagnostics = t.elapsed();
-            let elapsed = reindex + diagnostics;
-            total += elapsed;
-            worst = worst.max(elapsed);
-            edited += 1;
-            eprintln!(
-                "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
-                elapsed.as_secs_f64(),
-                reindex.as_secs_f64(),
-                diagnostics.as_secs_f64()
-            );
-            analysis.update_file_by_uri(&uri, Some(text));
-        }
-        if edited > 0 {
-            eprintln!(
-                "  [incremental] {} edits, avg {:.3}s, worst {:.3}s",
-                edited,
-                total.as_secs_f64() / edited as f64,
-                worst.as_secs_f64()
-            );
-            incremental_worst = Some(worst);
+            // Top-3 hubs (worst ripple), the median file, and the largest file
+            // by bytes (worst parse).
+            let mut sample: Vec<(FileId, usize)> = ranked.iter().take(3).copied().collect();
+            for extra in [
+                ranked.get(ranked.len() / 2).copied(),
+                main_ids
+                    .iter()
+                    .max_by_key(|id| {
+                        analysis
+                            .compilation
+                            .get_db()
+                            .get_vfs()
+                            .get_file_content(id)
+                            .map_or(0, |text| text.len())
+                    })
+                    .and_then(|id| ranked.iter().find(|(f, _)| f == id).copied()),
+            ]
+            .into_iter()
+            .flatten()
+            {
+                if !sample.iter().any(|(id, _)| *id == extra.0) {
+                    sample.push(extra);
+                }
+            }
+
+            incremental_worst = run_incremental_edits(&mut analysis, sample);
         }
     }
 
@@ -398,6 +520,7 @@ async fn main() {
     let infos = info_count.load(std::sync::atomic::Ordering::Relaxed);
     let hints = hint_count.load(std::sync::atomic::Ordering::Relaxed);
     let diagnostics_duration = t.elapsed();
+    alloc_report!("diagnostics", alloc_mark);
     results.push(BenchmarkResult {
         phase: format!(
             "diagnostics ({} files, {} issues)",
