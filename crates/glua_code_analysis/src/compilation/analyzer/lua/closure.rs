@@ -21,6 +21,35 @@ use crate::{
 
 use super::{LuaAnalyzer, LuaReturnPoint, func_body::analyze_func_body_returns};
 
+/// The closure's own `return` statements — those not belonging to a closure
+/// nested inside it.
+///
+/// Several of the analyses below need exactly this set, and each derived it
+/// separately: a full walk of the block, plus an ancestor walk for every return
+/// statement found. It is a pure function of the closure, so derive it once.
+fn closure_own_return_stats(
+    analyzer: &mut LuaAnalyzer,
+    closure: &LuaClosureExpr,
+    block: &LuaBlock,
+) -> std::rc::Rc<Vec<LuaReturnStat>> {
+    let key = closure.get_syntax_id();
+    if let Some(cached) = analyzer.closure_own_returns_cache.get(&key) {
+        return cached.clone();
+    }
+    let returns = std::rc::Rc::new(
+        block
+            .descendants::<LuaReturnStat>()
+            .filter(|return_stat| {
+                return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
+            })
+            .collect::<Vec<_>>(),
+    );
+    analyzer
+        .closure_own_returns_cache
+        .insert(key, returns.clone());
+    returns
+}
+
 pub fn analyze_closure(analyzer: &mut LuaAnalyzer, closure: LuaClosureExpr) -> Option<()> {
     let signature_id = LuaSignatureId::from_closure(analyzer.file_id, &closure);
 
@@ -58,13 +87,7 @@ fn analyze_direct_param_return_alias(
     // unshadowed and unassigned parameter, with no nested closure that could
     // capture and replace it before the return executes.
     if block.descendants::<LuaClosureExpr>().next().is_some()
-        || block
-            .descendants::<LuaReturnStat>()
-            .filter(|returned| {
-                returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
-            })
-            .count()
-            != 1
+        || closure_own_return_stats(analyzer, closure, &block).len() != 1
     {
         return Some(());
     }
@@ -154,12 +177,7 @@ fn analyze_class_name_param_return_alias(
     }
 
     let block = closure.get_block()?;
-    if block
-        .descendants::<LuaReturnStat>()
-        .filter(|returned| returned.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure))
-        .count()
-        != 1
-    {
+    if closure_own_return_stats(analyzer, closure, &block).len() != 1 {
         return Some(());
     }
     let LuaStat::ReturnStat(return_stat) = block.get_stats().last()? else {
@@ -641,12 +659,7 @@ fn falsy_param_nil_free_return_slot(
         return None;
     }
 
-    let return_stats = block
-        .descendants::<LuaReturnStat>()
-        .filter(|return_stat| {
-            return_stat.ancestors::<LuaClosureExpr>().next().as_ref() == Some(closure)
-        })
-        .collect::<Vec<_>>();
+    let return_stats = closure_own_return_stats(analyzer, closure, block);
     let reachable_returns = return_stats
         .iter()
         .filter(|return_stat| !return_is_inside_stat(return_stat, if_stat))
@@ -981,11 +994,8 @@ fn non_guard_returns_are_proven_non_nil(
     guard_return_ranges: &[TextRange],
 ) -> bool {
     let mut saw_non_guard_return = false;
-    let return_stats = block.descendants::<LuaReturnStat>().collect::<Vec<_>>();
-    for return_stat in return_stats {
-        if return_stat.ancestors::<LuaClosureExpr>().next().as_ref() != Some(closure) {
-            continue;
-        }
+    let return_stats = closure_own_return_stats(analyzer, closure, block);
+    for return_stat in return_stats.iter() {
         if guard_return_ranges.contains(&return_stat.get_range()) {
             continue;
         }

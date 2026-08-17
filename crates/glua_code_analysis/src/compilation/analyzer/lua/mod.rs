@@ -414,6 +414,11 @@ struct LuaAnalyzer<'a> {
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
     literal_index_member_owner_cache: FxHashMap<smol_str::SmolStr, LuaMemberOwner>,
+    /// A closure's own `return` statements — those not inside a closure nested
+    /// within it. Five separate analyses derived this per closure, each walking
+    /// the whole block and then walking ancestors once per return found.
+    closure_own_returns_cache:
+        FxHashMap<glua_parser::LuaSyntaxId, std::rc::Rc<Vec<glua_parser::LuaReturnStat>>>,
 }
 
 impl LuaAnalyzer<'_> {
@@ -438,6 +443,7 @@ impl LuaAnalyzer<'_> {
             guarded_table_assignment_type_cache: FxHashMap::default(),
             direct_local_table_member_owner_cache: FxHashMap::default(),
             literal_index_member_owner_cache: FxHashMap::default(),
+            closure_own_returns_cache: FxHashMap::default(),
         }
     }
 
