@@ -4,12 +4,10 @@ use glua_parser::{
 };
 
 use crate::{
-    DbIndex, GlobalId, InferFailReason, LuaDeclId, LuaDeclOrMemberId, LuaInferCache,
-    LuaInstanceType, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId,
+    DbIndex, GlobalId, InferFailReason, LuaDeclId, LuaInferCache, LuaInstanceType, LuaMemberId,
+    LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
-        infer::find_self_decl_or_member_id,
         member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
         semantic_info::resolve_global_decl_id,
     },
@@ -241,11 +239,8 @@ fn infer_self_semantic_decl(
     cache: &mut LuaInferCache,
     name_expr: LuaNameExpr,
 ) -> Option<LuaSemanticDeclId> {
-    let id = find_self_decl_or_member_id(db, cache, &name_expr)?;
-    match id {
-        LuaDeclOrMemberId::Decl(decl_id) => Some(LuaSemanticDeclId::LuaDecl(decl_id)),
-        LuaDeclOrMemberId::Member(member_id) => Some(LuaSemanticDeclId::Member(member_id)),
-    }
+    let self_ref_id = super::super::infer::find_self_ref_id(db, cache, &name_expr)?;
+    Some(LuaSemanticDeclId::LuaDecl(self_ref_id.self_decl_id))
 }
 
 fn infer_index_expr_semantic_decl(

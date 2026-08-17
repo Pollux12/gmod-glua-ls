@@ -2589,11 +2589,7 @@ fn find_self_receiver_id(
             }
 
             if name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name).is_some() {
-                let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
-                return db
-                    .get_member_index()
-                    .get_member(&member_id)
-                    .map(|_| LuaDeclOrMemberId::Member(member_id));
+                return Some(LuaDeclOrMemberId::Decl(self_decl.get_id()));
             }
 
             let id = resolve_global_decl_id(db, cache, &name, Some(&prefix_name))?;
@@ -2615,19 +2611,6 @@ fn find_self_receiver_id(
         }
         _ => None,
     }
-}
-
-/// Resolves only the receiver owner of a `self` expression (decl or member).
-///
-/// Retained for callers that need the receiver owner (member/base lookup,
-/// unresolved-reference rewriting) and do not care about the per-method `self`
-/// identity.
-pub fn find_self_decl_or_member_id(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaDeclOrMemberId> {
-    Some(find_self_ref_id(db, cache, name_expr)?.receiver)
 }
 
 /// Returns true if the type contains an unresolved `SelfInfer`.
