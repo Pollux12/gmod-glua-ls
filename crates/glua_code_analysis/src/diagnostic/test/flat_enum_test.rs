@@ -59,6 +59,70 @@ mod tests {
     }
 
     #[test]
+    fn a_numeric_base_keeps_plain_numbers_assignable() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            MASK_SOLID = 1
+            MASK_SHOT = 2
+
+            ---@enum MASK : number
+            ---| MASK_SOLID # Solid
+            ---| MASK_SHOT # Shot
+
+            ---@param mask MASK
+            function SetMask(mask) end
+
+            ---@type number
+            local combined
+            SetMask(combined)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_numeric_base_keeps_the_enum_assignable_to_a_number() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            MASK_SOLID = 1
+
+            ---@enum MASK : number
+            ---| MASK_SOLID # Solid
+
+            ---@param n number
+            function TakesNumber(n) end
+
+            ---@type MASK
+            local mask
+            TakesNumber(mask)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn a_numeric_base_allows_a_comparison_against_an_unlisted_value() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(ws.check_code_for(
+            DiagnosticCode::EnumValueMismatch,
+            r#"
+            LEVEL_LOW = 1
+
+            ---@enum LEVEL : number
+            ---| LEVEL_LOW # Low
+
+            ---@type LEVEL
+            local level
+
+            if level == 999 then
+            end
+            "#,
+        ));
+    }
+
+    #[test]
     fn flat_enum_reports_a_comparison_against_an_unlisted_value() {
         let mut ws = VirtualWorkspace::new();
         assert!(!ws.check_code_for(

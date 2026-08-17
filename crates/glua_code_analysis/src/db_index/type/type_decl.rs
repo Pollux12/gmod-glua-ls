@@ -186,6 +186,16 @@ impl LuaTypeDecl {
         }
     }
 
+    /// The declared base type of `---@enum X : T`. Values of the enum are `T`,
+    /// of which the members are the named ones, so `T` stays assignable both
+    /// ways: Garry's Mod code combines numeric enums bitwise.
+    pub fn get_enum_base(&self) -> Option<&LuaType> {
+        match &self.extra {
+            LuaTypeExtra::Enum { base, .. } => base.as_ref(),
+            _ => None,
+        }
+    }
+
     /// A flat enum lists its constants as `---|` fields naming globals, rather
     /// than owning a runtime table. Garry's Mod enums are all of this shape.
     pub fn is_flat_enum(&self) -> bool {
@@ -275,6 +285,10 @@ impl LuaTypeDecl {
         let enum_members = db.get_member_index().get_members(&enum_member_owner)?;
 
         let mut union_types = Vec::new();
+        if let Some(base) = self.get_enum_base() {
+            union_types.push(base.clone());
+        }
+
         if self.is_enum_key() {
             for enum_member in enum_members {
                 let member_key = enum_member.get_key();
