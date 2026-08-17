@@ -1826,7 +1826,9 @@ fn infer_custom_type_member(
 
                         return Ok(dynamic_field.typ);
                     }
-                    Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                    Err(InferFailReason::FieldNotFound)
+                    | Err(InferFailReason::None)
+                    | Err(InferFailReason::RecursiveInfer) => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -1868,13 +1870,7 @@ fn infer_custom_type_member(
         && let Some(super_types) =
             visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
     {
-        let mut saw_recursive = false;
         for super_type in super_types {
-            // Each sibling super is an independent branch of the inheritance DAG,
-            // so it gets its own guard fork. Sharing one guard lets a diamond
-            // (`ENT : ENTITY : Entity` alongside a direct `Entity` super) mark a
-            // type visited in one branch and abort the siblings after it —
-            // dropping the real parent that holds the member.
             let result = infer_member_by_member_key_with_table_guard(
                 db,
                 cache,
@@ -1888,16 +1884,11 @@ fn infer_custom_type_member(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                // A cycle in one branch has not disproved the member; a later
-                // sibling may still hold it. Recursion is transient, so report it
-                // rather than a permanent miss when no sibling answers.
-                Err(InferFailReason::RecursiveInfer) => saw_recursive = true,
-                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
-        }
-        if saw_recursive {
-            return Err(InferFailReason::RecursiveInfer);
         }
     }
 
@@ -2601,18 +2592,14 @@ fn infer_global_path_member(
     resolved
 }
 
-fn global_expr_access_path(
-    db: &DbIndex,
-    file_id: FileId,
-    expr: &LuaExpr,
-) -> Option<smol_str::SmolStr> {
+fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
     if !expr_root_is_global(db, file_id, expr) {
         return None;
     }
 
     match expr {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path().map(Into::into),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().map(Into::into),
         _ => None,
     }
 }
@@ -2865,11 +2852,7 @@ fn infer_member_by_index_custom_type(
         && let Some(super_types) =
             visible_super_types_for_index(db, cache, prefix_type_id, &index_expr)
     {
-        let mut saw_recursive = false;
         for super_type in super_types {
-            // Sibling supers are independent branches of the inheritance DAG and
-            // each gets its own guard fork, for the same reason as the member-key
-            // walk in `infer_custom_type_member`.
             let result = infer_member_by_operator(
                 db,
                 cache,
@@ -2881,16 +2864,11 @@ fn infer_member_by_index_custom_type(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                // A cycle in one branch has not disproved the member; a later
-                // sibling may still hold it. Recursion is transient, so report it
-                // rather than a permanent miss when no sibling answers.
-                Err(InferFailReason::RecursiveInfer) => saw_recursive = true,
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
-        }
-        if saw_recursive {
-            return Err(InferFailReason::RecursiveInfer);
         }
     }
 
@@ -3079,7 +3057,9 @@ fn infer_member_by_index_generic(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
         }

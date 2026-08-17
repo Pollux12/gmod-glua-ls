@@ -678,4 +678,39 @@ mod test {
             "#,
         ));
     }
+
+    /// An unattributable write carries no owner, so it is matched by bare name.
+    /// A declared class does not share that name space: its methods keep their
+    /// arity however many untyped tables elsewhere hold a field called the same.
+    #[test]
+    fn test_class_method_still_reports_despite_unattributable_writers() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Holder = {
+                build = function(self)
+                    self.Think = function(a, b, c) return a, b, c end
+                end,
+            }
+            return Holder
+            "#,
+        );
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            ---@class ThinkerA
+            local A = {}
+            function A:Think(a) return a end
+
+            ---@class ThinkerB
+            local B = {}
+            function B:Think(a) return a end
+
+            A:Think(1, 2)
+            "#,
+        ));
+    }
 }

@@ -4172,14 +4172,247 @@ local EscapeStringMap: {
         Ok(())
     }
 
-    /// `self` inside a scripted-class method must resolve to the class the
-    /// authoring table stands for, the same answer hovering `ENT` gives.
+    #[gtest]
+    fn test_base_glide_car_inherited_method_and_return_hover() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide/sv_input.lua",
+            r#"
+                local getTable = FindMetaTable("Entity").GetTable
+
+                --- Get the action's boolean value from a specific seat.
+                --- @param seatIndex number The seat index
+                --- @param action string The action name
+                --- @param entTbl table|nil Optional cached entity table from GetTable()
+                function ENT:GetInputBool(seatIndex, action, entTbl)
+                    local bools = (entTbl or getTable(self)).inputBools[seatIndex]
+                    return bools and bools[action] or false
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_glide"
+                DEFINE_BASECLASS("base_glide")
+            "#,
+        );
+
+        let (init_content, pos_input) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("base_glide")
+
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local freeLookHeld = self:GetIn<??>putBool(1, "free_look")
+                end
+            "#,
+        )?;
+        let init_file_id = ws.def_file("lua/entities/base_glide_car/init.lua", &init_content);
+
+        let hover_input = extract_hover_markdown(&ws, init_file_id, pos_input);
+        assert!(
+            hover_input.contains("base_glide:GetInputBool"),
+            "hover at call site should show inherited method, got: {hover_input}"
+        );
+        assert!(
+            hover_input.contains("Get the action's boolean value from a specific seat."),
+            "hover should include docstring: {hover_input}"
+        );
+
+        let (ret_content, pos_ret) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("base_glide")
+
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local free<??>LookHeld = self:GetInputBool(1, "free_look")
+                end
+            "#,
+        )?;
+        let ret_file_id = ws.def_file("lua/entities/base_glide_car/init3.lua", &ret_content);
+        let hover_ret = extract_hover_markdown(&ws, ret_file_id, pos_ret);
+        assert!(
+            !hover_ret.contains("unknown"),
+            "return variable should not infer as unknown: {hover_ret}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_real_cityrp_base_glide_car_hover() -> Result<()> {
+        use glua_code_analysis::{WorkspaceFolder, collect_workspace_files};
+
+        let mut analysis = glua_code_analysis::EmmyLuaAnalysis::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+
+        let codebase_path = std::path::PathBuf::from(r"D:\Source\Repos\GitHub\cityrp-vehicle-base");
+        if !codebase_path.exists() {
+            return Ok(());
+        }
+        let annot_path =
+            std::path::PathBuf::from(r"D:\Source\Repos\GitHub\annotations-gmod-glua-ls");
+
+        let mut folders = Vec::new();
+        if annot_path.exists() {
+            analysis.add_library_workspace(annot_path.clone());
+            folders.push(WorkspaceFolder::new(annot_path.clone(), true));
+        }
+
+        analysis.add_main_workspace(codebase_path.clone());
+        folders.push(WorkspaceFolder::new(codebase_path.clone(), false));
+
+        analysis.update_config(std::sync::Arc::new(emmyrc.clone()));
+
+        let collected = collect_workspace_files(&folders, &emmyrc, None, None);
+        let files: Vec<(std::path::PathBuf, Option<String>)> = collected
+            .into_iter()
+            .filter_map(|f| {
+                let path = std::path::PathBuf::from(&f.path);
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, Some(text)))
+            })
+            .collect();
+        analysis.update_files_by_path(files);
+
+        let vfs = analysis.compilation.get_db().get_vfs();
+        let file_id = vfs
+            .get_all_file_ids()
+            .into_iter()
+            .find(|id| {
+                vfs.get_file_path(id).is_some_and(|p| {
+                    p.ends_with("base_glide_car/init.lua")
+                        || p.ends_with(r"base_glide_car\init.lua")
+                })
+            })
+            .expect("base_glide_car/init.lua file_id");
+
+        // Line 781 is index 780 in 0-indexed LSP line coordinates:
+        // "        local freeLookHeld = self:GetInputBool(1, "free_look")"
+        // Col for self: 29
+        // Col for GetInputBool: 35
+        // Col for freeLookHeld: 14
+
+        // 1. Hover on `self` at line 781: must show `self: base_glide_car` (not method `OnSeatInput`)
+        let pos_self = lsp_types::Position::new(780, 29);
+        let hover_self =
+            crate::handlers::hover::hover(&analysis, file_id, pos_self, None).expect("hover self");
+        let HoverContents::Markup(self_markup) = hover_self.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            self_markup.value.contains("self: base_glide_car"),
+            "hover self should show self: base_glide_car, got: {}",
+            self_markup.value
+        );
+        assert!(
+            !self_markup
+                .value
+                .contains("(method) base_glide_car:OnSeatInput"),
+            "hover self must not resolve to the method definition itself: {}",
+            self_markup.value
+        );
+        assert!(
+            self_markup.value.contains("Scripted Entity:")
+                && self_markup.value.contains("base_glide_car"),
+            "hover self should include scripted entity info: {}",
+            self_markup.value
+        );
+
+        // 2. Hover on `GetInputBool` at line 781: must show inherited method `base_glide:GetInputBool`
+        let pos_input = lsp_types::Position::new(780, 35);
+        let hover_input = crate::handlers::hover::hover(&analysis, file_id, pos_input, None)
+            .expect("hover GetInputBool");
+        let HoverContents::Markup(input_markup) = hover_input.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            input_markup
+                .value
+                .contains("GetInputBool(seatIndex: number, action: string, entTbl: table?) -> any"),
+            "hover GetInputBool should show signature with return type, got: {}",
+            input_markup.value
+        );
+        assert!(
+            input_markup
+                .value
+                .contains("Get the action's boolean value from a specific seat."),
+            "hover GetInputBool should show docstring: {}",
+            input_markup.value
+        );
+
+        // 3. Hover on `freeLookHeld` variable at line 781: must show `local freeLookHeld: any` (not unknown)
+        let pos_var = lsp_types::Position::new(780, 15);
+        let hover_var = crate::handlers::hover::hover(&analysis, file_id, pos_var, None)
+            .expect("hover freeLookHeld");
+        let HoverContents::Markup(var_markup) = hover_var.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            var_markup.value.contains("local freeLookHeld: any"),
+            "hover freeLookHeld should infer return type `any`, got: {}",
+            var_markup.value
+        );
+
+        // 4. Definition site sv_input.lua: GetInputBool
+        let sv_file_id = vfs
+            .get_all_file_ids()
+            .into_iter()
+            .find(|id| {
+                vfs.get_file_path(id).is_some_and(|p| {
+                    p.ends_with("base_glide/sv_input.lua")
+                        || p.ends_with(r"base_glide\sv_input.lua")
+                })
+            })
+            .expect("base_glide/sv_input.lua file_id");
+        let pos_def = lsp_types::Position::new(62, 14);
+        let hover_def = crate::handlers::hover::hover(&analysis, sv_file_id, pos_def, None)
+            .expect("hover GetInputBool def");
+        let HoverContents::Markup(def_markup) = hover_def.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            def_markup
+                .value
+                .contains("(method) base_glide:GetInputBool"),
+            "definition hover should show method base_glide:GetInputBool, got: {}",
+            def_markup.value
+        );
+
+        Ok(())
+    }
+
+    /// `self` inside a scripted-class method is an instance of the class the
+    /// authoring table stands for, so hover must name that class.
     ///
     /// `ENT` is virtual inside a scripted scope, so it has no decl and the
-    /// receiver lookup fell back to the enclosing method's member. That is the
-    /// shared semantic decl id, so goto-definition, references, implementation
-    /// and rename all pointed at the method too; hover is just the cheapest
-    /// place to observe it.
+    /// receiver lookup used to fall back to the enclosing method's member. That
+    /// is the shared semantic decl id, so goto-definition, references,
+    /// implementation and rename all pointed at the method too; hover is just
+    /// the cheapest place to observe it.
     #[gtest]
     fn test_hover_self_in_scripted_entity_method_shows_class() -> Result<()> {
         let mut ws = enable_gmod_workspace();
@@ -4213,34 +4446,39 @@ local EscapeStringMap: {
         let ent_hover = extract_hover_markdown(&ws, ent_file, ent_position);
 
         assert!(
-            self_hover.contains("(class) base_glide_car") && !self_hover.contains("(method)"),
-            "hovering `self` must describe the class, not the enclosing method, got: {self_hover}"
+            self_hover.contains("self: base_glide_car") && !self_hover.contains("(method)"),
+            "hovering `self` must name the class it is an instance of, not the \
+             enclosing method, got: {self_hover}"
         );
-        assert_eq!(
-            self_hover,
-            ent_hover.replace("base_glide_boat", "base_glide_car"),
-            "hovering `self` must resolve identically to hovering the authoring table"
+        assert!(
+            ent_hover.contains("base_glide_boat") && !ent_hover.contains("(method)"),
+            "hovering the authoring table must name the class, got: {ent_hover}"
         );
 
         // Goto-definition shares the same semantic decl and used to land on the
-        // enclosing method's name token, so pin it too.
+        // enclosing method's name token, so pin that it no longer does.
         let self_def =
             crate::handlers::definition::definition(&ws.analysis, self_file, self_position)
                 .expect("goto-definition on `self`");
-        let ent_def = crate::handlers::definition::definition(&ws.analysis, ent_file, ent_position)
-            .expect("goto-definition on the authoring table");
-        assert_eq!(
-            format!("{self_def:?}").replace("base_glide_car", "CLASS"),
-            format!("{ent_def:?}").replace("base_glide_boat", "CLASS"),
-            "goto-definition on `self` must land where the authoring table does"
+        let lsp_types::GotoDefinitionResponse::Scalar(location) = self_def else {
+            panic!("expected a single goto-definition location, got: {self_def:?}");
+        };
+        let method_name_start = self_content
+            .lines()
+            .nth(location.range.start.line as usize)
+            .and_then(|line| line.find("OnSeatInput"))
+            .expect("the method name is on the target line");
+        assert!(
+            (location.range.start.character as usize) < method_name_start,
+            "goto-definition on `self` must not land on the method name, got: {location:?}"
         );
         Ok(())
     }
 
     /// `PLAYER` and `PLUGIN` author their class through a real local, unlike the
-    /// virtual `ENT` / `SWEP` / `GM` tables. The authoring token still denotes
-    /// that file's scripted class, so `self` must resolve to the class in both
-    /// styles — the local is the authoring mechanism, not a different entity.
+    /// virtual `ENT` / `SWEP` / `GM` tables. `self` must still be typed as that
+    /// file's scripted class in both styles — the local is the authoring
+    /// mechanism, not a different entity.
     #[gtest]
     fn test_self_in_player_class_resolves_to_class_like_the_token() -> Result<()> {
         let source = r#"
@@ -4267,13 +4505,12 @@ local EscapeStringMap: {
         let token_hover = extract_hover_markdown(&ws, token_file, token_position);
 
         assert!(
-            self_hover.contains("(class) player_x"),
-            "hovering `self` in a player class must describe the class, got: {self_hover}"
+            self_hover.contains("self: player_x") && !self_hover.contains("(method)"),
+            "hovering `self` in a player class must name the class, got: {self_hover}"
         );
-        assert_eq!(
-            self_hover,
-            token_hover.replace("player_y", "player_x"),
-            "hovering `self` must resolve identically to hovering the authoring token"
+        assert!(
+            token_hover.contains("player_y"),
+            "hovering the authoring token must name the class, got: {token_hover}"
         );
         Ok(())
     }

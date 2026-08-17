@@ -177,16 +177,26 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // built during an earlier workspace group (with fewer files indexed) be
         // served to a later group that could see more.
         let helper_revision = helper_registry_revision(db);
-        // "Does this file contain any call expression" is a pure function
-        // of the file's content, but it used to be memoised only for the
-        // lifetime of one builder — so every single-file edit re-walked the
-        // syntax tree of every file that owns a signature. Resolving it
-        // against the db-level cache first keeps that work proportional to
-        // the files actually re-analysed.
-        let (helper_registry, annotated_global_call_roles) =
-            crate::profile::phase("gmodpre/call_roles_and_registry", || {
+        // `collect_gmod_call_sites` already built this pair for every group
+        // before any group entered resolution, so reuse it whenever the
+        // signature index has not grown since — deriving it again means
+        // another fold over the whole signature index.
+        //
+        // On a miss the rebuild is served from the per-file scan cache, so it
+        // only re-derives the files that changed.
+        let reusable_roles = context
+            .gmod_global_call_roles
+            .as_ref()
+            .filter(|(revision, _)| *revision == helper_revision)
+            .map(|(_, roles)| roles.clone());
+        let cached_registry = db.get_cached_helper_registry(helper_revision);
+        let (helper_registry, annotated_global_call_roles) = match (cached_registry, reusable_roles)
+        {
+            (Some(registry), Some(roles)) => (registry, roles),
+            _ => crate::profile::phase("gmodpre/call_roles_and_registry", || {
                 build_call_roles_and_registry(db)
-            });
+            }),
+        };
         // Publish the canonical op-name table so diagnostics and completions can
         // name a net op they have no call expression for.
         db.get_gmod_network_index_mut()
@@ -196,23 +206,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 
         let prefixes =
             crate::profile::phase("gmodpre/hook_prefixes", || formatted_hook_prefixes(db));
-
-        let t_class = do_profile.then(std::time::Instant::now);
-        crate::profile::phase("gmodpre/annotated_call_sites", || {
-            collect_annotated_call_sites_with(
-                db,
-                context,
-                &prefixes,
-                &annotated_global_call_roles,
-                true,
-            )
-        });
-        if let Some(t_class) = t_class {
-            log::info!(
-                "gmod pre: annotated_scripted_class_and_load_calls cost {:?}",
-                t_class.elapsed()
-            );
-        }
 
         let t_vgui = do_profile.then(std::time::Instant::now);
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
@@ -255,7 +248,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             let GmodFileMetadataResult {
                 keywords,
                 hook_metadata,
-                network_data,
                 member_ranges,
                 branch_ranges,
                 annotation_realm,
@@ -265,7 +257,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             if let Some(profile) = profile.as_mut() {
                 profile.files_scanned += 1;
                 profile.record_keywords(&keywords, is_in_scope);
-                profile.receive_flows += network_data.receive_flows.len();
             }
 
             if let Some((hook_sites, system_metadata, gm_method_realms)) = hook_metadata {
@@ -282,11 +273,6 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 }
             } else if let Some(profile) = profile.as_mut() {
                 profile.hook_metadata_skips += 1;
-            }
-
-            if !network_data.send_flows.is_empty() || !network_data.receive_flows.is_empty() {
-                db.get_gmod_network_index_mut()
-                    .add_file_data(file_id, network_data);
             }
 
             if is_in_scope {
@@ -439,7 +425,6 @@ struct GmodPreProfile {
     scoped_files: usize,
     hook_metadata_skips: usize,
     gm_method_realms: usize,
-    receive_flows: usize,
     scoped_class_matches: usize,
     branch_realm_ranges: usize,
     annotation_realms: usize,
@@ -458,7 +443,7 @@ impl GmodPreProfile {
 
     fn log(&self) {
         log::info!(
-            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} receive_flows={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
+            "gmod pre profile: files={} keyword_files hook={} system={} gm_func={} realm_branch={} realm_anno={} scoped={} hook_skips={} gm_method_realms={} scoped_matches={} branch_ranges={} annotation_realms={} member_ranges={}",
             self.files_scanned,
             self.hook_keyword_files,
             self.system_call_keyword_files,
@@ -468,7 +453,6 @@ impl GmodPreProfile {
             self.scoped_files,
             self.hook_metadata_skips,
             self.gm_method_realms,
-            self.receive_flows,
             self.scoped_class_matches,
             self.branch_realm_ranges,
             self.annotation_realms,
@@ -840,16 +824,22 @@ fn collect_annotated_call_sites_with(
 
 /// Scripted-class registration and `load`-style call sites for one
 /// workspace group, collected before *any* group resolves.
-pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &AnalyzeContext) {
+///
+/// The role map is stashed on the context because `GmodPreAnalysisPipeline`
+/// needs the same one; rebuilding it there would repeat a full signature-index
+/// fold per group.
+pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if !db.get_emmyrc().gmod.enabled {
         return;
     }
 
     let prefixes = formatted_hook_prefixes(db);
+    let helper_revision = helper_registry_revision(db);
     let (_, annotated_global_call_roles) = {
         let _p = Profile::new("ccs: build_call_roles_and_registry");
         build_call_roles_and_registry(db)
     };
+    context.gmod_global_call_roles = Some((helper_revision, annotated_global_call_roles.clone()));
     let _p = Profile::new("ccs: walk");
     collect_annotated_call_sites_with(db, context, &prefixes, &annotated_global_call_roles, true);
 }
@@ -1280,7 +1270,6 @@ struct GmodFileMetadataResult {
         GmodSystemFileMetadata,
         Vec<(String, GmodRealm)>,
     )>,
-    network_data: crate::db_index::FileNetworkData,
     /// `---@realm` member ranges (only populated when `keywords.has_realm_anno`).
     member_ranges: Vec<GmodRealmRange>,
     /// Branch realm ranges (only populated when `keywords.has_realm_branch`).
@@ -1324,7 +1313,6 @@ fn collect_file_gmod_metadata(
         return GmodFileMetadataResult {
             keywords,
             hook_metadata: None,
-            network_data: crate::db_index::FileNetworkData::default(),
             member_ranges: Vec::new(),
             branch_ranges: Vec::new(),
             annotation_realm: None,
@@ -1365,8 +1353,6 @@ fn collect_file_gmod_metadata(
         (hook_sites, system_metadata, gm_method_realms)
     });
 
-    let network_data = crate::db_index::FileNetworkData::default();
-
     let branch_ranges = if keywords.has_realm_branch {
         collect_branch_realm_ranges(&root)
     } else {
@@ -1392,7 +1378,6 @@ fn collect_file_gmod_metadata(
     GmodFileMetadataResult {
         keywords,
         hook_metadata,
-        network_data,
         member_ranges,
         branch_ranges,
         annotation_realm,

@@ -1,10 +1,9 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
     LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
-    LuaReturnStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaReturnStat, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
-use std::sync::Arc;
 
 use super::{
     InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
@@ -728,7 +727,10 @@ pub fn get_name_expr_var_ref_id(
     let name_token = name_expr.get_name_token()?;
     let name = name_token.get_name_text();
     let var_ref_id = match name {
-        "self" => VarRefId::SelfRef(resolve_self(db, cache, name_expr)?.0),
+        "self" => {
+            let self_ref_id = find_self_ref_id(db, cache, name_expr)?;
+            VarRefId::SelfRef(self_ref_id)
+        }
         _ => {
             let file_id = cache.get_file_id();
             let references_index = db.get_reference_index();
@@ -946,7 +948,7 @@ fn infer_param_type_from_call_sites(
         .get_signature_index()
         .local_func_decl_for(&signature_id)?;
     let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id);
     infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
 }
 
@@ -1059,7 +1061,7 @@ fn infer_unread_local_call_site_args(
     };
 
     let unread_args =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id)
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
             .into_iter()
             .filter_map(|(_, call_expr)| {
                 call_expr
@@ -1137,52 +1139,21 @@ fn infer_forwarded_param_arg_type(
         .and_then(|local_func| local_func.get_local_name())?;
     let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
 
-    let call_sites =
-        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
-    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, idx, false)
+    infer_param_type_from_local_call_sites_inner(
+        db,
+        cache,
+        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id),
+        idx,
+        false,
+    )
 }
 
 fn local_function_call_sites(
     db: &DbIndex,
-    cache: &mut LuaInferCache,
     file_id: FileId,
     root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
 ) -> Vec<(FileId, LuaCallExpr)> {
-    // Parameter inference asks for the same function's call sites once per
-    // parameter index, and each miss walks the tree from the root for every
-    // reference. Derive the set once and re-resolve the ids on later calls.
-    let syntax_ids = match cache.local_function_call_sites_cache.get(&target_decl_id) {
-        Some(cached) => cached.clone(),
-        None => {
-            let ids = Arc::new(find_local_function_call_sites(
-                db,
-                file_id,
-                root,
-                target_decl_id,
-            ));
-            cache
-                .local_function_call_sites_cache
-                .insert(target_decl_id, ids.clone());
-            ids
-        }
-    };
-
-    syntax_ids
-        .iter()
-        .filter_map(|syntax_id| {
-            let node = syntax_id.to_node_from_root(root)?;
-            Some((file_id, LuaCallExpr::cast(node)?))
-        })
-        .collect()
-}
-
-fn find_local_function_call_sites(
-    db: &DbIndex,
-    file_id: FileId,
-    root: &LuaSyntaxNode,
-    target_decl_id: LuaDeclId,
-) -> Vec<LuaSyntaxId> {
     let Some(decl_refs) = db
         .get_reference_index()
         .get_local_reference(&file_id)
@@ -1204,7 +1175,7 @@ fn find_local_function_call_sites(
         })
         .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
         .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
-        .map(|call_expr| call_expr.get_syntax_id())
+        .map(|call_expr| (file_id, call_expr))
         .collect()
 }
 
@@ -1366,72 +1337,7 @@ fn find_param_type_from_sibling_members(
     final_type
 }
 
-type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
-
-thread_local! {
-    /// Memo for [`find_param_type_from_inherited_members`], guarded by the
-    /// `type_structure_revision` it was built against. Thread-local because
-    /// `&DbIndex` is shared across worker threads.
-    static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
-        std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
-}
-
-/// The parameter's type as declared by an inherited member, if any.
-/// Memoized against `type_structure_revision`, which any mutable index access
-/// bumps, so a stale answer is impossible.
 fn find_param_type_from_inherited_members(
-    db: &DbIndex,
-    current_member_id: LuaMemberId,
-    param_idx: usize,
-    colon_define: bool,
-    is_dots: bool,
-    caller_file_id: FileId,
-    caller_position: TextSize,
-) -> Option<LuaType> {
-    let revision = db.type_structure_revision();
-    let key = (
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    let cached = INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        if memo.0 != revision {
-            memo.0 = revision;
-            memo.1.clear();
-            return None;
-        }
-        memo.1.get(&key).cloned()
-    });
-    if let Some(cached) = cached {
-        return cached;
-    }
-
-    let found = find_param_type_from_inherited_members_uncached(
-        db,
-        current_member_id,
-        param_idx,
-        colon_define,
-        is_dots,
-        caller_file_id,
-        caller_position,
-    );
-
-    INHERITED_PARAM_MEMO.with(|memo| {
-        let mut memo = memo.borrow_mut();
-        // Only store if nothing bumped the revision while we were computing.
-        if memo.0 == revision {
-            memo.1.insert(key, found.clone());
-        }
-    });
-    found
-}
-
-fn find_param_type_from_inherited_members_uncached(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     param_idx: usize,
@@ -2625,74 +2531,46 @@ fn select_realm_compatible_decl_ids_for_global_infer_tier(
         .collect()
 }
 
-/// Resolves a `self` name expression to its [`SelfRefId`], plus the scripted
-/// class the colon-method prefix stands for when that prefix is a scoped
-/// authoring table (`ENT`, `SWEP`, `GM`, ...).
+/// Resolves the full `self` reference identity for a `self` name expression.
 ///
-/// Those tables are virtual, so they have no decl and `receiver` falls back to
-/// the enclosing method's member: a usable narrowing key, but the wrong answer
-/// to "what does `self` refer to". Hence the class rides alongside rather than
-/// folded into `receiver`.
-fn resolve_self(
+/// Returns a [`SelfRefId`] carrying:
+/// - `self_decl_id`: the (implicit or explicit) `self` declaration — unique per
+///   method body, used as the flow-cache / `VarRefId` identity.
+/// - `receiver`: the colon-method prefix owner used for base/member lookup.
+///
+/// For an explicit (shadowing) `self` local/param, the receiver is the `self`
+/// decl itself, so it behaves like an ordinary local.
+pub fn find_self_ref_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     name_expr: &LuaNameExpr,
-) -> Option<(SelfRefId, Option<LuaTypeDeclId>)> {
+) -> Option<SelfRefId> {
     let file_id = cache.get_file_id();
     let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
     let self_decl = tree.find_local_decl("self", name_expr.get_position())?;
     let self_decl_id = self_decl.get_id();
     if !self_decl.is_implicit_self() {
-        return Some((
-            SelfRefId {
-                self_decl_id,
-                receiver: LuaDeclOrMemberId::Decl(self_decl_id),
-            },
-            None,
-        ));
-    }
-
-    let (receiver, scoped_authoring_type) =
-        find_self_receiver_id(db, cache, &self_decl, name_expr)?;
-    Some((
-        SelfRefId {
+        return Some(SelfRefId {
             self_decl_id,
-            receiver,
-        },
-        scoped_authoring_type,
-    ))
-}
-
-/// Resolves what `self` refers to, for hover, goto-definition, references,
-/// implementation and rename.
-///
-/// Inside a scripted-class method this is the class the authoring table stands
-/// for, so `self` and the `ENT` / `SWEP` / `GM` token resolve to the same thing.
-pub(crate) fn find_self_semantic_decl_id(
-    db: &DbIndex,
-    cache: &mut LuaInferCache,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaSemanticDeclId> {
-    let (self_ref_id, scoped_authoring_type) = resolve_self(db, cache, name_expr)?;
-    if let Some(type_decl_id) = scoped_authoring_type {
-        return Some(LuaSemanticDeclId::TypeDecl(type_decl_id));
+            receiver: LuaDeclOrMemberId::Decl(self_decl_id),
+        });
     }
-    Some(match self_ref_id.receiver {
-        LuaDeclOrMemberId::Decl(decl_id) => LuaSemanticDeclId::LuaDecl(decl_id),
-        LuaDeclOrMemberId::Member(member_id) => LuaSemanticDeclId::Member(member_id),
+
+    let receiver = find_self_receiver_id(db, cache, &self_decl, name_expr)?;
+    Some(SelfRefId {
+        self_decl_id,
+        receiver,
     })
 }
 
-/// Resolves the receiver owner (colon-method prefix) for an implicit `self`,
-/// plus the scripted class it stands for when the prefix is a scoped authoring
-/// table. See [`resolve_self`].
+/// Resolves the receiver owner (colon-method prefix) for an implicit `self`.
 fn find_self_receiver_id(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     self_decl: &LuaDecl,
     name_expr: &LuaNameExpr,
-) -> Option<(LuaDeclOrMemberId, Option<LuaTypeDeclId>)> {
+) -> Option<LuaDeclOrMemberId> {
     let file_id = cache.get_file_id();
     let tree = db.get_decl_index().get_decl_tree(&file_id)?;
 
@@ -2707,30 +2585,15 @@ fn find_self_receiver_id(
             let name = prefix_name.get_name_text()?;
             let decl = tree.find_local_decl(&name, prefix_name.get_position());
             if let Some(decl) = decl {
-                // `PLAYER` and `PLUGIN` author their class through a real local
-                // (`local PLAYER = {}`), unlike the virtual `ENT` / `SWEP` / `GM`
-                // tables. The local is still that file's scripted class, so the
-                // identity is the class even though the narrowing receiver stays
-                // the local decl. The resolver rejects a local that merely shadows
-                // the name, so a genuine shadow still resolves to the local.
-                return Some((
-                    LuaDeclOrMemberId::Decl(decl.get_id()),
-                    name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name),
-                ));
+                return Some(LuaDeclOrMemberId::Decl(decl.get_id()));
             }
 
-            if let Some(type_decl_id) =
-                name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name)
-            {
-                let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
-                return db
-                    .get_member_index()
-                    .get_member(&member_id)
-                    .map(|_| (LuaDeclOrMemberId::Member(member_id), Some(type_decl_id)));
+            if name_expr_resolves_to_scoped_authoring_table(db, file_id, &prefix_name).is_some() {
+                return Some(LuaDeclOrMemberId::Decl(self_decl.get_id()));
             }
 
             let id = resolve_global_decl_id(db, cache, &name, Some(&prefix_name))?;
-            Some((LuaDeclOrMemberId::Decl(id), None))
+            Some(LuaDeclOrMemberId::Decl(id))
         }
         LuaExpr::IndexExpr(prefix_index) => {
             let semantic_id = infer_node_semantic_decl(
@@ -2741,12 +2604,8 @@ fn find_self_receiver_id(
             )?;
 
             match semantic_id {
-                LuaSemanticDeclId::Member(member_id) => {
-                    Some((LuaDeclOrMemberId::Member(member_id), None))
-                }
-                LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    Some((LuaDeclOrMemberId::Decl(decl_id), None))
-                }
+                LuaSemanticDeclId::Member(member_id) => Some(LuaDeclOrMemberId::Member(member_id)),
+                LuaSemanticDeclId::LuaDecl(decl_id) => Some(LuaDeclOrMemberId::Decl(decl_id)),
                 _ => None,
             }
         }

@@ -812,7 +812,12 @@ impl LuaTypeIndex {
         self.full_name_type_map.get_mut(decl_id)
     }
 
-    /// Stores `cache` for `owner` unless the owner already holds a type.
+    /// Stores `cache` for `owner`, keeping any type already bound there unless
+    /// `cache` supersedes it.
+    ///
+    /// A superseding write discards the old type, so the metadata derived from
+    /// it has to go with it; otherwise [`get_type_fact`](Self::get_type_fact)
+    /// pairs the new type with the old confidence and provenance.
     pub fn bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         if let Some(existing) = self.types.get(&owner)
             && !cache.supersedes(existing)
@@ -820,11 +825,14 @@ impl LuaTypeIndex {
             return;
         }
         let file_id = owner.get_file_id();
-        self.types.insert(owner.clone(), cache);
+        let replaced = self.types.insert(owner.clone(), cache).is_some();
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
-            .insert(owner);
+            .insert(owner.clone());
+        if replaced && self.fact_metadata.remove(&owner).is_some() {
+            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        }
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
@@ -1348,6 +1356,41 @@ mod super_type_tests {
     use rowan::TextRange;
 
     use super::*;
+
+    /// A superseding write replaces the type, so the metadata derived from the
+    /// discarded type must not survive to be reported against the new one.
+    #[test]
+    fn superseding_write_does_not_keep_the_discarded_types_metadata() {
+        use crate::db_index::LuaDeclId;
+        use crate::db_index::r#type::inference_fact::{
+            LuaInferenceConfidence, LuaTypeFactMetadata,
+        };
+
+        let mut index = LuaTypeIndex::new();
+        let owner: LuaTypeOwner = LuaDeclId::new(FileId::new(1), 0.into()).into();
+
+        // A bottom placeholder carrying anchored evidence about the nil.
+        index.bind_type_fact(
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Nil),
+            LuaTypeFactMetadata {
+                confidence: LuaInferenceConfidence::Anchored,
+                base_provenance_kind: None,
+                provenance: std::sync::Arc::from([]),
+            },
+        );
+
+        // A real type supersedes the placeholder.
+        index.bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::String));
+
+        let fact = index.get_type_fact(&owner).expect("fact");
+        assert_eq!(fact.typ(), &LuaType::String, "the new type must win");
+        assert_ne!(
+            fact.confidence(),
+            LuaInferenceConfidence::Anchored,
+            "confidence describing the discarded nil must not be reported for the new type"
+        );
+    }
 
     #[test]
     fn logical_super_type_accessors_deduplicate_source_edges() {

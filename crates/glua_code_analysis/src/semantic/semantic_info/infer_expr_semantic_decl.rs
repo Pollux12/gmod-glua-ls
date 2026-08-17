@@ -8,7 +8,6 @@ use crate::{
     LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId,
     compilation::analyzer::gmod::name_expr_resolves_to_scoped_authoring_table,
     semantic::{
-        infer::find_self_semantic_decl_id,
         member::{get_buildin_type_map_type_id, resolve_dynamic_field_member},
         semantic_info::resolve_global_decl_id,
     },
@@ -119,7 +118,7 @@ fn infer_name_expr_semantic_decl(
     };
     let name = name_token.get_name_text().to_string();
     if name == "self" {
-        return Ok(find_self_semantic_decl_id(db, cache, &name_expr));
+        return Ok(infer_self_semantic_decl(db, cache, name_expr));
     }
 
     if let Some(type_decl_id) =
@@ -233,6 +232,15 @@ fn get_name_decl_id(
     }
 
     resolve_global_decl_id(db, cache, name, Some(&name_expr))
+}
+
+fn infer_self_semantic_decl(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    name_expr: LuaNameExpr,
+) -> Option<LuaSemanticDeclId> {
+    let self_ref_id = super::super::infer::find_self_ref_id(db, cache, &name_expr)?;
+    Some(LuaSemanticDeclId::LuaDecl(self_ref_id.self_decl_id))
 }
 
 fn infer_index_expr_semantic_decl(

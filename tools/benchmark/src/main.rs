@@ -51,7 +51,8 @@ mod alloc_stats {
         unsafe fn realloc(&self, ptr: *mut u8, layout: Layout, new_size: usize) -> *mut u8 {
             ALLOCS.fetch_add(1, Relaxed);
             BYTES.fetch_add(new_size as u64, Relaxed);
-            let live = LIVE.fetch_add(new_size.saturating_sub(layout.size()), Relaxed) + new_size;
+            LIVE.fetch_sub(layout.size(), Relaxed);
+            let live = LIVE.fetch_add(new_size, Relaxed) + new_size;
             PEAK.fetch_max(live, Relaxed);
             unsafe { self.0.realloc(ptr, layout, new_size) }
         }

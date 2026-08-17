@@ -485,11 +485,21 @@ fn has_override_callable_accepting_call(
         return false;
     };
 
+    let Some(owner) = context.db.get_member_index().get_current_owner(&member_id) else {
+        return false;
+    };
+
     // The member's own history is not the whole set of writers when some
     // `<unresolvable>.name = function(...)` write could not be attributed
     // to any owner: those closures never join the item, so the arity
     // elected here is one of several the slot holds at runtime.
+    //
+    // Such a write carries no owner, so it can only be matched by name. That
+    // is scoped to anonymous tables: a write onto a declared type resolves and
+    // joins the item, so an unattributable one is evidence the receiver was an
+    // untyped table rather than any named class sharing the field name.
     if !member.get_feature().is_meta_decl()
+        && matches!(owner, LuaMemberOwner::Element(_))
         && let LuaMemberKey::Name(field_name) = member.get_key()
         && context
             .db
@@ -498,10 +508,6 @@ fn has_override_callable_accepting_call(
     {
         return true;
     }
-
-    let Some(owner) = context.db.get_member_index().get_current_owner(&member_id) else {
-        return false;
-    };
     let Some(member_item) = context
         .db
         .get_member_index()

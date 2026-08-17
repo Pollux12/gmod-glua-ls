@@ -693,7 +693,6 @@ foo({})
             ---@param value Full
             local function consume_typed(value) end
 
-            ---@type Full
             local value = {}
             consume_typed(value)
             value.required = "ready"
@@ -720,6 +719,53 @@ foo({})
 
             local layout = {}
             GetHUDStackLayout(layout)
+            "#,
+        ));
+    }
+
+    /// A callee only completes the fields it always writes. A branch-nested
+    /// write may not run, which is the same rule the caller-side scan applies.
+    #[test]
+    fn out_param_field_written_only_in_a_branch_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Branchy
+            ---@field width number
+            ---@field height number
+
+            ---@param out Branchy
+            local function fill(out, flag)
+                out.width = 100
+                if flag then
+                    out.height = 50
+                end
+            end
+
+            local box = {}
+            fill(box, true)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn unannotated_local_table_passed_to_reader_reports_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Sized
+            ---@field width number
+            ---@field height number
+
+            ---@param size Sized
+            local function measure(size) return size end
+
+            local sized = { width = 100 }
+            measure(sized)
             "#,
         ));
     }

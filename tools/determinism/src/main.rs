@@ -14,10 +14,19 @@
 //!
 //! # Release gates vs bisect stages
 //!
-//! Only some stages are pass/fail. The gates are `repeat`, `edit`, `mainexpand`,
-//! `allreindex`, `reindex`, `order` and `fresh`: each of these runs a path the
-//! language server actually takes (or a ground-truth rebuild), so any divergence
-//! one of them reports is a defect that ships.
+//! Only some stages are pass/fail. The gates are `repeat`, `noopedit`,
+//! `realedit`, `mainexpand`, `allreindex`, `reindex`, `order` and `fresh`: each
+//! of these runs a path the language server actually takes (or a ground-truth
+//! rebuild), so any divergence one of them reports is a defect that ships.
+//!
+//! `noopedit` and `realedit` gate different halves of editing. `noopedit`
+//! verifies that the semantic no-op gate skips the re-index and that skipping
+//! preserves state — it cannot verify re-analysis, because its edit pair is
+//! exactly what that gate rejects as meaningless. `realedit` is the gate for
+//! re-analysis itself: its edit changes what the file means, so the incremental
+//! result has to land where a cold build of the edited source lands. It is a
+//! real gate and it does pass — measured IDENTICAL on CityRP at 11,655 entries
+//! — so a divergence there is a regression, not a known hole.
 //!
 //! `mainreindex`, `exact`, `editmid` and `split:N` are **bisect stages** — diagnostic
 //! instruments, not gates, and they are expected to diverge. Both `mainreindex`
@@ -38,7 +47,7 @@
 //!
 //! Example:
 //!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
-//!     DET_STAGES=repeat,edit,mainexpand DET_TARGETS=lua/autorun/init.lua \
+//!     DET_STAGES=repeat,noopedit,mainexpand DET_TARGETS=lua/autorun/init.lua \
 //!     cargo run --release -p determinism
 //!
 //! Env vars:
@@ -47,14 +56,14 @@
 //!   DET_TARGETS     comma separated workspace-relative paths to no-op edit
 //!   DET_STAGES      comma separated subset of:
 //!                     repeat    re-collect diagnostics with no change at all
-//!                     edit      no-op edit each DET_TARGETS entry, through the
-//!                               same `update_file_by_uri` path the LSP uses.
-//!                               NOTE: the EOF-newline pair is semantically
-//!                               unchanged, so since the no-op gate landed this
-//!                               stage verifies the gate SKIPS the re-index (and
-//!                               that skipping preserves state) — it no longer
-//!                               exercises re-analysis at all. `editmid` is the
-//!                               stage that forces real re-analysis.
+//!                     noopedit  EOF-newline edit pair on each DET_TARGETS
+//!                               entry, through the same `update_file_by_uri`
+//!                               path the LSP uses. The pair is semantically
+//!                               unchanged, which is precisely what this stage
+//!                               gates: the no-op gate must SKIP the re-index
+//!                               and skipping must preserve state. It does not
+//!                               exercise re-analysis — `realedit` gates that,
+//!                               and `editmid` bisects it.
 //!                     editmid   offset-shifting no-op edit pair (newline at the
 //!                               front of the file, then removed): the semantic
 //!                               no-op gate cannot fire, so both edits run the
@@ -75,6 +84,8 @@
 //!                               an edit actually moves — which bounds what a
 //!                               cheaper re-index mechanism has to reproduce.
 //!                               Always diffs the index, DET_INDEX_DIFF or not.
+//!                               Needs DET_EDIT_FIND; without it the stage
+//!                               skips loudly instead of gating anything.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
@@ -881,11 +892,17 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
         net_gained.len()
     );
     for entry in net_dropped.iter().take(limit) {
-        emit(format!("  NET_DROPPED {}", &entry[..entry.len().min(400)]));
+        emit(format!("  NET_DROPPED {}", clip(entry, 400)));
     }
     for entry in net_gained.iter().take(limit) {
-        emit(format!("  NET_GAINED  {}", &entry[..entry.len().min(400)]));
+        emit(format!("  NET_GAINED  {}", clip(entry, 400)));
     }
+}
+
+/// Truncates by characters — entries carry workspace paths and net message
+/// names, so a byte slice can land mid-codepoint and panic the whole run.
+fn clip(text: &str, chars: usize) -> String {
+    text.chars().take(chars).collect()
 }
 
 fn counts(set: &BTreeSet<Snapshot>) -> (usize, usize) {
@@ -954,7 +971,7 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
 /// shifts every offset in the file, so the gate cannot fire and the full
 /// re-index expansion runs.
 fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> bool {
-    let tag = if at_front { "editmid" } else { "edit" };
+    let tag = if at_front { "editmid" } else { "noopedit" };
     let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
         eprintln!("[{tag}] cannot build uri for {}", target.display());
         return false;
@@ -976,9 +993,14 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
 
     let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
     eprintln!(
-        "[{tag}] {} expands to {} files",
+        "[{tag}] {} expands to {} files{}",
         target.display(),
-        expanded.len()
+        expanded.len(),
+        if at_front {
+            ""
+        } else {
+            " (the re-index the semantic no-op gate must skip, not run)"
+        }
     );
     if std::env::var_os("DET_SHOW_EXPANSION").is_some() {
         for expanded_id in &expanded {
@@ -1236,7 +1258,12 @@ fn real_edit(
     targets: &[String],
     cold: &BTreeSet<Snapshot>,
 ) {
-    let find = std::env::var("DET_EDIT_FIND").expect("DET_EDIT_FIND is required by realedit");
+    // In the default stage set, so a missing edit spec must skip loudly rather
+    // than abort the run and lose every stage after it.
+    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
+        eprintln!("[realedit] SKIPPED: DET_EDIT_FIND is not set, so no edit gate ran");
+        return;
+    };
     let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
     let cold_index = collect_index(analysis, "cold");
 
@@ -1333,7 +1360,7 @@ fn main() {
         std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS env var is required"),
     );
     let stages = std::env::var("DET_STAGES")
-        .unwrap_or_else(|_| "repeat,edit".to_string())
+        .unwrap_or_else(|_| "repeat,noopedit,realedit".to_string())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1370,7 +1397,7 @@ fn main() {
         diff("cold", &cold, "repeat", &again);
     }
 
-    if stages.iter().any(|s| s == "edit") {
+    if stages.iter().any(|s| s == "noopedit") {
         let mut previous = cold.clone();
         let mut previous_label = "cold".to_string();
         let cold_index =
@@ -1380,7 +1407,7 @@ fn main() {
             if !noop_edit(&mut analysis, &path, false) {
                 continue;
             }
-            let label = format!("after_edit[{target}]");
+            let label = format!("after_noopedit[{target}]");
             if let Some(cold_index) = &cold_index {
                 let after_index = collect_index(&analysis, &label);
                 diff_index("cold", cold_index, &label, &after_index);

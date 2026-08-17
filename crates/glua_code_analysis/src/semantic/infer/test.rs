@@ -1544,7 +1544,8 @@ mod test {
 
     /// Sibling super branches get their own guard fork, so cycle detection now
     /// rests entirely on the guard's parent chain. Mutually recursive classes
-    /// must still terminate rather than recurse forever.
+    /// must still terminate rather than recurse forever, and an absent field
+    /// stays an absent field rather than degrading to unknown.
     #[test]
     fn test_mutually_recursive_supers_terminate() {
         let mut ws = VirtualWorkspace::new();
@@ -1561,6 +1562,6 @@ mod test {
             "#,
         );
 
-        assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Unknown);
+        assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Nil);
     }
 }

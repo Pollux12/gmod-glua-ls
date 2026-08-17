@@ -4,12 +4,12 @@ use std::{
 };
 
 use glua_parser::{
-    LuaAssignStat, LuaAst, LuaAstNode, LuaExpr, LuaIndexKey, LuaStat, LuaTableExpr, LuaTableField,
-    LuaVarExpr, PathTrait,
+    LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey,
+    LuaStat, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 
 use crate::{
-    DbIndex, DiagnosticCode, LuaDeclId, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId,
+    DbIndex, DiagnosticCode, LuaMemberFeature, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId,
     LuaType, LuaTypeCache, LuaTypeDeclId, SemanticModel,
 };
 
@@ -45,28 +45,6 @@ fn check_table_expr(
     }
 
     let db = context.db;
-
-    // If the table literal is initializing a local variable, only check missing-fields
-    // if that local variable declaration has an explicit type annotation.
-    // Unannotated local tables (e.g. `local layout = {}`) may be used as out-parameters
-    // or buffers whose inferred type comes purely from downstream call references.
-    if let Some(LuaAst::LuaLocalStat(local_stat)) = expr.get_parent::<LuaAst>() {
-        let num = local_stat
-            .get_value_exprs()
-            .position(|val| val.get_position() == expr.get_position());
-        if let Some(num) = num
-            && let Some(local_name) = local_stat.get_local_name_list().nth(num)
-        {
-            let decl_id = LuaDeclId::new(semantic_model.get_file_id(), local_name.get_position());
-            let has_explicit_type = db
-                .get_type_index()
-                .get_type_cache(&decl_id.into())
-                .is_some_and(|tc| tc.is_doc());
-            if !has_explicit_type {
-                return Some(());
-            }
-        }
-    }
 
     let mut union_has_array_type = false;
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
@@ -194,7 +172,7 @@ fn check_table_expr(
         return Some(());
     }
 
-    remove_fields_completed_after(expr, &mut missing);
+    remove_fields_completed_after(semantic_model, &table_type, expr, &mut missing);
     if missing.is_empty() {
         return Some(());
     }
@@ -226,7 +204,12 @@ fn check_table_expr(
 ///
 /// Restricted to the literal's own block. An assignment nested in a branch does
 /// not always run, and the report is still correct there.
-fn remove_fields_completed_after(expr: &LuaTableExpr, missing: &mut HashSet<&str>) -> Option<()> {
+fn remove_fields_completed_after(
+    semantic_model: &SemanticModel,
+    table_type: &LuaType,
+    expr: &LuaTableExpr,
+    missing: &mut HashSet<&str>,
+) -> Option<()> {
     let stat = expr.ancestors::<LuaStat>().next()?;
     let target = assigned_target_path(expr, &stat)?;
 
@@ -261,11 +244,18 @@ fn remove_fields_completed_after(expr: &LuaTableExpr, missing: &mut HashSet<&str
 
         // Anything else touching the target consumes it while it is still
         // incomplete, so later writes no longer make the literal complete.
-        let escapes = node.descendants().filter_map(LuaVarExpr::cast).any(|var| {
-            var.get_access_path().as_deref() == Some(target.as_str())
-                && !written_prefixes.contains(var.syntax())
-        });
-        if escapes {
+        let escaping_vars = node
+            .descendants()
+            .filter_map(LuaVarExpr::cast)
+            .filter(|var| {
+                var.get_access_path().as_deref() == Some(target.as_str())
+                    && !written_prefixes.contains(var.syntax())
+            })
+            .collect::<Vec<_>>();
+        if !escaping_vars.is_empty() {
+            for var in escaping_vars {
+                remove_fields_filled_by_callee(semantic_model, table_type, &var, missing);
+            }
             break;
         }
 
@@ -273,6 +263,86 @@ fn remove_fields_completed_after(expr: &LuaTableExpr, missing: &mut HashSet<&str
     }
 
     Some(())
+}
+
+/// A literal passed as an out-parameter is completed by the callee, not by the
+/// caller: `local layout = {}` followed by `Fill(layout)` is complete when
+/// `Fill` writes those fields onto its parameter. Only a parameter declared as
+/// the very type being checked is read this way, so an ordinary consumer of the
+/// value keeps reporting.
+fn remove_fields_filled_by_callee(
+    semantic_model: &SemanticModel,
+    table_type: &LuaType,
+    var: &LuaVarExpr,
+    missing: &mut HashSet<&str>,
+) -> Option<()> {
+    let arg_list = var.get_parent::<LuaCallArgList>()?;
+    let call_expr = arg_list.get_parent::<LuaCallExpr>()?;
+    let arg_index = arg_list
+        .get_args()
+        .position(|arg| arg.get_position() == var.get_position())?;
+
+    let prefix_expr = call_expr.get_prefix_expr()?;
+    let LuaType::Signature(signature_id) = semantic_model.infer_expr(prefix_expr).ok()? else {
+        return None;
+    };
+    let signature = semantic_model
+        .get_db()
+        .get_signature_index()
+        .get(&signature_id)?;
+
+    // A colon-defined function keeps its receiver out of the parameter list.
+    let param_index = match (signature.is_colon_define, call_expr.is_colon_call()) {
+        (true, true) | (false, false) => arg_index,
+        (false, true) => arg_index + 1,
+        (true, false) => arg_index.checked_sub(1)?,
+    };
+    if signature.get_param_info_by_id(param_index)?.type_ref != *table_type {
+        return None;
+    }
+    let param_name = signature.params.get(param_index)?;
+
+    let closure = find_closure(semantic_model, &signature_id)?;
+    let block = closure.get_block()?;
+    // Only the body's own statements count, the same rule
+    // `remove_fields_completed_after` applies to the caller side: a write nested
+    // in a branch or a loop does not always run, so it cannot complete the
+    // literal.
+    for stat in block.get_stats() {
+        let LuaStat::AssignStat(assign) = stat else {
+            continue;
+        };
+        for assigned in assign.get_var_and_expr_list().0 {
+            let LuaVarExpr::IndexExpr(index) = assigned else {
+                continue;
+            };
+            let Some(LuaExpr::NameExpr(prefix)) = index.get_prefix_expr() else {
+                continue;
+            };
+            if prefix.get_name_text().as_deref() != Some(param_name.as_str()) {
+                continue;
+            }
+            if let Some(key) = index.get_index_key() {
+                missing.remove(key.get_path_part().as_str());
+            }
+        }
+    }
+
+    Some(())
+}
+
+fn find_closure(
+    semantic_model: &SemanticModel,
+    signature_id: &LuaSignatureId,
+) -> Option<LuaClosureExpr> {
+    let file_id = signature_id.get_file_id();
+    let root = semantic_model.get_root_by_file_id(file_id)?;
+    root.syntax()
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
+        .find_map(LuaClosureExpr::cast)
+        .filter(|closure| LuaSignatureId::from_closure(file_id, closure) == *signature_id)
 }
 
 /// The path the literal is assigned to, e.g. `self.portals` or `cfg`.

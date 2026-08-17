@@ -1,7 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        DiagnosticCode, FileId, InFiled, LuaType, LuaUnionType, TypeOps, VirtualWorkspace,
+        DiagnosticCode, FileId, InFiled, LuaMultiLineUnion, LuaType, LuaUnionType, TypeOps,
+        VirtualWorkspace,
     };
     use internment::ArcIntern;
     use rowan::TextRange;
@@ -61,6 +62,88 @@ mod tests {
                 "from_vec was assembly-order dependent for {set:?}"
             );
         }
+    }
+
+    /// A declared `string|"a"|"b"` keeps every arm the author wrote, while an
+    /// inferred literal still collapses into its primitive.
+    #[test]
+    fn declared_literal_arms_outlive_their_primitive() {
+        let members = |types: Vec<LuaType>| match LuaType::from_vec(types) {
+            LuaType::Union(union) => union.into_vec(),
+            other => panic!("expected a union, got {other:?}"),
+        };
+
+        let doc_a = LuaType::DocStringConst(ArcIntern::from(SmolStr::new("a")));
+        let doc_b = LuaType::DocStringConst(ArcIntern::from(SmolStr::new("b")));
+        let declared = members(vec![LuaType::String, doc_a.clone(), doc_b.clone()]);
+        assert_eq!(
+            declared.len(),
+            3,
+            "declared arms were absorbed: {declared:?}"
+        );
+        for arm in [LuaType::String, doc_a, doc_b] {
+            assert!(declared.contains(&arm), "{arm:?} missing from {declared:?}");
+        }
+
+        let declared_ints = members(vec![
+            LuaType::Integer,
+            LuaType::DocIntegerConst(1),
+            LuaType::DocIntegerConst(2),
+        ]);
+        assert_eq!(
+            declared_ints.len(),
+            3,
+            "declared arms were absorbed: {declared_ints:?}"
+        );
+
+        assert_eq!(
+            LuaType::from_vec(vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))),
+            ]),
+            LuaType::String
+        );
+        assert_eq!(
+            LuaType::from_vec(vec![LuaType::Integer, LuaType::IntegerConst(1)]),
+            LuaType::Integer
+        );
+    }
+
+    /// A multi-line union answers the same whichever operand it arrives as.
+    #[test]
+    fn multi_line_union_membership_is_operand_order_free() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+
+        let multi_line = LuaType::MultiLineUnion(
+            LuaMultiLineUnion::new(vec![
+                (
+                    LuaType::DocStringConst(ArcIntern::from(SmolStr::new("a"))),
+                    None,
+                ),
+                (
+                    LuaType::DocStringConst(ArcIntern::from(SmolStr::new("b"))),
+                    None,
+                ),
+            ])
+            .into(),
+        );
+
+        for value in ["a", "z"] {
+            let other = LuaType::StringConst(ArcIntern::from(SmolStr::new(value)));
+            assert_eq!(
+                TypeOps::Union.apply(db, &multi_line, &other),
+                TypeOps::Union.apply(db, &other, &multi_line),
+                "multi-line union depended on operand order for {value:?}"
+            );
+        }
+
+        let member = LuaType::StringConst(ArcIntern::from(SmolStr::new("a")));
+        assert_eq!(
+            TypeOps::Union.apply(db, &member, &multi_line),
+            multi_line,
+            "an existing arm must not widen the multi-line union"
+        );
     }
 
     /// Unioning an alias into an existing union must keep the *alias*, not
