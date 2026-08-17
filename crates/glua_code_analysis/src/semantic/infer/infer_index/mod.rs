@@ -1807,7 +1807,7 @@ fn infer_custom_type_member(
                     cache,
                     &super_type,
                     index_expr.clone(),
-                    infer_guard,
+                    &infer_guard.fork(),
                     table_member_lookup_guard,
                 );
 
@@ -1826,7 +1826,9 @@ fn infer_custom_type_member(
 
                         return Ok(dynamic_field.typ);
                     }
-                    Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                    Err(InferFailReason::FieldNotFound)
+                    | Err(InferFailReason::None)
+                    | Err(InferFailReason::RecursiveInfer) => {}
                     Err(err) => return Err(err),
                 }
             }
@@ -1874,7 +1876,7 @@ fn infer_custom_type_member(
                 cache,
                 &super_type,
                 index_expr.clone(),
-                infer_guard,
+                &infer_guard.fork(),
                 table_member_lookup_guard,
             );
 
@@ -1882,7 +1884,9 @@ fn infer_custom_type_member(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) | Err(InferFailReason::None) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -2849,13 +2853,20 @@ fn infer_member_by_index_custom_type(
             visible_super_types_for_index(db, cache, prefix_type_id, &index_expr)
     {
         for super_type in super_types {
-            let result =
-                infer_member_by_operator(db, cache, &super_type, index_expr.clone(), infer_guard);
+            let result = infer_member_by_operator(
+                db,
+                cache,
+                &super_type,
+                index_expr.clone(),
+                &infer_guard.fork(),
+            );
             match result {
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
         }
@@ -3046,7 +3057,9 @@ fn infer_member_by_index_generic(
                 Ok(member_type) => {
                     return Ok(member_type);
                 }
-                Err(InferFailReason::FieldNotFound) => {}
+                Err(InferFailReason::FieldNotFound)
+                | Err(InferFailReason::None)
+                | Err(InferFailReason::RecursiveInfer) => {}
                 Err(err) => return Err(err),
             }
         }

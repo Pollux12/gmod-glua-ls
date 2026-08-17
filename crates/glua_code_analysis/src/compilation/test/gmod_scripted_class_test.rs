@@ -11905,4 +11905,77 @@ GM.TestValue = 1"#,
         }
         assert!(found_self, "should find self NameExpr");
     }
+
+    #[gtest]
+    fn test_scripted_entity_inherited_method_call_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/base_vehicle/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@return boolean
+                function ENT:GetInputBool(seatIndex, action)
+                    return true
+                end
+                "#,
+            ),
+            (
+                "lua/entities/custom_car/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_vehicle"
+                "#,
+            ),
+            (
+                "lua/entities/custom_car/init.lua",
+                r#"
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local result = self:GetInputBool(seatIndex, action)
+                end
+                "#,
+            ),
+        ]);
+
+        let car_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/custom_car/init.lua");
+        let car_init_id = ws.analysis.get_file_id(&car_uri).unwrap();
+        let sm = ws
+            .analysis
+            .compilation
+            .get_semantic_model(car_init_id)
+            .unwrap();
+        let root = sm.get_root();
+
+        let mut found_call = false;
+        for node in root.descendants::<LuaAst>() {
+            if let LuaAst::LuaCallExpr(call_expr) = &node {
+                if call_expr
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .contains("GetInputBool")
+                {
+                    found_call = true;
+                    let call_type =
+                        sm.infer_expr(glua_parser::LuaExpr::CallExpr(call_expr.clone()));
+                    assert_eq!(
+                        call_type,
+                        Ok(LuaType::Boolean),
+                        "self:GetInputBool(...) should infer as Boolean return type"
+                    );
+                }
+            }
+        }
+        assert!(found_call, "should find GetInputBool CallExpr");
+    }
 }
