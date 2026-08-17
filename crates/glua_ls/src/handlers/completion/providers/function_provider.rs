@@ -177,7 +177,8 @@ fn add_type_ref_completion(
             }
         } else {
             let locations = type_decl.get_locations().to_vec();
-            add_enum_members_completion(builder, &type_ref_id, locations);
+            let is_flat = type_decl.is_flat_enum();
+            add_enum_members_completion(builder, &type_ref_id, locations, is_flat);
         }
 
         builder.stop_here();
@@ -626,6 +627,7 @@ fn add_enum_members_completion(
     builder: &mut CompletionBuilder,
     type_id: &LuaTypeDeclId,
     locations: Vec<LuaDeclLocation>,
+    is_flat: bool,
 ) -> Option<()> {
     let owner_id = LuaMemberOwner::Type(type_id.clone());
     let members = builder
@@ -635,16 +637,17 @@ fn add_enum_members_completion(
         .get_members(&owner_id)?
         .iter()
         .map(|it| {
+            let db = builder.semantic_model.get_db();
             (
                 it.get_key().clone(),
-                builder
-                    .semantic_model
-                    .get_db()
-                    .get_type_index()
+                db.get_type_index()
                     .get_type_cache(&it.get_id().into())
                     .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
                     .as_type()
                     .clone(),
+                db.get_property_index()
+                    .get_property(&LuaSemanticDeclId::Member(it.get_id()))
+                    .and_then(|property| property.description.as_deref().cloned()),
             )
         })
         .sorted_by(|a, b| a.0.cmp(&b.0))
@@ -665,8 +668,15 @@ fn add_enum_members_completion(
     let variable_name = get_enum_decl_variable_name(builder, locations, is_same_file);
 
     // 遍历成员并生成补全项
-    for (key, typ) in members {
-        let label = if is_string_literal_trigger {
+    for (key, typ, description) in members {
+        // A flat enum's members are globals: the member key is what belongs in
+        // the source, so it is both the label and the inserted text.
+        let label = if is_flat && !is_string_literal_trigger {
+            match key {
+                LuaMemberKey::Name(str) => str.to_string(),
+                _ => continue,
+            }
+        } else if is_string_literal_trigger {
             let mut label =
                 humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal);
             if label.starts_with("\"") {
@@ -686,14 +696,14 @@ fn add_enum_members_completion(
             humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal)
         };
 
-        let description = type_id.get_name().to_string();
         let completion_item = CompletionItem {
             label,
             kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
                 detail: None,
-                description: Some(description),
+                description: Some(type_id.get_name().to_string()),
             }),
+            documentation: description.map(Documentation::String),
             ..Default::default()
         };
 
