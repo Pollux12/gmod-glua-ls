@@ -75,6 +75,44 @@ pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
     out
 }
 
+/// Scoped form of [`phase`], for regions that span too many locals to wrap in a
+/// closure. Accumulates from construction until drop.
+pub struct PhaseGuard {
+    name: &'static str,
+    /// Timer and allocation baseline, or `None` when phase profiling is off.
+    start: Option<(Instant, u64)>,
+}
+
+impl PhaseGuard {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: phase_enabled().then(|| (Instant::now(), ALLOC_COUNT.load(Ordering::Relaxed))),
+        }
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let Some((start, allocs_before)) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        let allocs = ALLOC_COUNT
+            .load(Ordering::Relaxed)
+            .saturating_sub(allocs_before);
+        let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        match phases.iter_mut().find(|(phase, _, _, _)| *phase == self.name) {
+            Some((_, total, count, total_allocs)) => {
+                *total += elapsed;
+                *count += 1;
+                *total_allocs += allocs;
+            }
+            None => phases.push((self.name, elapsed, 1, allocs)),
+        }
+    }
+}
+
 /// Print and clear the accumulated sub-phase table.
 pub fn phase_report(label: &str) {
     if !phase_enabled() {

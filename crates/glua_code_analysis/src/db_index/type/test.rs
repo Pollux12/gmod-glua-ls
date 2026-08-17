@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
-    use std::{cmp::Ordering, collections::HashSet, sync::Arc};
+    use rustc_hash::FxHashSet as HashSet;
+    use std::{cmp::Ordering, sync::Arc};
 
     use glua_parser::{LuaKind, LuaSyntaxId, LuaSyntaxKind};
     use rowan::TextRange;
@@ -309,8 +310,10 @@ mod test {
         );
 
         assert_eq!(
-            index.files_with_type_caches_referencing_files(&HashSet::from([provider])),
-            HashSet::from([consumer])
+            index.files_with_type_caches_referencing_files(
+                &[provider].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
         );
     }
 
@@ -351,9 +354,10 @@ mod test {
         );
 
         assert_eq!(
-            index
-                .files_with_cross_file_type_caches_referencing_files(&HashSet::from([contributor])),
-            HashSet::from([consumer])
+            index.files_with_cross_file_type_caches_referencing_files(
+                &[contributor].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
         );
     }
 
@@ -546,8 +550,10 @@ mod test {
 
         assert_eq!(index.get_definition_fact(&definition), Some(&fact));
         assert_eq!(
-            index.files_depending_on_inference_support(&HashSet::from([support_file])),
-            HashSet::from([file_id()])
+            index.files_depending_on_inference_support(
+                &[support_file].into_iter().collect::<HashSet<_>>()
+            ),
+            [file_id()].into_iter().collect::<HashSet<_>>()
         );
     }
 
@@ -647,7 +653,9 @@ mod test {
 
         assert_eq!(
             db.publish_inference_facts(vec![(node.clone(), fact.clone())]),
-            HashSet::from([file_id()])
+            [file_id()]
+                .into_iter()
+                .collect::<std::collections::HashSet<_>>()
         );
         assert_eq!(db.get_inference_fact(&node), Some(fact));
     }

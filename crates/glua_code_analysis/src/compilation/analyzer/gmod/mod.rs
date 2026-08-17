@@ -158,7 +158,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let do_profile = tree_list.len() > 100 && log::log_enabled!(log::Level::Info);
 
         // Pre-compute scripted class scope for all files (compile globs once)
-        let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
+        let scripted_scope_files = crate::profile::phase("gmodpre/scripted_scope_files", || {
+            context.get_or_compute_scripted_scope_files(db).clone()
+        });
 
         let t0 = do_profile.then(std::time::Instant::now);
         let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
@@ -181,7 +183,10 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // syntax tree of every file that owns a signature. Resolving it
         // against the db-level cache first keeps that work proportional to
         // the files actually re-analysed.
-        let (helper_registry, annotated_global_call_roles) = build_call_roles_and_registry(db);
+        let (helper_registry, annotated_global_call_roles) =
+            crate::profile::phase("gmodpre/call_roles_and_registry", || {
+                build_call_roles_and_registry(db)
+            });
         // Publish the canonical op-name table so diagnostics and completions can
         // name a net op they have no call expression for.
         db.get_gmod_network_index_mut()
@@ -189,16 +194,19 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         context.gmod_global_call_roles =
             Some((helper_revision, annotated_global_call_roles.clone()));
 
-        let prefixes = formatted_hook_prefixes(db);
+        let prefixes =
+            crate::profile::phase("gmodpre/hook_prefixes", || formatted_hook_prefixes(db));
 
         let t_class = do_profile.then(std::time::Instant::now);
-        collect_annotated_call_sites_with(
-            db,
-            context,
-            &prefixes,
-            &annotated_global_call_roles,
-            true,
-        );
+        crate::profile::phase("gmodpre/annotated_call_sites", || {
+            collect_annotated_call_sites_with(
+                db,
+                context,
+                &prefixes,
+                &annotated_global_call_roles,
+                true,
+            )
+        });
         if let Some(t_class) = t_class {
             log::info!(
                 "gmod pre: annotated_scripted_class_and_load_calls cost {:?}",
@@ -208,7 +216,9 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
 
         let t_vgui = do_profile.then(std::time::Instant::now);
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        synthesize_vgui_registrations(db, context, &file_ids);
+        crate::profile::phase("gmodpre/vgui_registrations", || {
+            synthesize_vgui_registrations(db, context, &file_ids)
+        });
         if let Some(t_vgui) = t_vgui {
             log::info!(
                 "gmod pre: vgui_registration_bindings cost {:?}",
@@ -224,14 +234,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         // mutates the db and stays in the sequential merge loop.
         let s_collect = do_profile.then(std::time::Instant::now);
         let collect_file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
-        let collected = super::parallel::map_files_collect(db, &collect_file_ids, |db, file_id| {
-            collect_file_gmod_metadata(
-                db,
-                file_id,
-                &helper_registry,
-                &prefixes,
-                &annotated_global_call_roles,
-            )
+        let collected = crate::profile::phase("gmodpre/collect_file_metadata", || {
+            super::parallel::map_files_collect(db, &collect_file_ids, |db, file_id| {
+                collect_file_gmod_metadata(
+                    db,
+                    file_id,
+                    &helper_registry,
+                    &prefixes,
+                    &annotated_global_call_roles,
+                )
+            })
         });
         if let Some(s_collect) = s_collect {
             t_collect += s_collect.elapsed();
@@ -379,18 +391,22 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
             .iter()
             .map(|x| (x.file_id, x.value.clone()))
             .collect();
-        synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map);
+        crate::profile::phase("gmodpre/network_var_wrappers", || {
+            synthesize_network_var_wrappers(db, &scripted_scope_files, &tree_map)
+        });
         if let Some(t1) = t1 {
             log::info!("gmod pre: network_var_wrappers cost {:?}", t1.elapsed());
         }
 
         let t_load = do_profile.then(std::time::Instant::now);
-        rebuild_gmod_load_index(
-            db,
-            &branch_realm_ranges,
-            &file_ids,
-            &annotated_global_call_roles,
-        );
+        crate::profile::phase("gmodpre/rebuild_load_index", || {
+            rebuild_gmod_load_index(
+                db,
+                &branch_realm_ranges,
+                &file_ids,
+                &annotated_global_call_roles,
+            )
+        });
         if let Some(t_load) = t_load {
             log::info!(
                 "gmod pre: rebuild_gmod_load_index cost {:?}",
@@ -399,12 +415,16 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         let t2 = do_profile.then(std::time::Instant::now);
-        rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids);
+        crate::profile::phase("gmodpre/rebuild_realm_metadata", || {
+            rebuild_realm_metadata(db, branch_realm_ranges, annotation_realms, &file_ids)
+        });
         if let Some(t2) = t2 {
             log::info!("gmod pre: rebuild_realm_metadata cost {:?}", t2.elapsed());
         }
 
-        rebuild_effective_valid_guard_signatures(db);
+        crate::profile::phase("gmodpre/effective_valid_guard_signatures", || {
+            rebuild_effective_valid_guard_signatures(db)
+        });
     }
 }
 
@@ -600,13 +620,17 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         let do_profile = context.tree_list.len() > 100
             && (log::log_enabled!(log::Level::Info) || stderr_profile_enabled);
 
-        let scripted_scope_files = context.get_or_compute_scripted_scope_files(db).clone();
+        let scripted_scope_files = crate::profile::phase("gmodpost/scripted_scope_files", || {
+            context.get_or_compute_scripted_scope_files(db).clone()
+        });
 
         // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
         // members so that NetworkVar calls copied from target entities are
         // picked up by synthesize_scripted_class_members.
         let t_deleg = do_profile.then(std::time::Instant::now);
-        resolve_getmember_network_var_delegations(db, &scripted_scope_files, context);
+        crate::profile::phase("gmodpost/getmember_delegations", || {
+            resolve_getmember_network_var_delegations(db, &scripted_scope_files, context)
+        });
         if let Some(t_deleg) = t_deleg {
             log::info!(
                 "gmod post: getmember_delegations cost {:?}",
@@ -618,9 +642,16 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         // Same per-file cached scan the net pass uses. Folding the signature
         // index directly here took its `HashMap` iteration order, so a call path
         // defined by two files resolved differently between processes.
-        let (_, annotated_global_call_roles) = build_call_roles_and_registry(db);
-        collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles);
-        update_compilefile_execution_environments(db, context, &annotated_global_call_roles);
+        let (_, annotated_global_call_roles) =
+            crate::profile::phase("gmodpost/call_roles_and_registry", || {
+                build_call_roles_and_registry(db)
+            });
+        crate::profile::phase("gmodpost/scripted_class_calls", || {
+            collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles)
+        });
+        crate::profile::phase("gmodpost/compilefile_environments", || {
+            update_compilefile_execution_environments(db, context, &annotated_global_call_roles)
+        });
         if let Some(t_class) = t_class {
             log::info!(
                 "gmod post: annotated_scripted_class_calls cost {:?}",
@@ -629,12 +660,16 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t1 = do_profile.then(std::time::Instant::now);
-        synthesize_vgui_registrations(db, context, &file_ids);
+        crate::profile::phase("gmodpost/vgui_registrations", || {
+            synthesize_vgui_registrations(db, context, &file_ids)
+        });
         if let Some(t1) = t1 {
             log::info!("gmod post: vgui_registrations cost {:?}", t1.elapsed());
         }
         let t_parent = do_profile.then(std::time::Instant::now);
-        resolve_vgui_parent_relations(db, context, &file_ids);
+        crate::profile::phase("gmodpost/vgui_parent_relations", || {
+            resolve_vgui_parent_relations(db, context, &file_ids)
+        });
         if let Some(t_parent) = t_parent {
             let elapsed = t_parent.elapsed();
             if log::log_enabled!(log::Level::Info) {
@@ -645,7 +680,9 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t_local_register = do_profile.then(std::time::Instant::now);
-        synthesize_scripted_ent_registrations(db, &file_ids);
+        crate::profile::phase("gmodpost/scripted_ent_registrations", || {
+            synthesize_scripted_ent_registrations(db, &file_ids)
+        });
         if let Some(t_local_register) = t_local_register {
             log::info!(
                 "gmod post: scripted_ent_registrations cost {:?}",
@@ -654,12 +691,16 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         }
 
         let t0 = do_profile.then(std::time::Instant::now);
-        synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids);
+        crate::profile::phase("gmodpost/scripted_class_members", || {
+            synthesize_scripted_class_members(db, &scripted_scope_files, &file_ids)
+        });
         if let Some(t0) = t0 {
             log::info!("gmod post: scripted_class_members cost {:?}", t0.elapsed());
         }
 
-        collect_numeric_range_table_populations(db, context);
+        crate::profile::phase("gmodpost/numeric_range_populations", || {
+            collect_numeric_range_table_populations(db, context)
+        });
     }
 }
 
@@ -895,30 +936,36 @@ fn build_call_roles_and_registry(
     let helper_revision = helper_registry_revision(db);
     let cached_helper_registry = db.get_cached_helper_registry::<HelperRegistry>(helper_revision);
 
-    let mut signatures_by_file: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::new();
-    for (signature_id, _) in db.get_signature_index().iter() {
-        signatures_by_file
-            .entry(signature_id.get_file_id())
-            .or_default()
-            .push(*signature_id);
-    }
+    let mut signatures_by_file: HashMap<FileId, Vec<LuaSignatureId>> =
+        crate::profile::phase("ccs/signatures_by_file", || {
+            let mut map: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::new();
+            for (signature_id, _) in db.get_signature_index().iter() {
+                map.entry(signature_id.get_file_id())
+                    .or_default()
+                    .push(*signature_id);
+            }
+            map
+        });
     // Merge order decides which file wins a call path both define, so it has to
     // be a property of the source, not of the session. `FileId`s are handed out
     // in workspace-collection order and shift when a file is removed and
     // re-added, so order by normalized path — the same policy
     // `HelperRegistryBuilder::build` already uses for its definitions.
-    let vfs = db.get_vfs();
-    let mut scan_files = signatures_by_file.keys().copied().collect::<Vec<_>>();
-    scan_files.sort_by_cached_key(|file_id| {
-        let raw_path = vfs
-            .get_file_path(file_id)
-            .map(|path| path.to_string_lossy().to_string())
-            .unwrap_or_default();
-        (
-            crate::vfs::normalize_path_for_ordering(&raw_path),
-            raw_path,
-            file_id.id,
-        )
+    let scan_files = crate::profile::phase("ccs/sort_scan_files", || {
+        let vfs = db.get_vfs();
+        let mut scan_files = signatures_by_file.keys().copied().collect::<Vec<_>>();
+        scan_files.sort_by_cached_key(|file_id| {
+            let raw_path = vfs
+                .get_file_path(file_id)
+                .map(|path| path.to_string_lossy().to_string())
+                .unwrap_or_default();
+            (
+                crate::vfs::normalize_path_for_ordering(&raw_path),
+                raw_path,
+                file_id.id,
+            )
+        });
+        scan_files
     });
 
     // A file's scan reads only its own signatures plus immutable db state, so
@@ -963,22 +1010,27 @@ fn build_call_roles_and_registry(
         db.set_cached_file_helper_scan(*file_id, scan);
     }
 
-    let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
-    let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
-    for file_id in scan_files {
-        let Some(scan) = db.get_cached_file_helper_scan::<FileHelperScan>(file_id) else {
-            continue;
-        };
-        role_map.merge_from(&scan.role_map);
-        if cached_helper_registry.is_none() {
-            definitions.extend(scan.definitions.iter().cloned());
+    let (mut role_map, definitions) = crate::profile::phase("ccs/merge_scans", || {
+        let mut role_map = AnnotatedGmodGlobalCallRoleMap::default();
+        let mut definitions: Vec<IndexedHelperDefinition> = Vec::new();
+        for file_id in scan_files {
+            let Some(scan) = db.get_cached_file_helper_scan::<FileHelperScan>(file_id) else {
+                continue;
+            };
+            role_map.merge_from(&scan.role_map);
+            if cached_helper_registry.is_none() {
+                definitions.extend(scan.definitions.iter().cloned());
+            }
         }
-    }
-    role_map.rebuild_candidate_call_path_set();
+        (role_map, definitions)
+    });
+    crate::profile::phase("ccs/rebuild_call_path_set", || {
+        role_map.rebuild_candidate_call_path_set()
+    });
 
     let registry = match cached_helper_registry {
         Some(registry) => registry,
-        None => {
+        None => crate::profile::phase("ccs/build_registry", || {
             let builder = HelperRegistryBuilder {
                 definitions,
                 ..Default::default()
@@ -986,7 +1038,7 @@ fn build_call_roles_and_registry(
             let registry = Arc::new(builder.build(db));
             db.set_cached_helper_registry(helper_revision, registry.clone());
             registry
-        }
+        }),
     };
 
     (registry, Arc::new(role_map))
@@ -3505,6 +3557,7 @@ fn resolve_vgui_parent_relations(
         })
         .collect::<Vec<_>>();
     file_ids.sort_by_key(|file_id| file_id.id);
+    let _p_cand = crate::profile::PhaseGuard::new("vgui/parent_candidates");
     let mut forwarding_parent_candidates =
         HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::new();
     for file_id in &file_ids {
@@ -3528,6 +3581,7 @@ fn resolve_vgui_parent_relations(
             &mut forwarding_parent_candidates,
         );
     }
+    drop(_p_cand);
     let forwarding_parents =
         finalize_vgui_forwarding_parent_candidates(forwarding_parent_candidates);
     let forwarding_parents_changed = db
@@ -3545,12 +3599,15 @@ fn resolve_vgui_parent_relations(
         db.get_gmod_class_metadata_index_mut()
             .clear_forwarded_vgui_parent_calls_for_files(&forwarding_scan_file_ids);
     }
+    let _p_fwd = crate::profile::PhaseGuard::new("vgui/forwarding_scan");
     file_ids.extend(collect_vgui_forwarding_parent_calls(
         db,
         context,
         &forwarding_parents,
         &forwarding_scan_file_ids,
     ));
+    drop(_p_fwd);
+    let _p_rel = crate::profile::PhaseGuard::new("vgui/resolve_relations");
     file_ids.sort_by_key(|file_id| file_id.id);
     file_ids.dedup();
     let mut relations_by_file = Vec::new();
@@ -11508,6 +11565,7 @@ fn rebuild_gmod_load_index(
     analyzed_file_ids: &[FileId],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
+    let _p_prep = crate::profile::PhaseGuard::new("gmodload/prep");
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
     let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
@@ -11553,14 +11611,20 @@ fn rebuild_gmod_load_index(
         }
     }
 
+    drop(_p_prep);
+    let _p_sites = crate::profile::PhaseGuard::new("gmodload/resolve_sites");
     let dependency_sites = db
         .get_file_dependencies_index()
         .iter_dependency_sites()
         .flat_map(|(_, sites)| sites.iter().cloned())
         .map(|site| resolve_load_dependency_site(db, site))
         .collect::<Vec<_>>();
+    drop(_p_sites);
+    let _p_dyn = crate::profile::PhaseGuard::new("gmodload/dynamic_loaders");
     let dynamic_loaders = collect_dynamic_loaders(db, &file_ids, annotated_global_call_roles);
+    drop(_p_dyn);
 
+    let _p_fix = crate::profile::PhaseGuard::new("gmodload/fixpoint");
     let mut unresolved_edges = Vec::new();
     for _ in 0..file_ids.len().max(1) {
         let mut changed = false;
@@ -11583,7 +11647,9 @@ fn rebuild_gmod_load_index(
             break;
         }
     }
+    drop(_p_fix);
 
+    let _p_shadow = crate::profile::PhaseGuard::new("gmodload/shadows_and_publish");
     mark_main_workspace_load_shadows(db, &mut file_infos, &file_ids);
 
     db.get_gmod_load_index_mut()
@@ -11894,44 +11960,45 @@ fn collect_dynamic_loaders(
             .push((*file_id, path));
     }
 
-    let mut patterns = Vec::new();
-    for source_file_id in file_ids {
-        let Some(tree) = db.get_vfs().get_syntax_tree(source_file_id) else {
-            continue;
+    // Every file is content-scanned for a `file_find` candidate before almost
+    // all of them bail out, and the whole walk is read-only against `&DbIndex`,
+    // so it runs across files in parallel. Results stay index-aligned and are
+    // flattened in file order, so the pattern list is identical to the previous
+    // sequential build.
+    let per_file = super::parallel::map_files_collect(db, file_ids, |db, source_file_id| {
+        let mut patterns = Vec::new();
+        let Some(tree) = db.get_vfs().get_syntax_tree(&source_file_id) else {
+            return patterns;
         };
-        let Some(content) = db.get_vfs().get_file_content(source_file_id) else {
-            continue;
+        let Some(content) = db.get_vfs().get_file_content(&source_file_id) else {
+            return patterns;
         };
         let annotated_candidates =
             annotated_global_call_roles.candidate_call_paths_in_content(content);
         if !content.contains("gmod.file_find") && !annotated_candidates.has_file_find {
-            continue;
+            return patterns;
         }
 
         let root = tree.get_chunk_node();
-        let annotated_call_roles = AnnotatedGmodCallRoleMap::build(
-            db,
-            *source_file_id,
-            &root,
-            annotated_global_call_roles,
-        );
+        let annotated_call_roles =
+            AnnotatedGmodCallRoleMap::build(db, source_file_id, &root, annotated_global_call_roles);
         let bindings = collect_static_string_bindings(&root);
         let wrappers = collect_dynamic_load_wrappers(&root);
 
         let file_find_patterns = collect_dynamic_file_find_patterns(
             db,
-            *source_file_id,
+            source_file_id,
             &root,
             &bindings,
             &annotated_call_roles,
         );
         if file_find_patterns.is_empty() {
-            continue;
+            return patterns;
         }
 
         let usages = collect_dynamic_load_usages(
             db,
-            *source_file_id,
+            source_file_id,
             &root,
             &file_find_patterns,
             &wrappers,
@@ -11959,7 +12026,7 @@ fn collect_dynamic_loaders(
                     .is_some_and(is_realm_file_prefix);
 
                 patterns.push(DynamicLoadPattern {
-                    source_file_id: *source_file_id,
+                    source_file_id,
                     result_kind,
                     glob: file_find_pattern.glob.clone(),
                     dispatch,
@@ -11969,9 +12036,10 @@ fn collect_dynamic_loaders(
                 });
             }
         }
-    }
+        patterns
+    });
 
-    patterns
+    per_file.into_iter().flatten().collect()
 }
 
 fn collect_dynamic_file_find_patterns(

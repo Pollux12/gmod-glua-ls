@@ -21,6 +21,7 @@ chrono.workspace = true
 
 [features]
 dhat-heap = ["dep:dhat"]
+alloc-stats = []
 
 [[bin]]
 name = "benchmark"
