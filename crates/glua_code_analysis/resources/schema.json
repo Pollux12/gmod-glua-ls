@@ -2256,7 +2256,7 @@
         },
         "enumParamHint": {
           "default": false,
-          "description": "Show name of enumerator when passing a literal value to a function\nthat expects an enum.\n\nExample:\n\n```lua\n--- @enum Level\nlocal Foo = {\n   Info = 1,\n   Error = 2,\n}\n\n--- @param l Level\nfunction print_level(l) end\n\nprint_level(1 --[[ Hint: Level.Info ]])\n```",
+          "description": "Show name of enumerator when passing a literal value to a function\nthat expects an enum, including Garry's Mod enums such as `EF`\nand `MASK`.\n\nExample:\n\n```lua\nent:AddEffects(32 --[[ Hint: EF_NODRAW ]])\n```",
           "type": "boolean",
           "x-vscode-setting": true
         },

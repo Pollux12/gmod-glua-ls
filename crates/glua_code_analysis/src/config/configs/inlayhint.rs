@@ -36,21 +36,13 @@ pub struct EmmyrcInlayHint {
     #[schemars(extend("x-vscode-setting" = true))]
     pub meta_call_hint: bool,
     /// Show name of enumerator when passing a literal value to a function
-    /// that expects an enum.
+    /// that expects an enum, including Garry's Mod enums such as `EF`
+    /// and `MASK`.
     ///
     /// Example:
     ///
     /// ```lua
-    /// --- @enum Level
-    /// local Foo = {
-    ///    Info = 1,
-    ///    Error = 2,
-    /// }
-    ///
-    /// --- @param l Level
-    /// function print_level(l) end
-    ///
-    /// print_level(1 --[[ Hint: Level.Info ]])
+    /// ent:AddEffects(32 --[[ Hint: EF_NODRAW ]])
     /// ```
     #[serde(default = "default_false")]
     #[schemars(extend("x-vscode-setting" = true))]
