@@ -1357,6 +1357,41 @@ mod super_type_tests {
 
     use super::*;
 
+    /// A superseding write replaces the type, so the metadata derived from the
+    /// discarded type must not survive to be reported against the new one.
+    #[test]
+    fn superseding_write_does_not_keep_the_discarded_types_metadata() {
+        use crate::db_index::LuaDeclId;
+        use crate::db_index::r#type::inference_fact::{
+            LuaInferenceConfidence, LuaTypeFactMetadata,
+        };
+
+        let mut index = LuaTypeIndex::new();
+        let owner: LuaTypeOwner = LuaDeclId::new(FileId::new(1), 0.into()).into();
+
+        // A bottom placeholder carrying anchored evidence about the nil.
+        index.bind_type_fact(
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Nil),
+            LuaTypeFactMetadata {
+                confidence: LuaInferenceConfidence::Anchored,
+                base_provenance_kind: None,
+                provenance: std::sync::Arc::from([]),
+            },
+        );
+
+        // A real type supersedes the placeholder.
+        index.bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::String));
+
+        let fact = index.get_type_fact(&owner).expect("fact");
+        assert_eq!(fact.typ(), &LuaType::String, "the new type must win");
+        assert_ne!(
+            fact.confidence(),
+            LuaInferenceConfidence::Anchored,
+            "confidence describing the discarded nil must not be reported for the new type"
+        );
+    }
+
     #[test]
     fn logical_super_type_accessors_deduplicate_source_edges() {
         let mut index = LuaTypeIndex::new();
