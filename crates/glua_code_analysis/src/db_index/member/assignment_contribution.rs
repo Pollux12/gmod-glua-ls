@@ -56,35 +56,6 @@ impl MemberAssignmentContributionStore {
             .insert(member_id, contribution);
     }
 
-    /// Re-keys a member's entry onto the owner it was just re-homed to. The
-    /// settled merge groups writers by owner, so evidence left under the
-    /// owner the member had at record time would be discarded.
-    pub fn move_member(&mut self, member_id: LuaMemberId, new_owner: &LuaMemberOwner) {
-        let Some(previous) = self
-            .by_file
-            .get(&member_id.file_id)
-            .and_then(|entries| entries.get(&member_id))
-            .cloned()
-        else {
-            return;
-        };
-        if &previous.0 == new_owner {
-            return;
-        }
-        let Some(contribution) = self.detach(&previous, member_id) else {
-            return;
-        };
-
-        let store_key = (new_owner.clone(), previous.1);
-        if let Some(entries) = self.by_file.get_mut(&member_id.file_id) {
-            entries.insert(member_id, store_key.clone());
-        }
-        self.by_owner_key
-            .entry(store_key)
-            .or_default()
-            .insert(member_id, contribution);
-    }
-
     /// Drops every entry the removed files contributed, in one sweep keyed by
     /// file rather than a whole-store scan per file.
     pub fn remove_files<S: std::hash::BuildHasher>(&mut self, removed: &HashSet<FileId, S>) {
@@ -130,16 +101,13 @@ impl MemberAssignmentContributionStore {
         self.by_file.clear();
     }
 
-    fn detach(
-        &mut self,
-        store_key: &MemberAssignmentContributionKey,
-        member_id: LuaMemberId,
-    ) -> Option<MemberAssignmentContribution> {
-        let group = self.by_owner_key.get_mut(store_key)?;
-        let contribution = group.remove(&member_id);
+    fn detach(&mut self, store_key: &MemberAssignmentContributionKey, member_id: LuaMemberId) {
+        let Some(group) = self.by_owner_key.get_mut(store_key) else {
+            return;
+        };
+        group.remove(&member_id);
         if group.is_empty() {
             self.by_owner_key.remove(store_key);
         }
-        contribution
     }
 }

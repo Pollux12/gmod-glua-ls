@@ -774,7 +774,6 @@ impl LuaMemberIndex {
         {
             self.remove_member_from_visible_owner_key_index(previous_owner, id);
             self.remove_current_owner_member(previous_owner, id);
-            self.assignment_contributions.move_member(id, &owner);
         }
 
         self.current_owner_member_history
@@ -1360,7 +1359,7 @@ mod tests {
     use rowan::{TextRange, TextSize};
 
     use super::*;
-    use crate::{FileId, LuaType, LuaTypeDeclId};
+    use crate::{FileId, LuaTypeDeclId};
 
     fn make_member(member_id: LuaMemberId, key: &str) -> LuaMember {
         make_member_with_feature(member_id, key, LuaMemberFeature::FileFieldDecl)
@@ -1639,85 +1638,6 @@ mod tests {
         assert_eq!(
             key_history_member_ids,
             vec![first_member_id, second_member_id]
-        );
-    }
-
-    #[test]
-    fn set_member_owner_rekeys_assignment_contributions() {
-        let global_owner = LuaMemberOwner::GlobalPath(GlobalId::new("cityrp"));
-        let key = LuaMemberKey::Name("foo".into());
-        let first_file = FileId::new(1);
-        let second_file = FileId::new(2);
-        let first_member_id = make_index_member_id(first_file, 10);
-        let second_member_id = make_index_member_id(second_file, 20);
-        let first_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("FirstTable"));
-        let second_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SecondTable"));
-        let contribution = |bound_type: LuaType| MemberAssignmentContribution {
-            source_type: bound_type.clone(),
-            bound_type,
-            doc_type: None,
-            guarded_bootstrap: false,
-            preserve_table_literals: false,
-        };
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(global_owner.clone(), make_member(first_member_id, "foo"));
-        index.add_member(global_owner.clone(), make_member(second_member_id, "foo"));
-        index
-            .record_member_assignment_contribution(first_member_id, contribution(LuaType::Integer))
-            .expect("first contribution should record");
-        index
-            .record_member_assignment_contribution(second_member_id, contribution(LuaType::String))
-            .expect("second contribution should record");
-        assert_eq!(
-            index
-                .member_assignment_contributions()
-                .contributions(&(global_owner.clone(), key.clone()))
-                .expect("both writers should share the global path group")
-                .len(),
-            2
-        );
-
-        index
-            .set_member_owner(first_owner.clone(), first_file, first_member_id)
-            .expect("first owner reassignment should succeed");
-        index
-            .set_member_owner(second_owner.clone(), second_file, second_member_id)
-            .expect("second owner reassignment should succeed");
-
-        assert!(
-            index
-                .member_assignment_contributions()
-                .contributions(&(global_owner, key.clone()))
-                .is_none()
-        );
-        for (owner, member_id, bound_type) in [
-            (first_owner.clone(), first_member_id, LuaType::Integer),
-            (second_owner.clone(), second_member_id, LuaType::String),
-        ] {
-            let group = index
-                .member_assignment_contributions()
-                .contributions(&(owner, key.clone()))
-                .expect("contribution should follow its member to the new owner");
-            assert_eq!(group.len(), 1);
-            assert_eq!(
-                group
-                    .get(&member_id)
-                    .map(|contribution| contribution.bound_type.clone()),
-                Some(bound_type)
-            );
-        }
-
-        let files = std::collections::HashSet::from([first_file, second_file]);
-        let mut store_keys = index
-            .member_assignment_contributions()
-            .keys_for_files(&files)
-            .into_iter()
-            .collect::<Vec<_>>();
-        store_keys.sort_by_key(|(owner, _)| format!("{owner:?}"));
-        assert_eq!(
-            store_keys,
-            vec![(first_owner, key.clone()), (second_owner, key)]
         );
     }
 
