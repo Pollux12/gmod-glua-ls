@@ -357,12 +357,54 @@ impl LuaDocTagEnum {
         self.child()
     }
 
-    pub fn get_fields(&self) -> Option<LuaDocEnumField> {
+    pub fn get_field_list(&self) -> Option<LuaDocEnumFieldList> {
         self.child()
+    }
+
+    pub fn get_fields(&self) -> Vec<LuaDocEnumField> {
+        match self.get_field_list() {
+            Some(list) => list.get_fields().collect(),
+            None => Vec::new(),
+        }
     }
 
     pub fn get_type_flag(&self) -> Option<LuaDocTypeFlag> {
         self.child()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct LuaDocEnumFieldList {
+    syntax: LuaSyntaxNode,
+}
+
+impl LuaAstNode for LuaDocEnumFieldList {
+    fn syntax(&self) -> &LuaSyntaxNode {
+        &self.syntax
+    }
+
+    fn can_cast(kind: LuaSyntaxKind) -> bool
+    where
+        Self: Sized,
+    {
+        kind == LuaSyntaxKind::DocEnumFieldList
+    }
+
+    fn cast(syntax: LuaSyntaxNode) -> Option<Self>
+    where
+        Self: Sized,
+    {
+        if Self::can_cast(syntax.kind().into()) {
+            Some(Self { syntax })
+        } else {
+            None
+        }
+    }
+}
+
+impl LuaDocEnumFieldList {
+    pub fn get_fields(&self) -> LuaAstChildren<LuaDocEnumField> {
+        self.children()
     }
 }
 

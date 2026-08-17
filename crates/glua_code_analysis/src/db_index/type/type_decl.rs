@@ -7,7 +7,8 @@ use serde::{Deserialize, Deserializer, Serialize, Serializer};
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, LuaMemberKey, LuaMemberOwner, TypeSubstitutor, instantiate_type_generic,
+    DbIndex, FileId, LuaMember, LuaMemberKey, LuaMemberOwner, TypeSubstitutor,
+    instantiate_type_generic,
 };
 
 use super::{LuaType, LuaUnionType};
@@ -59,7 +60,10 @@ impl LuaTypeDecl {
             }],
             id,
             extra: match kind {
-                LuaDeclTypeKind::Enum => LuaTypeExtra::Enum { base: None },
+                LuaDeclTypeKind::Enum => LuaTypeExtra::Enum {
+                    base: None,
+                    flat: false,
+                },
                 LuaDeclTypeKind::Class => LuaTypeExtra::Class,
                 LuaDeclTypeKind::Alias => LuaTypeExtra::Alias { origin: None },
                 LuaDeclTypeKind::Attribute => LuaTypeExtra::Attribute { typ: None },
@@ -177,8 +181,20 @@ impl LuaTypeDecl {
     }
 
     pub fn add_enum_base(&mut self, base_type: LuaType) {
-        if let LuaTypeExtra::Enum { base } = &mut self.extra {
+        if let LuaTypeExtra::Enum { base, .. } = &mut self.extra {
             *base = Some(base_type);
+        }
+    }
+
+    /// A flat enum lists its constants as `---|` fields naming globals, rather
+    /// than owning a runtime table. Garry's Mod enums are all of this shape.
+    pub fn is_flat_enum(&self) -> bool {
+        matches!(self.extra, LuaTypeExtra::Enum { flat: true, .. })
+    }
+
+    pub fn mark_flat_enum(&mut self) {
+        if let LuaTypeExtra::Enum { flat, .. } = &mut self.extra {
+            *flat = true;
         }
     }
 
@@ -218,6 +234,37 @@ impl LuaTypeDecl {
         self.locations.push(location);
     }
 
+    /// The value an enum member stands for. A table enum stores it on the member
+    /// itself; a flat enum member names a global, so the value is read from that
+    /// global at query time. Resolving it during doc analysis would make enum
+    /// ingestion depend on global inference having already run.
+    pub fn get_enum_member_value(&self, db: &DbIndex, member: &LuaMember) -> Option<LuaType> {
+        if !self.is_flat_enum() {
+            return db
+                .get_type_index()
+                .get_type_cache(&member.get_id().into())
+                .map(|type_cache| type_cache.as_type().clone());
+        }
+
+        let LuaMemberKey::Name(name) = member.get_key() else {
+            return None;
+        };
+
+        let mut decl_ids = db
+            .get_global_index()
+            .get_global_decl_ids(name.as_str())?
+            .clone();
+        decl_ids.sort_unstable_by_key(|decl_id| (decl_id.file_id.id, u32::from(decl_id.position)));
+
+        decl_ids.into_iter().find_map(|decl_id| {
+            let typ = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())?
+                .as_type();
+            (!typ.is_unknown()).then(|| typ.clone())
+        })
+    }
+
     /// 获取枚举字段的类型
     pub fn get_enum_field_type(&self, db: &DbIndex) -> Option<LuaType> {
         if !self.is_enum() {
@@ -242,17 +289,15 @@ impl LuaTypeDecl {
             }
         } else {
             for member in enum_members {
-                if let Some(type_cache) =
-                    db.get_type_index().get_type_cache(&member.get_id().into())
-                {
-                    let member_fake_type = match type_cache.as_type() {
-                        LuaType::StringConst(s) => LuaType::DocStringConst(s.clone()),
-                        LuaType::IntegerConst(i) => LuaType::DocIntegerConst(*i),
-                        _ => type_cache.as_type().clone(),
-                    };
+                let Some(member_type) = self.get_enum_member_value(db, member) else {
+                    continue;
+                };
 
-                    union_types.push(member_fake_type);
-                }
+                union_types.push(match member_type {
+                    LuaType::StringConst(s) => LuaType::DocStringConst(s),
+                    LuaType::IntegerConst(i) => LuaType::DocIntegerConst(i),
+                    other => other,
+                });
             }
         }
 
@@ -417,7 +462,7 @@ pub struct LuaDeclLocation {
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum LuaTypeExtra {
-    Enum { base: Option<LuaType> },
+    Enum { base: Option<LuaType>, flat: bool },
     Class,
     Alias { origin: Option<LuaType> },
     Attribute { typ: Option<LuaType> },
