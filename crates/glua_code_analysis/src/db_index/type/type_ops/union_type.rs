@@ -1,6 +1,6 @@
 use std::ops::Deref;
 
-use crate::{DbIndex, LuaType, LuaUnionType, get_real_type};
+use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
 
 // Union member *order* is preserved here, but the member *set* is
 // canonical.
@@ -28,7 +28,19 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
     // cost 9 false `redundant-parameter` reports on StarfallEx (a method
     // resolving to a 0-parameter arm), and it buys no determinism — the
     // re-index gates already pass without it.
-    if types.iter().any(|typ| matches!(typ, LuaType::Any)) || can_use_structural_union(&types) {
+    //
+    // `DocStringConst`/`DocIntegerConst` are held for the same reason: they only
+    // exist where the author typed a literal, so `---@type string|"a"|"b"` has
+    // to keep all three arms — the literals are what completion offers and what
+    // hover shows. The pairwise rule still absorbs them, because joining two
+    // types is a different question from listing the arms of a declared one.
+    if types.iter().any(|typ| {
+        matches!(
+            typ,
+            LuaType::Any | LuaType::DocStringConst(_) | LuaType::DocIntegerConst(_)
+        )
+    }) || can_use_structural_union(&types)
+    {
         return LuaType::from_vec_structural(types);
     }
 
@@ -44,6 +56,8 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
 /// Skipping the fold is worth its own rule table: on a large workspace the
 /// pairwise path costs ~65% more indexing time, and this decides the cases
 /// where the two agree.
+///
+/// The flags mirror [`try_collapse`] arm for arm.
 fn can_use_structural_union(types: &[LuaType]) -> bool {
     let (mut num, mut num_variant) = (false, false);
     let (mut int, mut int_const) = (false, false);
@@ -108,26 +122,13 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
 
     match (match_source, target) {
         (LuaType::MultiLineUnion(left), right) => {
-            let include = match right {
-                LuaType::StringConst(v) => {
-                    left.get_unions().iter().any(|(t, _)| match (t, right) {
-                        (LuaType::DocStringConst(a), _) => a == v,
-                        _ => false,
-                    })
-                }
-                LuaType::IntegerConst(v) => {
-                    left.get_unions().iter().any(|(t, _)| match (t, right) {
-                        (LuaType::DocIntegerConst(a), _) => a == v,
-                        _ => false,
-                    })
-                }
-                _ => false,
-            };
-
-            if include {
+            if multi_line_union_contains(left, right) {
                 return source.clone();
             }
             LuaType::from_vec_structural(vec![source.clone(), target.clone()])
+        }
+        (left, LuaType::MultiLineUnion(right)) if multi_line_union_contains(right, left) => {
+            target.clone()
         }
         // union
         (LuaType::Union(left), right) if !right.is_union() => {
@@ -160,6 +161,10 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
 }
 
 /// The pairwise rules that collapse two union members into a single type.
+///
+/// Joining two types subsumes a literal into its primitive, author-written or
+/// not. Listing the arms of a *declared* union is the other question, and
+/// [`union_type_all`] answers it without these rules.
 fn try_collapse(match_source: &LuaType, source: &LuaType, target: &LuaType) -> Option<LuaType> {
     Some(match (match_source, target) {
         (LuaType::Never, _) => target.clone(),
@@ -199,6 +204,21 @@ fn try_collapse(match_source: &LuaType, source: &LuaType, target: &LuaType) -> O
         (left, right) if *left == *right => source.clone(),
         _ => return None,
     })
+}
+
+/// Whether `other` is already one of `union`'s arms.
+///
+/// A multi-line union's arms are author-written literals, so an inferred
+/// literal of the same value is the same member.
+fn multi_line_union_contains(union: &LuaMultiLineUnion, other: &LuaType) -> bool {
+    union
+        .get_unions()
+        .iter()
+        .any(|(member, _)| match (member, other) {
+            (LuaType::DocStringConst(a), LuaType::StringConst(b)) => a == b,
+            (LuaType::DocIntegerConst(a), LuaType::IntegerConst(b)) => a == b,
+            _ => false,
+        })
 }
 
 /// Add `ty` to an existing union's member list, applying absorption rules.
