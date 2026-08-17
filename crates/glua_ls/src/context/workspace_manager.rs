@@ -75,15 +75,8 @@ impl WorkspaceManager {
         self.workspace_diagnostic_level.clone()
     }
 
-    /// Take the pending diagnostic level and reset it to `None` in one step.
-    ///
-    /// The pull handler holds only a *read* guard on the workspace manager and
-    /// `update_workspace_version` takes `&self`, so a load-then-store pair is
-    /// serialised by nothing. Two pulls could both observe `Fast` and both run
-    /// a full sweep, and a level stored by the idle refresh task — which writes
-    /// the atomic directly, without any guard — could be cleared by a pull that
-    /// had already read the old value, stranding closed-file diagnostics until
-    /// the next edit.
+    /// Take the pending diagnostic level and reset it to `None` in one atomic
+    /// step; a separate load+store pair races with concurrent writers.
     pub fn claim_workspace_diagnostic_level(&self) -> WorkspaceDiagnosticLevel {
         let previous = self
             .workspace_diagnostic_level
@@ -91,26 +84,15 @@ impl WorkspaceManager {
         WorkspaceDiagnosticLevel::from_u8(previous)
     }
 
-    /// Put a claimed level back after a sweep failed to finish.
-    ///
-    /// A cancelled pull returns a partial set, and the level it claimed has
-    /// already been cleared — so without this the files it never reached stay
-    /// stale until some unrelated edit re-arms the level. Restores the higher
-    /// of the claimed level and whatever has been requested since, so a `Slow`
-    /// sweep interrupted after something asked for `Fast` still comes back as
-    /// `Slow` rather than being quietly downgraded.
+    /// Put a claimed level back after a sweep failed to finish; keeps the
+    /// higher of it and anything requested since.
     pub fn restore_workspace_diagnostic_level(&self, level: WorkspaceDiagnosticLevel) {
         self.workspace_diagnostic_level
             .fetch_max(level.to_u8(), Ordering::AcqRel);
     }
 
-    /// Request at least `level` of workspace diagnostics.
-    ///
-    /// Raising is a max, not a store: a save asks for `Slow`, and a didOpen or
-    /// an idle refresh arriving before the next pull must not downgrade that to
-    /// `Fast` — the deep sweep the save asked for would then not run until the
-    /// next save. Only `claim_workspace_diagnostic_level` clears the level, and
-    /// no caller requests a *lower* level on purpose.
+    /// Request at least `level` of workspace diagnostics. A max, not a store:
+    /// a concurrent request must never downgrade a pending `Slow` sweep.
     pub fn update_workspace_version(&self, level: WorkspaceDiagnosticLevel, add_version: bool) {
         self.workspace_diagnostic_level
             .fetch_max(level.to_u8(), Ordering::AcqRel);
@@ -177,8 +159,6 @@ impl WorkspaceManager {
                 watchdog_status,
             )
             .await;
-            // `workspace/diagnostic/refresh` requires the client to advertise
-            // `workspace.diagnostics.refreshSupport`, not just pull diagnostics.
             if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             }
@@ -241,9 +221,6 @@ impl WorkspaceManager {
             workspace_diagnostic_status
                 .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
 
-            // Trigger diagnostics refresh
-            // `workspace/diagnostic/refresh` requires the client to advertise
-            // `workspace.diagnostics.refreshSupport`, not just pull diagnostics.
             if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             } else {
@@ -301,16 +278,12 @@ impl WorkspaceManager {
             workspace_diagnostic_status
                 .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
 
-            // Trigger diagnostics refresh. Each of these is a server-initiated
-            // request and needs its own client capability.
             if lsp_features.supports_semantic_tokens_refresh() {
                 client.refresh_semantic_tokens();
             }
             if lsp_features.supports_inlay_hint_refresh() {
                 client.refresh_inlay_hints();
             }
-            // `workspace/diagnostic/refresh` requires the client to advertise
-            // `workspace.diagnostics.refreshSupport`, not just pull diagnostics.
             if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             } else {

@@ -106,9 +106,7 @@ pub async fn on_did_change_watched_files(
                 .await;
         }
     } else {
-        // Pull clients get no publish, but the remembered report must still go:
-        // replaying diagnostics computed against a file that no longer exists
-        // is the one way the replay path can state something untrue.
+        // Never replay a report for a file that no longer exists.
         for uri in &deleted_lua_uris {
             context
                 .file_diagnostic()

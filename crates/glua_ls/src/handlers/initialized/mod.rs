@@ -433,10 +433,6 @@ pub async fn init_analysis(
     }
 
     if lsp_features.supports_workspace_diagnostic() {
-        // Pull client. Nudge it to re-pull now that the index is ready — but
-        // only if it advertised refresh support; the request is not otherwise
-        // ours to send. Without it the client still re-pulls on its own
-        // triggers (open, edit, focus change).
         if lsp_features.supports_refresh_diagnostic() {
             client.refresh_workspace_diagnostics();
         }

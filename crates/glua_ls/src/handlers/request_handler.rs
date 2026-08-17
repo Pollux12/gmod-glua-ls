@@ -132,18 +132,8 @@ macro_rules! dispatch_request {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // `didChange` writes the new text and syntax tree to
-                            // the VFS but leaves the index describing the previous
-                            // tree until the debounced `reindex_files` lands.
-                            // Anything that resolves symbols through the index has
-                            // to wait: declarations are keyed by position, so a
-                            // model built over the new tree with the old index
-                            // silently resolves nothing and the feature returns
-                            // empty rather than reporting an error.
-                            //
-                            // Cancellation is the only way out. The dispatcher
-                            // turns `None` into the cancel response, and the
-                            // client re-requests when it wants the answer again.
+                            // Symbol resolution against a stale index silently
+                            // returns empty; wait for the reindex.
                             if !snapshot
                                 .debounced_analysis()
                                 .wait_until_fresh_for(&cancel_token, <$fresh_req_type>::METHOD)
@@ -164,16 +154,8 @@ macro_rules! dispatch_request {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$retry_req_type>::METHOD, &params);
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // ContentModified is only useful to a client that
-                            // re-sends afterwards. Anyone else reads it as "no
-                            // result" and clears the feature, so they must be
-                            // answered with a real result.
-                            //
-                            // That leaves waiting as the only honest way to
-                            // produce one: this handler resolves symbols through
-                            // the index, and computing against a pending reindex
-                            // silently drops them. Waiting delays the answer;
-                            // not waiting highlights the file wrongly.
+                            // A client that doesn't retry ContentModified must
+                            // get a real result: wait for freshness instead.
                             if !snapshot
                                 .lsp_features()
                                 .retries_on_content_modified(<$retry_req_type>::METHOD)
@@ -189,12 +171,6 @@ macro_rules! dispatch_request {
                                 return Some(Response::new_ok(id, result));
                             }
 
-                            // A pending reindex means the index still describes
-                            // the previous text, and unresolved symbols are
-                            // silently dropped from the result rather than
-                            // reported. Answering would repaint the file with a
-                            // near-empty result; the refresh after reindex
-                            // drives the corrective re-pull instead.
                             if snapshot.debounced_analysis().is_dirty() {
                                 return content_modified(id);
                             }
@@ -202,9 +178,7 @@ macro_rules! dispatch_request {
                             let result =
                                 $retry_handler(snapshot.clone(), params, cancel_token).await;
 
-                            // An edit landed while we worked, so this result
-                            // describes neither the text the client asked
-                            // about nor the text it now holds.
+                            // An edit landed while we worked.
                             if snapshot.debounced_analysis().is_dirty() {
                                 return content_modified(id);
                             }
@@ -233,14 +207,8 @@ pub async fn on_request_handler(
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     dispatch_request!(req, server_context, {
-        // Does not resolve symbols through the index, so a pending reindex
-        // cannot corrupt the answer. That is the precise test — not "touches
-        // the index at all": `document_selection_range` reads `get_module()`
-        // for a `workspace_id`, which is a property of where the file lives
-        // rather than of any position in it, so a stale index answers it
-        // correctly. What must never appear here is anything resolving a
-        // declaration, member or global, since those are keyed by offsets into
-        // a tree the index may no longer describe.
+        // Must not resolve declarations/members/globals through the index —
+        // those need the `wait_for_fresh_index` arm.
         FoldingRangeRequest => on_folding_range_handler,
         EmmySyntaxTreeRequest => on_emmy_syntax_tree_handler,
         SelectionRangeRequest => on_document_selection_range_handle,
@@ -248,8 +216,8 @@ pub async fn on_request_handler(
         RangeFormatting => on_range_formatting_handler,
         OnTypeFormatting => on_type_formatting_handler,
 
-        // Reads the index but performs its own wait, because it needs to answer
-        // a cancelled request with something other than the cancel response.
+        // Reads the index but performs its own wait to control the cancel
+        // response.
         EmmyAnnotatorRequest => on_emmy_annotator_handler,
         CodeLensRequest => on_code_lens_handler,
         InlayHintRequest => on_inlay_hint_handler,
@@ -308,14 +276,9 @@ mod tests {
         completion::{CompletionData, CompletionDataType},
     };
 
-    /// The `wait_for_fresh_index` arm is what stops index-reading handlers
-    /// answering from a stale index while an edit is pending. The membership of
-    /// that arm is maintained by hand, so this pins the mechanism: a request in
-    /// it must produce no response at all while analysis is dirty, and must
-    /// answer once the pending change settles.
     #[test]
     fn fresh_index_requests_do_not_answer_until_analysis_settles() {
-        use super::{on_request_handler, Completion, LspRequest};
+        use super::{Completion, LspRequest, on_request_handler};
         use crate::context::ServerContext;
         use googletest::prelude::*;
         use lsp_server::{Connection, Message};
@@ -347,7 +310,9 @@ mod tests {
 
             // Dirty: the handler must still be parked in the freshness wait.
             verify_that!(
-                peer.receiver.recv_timeout(Duration::from_millis(150)).is_err(),
+                peer.receiver
+                    .recv_timeout(Duration::from_millis(150))
+                    .is_err(),
                 eq(true)
             )
             .expect("no response may be sent while the index is stale");

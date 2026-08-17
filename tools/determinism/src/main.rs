@@ -214,7 +214,12 @@ mod alloc_sample {
             // unwind tables instead and costs microseconds.
             let mut buffer = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_FRAMES];
             let captured = unsafe {
-                RtlCaptureStackBackTrace(1, MAX_FRAMES as u32, buffer.as_mut_ptr(), std::ptr::null_mut())
+                RtlCaptureStackBackTrace(
+                    1,
+                    MAX_FRAMES as u32,
+                    buffer.as_mut_ptr(),
+                    std::ptr::null_mut(),
+                )
             };
             let mut ips: Vec<usize> = buffer[..captured as usize]
                 .iter()

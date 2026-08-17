@@ -22,11 +22,7 @@ use crate::{
 use super::{LuaAnalyzer, LuaReturnPoint, func_body::analyze_func_body_returns};
 
 /// The closure's own `return` statements — those not belonging to a closure
-/// nested inside it.
-///
-/// Several of the analyses below need exactly this set, and each derived it
-/// separately: a full walk of the block, plus an ancestor walk for every return
-/// statement found. It is a pure function of the closure, so derive it once.
+/// nested inside it. Cached per closure.
 fn closure_own_return_stats(
     analyzer: &mut LuaAnalyzer,
     closure: &LuaClosureExpr,

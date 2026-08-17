@@ -39,11 +39,7 @@ pub async fn on_completion_handler(
     let uri = params.text_document_position.text_document.uri;
     let position = params.text_document_position.position;
 
-    // Freshness is guaranteed by the `wait_for_fresh_index` dispatch arm:
-    // completion resolves members and locals through the index, and a bounded
-    // wait would routinely expire inside the window where the index still
-    // describes the pre-edit tree, producing a list missing exactly the
-    // symbols the user just typed near.
+    // Freshness is guaranteed by the `wait_for_fresh_index` dispatch arm.
     let analysis = context.read_analysis(&cancel_token).await?;
 
     if cancel_token.is_cancelled() {

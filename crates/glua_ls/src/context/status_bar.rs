@@ -45,10 +45,7 @@ impl StatusBar {
     }
 
     pub async fn create_progress_task(&self, task: ProgressTask) {
-        // `window/workDoneProgress/create` is a server-initiated request and
-        // requires `window.workDoneProgress`. Without it the token is never
-        // registered, so every `$/progress` for this task would be orphaned —
-        // skip the whole task rather than send notifications into the void.
+        // create/update/finish all no-op without the client capability.
         if !self.supports_work_done_progress {
             return;
         }
@@ -88,6 +85,9 @@ impl StatusBar {
         percentage: Option<u32>,
         message: Option<String>,
     ) {
+        if !self.supports_work_done_progress {
+            return;
+        }
         self.client.send_notification(
             "$/progress",
             ProgressParams {
@@ -113,6 +113,9 @@ impl StatusBar {
     }
 
     pub fn finish_progress_task(&self, task: ProgressTask, message: Option<String>) {
+        if !self.supports_work_done_progress {
+            return;
+        }
         self.client.send_notification(
             "$/progress",
             ProgressParams {

@@ -63,20 +63,13 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
     }
 }
 
-/// Per-thread memo for [`LuaSyntaxId::to_node_from_root`].
-///
-/// Keyed by root, because inference crosses files: resolving a declaration can
-/// jump to another file's tree and back. A single-root memo would be cleared on
-/// every such hop, so a few roots are kept, most-recently-used first.
-///
-/// Holding each root alive keeps its green tree alive too, which is what makes
-/// identity comparison sound — a dropped tree's address could otherwise be
-/// reused by a later one and produce a false hit.
+/// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
+/// (MRU, a few roots kept). Holding each root alive keeps its green tree
+/// alive, which is what makes identity comparison sound.
 mod node_memo {
     use super::{LuaSyntaxId, LuaSyntaxNode};
     use rustc_hash::FxHashMap;
 
-    /// Enough to cover a file and the handful of others inference reaches into.
     const MAX_ROOTS: usize = 4;
 
     #[derive(Default)]
@@ -94,8 +87,6 @@ mod node_memo {
             let index = match found {
                 Some(0) => 0,
                 Some(index) => {
-                    // Most-recently-used first, so the active file stays at the
-                    // front and the eviction below never drops it.
                     self.roots.swap(0, index);
                     0
                 }
@@ -183,16 +174,8 @@ impl LuaSyntaxId {
         self.to_node_from_root(&root)
     }
 
-    /// Resolve this id to its node, reusing an earlier resolution when possible.
-    ///
-    /// Resolving walks down from the root, and rowan materializes a red node at
-    /// every level of the descent — so a single resolution costs one allocation
-    /// per level of nesting, and analysis resolves the same handful of ids over
-    /// and over. Measured on the CityRP benchmark, this function accounted for
-    /// 31.8% of every allocation made during the `lua analyze` phase.
-    ///
-    /// A cache hit costs a hash lookup plus a `SyntaxNode` clone, which is a
-    /// refcount bump rather than an allocation.
+    /// Resolve this id to its node, memoized per thread: an uncached walk
+    /// allocates a red node per nesting level.
     pub fn to_node_from_root(&self, root: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
         NODE_MEMO.with(|memo| memo.borrow_mut().resolve(*self, root))
     }

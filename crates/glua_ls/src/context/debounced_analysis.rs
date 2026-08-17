@@ -31,9 +31,8 @@ pub struct DebouncedAnalysis {
     debounce_duration: Duration,
     shutdown: CancellationToken,
     client: Arc<ClientProxy>,
-    idle_workspace_diagnostic_token: Mutex<Option<CancellationToken>>,
-    workspace_diagnostic_level: Option<Arc<AtomicU8>>,
-    lsp_features: Option<Arc<crate::context::LspFeatures>>,
+    workspace_diagnostic_level: Arc<AtomicU8>,
+    lsp_features: Arc<crate::context::LspFeatures>,
 }
 
 impl DebouncedAnalysis {
@@ -43,13 +42,12 @@ impl DebouncedAnalysis {
         shutdown: CancellationToken,
         client: Arc<ClientProxy>,
         shared_diagnostic_data_cache: SharedDiagnosticDataCache,
-        workspace_diagnostic_level: Option<Arc<AtomicU8>>,
-        lsp_features: Option<Arc<crate::context::LspFeatures>>,
+        workspace_diagnostic_level: Arc<AtomicU8>,
+        lsp_features: Arc<crate::context::LspFeatures>,
     ) -> Self {
         Self {
             pending_files: Mutex::new(HashSet::new()),
             reindexing_files: Mutex::new(HashSet::new()),
-            idle_workspace_diagnostic_token: Mutex::new(None),
             has_pending_changes: AtomicBool::new(false),
             in_flight_changes: AtomicUsize::new(0),
             notify: Notify::new(),
@@ -147,11 +145,8 @@ impl DebouncedAnalysis {
         let mut warned_stuck = false;
 
         loop {
-            // Create and enable the Notified future BEFORE checking the
-            // condition.  `enable()` ensures that a `notify_waiters()` call
-            // between here and the `select!` poll is captured, avoiding a
-            // missed wakeup (unpolled Notified futures are invisible to
-            // `notify_waiters` without `enable`).
+            // Register (`enable()`) before testing the condition: unpolled
+            // Notified futures are invisible to `notify_waiters()`.
             let notified = self.reindex_notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -236,17 +231,10 @@ impl DebouncedAnalysis {
     /// Background loop: waits for events, debounces, then runs reindex.
     /// Spawn this once at server startup.
     pub async fn run(&self) {
+        let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
         loop {
-            // Wait for the first event, unless files were scheduled during
-            // the previous reindex (the Notify signal may have been missed
-            // because there was no active waiter at that point), or
-            // begin_in_flight_change() was called without a corresponding schedule().
-            // Register for the wakeup BEFORE testing the condition. `schedule()`
-            // and `begin_in_flight_change()` signal with `notify_waiters()`,
-            // which stores no permit — it only wakes waiters already registered.
-            // Testing first and registering second drops any signal that lands
-            // in between, and the work it announced then waits for the *next*
-            // notification, which may never come if the user has stopped typing.
+            // Register before testing the condition: `notify_waiters()` stores
+            // no permit, so a signal landing in between would be lost.
             let notified = self.notify.notified();
             tokio::pin!(notified);
             notified.as_mut().enable();
@@ -300,13 +288,8 @@ impl DebouncedAnalysis {
 
                 self.reindex_notify.notify_waiters();
                 if !reindex_completed {
-                    // Shutdown is the only reason to stop the loop. A panicked
-                    // reindex must not: `has_pending_changes` would stay true
-                    // forever, and every unbounded `wait_until_fresh_for` —
-                    // which is now how both diagnostic handlers wait — would
-                    // block until its request was cancelled, for the rest of
-                    // the session. Fall through so `refresh_dirty_state()`
-                    // below releases the waiters.
+                    // Only shutdown stops the loop; a panicked reindex must
+                    // fall through so `refresh_dirty_state()` releases waiters.
                     if self.shutdown.is_cancelled() {
                         return;
                     }
@@ -316,64 +299,43 @@ impl DebouncedAnalysis {
                     );
                 }
 
-                // Trigger semantic token and inlay hint refresh so the client
-                // re-pulls with fresh data after the reindex. Each refresh is a
-                // server-initiated request, so it may only be sent to a client
-                // that advertised support for it.
-                if let Some(lsp_features) = self.lsp_features.as_ref() {
-                    if lsp_features.supports_semantic_tokens_refresh() {
-                        self.client.refresh_semantic_tokens();
-                    }
-                    if lsp_features.supports_inlay_hint_refresh() {
-                        self.client.refresh_inlay_hints();
-                    }
+                if self.lsp_features.supports_semantic_tokens_refresh() {
+                    self.client.refresh_semantic_tokens();
+                }
+                if self.lsp_features.supports_inlay_hint_refresh() {
+                    self.client.refresh_inlay_hints();
                 }
 
-                // When reindex finishes from an edit, schedule an idle background workspace
-                // diagnostic refresh. If the user remains idle, this ensures any closed
-                // files affected by cross-file changes get re-diagnosed, without blocking
-                // or stalling active typing. `workspace/diagnostic/refresh` is a global
-                // invalidation signal, so the delay stays comfortably longer than a pause
-                // between two sentences.
-                if let (Some(status), Some(lsp_features)) = (
-                    self.workspace_diagnostic_level.as_ref(),
-                    self.lsp_features.as_ref(),
-                ) {
-                    let mut idle = self.idle_workspace_diagnostic_token.lock().await;
-                    if let Some(token) = idle.take() {
-                        token.cancel();
-                    }
-                    let cancel_token = CancellationToken::new();
-                    *idle = Some(cancel_token.clone());
+                // Arm an idle workspace diagnostic refresh so closed files hit
+                // by cross-file changes get re-diagnosed once typing pauses.
+                if let Some(token) = idle_workspace_diagnostic_token.take() {
+                    token.cancel();
+                }
+                let cancel_token = CancellationToken::new();
+                idle_workspace_diagnostic_token = Some(cancel_token.clone());
 
-                    let client = self.client.clone();
-                    let status = status.clone();
-                    let lsp_features = lsp_features.clone();
-                    let shutdown = self.shutdown.clone();
-                    tokio::spawn(async move {
-                        tokio::select! {
-                            _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
-                                if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
-                                    // Raise, never lower: a save during the idle
-                                    // window asks for `Slow`, and storing `Fast`
-                                    // over it would drop the deep sweep.
-                                    status.fetch_max(
-                                        crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
-                                        Ordering::AcqRel,
-                                    );
-                                    // `workspace/diagnostic/refresh` requires
-                                    // `workspace.diagnostics.refreshSupport`,
-                                    // not merely a pull-capable client.
-                                    if lsp_features.supports_refresh_diagnostic() {
-                                        client.refresh_workspace_diagnostics();
-                                    }
+                let client = self.client.clone();
+                let status = self.workspace_diagnostic_level.clone();
+                let lsp_features = self.lsp_features.clone();
+                let shutdown = self.shutdown.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = tokio::time::sleep(IDLE_WORKSPACE_DIAGNOSTIC_DELAY) => {
+                            if !cancel_token.is_cancelled() && !shutdown.is_cancelled() {
+                                // Raise, never lower: don't drop a pending Slow sweep.
+                                status.fetch_max(
+                                    crate::context::WorkspaceDiagnosticLevel::Fast.to_u8(),
+                                    Ordering::AcqRel,
+                                );
+                                if lsp_features.supports_refresh_diagnostic() {
+                                    client.refresh_workspace_diagnostics();
                                 }
                             }
-                            _ = cancel_token.cancelled() => {}
-                            _ = shutdown.cancelled() => {}
                         }
-                    });
-                }
+                        _ = cancel_token.cancelled() => {}
+                        _ = shutdown.cancelled() => {}
+                    }
+                });
             }
 
             self.refresh_dirty_state().await;
@@ -386,13 +348,8 @@ impl DebouncedAnalysis {
     }
 
     async fn refresh_dirty_state(&self) {
-        // Read every input and publish the result while still holding the
-        // locks. Releasing them first makes this a read-modify-write that two
-        // callers — the `run()` loop tail and `finish_in_flight_changes` — can
-        // interleave, so the later store can publish the earlier reading. That
-        // resolves itself within a debounce interval, but "stale for 200ms" now
-        // means every index-reading handler parks for 200ms, so it is worth the
-        // slightly wider critical section.
+        // Publish while holding both locks, or concurrent callers can
+        // interleave and store a stale reading.
         let pending = self.pending_files.lock().await;
         let reindexing = self.reindexing_files.lock().await;
 
@@ -452,18 +409,23 @@ impl Drop for InFlightChangeGuard {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
+    use std::sync::atomic::AtomicU8;
     use std::time::Duration;
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::Connection;
-    use lsp_types::{Diagnostic, NumberOrString};
+    use lsp_types::{ClientCapabilities, Diagnostic, NumberOrString};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
-    use crate::context::{ClientProxy, FileDiagnostic, StatusBar};
+    use crate::context::{ClientProxy, FileDiagnostic, LspFeatures, StatusBar};
 
     use super::DebouncedAnalysis;
+
+    fn test_lsp_features() -> Arc<LspFeatures> {
+        Arc::new(LspFeatures::new(ClientCapabilities::default()))
+    }
 
     fn test_debounced_analysis() -> Arc<DebouncedAnalysis> {
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
@@ -477,8 +439,8 @@ mod tests {
             CancellationToken::new(),
             client,
             file_diagnostic.shared_diagnostic_data_cache(),
-            None,
-            None,
+            Arc::new(AtomicU8::new(0)),
+            test_lsp_features(),
         ))
     }
 
@@ -607,8 +569,8 @@ mod tests {
                 CancellationToken::new(),
                 client,
                 file_diagnostic.shared_diagnostic_data_cache(),
-                None,
-                None,
+                Arc::new(AtomicU8::new(0)),
+                test_lsp_features(),
             );
             verify_that!(
                 debounced_analysis

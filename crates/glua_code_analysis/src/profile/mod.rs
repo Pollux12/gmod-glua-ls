@@ -102,7 +102,10 @@ impl Drop for PhaseGuard {
             .load(Ordering::Relaxed)
             .saturating_sub(allocs_before);
         let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
-        match phases.iter_mut().find(|(phase, _, _, _)| *phase == self.name) {
+        match phases
+            .iter_mut()
+            .find(|(phase, _, _, _)| *phase == self.name)
+        {
             Some((_, total, count, total_allocs)) => {
                 *total += elapsed;
                 *count += 1;

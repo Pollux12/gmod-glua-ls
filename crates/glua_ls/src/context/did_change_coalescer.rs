@@ -57,9 +57,7 @@ impl DidChangeCoalescer {
             let first = match rx.recv().await {
                 Some(params) => params,
                 None => {
-                    // Every sender is gone, so the server is shutting down.
-                    // Said once here rather than once per dropped edit in
-                    // `enqueue`, which is what a reader would otherwise see.
+                    // Every sender is gone: shutdown.
                     log::info!("didChange coalescer stopped: channel closed");
                     return;
                 }

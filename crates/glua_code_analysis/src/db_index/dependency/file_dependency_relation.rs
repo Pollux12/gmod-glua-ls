@@ -22,17 +22,9 @@ impl<'a> FileDependencyRelation<'a> {
             .collect()
     }
 
-    /// The same order as [`Self::get_best_analysis_order`], grouped into
-    /// dependency levels: no file in a level depends on another file in the same
-    /// level, and every level only depends on earlier ones.
-    ///
-    /// Flattening the result reproduces `get_best_analysis_order` exactly, so a
-    /// caller can switch between the two without changing analysis order. The
-    /// grouping is free: Kahn's algorithm with a FIFO queue already pops nodes
-    /// in breadth-first layers, so a level is a contiguous run of the flat order.
-    ///
-    /// Files left over from a dependency cycle each become their own level, so a
-    /// caller that parallelizes within a level never runs a cycle concurrently.
+    /// [`Self::get_best_analysis_order`] grouped into dependency levels: no
+    /// file depends on a same-level sibling; flattening reproduces the flat
+    /// order exactly. Cycle leftovers become single-file levels.
     pub fn get_analysis_levels(
         &self,
         file_ids: &[FileId],
@@ -94,8 +86,7 @@ impl<'a> FileDependencyRelation<'a> {
             for &neighbor in &adjacency[idx] {
                 in_degree[neighbor] -= 1;
                 if in_degree[neighbor] == 0 {
-                    // A FIFO queue pops in breadth-first layers, so `idx` is the
-                    // deepest dependency of `neighbor`: the last one to be popped.
+                    // FIFO pops breadth-first, so `idx` is the deepest dependency.
                     node_level[neighbor] = level + 1;
                     new_zero.push(neighbor);
                 }

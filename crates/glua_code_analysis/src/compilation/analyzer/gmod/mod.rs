@@ -4337,12 +4337,10 @@ fn index_vgui_field_assignment_parents(
             assignments
                 .entry(field_path.to_string())
                 .or_insert_with(Vec::new)
-                .push(
-                VguiFieldAssignmentParent {
+                .push(VguiFieldAssignmentParent {
                     owner_type_ids: resolve_vgui_parent_expr_type_ids(db, cache, owner),
                     parent_type_ids,
-                },
-            );
+                });
         }
     }
     assignments

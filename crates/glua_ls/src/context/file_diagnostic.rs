@@ -296,10 +296,7 @@ impl FileDiagnostic {
         }
     }
 
-    /// 清除指定文件的诊断信息
-    /// Drop the remembered report for a URI without telling the client
-    /// anything. Closing a document ends the only readership the cache has, so
-    /// this keeps it from growing with every file visited in a session.
+    /// Drop the remembered report for a URI without telling the client.
     pub async fn forget_cached_file_diagnostics(&self, uri: &Uri) {
         self.cached_file_diagnostics.lock().await.remove(uri);
     }

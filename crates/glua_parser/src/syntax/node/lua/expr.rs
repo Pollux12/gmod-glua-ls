@@ -245,7 +245,8 @@ impl LuaNameExpr {
     /// stores up to 22 bytes inline, which covers essentially every Lua
     /// identifier, so the common case allocates nothing.
     pub fn get_name_text(&self) -> Option<SmolStr> {
-        self.get_name_token().map(|it| SmolStr::new(it.get_name_text()))
+        self.get_name_token()
+            .map(|it| SmolStr::new(it.get_name_text()))
     }
 }
 

@@ -21,9 +21,7 @@ pub async fn on_emmy_syntax_tree_handler(
 ) -> Option<SyntaxTreeResponse> {
     let uri = Uri::from_str(&params.uri).ok()?;
 
-    // Ranges are offsets into this document's tree, so the tree must be the one
-    // the client is asking about — the same gate the formatting handlers use.
-    // Index freshness is not needed here.
+    // Tree-offset answer: needs the latest document version, not a fresh index.
     if !context
         .wait_until_latest_document_version_applied(&uri, &cancel_token)
         .await

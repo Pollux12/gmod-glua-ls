@@ -73,23 +73,9 @@ pub async fn on_notification_handler(
             snapshot
                 .note_document_seen_version(&uri, params.text_document.version)
                 .await;
-            // Keep stale-aware UI requests alive so they can wait for fresh
-            // data instead of flickering while typing.
-            //
-            // Diagnostics are exempt for a stronger reason than flicker. VS
-            // Code pulls again on every didChange and cancels its own in-flight
-            // pull to do it; whatever we answer a cancelled pull with — success
-            // or error — the client rewrites to an empty *full* report and
-            // clears the file. Cancelling here only guarantees that response
-            // arrives, and it discards a handler built to wait for fresh data
-            // and answer properly. Upstream never self-cancels any request.
-            //
-            // `workspace/executeCommand` is exempt for a different reason: it
-            // mutates (auto-require issues a `workspace/applyEdit`) and it now
-            // waits for a fresh index before running. Cancelling it mid-wait
-            // would drop the user's command with no visible error — and an edit
-            // landing in that window is routine, since the command's own applied
-            // edit or a format-on-save produces one.
+            // Exempted requests wait for fresh data instead of being
+            // cancelled: the client clears a file on a cancelled diagnostic
+            // pull, and a cancelled executeCommand drops the user's command.
             server_context
                 .cancel_all_requests_except(&[
                     "textDocument/codeLens",
@@ -126,13 +112,8 @@ pub async fn on_notification_handler(
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            // The in-flight workspace sweep is deliberately left to finish.
-            // Cancelling it restarts a whole-workspace scan from the beginning
-            // with no resume point, and VS Code re-pulls every 2s — so opening
-            // files faster than a large sweep completes used to livelock on
-            // partial scans. The level bump above already schedules the next
-            // sweep, and the client ignores workspace results for URIs it
-            // tracks by document pull, so the open file loses nothing.
+            // The in-flight workspace sweep is deliberately left to finish:
+            // cancelling restarts it from scratch, which livelocks large scans.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
@@ -164,13 +145,8 @@ pub async fn on_notification_handler(
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            // The in-flight workspace sweep is deliberately left to finish.
-            // Cancelling it restarts a whole-workspace scan from the beginning
-            // with no resume point, and VS Code re-pulls every 2s — so opening
-            // files faster than a large sweep completes used to livelock on
-            // partial scans. The level bump above already schedules the next
-            // sweep, and the client ignores workspace results for URIs it
-            // tracks by document pull, so the open file loses nothing.
+            // The in-flight workspace sweep is deliberately left to finish —
+            // see the didOpen branch above.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {

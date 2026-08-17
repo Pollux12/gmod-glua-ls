@@ -1158,7 +1158,12 @@ fn local_function_call_sites(
     let syntax_ids = match cache.local_function_call_sites_cache.get(&target_decl_id) {
         Some(cached) => cached.clone(),
         None => {
-            let ids = Arc::new(find_local_function_call_sites(db, file_id, root, target_decl_id));
+            let ids = Arc::new(find_local_function_call_sites(
+                db,
+                file_id,
+                root,
+                target_decl_id,
+            ));
             cache
                 .local_function_call_sites_cache
                 .insert(target_decl_id, ids.clone());
@@ -1367,28 +1372,16 @@ fn find_param_type_from_sibling_members(
 type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
 
 thread_local! {
-    /// Memo for [`find_param_type_from_inherited_members`], paired with the
-    /// `type_structure_revision` it was built against.
-    ///
-    /// Thread-local rather than a field on `DbIndex` because `&DbIndex` is
-    /// shared across worker threads, so the memo cannot live behind a `RefCell`
-    /// on the struct without giving up `Sync`.
+    /// Memo for [`find_param_type_from_inherited_members`], guarded by the
+    /// `type_structure_revision` it was built against. Thread-local because
+    /// `&DbIndex` is shared across worker threads.
     static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
         std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
 }
 
 /// The parameter's type as declared by an inherited member, if any.
-///
-/// This is the single most expensive step of parameter inference: the
-/// unresolve pipeline's reachability probe calls it once per deferred
-/// parameter, and on the CityRP benchmark it accounted for ~0.29s of a 2.29s
-/// edit — almost entirely in the visibility-aware member lookup it performs per
-/// super type.
-///
-/// The same key is asked repeatedly across the retry loop's iterations, so the
-/// answer is memoized against `type_structure_revision`: any mutable access to
-/// the type or member index discards the memo, which makes a stale answer
-/// impossible even though the loop mutates the db as it resolves.
+/// Memoized against `type_structure_revision`, which any mutable index access
+/// bumps, so a stale answer is impossible.
 fn find_param_type_from_inherited_members(
     db: &DbIndex,
     current_member_id: LuaMemberId,

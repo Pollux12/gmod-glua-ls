@@ -43,10 +43,8 @@ async fn apply_document_update_without_queuing(
         return None;
     }
 
-    // `write().await` joins the RwLock's fair queue, so new readers line up
-    // behind this writer. A `try_write` spin does not: under the steady stream
-    // of `blocking_read()` diagnostic workers it can fail for seconds, and
-    // every request gated on document freshness stalls with it.
+    // Fair-queued `write().await`, not a `try_write` spin, which can starve
+    // for seconds under a stream of readers.
     let mut analysis = context.analysis().write().await;
 
     // The lock wait is unbounded, so re-check staleness now that we hold it.
@@ -83,11 +81,8 @@ async fn apply_document_update_without_queuing(
         (analysis.update_file_text_only(uri, text), None)
     };
 
-    // Only an update that touched the index can invalidate the shared
-    // diagnostic data — precomputing it is a workspace-wide scan. The
-    // `trigger_reindex == false` paths write VFS text and the parsed tree and
-    // leave the index alone, and the debounced reindex that follows invalidates
-    // under its own write lock before any reader can see the new index.
+    // Text-only updates leave the index alone; the debounced reindex
+    // invalidates under its own write lock.
     if file_id.is_some() && trigger_reindex {
         context
             .file_diagnostic()
@@ -436,9 +431,7 @@ pub async fn on_did_close_document(
     let uri = &params.text_document.uri;
     let lsp_features = context.lsp_features();
 
-    // The pull path remembers each file's last report so it can replay it
-    // instead of claiming a file is clean. A closed document has no reader for
-    // that entry; the next pull recomputes it if the file comes back.
+    // A closed document has no reader for its cached replay report.
     if lsp_features.supports_pull_diagnostic() {
         context
             .file_diagnostic()
