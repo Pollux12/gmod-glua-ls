@@ -89,6 +89,17 @@ pub struct DbIndex {
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
     file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
+    /// Bumped whenever a caller takes a *mutable* handle to the type or member
+    /// index. Consumers memoizing derived facts about types and members key
+    /// their cache on it, so any potential write invalidates the memo.
+    ///
+    /// Deliberately conservative: it counts handing out the handle, not actual
+    /// writes, so it can over-invalidate but can never miss a mutation. That
+    /// trade is the point — a missed mutation is a wrong answer, an extra
+    /// invalidation is only a cache miss. Note this is distinct from
+    /// `Vfs::content_revision`, which only moves when file *content* changes and
+    /// so does not see writes made by analysis itself.
+    type_structure_revision: u64,
 }
 
 /// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
@@ -114,6 +125,7 @@ impl Default for DbIndex {
 impl DbIndex {
     pub fn new() -> Self {
         Self {
+            type_structure_revision: 0,
             decl_index: LuaDeclIndex::new(),
             references_index: LuaReferenceIndex::new(),
             types_index: LuaTypeIndex::new(),
@@ -233,7 +245,14 @@ impl DbIndex {
     }
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
+        self.type_structure_revision += 1;
         &mut self.types_index
+    }
+
+    /// See [`Self::type_structure_revision`]. Memos over type/member-derived
+    /// facts must be discarded when this changes.
+    pub fn type_structure_revision(&self) -> u64 {
+        self.type_structure_revision
     }
 
     pub fn get_inference_fact(&self, node: &LuaInferenceNodeId) -> Option<LuaTypeFact> {
@@ -259,6 +278,9 @@ impl DbIndex {
         &mut self,
         mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
     ) -> HashSet<FileId> {
+        // Writes into `types_index` below go direct rather than through
+        // `get_type_index_mut`, so bump the revision here too.
+        self.type_structure_revision += 1;
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
         let mut conflicting_nodes = HashSet::new();
@@ -319,6 +341,7 @@ impl DbIndex {
     }
 
     pub fn get_member_index_mut(&mut self) -> &mut LuaMemberIndex {
+        self.type_structure_revision += 1;
         &mut self.members_index
     }
 
@@ -511,6 +534,7 @@ impl DbIndex {
 
 impl LuaIndex for DbIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.type_structure_revision += 1;
         self.decl_index.remove(file_id);
         self.references_index.remove(file_id);
         self.types_index.remove(file_id);
@@ -537,6 +561,7 @@ impl LuaIndex for DbIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
+        self.type_structure_revision += 1;
         if let [file_id] = file_ids {
             self.remove(*file_id);
             return;
@@ -609,6 +634,7 @@ impl LuaIndex for DbIndex {
     }
 
     fn clear(&mut self) {
+        self.type_structure_revision += 1;
         self.decl_index.clear();
         self.references_index.clear();
         self.types_index.clear();
