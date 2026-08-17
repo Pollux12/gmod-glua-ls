@@ -58,7 +58,7 @@ impl MemberAssignmentContributionStore {
 
     /// Drops every entry the removed files contributed, in one sweep keyed by
     /// file rather than a whole-store scan per file.
-    pub fn remove_files(&mut self, removed: &HashSet<FileId>) {
+    pub fn remove_files<S: std::hash::BuildHasher>(&mut self, removed: &HashSet<FileId, S>) {
         for file_id in removed {
             let Some(entries) = self.by_file.remove(file_id) else {
                 continue;

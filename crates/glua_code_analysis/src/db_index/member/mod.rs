@@ -7,7 +7,8 @@ mod lua_owner_members;
 
 use glua_parser::LuaSyntaxKind;
 use rowan::{TextRange, TextSize};
-use std::collections::{BTreeMap, HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::BTreeMap;
 
 use super::traits::LuaIndex;
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
@@ -75,20 +76,20 @@ impl Default for LuaMemberIndex {
 impl LuaMemberIndex {
     pub fn new() -> Self {
         Self {
-            members: HashMap::new(),
-            in_filed: HashMap::new(),
-            owner_members: HashMap::new(),
-            member_current_owner: HashMap::new(),
-            member_owner_key_index: HashMap::new(),
-            member_owner_key_history_index: HashMap::new(),
-            current_owner_member_history: HashMap::new(),
-            current_members_by_key: HashMap::new(),
-            non_overwriting_assignment_members: HashSet::new(),
-            conditional_branch_assignment_members: HashSet::new(),
-            synthesized_owner_members: HashSet::new(),
-            deferred_index_expr_members: HashSet::new(),
-            function_scope_ranges: HashMap::new(),
-            member_function_scope_ranges: HashMap::new(),
+            members: HashMap::default(),
+            in_filed: HashMap::default(),
+            owner_members: HashMap::default(),
+            member_current_owner: HashMap::default(),
+            member_owner_key_index: HashMap::default(),
+            member_owner_key_history_index: HashMap::default(),
+            current_owner_member_history: HashMap::default(),
+            current_members_by_key: HashMap::default(),
+            non_overwriting_assignment_members: HashSet::default(),
+            conditional_branch_assignment_members: HashSet::default(),
+            synthesized_owner_members: HashSet::default(),
+            deferred_index_expr_members: HashSet::default(),
+            function_scope_ranges: HashMap::default(),
+            member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
         }
     }
@@ -1238,7 +1239,7 @@ impl LuaMemberIndex {
     /// O(files × index) and dominated incremental edits of high fan-in files.
     fn remove_file_owned_entries(&mut self, file_id: FileId) {
         if let Some(member_ids) = self.in_filed.remove(&file_id) {
-            let mut owners = HashSet::new();
+            let mut owners = HashSet::default();
             for member_id_or_owner in member_ids {
                 match member_id_or_owner {
                     MemberOrOwner::Member(member_id) => {
