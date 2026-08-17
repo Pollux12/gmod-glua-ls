@@ -128,6 +128,14 @@ pub struct LuaInferCache {
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
+    /// Call sites of a local function, keyed by its declaration.
+    ///
+    /// Resolving them walks down from the root once per reference, and parameter
+    /// inference re-runs the whole scan once per parameter index — so a function
+    /// with N parameters re-derived the same call sites N times. Syntax ids are
+    /// stored rather than nodes, matching the rest of this cache (red nodes are
+    /// `!Send`); re-resolving an id is a memo hit.
+    pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
     inferred_guard_dependencies: HashSet<LuaInferredGuardOwner>,
 }
 
@@ -161,6 +169,7 @@ impl LuaInferCache {
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
             vgui_parent_fallback_calls: FxHashSet::default(),
+            local_function_call_sites_cache: FxHashMap::default(),
             inferred_guard_dependencies: HashSet::new(),
         }
     }

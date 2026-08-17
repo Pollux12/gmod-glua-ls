@@ -159,6 +159,10 @@ mod alloc_sample {
     /// Frame address -> number of sampled allocations whose stack contained it.
     /// Addresses are resolved to names once, at report time.
     static FRAMES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
+    /// Ordered stacks (innermost first) -> count. Kept alongside FRAMES because
+    /// "which of our functions asked for this memory" needs frame order, which
+    /// the flat per-frame tally throws away.
+    static STACKS: Mutex<Option<HashMap<Box<[usize]>, u64>>> = Mutex::new(None);
 
     thread_local! {
         /// Capturing a backtrace allocates; without this guard the sampler
@@ -212,6 +216,13 @@ mod alloc_sample {
                 .iter()
                 .map(|&ip| ip as usize)
                 .collect();
+            {
+                let mut stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
+                *stacks
+                    .get_or_insert_with(HashMap::new)
+                    .entry(ips.as_slice().into())
+                    .or_insert(0) += 1;
+            }
             let mut frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
             let frames = frames.get_or_insert_with(HashMap::new);
             // Count each frame once per sample, so the number reads as "share of
@@ -223,6 +234,59 @@ mod alloc_sample {
             }
             sampling.set(false);
         });
+    }
+
+    /// Attribute each sampled allocation to the innermost frame belonging to our
+    /// own crates. The inclusive tally says an allocation happened *somewhere*
+    /// under a function; this says which of our functions actually asked for the
+    /// memory, which is the line you can go and change.
+    fn nearest_caller_report(top: usize) {
+        let stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(stacks) = stacks.as_ref() else {
+            return;
+        };
+        let total: u64 = stacks.values().sum();
+        if total == 0 {
+            return;
+        }
+
+        let mut names: HashMap<usize, Option<String>> = HashMap::new();
+        let mut resolve = |ip: usize| -> Option<String> {
+            names
+                .entry(ip)
+                .or_insert_with(|| {
+                    let mut found = None;
+                    backtrace::resolve(ip as *mut _, |symbol| {
+                        if found.is_none() {
+                            found = symbol.name().map(|name| name.to_string());
+                        }
+                    });
+                    found
+                })
+                .clone()
+        };
+
+        let mut by_caller: HashMap<String, u64> = HashMap::new();
+        for (stack, count) in stacks {
+            let owner = stack.iter().find_map(|&ip| {
+                let name = resolve(ip)?;
+                (name.starts_with("glua_") && !name.contains("::profile::")).then_some(name)
+            });
+            let owner = owner.unwrap_or_else(|| "<no glua frame>".to_string());
+            let owner = owner
+                .rsplit_once("::h")
+                .filter(|(_, hash)| hash.len() == 16)
+                .map_or(owner.as_str(), |(head, _)| head)
+                .to_string();
+            *by_caller.entry(owner).or_insert(0) += count;
+        }
+
+        let mut rows: Vec<_> = by_caller.into_iter().collect();
+        rows.sort_unstable_by_key(|(_, count)| std::cmp::Reverse(*count));
+        eprintln!("\n=== allocations by nearest owning function ({total} samples) ===");
+        for (name, count) in rows.into_iter().take(top) {
+            eprintln!("{:>6.2}%  {name}", (count as f64 / total as f64) * 100.0);
+        }
     }
 
     /// Print the functions that appear most often across sampled allocations.
@@ -254,6 +318,8 @@ mod alloc_sample {
                 *by_name.entry(name).or_insert(0) += count;
             });
         }
+
+        nearest_caller_report(top);
 
         let mut rows: Vec<_> = by_name
             .into_iter()
