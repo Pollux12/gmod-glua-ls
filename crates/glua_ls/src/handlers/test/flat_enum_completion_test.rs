@@ -24,11 +24,13 @@ mod tests {
             VirtualCompletionItem {
                 label: "EF_BONEMERGE".to_string(),
                 kind: CompletionItemKind::ENUM_MEMBER,
+                label_detail: Some(" = 1".to_string()),
                 ..Default::default()
             },
             VirtualCompletionItem {
                 label: "EF_NODRAW".to_string(),
                 kind: CompletionItemKind::ENUM_MEMBER,
+                label_detail: Some(" = 32".to_string()),
                 ..Default::default()
             },
         ]

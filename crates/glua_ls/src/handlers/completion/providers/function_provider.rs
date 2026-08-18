@@ -630,21 +630,18 @@ fn add_enum_members_completion(
     is_flat: bool,
 ) -> Option<()> {
     let owner_id = LuaMemberOwner::Type(type_id.clone());
-    let members = builder
-        .semantic_model
-        .get_db()
+    let db = builder.semantic_model.get_db();
+    let type_decl = db.get_type_index().get_type_decl(type_id)?;
+    let members = db
         .get_member_index()
         .get_members(&owner_id)?
         .iter()
         .map(|it| {
-            let db = builder.semantic_model.get_db();
             (
                 it.get_key().clone(),
-                db.get_type_index()
-                    .get_type_cache(&it.get_id().into())
-                    .unwrap_or(&LuaTypeCache::InferType(LuaType::Unknown))
-                    .as_type()
-                    .clone(),
+                type_decl
+                    .get_enum_member_value(db, it)
+                    .unwrap_or(LuaType::Unknown),
                 db.get_property_index()
                     .get_property(&LuaSemanticDeclId::Member(it.get_id()))
                     .and_then(|property| property.description.as_deref().cloned()),
@@ -670,12 +667,20 @@ fn add_enum_members_completion(
     // 遍历成员并生成补全项
     for (key, typ, description) in members {
         // A flat enum's members are globals: the member key is what belongs in
-        // the source, so it is both the label and the inserted text.
+        // the source, so it is both the label and the inserted text. The value
+        // stays visible beside it, since that is what the name stands for.
+        let mut value_detail = None;
         let label = if is_flat && !is_string_literal_trigger {
-            match key {
-                LuaMemberKey::Name(str) => str.to_string(),
-                _ => continue,
+            let LuaMemberKey::Name(str) = key else {
+                continue;
+            };
+            if !typ.is_unknown() {
+                value_detail = Some(format!(
+                    " = {}",
+                    humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal)
+                ));
             }
+            str.to_string()
         } else if is_string_literal_trigger {
             let mut label =
                 humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal);
@@ -700,7 +705,7 @@ fn add_enum_members_completion(
             label,
             kind: Some(lsp_types::CompletionItemKind::ENUM_MEMBER),
             label_details: Some(lsp_types::CompletionItemLabelDetails {
-                detail: None,
+                detail: value_detail,
                 description: Some(type_id.get_name().to_string()),
             }),
             documentation: description.map(Documentation::String),
