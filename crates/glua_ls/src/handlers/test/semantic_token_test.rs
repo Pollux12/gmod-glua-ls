@@ -164,6 +164,50 @@ local x = 1
     }
 
     #[gtest]
+    fn test_doc_tag_outparam_highlights_tag_and_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@outparam config.output string
+---@param config table
+function fill(config) end
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        let doc_modifiers = &[
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::DOCUMENTATION,
+        ];
+
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                4,
+                8,
+                SemanticTokenType::KEYWORD,
+                &[SemanticTokenModifier::DOCUMENTATION]
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                13,
+                13,
+                SemanticTokenType::PARAMETER,
+                doc_modifiers
+            ),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
     fn test_string_literal_segments_use_utf16_lengths() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
         let main = ws.def_file("main.lua", "local s = \"😀\\n\"\n");

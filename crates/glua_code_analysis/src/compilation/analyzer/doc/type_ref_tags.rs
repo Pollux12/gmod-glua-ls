@@ -297,14 +297,6 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         return None;
     };
     let field_path = path_segments.collect::<Vec<_>>();
-    if field_path.is_empty() {
-        report_invalid_outparam(
-            analyzer,
-            &tag,
-            format!("outparam `{path}` must target at least one field"),
-        );
-        return None;
-    }
 
     let type_ref = tag
         .get_type()
