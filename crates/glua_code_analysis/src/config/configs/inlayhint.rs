@@ -44,7 +44,7 @@ pub struct EmmyrcInlayHint {
     /// ```lua
     /// ent:AddEffects(32 --[[ Hint: EF_NODRAW ]])
     /// ```
-    #[serde(default = "default_false")]
+    #[serde(default = "default_true")]
     #[schemars(extend("x-vscode-setting" = true))]
     pub enum_param_hint: bool,
     /// Show an inlay hint after closing `end` keywords indicating what block
@@ -73,7 +73,7 @@ impl Default for EmmyrcInlayHint {
             local_hint: default_true(),
             override_hint: default_true(),
             meta_call_hint: default_true(),
-            enum_param_hint: default_false(),
+            enum_param_hint: default_true(),
             closing_end_hint: default_true(),
             closing_end_hint_control_flow: default_false(),
             closing_end_hint_min_lines: default_min_lines(),

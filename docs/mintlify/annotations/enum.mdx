@@ -130,7 +130,7 @@ Both `@enum` and `@alias` with `---|` can describe a fixed set of values. Use:
 
 GMod's built-in enums, such as `EF`, `MASK`, `TEAM`, and `MOVETYPE`, come from the downloaded annotations as flat enums. You do not need to redeclare them.
 
-Enable `hint.enumParamHint` to show the member name beside a raw value:
+`hint.enumParamHint` shows the member name beside a raw value. It is on by default; set it to `false` to turn it off:
 
 ```lua
 Entity:AddEffects(32) -- EF_NODRAW

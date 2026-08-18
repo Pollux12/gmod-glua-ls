@@ -2255,7 +2255,7 @@
           "x-vscode-setting": true
         },
         "enumParamHint": {
-          "default": false,
+          "default": true,
           "description": "Show name of enumerator when passing a literal value to a function\nthat expects an enum, including Garry's Mod enums such as `EF`\nand `MASK`.\n\nExample:\n\n```lua\nent:AddEffects(32 --[[ Hint: EF_NODRAW ]])\n```",
           "type": "boolean",
           "x-vscode-setting": true
@@ -3098,7 +3098,7 @@
         "closingEndHint": true,
         "closingEndHintControlFlow": false,
         "closingEndHintMinLines": 15,
-        "enumParamHint": false,
+        "enumParamHint": true,
         "indexHint": true,
         "localHint": true,
         "metaCallHint": true,
