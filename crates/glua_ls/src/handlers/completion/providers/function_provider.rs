@@ -16,7 +16,8 @@ use std::sync::Arc;
 
 use crate::handlers::{
     completion::{
-        add_completions::CompletionTriggerStatus, completion_builder::CompletionBuilder,
+        add_completions::{CompletionTriggerStatus, scalar_literal_detail},
+        completion_builder::CompletionBuilder,
         providers::member_provider::add_completions_for_members,
     },
     signature_helper::get_current_param_index,
@@ -666,21 +667,22 @@ fn add_enum_members_completion(
 
     // 遍历成员并生成补全项
     for (key, typ, description) in members {
+        // The value a member stands for stays visible beside its name, matching
+        // how declarations and members present literals elsewhere. Not under a
+        // string-literal trigger, where the value is already the label.
+        let value_detail = if is_string_literal_trigger {
+            None
+        } else {
+            scalar_literal_detail(&typ)
+        };
+
         // A flat enum's members are globals: the member key is what belongs in
-        // the source, so it is both the label and the inserted text. The value
-        // stays visible beside it, since that is what the name stands for.
-        let mut value_detail = None;
+        // the source, so it is both the label and the inserted text.
         let label = if is_flat && !is_string_literal_trigger {
-            let LuaMemberKey::Name(str) = key else {
-                continue;
-            };
-            if !typ.is_unknown() {
-                value_detail = Some(format!(
-                    " = {}",
-                    humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal)
-                ));
+            match key {
+                LuaMemberKey::Name(str) => str.to_string(),
+                _ => continue,
             }
-            str.to_string()
         } else if is_string_literal_trigger {
             let mut label =
                 humanize_type(builder.semantic_model.get_db(), &typ, RenderLevel::Minimal);

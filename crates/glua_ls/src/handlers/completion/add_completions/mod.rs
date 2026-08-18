@@ -9,6 +9,7 @@ pub use add_member_completion::{
     CompletionTriggerStatus, add_member_completion_with_description_hint,
 };
 pub use check_match_word::check_match_word;
+pub(crate) use completion_item_info::scalar_literal_detail;
 pub(crate) use completion_item_info::{
     color_info_from_expr, color_info_from_type, color_label_detail, color_preview_documentation,
     is_color_type,

@@ -25,13 +25,11 @@ mod tests {
                 label: "EF_BONEMERGE".to_string(),
                 kind: CompletionItemKind::ENUM_MEMBER,
                 label_detail: Some(" = 1".to_string()),
-                ..Default::default()
             },
             VirtualCompletionItem {
                 label: "EF_NODRAW".to_string(),
                 kind: CompletionItemKind::ENUM_MEMBER,
                 label_detail: Some(" = 32".to_string()),
-                ..Default::default()
             },
         ]
     }
@@ -147,12 +145,12 @@ mod tests {
                 VirtualCompletionItem {
                     label: "TEXFILTER.NONE".to_string(),
                     kind: CompletionItemKind::ENUM_MEMBER,
-                    ..Default::default()
+                    label_detail: Some(" = 0".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "TEXFILTER.POINT".to_string(),
                     kind: CompletionItemKind::ENUM_MEMBER,
-                    ..Default::default()
+                    label_detail: Some(" = 1".to_string()),
                 },
             ],
         ));
