@@ -1,8 +1,8 @@
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocDescription,
-    LuaDocDescriptionOwner, LuaDocGenericDeclList, LuaDocTagAlias, LuaDocTagAttribute,
-    LuaDocTagClass, LuaDocTagEnum, LuaDocTagGeneric, LuaFuncStat, LuaKind, LuaLocalName,
-    LuaLocalStat, LuaNameExpr, LuaSyntaxId, LuaSyntaxKind, LuaTokenKind, LuaVarExpr,
+    LuaDocDescriptionOwner, LuaDocDetailOwner, LuaDocGenericDeclList, LuaDocTagAlias,
+    LuaDocTagAttribute, LuaDocTagClass, LuaDocTagEnum, LuaDocTagGeneric, LuaFuncStat, LuaKind,
+    LuaLocalName, LuaLocalStat, LuaNameExpr, LuaSyntaxId, LuaSyntaxKind, LuaTokenKind, LuaVarExpr,
 };
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -16,7 +16,8 @@ use crate::{
     LuaTypeCache, LuaTypeDeclId,
     compilation::analyzer::common::bind_type,
     db_index::{
-        LuaDeclId, LuaGenericParamInfo, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
+        LuaDeclId, LuaGenericParamInfo, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberKey,
+        LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     },
 };
 use std::sync::Arc;
@@ -125,11 +126,82 @@ pub fn analyze_enum(analyzer: &mut DocAnalyzer, tag: LuaDocTagEnum) -> Option<()
 
     add_description_for_type_decl(analyzer, &enum_decl_id, tag.get_descriptions());
 
-    if !comment_has_explicit_owner_type(&analyzer.comment) {
+    let is_flat = analyze_enum_fields(analyzer, &enum_decl_id, &tag);
+
+    // A flat enum has no runtime table to bind to; binding would attach the enum
+    // type to whatever statement happens to follow the annotation block.
+    if !is_flat && !comment_has_explicit_owner_type(&analyzer.comment) {
         bind_def_type(analyzer, LuaType::Def(enum_decl_id.clone()));
     }
 
     Some(())
+}
+
+/// Registers each `---|` field as a member of the enum. Returns whether the enum
+/// is flat, i.e. declared its constants as fields rather than owning a table.
+fn analyze_enum_fields(
+    analyzer: &mut DocAnalyzer,
+    enum_decl_id: &LuaTypeDeclId,
+    tag: &LuaDocTagEnum,
+) -> bool {
+    let fields = tag.get_fields();
+    if fields.is_empty() {
+        return false;
+    }
+
+    let file_id = analyzer.file_id;
+    let owner_id = LuaMemberOwner::Type(enum_decl_id.clone());
+    let decl_feature = if analyzer.is_meta {
+        LuaMemberFeature::MetaFieldDecl
+    } else {
+        LuaMemberFeature::FileFieldDecl
+    };
+
+    let mut registered = false;
+    for field in fields {
+        let Some(name_token) = field.get_name_token() else {
+            continue;
+        };
+
+        let key = LuaMemberKey::Name(name_token.get_name_text().to_string().into());
+        let member_id = LuaMemberId::new(field.get_syntax_id(), file_id);
+        let member = LuaMember::new(member_id, key.clone(), decl_feature, None);
+
+        analyzer.db.get_reference_index_mut().add_index_reference(
+            key,
+            file_id,
+            field.get_syntax_id(),
+        );
+        analyzer
+            .db
+            .get_member_index_mut()
+            .add_member(owner_id.clone(), member);
+
+        if let Some(detail) = field.get_detail_text() {
+            let semantic_id = LuaSemanticDeclId::Member(member_id);
+            let description = preprocess_description(&detail, Some(&semantic_id));
+            if !description.is_empty() {
+                analyzer.db.get_property_index_mut().add_description(
+                    file_id,
+                    semantic_id,
+                    description,
+                );
+            }
+        }
+
+        registered = true;
+    }
+
+    if registered
+        && let Some(enum_decl) = analyzer
+            .db
+            .get_type_index_mut()
+            .get_type_decl_mut(enum_decl_id)
+    {
+        enum_decl.mark_flat_enum();
+    }
+
+    registered
 }
 
 fn comment_has_explicit_owner_type(comment: &LuaComment) -> bool {

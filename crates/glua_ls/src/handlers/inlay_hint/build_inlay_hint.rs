@@ -1092,8 +1092,12 @@ fn process_enum_hint_for_arg(
         _ => {}
     }
 
-    let enum_name = type_decl.get_name();
-    let hint_text = format!("{}.{}", enum_name, member_name);
+    // A flat enum has no table to qualify with; the member name is the source form.
+    let hint_text = if type_decl.is_flat_enum() {
+        member_name
+    } else {
+        format!("{}.{}", type_decl.get_name(), member_name)
+    };
 
     let document = semantic_model.get_document();
     let range = arg.get_range();
@@ -1135,14 +1139,10 @@ fn find_matching_enum_member<'a>(
                 (LuaMemberKey::ExprType(typ), _) => typ == arg_type,
                 _ => false,
             }
-        } else if let Some(type_cache) = semantic_model
-            .get_db()
-            .get_type_index()
-            .get_type_cache(&member_decl.get_id().into())
-        {
-            type_cache.as_type() == arg_type
         } else {
-            false
+            type_decl
+                .get_enum_member_value(semantic_model.get_db(), member_decl)
+                .is_some_and(|member_type| member_type == *arg_type)
         };
 
         if is_match {

@@ -391,12 +391,12 @@ mod tests {
                 VirtualCompletionItem {
                     label: "EP.A".to_string(),
                     kind: CompletionItemKind::ENUM_MEMBER,
-                    ..Default::default()
+                    label_detail: Some(" = \"A\"".to_string()),
                 },
                 VirtualCompletionItem {
                     label: "EP.B".to_string(),
                     kind: CompletionItemKind::ENUM_MEMBER,
-                    ..Default::default()
+                    label_detail: Some(" = \"B\"".to_string()),
                 },
             ],
         ));

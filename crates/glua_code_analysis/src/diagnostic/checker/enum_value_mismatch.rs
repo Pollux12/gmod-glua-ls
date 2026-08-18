@@ -110,6 +110,12 @@ fn get_enum_value_types(
     enum_decl_id: &LuaTypeDeclId,
 ) -> Option<Vec<LuaType>> {
     let type_decl = context.db.get_type_index().get_type_decl(enum_decl_id)?;
+    // `---@enum X : T` declares that any `T` is a valid value, so an unlisted
+    // constant is not a mismatch. Garry's Mod combines numeric enums bitwise.
+    if type_decl.get_enum_base().is_some() {
+        return None;
+    }
+
     let mut values = Vec::new();
     let is_enum_key = type_decl.is_enum_key();
 
@@ -135,15 +141,18 @@ fn get_enum_value_types(
                     }
                     _ => {}
                 }
-            } else if let Some(type_cache) = context
-                .db
-                .get_type_index()
-                .get_type_cache(&member.get_id().into())
-                && let Some(value) = get_constant_type(type_cache.as_type())
+            } else if let Some(member_type) = type_decl.get_enum_member_value(context.db, member)
+                && let Some(value) = get_constant_type(&member_type)
             {
                 values.push(value.clone());
             }
         }
+    }
+
+    // Without any resolvable value there is nothing to compare against, so
+    // reporting every comparison as a mismatch would be noise.
+    if values.is_empty() {
+        return None;
     }
 
     Some(values)
