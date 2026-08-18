@@ -2,6 +2,7 @@ mod code_actions_test;
 mod completion_resolve_test;
 mod completion_test;
 mod definition_test;
+mod flat_enum_completion_test;
 mod hover_function_test;
 mod hover_test;
 mod implementation_test;

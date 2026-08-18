@@ -2,7 +2,7 @@ use internment::ArcIntern;
 use rowan::TextRange;
 use smol_str::SmolStr;
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashSet},
     hash::Hash,
     ops::Deref,
     sync::Arc,
@@ -137,6 +137,13 @@ impl PartialEq for LuaType {
 
 impl Eq for LuaType {}
 
+/// `PartialEq` compares contents, so `Hash` must be derived from contents
+/// too. The `Arc`-wrapped variants used to hash `Arc::as_ptr` instead,
+/// which broke the `k1 == k2 => hash(k1) == hash(k2)` contract: two
+/// content-equal types allocated separately landed in different buckets, so
+/// a lookup hit or missed depending on where the allocator happened to
+/// place them — per process, ~1 run in 10 resolved a dynamic member
+/// differently and shifted a diagnostic.
 impl Hash for LuaType {
     fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
         match self {
@@ -165,69 +172,43 @@ impl Hash for LuaType {
             LuaType::Call(a) => (23, a).hash(state),
             LuaType::Tuple(a) => (25, a).hash(state),
             LuaType::DocFunction(a) => (26, a).hash(state),
-            LuaType::Object(a) => {
-                let ptr = Arc::as_ptr(a);
-                (27, ptr).hash(state)
-            }
-            LuaType::Union(a) => {
-                let ptr = Arc::as_ptr(a);
-                (28, ptr).hash(state)
-            }
-            LuaType::Intersection(a) => {
-                let ptr = Arc::as_ptr(a);
-                (29, ptr).hash(state)
-            }
+            LuaType::Object(a) => (27, a.fields.len(), a.index_access.len()).hash(state),
+            // The inner variant tag widens the summary at no cost: `T?` is by
+            // far the most common union, so arity alone puts every nullable in
+            // one bucket.
+            LuaType::Union(a) => match a.as_ref() {
+                LuaUnionType::Nullable(inner) => {
+                    (28, 2usize, std::mem::discriminant(inner)).hash(state)
+                }
+                LuaUnionType::Multi(types) => (28, types.len()).hash(state),
+            },
+            LuaType::Intersection(a) => (29, a.types.len()).hash(state),
             LuaType::MergedTable(a) => (54, a).hash(state),
-            LuaType::Generic(a) => {
-                let ptr = Arc::as_ptr(a);
-                (30, ptr).hash(state)
-            }
-            LuaType::TableGeneric(a) => {
-                let ptr = Arc::as_ptr(a);
-                (31, ptr).hash(state)
-            }
-            LuaType::TplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (32, ptr).hash(state)
-            }
-            LuaType::StrTplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (33, ptr).hash(state)
-            }
-            LuaType::Variadic(a) => {
-                let ptr = Arc::as_ptr(a);
-                (34, ptr).hash(state)
-            }
+            LuaType::Generic(a) => (30, &a.base, a.params.len()).hash(state),
+            LuaType::TableGeneric(a) => (31, a.len()).hash(state),
+            LuaType::TplRef(a) => (32, a.tpl_id).hash(state),
+            LuaType::StrTplRef(a) => (33, a.tpl_id).hash(state),
+            LuaType::Variadic(a) => match a.as_ref() {
+                VariadicType::Multi(types) => (34, 0u8, types.len()).hash(state),
+                VariadicType::Base(_) => (34, 1u8, 0usize).hash(state),
+            },
             LuaType::DocBooleanConst(a) => (35, a).hash(state),
             LuaType::Signature(a) => (36, a).hash(state),
             LuaType::Instance(a) => (37, a).hash(state),
             LuaType::DocStringConst(a) => (38, a).hash(state),
             LuaType::DocIntegerConst(a) => (39, a).hash(state),
             LuaType::Namespace(a) => (40, a).hash(state),
-            LuaType::MultiLineUnion(a) => {
-                let ptr = Arc::as_ptr(a);
-                (43, ptr).hash(state)
-            }
-            LuaType::TypeGuard(a) => {
-                let ptr = Arc::as_ptr(a);
-                (44, ptr).hash(state)
-            }
+            LuaType::MultiLineUnion(a) => (43, a.unions.len()).hash(state),
+            LuaType::TypeGuard(a) => (44, a.as_ref()).hash(state),
             LuaType::Never => 45.hash(state),
-            LuaType::ConstTplRef(a) => {
-                let ptr = Arc::as_ptr(a);
-                (46, ptr).hash(state)
-            }
+            LuaType::ConstTplRef(a) => (46, a.tpl_id).hash(state),
             LuaType::Language(a) => (47, a).hash(state),
             LuaType::ModuleRef(a) => (48, a).hash(state),
             LuaType::Conditional(a) => {
-                let ptr = Arc::as_ptr(a);
-                (49, ptr).hash(state)
+                (49, a.has_new, std::mem::discriminant(a.get_condition())).hash(state)
             }
             LuaType::ConditionalInfer(a) => (50, a).hash(state),
-            LuaType::Mapped(a) => {
-                let ptr = Arc::as_ptr(a);
-                (51, ptr).hash(state)
-            }
+            LuaType::Mapped(a) => (51, a.param.0, a.is_readonly, a.is_optional).hash(state),
             LuaType::DocAttribute(a) => (52, a).hash(state),
             LuaType::TableOf(a) => (53, a).hash(state),
         }
@@ -496,7 +477,21 @@ impl LuaType {
         matches!(self, LuaType::MultiLineUnion(_))
     }
 
+    /// Builds the canonical union of `types`.
     pub fn from_vec(types: Vec<LuaType>) -> Self {
+        if types.len() < 2 {
+            return Self::from_vec_structural(types);
+        }
+
+        crate::db_index::r#type::type_ops::union_type::union_type_all(types)
+    }
+
+    /// Flatten-and-deduplicate only, with no absorption rules.
+    ///
+    /// The terminal constructor used *inside* the pairwise union rules, where
+    /// routing back through [`from_vec`](Self::from_vec) would recurse forever.
+    /// Everywhere else, use `from_vec`.
+    pub(crate) fn from_vec_structural(types: Vec<LuaType>) -> Self {
         match types.len() {
             0 => LuaType::Nil,
             1 => types[0].clone(),
@@ -520,16 +515,29 @@ impl LuaType {
                     }
                 }
 
-                if result_types.len() > 1 && hash_set.remove(&LuaType::Unknown) {
-                    result_types.retain(|typ| !matches!(typ, LuaType::Unknown));
-                }
-
                 match result_types.len() {
                     0 => LuaType::Nil,
                     1 => result_types[0].clone(),
                     _ => LuaType::Union(LuaUnionType::from_vec(result_types).into()),
                 }
             }
+        }
+    }
+
+    /// [`from_vec`](Self::from_vec) for unions assembled from inference results.
+    ///
+    /// Same flattening and de-duplication, but the members come out in a
+    /// canonical order. See [`LuaUnionType::from_inferred_vec`] for why declared
+    /// unions must keep the author's order while inferred ones must not.
+    pub fn from_inferred_vec(types: Vec<LuaType>) -> Self {
+        match Self::from_vec(types) {
+            LuaType::Union(union) => match union.as_ref() {
+                LuaUnionType::Multi(members) => {
+                    LuaType::Union(LuaUnionType::from_inferred_vec(members.clone()).into())
+                }
+                LuaUnionType::Nullable(_) => LuaType::Union(union),
+            },
+            other => other,
         }
     }
 
@@ -632,7 +640,11 @@ impl LuaTupleType {
     }
 
     pub fn cast_down_array_base(&self, db: &DbIndex) -> LuaType {
-        let mut ty = LuaType::Unknown;
+        // Nothing to union: pin the escape value instead of returning the seed.
+        if self.types.is_empty() {
+            return LuaType::Unknown;
+        }
+        let mut ty = LuaType::Never;
         for t in &self.types {
             match t {
                 LuaType::IntegerConst(i) => {
@@ -711,7 +723,7 @@ pub fn table_const_array_base(db: &DbIndex, range: &InFiled<TextRange>) -> Optio
     let member_index = db.get_member_index();
     let members = member_index.get_members(&owner)?;
 
-    let mut ty = LuaType::Unknown;
+    let mut ty = LuaType::Never;
     let mut saw_integer_member = false;
     for member in members {
         if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {
@@ -899,9 +911,10 @@ pub enum LuaIndexAccessKey {
     Type(LuaType),
 }
 
+/// An anonymous table shape.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LuaObjectType {
-    fields: HashMap<LuaMemberKey, LuaType>,
+    fields: BTreeMap<LuaMemberKey, LuaType>,
     index_access: Vec<(LuaType, LuaType)>,
 }
 
@@ -922,7 +935,7 @@ impl TypeVisitTrait for LuaObjectType {
 
 impl LuaObjectType {
     pub fn new(object_fields: Vec<(LuaIndexAccessKey, LuaType)>) -> Self {
-        let mut fields = HashMap::new();
+        let mut fields = BTreeMap::new();
         let mut index_access = Vec::new();
         for (key, value_type) in object_fields.into_iter() {
             match key {
@@ -945,7 +958,7 @@ impl LuaObjectType {
     }
 
     pub fn new_with_fields(
-        fields: HashMap<LuaMemberKey, LuaType>,
+        fields: BTreeMap<LuaMemberKey, LuaType>,
         index_access: Vec<(LuaType, LuaType)>,
     ) -> Self {
         Self {
@@ -954,7 +967,7 @@ impl LuaObjectType {
         }
     }
 
-    pub fn get_fields(&self) -> &HashMap<LuaMemberKey, LuaType> {
+    pub fn get_fields(&self) -> &BTreeMap<LuaMemberKey, LuaType> {
         &self.fields
     }
 
@@ -980,7 +993,7 @@ impl LuaObjectType {
             for (key, value_type) in self.index_access.iter() {
                 if matches!(key, LuaType::Integer) {
                     if ty.is_none() {
-                        ty = Some(LuaType::Unknown);
+                        ty = Some(LuaType::Never);
                     }
                     if let Some(t) = ty {
                         ty = Some(TypeOps::Union.apply(db, &t, value_type));
@@ -990,7 +1003,12 @@ impl LuaObjectType {
             return ty;
         }
 
-        let mut ty = LuaType::Unknown;
+        // Nothing to union: pin the escape value instead of returning the seed.
+        if self.fields.is_empty() {
+            return Some(LuaType::Unknown);
+        }
+
+        let mut ty = LuaType::Never;
         let mut fields = self.fields.iter().collect::<Vec<_>>();
 
         fields.sort_by_key(|(a, _)| *a);
@@ -1043,10 +1061,6 @@ impl TypeVisitTrait for LuaUnionType {
 
 impl LuaUnionType {
     pub fn from_set(mut set: HashSet<LuaType>) -> Self {
-        if set.len() > 1 {
-            set.remove(&LuaType::Unknown);
-        }
-
         if set.len() == 2 && set.contains(&LuaType::Nil) {
             set.remove(&LuaType::Nil);
             if let Some(first) = set.iter().next() {
@@ -1064,21 +1078,39 @@ impl LuaUnionType {
     }
 
     pub fn from_vec(mut types: Vec<LuaType>) -> Self {
-        if types.len() > 1 && types.iter().any(|typ| !matches!(typ, LuaType::Unknown)) {
-            types.retain(|typ| !matches!(typ, LuaType::Unknown));
+        // Member order in a union is only ever consulted for members that
+        // take part in ordered resolution: overloads are matched and
+        // displayed in declaration order, and `` `T` ``|T resolves the
+        // string-template branch first on purpose. Every other union is a
+        // set, and leaving those in discovery order let an otherwise
+        // identical type render differently and offer a different first
+        // candidate to member resolution, purely because the contributing
+        // files were analysed in a different order or batch.
+        if types.len() > 1 && types.iter().all(Self::is_order_insensitive_member) {
+            types.sort_by_cached_key(lua_type_sort_key);
+            types.dedup();
         }
 
-        if types.len() == 2 {
-            if types.contains(&LuaType::Nil) {
-                let non_nil_type = types.iter().find(|t| !matches!(t, LuaType::Nil));
-                if let Some(ty) = non_nil_type {
-                    return Self::Nullable(ty.clone());
-                }
-            } else {
-                return Self::Multi(types);
-            }
+        if types.len() == 2
+            && types.contains(&LuaType::Nil)
+            && let Some(ty) = types.iter().find(|t| !matches!(t, LuaType::Nil))
+        {
+            return Self::Nullable(ty.clone());
         }
         Self::Multi(types)
+    }
+
+    /// Builds a union out of *inferred* alternatives, in a canonical order.
+    ///
+    /// Stronger than [`from_vec`]'s normalisation: this sorts even when the
+    /// union contains overload-like members, because a union assembled purely
+    /// from inference results carries no author intent about order.
+    pub fn from_inferred_vec(mut types: Vec<LuaType>) -> Self {
+        if types.len() > 1 {
+            types.sort_by_cached_key(lua_type_sort_key);
+            types.dedup();
+        }
+        Self::from_vec(types)
     }
 
     pub fn into_vec(&self) -> Vec<LuaType> {
@@ -1086,6 +1118,22 @@ impl LuaUnionType {
             LuaUnionType::Nullable(ty) => vec![ty.clone(), LuaType::Nil],
             LuaUnionType::Multi(types) => types.clone(),
         }
+    }
+
+    /// Whether a union member's position carries no meaning.
+    ///
+    /// Callables are matched and rendered in declaration order, and template
+    /// refs drive `` `T` ``|T dispatch, so a union containing either keeps the
+    /// order it was built with.
+    fn is_order_insensitive_member(typ: &LuaType) -> bool {
+        !matches!(
+            typ,
+            LuaType::Signature(_)
+                | LuaType::DocFunction(_)
+                | LuaType::TplRef(_)
+                | LuaType::StrTplRef(_)
+                | LuaType::ConstTplRef(_)
+        )
     }
 
     /// Borrowing iterator over the union members. Zero-allocation alternative to
@@ -1128,10 +1176,14 @@ impl LuaUnionType {
         }
     }
 
+    /// An `unknown` arm is a type that has not settled yet, not a statement that
+    /// the value may be absent, so it never makes the union optional on its own.
     pub fn is_optional(&self) -> bool {
         match self {
             LuaUnionType::Nullable(_) => true,
-            LuaUnionType::Multi(types) => types.iter().any(|t| t.is_optional()),
+            LuaUnionType::Multi(types) => types
+                .iter()
+                .any(|t| !matches!(t, LuaType::Unknown) && t.is_optional()),
         }
     }
 
@@ -1266,8 +1318,33 @@ impl TypeVisitTrait for LuaMergedTableType {
     }
 }
 
+/// Appends `types` to `out`, replacing every nested merged table by its own
+/// components so the result is the set of tables actually being merged.
+fn flatten_merged_tables(types: &[LuaType], out: &mut Vec<LuaType>) {
+    for typ in types {
+        match typ {
+            LuaType::MergedTable(nested) => flatten_merged_tables(nested.get_types(), out),
+            _ => out.push(typ.clone()),
+        }
+    }
+}
+
 impl LuaMergedTableType {
+    /// Builds a merged table, normalising it to the flat, ordered set of
+    /// the tables it is written from.
     pub fn new(types: Vec<LuaType>) -> Self {
+        let mut types = if types
+            .iter()
+            .any(|typ| matches!(typ, LuaType::MergedTable(_)))
+        {
+            let mut flattened = Vec::with_capacity(types.len());
+            flatten_merged_tables(&types, &mut flattened);
+            flattened
+        } else {
+            types
+        };
+        types.sort_by_key(lua_type_sort_key);
+        types.dedup();
         Self { types }
     }
 
@@ -1858,7 +1935,7 @@ impl LuaMappedType {
 /// The key is `(discriminant_ordinal, variant_detail)` where
 /// `variant_detail` differentiates same-variant entries cheaply
 /// (e.g., by pointer address for Arc-wrapped types, or by value for Copy types).
-fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
+pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
     let disc: u8 = match ty {
         LuaType::Nil => 0,
         LuaType::Boolean => 1,
@@ -1966,4 +2043,137 @@ fn hash_str_content(s: &str) -> u64 {
     let mut h = std::collections::hash_map::DefaultHasher::new();
     s.hash(&mut h);
     h.finish()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::GenericParam;
+    use std::collections::hash_map::DefaultHasher;
+    use std::hash::{Hash, Hasher};
+
+    fn hash_of(ty: &LuaType) -> u64 {
+        let mut hasher = DefaultHasher::new();
+        ty.hash(&mut hasher);
+        hasher.finish()
+    }
+
+    /// `k1 == k2` must imply `hash(k1) == hash(k2)`, for separately
+    /// allocated values.
+    #[test]
+    fn content_equal_types_hash_equal() {
+        let builders: Vec<(&str, fn() -> LuaType)> = vec![
+            ("TplRef", || {
+                LuaType::TplRef(Arc::new(GenericTpl::new(
+                    GenericTplId::Type(3),
+                    ArcIntern::new(SmolStr::new("T")),
+                    Some(LuaType::String),
+                )))
+            }),
+            ("ConstTplRef", || {
+                LuaType::ConstTplRef(Arc::new(GenericTpl::new(
+                    GenericTplId::Func(1),
+                    ArcIntern::new(SmolStr::new("K")),
+                    None,
+                )))
+            }),
+            ("Array", || {
+                LuaType::Array(Arc::new(LuaArrayType::from_base_type(LuaType::String)))
+            }),
+            ("StrTplRef", || {
+                LuaType::StrTplRef(Arc::new(LuaStringTplType::new(
+                    "pre",
+                    "T",
+                    GenericTplId::Type(0),
+                    "suf",
+                    None,
+                )))
+            }),
+            ("Variadic::Multi", || {
+                LuaType::Variadic(Arc::new(VariadicType::Multi(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                ])))
+            }),
+            ("Variadic::Base", || {
+                LuaType::Variadic(Arc::new(VariadicType::Base(LuaType::Number)))
+            }),
+            ("MultiLineUnion", || {
+                LuaType::MultiLineUnion(Arc::new(LuaMultiLineUnion::new(vec![
+                    (
+                        LuaType::DocStringConst(ArcIntern::new(SmolStr::new("a"))),
+                        None,
+                    ),
+                    (
+                        LuaType::DocStringConst(ArcIntern::new(SmolStr::new("b"))),
+                        None,
+                    ),
+                ])))
+            }),
+            ("TypeGuard", || {
+                LuaType::TypeGuard(Arc::new(LuaType::String))
+            }),
+            ("Union::Nullable", || {
+                LuaType::Union(Arc::new(LuaUnionType::Nullable(LuaType::String)))
+            }),
+            ("Union::Multi", || {
+                LuaType::Union(Arc::new(LuaUnionType::from_vec(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                    LuaType::Boolean,
+                ])))
+            }),
+            ("Object", || {
+                LuaType::Object(Arc::new(LuaObjectType::new(vec![(
+                    LuaIndexAccessKey::String(SmolStr::new("field")),
+                    LuaType::String,
+                )])))
+            }),
+            ("Intersection", || {
+                LuaType::Intersection(Arc::new(LuaIntersectionType::new(vec![
+                    LuaType::String,
+                    LuaType::Integer,
+                ])))
+            }),
+            ("Generic", || {
+                LuaType::Generic(Arc::new(LuaGenericType::new(
+                    LuaTypeDeclId::global("Box"),
+                    vec![LuaType::String],
+                )))
+            }),
+            ("TableGeneric", || {
+                LuaType::TableGeneric(Arc::new(vec![LuaType::String, LuaType::Integer]))
+            }),
+            ("Conditional", || {
+                LuaType::Conditional(Arc::new(LuaConditionalType::new(
+                    LuaType::String,
+                    LuaType::Integer,
+                    LuaType::Number,
+                    vec![],
+                    false,
+                )))
+            }),
+            ("Mapped", || {
+                LuaType::Mapped(Arc::new(LuaMappedType::new(
+                    (
+                        GenericTplId::Type(0),
+                        GenericParam::new(SmolStr::new("K"), None, None),
+                    ),
+                    LuaType::String,
+                    false,
+                    false,
+                )))
+            }),
+        ];
+
+        for (name, build) in builders {
+            let (left, right) = (build(), build());
+            assert_eq!(left, right, "{name} builders disagreed");
+            assert_eq!(
+                hash_of(&left),
+                hash_of(&right),
+                "{name} hashed its allocation, not its contents"
+            );
+        }
+    }
 }

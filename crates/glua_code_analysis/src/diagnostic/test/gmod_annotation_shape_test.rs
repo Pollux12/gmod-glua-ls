@@ -174,7 +174,7 @@ mod test {
     }
 
     #[gtest]
-    fn unguarded_table_index_field_access_still_warns() {
+    fn unguarded_table_index_field_access_is_still_reported() {
         let mut ws = VirtualWorkspace::new();
 
         let code = r#"
@@ -183,8 +183,14 @@ mod test {
             return T.someKey.Joinable
         "#;
 
+        // Still reported, but as a hint: an opaque table gives no nil evidence,
+        // so it does not earn the warning reserved for a definite nil.
         expect_that!(
             ws.check_code_for(DiagnosticCode::UncheckedNilAccess, code),
+            eq(true)
+        );
+        expect_that!(
+            ws.check_code_for(DiagnosticCode::NeedCheckNil, code),
             eq(false)
         );
     }

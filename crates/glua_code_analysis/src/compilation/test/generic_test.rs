@@ -894,9 +894,11 @@ mod test {
             );
 
             let result_ty = ws.expr_ty("A");
+            // `a + b` on two unannotated params is unresolved, not
+            // unconstrained: neither operand's type was ever established.
             assert_eq!(
                 ws.humanize_type_detailed(result_ty),
-                "Mock<fun(a, b) -> any>"
+                "Mock<fun(a, b) -> unknown>"
             );
         }
 

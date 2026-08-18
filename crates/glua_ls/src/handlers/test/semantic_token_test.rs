@@ -1527,4 +1527,27 @@ function my_global.action() end
 
         Ok(())
     }
+
+    #[gtest]
+    fn semantic_tokens_are_served_against_a_stale_index() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let file_id = ws.def("local function greet() return 1 end\ngreet()\n");
+
+        // VFS-only update: the tree offsets shift while the index still points
+        // at the old ones, exactly the state the handler now serves from.
+        let uri = ws
+            .analysis
+            .get_uri(file_id)
+            .expect("file should have a uri");
+        ws.analysis
+            .update_file_text_only(
+                &uri,
+                "\n\nlocal function greet() return 1 end\ngreet()\n".to_string(),
+            )
+            .expect("text-only update should keep the file");
+
+        let data = ws.get_semantic_token_data_for_file(file_id)?;
+
+        verify_that!(data.is_empty(), eq(false))
+    }
 }

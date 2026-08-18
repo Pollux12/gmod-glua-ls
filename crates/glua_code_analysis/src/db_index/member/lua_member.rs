@@ -228,7 +228,14 @@ impl Ord for LuaMemberKey {
             (Name(a), Name(b)) => a.cmp(b),
             (Name(_), _) => std::cmp::Ordering::Less,
             (_, Name(_)) => std::cmp::Ordering::Greater,
-            (ExprType(_), ExprType(_)) => std::cmp::Ordering::Equal,
+            // Reporting `Equal` for two different computed keys made this a
+            // partial order wearing `Ord`'s clothes: any sorted container keyed
+            // on `LuaMemberKey` would collapse distinct entries, and any sort
+            // over member keys was left at the mercy of the input order. Order
+            // computed keys by the same content-derived key the union types use.
+            (ExprType(a), ExprType(b)) => {
+                crate::db_index::lua_type_sort_key(a).cmp(&crate::db_index::lua_type_sort_key(b))
+            }
         }
     }
 }

@@ -8,11 +8,11 @@ pub(crate) mod gmod;
 mod infer_cache_manager;
 mod local_inference;
 mod lua;
-mod parallel;
+pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
-pub(crate) use lua::infer_for_range_iter_expr_func;
+pub(crate) use lua::{dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func};
 
 use std::{
     collections::{HashMap, HashSet},
@@ -23,7 +23,7 @@ use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
     LuaFunctionType, LuaInferenceNodeId, LuaInferredGuardOwner, LuaMember, LuaMemberFeature,
     LuaMemberId, LuaMemberKey, LuaSignatureId, LuaType, LuaTypeCache, LuaTypeDeclId, LuaTypeFact,
-    LuaTypeOwner, WorkspaceId,
+    LuaTypeOwner, LuaUnionType, WorkspaceId,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{DbIndex, LuaMemberOwner},
     profile::Profile,
@@ -73,10 +73,38 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         return;
     }
 
-    let contexts = module_analyze(db, need_analyzed_files);
+    let mut contexts = {
+        let _p = Profile::new("module_analyze");
+        module_analyze(db, need_analyzed_files)
+    };
+
+    // Declaration and documentation indexing runs for *every* workspace
+    // group before any group enters resolution. Both passes are per-file
+    // syntactic walks that only populate the decl/type/signature indexes,
+    // so hoisting them costs nothing — each file is still visited exactly
+    // once — but it guarantees that later stages observe the complete
+    // signature and type declaration set rather than only the groups
+    // analysed so far.
+    for (workspace_id, context) in contexts.iter_mut() {
+        context.workspace_id = Some(*workspace_id);
+        let profile_log = format!("declare workspace {}", workspace_id);
+        let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
+        run_analysis::<decl::DeclAnalysisPipeline>(db, context);
+        run_analysis::<doc::DocAnalysisPipeline>(db, context);
+    }
+
+    // Scripted-class and load call sites are collected for *every* group
+    // here, for the same reason declaration and documentation indexing is
+    // hoisted: they are per-file syntactic walks, and the passes that read
+    // them are not per-group.
+    {
+        let _p = Profile::new("collect_gmod_call_sites");
+        for (_, context) in contexts.iter_mut() {
+            gmod::collect_gmod_call_sites(db, context);
+        }
+    }
 
     for (workspace_id, mut context) in contexts {
-        context.workspace_id = Some(workspace_id);
         let profile_log = format!("analyze workspace {}", workspace_id);
         let _p = Profile::cond_new(&profile_log, context.tree_list.len() > 1);
         let workspace_file_ids = context
@@ -85,16 +113,27 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             .map(|in_filed_tree| in_filed_tree.file_id)
             .collect::<Vec<_>>();
 
-        run_analysis::<decl::DeclAnalysisPipeline>(db, &mut context);
-        run_analysis::<doc::DocAnalysisPipeline>(db, &mut context);
+        // Mirrors the per-group lifecycle of the infer-cache visibility flag:
+        // this group's dynamic-field facts are not complete until its own
+        // dynamic-field pass has run.
+        db.get_dynamic_field_index_mut().set_sealed(false);
+
         run_analysis::<gmod::GmodPreAnalysisPipeline>(db, &mut context);
-        let early_signature_owners = publish_callable_signatures(db, &context);
+        let early_signature_owners = {
+            let _p = Profile::new("publish_callable_signatures");
+            publish_callable_signatures(db, &context)
+        };
         run_analysis::<flow::FlowAnalysisPipeline>(db, &mut context);
 
-        let early_member_owners = resolve_early_member_owners(db, &mut context);
+        let early_member_owners = {
+            let _p = Profile::new("resolve_early_member_owners");
+            resolve_early_member_owners(db, &mut context)
+        };
+        let _p_guards = Profile::new("early inferred guards");
         local_inference::prepare_inferred_positive_guards(db, &context);
         let guard_candidates = context.inferred_guard_candidates.len();
         let early_guard_stats = stabilize_inferred_positive_guards(db, &mut context);
+        drop(_p_guards);
 
         run_analysis::<lua::LuaAnalysisPipeline>(db, &mut context);
 
@@ -102,7 +141,10 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         // during lua_analyze (AccessorFunc, NetworkVar, VGUI register calls).
         run_analysis::<gmod::GmodPostAnalysisPipeline>(db, &mut context);
 
-        synthesize_accessorfunc_members(db, &workspace_file_ids);
+        {
+            let _p = Profile::new("synthesize_accessorfunc_members");
+            synthesize_accessorfunc_members(db, &workspace_file_ids);
+        }
         let infer_dynamic_fields =
             db.get_emmyrc().gmod.enabled && db.get_emmyrc().gmod.infer_dynamic_fields;
         if infer_dynamic_fields {
@@ -112,11 +154,21 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             // dynamic pass still runs afterward.
             run_analysis::<dynamic_field::EarlyDynamicFieldAnalysisPipeline>(db, &mut context);
         }
+        // Every pass above ran against an empty dynamic-field index on a cold
+        // build; a warm re-index must not let retained facts leak into them.
+        context.infer_manager.set_dynamic_fields_visible();
 
         // Seed direct parent-to-child evidence before function returns are
         // resolved. The later pass still captures evidence unlocked by unresolve.
-        let early_child_sources =
-            local_inference::stabilize_unguarded_children(db, &mut context, true);
+        // Both passes read the same declaration references and syntax trees, so
+        // the first one's site walk is shared with the second.
+        let mut unguarded_child_sites = local_inference::UnguardedChildSiteCache::new();
+        let early_child_sources = local_inference::stabilize_unguarded_children(
+            db,
+            &mut context,
+            true,
+            &mut unguarded_child_sites,
+        );
         context.invalidate_inferred_returns_for_sources(db, &early_child_sources);
 
         if infer_dynamic_fields {
@@ -139,6 +191,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         if infer_dynamic_fields {
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
+            db.get_dynamic_field_index_mut().set_sealed(true);
             context.infer_manager.clear();
             run_analysis::<unresolve::UnResolveAnalysisPipeline>(db, &mut context);
             setmetatable_factory::synthesize_setmetatable_factory_members(db, &workspace_file_ids);
@@ -157,8 +210,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         // Unguarded-child inference is a fallback. Run it only after dynamic
         // fields and retained unresolves have stabilized declaration types.
-        let late_child_sources =
-            local_inference::stabilize_unguarded_children(db, &mut context, false);
+        let late_child_sources = local_inference::stabilize_unguarded_children(
+            db,
+            &mut context,
+            false,
+            &mut unguarded_child_sites,
+        );
         let late_child_local_changed = if late_child_sources.is_empty() {
             false
         } else {
@@ -178,6 +235,42 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             refresh_initializer_caches(db, &mut context);
         }
 
+        {
+            let _p = Profile::new("attach_settled_index_expr_members");
+            attach_settled_index_expr_members(db, &mut context);
+        }
+
+        {
+            let _p = Profile::new("rederive_settled_inferred_returns");
+            rederive_settled_inferred_returns(db, &mut context);
+        }
+
+        {
+            let _p = Profile::new("rewiden_settled_member_assignments");
+            rewiden_settled_member_assignments(db, &mut context);
+        }
+
+        // Members that landed on a global path before the global's owner was
+        // known are attached now that it is. See
+        // `reconcile_parked_global_path_members`.
+        {
+            let _p = Profile::new("reconcile_parked_global_path_members");
+            common::reconcile_parked_global_path_members(db);
+        }
+
+        // Runs last of the settled passes: it needs every member to have reached
+        // its final owner, because the writer set it merges is grouped by owner.
+        {
+            let _p = Profile::new("rederive_contributed_member_assignments");
+            let analyzed_files = context.analyzed_file_ids();
+            lua::rederive_contributed_member_assignments(db, &analyzed_files);
+        }
+
+        // Net flows are collected last: the collector resolves wrappers through
+        // signatures, receiver types and members, none of which exist yet when
+        // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
+        run_analysis::<gmod::GmodNetworkAnalysisPipeline>(db, &mut context);
+
         for (consumer_file_id, owners) in context.infer_manager.drain_inferred_guard_dependencies()
         {
             context.add_inferred_guard_dependencies(consumer_file_id, owners);
@@ -188,6 +281,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         if std::env::var_os("GLUALS_PROFILE").is_some() {
+            eprintln!(
+                "[profile] member_assignment_contributions entries={}",
+                db.get_member_index()
+                    .member_assignment_contributions()
+                    .entry_count(),
+            );
             eprintln!(
                 "[profile] inferred_guard candidates={} candidate_attempts={} candidate_iterations={} early_published={} late_retries={} late_published={} pending={} early_signature_owners={} early_member_owners={}",
                 guard_candidates,
@@ -201,6 +300,133 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 early_member_owners,
             );
         }
+    }
+}
+
+/// Retries the index-expression member attaches `set_index_expr_owner`
+/// dropped.
+fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = std::mem::take(&mut context.settled_member_attach_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
+    candidates.dedup();
+
+    // Only the candidate files are re-inferred, so only their caches are stale.
+    // Clearing the whole manager would also discard caches the passes that ran
+    // before this one built for files this pass never touches.
+    let candidate_files = candidates
+        .iter()
+        .map(|candidate| candidate.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&candidate_files);
+
+    for candidate in candidates {
+        let file_id = candidate.file_id;
+        let member_id = LuaMemberId::new(candidate.value, file_id);
+        // A member that already found a real owner is not the gap this pass
+        // exists for: some other authority decided where it lives, and re-homing
+        // it here would overrule that decision with a later, weaker read.
+        if db
+            .get_member_index()
+            .get_current_owner(&member_id)
+            .is_some_and(|owner| !matches!(owner, LuaMemberOwner::LocalUnresolve))
+        {
+            continue;
+        }
+        let Some(prefix_expr) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+            .and_then(|root| candidate.value.to_node_from_root(&root))
+            .and_then(glua_parser::LuaIndexExpr::cast)
+            .and_then(|index_expr| index_expr.get_prefix_expr())
+        else {
+            continue;
+        };
+        let mut unresolve_member = unresolve::UnResolveMember {
+            file_id,
+            member_id,
+            expr: None,
+            prefix: Some(prefix_expr),
+            ret_idx: 0,
+        };
+        let cache = context.infer_manager.get_infer_cache(file_id);
+        let _ = unresolve::try_resolve_member(db, cache, &mut unresolve_member);
+    }
+}
+
+/// Re-resolves inferred returns that settled on `any`/`unknown`.
+fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = context
+        .inferred_return_candidates
+        .iter()
+        .filter(|return_| {
+            db.get_signature_index()
+                .get(&return_.signature_id)
+                .is_some_and(|signature| {
+                    signature.resolve_return == crate::SignatureReturnStatus::InferResolve && {
+                        let current = signature.get_return_type();
+                        current.is_any() || current.is_unknown()
+                    }
+                })
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
+
+    // Only the candidate files are re-inferred, so only their caches are stale.
+    let candidate_files = candidates
+        .iter()
+        .map(|return_| return_.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files(&candidate_files);
+
+    for mut return_ in candidates {
+        let cache = context.infer_manager.get_infer_cache(return_.file_id);
+        let _ = unresolve::try_resolve_return_point(db, cache, &mut return_);
+    }
+}
+
+/// Re-derives member assignment widenings that ran against an incomplete
+/// set of sibling writers.
+fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let candidates = std::mem::take(&mut context.settled_member_widening_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    let mut candidates = candidates.into_iter().collect::<Vec<_>>();
+    candidates.sort_by_key(|(member_id, _)| (member_id.file_id, member_id.get_position()));
+
+    for (member_id, (assigned_type, preserve_table_literals)) in candidates {
+        // Only an inferred assignment cache is this pass' to rewrite: a doc type
+        // outranks inference, and anything else reaching the slot was written by
+        // an authority this pass has no evidence to overrule.
+        if !db
+            .get_type_index()
+            .get_type_cache(&member_id.into())
+            .is_some_and(|cache| cache.is_infer())
+        {
+            continue;
+        }
+
+        let type_owner = LuaTypeOwner::Member(member_id);
+        let Some(widened_type) = lua::get_widened_member_assignment_type(
+            db,
+            &type_owner,
+            &assigned_type,
+            preserve_table_literals,
+            &mut false,
+        ) else {
+            continue;
+        };
+
+        db.get_type_index_mut()
+            .force_bind_type(type_owner, LuaTypeCache::InferType(widened_type));
     }
 }
 
@@ -300,14 +526,21 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.sort();
     let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
     // Initializer inference reads the stabilized indexes and records candidate
     // cache writes without mutating the database. Process that read-only work
     // per file, then merge inference side effects and type writes in stable file
     // and source order on the caller thread.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache =
-            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+                building_dynamic_field_index: false,
+            },
+        );
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -354,6 +587,24 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             );
             let inferred_type = inferred_fact.typ().clone();
             if type_is_uninformative(&inferred_type) {
+                // When the cache and the settled re-derivation disagree
+                // over *which* bottom an unresolvable initializer has, both
+                // are false certainties — `nil` and `never` are only ever
+                // reached here by giving up, so which one is cached is
+                // decided by arrival order. Canonicalize to `unknown`,
+                // which is the honest answer and is opaque to the checkers,
+                // so it neither silences a real report nor invents one.
+                if is_bottom(&inferred_type)
+                    && current_cache
+                        .as_ref()
+                        .is_some_and(|current| is_bottom(current.as_type()))
+                    && current_cache.as_ref().map(LuaTypeCache::as_type) != Some(&inferred_type)
+                {
+                    result.updates.push(InitializerCacheUpdate::Overwrite {
+                        owner: type_owner,
+                        fact: inferred_fact.with_runtime_type(LuaType::Unknown),
+                    });
+                }
                 continue;
             }
             if current_cache
@@ -382,12 +633,18 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                 && current_cache.as_ref().is_some_and(|current| {
                     is_strict_nominal_refinement(db, &inferred_type, current.as_type())
                 });
+            let is_settled_widening = current_cache
+                .as_ref()
+                .is_some_and(|current| union_widens_arm(&inferred_type, current.as_type()));
             if current_is_uninformative {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
                     fact: inferred_fact,
                 });
-            } else if has_stronger_declared_authority || is_nominal_refinement {
+            } else if has_stronger_declared_authority
+                || is_nominal_refinement
+                || is_settled_widening
+            {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
                     fact: inferred_fact,
@@ -411,6 +668,48 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
     apply_initializer_cache_updates(db, updates);
 }
 
+/// Whether the re-derived type is a union that already contains the cached one.
+///
+/// The cache then holds a subset snapshot taken before the other arms were
+/// visible, so replacing it widens to the settled answer instead of guessing a
+/// different one.
+fn union_widens_arm(inferred: &LuaType, current: &LuaType) -> bool {
+    match inferred {
+        LuaType::Union(union) => union.types().any(|arm| arm == current),
+        _ => false,
+    }
+}
+
+/// Whether the re-derived union contains everything the cached type holds, plus
+/// more — the union-to-union counterpart of [`union_widens_arm`].
+///
+/// A cached union is as much a subset snapshot as a cached single arm is: both
+/// are decided by which contributors happened to be indexed first.
+pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    let LuaType::Union(inferred_union) = inferred else {
+        return false;
+    };
+    let inferred_arms = known_arms(inferred_union);
+    match current {
+        LuaType::Union(current_union) => {
+            let current_arms = known_arms(current_union);
+            current_arms.len() < inferred_arms.len()
+                && current_arms.iter().all(|arm| inferred_arms.contains(arm))
+        }
+        current => inferred_arms.contains(current),
+    }
+}
+
+/// The union arms that carry information. An `unknown` arm stands for a type
+/// that has not settled yet, so it can neither widen a cache nor block one.
+fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
+    union
+        .types()
+        .filter(|arm| !matches!(arm, LuaType::Unknown))
+        .cloned()
+        .collect()
+}
+
 fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if context.member_initializer_reinfer_candidates.is_empty() {
         return;
@@ -429,10 +728,17 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.sort();
     let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
-        let mut infer_cache =
-            crate::LuaInferCache::new(file_id, crate::CacheOptions { analysis_phase });
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+                building_dynamic_field_index: false,
+            },
+        );
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -447,7 +753,11 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
             else {
                 continue;
             };
-            if current_cache.is_doc() || single_nominal_type_id(current_cache.as_type()).is_none() {
+            let current_is_uninformative = type_is_uninformative(current_cache.as_type());
+            if current_cache.is_doc()
+                || (!current_is_uninformative
+                    && single_nominal_type_id(current_cache.as_type()).is_none())
+            {
                 continue;
             }
             let Some(expr) = member_initializer_expr(&root, *member_id) else {
@@ -456,9 +766,19 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
             let Ok(inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
                 continue;
             };
-            if inferred_type == *current_cache.as_type()
-                || !is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
-            {
+            if inferred_type == *current_cache.as_type() {
+                continue;
+            }
+            let takes_inferred_type = if current_is_uninformative {
+                // A placeholder is not an answer: it only records that the
+                // member's initializer had not been inferred yet when the write
+                // landed. Re-inferring it against the settled index is the same
+                // question, asked once the facts exist.
+                !type_is_uninformative(&inferred_type)
+            } else {
+                is_strict_nominal_refinement(db, &inferred_type, current_cache.as_type())
+            };
+            if !takes_inferred_type {
                 continue;
             }
 
@@ -618,6 +938,13 @@ fn type_cache_is_uninformative(type_cache: Option<&LuaTypeCache>) -> bool {
     }
 }
 
+/// The two lattice bottoms. Both are reached by giving up on an expression, so
+/// neither carries evidence about the value — unlike `any`/`unknown`, which the
+/// checkers already treat as opaque.
+fn is_bottom(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Nil | LuaType::Never)
+}
+
 fn type_is_uninformative(typ: &LuaType) -> bool {
     match typ {
         LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
@@ -699,7 +1026,15 @@ trait AnalysisPipeline {
 }
 
 fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    T::analyze(db, context);
+    let name = std::any::type_name::<T>()
+        .rsplit("::")
+        .next()
+        .unwrap_or_default();
+    // Timed through the phase accumulator rather than a `Profile`: several
+    // pipelines already carry their own `Profile`, and an unconditional one
+    // here would add a log line per pipeline per batch on a live server.
+    crate::profile::phase(name, || T::analyze(db, context));
+    crate::profile::phase_report(name);
 }
 
 fn module_analyze(
@@ -795,6 +1130,12 @@ pub struct AnalyzeContext {
     metas: HashSet<FileId>,
     scripted_scope_files: Option<Arc<HashSet<FileId>>>,
     scripted_scope_infos: Option<Arc<HashMap<FileId, GmodScopedClassInfo>>>,
+    /// Annotated global call-role map built by the gmod pre-pass, keyed by the
+    /// helper-registry revision it was derived from. Building it is a full
+    /// signature-index scan, so the late network pass reuses it whenever the
+    /// index has not grown since.
+    #[allow(clippy::type_complexity)]
+    gmod_global_call_roles: Option<(u64, Arc<gmod::AnnotatedGmodGlobalCallRoleMap>)>,
     unresolves: Vec<(UnResolve, InferFailReason)>,
     inferred_return_candidates: Vec<UnResolveReturn>,
     pending_call_site_return_consumers: Vec<UnResolve>,
@@ -807,6 +1148,14 @@ pub struct AnalyzeContext {
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
     early_callable_signatures: Vec<(crate::LuaTypeOwner, LuaSignatureId)>,
     early_member_owner_candidates: Vec<(LuaMemberId, LuaDeclId)>,
+    /// Index-expression member attaches that `set_index_expr_owner` dropped
+    /// because the prefix carried no owner information yet. See
+    /// [`attach_settled_index_expr_members`].
+    settled_member_attach_candidates: Vec<InFiled<LuaSyntaxId>>,
+    /// Member assignments whose widening ran against an incomplete sibling set,
+    /// with the type each one actually assigned. See
+    /// [`rewiden_settled_member_assignments`].
+    settled_member_widening_candidates: HashMap<LuaMemberId, (LuaType, bool)>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -818,6 +1167,7 @@ impl AnalyzeContext {
             metas: HashSet::new(),
             scripted_scope_files: None,
             scripted_scope_infos: None,
+            gmod_global_call_roles: None,
             unresolves: Vec::new(),
             inferred_return_candidates: Vec::new(),
             pending_call_site_return_consumers: Vec::new(),
@@ -830,6 +1180,8 @@ impl AnalyzeContext {
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
+            settled_member_attach_candidates: Vec::new(),
+            settled_member_widening_candidates: HashMap::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -858,6 +1210,19 @@ impl AnalyzeContext {
         self.tree_list.iter().map(|tree| tree.file_id).collect()
     }
 
+    /// Remembers an assignment whose widening skipped a sibling that had no type
+    /// yet. The assigned type is kept as written, not as widened, so the settled
+    /// pass can re-derive the merge instead of growing the partial answer.
+    pub(crate) fn record_settled_member_widening_candidate(
+        &mut self,
+        member_id: LuaMemberId,
+        assigned_type: LuaType,
+        preserve_table_literals: bool,
+    ) {
+        self.settled_member_widening_candidates
+            .insert(member_id, (assigned_type, preserve_table_literals));
+    }
+
     pub fn add_inferred_guard_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
         self.inferred_guard_candidates.push(candidate);
     }
@@ -874,6 +1239,10 @@ impl AnalyzeContext {
     pub fn add_early_member_owner_candidate(&mut self, member_id: LuaMemberId, decl_id: LuaDeclId) {
         self.early_member_owner_candidates
             .push((member_id, decl_id));
+    }
+
+    pub(crate) fn add_settled_member_attach_candidate(&mut self, candidate: InFiled<LuaSyntaxId>) {
+        self.settled_member_attach_candidates.push(candidate);
     }
 
     pub(crate) fn requeue_call_site_inferred_returns(
@@ -1237,5 +1606,63 @@ fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) 
             .iter()
             .any(|expr| expr.get_range().contains_range(range)),
         LuaReturnPoint::Nil | LuaReturnPoint::Error => false,
+    }
+}
+
+#[cfg(test)]
+mod union_widening_tests {
+    use super::union_widens_cached_type;
+    use crate::LuaType;
+
+    fn union(arms: Vec<LuaType>) -> LuaType {
+        LuaType::from_vec(arms)
+    }
+
+    #[test]
+    fn widens_a_cached_union_the_settled_one_contains() {
+        let settled = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::IntegerConst(5),
+            LuaType::Number,
+            LuaType::Any,
+        ]);
+        let cached = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::IntegerConst(5),
+            LuaType::Any,
+        ]);
+        assert!(union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn widens_a_cached_single_arm() {
+        let settled = union(vec![LuaType::Number, LuaType::Any]);
+        assert!(union_widens_cached_type(&settled, &LuaType::Number));
+    }
+
+    #[test]
+    fn rejects_a_cached_union_with_an_arm_the_settled_one_lacks() {
+        let settled = union(vec![
+            LuaType::IntegerConst(4),
+            LuaType::Number,
+            LuaType::Any,
+        ]);
+        let cached = union(vec![LuaType::IntegerConst(4), LuaType::String]);
+        assert!(!union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn rejects_an_equal_union() {
+        let settled = union(vec![LuaType::Number, LuaType::Any]);
+        let cached = union(vec![LuaType::Number, LuaType::Any]);
+        assert!(!union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn rejects_a_non_union_settled_type() {
+        assert!(!union_widens_cached_type(
+            &LuaType::Number,
+            &LuaType::Number
+        ));
     }
 }

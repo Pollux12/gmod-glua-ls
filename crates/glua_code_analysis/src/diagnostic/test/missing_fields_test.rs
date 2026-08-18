@@ -2,6 +2,152 @@
 mod tests {
     use crate::{DiagnosticCode, VirtualWorkspace};
 
+    /// A literal completed by the statements right after it is complete, on every
+    /// path that reaches the check. The last two must keep reporting: nothing
+    /// completes them before the value is used.
+    #[test]
+    fn literal_completed_before_first_use_is_complete() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairT
+            ---@field exterior string
+            ---@field interior string
+
+            ---@type pairT
+            local p = {}
+            p.exterior = "a"
+            p.interior = "b"
+        "#
+            ),
+            "---@type path"
+        );
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairF
+            ---@field exterior string
+            ---@field interior string
+
+            ---@class holderF
+            ---@field portals pairF
+            local H = {}
+
+            function H:make()
+                self.portals = {}
+                self.portals.exterior = "a"
+                self.portals.interior = "b"
+            end
+        "#
+            ),
+            "declared-field path"
+        );
+
+        assert!(
+            ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairL
+            ---@field exterior string
+            ---@field interior string
+
+            ---@param v pairL
+            local function take(v) return v end
+
+            local t = {}
+            t.exterior = "a"
+            t.interior = "b"
+            take(t)
+        "#
+            ),
+            "plain local path"
+        );
+
+        assert!(
+            !ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairN
+            ---@field exterior string
+            ---@field interior string
+
+            ---@type pairN
+            local p = {}
+            p.exterior = "a"
+        "#
+            ),
+            "still missing `interior`"
+        );
+
+        assert!(
+            !ws.check_code_for(
+                DiagnosticCode::MissingFields,
+                r#"
+            ---@class pairB
+            ---@field exterior string
+            ---@field interior string
+
+            ---@param cond boolean
+            local function build(cond)
+                ---@type pairB
+                local p = {}
+                if cond then
+                    p.exterior = "a"
+                    p.interior = "b"
+                end
+                return p
+            end
+        "#
+            ),
+            "a nested branch does not always run"
+        );
+    }
+
+    /// A documented default says the value arrives before anything reads it, so
+    /// the literal may leave it out while the read type stays non-nullable — the
+    /// reason the `@field` docs point users at `= value` rather than `?`. The
+    /// `---@type` and call-argument paths are covered above; the declared-field
+    /// assignment path and the read type are not.
+    #[test]
+    fn documented_default_satisfies_the_check_without_nulling_the_read() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class defcfg
+            ---@field a number
+            ---@field b number = 2
+
+            ---@class defowner
+            ---@field cfg defcfg
+            local O = {}
+
+            O.cfg = { a = 1 }
+        "#
+        ));
+
+        let mut read_ws = VirtualWorkspace::new();
+        read_ws.def(
+            r#"
+            ---@class defread
+            ---@field a number
+            ---@field b number = 2
+
+            ---@type defread
+            local v = { a = 1 }
+            default_read_out = v.b
+        "#,
+        );
+        let read_type = read_ws.expr_ty("default_read_out");
+        assert_eq!(read_ws.humanize_type(read_type), "number");
+    }
+
     #[test]
     fn test_missing_fields() {
         let mut ws = VirtualWorkspace::new();
@@ -550,6 +696,76 @@ foo({})
             local value = {}
             consume_typed(value)
             value.required = "ready"
+            "#,
+        ));
+    }
+
+    #[test]
+    fn unannotated_local_table_out_param_skips_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class GlideHUDStackLayout
+            ---@field width number
+            ---@field height number
+
+            ---@param out GlideHUDStackLayout
+            local function GetHUDStackLayout(out)
+                out.width = 100
+                out.height = 50
+            end
+
+            local layout = {}
+            GetHUDStackLayout(layout)
+            "#,
+        ));
+    }
+
+    /// A callee only completes the fields it always writes. A branch-nested
+    /// write may not run, which is the same rule the caller-side scan applies.
+    #[test]
+    fn out_param_field_written_only_in_a_branch_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Branchy
+            ---@field width number
+            ---@field height number
+
+            ---@param out Branchy
+            local function fill(out, flag)
+                out.width = 100
+                if flag then
+                    out.height = 50
+                end
+            end
+
+            local box = {}
+            fill(box, true)
+            "#,
+        ));
+    }
+
+    #[test]
+    fn unannotated_local_table_passed_to_reader_reports_missing_fields() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Sized
+            ---@field width number
+            ---@field height number
+
+            ---@param size Sized
+            local function measure(size) return size end
+
+            local sized = { width = 100 }
+            measure(sized)
             "#,
         ));
     }

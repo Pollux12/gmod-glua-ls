@@ -32,12 +32,13 @@ pub async fn on_semantic_token_handler(
 
     let uri = params.text_document.uri;
 
-    // Wait for any pending reindex to finish so we compute against
-    // consistent tree + index data. Cancel-aware: bails out when a
-    // new didChange fires cancel_all_requests().
+    // Index freshness is gated in `dispatch_request!`, but only for clients
+    // that re-send on ContentModified. Everyone else reaches here on any
+    // state, so still refuse to build against a superseded tree: token
+    // offsets are relative, and every one past the edit would land on the
+    // wrong word.
     if !context
-        .debounced_analysis()
-        .wait_until_fresh_for(&cancel_token, "textDocument/semanticTokens/full")
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
         .await
     {
         return None;
@@ -116,5 +117,66 @@ impl RegisterCapabilities for SemanticTokenCapabilities {
                 ..Default::default()
             }),
         );
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::on_semantic_token_handler;
+    use crate::context::ServerContext;
+    use googletest::prelude::*;
+    use lsp_server::Connection;
+    use lsp_types::{
+        ClientCapabilities, PartialResultParams, SemanticTokensParams, TextDocumentIdentifier, Uri,
+        WorkDoneProgressParams,
+    };
+    use std::str::FromStr;
+    use std::time::Duration;
+    use tokio_util::sync::CancellationToken;
+
+    /// The handler must not build tokens against a tree that predates the
+    /// newest `didChange`. Token offsets are relative and carry no version,
+    /// so a set built from a superseded tree paints every token after the
+    /// edit onto the wrong word.
+    #[gtest]
+    fn does_not_answer_until_the_newest_document_version_is_applied() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let (conn, _peer) = Connection::memory();
+            let context = ServerContext::new(conn, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let uri = Uri::from_str("file:///semantic_token_gate.lua").expect("uri should parse");
+
+            snapshot
+                .analysis()
+                .write()
+                .await
+                .update_file_by_uri(&uri, Some("local greeting = 1".to_string()));
+
+            // Seen but not yet applied: exactly the window between a didChange
+            // notification and the coalescer applying its preparsed tree.
+            snapshot.note_document_seen_version(&uri, 2).await;
+
+            let handler_snapshot = snapshot.clone();
+            let params = SemanticTokensParams {
+                text_document: TextDocumentIdentifier { uri: uri.clone() },
+                work_done_progress_params: WorkDoneProgressParams::default(),
+                partial_result_params: PartialResultParams::default(),
+            };
+            let handler = tokio::spawn(async move {
+                on_semantic_token_handler(handler_snapshot, params, CancellationToken::new()).await
+            });
+
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            verify_that!(handler.is_finished(), eq(false))?;
+
+            snapshot.note_document_applied_version(&uri, 2).await;
+
+            tokio::time::timeout(Duration::from_secs(1), handler)
+                .await
+                .expect("handler should answer once the newest version is applied")
+                .expect("handler should join successfully");
+            Ok(())
+        })
     }
 }

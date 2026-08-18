@@ -11843,4 +11843,139 @@ GM.TestValue = 1"#,
             "a later incompatible assignment must not be replaced by the initializer subtype: {mutable_diagnostics:?}"
         );
     }
+
+    #[gtest]
+    fn test_scripted_entity_self_semantic_decl_resolves_to_local_self_decl() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/custom_car/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+                "#,
+            ),
+            (
+                "lua/entities/custom_car/init.lua",
+                r#"
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local s = self
+                end
+                "#,
+            ),
+        ]);
+
+        let car_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/custom_car/init.lua");
+        let car_init_id = ws.analysis.get_file_id(&car_uri).unwrap();
+        let sm = ws
+            .analysis
+            .compilation
+            .get_semantic_model(car_init_id)
+            .unwrap();
+        let root = sm.get_root();
+
+        let mut found_self = false;
+        for node in root.descendants::<LuaAst>() {
+            if let LuaAst::LuaNameExpr(name_expr) = &node {
+                if name_expr.get_name_text().as_deref() == Some("self") {
+                    found_self = true;
+                    let decl_id = sm.find_decl(
+                        name_expr.syntax().clone().into(),
+                        crate::SemanticDeclLevel::NoTrace,
+                    );
+                    assert!(
+                        matches!(decl_id, Some(LuaSemanticDeclId::LuaDecl(_))),
+                        "self should resolve to local self decl, got: {decl_id:?}"
+                    );
+                    let self_type =
+                        sm.infer_expr(glua_parser::LuaExpr::NameExpr(name_expr.clone()));
+                    assert_eq!(
+                        self_type,
+                        Ok(LuaType::Def(LuaTypeDeclId::global("custom_car"))),
+                        "self type should be Def(custom_car)"
+                    );
+                }
+            }
+        }
+        assert!(found_self, "should find self NameExpr");
+    }
+
+    #[gtest]
+    fn test_scripted_entity_inherited_method_call_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/entities/base_vehicle/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+
+                ---@param seatIndex number
+                ---@param action string
+                ---@return boolean
+                function ENT:GetInputBool(seatIndex, action)
+                    return true
+                end
+                "#,
+            ),
+            (
+                "lua/entities/custom_car/shared.lua",
+                r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_vehicle"
+                "#,
+            ),
+            (
+                "lua/entities/custom_car/init.lua",
+                r#"
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local result = self:GetInputBool(seatIndex, action)
+                end
+                "#,
+            ),
+        ]);
+
+        let car_uri = ws
+            .virtual_url_generator
+            .new_uri("lua/entities/custom_car/init.lua");
+        let car_init_id = ws.analysis.get_file_id(&car_uri).unwrap();
+        let sm = ws
+            .analysis
+            .compilation
+            .get_semantic_model(car_init_id)
+            .unwrap();
+        let root = sm.get_root();
+
+        let mut found_call = false;
+        for node in root.descendants::<LuaAst>() {
+            if let LuaAst::LuaCallExpr(call_expr) = &node {
+                if call_expr
+                    .syntax()
+                    .text()
+                    .to_string()
+                    .contains("GetInputBool")
+                {
+                    found_call = true;
+                    let call_type =
+                        sm.infer_expr(glua_parser::LuaExpr::CallExpr(call_expr.clone()));
+                    assert_eq!(
+                        call_type,
+                        Ok(LuaType::Boolean),
+                        "self:GetInputBool(...) should infer as Boolean return type"
+                    );
+                }
+            }
+        }
+        assert!(found_call, "should find GetInputBool CallExpr");
+    }
 }

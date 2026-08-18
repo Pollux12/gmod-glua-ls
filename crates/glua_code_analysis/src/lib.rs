@@ -47,9 +47,16 @@ use url::Url;
 pub use vfs::*;
 
 #[derive(Default)]
+/// The cross-file facts an edit can invalidate, captured before
+/// re-analysis.
 struct InferredGuardSnapshot {
     facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
     consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
+    /// Parameter types inferred from the snapshotted files' call sites, keyed by
+    /// the callee signature they belong to.
+    inferred_params: HashMap<(LuaSignatureId, usize), LuaType>,
+    /// The files the snapshot was taken for, needed to recompute the same set.
+    snapshot_file_ids: HashSet<FileId>,
 }
 
 #[derive(Default)]
@@ -480,13 +487,39 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
+        // An edit whose significant token stream is unchanged — same kinds,
+        // same offsets, same texts, comments included — cannot change any
+        // derived fact, so re-indexing it (and its whole dependency
+        // expansion) would only re-derive facts the index already holds.
+        // Store the text and stop.
+        if let (Some(file_id), Some(new_text)) = (existing_file_id, text.as_deref())
+            && self
+                .compilation
+                .get_db()
+                .get_module_index()
+                .get_module(file_id)
+                .is_some()
+            && self
+                .compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .content_semantically_matches(file_id, new_text)
+        {
+            self.compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(uri, text);
+            return Some(file_id);
+        }
+
         let is_removed = text.is_none();
         let removed_file_ids = existing_file_id
             .filter(|_| is_removed)
             .into_iter()
             .collect::<HashSet<_>>();
-        let mut existing_reindex_file_ids =
-            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]));
+        let mut existing_reindex_file_ids = profile::phase("edit/expand", || {
+            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]))
+        });
         if let Some(reindex_file_ids) = &mut existing_reindex_file_ids {
             self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
         }
@@ -495,7 +528,9 @@ impl EmmyLuaAnalysis {
             .flatten()
             .copied()
             .collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
+        let old_guard_facts = profile::phase("edit/guard_snapshot", || {
+            self.inferred_guard_snapshot(&old_guard_fact_file_ids)
+        });
 
         let file_id = self
             .compilation
@@ -506,7 +541,9 @@ impl EmmyLuaAnalysis {
 
         let reindex_file_ids = existing_reindex_file_ids
             .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
-        self.compilation.remove_index(reindex_file_ids.clone());
+        profile::phase("edit/remove_index", || {
+            self.compilation.remove_index(reindex_file_ids.clone())
+        });
 
         let update_file_ids = reindex_file_ids
             .iter()
@@ -514,20 +551,30 @@ impl EmmyLuaAnalysis {
             .filter(|id| !is_removed || *id != file_id)
             .collect::<Vec<_>>();
         if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
+            profile::phase("edit/update_index", || {
+                self.compilation.update_index(update_file_ids.clone())
+            });
+            profile::phase("edit/stabilize_type_caches", || {
+                self.stabilize_cross_file_type_caches(&update_file_ids)
+            });
         }
         self.compilation
             .get_db_mut()
             .get_call_site_param_index_mut()
             .refresh_file_source_dependencies(file_id);
         let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &reindex_file_ids,
-            &incremental_source_file_ids,
-        );
+        profile::phase("edit/guard_reference_reindex", || {
+            self.reindex_changed_inferred_guard_references(
+                &guard_fact_file_ids,
+                &old_guard_facts,
+                &reindex_file_ids,
+                &incremental_source_file_ids,
+            )
+        });
+        profile::phase("edit/param_consumer_reindex", || {
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids)
+        });
+        profile::phase_report("update_file_by_uri");
 
         Some(file_id)
     }
@@ -646,6 +693,7 @@ impl EmmyLuaAnalysis {
                 &reindex_file_ids,
                 &incremental_source_file_ids,
             );
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
         }
 
         Some(file_id)
@@ -759,9 +807,18 @@ impl EmmyLuaAnalysis {
             &file_ids,
             &incremental_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
     }
 
-    fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+    /// Re-analyses exactly `file_ids`, skipping dependency expansion.
+    pub fn reindex_files_without_expansion(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.remove_index(file_ids.clone());
+        self.compilation.update_index(file_ids.clone());
+        self.stabilize_cross_file_type_caches(&file_ids);
+    }
+
+    pub fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
+        let _p = Profile::new("expand_reindex_file_ids");
         let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
         loop {
             // Include/require callers must be rebuilt with their changed target.
@@ -1067,7 +1124,70 @@ impl EmmyLuaAnalysis {
                 )
             })
             .collect();
-        InferredGuardSnapshot { facts, consumers }
+        let inferred_params = self
+            .compilation
+            .get_db()
+            .get_call_site_param_index()
+            .inferred_params_for_contributor_files(file_ids);
+        InferredGuardSnapshot {
+            facts,
+            consumers,
+            inferred_params,
+            snapshot_file_ids: file_ids.clone(),
+        }
+    }
+
+    /// Re-analyses callee files whose call-site-inferred parameter types
+    /// changed.
+    fn reindex_changed_inferred_param_consumers(
+        &mut self,
+        old_snapshot: &InferredGuardSnapshot,
+        already_reindexed: &[FileId],
+    ) {
+        let new_params = self
+            .compilation
+            .get_db()
+            .get_call_site_param_index()
+            .inferred_params_for_contributor_files(&old_snapshot.snapshot_file_ids);
+        let old_params = &old_snapshot.inferred_params;
+        if old_params.is_empty() && new_params.is_empty() {
+            return;
+        }
+
+        let already_reindexed = already_reindexed
+            .iter()
+            .copied()
+            .chain(old_snapshot.snapshot_file_ids.iter().copied())
+            .collect::<HashSet<_>>();
+        let mut changed_files = old_params
+            .keys()
+            .chain(new_params.keys())
+            .filter(|key| old_params.get(*key) != new_params.get(*key))
+            .map(|(signature_id, _)| signature_id.get_file_id())
+            .filter(|file_id| !already_reindexed.contains(file_id))
+            .collect::<Vec<_>>();
+        changed_files.sort_unstable();
+        changed_files.dedup();
+        if changed_files.is_empty() {
+            return;
+        }
+
+        let expanded = self.expand_reindex_file_ids(changed_files);
+        let expanded = expanded
+            .into_iter()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_some()
+            })
+            .collect::<Vec<_>>();
+        if expanded.is_empty() {
+            return;
+        }
+        self.compilation.remove_index(expanded.clone());
+        self.compilation.update_index(expanded);
     }
 
     fn reconcile_equivalent_inferred_guard_owners(
@@ -1467,19 +1587,32 @@ impl EmmyLuaAnalysis {
         let mut updated_files: Vec<FileId> = updated_files.into_iter().collect();
         updated_files.sort();
         self.compilation.update_index(updated_files.clone());
-        self.stabilize_cross_file_type_caches(&updated_files);
-        for file_id in &old_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
+        {
+            let _p = Profile::new("post: stabilize_cross_file_type_caches");
+            self.stabilize_cross_file_type_caches(&updated_files);
         }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &updated_files,
-            &old_source_file_ids,
-        );
+        {
+            let _p = Profile::new("post: refresh_file_source_dependencies");
+            for file_id in &old_source_file_ids {
+                self.compilation
+                    .get_db_mut()
+                    .get_call_site_param_index_mut()
+                    .refresh_file_source_dependencies(*file_id);
+            }
+        }
+        {
+            let _p = Profile::new("post: reindex_changed_inferred_guard_references");
+            self.reindex_changed_inferred_guard_references(
+                &guard_fact_file_ids,
+                &old_guard_facts,
+                &updated_files,
+                &old_source_file_ids,
+            );
+        }
+        {
+            let _p = Profile::new("post: reindex_changed_inferred_param_consumers");
+            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
+        }
         updated_files
     }
 
@@ -1578,6 +1711,7 @@ impl EmmyLuaAnalysis {
             &updated_files,
             &old_source_file_ids,
         );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &updated_files);
         updated_files
     }
 

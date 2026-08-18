@@ -568,4 +568,149 @@ mod test {
             "#
         ));
     }
+
+    /// StarfallEx's `Privilege` literal carries a 0-arg `check`
+    /// placeholder, and every real writer is `self.check =
+    /// function(instance, target)` inside `buildcheck = function(self)` —
+    /// an unannotated table-field param, so the write resolves to no owner
+    /// and never joins the member item.
+    #[test]
+    fn test_member_with_unattributable_writers_is_not_called_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Privilege = {
+                buildcheck = function(self)
+                    self.check = function(instance, target)
+                        return instance, target
+                    end
+                end,
+            }
+            return Privilege
+            "#,
+        );
+
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            local privilege = { check = function() error("not set") end }
+            privilege.check(1, 2)
+            "#,
+        ));
+    }
+
+    /// StarfallEx `permissions/core.lua` builds `checks` with
+    /// `checks[#checks+1] = check`, an append write under a computed key.
+    #[test]
+    fn test_computed_key_collection_element_is_not_called_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/collection.lua",
+            r#"
+            ---@param src any
+            local function build(src, key, instance, target)
+                local checks = {}
+                local check = src.checks[key]
+                if check == "block" then
+                    check = function() return false, "blocked!" end
+                end
+                if check ~= "allow" then
+                    checks[#checks+1] = check
+                end
+                for _, v in ipairs(checks) do
+                    local ok, reason = v(instance, target)
+                    if not ok then return false, reason end
+                end
+                return true
+            end
+            return build
+            "#,
+        ));
+    }
+
+    /// A container with only literal keys keeps its authority — nothing about it
+    /// is sampled, so a real arity error still has to be reported.
+    #[test]
+    fn test_literal_key_collection_element_still_reports_redundant() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/literal_collection.lua",
+            r#"
+            local checks = { function() return true end }
+            local function run(instance, target)
+                for _, v in ipairs(checks) do
+                    local ok = v(instance, target)
+                    if not ok then return false end
+                end
+                return true
+            end
+            return run
+            "#,
+        ));
+    }
+
+    /// An annotated member keeps its authority: an unattributed write to some
+    /// unrelated table sharing the name must not excuse a real arity error.
+    #[test]
+    fn test_annotated_member_still_reports_despite_unattributable_writers() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Holder = {
+                build = function(self)
+                    self.abs = function(a, b) return a, b end
+                end,
+            }
+            return Holder
+            "#,
+        );
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            local fade = math.abs(1, 0)
+            "#,
+        ));
+    }
+
+    /// An unattributable write carries no owner, so it is matched by bare name.
+    /// A declared class does not share that name space: its methods keep their
+    /// arity however many untyped tables elsewhere hold a field called the same.
+    #[test]
+    fn test_class_method_still_reports_despite_unattributable_writers() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            local Holder = {
+                build = function(self)
+                    self.Think = function(a, b, c) return a, b, c end
+                end,
+            }
+            return Holder
+            "#,
+        );
+
+        assert!(!ws.check_file_for(
+            DiagnosticCode::RedundantParameter,
+            "lua/reader.lua",
+            r#"
+            ---@class ThinkerA
+            local A = {}
+            function A:Think(a) return a end
+
+            ---@class ThinkerB
+            local B = {}
+            function B:Think(a) return a end
+
+            A:Think(1, 2)
+            "#,
+        ));
+    }
 }

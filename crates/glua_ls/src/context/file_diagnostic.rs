@@ -4,7 +4,7 @@ use std::{
         Arc, Mutex as StdMutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::{Duration, Instant},
+    time::Duration,
 };
 
 use glua_code_analysis::{EmmyLuaAnalysis, FileId, SharedDiagnosticData};
@@ -16,13 +16,6 @@ use tokio_util::sync::CancellationToken;
 use crate::util::{LongRunningWatchdogStatus, spawn_long_running_watchdog};
 
 use super::{ClientProxy, ProgressTask, StatusBar};
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct SuppressedDiagnosticLines {
-    start_line: u32,
-    end_line: u32,
-    expires_at: Instant,
-}
 
 #[derive(Clone, Default)]
 pub(crate) struct SharedDiagnosticDataCache {
@@ -86,7 +79,6 @@ pub struct FileDiagnostic {
     diagnostic_tokens: Arc<Mutex<HashMap<FileId, CancellationToken>>>,
     workspace_diagnostic_token: Arc<Mutex<Option<CancellationToken>>>,
     cached_file_diagnostics: Arc<Mutex<HashMap<Uri, Vec<Diagnostic>>>>,
-    recently_edited_lines: Arc<Mutex<HashMap<Uri, SuppressedDiagnosticLines>>>,
     shared_diagnostic_data_cache: SharedDiagnosticDataCache,
 }
 
@@ -104,7 +96,6 @@ impl FileDiagnostic {
             diagnostic_tokens: Arc::new(Mutex::new(HashMap::new())),
             workspace_diagnostic_token: Arc::new(Mutex::new(None)),
             cached_file_diagnostics: Arc::new(Mutex::new(HashMap::new())),
-            recently_edited_lines: Arc::new(Mutex::new(HashMap::new())),
             shared_diagnostic_data_cache: SharedDiagnosticDataCache::default(),
             status_bar,
         }
@@ -151,35 +142,6 @@ impl FileDiagnostic {
         self.shared_diagnostic_data_cache.invalidate();
     }
 
-    pub async fn note_recent_edit(
-        &self,
-        uri: &Uri,
-        previous_text: Option<&str>,
-        new_text: &str,
-        suppress_for: Duration,
-    ) {
-        let Some(previous_text) = previous_text else {
-            return;
-        };
-
-        let Some((start_line, end_line)) = changed_line_span(previous_text, new_text) else {
-            return;
-        };
-
-        self.recently_edited_lines.lock().await.insert(
-            uri.clone(),
-            SuppressedDiagnosticLines {
-                start_line,
-                end_line,
-                expires_at: Instant::now() + suppress_for,
-            },
-        );
-    }
-
-    pub async fn clear_recent_edit(&self, uri: &Uri) {
-        self.recently_edited_lines.lock().await.remove(uri);
-    }
-
     pub fn notify_workspace_loaded(&self) {
         if self.workspace_loaded_notified.swap(true, Ordering::AcqRel) {
             return;
@@ -214,39 +176,9 @@ impl FileDiagnostic {
             .insert(uri.clone(), diagnostics.to_vec());
     }
 
-    pub async fn cached_display_diagnostics(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
-        let diagnostics = {
-            let cache = self.cached_file_diagnostics.lock().await;
-            cache.get(uri).cloned()
-        }?;
-
-        Some(self.filter_display_diagnostics(uri, diagnostics).await)
-    }
-
-    pub async fn filter_display_diagnostics(
-        &self,
-        uri: &Uri,
-        diagnostics: Vec<Diagnostic>,
-    ) -> Vec<Diagnostic> {
-        let suppressed_lines = {
-            let mut recent_edits = self.recently_edited_lines.lock().await;
-            let Some(suppressed_lines) = recent_edits.get(uri).copied() else {
-                return diagnostics;
-            };
-
-            if Instant::now() >= suppressed_lines.expires_at {
-                recent_edits.remove(uri);
-                return diagnostics;
-            }
-
-            suppressed_lines
-        };
-
-        filter_diagnostics_by_line_span(
-            diagnostics,
-            suppressed_lines.start_line,
-            suppressed_lines.end_line,
-        )
+    pub async fn cached_file_diagnostics(&self, uri: &Uri) -> Option<Vec<Diagnostic>> {
+        let cache = self.cached_file_diagnostics.lock().await;
+        cache.get(uri).cloned()
     }
 
     pub async fn publish_fresh_file_diagnostics(
@@ -363,7 +295,6 @@ impl FileDiagnostic {
     /// 清除指定文件的诊断信息
     pub async fn clear_push_file_diagnostics(&self, uri: lsp_types::Uri) {
         self.cached_file_diagnostics.lock().await.remove(&uri);
-        self.recently_edited_lines.lock().await.remove(&uri);
 
         let diagnostic_param = PublishDiagnosticsParams {
             uri,
@@ -946,56 +877,6 @@ async fn push_workspace_diagnostic(
     }
 }
 
-fn changed_line_span(previous_text: &str, new_text: &str) -> Option<(u32, u32)> {
-    let previous_bytes = previous_text.as_bytes();
-    let new_bytes = new_text.as_bytes();
-
-    if previous_bytes == new_bytes {
-        return None;
-    }
-
-    let mut prefix = 0usize;
-    let prefix_limit = previous_bytes.len().min(new_bytes.len());
-    while prefix < prefix_limit && previous_bytes[prefix] == new_bytes[prefix] {
-        prefix += 1;
-    }
-
-    let mut previous_suffix = previous_bytes.len();
-    let mut new_suffix = new_bytes.len();
-    while previous_suffix > prefix
-        && new_suffix > prefix
-        && previous_bytes[previous_suffix - 1] == new_bytes[new_suffix - 1]
-    {
-        previous_suffix -= 1;
-        new_suffix -= 1;
-    }
-
-    let start_line = count_newlines(&new_bytes[..prefix]);
-    if count_newlines(previous_bytes) != count_newlines(new_bytes) {
-        return Some((start_line as u32, u32::MAX));
-    }
-
-    let end_line = count_newlines(&new_bytes[..new_suffix]).max(start_line);
-    Some((start_line as u32, end_line as u32))
-}
-
-fn count_newlines(bytes: &[u8]) -> usize {
-    bytes.iter().filter(|&&byte| byte == b'\n').count()
-}
-
-fn filter_diagnostics_by_line_span(
-    diagnostics: Vec<Diagnostic>,
-    start_line: u32,
-    end_line: u32,
-) -> Vec<Diagnostic> {
-    diagnostics
-        .into_iter()
-        .filter(|diagnostic| {
-            diagnostic.range.end.line < start_line || diagnostic.range.start.line > end_line
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use crate::context::{ClientProxy, StatusBar};
@@ -1003,78 +884,11 @@ mod tests {
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::NumberOrString;
-    use lsp_types::{Position, Range};
     use std::sync::{Arc, atomic::AtomicUsize};
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
-    use super::{
-        FileDiagnostic, changed_line_span, claim_next_diagnostic_file,
-        filter_diagnostics_by_line_span,
-    };
-
-    fn diagnostic(start_line: u32, end_line: u32) -> lsp_types::Diagnostic {
-        lsp_types::Diagnostic {
-            range: Range {
-                start: Position {
-                    line: start_line,
-                    character: 0,
-                },
-                end: Position {
-                    line: end_line,
-                    character: 0,
-                },
-            },
-            ..Default::default()
-        }
-    }
-
-    #[gtest]
-    fn changed_line_span_tracks_single_line_edits() -> Result<()> {
-        verify_that!(
-            changed_line_span("print(1)\n", "print(12)\n"),
-            some(eq((0, 0)))
-        )?;
-        Ok(())
-    }
-
-    #[gtest]
-    fn changed_line_span_tracks_multiline_edits() -> Result<()> {
-        verify_that!(
-            changed_line_span("a\nb\nc\n", "a\nb\nx\ny\nc\n"),
-            some(eq((2, u32::MAX)))
-        )?;
-        Ok(())
-    }
-
-    #[gtest]
-    fn changed_line_span_suppresses_to_eof_when_line_numbers_shift() -> Result<()> {
-        verify_that!(
-            changed_line_span("bad\nfoo\nbar\n", "x\nbad\nfoo\nbar\n"),
-            some(eq((0, u32::MAX)))
-        )?;
-        Ok(())
-    }
-
-    #[gtest]
-    fn filter_diagnostics_by_line_span_removes_overlapping_ranges() -> Result<()> {
-        let filtered = filter_diagnostics_by_line_span(
-            vec![
-                diagnostic(0, 0),
-                diagnostic(1, 1),
-                diagnostic(1, 2),
-                diagnostic(3, 3),
-            ],
-            1,
-            1,
-        )
-        .into_iter()
-        .map(|diagnostic| (diagnostic.range.start.line, diagnostic.range.end.line))
-        .collect::<Vec<_>>();
-
-        verify_that!(filtered.as_slice(), eq(&[(0, 0), (3, 3)]))?;
-        Ok(())
-    }
+    use super::{FileDiagnostic, claim_next_diagnostic_file};
 
     #[gtest]
     fn workspace_diagnostic_workers_claim_the_shared_priority_queue_in_order() -> Result<()> {

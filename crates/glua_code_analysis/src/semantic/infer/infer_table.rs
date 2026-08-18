@@ -326,17 +326,18 @@ fn infer_call_arg_should_be(
 
 /// 移除掉一些非`table`类型
 fn union_remove_non_table_type(db: &DbIndex, union: &Arc<LuaUnionType>) -> LuaType {
-    let mut result = LuaType::Unknown;
-    for typ in union.into_set().into_iter() {
-        match typ {
-            LuaType::Signature(_) | LuaType::DocFunction(_) => {}
-            _ if typ.is_string() || typ.is_number() || typ.is_boolean() => {}
-            _ => {
-                result = TypeOps::Union.apply(db, &result, &typ);
-            }
-        }
-    }
-    result
+    union
+        .into_set()
+        .into_iter()
+        .filter(|typ| {
+            !matches!(typ, LuaType::Signature(_) | LuaType::DocFunction(_))
+                && !typ.is_string()
+                && !typ.is_number()
+                && !typ.is_boolean()
+        })
+        .reduce(|left, right| TypeOps::Union.apply(db, &left, &right))
+        // Everything was filtered out: pin the escape value instead of the seed.
+        .unwrap_or(LuaType::Unknown)
 }
 
 fn infer_table_field_type_by_parent(
@@ -453,7 +454,7 @@ fn infer_table_type_from_local_call_references(
         .ok_or(InferFailReason::None)?
         .get_chunk_node();
 
-    let mut typ = LuaType::Unknown;
+    let mut typ = LuaType::Never;
     for cell in &references.cells {
         if cell.is_write {
             continue;
@@ -486,7 +487,7 @@ fn infer_table_type_from_local_call_references(
         typ = TypeOps::Union.apply(db, &typ, &call_arg_type);
     }
 
-    if typ.is_unknown() {
+    if typ.is_never() {
         Err(InferFailReason::None)
     } else {
         Ok(typ)

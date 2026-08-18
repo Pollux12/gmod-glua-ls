@@ -530,6 +530,17 @@ fn check_call_expr(
                 {
                     continue;
                 }
+                if colon_call
+                    && !colon_define
+                    && idx == 0
+                    && colon_receiver_accepted_by_any_callee_arm(
+                        semantic_model,
+                        &call_expr,
+                        arg_type,
+                    )
+                {
+                    continue;
+                }
                 // 这里执行了`AssignTypeMismatch`的检查
                 if arg_type.is_table() {
                     // 表字段已经报错了, 则不添加参数不匹配的诊断避免干扰
@@ -1462,6 +1473,59 @@ fn project_correlated_param_type(
         });
     }
     projected
+}
+
+/// Whether any arm of a union callee accepts `receiver_type` as its `self`.
+fn colon_receiver_accepted_by_any_callee_arm(
+    semantic_model: &SemanticModel,
+    call_expr: &LuaCallExpr,
+    receiver_type: &LuaType,
+) -> bool {
+    let Some(prefix_expr) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Ok(LuaType::Union(union)) = semantic_model.infer_expr(prefix_expr) else {
+        return false;
+    };
+    union
+        .types()
+        .any(|arm| callee_arm_accepts_receiver(semantic_model, arm, receiver_type))
+}
+
+fn callee_arm_accepts_receiver(
+    semantic_model: &SemanticModel,
+    arm: &LuaType,
+    receiver_type: &LuaType,
+) -> bool {
+    let self_type = match arm {
+        LuaType::Signature(signature_id) => {
+            let Some(signature) = semantic_model
+                .get_db()
+                .get_signature_index()
+                .get(signature_id)
+            else {
+                return false;
+            };
+            if signature.is_colon_define {
+                return true;
+            }
+            signature
+                .get_param_info_by_id(0)
+                .map(|param_info| param_info.type_ref.clone())
+        }
+        LuaType::DocFunction(func) => {
+            if func.is_colon_define() {
+                return true;
+            }
+            func.get_params().first().and_then(|(_, typ)| typ.clone())
+        }
+        _ => return false,
+    };
+    self_type.is_none_or(|typ| {
+        semantic_model
+            .type_check_detail(&typ, receiver_type)
+            .is_ok()
+    })
 }
 
 fn call_param_has_candidate_accepting_refined_arg(

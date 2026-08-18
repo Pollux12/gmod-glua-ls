@@ -320,6 +320,15 @@ fn check_index_expr(
 
     let field_name = SmolStr::new(index_key.get_path_part());
 
+    if code == DiagnosticCode::UndefinedField
+        && db
+            .get_dynamic_field_index()
+            .has_unattributed_field(&field_name)
+        && is_shapeless_table_const(db, &prefix_typ)
+    {
+        return Some(());
+    }
+
     if is_dynamic_field(db, &prefix_typ, &field_name) {
         if let Some(profile) = profile.as_mut() {
             profile.dynamic_field_skips += 1;
@@ -2137,6 +2146,22 @@ fn if_body_has_return(if_stat: &LuaIfStat) -> bool {
     false
 }
 
+/// A table literal with no members and no dynamic fields at all: nothing
+/// whatsoever is known about its shape.
+fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
+    let LuaType::TableConst(table_range) = typ else {
+        return false;
+    };
+
+    db.get_member_index()
+        .get_members(&crate::LuaMemberOwner::Element(table_range.clone()))
+        .is_none_or(|members| members.is_empty())
+        && db
+            .get_dynamic_field_index()
+            .get_fields(&crate::DynamicFieldOwner::Table(table_range.clone()))
+            .is_none_or(|fields| fields.is_empty())
+}
+
 fn is_dynamic_field(db: &DbIndex, prefix_typ: &LuaType, field_name: &SmolStr) -> bool {
     let emmyrc = db.get_emmyrc();
     if !emmyrc.gmod.enabled || !emmyrc.gmod.infer_dynamic_fields {
@@ -2169,10 +2194,7 @@ fn has_dynamic_field_for_type(
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => {
             let owner = crate::DynamicFieldOwner::Type(id.clone());
-            if index.has_field(&owner, field_name)
-                || owner_has_named_dynamic_fields(index, &owner)
-                    && !index.get_wildcard_definitions(&owner).is_empty()
-            {
+            if index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner) {
                 return true;
             }
             // Walk parent types: dynamic fields registered on a parent class
@@ -2184,8 +2206,7 @@ fn has_dynamic_field_for_type(
                 if let LuaType::Ref(super_id) | LuaType::Def(super_id) = super_type {
                     let owner = crate::DynamicFieldOwner::Type(super_id.clone());
                     index.has_field(&owner, field_name)
-                        || owner_has_named_dynamic_fields(index, &owner)
-                            && !index.get_wildcard_definitions(&owner).is_empty()
+                        || owner_wildcard_covers_any_field(db, &owner)
                 } else {
                     false
                 }
@@ -2193,9 +2214,7 @@ fn has_dynamic_field_for_type(
         }
         LuaType::TableConst(table_range) => {
             let owner = crate::DynamicFieldOwner::Table(table_range.clone());
-            index.has_field(&owner, field_name)
-                || owner_has_named_dynamic_fields(index, &owner)
-                    && !index.get_wildcard_definitions(&owner).is_empty()
+            index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner)
         }
         LuaType::Instance(instance) => {
             has_dynamic_field_for_type(db, index, instance.get_base(), field_name)
@@ -2208,11 +2227,15 @@ fn has_dynamic_field_for_type(
     }
 }
 
-fn owner_has_named_dynamic_fields(
-    index: &crate::DynamicFieldIndex,
-    owner: &crate::DynamicFieldOwner,
-) -> bool {
-    index
-        .get_fields(owner)
-        .is_some_and(|fields| !fields.is_empty())
+/// Whether a wildcard assignment on `owner` should vouch for an arbitrary field
+/// name. Two shapes qualify: a mixed table that already has named dynamic fields
+/// (the wildcard extends a known shape), and a pure computed-key registry where
+/// the wildcard is the only information there is.
+fn owner_wildcard_covers_any_field(db: &DbIndex, owner: &crate::DynamicFieldOwner) -> bool {
+    let index = db.get_dynamic_field_index();
+    index.has_wildcard_definitions(owner)
+        && index
+            .get_fields(owner)
+            .is_some_and(|fields| !fields.is_empty())
+        || crate::is_pure_wildcard_registry(db, owner)
 }

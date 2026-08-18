@@ -4,12 +4,22 @@ mod test {
     use std::path::PathBuf;
 
     #[test]
-    fn test_default_ignore_dir_defaults_resolve_to_4_globs() {
+    fn test_default_ignore_dir_defaults_resolve_to_14_globs() {
         let emmyrc = Emmyrc::default();
 
         assert!(emmyrc.workspace.use_default_ignores);
         let resolved = emmyrc.workspace.resolve_ignore_dir_defaults();
-        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved.len(), 14);
+        assert!(resolved.contains(&"**/.git/**".to_string()));
+        assert!(resolved.contains(&"**/.github/**".to_string()));
+        assert!(resolved.contains(&"**/.claude/**".to_string()));
+        assert!(resolved.contains(&"**/.agents/**".to_string()));
+        assert!(resolved.contains(&"**/.gemini/**".to_string()));
+        assert!(resolved.contains(&"**/.vscode/**".to_string()));
+        assert!(resolved.contains(&"**/.idea/**".to_string()));
+        assert!(resolved.contains(&"**/.svn/**".to_string()));
+        assert!(resolved.contains(&"**/.hg/**".to_string()));
+        assert!(resolved.contains(&"**/node_modules/**".to_string()));
         assert!(resolved.contains(&"**/gmod_wire_expression2/**".to_string()));
         assert!(resolved.contains(&"**/wire_expression*.lua".to_string()));
         assert!(resolved.contains(&"**/tests/**".to_string()));
@@ -35,8 +45,8 @@ mod test {
         let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
 
         assert!(!emmyrc.workspace.use_default_ignores);
-        // Defaults still present as entries even when disabled (4 built-ins)
-        assert_eq!(emmyrc.workspace.resolve_ignore_dir_defaults().len(), 4);
+        // Defaults still present as entries even when disabled (14 built-ins)
+        assert_eq!(emmyrc.workspace.resolve_ignore_dir_defaults().len(), 14);
     }
 
     #[test]
@@ -86,8 +96,8 @@ mod test {
         assert!(emmyrc.workspace.use_default_ignores);
         assert_eq!(emmyrc.workspace.ignore_dir.len(), 1);
         assert_eq!(emmyrc.workspace.ignore_dir[0], "user_custom_dir");
-        // Defaults resolve to 4 built-in patterns
-        assert_eq!(emmyrc.workspace.resolve_ignore_dir_defaults().len(), 4);
+        // Defaults resolve to 14 built-in patterns
+        assert_eq!(emmyrc.workspace.resolve_ignore_dir_defaults().len(), 14);
     }
 
     #[test]
@@ -105,8 +115,8 @@ mod test {
 
         assert_eq!(
             resolved.len(),
-            3,
-            "should have 3 entries after disabling 'tests'"
+            13,
+            "should have 13 entries after disabling 'tests'"
         );
         assert!(!resolved.contains(&"**/tests/**".to_string()));
         assert!(resolved.contains(&"**/test/**".to_string()));
@@ -126,7 +136,7 @@ mod test {
         let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
         let resolved = emmyrc.workspace.resolve_ignore_dir_defaults();
 
-        assert_eq!(resolved.len(), 4);
+        assert_eq!(resolved.len(), 14);
         assert!(!resolved.contains(&"**/test/**".to_string()));
         assert!(resolved.contains(&"**/my_tests/**".to_string()));
     }
@@ -144,7 +154,7 @@ mod test {
         let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
         let resolved = emmyrc.workspace.resolve_ignore_dir_defaults();
 
-        assert_eq!(resolved.len(), 5, "should have 4 built-ins + 1 custom");
+        assert_eq!(resolved.len(), 15, "should have 14 built-ins + 1 custom");
         assert!(resolved.contains(&"**/custom_ignore/**".to_string()));
     }
 
@@ -183,8 +193,8 @@ mod test {
         let emmyrc: Emmyrc = serde_json::from_str(json).unwrap();
         let resolved = emmyrc.workspace.resolve_ignore_dir_defaults();
 
-        // 4 built-ins minus the disabled "tests" = 3, plus the legacy string = 4
-        assert_eq!(resolved.len(), 4);
+        // 14 built-ins minus the disabled "tests" = 13, plus the legacy string = 14
+        assert_eq!(resolved.len(), 14);
         assert!(!resolved.contains(&"**/tests/**".to_string()));
         assert!(resolved.contains(&"**/legacy_tests/**".to_string()));
     }

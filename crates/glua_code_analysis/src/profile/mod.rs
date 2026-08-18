@@ -1,6 +1,82 @@
 use log::info;
-use std::sync::OnceLock;
-use std::time::Instant;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
+/// Named sub-phase accumulator, gated on `GLUALS_PROFILE_PHASE`.
+fn phase_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_PHASE").is_some())
+}
+
+static PHASES: Mutex<Vec<(&'static str, Duration, u64)>> = Mutex::new(Vec::new());
+
+/// Run `f`, accumulating its elapsed time under `name` when phase profiling is on.
+pub fn phase<T>(name: &'static str, f: impl FnOnce() -> T) -> T {
+    if !phase_enabled() {
+        return f();
+    }
+    let start = Instant::now();
+    let out = f();
+    let elapsed = start.elapsed();
+    let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+    match phases.iter_mut().find(|(phase, _, _)| *phase == name) {
+        Some((_, total, count)) => {
+            *total += elapsed;
+            *count += 1;
+        }
+        None => phases.push((name, elapsed, 1)),
+    }
+    out
+}
+
+/// Scoped form of [`phase`], for regions that span too many locals to wrap in a
+/// closure. Accumulates from construction until drop.
+pub struct PhaseGuard {
+    name: &'static str,
+    start: Option<Instant>,
+}
+
+impl PhaseGuard {
+    pub fn new(name: &'static str) -> Self {
+        Self {
+            name,
+            start: phase_enabled().then(Instant::now),
+        }
+    }
+}
+
+impl Drop for PhaseGuard {
+    fn drop(&mut self) {
+        let Some(start) = self.start else {
+            return;
+        };
+        let elapsed = start.elapsed();
+        let mut phases = PHASES.lock().unwrap_or_else(|poison| poison.into_inner());
+        match phases.iter_mut().find(|(phase, _, _)| *phase == self.name) {
+            Some((_, total, count)) => {
+                *total += elapsed;
+                *count += 1;
+            }
+            None => phases.push((self.name, elapsed, 1)),
+        }
+    }
+}
+
+/// Print and clear the accumulated sub-phase table.
+pub fn phase_report(label: &str) {
+    if !phase_enabled() {
+        return;
+    }
+    let mut phases =
+        std::mem::take(&mut *PHASES.lock().unwrap_or_else(|poison| poison.into_inner()));
+    phases.sort_unstable_by_key(|(_, total, _)| std::cmp::Reverse(*total));
+    for (name, total, count) in phases {
+        eprintln!(
+            "  [phase] {label:<22} {name:<44} {:>8.3}s ({count} calls)",
+            total.as_secs_f64()
+        );
+    }
+}
 
 pub struct Profile<'a> {
     name: &'a str,

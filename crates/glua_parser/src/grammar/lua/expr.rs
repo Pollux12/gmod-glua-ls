@@ -115,6 +115,10 @@ fn parse_simple_expr(p: &mut LuaParser) -> ParseResult {
 pub fn parse_closure_expr(p: &mut LuaParser) -> ParseResult {
     let m = p.mark(LuaSyntaxKind::ClosureExpr);
 
+    // A missing `end` is only discovered at EOF, so the error has to be pinned
+    // to where the function opens or it lands at the bottom of the file, far
+    // from the definition that is actually unclosed.
+    let start_range = p.current_token_range();
     if_token_bump(p, LuaTokenKind::TkFunction);
 
     parse_param_list(p)?;
@@ -128,7 +132,7 @@ pub fn parse_closure_expr(p: &mut LuaParser) -> ParseResult {
     } else {
         p.push_error(LuaParseError::syntax_error_from(
             "expected 'end' to close function definition",
-            p.current_token_range(),
+            start_range,
         ));
     }
 

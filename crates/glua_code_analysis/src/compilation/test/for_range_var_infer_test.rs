@@ -418,6 +418,65 @@ mod test {
     }
 
     #[test]
+    fn pairs_defers_iter_vars_when_generic_leaves_template_refs() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let file_ids = ws.def_files(vec![
+            (
+                "a_loop.lua",
+                r#"
+                local packages = Store.packages or {}
+
+                for pkg, data in pairs(packages) do
+                    pkg_out = pkg
+                    data_out = data
+                end
+                "#,
+            ),
+            (
+                "b_writer.lua",
+                r#"
+                Store = Store or {}
+                Store.packages = Store.packages or {}
+
+                ---@class Package
+                ---@field id number
+
+                ---@param pkg Package
+                function AddPackage(pkg)
+                    Store.packages[pkg.id] = pkg
+                end
+                "#,
+            ),
+        ]);
+
+        let loop_file = file_ids[0];
+        let db = ws.get_db_mut();
+        let decl_tree = db
+            .get_decl_index()
+            .get_decl_tree(&loop_file)
+            .expect("loop file decl tree");
+        let iter_decls = decl_tree
+            .get_decls()
+            .values()
+            .filter(|decl| matches!(decl.get_name(), "pkg" | "data"))
+            .map(|decl| (decl.get_name().to_string(), decl.get_id()))
+            .collect::<Vec<_>>();
+        assert_eq!(iter_decls.len(), 2, "expected both iterator var decls");
+
+        for (name, decl_id) in iter_decls {
+            let cached = db
+                .get_type_index()
+                .get_type_cache(&decl_id.into())
+                .map(|cache| cache.as_type().clone());
+            assert!(
+                cached.as_ref().is_some_and(|typ| !typ.contain_tpl()),
+                "iter var `{name}` froze as a raw template ref: {cached:?}"
+            );
+        }
+    }
+
+    #[test]
     fn test_pairs_nil_only_values_fall_back_to_unknown() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
 
@@ -436,5 +495,80 @@ mod test {
         );
 
         assert_eq!(ws.expr_ty("value_out"), LuaType::Unknown);
+    }
+
+    /// A loop variable that still holds a raw template ref is a placeholder, and
+    /// facts derived from it inside the body are deferred rather than committed.
+    /// The deferral must not swallow a body whose template really is bound by
+    /// the enclosing generic: those types still have to be published.
+    #[test]
+    fn generic_iterator_body_still_publishes_its_loop_derived_types() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def(
+            r#"
+            ---@generic K, V
+            ---@param source table<K, V>
+            local function walk(source)
+                for key, value in pairs(source) do
+                    local seen_key = key
+                    local seen_value = value
+                    return seen_key, seen_value
+                end
+            end
+
+            key_out, value_out = walk({ [1] = "a" })
+        "#,
+        );
+
+        assert!(!ws.expr_ty("key_out").contain_tpl());
+        assert!(!ws.expr_ty("value_out").contain_tpl());
+    }
+
+    /// The container is declared in a file analysed *after* the loop, so the
+    /// iteration variable starts as a placeholder and is repaired once the
+    /// member map settles. A plain local copying it — taken after a conditional
+    /// early exit, which is what splits the copy off into its own flow branch —
+    /// has to be repaired with it. Copying the placeholder instead left the
+    /// alias at `nil` while the variable it copied resolved correctly, so the
+    /// same value held two incompatible types two lines apart.
+    #[test]
+    fn pairs_alias_after_early_exit_matches_the_loop_variable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        ws.def_files(vec![
+            (
+                "a_use.lua",
+                r#"
+                for k, def in pairs(MCP.KNOBS) do
+                    if k == "" then return end
+
+                    local alias = def
+
+                    def_out = def
+                    alias_out = alias
+                end
+                "#,
+            ),
+            (
+                "z_decl.lua",
+                r#"
+                MCP = {}
+
+                ---@type table<string, { a: string }>
+                MCP.KNOBS = {}
+                "#,
+            ),
+        ]);
+
+        let def_ty = ws.expr_ty("def_out");
+        let alias_ty = ws.expr_ty("alias_out");
+
+        // Guards against passing vacuously: if the container stopped resolving,
+        // both sides would agree on `unknown` and the assertion below would hold
+        // for the wrong reason.
+        assert_eq!(ws.humanize_type(def_ty.clone()), "{ a: string }");
+        assert_eq!(ws.humanize_type(alias_ty.clone()), "{ a: string }");
+        assert_eq!(def_ty, alias_ty);
     }
 }

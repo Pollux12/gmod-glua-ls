@@ -836,7 +836,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("boolean"));
+        assert_eq!(ty, ws.ty("boolean|unknown"));
     }
 
     #[test]
@@ -1096,7 +1096,17 @@ mod test {
             "result",
         );
 
-        assert_eq!(ty, ws.ty("any"));
+        // Both arms survive: the fallback table is real evidence and the
+        // unresolved left arm is not, so neither erases the other.
+        let LuaType::Union(union) = &ty else {
+            panic!("expected a union, got: {ty:?}");
+        };
+        let arms = union.into_vec();
+        assert!(
+            arms.iter().any(|arm| matches!(arm, LuaType::TableConst(_)))
+                && arms.iter().any(|arm| matches!(arm, LuaType::Unknown)),
+            "expected `unknown | table`, got: {arms:?}"
+        );
     }
 
     #[test]
@@ -1160,7 +1170,10 @@ mod test {
             "result",
         );
 
-        assert_eq!(ty, ws.ty("any"));
+        // The workaround still holds — the `or error(...)` arm does not drag
+        // the result to `nil` — but an unresolved global stays unresolved
+        // rather than being promoted to `any`.
+        assert_eq!(ty, ws.ty("unknown"));
     }
 
     /// Regression: assigning an undefined global to a (global / table) target
@@ -1440,5 +1453,60 @@ mod test {
             "reassigned local `t` collapsed to the initializer table identity \
              (first={first_range:?}, last={last_range:?}); each region must keep its own table"
         );
+    }
+
+    /// An unresolved arm must not erase a resolved sibling. Dropping the
+    /// fallback here hides a real mismatch: found in CityRP as
+    /// `Material(data.icon or iconExclamation)`, where the fallback is an
+    /// `IMaterial` rather than the path string `Material` expects.
+    #[test]
+    fn test_or_fallback_arm_survives_an_unresolved_left_side() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class IMaterial
+            ---@type IMaterial
+            fallbackMaterial = nil
+            "#,
+        );
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            local function pick(data)
+                local icon = data.icon or fallbackMaterial
+                return icon
+            end
+            local chosen = pick({})
+            print(chosen)
+            "#,
+            "chosen",
+        );
+
+        let rendered = ws.humanize_type_detailed(ty);
+        assert!(
+            rendered.contains("IMaterial"),
+            "the resolved fallback arm must survive, got: {rendered}"
+        );
+    }
+
+    /// A call shape the reader cannot interpret leaves the type unresolved.
+    /// `any` would claim the author opted out of checking instead.
+    #[test]
+    fn test_setmetatable_with_wrong_arity_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        assert_eq!(ws.expr_ty("setmetatable({})"), LuaType::Unknown);
+    }
+
+    /// Same for a module path the analyzer cannot identify: the export type is
+    /// unresolved, not unconstrained.
+    #[test]
+    fn test_require_with_computed_path_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            some_computed_path = nil
+            "#,
+        );
+        assert_eq!(ws.expr_ty("require(some_computed_path)"), LuaType::Unknown);
     }
 }

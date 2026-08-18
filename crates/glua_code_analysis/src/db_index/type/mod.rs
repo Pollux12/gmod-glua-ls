@@ -19,13 +19,13 @@ pub use humanize_type::{
 };
 pub use inference_fact::*;
 use rowan::TextRange;
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+// The type index is the hottest hashing site in the analyzer: `LuaTypeOwner`
+// hashing alone was 3.9% of all CPU under the default SipHash.
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
-pub use type_owner::{LuaTypeCache, LuaTypeOwner};
+pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
 
@@ -42,7 +42,7 @@ pub(crate) struct LuaSuperType {
 }
 
 pub fn resolve_alias_type(db: &DbIndex, typ: &LuaType) -> LuaResolvedAliasType {
-    let mut visited_aliases = HashSet::new();
+    let mut visited_aliases = HashSet::default();
     resolve_alias_type_inner(db, typ, None, &mut visited_aliases)
 }
 
@@ -136,9 +136,9 @@ fn replace_table_const_in_type(
     }
 }
 
-fn replace_table_consts_in_type(
+fn replace_table_consts_in_type<S: std::hash::BuildHasher>(
     typ: &LuaType,
-    replacements: &HashMap<InFiled<TextRange>, LuaType>,
+    replacements: &std::collections::HashMap<InFiled<TextRange>, LuaType, S>,
 ) -> Option<LuaType> {
     match typ {
         LuaType::TableConst(existing_range) => replacements.get(existing_range).cloned(),
@@ -502,18 +502,18 @@ impl Default for LuaTypeIndex {
 impl LuaTypeIndex {
     pub fn new() -> Self {
         Self {
-            file_namespace: HashMap::new(),
-            file_using_namespace: HashMap::new(),
-            file_types: HashMap::new(),
-            full_name_type_map: HashMap::new(),
-            generic_params: HashMap::new(),
-            supers: HashMap::new(),
-            types: HashMap::new(),
-            in_filed_type_owner: HashMap::new(),
-            fact_metadata: HashMap::new(),
-            definition_facts: HashMap::new(),
-            inference_events_by_file: HashMap::new(),
-            support_file_dependents: HashMap::new(),
+            file_namespace: HashMap::default(),
+            file_using_namespace: HashMap::default(),
+            file_types: HashMap::default(),
+            full_name_type_map: HashMap::default(),
+            generic_params: HashMap::default(),
+            supers: HashMap::default(),
+            types: HashMap::default(),
+            in_filed_type_owner: HashMap::default(),
+            fact_metadata: HashMap::default(),
+            definition_facts: HashMap::default(),
+            inference_events_by_file: HashMap::default(),
+            support_file_dependents: HashMap::default(),
         }
     }
 
@@ -595,7 +595,7 @@ impl LuaTypeIndex {
         file_id: FileId,
         prefix: &str,
     ) -> HashMap<String, Option<LuaTypeDeclId>> {
-        let mut result = HashMap::new();
+        let mut result = HashMap::default();
         let all_type_ids = self.full_name_type_map.keys().collect::<Vec<_>>();
         if let Some(ns) = self.get_file_namespace(&file_id) {
             let prefix = &format!("{}.{}", ns, prefix);
@@ -769,7 +769,7 @@ impl LuaTypeIndex {
     /// Returns a vector of type declarations in the inheritance hierarchy
     pub fn get_all_sub_types(&self, decl_id: &LuaTypeDeclId) -> Vec<&LuaTypeDecl> {
         let mut all_sub_types = Vec::new();
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
         let mut queue = vec![decl_id.clone()];
 
         while let Some(current_id) = queue.pop() {
@@ -812,16 +812,27 @@ impl LuaTypeIndex {
         self.full_name_type_map.get_mut(decl_id)
     }
 
+    /// Stores `cache` for `owner`, keeping any type already bound there unless
+    /// `cache` supersedes it.
+    ///
+    /// A superseding write discards the old type, so the metadata derived from
+    /// it has to go with it; otherwise [`get_type_fact`](Self::get_type_fact)
+    /// pairs the new type with the old confidence and provenance.
     pub fn bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
-        if self.types.contains_key(&owner) {
+        if let Some(existing) = self.types.get(&owner)
+            && !cache.supersedes(existing)
+        {
             return;
         }
         let file_id = owner.get_file_id();
-        self.types.insert(owner.clone(), cache);
+        let replaced = self.types.insert(owner.clone(), cache).is_some();
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
-            .insert(owner);
+            .insert(owner.clone());
+        if replaced && self.fact_metadata.remove(&owner).is_some() {
+            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        }
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
@@ -832,17 +843,21 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         if self.fact_metadata.remove(&owner).is_some() {
-            self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
         }
     }
 
+    /// Fact-carrying counterpart of [`bind_type`](Self::bind_type); the same
+    /// bottom-placeholder exception applies.
     pub fn bind_type_fact(
         &mut self,
         owner: LuaTypeOwner,
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
-        if self.types.contains_key(&owner) {
+        if let Some(existing) = self.types.get(&owner)
+            && !cache.supersedes(existing)
+        {
             return;
         }
 
@@ -854,7 +869,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         self.fact_metadata.insert(owner, metadata);
-        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
     }
 
     pub fn force_bind_type_fact(
@@ -864,7 +879,7 @@ impl LuaTypeIndex {
         metadata: LuaTypeFactMetadata,
     ) {
         let file_id = self.force_bind_type_fact_unchecked(owner, cache, metadata);
-        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
     }
 
     pub fn get_type_fact(&self, owner: &LuaTypeOwner) -> Option<LuaTypeFact> {
@@ -883,7 +898,7 @@ impl LuaTypeIndex {
 
     pub fn bind_definition_fact(&mut self, definition: LuaDefinitionId, fact: LuaTypeFact) {
         let file_id = self.bind_definition_fact_unchecked(definition, fact);
-        self.rebuild_inference_derived_state(&HashSet::from([file_id]));
+        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
     }
 
     pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
@@ -897,11 +912,11 @@ impl LuaTypeIndex {
             .unwrap_or_default()
     }
 
-    pub fn files_depending_on_inference_support(
+    pub fn files_depending_on_inference_support<S: std::hash::BuildHasher>(
         &self,
-        file_ids: &HashSet<FileId>,
+        file_ids: &std::collections::HashSet<FileId, S>,
     ) -> HashSet<FileId> {
-        let mut dependents = HashSet::new();
+        let mut dependents = HashSet::default();
         for file_id in file_ids {
             if let Some(files) = self.support_file_dependents.get(file_id) {
                 dependents.extend(files.iter().copied());
@@ -941,13 +956,17 @@ impl LuaTypeIndex {
         file_id
     }
 
-    pub(crate) fn rebuild_inference_derived_state(&mut self, changed_files: &HashSet<FileId>) {
+    pub(crate) fn rebuild_inference_derived_state<S: std::hash::BuildHasher>(
+        &mut self,
+        changed_files: &std::collections::HashSet<FileId, S>,
+    ) {
         if changed_files.is_empty() {
             return;
         }
 
-        let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> = HashMap::new();
-        let mut support_file_dependents = HashMap::new();
+        let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> =
+            HashMap::default();
+        let mut support_file_dependents = HashMap::default();
 
         for (owner, metadata) in &self.fact_metadata {
             let Some(cache) = self.types.get(owner) else {
@@ -1012,7 +1031,7 @@ impl LuaTypeIndex {
             })
             .collect();
 
-        let mut changed_files = HashSet::new();
+        let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
             self.types.insert(owner, new_cache);
@@ -1020,9 +1039,9 @@ impl LuaTypeIndex {
         self.rebuild_inference_derived_state(&changed_files);
     }
 
-    pub fn replace_table_const_types(
+    pub fn replace_table_const_types<S: std::hash::BuildHasher>(
         &mut self,
-        replacements: &HashMap<InFiled<TextRange>, LuaType>,
+        replacements: &std::collections::HashMap<InFiled<TextRange>, LuaType, S>,
     ) {
         if replacements.is_empty() {
             return;
@@ -1042,7 +1061,7 @@ impl LuaTypeIndex {
             })
             .collect();
 
-        let mut changed_files = HashSet::new();
+        let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
             self.types.insert(owner, new_cache);
@@ -1050,11 +1069,11 @@ impl LuaTypeIndex {
         self.rebuild_inference_derived_state(&changed_files);
     }
 
-    pub fn files_with_type_caches_referencing_files(
+    pub fn files_with_type_caches_referencing_files<S: std::hash::BuildHasher>(
         &self,
-        file_ids: &HashSet<FileId>,
+        file_ids: &std::collections::HashSet<FileId, S>,
     ) -> HashSet<FileId> {
-        let mut dependent_files = HashSet::new();
+        let mut dependent_files = HashSet::default();
         for (owner, cache) in &self.types {
             let owner_file_id = owner.get_file_id();
             if file_ids.contains(&owner_file_id) {
@@ -1069,11 +1088,11 @@ impl LuaTypeIndex {
         dependent_files
     }
 
-    pub fn files_with_cross_file_type_caches_referencing_files(
+    pub fn files_with_cross_file_type_caches_referencing_files<S: std::hash::BuildHasher>(
         &self,
-        file_ids: &HashSet<FileId>,
+        file_ids: &std::collections::HashSet<FileId, S>,
     ) -> HashSet<FileId> {
-        let mut dependent_files = HashSet::new();
+        let mut dependent_files = HashSet::default();
         for (owner, cache) in &self.types {
             let owner_file_id = owner.get_file_id();
             if self.type_references_other_file(cache.as_type(), file_ids, owner_file_id) {
@@ -1083,10 +1102,10 @@ impl LuaTypeIndex {
 
         dependent_files
     }
-    fn type_references_any_file(
+    fn type_references_any_file<S: std::hash::BuildHasher>(
         &self,
         typ: &LuaType,
-        file_ids: &HashSet<FileId>,
+        file_ids: &std::collections::HashSet<FileId, S>,
         owner_file_id: FileId,
     ) -> bool {
         let mut references_file = false;
@@ -1100,6 +1119,11 @@ impl LuaTypeIndex {
                 LuaType::Instance(instance) => file_ids.contains(&instance.get_range().file_id),
                 LuaType::Signature(signature_id) => file_ids.contains(&signature_id.get_file_id()),
                 LuaType::ModuleRef(file_id) => file_ids.contains(file_id),
+                // A file that only *names* a class still has to be re-analysed
+                // when a changed file is one of that class's definition sites:
+                // its inference reads the class's full member set, which that
+                // file contributes to. Dropping this arm under-invalidates
+                // badly (measured: 300 removed / 332 added on CityRP).
                 LuaType::Ref(type_id) | LuaType::Def(type_id) => {
                     self.get_type_decl(type_id).is_some_and(|decl| {
                         let locations = decl.get_locations();
@@ -1118,10 +1142,10 @@ impl LuaTypeIndex {
         references_file
     }
 
-    fn type_references_other_file(
+    fn type_references_other_file<S: std::hash::BuildHasher>(
         &self,
         typ: &LuaType,
-        file_ids: &HashSet<FileId>,
+        file_ids: &std::collections::HashSet<FileId, S>,
         owner_file_id: FileId,
     ) -> bool {
         let references_changed_file =
@@ -1166,7 +1190,7 @@ impl LuaIndex for LuaTypeIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
-        let mut changed_files = HashSet::new();
+        let mut changed_files = HashSet::default();
         for &file_id in file_ids {
             if changed_files.insert(file_id) {
                 self.remove_file_raw(file_id);
@@ -1332,6 +1356,41 @@ mod super_type_tests {
     use rowan::TextRange;
 
     use super::*;
+
+    /// A superseding write replaces the type, so the metadata derived from the
+    /// discarded type must not survive to be reported against the new one.
+    #[test]
+    fn superseding_write_does_not_keep_the_discarded_types_metadata() {
+        use crate::db_index::LuaDeclId;
+        use crate::db_index::r#type::inference_fact::{
+            LuaInferenceConfidence, LuaTypeFactMetadata,
+        };
+
+        let mut index = LuaTypeIndex::new();
+        let owner: LuaTypeOwner = LuaDeclId::new(FileId::new(1), 0.into()).into();
+
+        // A bottom placeholder carrying anchored evidence about the nil.
+        index.bind_type_fact(
+            owner.clone(),
+            LuaTypeCache::InferType(LuaType::Nil),
+            LuaTypeFactMetadata {
+                confidence: LuaInferenceConfidence::Anchored,
+                base_provenance_kind: None,
+                provenance: std::sync::Arc::from([]),
+            },
+        );
+
+        // A real type supersedes the placeholder.
+        index.bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::String));
+
+        let fact = index.get_type_fact(&owner).expect("fact");
+        assert_eq!(fact.typ(), &LuaType::String, "the new type must win");
+        assert_ne!(
+            fact.confidence(),
+            LuaInferenceConfidence::Anchored,
+            "confidence describing the discarded nil must not be reported for the new type"
+        );
+    }
 
     #[test]
     fn logical_super_type_accessors_deduplicate_source_edges() {
@@ -1556,8 +1615,9 @@ mod batch_removal_tests {
         );
         assert_eq!(batched.get_inference_events_for_file(source_file).len(), 1);
         assert_eq!(
-            batched.files_depending_on_inference_support(&HashSet::from([first])),
-            HashSet::from([survivor])
+            batched
+                .files_depending_on_inference_support(&[first].into_iter().collect::<HashSet<_>>()),
+            [survivor].into_iter().collect::<HashSet<_>>()
         );
     }
 }

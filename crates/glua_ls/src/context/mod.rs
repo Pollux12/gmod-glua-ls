@@ -37,7 +37,7 @@ use crate::context::snapshot::ServerContextInner;
 // ## Global Lock Order (Low to High Priority):
 // 1. **diagnostic_tokens** (Mutex) - File diagnostic task tokens
 // 2. **workspace_diagnostic_token** (Mutex) - Workspace diagnostic task token
-// 3. **cached_file_diagnostics / recently_edited_lines** (Mutex) - UI state
+// 3. **cached_file_diagnostics** (Mutex) - UI state
 // 4. **update_token** (Mutex) - Reindex/config update token
 // 5. **analysis** (RwLock - READ) - Read-only access to EmmyLuaAnalysis
 // 6. **workspace_manager** (RwLock - READ) - Read-only access to WorkspaceManager
@@ -130,13 +130,43 @@ fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
     // spec, "the result even computed on an older state might still be
     // useful for the client". Sending RequestCanceled for these methods
     // causes brief visual flickering as the client clears its display.
+    //
+    // Semantic tokens are deliberately excluded: their result carries no
+    // version and is encoded as offsets relative to the previous token, so a
+    // set computed against superseded text does not degrade — every offset
+    // past the edit lands on the wrong word. They get ContentModified
+    // instead, via `cancel_error_code`.
     matches!(
         method,
-        "textDocument/codeLens"
-            | "textDocument/inlayHint"
-            | "textDocument/semanticTokens/full"
-            | "gluals/annotator"
+        "textDocument/codeLens" | "textDocument/inlayHint" | "gluals/annotator"
     )
+}
+
+fn cancel_error_code(features: &LspFeatures, method: &str) -> ErrorCode {
+    // Pull diagnostics are explicitly server-cancellable. LSP 3.17: "A server
+    // is also allowed to return an error with code `ServerCancelled`
+    // indicating that the server can't compute the result right now... If no
+    // data is provided it defaults to `{ retriggerRequest: true }`." That is
+    // exactly this situation — our own state was invalidated and we want the
+    // client to ask again — and the default spares us a `data` payload.
+    if matches!(method, "textDocument/diagnostic" | "workspace/diagnostic") {
+        return ErrorCode::ServerCancelled;
+    }
+
+    // LSP 3.17 implementation considerations: "Use ContentModified only when
+    // the server's own internal state invalidates an in-flight result." A
+    // cancelled request is exactly that — `didChange` fired
+    // `cancel_all_requests_except`, so the text it describes is gone.
+    //
+    // Only worth saying to a client that re-sends the request afterwards.
+    // `retryOnContentModified` is the client's own per-method declaration of
+    // that; for anything absent from it, ContentModified reads as "no result"
+    // and clears the feature's UI, so those keep RequestCanceled.
+    if features.retries_on_content_modified(method) {
+        ErrorCode::ContentModified
+    } else {
+        ErrorCode::RequestCanceled
+    }
 }
 
 fn should_send_stale_response_on_cancel(method: &str, response: &Response) -> bool {
@@ -262,6 +292,7 @@ impl ServerContext {
 
         let sender = self.conn.sender.clone();
         let requests = self.requests.clone();
+        let lsp_features = self.inner.lsp_features.clone();
 
         tokio::spawn(async move {
             let res = exec(cancel_token.clone()).await;
@@ -278,7 +309,7 @@ impl ServerContext {
                 } else {
                     let response = Response::new_err(
                         req_id.clone(),
-                        ErrorCode::RequestCanceled as i32,
+                        cancel_error_code(&lsp_features, &request_method) as i32,
                         "cancel".to_string(),
                     );
                     let _ = sender.send(Message::Response(response));
@@ -356,9 +387,12 @@ impl ServerContext {
 
 #[cfg(test)]
 mod tests {
-    use super::{RequestTaskMetadata, ServerContext, should_send_stale_response_on_cancel};
+    use super::{
+        LspFeatures, RequestTaskMetadata, ServerContext, cancel_error_code,
+        keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
+    };
     use googletest::prelude::*;
-    use lsp_server::{RequestId, Response};
+    use lsp_server::{ErrorCode, RequestId, Response};
     use lsp_types::ClientCapabilities;
     use serde_json::json;
     use std::time::Duration;
@@ -388,12 +422,42 @@ mod tests {
     }
 
     #[gtest]
-    fn stale_semantic_tokens_still_allow_non_null_payload() -> Result<()> {
-        let empty_data = Response::new_ok(1.into(), json!({"data": []}));
-
+    fn cancelled_semantic_tokens_report_content_modified_without_stale_data() -> Result<()> {
+        // Token offsets are relative and carry no version, so a set built
+        // against superseded text is wrong rather than merely old.
         verify_that!(
-            should_send_stale_response_on_cancel("textDocument/semanticTokens/full", &empty_data),
-            eq(true)
+            keep_stale_editor_data_on_cancel("textDocument/semanticTokens/full"),
+            eq(false)
+        )?;
+
+        // ContentModified only for what the client says it re-sends. Inlay
+        // hints are absent from VS Code's list, and answering them with it
+        // clears the hints instead of preserving them.
+        let features = LspFeatures::new(
+            serde_json::from_value(json!({
+                "general": {
+                    "staleRequestSupport": {
+                        "cancel": true,
+                        "retryOnContentModified": ["textDocument/semanticTokens/full"],
+                    }
+                }
+            }))
+            .expect("capabilities should deserialize"),
+        );
+        verify_that!(
+            cancel_error_code(&features, "textDocument/semanticTokens/full") as i32,
+            eq(ErrorCode::ContentModified as i32)
+        )?;
+        verify_that!(
+            cancel_error_code(&features, "textDocument/inlayHint") as i32,
+            eq(ErrorCode::RequestCanceled as i32)
+        )?;
+        verify_that!(
+            cancel_error_code(
+                &LspFeatures::new(ClientCapabilities::default()),
+                "textDocument/semanticTokens/full"
+            ) as i32,
+            eq(ErrorCode::RequestCanceled as i32)
         )?;
         Ok(())
     }

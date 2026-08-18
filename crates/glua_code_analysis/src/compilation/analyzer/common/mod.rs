@@ -1,13 +1,73 @@
 mod migrate_global_member;
+use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 pub(super) use migrate_global_member::{
     migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
+    reconcile_parked_global_path_members,
 };
 use rowan::TextRange;
 
 use crate::{
-    InFiled, LuaMemberId, LuaTypeCache, LuaTypeOwner,
-    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId},
+    FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
+    compilation::analyzer::lua::iterates_table_member_map,
+    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
 };
+
+/// Whether `typ` is a raw template placeholder inherited from a generic-for
+/// variable that nothing has bound yet.
+pub fn holds_unbound_iter_template(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    typ: &LuaType,
+) -> bool {
+    if !typ.contain_tpl() {
+        return false;
+    }
+
+    expr.ancestors::<LuaForRangeStat>().any(|for_range_stat| {
+        for_range_stat.get_var_name_list().any(|var_name| {
+            let decl_id = LuaDeclId::new(file_id, var_name.get_position());
+            db.get_type_index()
+                .get_type_cache(&decl_id.into())
+                .is_some_and(|cache| cache.as_type().contain_tpl())
+        })
+    })
+}
+
+/// Whether `expr` is a plain read of a variable of an enclosing `pairs` loop.
+///
+/// Those loops take their variable types from the iterated table's member map,
+/// so [`analyze_for_range_stat`] queues a retry that re-derives them once the
+/// map settles. A fact that copies the variable holds the same pre-settlement
+/// snapshot, but nothing retries it, so committing one here would freeze
+/// whichever members happened to be indexed first. Queue it behind the retry
+/// instead.
+///
+/// Only a direct read qualifies. An expression that merely mentions the variable
+/// — a concatenation, a call argument — has a type its own operator decides, so
+/// deferring it buys nothing and costs a retry.
+///
+/// [`analyze_for_range_stat`]: super::lua::analyze_for_range_stat
+pub fn reads_settling_iter_var(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    let Some(decl) = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, name_expr.get_position()))
+    else {
+        return false;
+    };
+
+    expr.ancestors::<LuaForRangeStat>()
+        .filter(|for_range_stat| iterates_table_member_map(db, file_id, for_range_stat))
+        .flat_map(|for_range_stat| for_range_stat.get_var_name_list())
+        .any(|var_name| LuaDeclId::new(file_id, var_name.get_position()) == decl.get_id())
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TypeCacheWriteMode {
@@ -118,6 +178,7 @@ fn should_replace_uninformative_resolved_cache(
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
 }
 
+/// Whether a freshly inferred cache should displace what is already stored.
 fn should_replace_uninformative_inferred_cache(
     type_owner: &LuaTypeOwner,
     current_cache: &LuaTypeCache,
@@ -127,8 +188,33 @@ fn should_replace_uninformative_inferred_cache(
         return true;
     }
 
-    if !matches!(type_owner, LuaTypeOwner::Member(_)) {
-        return false;
+    // `nil` and `never` sit at the bottom of the type lattice: they record
+    // that no value was found, not that any value is allowed. A concrete
+    // inferred type is strictly more precise, so it has to win regardless of
+    // which round produced it — a local that an early round saw only as `nil`
+    // must not stay `nil` once the assignment that gives it a table has been
+    // analysed.
+    if new_cache.supersedes(current_cache) {
+        return true;
+    }
+
+    match type_owner {
+        LuaTypeOwner::Member(_) => {}
+        // A decl's cache is its whole-lifetime type; narrowing it to one
+        // assignment's type is flow analysis' job, not the cache's. So only
+        // a *placeholder* may be displaced here, and a bare `any`/`unknown`
+        // is not treated as one: several inference paths deliberately park
+        // a decl at `any`/`unknown` and expect it to survive a later,
+        // narrower assignment (pinned by
+        // `test_flow_merge_keeps_inferred_any_over_specific_non_table_assignment`,
+        // `stabilized_local_respects_assignment_regions` and
+        // `bind_type_keeps_uninformative_decl_cache_for_non_signature_inference`).
+        LuaTypeOwner::Decl(_) => {
+            if matches!(current_cache.as_type(), LuaType::Any | LuaType::Unknown) {
+                return false;
+            }
+        }
+        LuaTypeOwner::SyntaxId(_) => return false,
     }
 
     should_replace_uninformative_infer_type_cache(current_cache, new_cache)
@@ -145,7 +231,7 @@ fn should_replace_uninformative_infer_type_cache(
         return false;
     };
 
-    is_uninformative_inferred_type(current_type) && is_informative_inferred_type(new_type)
+    !is_informative_type(current_type) && is_informative_type(new_type)
 }
 
 fn should_inferred_signature_replace_uninformative_cache(
@@ -160,30 +246,6 @@ fn should_inferred_signature_replace_uninformative_cache(
             LuaTypeCache::InferType(typ) => typ.is_any() || typ.is_unknown(),
             _ => false,
         }
-}
-
-fn is_uninformative_inferred_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(is_uninformative_inferred_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| is_uninformative_inferred_type(typ)),
-        _ => false,
-    }
-}
-
-fn is_informative_inferred_type(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => false,
-        LuaType::Union(union) => union.types().any(is_informative_inferred_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .any(|(typ, _)| is_informative_inferred_type(typ)),
-        _ => true,
-    }
 }
 
 fn merge_def_type(db: &mut DbIndex, decl_type: LuaType, expr_type: LuaType, merge_level: i32) {

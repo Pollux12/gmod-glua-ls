@@ -1,0 +1,17 @@
+[package]
+name = "determinism"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+glua_code_analysis.workspace = true
+glua_parser.workspace = true
+
+tokio-util.workspace = true
+lsp_types.workspace = true
+mimalloc.workspace = true
+
+[[bin]]
+name = "determinism"
+path = "src/main.rs"

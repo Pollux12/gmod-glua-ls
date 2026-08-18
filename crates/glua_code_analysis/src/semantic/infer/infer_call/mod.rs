@@ -1670,6 +1670,10 @@ fn infer_union(
         match ty {
             LuaType::Signature(signature_id) => {
                 if let Some(signature) = db.get_signature_index().get(&signature_id) {
+                    if !signature.is_resolve_return() {
+                        return Err(InferFailReason::UnResolveSignatureReturn(signature_id));
+                    }
+
                     // 处理 overloads
                     let overloads = if signature.is_generic() {
                         signature
@@ -2098,8 +2102,10 @@ fn apply_definition_return_type(return_type: LuaType) -> LuaType {
 #[cfg(test)]
 mod tests {
     use crate::{
-        InferFailReason, InferGuard, LuaType, VirtualWorkspace, semantic::infer_call_expr_func,
+        InferFailReason, InferGuard, LuaSignatureId, LuaType, LuaUnionType, SignatureReturnStatus,
+        VirtualWorkspace, semantic::infer_call_expr_func,
     };
+    use glua_parser::LuaAstNode;
 
     #[test]
     fn test_call_cache_non_callable_not_sticky() {
@@ -2129,5 +2135,70 @@ mod tests {
         );
 
         assert!(!matches!(second, Err(InferFailReason::RecursiveInfer)));
+    }
+
+    #[test]
+    fn test_union_call_defers_when_an_overload_return_is_unresolved() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            local function resolved() return "a" end
+            local function pending() return "b" end
+            resolved()
+            "#,
+        );
+
+        let (signature_ids, call_expr) = {
+            let db = ws.analysis.compilation.get_db();
+            let tree = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("Tree must exist");
+            let chunk = tree.get_chunk_node();
+            let signature_ids = chunk
+                .descendants::<glua_parser::LuaClosureExpr>()
+                .map(|closure| LuaSignatureId::from_closure(file_id, &closure))
+                .collect::<Vec<_>>();
+            let call_expr = chunk
+                .descendants::<glua_parser::LuaCallExpr>()
+                .next()
+                .expect("Call expr must exist");
+            (signature_ids, call_expr)
+        };
+        assert_eq!(signature_ids.len(), 2);
+
+        ws.get_db_mut()
+            .get_signature_index_mut()
+            .get_mut(&signature_ids[1])
+            .expect("Signature must exist")
+            .resolve_return = SignatureReturnStatus::UnResolve;
+
+        let union_type = LuaType::Union(
+            LuaUnionType::from_vec(vec![
+                LuaType::Signature(signature_ids[0]),
+                LuaType::Signature(signature_ids[1]),
+            ])
+            .into(),
+        );
+
+        let semantic_model = ws.analysis.compilation.get_semantic_model(file_id).unwrap();
+        let db = semantic_model.get_db();
+        let mut cache = semantic_model.get_cache().borrow_mut();
+        let result = infer_call_expr_func(
+            db,
+            &mut cache,
+            call_expr,
+            union_type,
+            &InferGuard::new(),
+            None,
+        );
+
+        assert!(
+            matches!(
+                result,
+                Err(InferFailReason::UnResolveSignatureReturn(id)) if id == signature_ids[1]
+            ),
+            "expected the union call to defer on the unresolved overload, got: {result:?}"
+        );
     }
 }

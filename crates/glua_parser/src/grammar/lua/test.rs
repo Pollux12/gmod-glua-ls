@@ -1184,4 +1184,44 @@ Syntax(Chunk)@0..94
 
         assert_ast_eq!(code, result);
     }
+    /// A missing `end` is only detected at EOF, but reporting it there puts the
+    /// error at the bottom of the file instead of on the definition that is
+    /// unclosed. Every `function` form routes through `parse_closure_expr`.
+    #[test]
+    fn missing_end_reports_at_the_function_not_at_eof() {
+        for src in [
+            "function Foo(a)
+    return a
+
+local x = 1
+local y = 2
+",
+            "local function Foo(a)
+    return a
+
+local x = 1
+local y = 2
+",
+            "local f = function(a)
+    return a
+
+local x = 1
+local y = 2
+",
+        ] {
+            let tree = LuaParser::parse(src, ParserConfig::default());
+            let errors = tree.get_errors();
+            let unclosed = errors
+                .iter()
+                .find(|error| error.message.contains("close function definition"))
+                .unwrap_or_else(|| panic!("no unclosed-function error for {src:?}: {errors:?}"));
+
+            let start: usize = u32::from(unclosed.range.start()) as usize;
+            let first_line_end = src.lines().next().expect("multi-line fixture").len();
+            assert!(
+                start <= first_line_end,
+                "error at {start} should sit on the definition line (0..={first_line_end}) for {src:?}"
+            );
+        }
+    }
 }

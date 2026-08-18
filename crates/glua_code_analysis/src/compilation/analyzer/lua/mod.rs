@@ -5,6 +5,7 @@ pub(in crate::compilation::analyzer) mod func_body;
 mod member_write_policy;
 mod metatable;
 mod module;
+mod settled_contributions;
 mod stats;
 
 use rustc_hash::FxHashMap;
@@ -13,7 +14,7 @@ use std::sync::Arc;
 use closure::analyze_closure;
 pub use closure::{analyze_return_correlations, analyze_return_point};
 use for_range_stat::analyze_for_range_stat;
-pub use for_range_stat::infer_for_range_iter_expr_func;
+pub use for_range_stat::{infer_for_range_iter_expr_func, iterates_table_member_map};
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
@@ -24,9 +25,16 @@ use member_write_policy::{
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
+pub(in crate::compilation::analyzer) use settled_contributions::rederive_contributed_member_assignments;
+pub(crate) use stats::dominating_guarded_table_bootstrap_range;
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
     analyze_table_field, flush_pending_dynamic_key_collection_widenings,
+};
+pub(in crate::compilation::analyzer) use stats::{
+    get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
+    is_guarded_table_assignment_index_expr, is_guarded_table_assignment_member,
+    preserve_guarded_table_assignment_members,
 };
 
 use log::info;

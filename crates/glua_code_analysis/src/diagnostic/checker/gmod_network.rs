@@ -190,6 +190,7 @@ pub struct SenderSortKey {
     file_id: u32,
     start_offset: u32,
     send_offset: u32,
+    flow_idx: usize,
 }
 
 /// Precomputed send flows sorted by SenderSortKey for each message name.
@@ -204,8 +205,8 @@ pub fn precompute_sorted_send_flows(
     vfs: &crate::vfs::Vfs,
 ) -> SortedSendFlowCache {
     let mut cache: SortedSendFlowCache = FxHashMap::default();
-    for (file_id, send_flow) in network_index.iter_send_flows() {
-        let sort_key = sender_sort_key(vfs, file_id, send_flow);
+    for (file_id, flow_idx, send_flow) in network_index.iter_send_flows() {
+        let sort_key = sender_sort_key(vfs, file_id, flow_idx, send_flow);
         cache
             .entry(send_flow.message_name.clone())
             .or_default()
@@ -220,6 +221,7 @@ pub fn precompute_sorted_send_flows(
 fn sender_sort_key(
     vfs: &crate::vfs::Vfs,
     file_id: crate::FileId,
+    flow_idx: usize,
     send_flow: &NetSendFlow,
 ) -> SenderSortKey {
     let raw_path = vfs
@@ -233,6 +235,7 @@ fn sender_sort_key(
         file_id: file_id.id,
         start_offset: u32::from(send_flow.start_range.start()),
         send_offset: u32::from(send_flow.send_range.start()),
+        flow_idx,
     }
 }
 

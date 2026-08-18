@@ -52,7 +52,7 @@ pub(crate) fn color_info_from_expr(expr: &LuaExpr) -> Option<CompletionColorInfo
     }
 }
 
-pub(super) fn scalar_literal_detail(typ: &LuaType) -> Option<String> {
+pub(crate) fn scalar_literal_detail(typ: &LuaType) -> Option<String> {
     let value = match typ {
         LuaType::BooleanConst(value) | LuaType::DocBooleanConst(value) => value.to_string(),
         LuaType::IntegerConst(value) | LuaType::DocIntegerConst(value) => value.to_string(),

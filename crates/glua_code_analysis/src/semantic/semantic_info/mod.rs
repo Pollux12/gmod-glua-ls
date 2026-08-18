@@ -14,7 +14,7 @@ use glua_parser::{
     LuaAstNode, LuaAstToken, LuaDocNameType, LuaDocTag, LuaExpr, LuaLocalName, LuaParamName,
     LuaSyntaxId, LuaSyntaxKind, LuaSyntaxNode, LuaSyntaxToken, LuaTableField,
 };
-pub use infer_expr_semantic_decl::infer_expr_semantic_decl;
+pub use infer_expr_semantic_decl::{infer_expr_semantic_decl, try_infer_expr_semantic_decl};
 pub use resolve_global_decl::resolve_global_decl_id;
 pub use semantic_decl_level::SemanticDeclLevel;
 pub use semantic_guard::SemanticDeclGuard;

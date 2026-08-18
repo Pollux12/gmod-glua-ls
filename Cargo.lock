@@ -540,6 +540,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "determinism"
+version = "0.1.0"
+dependencies = [
+ "emmy_lsp_types",
+ "glua_code_analysis",
+ "glua_parser",
+ "mimalloc",
+ "tokio-util",
+]
+
+[[package]]
 name = "deunicode"
 version = "1.6.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"

@@ -375,6 +375,9 @@ impl GmodLoadIndex {
     }
 
     fn rebuild_execution_environments(&mut self) {
+        // Order-free by construction: this is a set union into `HashSet<String>`
+        // per target, so the hash order of `execution_environment_sites` cannot
+        // reach the result.
         self.execution_environments.clear();
         for targets in self.execution_environment_sites.values() {
             for (target, fields) in targets {

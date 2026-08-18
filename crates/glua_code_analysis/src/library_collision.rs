@@ -34,8 +34,8 @@ impl LibraryDefinitionCollision {
             format!("; examples: {}", self.examples.join(", "))
         };
         format!(
-            "Library '{}' overlaps definitions from earlier library '{}'; the earlier \
-             workspace.library entry takes precedence ({} types, {} members{}).",
+            "Library '{}' has duplicate definitions that conflict with '{}'. The earlier \
+             entry in .gluarc.json (workspace.library) takes priority ({} types, {} members{}).",
             self.shadowed_root.display(),
             self.preferred_root.display(),
             self.type_collisions,

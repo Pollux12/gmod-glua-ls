@@ -84,20 +84,20 @@ fn infer_union_binary_expr(
         return None;
     };
 
-    let mut result = LuaType::Unknown;
-    for ty in u.types() {
-        // 只在实际调用时才 clone，而不是预先 clone
-        let ty_result = if is_left_union {
-            infer_binary_expr_type(db, ty.clone(), other.clone(), op)
-        } else {
-            infer_binary_expr_type(db, other.clone(), ty.clone(), op)
-        };
-
-        if let Ok(ty) = ty_result {
-            result = TypeOps::Union.apply(db, &result, &ty);
-        }
-    }
-    Some(result)
+    // 只在实际调用时才 clone，而不是预先 clone
+    let inferred = u
+        .types()
+        .filter_map(|ty| {
+            if is_left_union {
+                infer_binary_expr_type(db, ty.clone(), other.clone(), op)
+            } else {
+                infer_binary_expr_type(db, other.clone(), ty.clone(), op)
+            }
+            .ok()
+        })
+        .reduce(|left, right| TypeOps::Union.apply(db, &left, &right));
+    // Every member failed: pin the escape value instead of returning the seed.
+    Some(inferred.unwrap_or(LuaType::Unknown))
 }
 
 fn infer_binary_expr_type(
@@ -163,13 +163,20 @@ fn infer_binary_custom_operator(
         | LuaOperatorMetaMethod::Div
         | LuaOperatorMetaMethod::Mod
         | LuaOperatorMetaMethod::Pow => {
-            let has_ambiguous_operand = left.is_nil()
+            // An operand we could not resolve leaves the result unresolved
+            // too; `any` would claim the author opted out of checking.
+            if left.is_unknown() || right.is_unknown() {
+                return Ok(LuaType::Unknown);
+            }
+            // GMod overloads arithmetic on Vector/Angle/VMatrix, so unlike
+            // plain Lua the answer is not necessarily a number.
+            let unconstrained_operand = left.is_nil()
                 || right.is_nil()
                 || left.is_any()
                 || right.is_any()
-                || left.is_unknown()
-                || right.is_unknown();
-            if has_ambiguous_operand || left.is_custom_type() || right.is_custom_type() {
+                || left.is_custom_type()
+                || right.is_custom_type();
+            if unconstrained_operand {
                 Ok(LuaType::Any)
             } else {
                 Ok(LuaType::Number)

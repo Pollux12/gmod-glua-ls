@@ -140,18 +140,23 @@ pub fn check_simple_type_compact(
             }
             _ => {}
         },
-        LuaType::Number | LuaType::FloatConst(_) => {
-            if matches!(
-                compact_type,
-                LuaType::Number
-                    | LuaType::FloatConst(_)
-                    | LuaType::Integer
-                    | LuaType::IntegerConst(_)
-                    | LuaType::DocIntegerConst(_)
-            ) {
+        LuaType::Number | LuaType::FloatConst(_) => match compact_type {
+            LuaType::Number
+            | LuaType::FloatConst(_)
+            | LuaType::Integer
+            | LuaType::IntegerConst(_)
+            | LuaType::DocIntegerConst(_) => {
                 return Ok(());
             }
-        }
+            LuaType::Ref(_) => {
+                match check_base_type_for_ref_compact(context, source, compact_type, check_guard) {
+                    Ok(_) => return Ok(()),
+                    Err(err) if err.is_type_not_match() => {}
+                    Err(err) => return Err(err),
+                }
+            }
+            _ => {}
+        },
         LuaType::Io => {
             if let LuaType::Io = compact_type {
                 return Ok(());

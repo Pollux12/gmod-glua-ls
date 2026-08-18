@@ -1094,7 +1094,7 @@ fn is_lua_keyword(name: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use std::{collections::HashMap, sync::Arc};
+    use std::{collections::BTreeMap, sync::Arc};
 
     use googletest::prelude::*;
 
@@ -1193,7 +1193,7 @@ mod tests {
         let db = DbIndex::default();
         let object = LuaType::Object(
             LuaObjectType::new_with_fields(
-                HashMap::from([(
+                BTreeMap::from([(
                     LuaMemberKey::Name("\n".into()),
                     LuaType::StringConst(SmolStr::new("\\n").into()),
                 )]),

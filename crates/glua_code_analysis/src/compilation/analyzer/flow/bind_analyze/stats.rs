@@ -452,7 +452,11 @@ pub fn bind_while_stat(
         );
     }
 
-    current
+    // The loop is left either by the condition turning false or by a `break`;
+    // both were added as antecedents of `post_while_label`. Continuing from it
+    // (instead of from `current`) is what narrows the condition variables by
+    // the negated condition after the loop.
+    finish_flow_label(binder, post_while_label, current)
 }
 
 pub fn bind_repeat_stat(

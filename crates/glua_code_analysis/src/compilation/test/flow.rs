@@ -2729,6 +2729,48 @@ _2 = a[1]
     }
 
     #[test]
+    fn test_gmod_param_name_hint_yields_to_unread_call_site_arg() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let code = r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@class Vector
+
+            local config = { spots = { } }
+
+            local function place(ent)
+                B = ent
+                for _, v in pairs(ent) do
+                    A = v
+                end
+            end
+
+            place(config.spots)
+        "#;
+
+        assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+
+        let param_type = ws.expr_ty("B");
+        let param = ws.humanize_type(param_type);
+        assert_ne!(
+            param, "Entity",
+            "a name guess must not beat a call site that fills the param with a table"
+        );
+
+        let element_type = ws.expr_ty("A");
+        let element = ws.humanize_type(element_type);
+        assert!(
+            !element.contains("fun("),
+            "pairs over that param must not enumerate the guessed class's members: {element}"
+        );
+    }
+
+    #[test]
     fn test_gmod_func_param_name_hint_infers_function_type() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = ws.get_emmyrc();
@@ -2911,6 +2953,102 @@ _2 = a[1]
         "#;
 
         assert!(ws.check_code_for(DiagnosticCode::UndefinedField, code));
+    }
+
+    #[gtest]
+    fn test_nil_guard_reassignment_join_keeps_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if x == nil then
+                    x = AddRow()
+                end
+                local narrowed = x
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    #[gtest]
+    fn test_isvalid_guard_reassignment_join_keeps_non_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if not IsValid(x) then
+                    x = AddRow()
+                end
+                local narrowed = x
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    #[gtest]
+    fn test_isvalid_guard_reassignment_join_does_not_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            ---@return Panel
+            local function AddRow() end
+
+            local function use()
+                local x = GetRow()
+                if not IsValid(x) then
+                    x = AddRow()
+                end
+                x:GetText()
+            end
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::NeedCheckNil
+        ));
     }
 
     #[gtest]
@@ -4833,7 +4971,7 @@ _2 = a[1]
     }
 
     #[test]
-    fn test_local_cached_isvalid_narrows_unknown_to_any() {
+    fn test_local_cached_isvalid_keeps_unknown_unresolved() {
         let mut ws = VirtualWorkspace::new();
         def_isvalid_guard(&mut ws);
 
@@ -4853,7 +4991,9 @@ _2 = a[1]
         );
 
         let a = ws.expr_ty("a");
-        assert_eq!(a, LuaType::Any);
+        // The guard proves the value is valid, not what type it is, so the
+        // narrowed type stays unresolved instead of widening to `any`.
+        assert_eq!(a, LuaType::Unknown);
     }
 
     #[test]
@@ -8302,6 +8442,167 @@ _2 = a[1]
             desc,
             contains_substring("DPanel"),
             "explicit default must survive wrong-realm assignment for generic binding, got: {}",
+            desc
+        );
+    }
+
+    /// A `while` loop exits only when its condition is false, so the code
+    /// after the loop must see the variable narrowed by the negated condition.
+    #[gtest]
+    fn test_while_not_isvalid_exit_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    print(p)
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// Same for a plain `== nil` loop condition.
+    #[gtest]
+    fn test_while_nil_compare_exit_narrows() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local q = GetRow()
+                while q == nil do
+                    print(q)
+                end
+                local narrowed = q
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// The loop body may reassign the variable back to a nullable value; the
+    /// exit edge still guarantees exactly what the negated condition says.
+    #[gtest]
+    fn test_while_exit_narrows_after_body_reassignment() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    p = GetRow()
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Panel");
+    }
+
+    /// The retry-loop shape must not report a nil-check diagnostic afterwards.
+    #[gtest]
+    fn test_while_exit_narrow_does_not_need_check_nil() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while not IsValid(p) do
+                    p = GetRow()
+                end
+                p:GetText()
+            end
+            "#,
+        );
+
+        assert!(!file_has_diagnostic(
+            &mut ws,
+            file_id,
+            DiagnosticCode::NeedCheckNil
+        ));
+    }
+
+    /// Control: a `while true do ... break end` loop exits without proving
+    /// anything about the variable, so it must stay nullable.
+    #[gtest]
+    fn test_while_true_break_does_not_narrow() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetText fun(self: Panel): string
+
+            ---@return Panel?
+            local function GetRow() end
+
+            local function use()
+                local p = GetRow()
+                while true do
+                    print(p)
+                    break
+                end
+                local narrowed = p
+                print(narrowed)
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        let desc = ws.humanize_type(narrowed);
+        assert!(
+            desc.contains("nil") || desc.contains('?'),
+            "while true/break must not narrow, got: {}",
             desc
         );
     }

@@ -304,25 +304,42 @@ impl GmodNetworkIndex {
         self.file_data.get(&file_id)
     }
 
-    pub fn iter_all(&self) -> impl Iterator<Item = (FileId, &FileNetworkData)> {
-        self.file_data
-            .iter()
-            .map(|(file_id, data)| (*file_id, data))
+    /// File ids in canonical order. `file_data` is a `RandomState` map, so
+    /// iterating it directly yields a different flow order every process run.
+    fn ordered_file_ids(&self) -> Vec<FileId> {
+        let mut file_ids: Vec<FileId> = self.file_data.keys().copied().collect();
+        file_ids.sort_unstable_by_key(|file_id| file_id.id);
+        file_ids
     }
 
-    pub fn iter_send_flows(&self) -> impl Iterator<Item = (FileId, &NetSendFlow)> {
-        self.file_data.iter().flat_map(move |(file_id, data)| {
-            data.send_flows
-                .iter()
-                .filter(move |flow| !self.is_replaced_definition(*file_id, flow))
-                .map(move |flow| (*file_id, flow))
-        })
+    pub fn iter_send_flows(&self) -> impl Iterator<Item = (FileId, usize, &NetSendFlow)> {
+        self.ordered_file_ids()
+            .into_iter()
+            .flat_map(move |file_id| {
+                self.file_data
+                    .get(&file_id)
+                    .into_iter()
+                    .flat_map(move |data| {
+                        data.send_flows
+                            .iter()
+                            .enumerate()
+                            .filter(move |(_, flow)| !self.is_replaced_definition(file_id, flow))
+                            .map(move |(flow_idx, flow)| (file_id, flow_idx, flow))
+                    })
+            })
     }
 
     pub fn iter_receive_flows(&self) -> impl Iterator<Item = (FileId, &NetReceiveFlow)> {
-        self.file_data
-            .iter()
-            .flat_map(|(file_id, data)| data.receive_flows.iter().map(move |flow| (*file_id, flow)))
+        self.ordered_file_ids()
+            .into_iter()
+            .flat_map(move |file_id| {
+                self.file_data
+                    .get(&file_id)
+                    .into_iter()
+                    .flat_map(move |data| {
+                        data.receive_flows.iter().map(move |flow| (file_id, flow))
+                    })
+            })
     }
 
     pub fn get_send_flows_for_message(&self, name: &str) -> Vec<(FileId, &NetSendFlow)> {

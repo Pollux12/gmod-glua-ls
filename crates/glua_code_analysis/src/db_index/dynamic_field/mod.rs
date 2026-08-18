@@ -4,12 +4,43 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{FileId, InFiled, LuaMemberId, LuaTypeDeclId};
+use crate::{DbIndex, FileId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum DynamicFieldOwner {
     Type(LuaTypeDeclId),
     Table(InFiled<TextRange>),
+}
+
+/// True when a wildcard (computed-key) assignment is the *only* thing known
+/// about `owner`: no named dynamic fields and no statically-known named
+/// members.
+pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> bool {
+    let index = db.get_dynamic_field_index();
+    if !index.has_wildcard_definitions(owner) {
+        return false;
+    }
+    if index
+        .get_fields(owner)
+        .is_some_and(|fields| !fields.is_empty())
+    {
+        return false;
+    }
+
+    let member_owner = match owner {
+        DynamicFieldOwner::Type(id) => LuaMemberOwner::Type(id.clone()),
+        DynamicFieldOwner::Table(range) => LuaMemberOwner::Element(range.clone()),
+    };
+    db.get_member_index()
+        .get_members(&member_owner)
+        .is_none_or(|members| {
+            !members.iter().any(|member| {
+                matches!(
+                    member.get_key(),
+                    LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)
+                )
+            })
+        })
 }
 
 /// Index tracking dynamically-assigned fields on typed variables.
@@ -33,6 +64,22 @@ pub struct DynamicFieldIndex {
     wildcard_definitions: HashMap<DynamicFieldOwner, Vec<InFiled<TextRange>>>,
     /// file → wildcard assignments contributed by this file.
     wildcard_file_contributions: HashMap<FileId, Vec<(DynamicFieldOwner, TextRange)>>,
+    /// field_name → files containing an `X.field_name = ...` write whose
+    /// receiver could not be resolved to any owner, so the write landed
+    /// nowhere. Names here are known to be assigned *somewhere* at runtime even
+    /// though no table in the index can claim them.
+    unattributed_fields: HashMap<SmolStr, HashSet<FileId>>,
+    /// file → unattributed field names contributed by this file.
+    unattributed_file_contributions: HashMap<FileId, Vec<SmolStr>>,
+    sealed: bool,
+}
+
+fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
+    (
+        definition.file_id.id,
+        definition.value.start().into(),
+        definition.value.end().into(),
+    )
 }
 
 impl DynamicFieldIndex {
@@ -91,9 +138,15 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let definition = InFiled::new(file_id, range);
-        let is_new_definition = !field_definitions.contains(&definition);
+        // Kept in canonical order: `get_field_definitions` feeds a union of
+        // overloads, so insertion order would make the elected arm depend on the
+        // batch walk order rather than on the workspace.
+        let insert_at = field_definitions.partition_point(|existing| {
+            definition_sort_key(existing) < definition_sort_key(&definition)
+        });
+        let is_new_definition = field_definitions.get(insert_at) != Some(&definition);
         if is_new_definition {
-            field_definitions.push(definition);
+            field_definitions.insert(insert_at, definition);
         }
 
         if is_new_definition {
@@ -120,6 +173,35 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push((owner, range));
         }
+    }
+
+    pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
+        if self
+            .unattributed_fields
+            .entry(field_name.clone())
+            .or_default()
+            .insert(file_id)
+        {
+            self.unattributed_file_contributions
+                .entry(file_id)
+                .or_default()
+                .push(field_name);
+        }
+    }
+
+    /// Whether the index has finished being built for the current analysis
+    /// round. A read taken before that answers from however far the batch walk
+    /// happened to get, so an absent field is not yet known to be absent.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    pub fn set_sealed(&mut self, sealed: bool) {
+        self.sealed = sealed;
+    }
+
+    pub fn has_unattributed_field(&self, field_name: &str) -> bool {
+        self.unattributed_fields.contains_key(field_name)
     }
 
     pub fn has_field(&self, owner: &DynamicFieldOwner, field_name: &str) -> bool {
@@ -373,45 +455,80 @@ fn normalize_field_definitions(
 
 impl LuaIndex for DynamicFieldIndex {
     fn remove(&mut self, file_id: FileId) {
-        let mut removed_field_definitions = false;
+        self.remove_files(&[file_id]);
+    }
+
+    fn remove_files(&mut self, file_ids: &[FileId]) {
+        let removed: HashSet<FileId> = file_ids.iter().copied().collect();
+        // The definition maps are swept once for the whole batch: retaining
+        // per file made removal cost O(files × index) on high fan-in edits.
+        let mut files_with_removed_fields: HashSet<FileId> = HashSet::new();
         self.field_definitions.retain(|_, fields| {
             fields.retain(|_, definitions| {
-                let definition_count_before = definitions.len();
-                definitions.retain(|definition| definition.file_id != file_id);
-                removed_field_definitions |= definitions.len() != definition_count_before;
+                definitions.retain(|definition| {
+                    if removed.contains(&definition.file_id) {
+                        files_with_removed_fields.insert(definition.file_id);
+                        false
+                    } else {
+                        true
+                    }
+                });
                 !definitions.is_empty()
             });
             !fields.is_empty()
         });
         self.direct_field_definitions.retain(|_, fields| {
             fields.retain(|_, definitions| {
-                definitions.retain(|definition| definition.file_id != file_id);
+                definitions.retain(|definition| !removed.contains(&definition.file_id));
                 !definitions.is_empty()
             });
             !fields.is_empty()
         });
         self.finite_named_members.retain(|_, members| {
-            members.retain(|member_id| member_id.file_id != file_id);
+            members.retain(|member_id| !removed.contains(&member_id.file_id));
             !members.is_empty()
         });
 
-        let mut removed_wildcard_definitions = false;
+        let mut files_with_removed_wildcards: HashSet<FileId> = HashSet::new();
         self.wildcard_definitions.retain(|_, definitions| {
-            let definition_count_before = definitions.len();
-            definitions.retain(|definition| definition.file_id != file_id);
-            removed_wildcard_definitions |= definitions.len() != definition_count_before;
+            definitions.retain(|definition| {
+                if removed.contains(&definition.file_id) {
+                    files_with_removed_wildcards.insert(definition.file_id);
+                    false
+                } else {
+                    true
+                }
+            });
             !definitions.is_empty()
         });
 
         // `file_contributions` is an internal removal index only; no downstream consumer
         // observes its Vec order, and `rebuild_derived_state` may repopulate it through
         // HashMap iteration.
-        let (had_field_contributions, had_wildcard_contributions) =
-            self.erase_file_from_derived(file_id);
+        for &file_id in file_ids {
+            if let Some(field_names) = self.unattributed_file_contributions.remove(&file_id) {
+                for field_name in field_names {
+                    if let Some(files) = self.unattributed_fields.get_mut(&field_name) {
+                        files.remove(&file_id);
+                        if files.is_empty() {
+                            self.unattributed_fields.remove(&field_name);
+                        }
+                    }
+                }
+            }
+        }
 
-        if (removed_field_definitions && !had_field_contributions)
-            || (removed_wildcard_definitions && !had_wildcard_contributions)
-        {
+        let mut need_rebuild = false;
+        for &file_id in file_ids {
+            let (had_field_contributions, had_wildcard_contributions) =
+                self.erase_file_from_derived(file_id);
+            need_rebuild |= (files_with_removed_fields.contains(&file_id)
+                && !had_field_contributions)
+                || (files_with_removed_wildcards.contains(&file_id) && !had_wildcard_contributions);
+        }
+        // Rebuilding is a pure function of the primary maps, so one rebuild at
+        // batch end is equivalent to the per-file rebuilds it replaces.
+        if need_rebuild {
             self.rebuild_derived_state();
         }
     }
@@ -424,6 +541,9 @@ impl LuaIndex for DynamicFieldIndex {
         self.file_contributions.clear();
         self.wildcard_definitions.clear();
         self.wildcard_file_contributions.clear();
+        self.unattributed_fields.clear();
+        self.unattributed_file_contributions.clear();
+        self.sealed = false;
     }
 }
 
@@ -526,6 +646,39 @@ mod tests {
         assert!(!index.has_field(&owner, &field));
         assert!(index.get_fields(&owner).is_none());
         assert!(index.get_field_definitions(&owner, &field).is_empty());
+    }
+
+    #[test]
+    fn field_definitions_are_canonically_ordered_regardless_of_insertion_order() {
+        let owner = DynamicFieldOwner::Type(LuaTypeDeclId::global("DynFieldTest"));
+        let field = SmolStr::new("value");
+        let inserts = [
+            (FileId::new(2), range(5, 6)),
+            (FileId::new(1), range(9, 10)),
+            (FileId::new(1), range(3, 4)),
+        ];
+
+        let mut forward = DynamicFieldIndex::new();
+        for (file_id, range) in inserts {
+            forward.add_field(owner.clone(), field.clone(), file_id, range);
+        }
+        let mut reverse = DynamicFieldIndex::new();
+        for (file_id, range) in inserts.into_iter().rev() {
+            reverse.add_field(owner.clone(), field.clone(), file_id, range);
+        }
+
+        assert_eq!(
+            forward.get_field_definitions(&owner, &field),
+            vec![
+                InFiled::new(FileId::new(1), range(3, 4)),
+                InFiled::new(FileId::new(1), range(9, 10)),
+                InFiled::new(FileId::new(2), range(5, 6)),
+            ]
+        );
+        assert_eq!(
+            forward.get_field_definitions(&owner, &field),
+            reverse.get_field_definitions(&owner, &field)
+        );
     }
 
     #[test]

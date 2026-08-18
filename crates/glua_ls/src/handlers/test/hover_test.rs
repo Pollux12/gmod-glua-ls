@@ -4171,4 +4171,237 @@ local EscapeStringMap: {
         );
         Ok(())
     }
+
+    #[gtest]
+    fn test_base_glide_car_inherited_method_and_return_hover() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_file(
+            "lua/entities/base_glide/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_anim"
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide/sv_input.lua",
+            r#"
+                local getTable = FindMetaTable("Entity").GetTable
+
+                --- Get the action's boolean value from a specific seat.
+                --- @param seatIndex number The seat index
+                --- @param action string The action name
+                --- @param entTbl table|nil Optional cached entity table from GetTable()
+                function ENT:GetInputBool(seatIndex, action, entTbl)
+                    local bools = (entTbl or getTable(self)).inputBools[seatIndex]
+                    return bools and bools[action] or false
+                end
+            "#,
+        );
+
+        ws.def_file(
+            "lua/entities/base_glide_car/shared.lua",
+            r#"
+                ENT.Type = "anim"
+                ENT.Base = "base_glide"
+                DEFINE_BASECLASS("base_glide")
+            "#,
+        );
+
+        let (init_content, pos_input) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("base_glide")
+
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local freeLookHeld = self:GetIn<??>putBool(1, "free_look")
+                end
+            "#,
+        )?;
+        let init_file_id = ws.def_file("lua/entities/base_glide_car/init.lua", &init_content);
+
+        let hover_input = extract_hover_markdown(&ws, init_file_id, pos_input);
+        assert!(
+            hover_input.contains("base_glide:GetInputBool"),
+            "hover at call site should show inherited method, got: {hover_input}"
+        );
+        assert!(
+            hover_input.contains("Get the action's boolean value from a specific seat."),
+            "hover should include docstring: {hover_input}"
+        );
+
+        let (ret_content, pos_ret) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                DEFINE_BASECLASS("base_glide")
+
+                function ENT:OnSeatInput(seatIndex, action, pressed)
+                    local free<??>LookHeld = self:GetInputBool(1, "free_look")
+                end
+            "#,
+        )?;
+        let ret_file_id = ws.def_file("lua/entities/base_glide_car/init3.lua", &ret_content);
+        let hover_ret = extract_hover_markdown(&ws, ret_file_id, pos_ret);
+        assert!(
+            !hover_ret.contains("unknown"),
+            "return variable should not infer as unknown: {hover_ret}"
+        );
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_real_cityrp_base_glide_car_hover() -> Result<()> {
+        use glua_code_analysis::{WorkspaceFolder, collect_workspace_files};
+
+        let mut analysis = glua_code_analysis::EmmyLuaAnalysis::new();
+        let mut emmyrc = glua_code_analysis::Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+
+        let codebase_path = std::path::PathBuf::from(r"D:\Source\Repos\GitHub\cityrp-vehicle-base");
+        if !codebase_path.exists() {
+            return Ok(());
+        }
+        let annot_path =
+            std::path::PathBuf::from(r"D:\Source\Repos\GitHub\annotations-gmod-glua-ls");
+
+        let mut folders = Vec::new();
+        if annot_path.exists() {
+            analysis.add_library_workspace(annot_path.clone());
+            folders.push(WorkspaceFolder::new(annot_path.clone(), true));
+        }
+
+        analysis.add_main_workspace(codebase_path.clone());
+        folders.push(WorkspaceFolder::new(codebase_path.clone(), false));
+
+        analysis.update_config(std::sync::Arc::new(emmyrc.clone()));
+
+        let collected = collect_workspace_files(&folders, &emmyrc, None, None);
+        let files: Vec<(std::path::PathBuf, Option<String>)> = collected
+            .into_iter()
+            .filter_map(|f| {
+                let path = std::path::PathBuf::from(&f.path);
+                let text = std::fs::read_to_string(&path).ok()?;
+                Some((path, Some(text)))
+            })
+            .collect();
+        analysis.update_files_by_path(files);
+
+        let vfs = analysis.compilation.get_db().get_vfs();
+        let file_id = vfs
+            .get_all_file_ids()
+            .into_iter()
+            .find(|id| {
+                vfs.get_file_path(id).is_some_and(|p| {
+                    p.ends_with("base_glide_car/init.lua")
+                        || p.ends_with(r"base_glide_car\init.lua")
+                })
+            })
+            .expect("base_glide_car/init.lua file_id");
+
+        // Line 781 is index 780 in 0-indexed LSP line coordinates:
+        // "        local freeLookHeld = self:GetInputBool(1, "free_look")"
+        // Col for self: 29
+        // Col for GetInputBool: 35
+        // Col for freeLookHeld: 14
+
+        // 1. Hover on `self` at line 781: must show `self: base_glide_car` (not method `OnSeatInput`)
+        let pos_self = lsp_types::Position::new(780, 29);
+        let hover_self =
+            crate::handlers::hover::hover(&analysis, file_id, pos_self, None).expect("hover self");
+        let HoverContents::Markup(self_markup) = hover_self.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            self_markup.value.contains("self: base_glide_car"),
+            "hover self should show self: base_glide_car, got: {}",
+            self_markup.value
+        );
+        assert!(
+            !self_markup
+                .value
+                .contains("(method) base_glide_car:OnSeatInput"),
+            "hover self must not resolve to the method definition itself: {}",
+            self_markup.value
+        );
+        assert!(
+            self_markup.value.contains("Scripted Entity:")
+                && self_markup.value.contains("base_glide_car"),
+            "hover self should include scripted entity info: {}",
+            self_markup.value
+        );
+
+        // 2. Hover on `GetInputBool` at line 781: must show inherited method `base_glide:GetInputBool`
+        let pos_input = lsp_types::Position::new(780, 35);
+        let hover_input = crate::handlers::hover::hover(&analysis, file_id, pos_input, None)
+            .expect("hover GetInputBool");
+        let HoverContents::Markup(input_markup) = hover_input.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            input_markup
+                .value
+                .contains("GetInputBool(seatIndex: number, action: string, entTbl: table?) -> any"),
+            "hover GetInputBool should show signature with return type, got: {}",
+            input_markup.value
+        );
+        assert!(
+            input_markup
+                .value
+                .contains("Get the action's boolean value from a specific seat."),
+            "hover GetInputBool should show docstring: {}",
+            input_markup.value
+        );
+
+        // 3. Hover on `freeLookHeld` variable at line 781: must show `local freeLookHeld: any` (not unknown)
+        let pos_var = lsp_types::Position::new(780, 15);
+        let hover_var = crate::handlers::hover::hover(&analysis, file_id, pos_var, None)
+            .expect("hover freeLookHeld");
+        let HoverContents::Markup(var_markup) = hover_var.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            var_markup.value.contains("local freeLookHeld: any"),
+            "hover freeLookHeld should infer return type `any`, got: {}",
+            var_markup.value
+        );
+
+        // 4. Definition site sv_input.lua: GetInputBool
+        let sv_file_id = vfs
+            .get_all_file_ids()
+            .into_iter()
+            .find(|id| {
+                vfs.get_file_path(id).is_some_and(|p| {
+                    p.ends_with("base_glide/sv_input.lua")
+                        || p.ends_with(r"base_glide\sv_input.lua")
+                })
+            })
+            .expect("base_glide/sv_input.lua file_id");
+        let pos_def = lsp_types::Position::new(62, 14);
+        let hover_def = crate::handlers::hover::hover(&analysis, sv_file_id, pos_def, None)
+            .expect("hover GetInputBool def");
+        let HoverContents::Markup(def_markup) = hover_def.contents else {
+            panic!("expected markup")
+        };
+        assert!(
+            def_markup
+                .value
+                .contains("(method) base_glide:GetInputBool"),
+            "definition hover should show method base_glide:GetInputBool, got: {}",
+            def_markup.value
+        );
+
+        Ok(())
+    }
 }

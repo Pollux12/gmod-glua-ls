@@ -9,7 +9,7 @@ pub use collect_workspace_files::*;
 pub use document::LuaDocument;
 pub use file_id::{FileId, InFiled};
 pub use file_uri_handler::{file_path_to_uri, uri_to_file_path};
-use glua_parser::{LineIndex, LuaParseError, LuaParser, LuaSyntaxTree};
+use glua_parser::{LineIndex, LuaParseError, LuaParser, LuaSyntaxTree, LuaTokenKind};
 pub(crate) use loader::normalize_path_for_ordering;
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
 use lsp_types::Uri;
@@ -37,6 +37,47 @@ pub struct Vfs {
     /// NOT bumped by analysis/index updates, so the cold-index main pass and its
     /// stabilization re-run share a revision and the second build is a cache hit.
     content_revision: u64,
+}
+
+fn trees_semantically_equal(left: &LuaSyntaxTree, right: &LuaSyntaxTree) -> bool {
+    // Trivia is NOT skippable mid-file: the parser groups doc comments by
+    // the number of `TkEndOfLine` tokens between them and classifies a
+    // comment as inline-trailer vs leading-block by whether an EOL or plain
+    // whitespace precedes it, so `\n` -> ` ` (one Join Lines keystroke)
+    // re-attaches an annotation while every non-trivia token stays
+    // identical. The streams are therefore compared in full — kind, range
+    // and text of every token — and only trivia *after* the last
+    // significant token (a trailing newline, the one shape an EOF-append
+    // edit produces) may differ.
+    let all_tokens = |tree: &LuaSyntaxTree| {
+        tree.get_red_root()
+            .descendants_with_tokens()
+            .filter_map(|element| element.into_token())
+            .collect::<Vec<_>>()
+    };
+    let is_trailing_trivia = |token: &glua_parser::LuaSyntaxToken| {
+        matches!(
+            token.kind().to_token(),
+            LuaTokenKind::TkWhitespace | LuaTokenKind::TkEndOfLine | LuaTokenKind::TkEof
+        )
+    };
+    let left_tokens = all_tokens(left);
+    let right_tokens = all_tokens(right);
+    let significant_len = |tokens: &[glua_parser::LuaSyntaxToken]| {
+        tokens
+            .iter()
+            .rposition(|token| !is_trailing_trivia(token))
+            .map_or(0, |index| index + 1)
+    };
+    let left_len = significant_len(&left_tokens);
+    let right_len = significant_len(&right_tokens);
+    left_len == right_len
+        && left_tokens[..left_len]
+            .iter()
+            .zip(&right_tokens[..right_len])
+            .all(|(a, b)| {
+                a.kind() == b.kind() && a.text_range() == b.text_range() && a.text() == b.text()
+            })
 }
 
 #[derive(Default)]
@@ -116,6 +157,25 @@ impl Vfs {
 
     pub fn get_file_path(&self, id: &FileId) -> Option<&PathBuf> {
         self.file_path_map.get(&id.id)
+    }
+
+    /// Whether `data` parses to the same significant token stream (kind,
+    /// range and text) as the tree currently stored for `file_id`. Comments
+    /// count as significant — annotations live in them — so only pure
+    /// whitespace changes that shift no offset (e.g. a trailing newline at
+    /// end of file) can match.
+    pub fn content_semantically_matches(&mut self, file_id: FileId, data: &str) -> bool {
+        if !self.tree_map.contains_key(&file_id) {
+            return false;
+        }
+        let parse_config = self
+            .emmyrc
+            .as_ref()
+            .expect("emmyrc set")
+            .get_parse_config(&mut self.node_cache);
+        let new_tree = LuaParser::parse(data, parse_config);
+        let old_tree = &self.tree_map[&file_id];
+        trees_semantically_equal(old_tree, &new_tree)
     }
 
     pub fn set_file_content(&mut self, uri: &Uri, data: Option<String>) -> FileId {
@@ -502,5 +562,47 @@ mod tests {
 
         assert!(result.is_none(), "stale update should be rejected");
         assert_eq!(vfs.content_revision(), revision);
+    }
+
+    #[test]
+    fn semantic_match_accepts_only_offset_preserving_whitespace() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+        let original = "local a = 1\nreturn a";
+        let file_id = vfs.set_file_content(&uri, Some(original.to_string()));
+
+        // Trailing whitespace shifts no token offset: still the same program.
+        assert!(vfs.content_semantically_matches(file_id, "local a = 1\nreturn a\n"));
+        assert!(vfs.content_semantically_matches(file_id, original));
+
+        // Token text, leading whitespace (offsets shift) and comments (they
+        // carry annotations) are all significant.
+        assert!(!vfs.content_semantically_matches(file_id, "local a = 2\nreturn a"));
+        assert!(!vfs.content_semantically_matches(file_id, "\nlocal a = 1\nreturn a"));
+        assert!(!vfs.content_semantically_matches(file_id, "local a = 1 --c\nreturn a"));
+        assert!(!vfs.content_semantically_matches(file_id, "local a = 1  \nreturn a"));
+    }
+
+    /// Trivia *kind* decides comment attachment: an EOL-to-space swap turns a
+    /// leading doc annotation into an inline trailer on the previous statement
+    /// (the Join Lines keystroke), and the blank-line count between `---` lines
+    /// decides whether they form one doc block or two. Byte-length-preserving
+    /// variants of both must never pass the gate.
+    #[test]
+    fn semantic_match_rejects_trivia_kind_mutations() {
+        let mut vfs = new_vfs();
+        let uri = file_uri();
+
+        let annotated = "local a = 1\n---@type integer\nlocal b = x";
+        let file_id = vfs.set_file_content(&uri, Some(annotated.to_string()));
+        // Join Lines: `\n` -> ` `, every non-trivia token keeps kind/range/text.
+        assert!(
+            !vfs.content_semantically_matches(file_id, "local a = 1 ---@type integer\nlocal b = x")
+        );
+
+        let block = "--- a\r\n--- b\nlocal c = 1";
+        let file_id = vfs.set_file_content(&uri, Some(block.to_string()));
+        // Same byte length, but the blank line splits the doc block in two.
+        assert!(!vfs.content_semantically_matches(file_id, "--- a\n\n--- b\nlocal c = 1"));
     }
 }

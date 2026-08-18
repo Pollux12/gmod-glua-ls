@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test {
     use crate::{DiagnosticCode, VirtualWorkspace};
+    use glua_parser::{LuaAstNode, LuaBinaryExpr};
     use googletest::prelude::*;
 
     #[test]
@@ -177,5 +178,55 @@ mod test {
         let a = ws.expr_ty("a");
         let desc = ws.humanize_type(a);
         assert_eq!(desc, "string");
+    }
+
+    #[gtest]
+    fn test_self_referential_table_bootstrap_ignores_sibling_type() {
+        // `X.a = X.a or {}` defines the table; the self-read on the left cannot inform
+        // its own definition, so an already resolved type must not be folded in. Without
+        // this the fold depends on what the left read happens to resolve to, which
+        // differs between a cold build and a warm partial re-index.
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "a.lua",
+            r#"
+            ---@class Order
+            ---@field id number
+
+            ---@class Reg
+            ---@field entry Order
+
+            ---@type Reg
+            Registry = {}
+            "#,
+        );
+
+        let file_id = ws.def_file(
+            "b.lua",
+            r#"
+            function Bootstrap()
+                Registry.entry = Registry.entry or {}
+            end
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let binary_expr = semantic_model
+            .get_root()
+            .descendants::<LuaBinaryExpr>()
+            .next()
+            .expect("expected the or-expression");
+        let folded = semantic_model
+            .get_semantic_info(binary_expr.syntax().clone().into())
+            .expect("expected semantic info")
+            .display_typ()
+            .clone();
+
+        assert_eq!(ws.humanize_type(folded), "table");
     }
 }

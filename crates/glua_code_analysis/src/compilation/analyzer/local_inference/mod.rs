@@ -52,7 +52,14 @@ pub(super) fn stabilize_unknown_locals(
                 && db
                     .get_type_index()
                     .get_type_cache(&(*decl_id).into())
-                    .is_none_or(|cache| cache.is_infer() && cache.as_type().is_unknown())
+                    // `never` is the bottom of the same uninformative band
+                    // as `unknown` (see `LuaTypeCache::supersedes`), and it
+                    // is what an initialiser resolves to when the member it
+                    // reads is not in the index *yet*.
+                    .is_none_or(|cache| {
+                        cache.is_infer()
+                            && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
+                    })
         })
         .collect::<Vec<_>>();
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
@@ -227,10 +234,16 @@ fn compare_unguarded_child_candidates(
         .then_with(|| left.stable_cmp(right))
 }
 
+/// The evidence sites of one declaration, with whether each sits inside a
+/// `return`.
+pub(super) type UnguardedChildSiteCache =
+    HashMap<(crate::FileId, crate::LuaDeclId), Vec<(LuaNameExpr, LuaIndexExpr, bool)>>;
+
 pub(super) fn stabilize_unguarded_children(
     db: &mut crate::DbIndex,
     context: &mut AnalyzeContext,
     only_return_evidence: bool,
+    site_cache: &mut UnguardedChildSiteCache,
 ) -> Vec<InFiled<glua_parser::LuaSyntaxId>> {
     let _profile =
         crate::profile::Profile::cond_new("unguarded child inference", context.tree_list.len() > 1);
@@ -241,6 +254,7 @@ pub(super) fn stabilize_unguarded_children(
         return Vec::new();
     }
     let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::new();
+    let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
         HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::new();
     let mut sources =
@@ -281,6 +295,47 @@ pub(super) fn stabilize_unguarded_children(
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
 
         for (decl_id, references) in references {
+            // The syntactic prerequisites for evidence — a read reference
+            // that is the prefix of an index expression — are pure tree
+            // lookups, while `declaration_base_type` infers a parameter's
+            // type.
+            let all_sites = site_cache.entry((file_id, decl_id)).or_insert_with(|| {
+                references
+                    .cells
+                    .iter()
+                    .filter(|cell| !cell.is_write)
+                    .filter_map(|cell| {
+                        let name_expr = root
+                            .covering_element(cell.range)
+                            .ancestors()
+                            .find_map(LuaNameExpr::cast)
+                            .filter(|name| name.get_range() == cell.range)?;
+                        let index_expr = name_expr
+                            .syntax()
+                            .ancestors()
+                            .find_map(LuaIndexExpr::cast)
+                            .filter(|index| {
+                                index
+                                    .get_prefix_expr()
+                                    .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+                            })?;
+                        let in_return = index_expr
+                            .syntax()
+                            .ancestors()
+                            .any(|node| LuaReturnStat::cast(node).is_some());
+                        Some((name_expr, index_expr, in_return))
+                    })
+                    .collect::<Vec<_>>()
+            });
+            let sites = all_sites
+                .iter()
+                .filter(|(_, _, in_return)| !only_return_evidence || *in_return)
+                .map(|(name_expr, index_expr, _)| (name_expr.clone(), index_expr.clone()))
+                .collect::<Vec<_>>();
+            if sites.is_empty() {
+                continue;
+            }
+
             let Some(base_type) = declaration_base_type(db, context, decl_id) else {
                 continue;
             };
@@ -291,35 +346,7 @@ pub(super) fn stabilize_unguarded_children(
                 continue;
             };
 
-            for cell in references.cells.into_iter().filter(|cell| !cell.is_write) {
-                let Some(name_expr) = root
-                    .covering_element(cell.range)
-                    .ancestors()
-                    .find_map(LuaNameExpr::cast)
-                    .filter(|name| name.get_range() == cell.range)
-                else {
-                    continue;
-                };
-                let Some(index_expr) = name_expr
-                    .syntax()
-                    .ancestors()
-                    .find_map(LuaIndexExpr::cast)
-                    .filter(|index| {
-                        index
-                            .get_prefix_expr()
-                            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                    })
-                else {
-                    continue;
-                };
-                if only_return_evidence
-                    && !index_expr
-                        .syntax()
-                        .ancestors()
-                        .any(|node| LuaReturnStat::cast(node).is_some())
-                {
-                    continue;
-                }
+            for (name_expr, index_expr) in sites {
                 if let Some(profile) = &mut profile {
                     profile.references_scanned += 1;
                 }
@@ -416,15 +443,27 @@ pub(super) fn stabilize_unguarded_children(
                                     index_expr.get_position(),
                                 )
                                 .is_empty()
-                        })
-                        || resolve_dynamic_field_member(
+                        });
+                    let visible = visible
+                        || match resolve_dynamic_field_member(
                             db,
                             cache,
                             &LuaType::Ref(child_id.clone()),
                             &member_key,
                             None,
-                        )
-                        .is_some();
+                        ) {
+                            Ok(resolution) => resolution.is_some(),
+                            // The index is still unsealed, so this child's
+                            // membership is unknown. Scoring the definition now
+                            // would publish a narrowed fact that the sealed pass
+                            // can no longer revise, so defer the whole definition
+                            // to that pass instead.
+                            Err(reason) if reason.is_need_resolve() => {
+                                deferred_definitions.extend(definitions.iter().cloned());
+                                break;
+                            }
+                            Err(_) => false,
+                        };
                     if !visible {
                         continue;
                     }
@@ -481,6 +520,11 @@ pub(super) fn stabilize_unguarded_children(
         profile.reference_scan = start.elapsed();
     }
 
+    if !deferred_definitions.is_empty() {
+        scores.retain(|definition, _| !deferred_definitions.contains(definition));
+        sources.retain(|(definition, _), _| !deferred_definitions.contains(definition));
+    }
+
     let mut updates = Vec::new();
     let mut update_sources = Vec::new();
     for (definition, candidates) in scores {
@@ -532,7 +576,7 @@ pub(super) fn stabilize_unguarded_children(
             kind: LuaInferenceProvenanceKind::UnguardedChild,
             source: source.clone(),
         };
-        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let typ = LuaType::from_inferred_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
         for child in &winners {
             support.extend(
@@ -582,7 +626,7 @@ pub(super) fn stabilize_unguarded_children(
                 .unwrap_or_else(|| right.get_name());
             compare_unguarded_child_candidates(left, left_display_name, right, right_display_name)
         });
-        let typ = LuaType::from_vec(winners.iter().cloned().map(LuaType::Ref).collect());
+        let typ = LuaType::from_inferred_vec(winners.iter().cloned().map(LuaType::Ref).collect());
         let mut support = Vec::new();
         for child in &winners {
             support.extend(

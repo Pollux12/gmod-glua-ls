@@ -1,4 +1,4 @@
-use glua_parser::{LuaAstNode, LuaExpr};
+use glua_parser::{LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaSyntaxNode};
 
 use crate::{
     DbIndex, LuaInferCache, LuaType, LuaUnionType, TypeOps, check_type_compact,
@@ -123,11 +123,7 @@ pub fn special_or_rule(
         && call_expr.is_error()
     {
         let narrowed = remove_false_or_nil(left_type.clone());
-        return Some(if narrowed.is_unknown() {
-            LuaType::Any
-        } else {
-            narrowed
-        });
+        return Some(narrowed);
     }
 
     if is_unresolved_global_unknown_name_expr(db, cache, &left_expr, left_type) {
@@ -151,6 +147,13 @@ pub fn special_or_rule(
     match right_expr {
         LuaExpr::TableExpr(table_expr) => {
             if table_expr.is_empty() {
+                // A self-read cannot inform its own definition, so the fold must
+                // not consult it: `X = X or {}` always yields the fresh table,
+                // whatever the left read happens to resolve to right now.
+                if is_self_referential_bootstrap(&left_expr) {
+                    return Some(right_type.clone());
+                }
+
                 // When left is an unresolved global or field, `x or {}` is a
                 // bootstrap pattern. Prefer the RHS table literal so member
                 // definitions attach to the concrete table owner.
@@ -188,20 +191,18 @@ pub fn special_or_rule(
             }
 
             if check_type_compact(db, left_type, right_type).is_ok() {
-                let narrowed = remove_false_or_nil(left_type.clone());
-                return Some(if narrowed.is_unknown() {
-                    LuaType::Any
-                } else {
-                    narrowed
-                });
+                return Some(remove_false_or_nil(left_type.clone()));
             }
         }
 
         _ => {}
     }
 
+    // `X = X or {}` with an unresolved `X`: the fallback arm is real
+    // evidence, the left arm is not, so keep both rather than widening the
+    // pair to `any`.
     if left_type.is_unknown() {
-        return Some(TypeOps::Union.apply(db, &LuaType::Any, right_type));
+        return Some(TypeOps::Union.apply(db, &LuaType::Unknown, right_type));
     }
 
     None
@@ -214,7 +215,53 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
         return Ok(right);
     }
 
-    Ok(TypeOps::Union.apply(db, &remove_false_or_nil(left), &right))
+    // Mirror of the `and` case: an unresolved left operand has no enumerable
+    // truthy half, so it contributes nothing rather than widening to
+    // `x|unknown`.
+    let truthy_left = remove_false_or_nil(left);
+    if truthy_left.is_unknown() {
+        return Ok(right);
+    }
+
+    Ok(TypeOps::Union.apply(db, &truthy_left, &right))
+}
+
+/// True when `left_expr` is a field read that is also the target of the assignment
+/// it feeds, e.g. `X.a[k] = X.a[k] or {}`. Name targets are excluded: for a local or
+/// parameter `x = x or {}` is a narrowing idiom over a declared type rather than a
+/// definition of the table, and unresolved globals are already handled below.
+fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
+    if !matches!(left_expr, LuaExpr::IndexExpr(_)) {
+        return false;
+    }
+
+    let Some(binary_expr) = left_expr.get_parent::<LuaBinaryExpr>() else {
+        return false;
+    };
+    let Some(assign_stat) = binary_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+
+    let (vars, exprs) = assign_stat.get_var_and_expr_list();
+    let Some(index) = exprs
+        .iter()
+        .position(|expr| expr.get_range() == binary_expr.get_range())
+    else {
+        return false;
+    };
+    let Some(var) = vars.get(index) else {
+        return false;
+    };
+
+    significant_tokens(var.syntax()) == significant_tokens(left_expr.syntax())
+}
+
+fn significant_tokens(node: &LuaSyntaxNode) -> Vec<String> {
+    node.descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+        .filter(|token| !token.kind().to_token().is_trivia())
+        .map(|token| token.text().to_string())
+        .collect()
 }
 
 fn is_unresolved_global_unknown_name_expr(

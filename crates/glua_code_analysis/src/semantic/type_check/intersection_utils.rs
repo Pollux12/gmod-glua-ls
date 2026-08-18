@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::BTreeMap;
 
 use crate::{DbIndex, LuaIntersectionType, LuaObjectType, LuaType, semantic::member::find_members};
 
@@ -8,7 +8,7 @@ pub(super) fn intersection_to_object(
 ) -> Option<LuaObjectType> {
     let intersection_type: LuaType = intersection.clone().into();
     let members = find_members(db, &intersection_type)?;
-    let mut fields: HashMap<_, _> = HashMap::new();
+    let mut fields: BTreeMap<_, _> = BTreeMap::new();
     for member in members {
         fields
             .entry(member.key.clone())

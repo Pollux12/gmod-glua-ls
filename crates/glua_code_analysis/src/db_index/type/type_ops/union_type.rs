@@ -1,23 +1,174 @@
 use std::ops::Deref;
 
-use crate::{DbIndex, LuaType, LuaUnionType, get_real_type};
+use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
+
+// Union member *order* is preserved here, but the member *set* is
+// canonical.
 
 pub fn union_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
-    let real_type = get_real_type(db, &source).unwrap_or(&source);
+    let match_source = get_real_type(db, &source).unwrap_or(&source);
+    union_type_impl(match_source, &source, &target)
+}
 
-    match (&real_type, &target) {
-        // Preserve explicit nilability for dynamic values. In this type system, bare `any`
-        // is not treated as nullable by diagnostics like NeedCheckNil, so collapsing
-        // `any | nil` to `any` loses important information.
-        (LuaType::Any, right) if right.is_nullable() => nullable_any_type(),
-        (left, LuaType::Any) if left.is_nullable() => nullable_any_type(),
-        // ANY | T = ANY
-        (LuaType::Any, _) => LuaType::Any,
-        (_, LuaType::Any) => LuaType::Any,
-        (LuaType::Never, _) => target,
-        (_, LuaType::Never) => source,
-        (LuaType::Unknown, _) => target,
-        (_, LuaType::Unknown) => source,
+/// `union_type` without the alias dereference, for callers that have no `DbIndex`.
+pub(crate) fn union_type_shallow(source: &LuaType, target: &LuaType) -> LuaType {
+    union_type_impl(source, source, target)
+}
+
+/// Normalise a whole member set the same way repeated `union_type` would.
+pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
+    // `any` is the one member that deliberately does NOT absorb its siblings
+    // here, unlike the pairwise rule and upstream. A declared
+    // `---@type any|string` has to keep its `string` arm — the arms are the
+    // author's text, and dropping them stops param checking flagging the ones
+    // that do not fit.
+    //
+    // Absorbing was measured twice and rejected both times: on every path it
+    // takes the arm that carries a callable's real signature with it, which
+    // cost 9 false `redundant-parameter` reports on StarfallEx (a method
+    // resolving to a 0-parameter arm), and it buys no determinism — the
+    // re-index gates already pass without it.
+    //
+    // `DocStringConst`/`DocIntegerConst` are held for the same reason: they only
+    // exist where the author typed a literal, so `---@type string|"a"|"b"` has
+    // to keep all three arms — the literals are what completion offers and what
+    // hover shows. The pairwise rule still absorbs them, because joining two
+    // types is a different question from listing the arms of a declared one.
+    if types.iter().any(|typ| {
+        matches!(
+            typ,
+            LuaType::Any | LuaType::DocStringConst(_) | LuaType::DocIntegerConst(_)
+        )
+    }) || can_use_structural_union(&types)
+    {
+        return LuaType::from_vec_structural(types);
+    }
+
+    let mut result = LuaType::Never;
+    for typ in types {
+        result = union_type_shallow(&result, &typ);
+    }
+    result
+}
+
+/// Whether `LuaType::from_vec_structural` alone matches the pairwise fold.
+///
+/// Skipping the fold is worth its own rule table: on a large workspace the
+/// pairwise path costs ~65% more indexing time, and this decides the cases
+/// where the two agree.
+///
+/// The flags mirror [`try_collapse`] arm for arm.
+fn can_use_structural_union(types: &[LuaType]) -> bool {
+    let (mut num, mut num_variant) = (false, false);
+    let (mut int, mut int_const) = (false, false);
+    let (mut string, mut string_const) = (false, false);
+    let (mut boolean, mut bool_consts) = (false, 0u32);
+    let (mut table, mut table_const) = (false, false);
+    let (mut function, mut callable) = (false, false);
+
+    for typ in types {
+        match typ {
+            LuaType::Never | LuaType::Union(_) | LuaType::MultiLineUnion(_) => return false,
+            LuaType::Function => function = true,
+            LuaType::DocFunction(_) | LuaType::Signature(_) => callable = true,
+            LuaType::Number => num = true,
+            LuaType::Integer => {
+                num_variant = true;
+                int = true;
+            }
+            LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => {
+                num_variant = true;
+                int_const = true;
+            }
+            LuaType::FloatConst(_) => num_variant = true,
+            LuaType::String => string = true,
+            LuaType::StringConst(_) | LuaType::DocStringConst(_) => string_const = true,
+            LuaType::Boolean => boolean = true,
+            LuaType::BooleanConst(_) => bool_consts += 1,
+            LuaType::Table => table = true,
+            LuaType::TableConst(_) => table_const = true,
+            _ => {}
+        }
+
+        if num && num_variant
+            || int && int_const
+            || string && string_const
+            || boolean && bool_consts > 0
+            || bool_consts > 1
+            || table && table_const
+            || function && callable
+        {
+            return false;
+        }
+    }
+
+    true
+}
+
+fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -> LuaType {
+    // `any` absorbs everything, except that an explicit nil on the other side
+    // survives: bare `any` is not treated as nullable by diagnostics like
+    // NeedCheckNil, so collapsing `any | nil` to `any` loses information.
+    match (match_source, target) {
+        (LuaType::Any, right) if right.is_nullable() => return nullable_any_type(),
+        (left, LuaType::Any) if left.is_nullable() => return nullable_any_type(),
+        (LuaType::Any, _) | (_, LuaType::Any) => return LuaType::Any,
+        _ => {}
+    }
+
+    if let Some(merged) = try_collapse(match_source, source, target) {
+        return merged;
+    }
+
+    match (match_source, target) {
+        (LuaType::MultiLineUnion(left), right) => {
+            if multi_line_union_contains(left, right) {
+                return source.clone();
+            }
+            LuaType::from_vec_structural(vec![source.clone(), target.clone()])
+        }
+        (left, LuaType::MultiLineUnion(right)) if multi_line_union_contains(right, left) => {
+            target.clone()
+        }
+        // union
+        (LuaType::Union(left), right) if !right.is_union() => {
+            let mut members = left.deref().clone().into_vec();
+            absorb(&mut members, right.clone());
+            LuaType::from_vec_structural(members)
+        }
+        // The *source* joins the union, not the dereferenced view of it:
+        // the alias is what the caller passed and what has to survive into
+        // the rendered type, exactly as the sibling arms keep their
+        // operands. The dereference is only ever a matching aid (see
+        // `try_collapse`), and `absorb` matches an alias by identity, which
+        // is the same answer the other two union arms give.
+        (left, LuaType::Union(right)) if !left.is_union() => {
+            let mut members = right.deref().clone().into_vec();
+            absorb(&mut members, source.clone());
+            LuaType::from_vec_structural(members)
+        }
+        // two union
+        (LuaType::Union(left), LuaType::Union(right)) => {
+            let mut members = left.into_vec();
+            for member in right.into_vec() {
+                absorb(&mut members, member);
+            }
+            LuaType::from_vec_structural(members)
+        }
+
+        _ => LuaType::from_vec_structural(vec![source.clone(), target.clone()]),
+    }
+}
+
+/// The pairwise rules that collapse two union members into a single type.
+///
+/// Joining two types subsumes a literal into its primitive, author-written or
+/// not. Listing the arms of a *declared* union is the other question, and
+/// [`union_type_all`] answers it without these rules.
+fn try_collapse(match_source: &LuaType, source: &LuaType, target: &LuaType) -> Option<LuaType> {
+    Some(match (match_source, target) {
+        (LuaType::Never, _) => target.clone(),
+        (_, LuaType::Never) => source.clone(),
         // int | int const
         (LuaType::Integer, LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_)) => {
             LuaType::Integer
@@ -48,69 +199,50 @@ pub fn union_type(db: &DbIndex, source: LuaType, target: LuaType) -> LuaType {
         (LuaType::Function, LuaType::DocFunction(_) | LuaType::Signature(_)) => LuaType::Function,
         (LuaType::DocFunction(_) | LuaType::Signature(_), LuaType::Function) => LuaType::Function,
         // class references
-        (LuaType::Ref(id1), LuaType::Ref(id2)) => {
-            if id1 == id2 {
-                source.clone()
-            } else {
-                LuaType::from_vec(vec![source.clone(), target.clone()])
-            }
-        }
-        (LuaType::MultiLineUnion(left), right) => {
-            let include = match right {
-                LuaType::StringConst(v) => {
-                    left.get_unions().iter().any(|(t, _)| match (t, right) {
-                        (LuaType::DocStringConst(a), _) => a == v,
-                        _ => false,
-                    })
-                }
-                LuaType::IntegerConst(v) => {
-                    left.get_unions().iter().any(|(t, _)| match (t, right) {
-                        (LuaType::DocIntegerConst(a), _) => a == v,
-                        _ => false,
-                    })
-                }
-                _ => false,
-            };
-
-            if include {
-                return source;
-            }
-            LuaType::from_vec(vec![source, target])
-        }
-        // union
-        (LuaType::Union(left), right) if !right.is_union() => {
-            let left = left.deref().clone();
-            let mut types = left.into_vec();
-            if types.contains(right) {
-                return source.clone();
-            }
-
-            types.push(right.clone());
-            LuaType::Union(LuaUnionType::from_vec(types).into())
-        }
-        (left, LuaType::Union(right)) if !left.is_union() => {
-            let right = right.deref().clone();
-            let mut types = right.into_vec();
-            if types.contains(left) {
-                return target.clone();
-            }
-
-            types.push(source.clone());
-            LuaType::Union(LuaUnionType::from_vec(types).into())
-        }
-        // two union
-        (LuaType::Union(left), LuaType::Union(right)) => {
-            let mut left = left.into_vec();
-            let right = right.into_vec();
-            left.extend(right);
-
-            LuaType::from_vec(left)
-        }
-
+        (LuaType::Ref(id1), LuaType::Ref(id2)) if id1 == id2 => source.clone(),
         // same type
-        (left, right) if *left == right => source.clone(),
-        _ => LuaType::from_vec(vec![source, target]),
+        (left, right) if *left == *right => source.clone(),
+        _ => return None,
+    })
+}
+
+/// Whether `other` is already one of `union`'s arms.
+///
+/// A multi-line union's arms are author-written literals, so an inferred
+/// literal of the same value is the same member.
+fn multi_line_union_contains(union: &LuaMultiLineUnion, other: &LuaType) -> bool {
+    union
+        .get_unions()
+        .iter()
+        .any(|(member, _)| match (member, other) {
+            (LuaType::DocStringConst(a), LuaType::StringConst(b)) => a == b,
+            (LuaType::DocIntegerConst(a), LuaType::IntegerConst(b)) => a == b,
+            _ => false,
+        })
+}
+
+/// Add `ty` to an existing union's member list, applying absorption rules.
+fn absorb(members: &mut Vec<LuaType>, ty: LuaType) {
+    let mut ty = ty;
+    // A merged member keeps the slot of the member it merged with, so absorbing
+    // never reorders the survivors. Member order is semantic for overloads and
+    // template dispatch, which the structural constructor deliberately leaves
+    // alone.
+    let mut slot = members.len();
+
+    'restart: loop {
+        for i in 0..members.len() {
+            if let Some(merged) = try_collapse(&members[i], &members[i], &ty) {
+                members.remove(i);
+                ty = merged;
+                slot = slot.min(i);
+                continue 'restart;
+            }
+        }
+        break;
     }
+
+    members.insert(slot.min(members.len()), ty);
 }
 
 fn nullable_any_type() -> LuaType {

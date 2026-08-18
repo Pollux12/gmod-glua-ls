@@ -1,6 +1,175 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, LuaType, LuaUnionType, TypeOps, VirtualWorkspace};
+    use crate::{
+        DiagnosticCode, FileId, InFiled, LuaMultiLineUnion, LuaType, LuaUnionType, TypeOps,
+        VirtualWorkspace,
+    };
+    use internment::ArcIntern;
+    use rowan::TextRange;
+    use smol_str::SmolStr;
+
+    /// `LuaType::from_vec` and repeated `TypeOps::Union` must agree on the
+    /// same member set, in any assembly order.
+    #[test]
+    fn union_normal_form_is_assembly_order_free() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+
+        let sets: Vec<Vec<LuaType>> = vec![
+            // absorption families the structural path used to miss
+            vec![LuaType::Number, LuaType::IntegerConst(1)],
+            vec![LuaType::Integer, LuaType::IntegerConst(7)],
+            vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("x"))),
+            ],
+            vec![LuaType::Boolean, LuaType::BooleanConst(true)],
+            vec![LuaType::BooleanConst(true), LuaType::BooleanConst(false)],
+            vec![
+                LuaType::Table,
+                LuaType::TableConst(InFiled::new(FileId { id: 1 }, TextRange::default())),
+            ],
+            vec![LuaType::Never, LuaType::String],
+            vec![LuaType::Unknown, LuaType::String],
+            // sets that must stay untouched
+            vec![LuaType::String, LuaType::Nil],
+            vec![LuaType::String, LuaType::Integer, LuaType::Boolean],
+            // three members, so order matters to the fold as well as the set
+            vec![LuaType::Number, LuaType::IntegerConst(1), LuaType::Nil],
+            vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))),
+                LuaType::Boolean,
+            ],
+        ];
+
+        for set in sets {
+            let folded = set
+                .iter()
+                .fold(LuaType::Never, |acc, ty| TypeOps::Union.apply(db, &acc, ty));
+            assert_eq!(
+                LuaType::from_vec(set.clone()),
+                folded,
+                "from_vec disagreed with pairwise TypeOps::Union for {set:?}"
+            );
+
+            // ...and the answer must not depend on the order the members arrived in.
+            let mut reversed = set.clone();
+            reversed.reverse();
+            assert_eq!(
+                LuaType::from_vec(set.clone()),
+                LuaType::from_vec(reversed),
+                "from_vec was assembly-order dependent for {set:?}"
+            );
+        }
+    }
+
+    /// A declared `string|"a"|"b"` keeps every arm the author wrote, while an
+    /// inferred literal still collapses into its primitive.
+    #[test]
+    fn declared_literal_arms_outlive_their_primitive() {
+        let members = |types: Vec<LuaType>| match LuaType::from_vec(types) {
+            LuaType::Union(union) => union.into_vec(),
+            other => panic!("expected a union, got {other:?}"),
+        };
+
+        let doc_a = LuaType::DocStringConst(ArcIntern::from(SmolStr::new("a")));
+        let doc_b = LuaType::DocStringConst(ArcIntern::from(SmolStr::new("b")));
+        let declared = members(vec![LuaType::String, doc_a.clone(), doc_b.clone()]);
+        assert_eq!(
+            declared.len(),
+            3,
+            "declared arms were absorbed: {declared:?}"
+        );
+        for arm in [LuaType::String, doc_a, doc_b] {
+            assert!(declared.contains(&arm), "{arm:?} missing from {declared:?}");
+        }
+
+        let declared_ints = members(vec![
+            LuaType::Integer,
+            LuaType::DocIntegerConst(1),
+            LuaType::DocIntegerConst(2),
+        ]);
+        assert_eq!(
+            declared_ints.len(),
+            3,
+            "declared arms were absorbed: {declared_ints:?}"
+        );
+
+        assert_eq!(
+            LuaType::from_vec(vec![
+                LuaType::String,
+                LuaType::StringConst(ArcIntern::from(SmolStr::new("a"))),
+            ]),
+            LuaType::String
+        );
+        assert_eq!(
+            LuaType::from_vec(vec![LuaType::Integer, LuaType::IntegerConst(1)]),
+            LuaType::Integer
+        );
+    }
+
+    /// A multi-line union answers the same whichever operand it arrives as.
+    #[test]
+    fn multi_line_union_membership_is_operand_order_free() {
+        let mut ws = VirtualWorkspace::new();
+        let db = ws.get_db_mut();
+
+        let multi_line = LuaType::MultiLineUnion(
+            LuaMultiLineUnion::new(vec![
+                (
+                    LuaType::DocStringConst(ArcIntern::from(SmolStr::new("a"))),
+                    None,
+                ),
+                (
+                    LuaType::DocStringConst(ArcIntern::from(SmolStr::new("b"))),
+                    None,
+                ),
+            ])
+            .into(),
+        );
+
+        for value in ["a", "z"] {
+            let other = LuaType::StringConst(ArcIntern::from(SmolStr::new(value)));
+            assert_eq!(
+                TypeOps::Union.apply(db, &multi_line, &other),
+                TypeOps::Union.apply(db, &other, &multi_line),
+                "multi-line union depended on operand order for {value:?}"
+            );
+        }
+
+        let member = LuaType::StringConst(ArcIntern::from(SmolStr::new("a")));
+        assert_eq!(
+            TypeOps::Union.apply(db, &member, &multi_line),
+            multi_line,
+            "an existing arm must not widen the multi-line union"
+        );
+    }
+
+    /// Unioning an alias into an existing union must keep the *alias*, not
+    /// the type it dereferences to.
+    #[test]
+    fn union_with_a_union_keeps_the_alias_member() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@alias Seconds string
+        "#,
+        );
+
+        let alias = LuaType::Ref(crate::LuaTypeDeclId::global("Seconds"));
+        let union = LuaType::from_vec(vec![LuaType::Integer, LuaType::Boolean]);
+        let merged = TypeOps::Union.apply(ws.get_db_mut(), &alias, &union);
+
+        let members = match &merged {
+            LuaType::Union(union) => union.into_vec(),
+            other => panic!("expected a union, got {other:?}"),
+        };
+        assert!(
+            members.contains(&alias),
+            "the alias must survive into the union, got {members:?}"
+        );
+    }
 
     #[test]
     fn test_custom_ops() {
@@ -137,14 +306,16 @@ mod tests {
             );
         }
         {
+            // An `unknown` arm is an unsettled type, not an absent one, so it
+            // stays in the union instead of being dropped as noise.
             assert_eq!(
                 LuaType::from_vec(vec![LuaType::Unknown, LuaType::String]),
-                LuaType::String
+                LuaType::from(LuaUnionType::Multi(vec![LuaType::String, LuaType::Unknown]))
             );
         }
         {
             let union = LuaUnionType::from_vec(vec![LuaType::Unknown, LuaType::String]);
-            assert_eq!(union.into_vec(), vec![LuaType::String]);
+            assert_eq!(union.into_vec(), vec![LuaType::String, LuaType::Unknown]);
         }
         {
             let type_string_number = ws.ty("string | number");

@@ -932,4 +932,154 @@ mod tests {
             "disabling child inference must not disable generic unknown inference"
         );
     }
+
+    fn gmod_workspace_with_std_lib() -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut config = Emmyrc::default();
+        config.gmod.enabled = true;
+        ws.analysis.update_config(Arc::new(config));
+        ws.def_gmod_call_arg_builtins();
+        ws
+    }
+
+    /// A `NetworkVar`-synthesized accessor carries the type written in its
+    /// `"Int"` literal, so a value derived from it is not a guess. Narrowing the
+    /// result through a branch that can assign `nil`, then storing it in a table
+    /// field, must not turn the declared type into an inferred one.
+    #[test]
+    fn network_var_result_through_nilable_branch_does_not_infer_from_usage_context() {
+        let mut ws = gmod_workspace_with_std_lib();
+        ws.def_files(vec![
+            (
+                "lua/entities/thing/shared.lua",
+                r#"
+                ---@class thing : Entity
+                ENT.Type = "anim"
+
+                function ENT:SetupDataTables()
+                    self:NetworkVar("Int", "ZFar")
+                end
+
+                ---@return integer
+                function ENT:GetHand() end
+                "#,
+            ),
+            (
+                "lua/use.lua",
+                r#"
+                local t1, t2 = { zfar = nil }, { zfar = nil }
+
+                ---@param p thing
+                ---@param d number
+                local function subject(p, d)
+                    local z = p:GetZFar()
+                    if z > 0 then z = math.max(d, z) else z = nil end
+                    t1.zfar = z
+                end
+
+                ---@param p thing
+                ---@param d number
+                local function control(p, d)
+                    local hand = p:GetHand()
+                    if hand > 0 then hand = math.max(d, hand) else hand = nil end
+                    t2.zfar = hand
+                end
+
+                return subject, control
+                "#,
+            ),
+        ]);
+        let use_file_id = file_id(&ws, "lua/use.lua");
+
+        let found = diagnostics_for(&mut ws, use_file_id, DiagnosticCode::InferUnknown);
+
+        // The synthesized accessor and the hand-declared control must both still
+        // resolve, so silence above cannot come from nothing having attached.
+        assert_eq!(
+            (
+                local_type(&ws, use_file_id, "z"),
+                local_type(&ws, use_file_id, "hand"),
+                found,
+            ),
+            (LuaType::Integer, LuaType::Integer, Vec::new())
+        );
+    }
+
+    /// The using file sorts before the file declaring the entity, so the
+    /// receiver is still unresolved when the call is analysed. Past an
+    /// `IsValid` guard, a stock method's declared `---@return number` used to
+    /// come back flagged as inferred purely because the receiver had been —
+    /// which made the answer depend on what the files were named.
+    #[test]
+    fn declared_return_past_valid_guard_does_not_infer_when_use_file_sorts_first() {
+        let mut ws = gmod_workspace_with_std_lib();
+        ws.def_files(vec![
+            (
+                "annotations/gmod.lua",
+                r#"
+                ---@meta
+                ---@attribute valid_guard()
+
+                ---@class Entity
+                local Entity = {}
+
+                ---@param name string
+                ---@return number
+                function Entity:FindBodygroupByName(name) end
+
+                ---@param bodyGroupId number
+                ---@param subModelId number
+                function Entity:SetBodygroup(bodyGroupId, subModelId) end
+
+                ---@class NULL : Entity
+
+                ---@param object any
+                ---@return TypeGuard<any>
+                ---@return_cast object -NULL
+                ---@[valid_guard]
+                function _G.IsValid(object) end
+                "#,
+            ),
+            (
+                "lua/entities/my_int/aa_use.lua",
+                r#"
+                ---@param int my_int
+                ---@param name string
+                local function use(int, name)
+                    local p = int:GetPart("door")
+                    if not IsValid(p) then return end
+
+                    local bg = p:FindBodygroupByName(name)
+                    p:SetBodygroup(bg, 0)
+                end
+                return use
+                "#,
+            ),
+            (
+                "lua/entities/my_int/zz_ent.lua",
+                r#"
+                ---@class my_int : Entity
+                ENT.Type = "anim"
+
+                ---@param id string
+                ---@return Entity
+                function ENT:GetPart(id) end
+                "#,
+            ),
+        ]);
+        let use_file_id = file_id(&ws, "lua/entities/my_int/aa_use.lua");
+
+        let found = diagnostics_for(&mut ws, use_file_id, DiagnosticCode::InferUnknown);
+
+        // Both must still resolve past the guard, so silence above cannot come
+        // from a workspace where the receiver never attached.
+        assert_eq!(
+            (
+                local_type(&ws, use_file_id, "p"),
+                local_type(&ws, use_file_id, "bg"),
+                found,
+            ),
+            (ws.ty("Entity"), LuaType::Number, Vec::new())
+        );
+    }
 }

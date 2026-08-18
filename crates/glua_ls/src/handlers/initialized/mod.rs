@@ -387,9 +387,9 @@ pub async fn init_analysis(
         client.show_message(ShowMessageParams {
             typ: MessageType::WARNING,
             message: format!(
-                "GLuaLS found overlapping definitions in {} library-root pair(s). Earlier \
-                 workspace.library entries take precedence. See the GLuaLS output log for roots \
-                 and examples.",
+                "Found duplicate definitions across {} library folder(s). Earlier libraries \
+                 configured in your .gluarc.json (workspace.library) or settings take priority. \
+                 Open the GLuaLS output log to view details.",
                 library_collisions.len()
             ),
         });

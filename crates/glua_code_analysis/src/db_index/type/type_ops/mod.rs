@@ -1,7 +1,7 @@
 mod intersect_type;
 mod remove_type;
 mod test;
-mod union_type;
+pub(crate) mod union_type;
 
 use super::LuaType;
 use crate::DbIndex;

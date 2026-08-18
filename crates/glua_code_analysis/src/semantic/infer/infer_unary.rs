@@ -44,7 +44,10 @@ fn infer_unary_custom_operator(
 
     match op {
         LuaOperatorMetaMethod::Unm => {
-            if inner.is_any() || inner.is_unknown() {
+            if inner.is_unknown() {
+                // Unresolved operand, so the negation is unresolved as well.
+                Ok(LuaType::Unknown)
+            } else if inner.is_any() {
                 Ok(LuaType::Any)
             } else {
                 Ok(LuaType::Number)

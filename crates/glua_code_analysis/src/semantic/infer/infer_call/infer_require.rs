@@ -15,8 +15,10 @@ pub fn infer_require_call(
     let require_path_type = infer_expr(db, cache, first_arg)?;
     let module_path: String = match &require_path_type {
         LuaType::StringConst(module_path) => module_path.as_ref().to_string(),
+        // A computed path names a module the analyzer cannot identify, so the
+        // export type is unresolved rather than unconstrained.
         _ => {
-            return Ok(LuaType::Any);
+            return Ok(LuaType::Unknown);
         }
     };
 

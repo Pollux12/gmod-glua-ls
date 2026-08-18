@@ -1,4 +1,4 @@
-use std::{collections::HashMap, ops::Deref, vec};
+use std::{collections::BTreeMap, ops::Deref, vec};
 
 use smol_str::SmolStr;
 
@@ -110,12 +110,12 @@ fn instantiate_merge_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
         return LuaType::Unknown;
     }
 
-    let mut left_map: HashMap<_, _> = HashMap::new();
+    let mut left_map: BTreeMap<_, _> = BTreeMap::new();
     for member in left_members.unwrap_or_default() {
         left_map.entry(member.key).or_insert(member.typ);
     }
 
-    let mut right_map: HashMap<_, _> = HashMap::new();
+    let mut right_map: BTreeMap<_, _> = BTreeMap::new();
     for member in right_members.unwrap_or_default() {
         right_map.entry(member.key).or_insert(member.typ);
     }
@@ -281,11 +281,14 @@ fn instantiate_unpack_call(db: &DbIndex, operands: &[LuaType]) -> LuaType {
             for i in 1..10 {
                 let member_key = LuaMemberKey::Integer(i);
                 if let Some(member_info) = members.get(&member_key) {
-                    let mut member_type = LuaType::Unknown;
-                    for sub_member_info in member_info {
-                        member_type = TypeOps::Union.apply(db, &member_type, &sub_member_info.typ);
-                    }
-                    multi_types.push(member_type);
+                    multi_types.push(
+                        member_info
+                            .iter()
+                            .map(|sub_member_info| sub_member_info.typ.clone())
+                            .reduce(|left, right| TypeOps::Union.apply(db, &left, &right))
+                            // Nothing to union: pin the escape value, not the seed.
+                            .unwrap_or(LuaType::Unknown),
+                    );
                 } else {
                     break;
                 }

@@ -1425,6 +1425,65 @@ mod test {
     }
 
     #[gtest]
+    fn test_dynamic_field_written_through_another_dynamic_field_is_collected() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+
+            ---@class Panel
+            ---@class DPanel : Panel
+            ---@class DFrame : DPanel
+
+            ---@class DTextEntry : DPanel
+            function DTextEntry:SetText(text) end
+
+            ---@class DPropertySheetSheet
+            ---@field Name string
+
+            ---@class DPropertySheet : DPanel
+            ---@param name string
+            ---@param pnl Panel
+            ---@return DPropertySheetSheet? sheet
+            function DPropertySheet:AddSheet(name, pnl) end
+            "#,
+        );
+        let target_path = "lua/starfall/editor/nested_dynamic_field.lua";
+        let target_file = ws.def_file(
+            target_path,
+            r#"
+            local PANEL = {}
+            vgui.Register("StarfallEditor", PANEL, "DPanel")
+
+            function PANEL:CreateFindWindow()
+                self.FindWindow = vgui.Create("DFrame", self)
+                local pnl = self.FindWindow
+                pnl.TabHolder = vgui.Create("DPropertySheet", pnl)
+                local findtab = vgui.Create("DPanel", pnl)
+                local FindEntry = vgui.Create("DTextEntry", findtab)
+                pnl.FindTab = pnl.TabHolder:AddSheet("Find", findtab)
+                pnl.FindTab.Entry = FindEntry
+            end
+
+            function PANEL:OpenFindWindow()
+                self.FindWindow.FindTab.Entry:SetText("")
+            end
+            "#,
+        );
+
+        // `Entry` is written through `pnl.FindTab`, itself a dynamic field of a
+        // panel. The collection pass runs before the dynamic-field index seals,
+        // so it must not defer on the unsealed index — deferring there drops the
+        // write and every read of `Entry` reports `undefined-field`.
+        assert_that!(
+            diagnostic_messages_for_file(&mut ws, target_file, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    #[gtest]
     fn test_deferred_uninformative_member_rhs_stays_any_without_owner_pollution() {
         let mut ws = VirtualWorkspace::new();
         let target_path = "lua/vgui/unresolved_member_rhs.lua";
@@ -1503,6 +1562,126 @@ mod test {
         assert_that!(
             nil_diagnostic_messages_for_file(&mut ws, file_id),
             not(is_empty())
+        );
+    }
+
+    /// StarfallEx builds `instance.data = {}` and then fills it from
+    /// library files whose receiver arrives as an unannotated closure param
+    /// (`SF.Modules[..][..].init(self)` after a `CompileFile` round trip),
+    /// so every `instance.data.<x> = ...` write is attributed to nothing.
+    #[gtest]
+    fn test_shapeless_table_stays_quiet_only_for_unattributably_written_fields() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/holder.lua",
+            r#"
+            Holder = {}
+            Holder.data = {}
+            Holder.shaped = {}
+            Holder.shaped.known = 1
+            "#,
+        );
+        ws.def_file(
+            "lua/writer.lua",
+            r#"
+            return function(instance)
+                instance.data.filledElsewhere = {}
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "lua/reader.lua",
+            r#"
+            print(Holder.data.filledElsewhere)
+            print(Holder.data.neverWrittenAnywhere)
+            print(Holder.shaped.neverWritten)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, reader, DiagnosticCode::UndefinedField),
+            vec![
+                // No unattributed writer for this name.
+                "Undefined field `neverWrittenAnywhere`. ",
+                // `shaped` has a known member, so it has a shape.
+                "Undefined field `neverWritten`. ",
+            ]
+        );
+    }
+
+    /// The plain typo case must keep reporting: nothing writes `meow` anywhere.
+    #[gtest]
+    fn test_empty_local_table_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/same_file.lua",
+            r#"
+            local test = {}
+            print(test.meow)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `meow`. "]
+        );
+    }
+
+    /// A table populated only through computed keys has no statically knowable
+    /// field names, so reads off it are never actionable typos.
+    #[gtest]
+    fn test_pure_computed_key_registry_suppresses_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/registry.lua",
+            r#"
+            ---@class WildReg.Registry
+
+            ---@type WildReg.Registry
+            local registry
+
+            ---@param name string
+            local function add(name, value)
+                registry[name] = value
+            end
+
+            add("a", 1)
+            print(registry.Anything)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            Vec::<String>::new()
+        );
+    }
+
+    /// One named write gives the table a shape again, so bogus names still report.
+    #[gtest]
+    fn test_mixed_computed_key_table_still_reports_undefined_field() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/mixed_registry.lua",
+            r#"
+            ---@class WildRegMixed.Registry
+            ---@field known number
+
+            ---@type WildRegMixed.Registry
+            local registry
+
+            ---@param name string
+            local function add(name, value)
+                registry[name] = value
+            end
+
+            add("a", 1)
+            print(registry.bogus)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_messages_for_file(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            vec!["Undefined field `bogus`. "]
         );
     }
 }

@@ -2,7 +2,7 @@ use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use std::collections::{HashMap, HashSet};
 
 use crate::{
-    DbIndex, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
+    DbIndex, FileId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
     TplContext, TypeOps, TypeSubstitutor, VariadicType,
     compilation::analyzer::{
@@ -18,17 +18,19 @@ pub fn analyze_for_range_stat(
     analyzer: &mut LuaAnalyzer,
     for_range_stat: LuaForRangeStat,
 ) -> Option<()> {
-    let var_name_list = for_range_stat.get_var_name_list();
+    let var_name_list = for_range_stat.get_var_name_list().collect::<Vec<_>>();
     let iter_exprs = for_range_stat.get_expr_list().collect::<Vec<_>>();
     let cache = analyzer
         .context
         .infer_manager
         .get_infer_cache(analyzer.file_id);
     let iter_var_types = infer_for_range_iter_expr_func(analyzer.db, cache, &iter_exprs);
+    let enumerates_member_map =
+        iterates_table_member_map(analyzer.db, analyzer.file_id, &for_range_stat);
 
     match iter_var_types {
         Ok(iter_var_types) => {
-            for (idx, var_name) in var_name_list.enumerate() {
+            for (idx, var_name) in var_name_list.iter().enumerate() {
                 let position = var_name.get_position();
                 let decl_id = LuaDeclId::new(analyzer.file_id, position);
                 let ret_type = iter_var_types
@@ -42,6 +44,22 @@ pub fn analyze_for_range_stat(
                     LuaTypeCache::InferType(ret_type),
                     TypeCacheWriteMode::InsertOnly,
                 );
+            }
+
+            if iter_var_types.contain_tpl() || enumerates_member_map {
+                // Either nothing bound the generic, so the vars hold raw
+                // template refs, or the types came from enumerating a
+                // table's member map. Either way the answer only covers the
+                // members indexed when this ran, and which those are
+                // depends on the order files were analysed in.
+                let unresolved = UnResolveIterVar {
+                    file_id: analyzer.file_id,
+                    iter_exprs: iter_exprs.clone(),
+                    iter_vars: var_name_list,
+                };
+                analyzer
+                    .context
+                    .add_unresolve(unresolved.into(), InferFailReason::UnResolveIterTemplate);
             }
         }
         Err(InferFailReason::None) => {
@@ -60,7 +78,7 @@ pub fn analyze_for_range_stat(
             let unresolved = UnResolveIterVar {
                 file_id: analyzer.file_id,
                 iter_exprs: iter_exprs.clone(),
-                iter_vars: var_name_list.collect::<Vec<_>>(),
+                iter_vars: var_name_list,
             };
 
             analyzer
@@ -70,6 +88,20 @@ pub fn analyze_for_range_stat(
     }
 
     Some(())
+}
+
+/// Whether this loop's variable types come from enumerating a table's
+/// member map, the union [`try_infer_pairs_iter_types_from_table_members`]
+/// builds.
+pub fn iterates_table_member_map(
+    db: &DbIndex,
+    file_id: FileId,
+    for_range_stat: &LuaForRangeStat,
+) -> bool {
+    let Some(LuaExpr::CallExpr(call_expr)) = for_range_stat.get_expr_list().next() else {
+        return false;
+    };
+    is_global_pairs_call(db, file_id, &call_expr)
 }
 
 pub fn infer_for_range_iter_expr_func(
@@ -199,7 +231,7 @@ fn try_infer_pairs_iter_types_from_table_members(
     let LuaExpr::CallExpr(call_expr) = iter_expr else {
         return Ok(None);
     };
-    if !is_global_pairs_call(db, cache, call_expr) {
+    if !is_global_pairs_call(db, cache.get_file_id(), call_expr) {
         return Ok(None);
     }
 
@@ -253,7 +285,9 @@ fn try_infer_pairs_iter_types_from_table_members(
         let value_type = match member_infos.as_slice() {
             [] => LuaType::Any,
             [member] => member.typ.clone(),
-            _ => LuaType::from_vec(member_infos.into_iter().map(|member| member.typ).collect()),
+            _ => LuaType::from_inferred_vec(
+                member_infos.into_iter().map(|member| member.typ).collect(),
+            ),
         };
         values.push(value_type);
     }
@@ -349,7 +383,7 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
     {
         LuaType::Integer
     } else {
-        LuaType::from_vec(keys.to_vec())
+        LuaType::from_inferred_vec(keys.to_vec())
     }
 }
 
@@ -364,7 +398,7 @@ fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
         return LuaType::Unknown;
     }
 
-    try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_vec(values))
+    try_compact_record_values(db, &values).unwrap_or_else(|| LuaType::from_inferred_vec(values))
 }
 
 fn remove_pairs_yield_nil(db: &DbIndex, value_type: &LuaType) -> LuaType {
@@ -454,7 +488,7 @@ fn member_key_stable_key(key: &LuaMemberKey) -> (u8, String) {
 
 fn is_global_pairs_call(
     db: &DbIndex,
-    cache: &LuaInferCache,
+    file_id: FileId,
     call_expr: &glua_parser::LuaCallExpr,
 ) -> bool {
     let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr() else {
@@ -465,7 +499,7 @@ fn is_global_pairs_call(
     }
 
     db.get_reference_index()
-        .get_local_reference(&cache.get_file_id())
+        .get_local_reference(&file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .is_none()
 }

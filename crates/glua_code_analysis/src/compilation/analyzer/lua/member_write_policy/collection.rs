@@ -1,5 +1,5 @@
 use crate::{
-    FileId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, LuaTypeOwner, TypeOps,
+    DbIndex, FileId, InFiled, LuaArrayType, LuaMemberKey, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::common::{TypeCacheWriteMode, write_type_cache},
     db_index::{LuaDeclId, LuaMemberId, LuaMemberOwner, LuaType},
     semantic::member_key_matches_type,
@@ -58,7 +58,7 @@ pub(in crate::compilation::analyzer::lua) fn get_widened_member_assignment_colle
         if related_member_id == *member_id {
             continue;
         }
-        if !is_member_realm_compatible(analyzer, *member_id, related_member_id) {
+        if !is_member_realm_compatible(analyzer.db, *member_id, related_member_id) {
             continue;
         }
 
@@ -178,16 +178,16 @@ pub(in crate::compilation::analyzer::lua) fn record_member_collection_assignment
     );
 }
 
-pub(in crate::compilation::analyzer::lua) fn is_member_realm_compatible(
-    analyzer: &LuaAnalyzer,
+pub(in crate::compilation::analyzer) fn is_member_realm_compatible(
+    db: &DbIndex,
     current_member_id: LuaMemberId,
     related_member_id: LuaMemberId,
 ) -> bool {
-    if !analyzer.db.get_emmyrc().gmod.enabled {
+    if !db.get_emmyrc().gmod.enabled {
         return true;
     }
 
-    let infer_index = analyzer.db.get_gmod_infer_index();
+    let infer_index = db.get_gmod_infer_index();
     infer_index.are_offsets_compatible(
         &current_member_id.file_id,
         current_member_id.get_position(),

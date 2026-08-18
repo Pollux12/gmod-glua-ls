@@ -453,6 +453,11 @@ fn resolve_member_type(
                     return Err(InferFailReason::None);
                 }
             }
+            // No member contributes to the union below, so the accumulator seed
+            // would escape as the result. Pin it to `Unknown` explicitly.
+            if members.is_empty() {
+                return Ok(LuaType::Unknown);
+            }
             let all_file_defines = members
                 .iter()
                 .all(|member| member.get_feature().is_file_define());
@@ -492,7 +497,7 @@ fn resolve_member_type(
 
             match resolve_state {
                 MemberTypeResolveState::All => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let member_type_cache = db
                             .get_type_index()
@@ -524,7 +529,7 @@ fn resolve_member_type(
                     Ok(typ)
                 }
                 MemberTypeResolveState::Meta => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let feature = member.get_feature();
                         if feature.is_meta_decl() {
@@ -548,7 +553,7 @@ fn resolve_member_type(
                     Ok(typ)
                 }
                 MemberTypeResolveState::FileDecl => {
-                    let mut typ = LuaType::Unknown;
+                    let mut typ = LuaType::Never;
                     for member in &members {
                         let feature = member.get_feature();
                         if feature.is_file_decl() {

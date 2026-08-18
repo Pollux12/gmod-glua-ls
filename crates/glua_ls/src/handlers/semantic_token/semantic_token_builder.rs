@@ -3,7 +3,7 @@ use glua_parser::LuaSyntaxToken;
 use lsp_types::{SemanticToken, SemanticTokenModifier, SemanticTokenType};
 use rowan::{TextRange, TextSize};
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     vec::Vec,
 };
 
@@ -91,7 +91,11 @@ pub struct SemanticBuilder<'a> {
     multi_line_support: bool,
     type_to_id: HashMap<SemanticTokenType, u32>,
     modifier_to_id: HashMap<SemanticTokenModifier, u32>,
-    data: HashMap<TextSize, SemanticTokenData>,
+    /// Ordered by offset so `build()` sees a deterministic sequence. A
+    /// `HashMap` here let entries that collapse to the same `(line, col)` —
+    /// reachable through the `MultiLine` fan-out — win the stable sort at
+    /// random, recolouring tokens between builds with no content change.
+    data: BTreeMap<TextSize, SemanticTokenData>,
     string_special_range: HashSet<TextRange>,
     class_like_global_cache: HashMap<GlobalId, bool>,
     alias_target_cache:
@@ -119,7 +123,7 @@ impl<'a> SemanticBuilder<'a> {
             multi_line_support,
             type_to_id,
             modifier_to_id,
-            data: HashMap::new(),
+            data: BTreeMap::new(),
             string_special_range: HashSet::new(),
             class_like_global_cache: HashMap::new(),
             alias_target_cache: HashMap::new(),
@@ -332,11 +336,20 @@ impl<'a> SemanticBuilder<'a> {
         let mut prev_col = 0;
 
         for token_data in data {
-            let line_diff = token_data.line - prev_line;
+            // The sort above guarantees non-decreasing (line, col), so neither
+            // subtraction underflows today. Assert it so an ordering regression
+            // fails loudly in tests, and saturate so that in release it degrades
+            // to a clamped offset instead of wrapping to a huge relative offset
+            // that would garble every token after it.
+            debug_assert!(
+                (token_data.line, token_data.col) >= (prev_line, prev_col),
+                "semantic tokens must be emitted in document order"
+            );
+            let line_diff = token_data.line.saturating_sub(prev_line);
             if line_diff != 0 {
                 prev_col = 0;
             }
-            let col_diff = token_data.col - prev_col;
+            let col_diff = token_data.col.saturating_sub(prev_col);
 
             result.push(SemanticToken {
                 delta_line: line_diff,

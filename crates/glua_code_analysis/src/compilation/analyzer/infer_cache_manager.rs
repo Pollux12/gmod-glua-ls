@@ -11,6 +11,7 @@ use crate::{
 pub struct InferCacheManager {
     infer_map: FxHashMap<FileId, LuaInferCache>,
     current_phase: LuaAnalysisPhase,
+    dynamic_fields_visible: bool,
 }
 
 impl InferCacheManager {
@@ -18,23 +19,41 @@ impl InferCacheManager {
         InferCacheManager {
             infer_map: FxHashMap::default(),
             current_phase: LuaAnalysisPhase::Ordered,
+            dynamic_fields_visible: false,
         }
     }
 
     pub fn get_infer_cache(&mut self, file_id: FileId) -> &mut LuaInferCache {
         let phase = self.current_phase;
+        let dynamic_fields_visible = self.dynamic_fields_visible;
         self.infer_map.entry(file_id).or_insert_with(|| {
             LuaInferCache::new(
                 file_id,
                 crate::CacheOptions {
                     analysis_phase: phase,
+                    dynamic_fields_visible,
+                    building_dynamic_field_index: false,
                 },
             )
         })
     }
 
+    /// Called once the dynamic-field index has been populated for this batch.
+    /// Until then inference must not read it — see [`crate::CacheOptions`].
+    pub fn set_dynamic_fields_visible(&mut self) {
+        self.dynamic_fields_visible = true;
+        for infer_cache in self.infer_map.values_mut() {
+            infer_cache.config_mut().dynamic_fields_visible = true;
+            infer_cache.dynamic_field_resolution_cache.clear();
+        }
+    }
+
     pub fn current_phase(&self) -> LuaAnalysisPhase {
         self.current_phase
+    }
+
+    pub fn dynamic_fields_visible(&self) -> bool {
+        self.dynamic_fields_visible
     }
 
     pub fn merge_inference_side_effects(
@@ -109,5 +128,21 @@ impl InferCacheManager {
             .iter_mut()
             .map(|(file_id, cache)| (*file_id, cache.take_inferred_guard_dependencies()))
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The two halves of the dynamic-field gate pull in opposite directions and
+    /// only work together: a batch starts with the index invisible and opens it
+    /// once populated, while everything outside a batch (hover, completion,
+    /// diagnostics) must see it. Flipping either default silently changes what a
+    /// cold build infers.
+    #[test]
+    fn dynamic_field_visibility_defaults_are_opposite() {
+        assert!(crate::CacheOptions::default().dynamic_fields_visible);
+        assert!(!InferCacheManager::new().dynamic_fields_visible());
     }
 }

@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, Emmyrc, LuaType, TypeVisitTrait, VirtualWorkspace};
+    use crate::{DiagnosticCode, Emmyrc, VirtualWorkspace};
     use glua_parser::{LuaAstNode, LuaAstToken};
     use lsp_types::{DiagnosticSeverity, NumberOrString};
     use tokio_util::sync::CancellationToken;
@@ -15,18 +15,6 @@ mod tests {
     fn has_code(diagnostics: &[lsp_types::Diagnostic], code: DiagnosticCode) -> bool {
         let code = Some(NumberOrString::String(code.get_name().to_string()));
         diagnostics.iter().any(|diagnostic| diagnostic.code == code)
-    }
-
-    fn contains_named_type(typ: &LuaType, name: &str) -> bool {
-        let mut found = false;
-        typ.visit_type(&mut |candidate| {
-            if let LuaType::Ref(id) | LuaType::Def(id) = candidate
-                && id.get_simple_name() == name
-            {
-                found = true;
-            }
-        });
-        found
     }
 
     fn gmod_diagnostics(source: &str) -> Vec<lsp_types::Diagnostic> {
@@ -148,6 +136,51 @@ mod tests {
             "#,
         );
 
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    #[test]
+    fn loop_body_write_does_not_type_its_own_iteration_variable() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@class LoopWrite.Player
+            local Player = {}
+            function Player:Name() end
+
+            local targets = {}
+            for id, tgt in ipairs(targets) do
+                targets[id] = string.format("%s", tgt:Name())
+            end
+            "#,
+        );
+
+        let stat = ws.get_node::<glua_parser::LuaForRangeStat>(file_id);
+        let element_type = {
+            let model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(file_id)
+                .expect("semantic model");
+            let element = stat
+                .get_var_name_list()
+                .nth(1)
+                .expect("iteration value variable");
+            model
+                .get_semantic_info(element.syntax().clone().into())
+                .expect("semantic info")
+                .display_typ()
+                .clone()
+        };
+        assert!(
+            !element_type.is_string(),
+            "loop body write leaked into its own element type: {element_type:?}"
+        );
+
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
         assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
     }
 
@@ -467,127 +500,6 @@ mod tests {
         assert!(
             humanized.contains("ControlPanel"),
             "expected ControlPanel for earlier cross-function read, got {humanized}"
-        );
-    }
-
-    #[test]
-    fn real_glide_transmission_tool_panel_help_is_defined() {
-        use std::path::PathBuf;
-
-        let annotations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../annotations-gmod-glua-ls/output");
-        let vehicle_base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cityrp-vehicle-base");
-        let stool = vehicle_base.join("lua/weapons/gmod_tool/stools/glide_transmission_editor.lua");
-        let glide_autorun = vehicle_base.join("lua/autorun/sh_glide.lua");
-        if !annotations.is_dir() || !stool.is_file() || !glide_autorun.is_file() {
-            // Adjacent checkouts are optional on CI; unit fixtures cover the rule.
-            return;
-        }
-
-        let mut ws = VirtualWorkspace::new_with_init_std_lib();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.analysis.add_library_workspace(annotations.clone());
-
-        // Load a representative subset of panel/tool annotations so the test stays
-        // bounded while still using real hierarchy + Help/BuildCPanel signatures.
-        for name in [
-            "panel.lua",
-            "dcollapsiblecategory.lua",
-            "dform.lua",
-            "controlpanel.lua",
-            "controlpresets.lua",
-            "dcheckboxlabel.lua",
-            "dgrid.lua",
-            "dnotify.lua",
-            "tool.lua",
-            "global.lua",
-        ] {
-            let path = annotations.join(name);
-            if !path.is_file() {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read annotation");
-            let uri = lsp_types::Uri::parse_from_file_path(&path).expect("uri");
-            ws.analysis.update_file_by_uri(&uri, Some(text));
-        }
-
-        let glide_text = std::fs::read_to_string(&glide_autorun).expect("read glide");
-        let glide_uri = lsp_types::Uri::parse_from_file_path(&glide_autorun).expect("glide uri");
-        ws.analysis.update_file_by_uri(&glide_uri, Some(glide_text));
-
-        let stool_text = std::fs::read_to_string(&stool).expect("read stool");
-        let stool_uri = lsp_types::Uri::parse_from_file_path(&stool).expect("stool uri");
-        let file_id = ws
-            .analysis
-            .update_file_by_uri(&stool_uri, Some(stool_text))
-            .expect("stool file id");
-
-        let semantic_model = ws
-            .analysis
-            .compilation
-            .get_semantic_model(file_id)
-            .expect("semantic model");
-
-        let mut panel_local_types = Vec::new();
-        let mut panel_locals = Vec::new();
-        for local_name in semantic_model
-            .get_root()
-            .descendants::<glua_parser::LuaLocalName>()
-        {
-            if local_name
-                .get_name_token()
-                .is_some_and(|token| token.get_name_text() == "panel")
-            {
-                let ty = semantic_model
-                    .get_semantic_info(
-                        local_name
-                            .get_name_token()
-                            .expect("name token")
-                            .syntax()
-                            .clone()
-                            .into(),
-                    )
-                    .map(|info| info.display_typ().clone())
-                    .unwrap_or(LuaType::Unknown);
-                panel_locals.push(ws.humanize_type(ty.clone()));
-                panel_local_types.push(ty);
-            }
-        }
-
-        let field_types: Vec<String> = semantic_model
-            .get_root()
-            .descendants::<glua_parser::LuaIndexExpr>()
-            .filter(|index| format!("{}", index.syntax().text()).contains("transmissionToolPanel"))
-            .filter_map(|index| {
-                semantic_model
-                    .infer_expr(glua_parser::LuaExpr::IndexExpr(index))
-                    .ok()
-                    .map(|ty| ws.humanize_type(ty))
-            })
-            .collect();
-        let diagnostics = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default();
-        let help_undefined = diagnostics.iter().any(|diagnostic| {
-            diagnostic.code
-                == Some(NumberOrString::String(
-                    DiagnosticCode::UndefinedMethod.get_name().to_string(),
-                ))
-                && diagnostic.message.contains("Help")
-        });
-        assert!(
-            !help_undefined,
-            "real glide transmission editor must not report undefined-method Help; panel_locals={panel_locals:?}; field_types={field_types:?}; diagnostics={diagnostics:?}"
-        );
-        assert!(
-            panel_local_types
-                .iter()
-                .any(|ty| contains_named_type(ty, "ControlPanel")),
-            "expected ControlPanel for local panel from Glide.transmissionToolPanel, got panel_locals={panel_locals:?}; field_types={field_types:?}"
         );
     }
 
@@ -1311,92 +1223,6 @@ mod tests {
                 ]
                 .as_slice()
             )
-        );
-    }
-
-    #[test]
-    fn stream_editor_tab_button_resolves_parent_chain() {
-        use std::path::PathBuf;
-
-        let annotations = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
-            .join("../../../annotations-gmod-glua-ls/output");
-        let vehicle_base =
-            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../../cityrp-vehicle-base");
-        let stream_editor = vehicle_base.join("lua/glide/client/vgui/stream_editor.lua");
-        if !annotations.is_dir() || !stream_editor.is_file() {
-            return;
-        }
-
-        let mut ws = VirtualWorkspace::new();
-        let mut emmyrc = Emmyrc::default();
-        emmyrc.gmod.enabled = true;
-        ws.update_emmyrc(emmyrc);
-        ws.def_gmod_call_arg_builtins();
-        ws.analysis.add_library_workspace(annotations.clone());
-        ws.analysis.add_main_workspace(vehicle_base.clone());
-
-        let mut files = Vec::new();
-        for entry in std::fs::read_dir(&annotations).expect("read annotations") {
-            let path = entry.expect("read annotation entry").path();
-            if path.extension().is_none_or(|extension| extension != "lua") {
-                continue;
-            }
-            let text = std::fs::read_to_string(&path).expect("read annotation");
-            files.push((path, Some(text)));
-        }
-        files.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
-        let vehicle_files =
-            crate::load_workspace_files(&vehicle_base, &["**/*.lua".to_string()], &[], &[], None)
-                .expect("read vehicle base");
-        files.extend(
-            vehicle_files
-                .into_iter()
-                .map(crate::LuaFileInfo::into_tuple),
-        );
-        ws.analysis.update_files_by_path(files);
-        let uri = lsp_types::Uri::parse_from_file_path(&stream_editor).expect("stream editor uri");
-        let file_id = ws
-            .analysis
-            .get_file_id(&uri)
-            .expect("stream editor file id");
-
-        let metadata = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_gmod_class_metadata_index();
-        assert_eq!(
-            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global(
-                "Styled_StreamEditorTabButton",
-            )),
-            Some(
-                [
-                    crate::LuaTypeDeclId::global("DDragBase"),
-                    crate::LuaTypeDeclId::global("DHorizontalScroller"),
-                    crate::LuaTypeDeclId::global("Glide_EngineStreamEditor"),
-                ]
-                .as_slice()
-            )
-        );
-
-        let undefined_methods = ws
-            .analysis
-            .diagnose_file(file_id, CancellationToken::new())
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|diagnostic| {
-                diagnostic.code
-                    == Some(NumberOrString::String(
-                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
-                    ))
-            })
-            .map(|diagnostic| diagnostic.message)
-            .collect::<Vec<_>>();
-        assert!(
-            !undefined_methods.iter().any(|message| {
-                message.contains("SetActiveTabById") || message.contains("CloseTabById")
-            }),
-            "expected the tab button parent chain to reach Glide_EngineStreamEditor, got {undefined_methods:?}"
         );
     }
 

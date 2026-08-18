@@ -23,7 +23,11 @@ mod signature;
 mod traits;
 mod r#type;
 
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::Arc,
+};
 
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
@@ -32,7 +36,7 @@ pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerT
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
-pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner};
+pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner, is_pure_wildcard_registry};
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};
 pub use gmod_class::*;
@@ -84,6 +88,7 @@ pub struct DbIndex {
     /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
+    file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
 }
 
 /// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
@@ -135,7 +140,26 @@ impl DbIndex {
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_registry_cache: RevisionedCache::default(),
+            file_helper_scan_cache: HashMap::new(),
         }
+    }
+
+    /// One file's contribution to the gmod net-helper scan.
+    pub fn get_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
+        &self,
+        file_id: FileId,
+    ) -> Option<Arc<T>> {
+        self.file_helper_scan_cache
+            .get(&file_id)
+            .and_then(|value| value.clone().downcast::<T>().ok())
+    }
+
+    pub fn set_cached_file_helper_scan<T: std::any::Any + Send + Sync>(
+        &mut self,
+        file_id: FileId,
+        value: Arc<T>,
+    ) {
+        self.file_helper_scan_cache.insert(file_id, value);
     }
 
     /// Fetch the cached gmod net-helper registry if it was built at `revision`.
@@ -171,6 +195,13 @@ impl DbIndex {
         }
 
         let _profile = Profile::cond_new("remove indexes", file_ids.len() > 1);
+        // Same reasoning as in `clear`: both halves of the revision key can
+        // return to a previously cached value after a remove + update while the
+        // underlying index has changed.
+        self.helper_registry_cache = RevisionedCache::default();
+        for &file_id in &file_ids {
+            self.file_helper_scan_cache.remove(&file_id);
+        }
         for &file_id in &file_ids {
             if let Some(path) = self.get_vfs().get_file_path(&file_id) {
                 log::debug!(
@@ -511,31 +542,70 @@ impl LuaIndex for DbIndex {
             return;
         }
 
-        self.decl_index.remove_files(file_ids);
-        self.references_index.remove_files(file_ids);
-        self.types_index.remove_files(file_ids);
-        self.modules_index.remove_files(file_ids);
-        self.members_index.remove_files(file_ids);
-        self.property_index.remove_files(file_ids);
-        self.signature_index.remove_files(file_ids);
-        self.diagnostic_index.remove_files(file_ids);
-        self.operator_index.remove_files(file_ids);
-        self.flow_index.remove_files(file_ids);
-        self.accessor_func_index.remove_files(file_ids);
-        self.accessor_func_call_index.remove_files(file_ids);
-        self.call_site_param_index.remove_files(file_ids);
-        self.gmod_class_index.remove_files(file_ids);
-        self.gmod_infer_index.remove_files(file_ids);
-        self.gmod_load_index.remove_files(file_ids);
-        self.gmod_network_index.remove_files(file_ids);
-        self.dynamic_field_index.remove_files(file_ids);
-        self.file_dependencies_index.remove_files(file_ids);
-        for &file_id in file_ids {
-            self.numeric_range_population_index.remove(file_id);
-        }
-        self.metatable_index.remove_files(file_ids);
-        self.global_index.remove_files(file_ids);
-        self.json_schema_index.remove_files(file_ids);
+        use crate::profile::phase;
+        phase("remove/decl", || self.decl_index.remove_files(file_ids));
+        phase("remove/references", || {
+            self.references_index.remove_files(file_ids)
+        });
+        phase("remove/types", || self.types_index.remove_files(file_ids));
+        phase("remove/modules", || {
+            self.modules_index.remove_files(file_ids)
+        });
+        phase("remove/members", || {
+            self.members_index.remove_files(file_ids)
+        });
+        phase("remove/property", || {
+            self.property_index.remove_files(file_ids)
+        });
+        phase("remove/signature", || {
+            self.signature_index.remove_files(file_ids)
+        });
+        phase("remove/diagnostic", || {
+            self.diagnostic_index.remove_files(file_ids)
+        });
+        phase("remove/operator", || {
+            self.operator_index.remove_files(file_ids)
+        });
+        phase("remove/flow", || self.flow_index.remove_files(file_ids));
+        phase("remove/accessor_func", || {
+            self.accessor_func_index.remove_files(file_ids)
+        });
+        phase("remove/accessor_func_call", || {
+            self.accessor_func_call_index.remove_files(file_ids)
+        });
+        phase("remove/call_site_param", || {
+            self.call_site_param_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_class", || {
+            self.gmod_class_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_infer", || {
+            self.gmod_infer_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_load", || {
+            self.gmod_load_index.remove_files(file_ids)
+        });
+        phase("remove/gmod_network", || {
+            self.gmod_network_index.remove_files(file_ids)
+        });
+        phase("remove/dynamic_field", || {
+            self.dynamic_field_index.remove_files(file_ids)
+        });
+        phase("remove/file_dependencies", || {
+            self.file_dependencies_index.remove_files(file_ids)
+        });
+        phase("remove/numeric_range", || {
+            for &file_id in file_ids {
+                self.numeric_range_population_index.remove(file_id);
+            }
+        });
+        phase("remove/metatable", || {
+            self.metatable_index.remove_files(file_ids)
+        });
+        phase("remove/global", || self.global_index.remove_files(file_ids));
+        phase("remove/json_schema", || {
+            self.json_schema_index.remove_files(file_ids)
+        });
     }
 
     fn clear(&mut self) {
@@ -562,5 +632,35 @@ impl LuaIndex for DbIndex {
         self.metatable_index.clear();
         self.global_index.clear();
         self.json_schema_index.clear();
+        // Derived caches have to go with the facts they were derived from.
+        // `clear` does not touch the VFS, so `content_revision` and the
+        // signature count both return to their old values once the same file
+        // set is re-indexed — the revision key would hand back a registry built
+        // against the discarded index.
+        self.helper_registry_cache = RevisionedCache::default();
+        self.file_helper_scan_cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::DbIndex;
+    use crate::FileId;
+
+    #[test]
+    fn remove_index_resets_the_helper_registry_cache() {
+        let mut db = DbIndex::new();
+        let revision = 7u64;
+        db.set_cached_helper_registry(revision, Arc::new(42u32));
+        assert_eq!(
+            db.get_cached_helper_registry::<u32>(revision).as_deref(),
+            Some(&42)
+        );
+
+        db.remove_index(vec![FileId::new(1)]);
+
+        assert!(db.get_cached_helper_registry::<u32>(revision).is_none());
     }
 }

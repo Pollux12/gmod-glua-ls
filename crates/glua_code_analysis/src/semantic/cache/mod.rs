@@ -243,10 +243,22 @@ impl LuaInferCache {
         self.vgui_parent_fallback_calls.clear();
     }
 
+    /// Discards the inference a wave of deferred resolution can have
+    /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        self.flow_node_cache.retain(|_, inner| {
+            inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+            !inner.is_empty()
+        });
+        self.param_type_cache
+            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+        self.param_type_source_cache
+            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+        self.for_range_iter_var_type_cache
+            .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
     }
 
     /// Clears inference results that can become stale as deferred declarations,

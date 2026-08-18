@@ -1299,7 +1299,7 @@ fn infer_tracked_safe_helper_call_return_type(
     if return_types.is_empty() {
         None
     } else {
-        Some(LuaType::from_vec(return_types))
+        Some(LuaType::from_inferred_vec(return_types))
     }
 }
 

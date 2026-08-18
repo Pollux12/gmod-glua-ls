@@ -11,7 +11,10 @@ use std::time::Duration;
 use crate::{
     FileId, InferFailReason, LuaDeclTypeKind, LuaMemberFeature, LuaSemanticDeclId, LuaTypeDecl,
     LuaTypeFlag,
-    compilation::analyzer::{AnalysisPipeline, unresolve::resolve::try_resolve_special_call},
+    compilation::analyzer::{
+        AnalysisPipeline, call_site_params::materialize_call_result_consumer,
+        unresolve::resolve::try_resolve_special_call,
+    },
     db_index::{DbIndex, LuaDeclId, LuaMemberId, LuaSignatureId},
     profile::Profile,
 };
@@ -21,14 +24,15 @@ use glua_parser::{
     LuaNameToken, LuaTableExpr, LuaTableField,
 };
 use resolve::{
-    try_resolve_decl, try_resolve_iter_var, try_resolve_member, try_resolve_module,
-    try_resolve_module_ref, try_resolve_return_point, try_resolve_table_field,
+    try_resolve_call_site_contribution, try_resolve_decl, try_resolve_iter_var, try_resolve_module,
+    try_resolve_module_ref, try_resolve_table_field,
 };
 use resolve_closure::{
     try_resolve_call_closure_params, try_resolve_closure_parent_params, try_resolve_closure_return,
 };
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
+pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
 pub use resolve_closure::extract_hook_name;
 pub use resolve_closure::{
     resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
@@ -59,6 +63,16 @@ fn partition_pre_dynamic_unresolves(
     let mut deferred = Vec::new();
     let mut ready = Vec::new();
     for (unresolve, reason) in candidates {
+        // An unbound `pairs` generic is missing exactly the keys the
+        // dynamic-field pass synthesizes. Retrying it here reaches a weaker
+        // answer, force-writes it over the template placeholder and retires
+        // the item, so the type ends up a function of whether this pass had
+        // run yet.
+        if matches!(reason, InferFailReason::UnResolveIterTemplate) {
+            deferred.push((unresolve, reason));
+            continue;
+        }
+
         let UnResolve::Member(mut member) = unresolve else {
             ready.push((unresolve, reason));
             continue;
@@ -95,12 +109,20 @@ fn partition_pre_dynamic_unresolves(
     (ready, deferred)
 }
 
+/// Per-reason unresolve attribution, gated on `GLUALS_PROFILE_UNRESOLVE`. Kept
+/// off `GLUALS_PROFILE_PHASE` because the per-attempt `Instant` pairs inflate
+/// the pass by ~50%, which would distort every other phase reading.
+fn unresolve_profile_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var_os("GLUALS_PROFILE_UNRESOLVE").is_some())
+}
+
 pub struct UnResolveAnalysisPipeline;
 
 impl AnalysisPipeline for UnResolveAnalysisPipeline {
     fn analyze(db: &mut DbIndex, context: &mut AnalyzeContext) {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
-        let log_enabled = log::log_enabled!(log::Level::Info);
+        let log_enabled = log::log_enabled!(log::Level::Info) || unresolve_profile_enabled();
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
 
         let mat_start = log_enabled.then(std::time::Instant::now);
@@ -135,7 +157,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
             let resolve_start = log_enabled.then(std::time::Instant::now);
-            let profile = try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled);
+            let profile = crate::profile::phase("unresolve/try_resolve", || {
+                try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled)
+            });
             if let Some(resolve_start) = resolve_start {
                 log::info!(
                     "unresolve: loop {} try_resolve cost {:?}",
@@ -148,7 +172,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
 
             let mat_start = log_enabled.then(std::time::Instant::now);
-            materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
+            crate::profile::phase("unresolve/materialize_pending", || {
+                materialize_pending_str_tpl_type_decls(db, &mut infer_manager)
+            });
             if let Some(mat_start) = mat_start {
                 log::info!(
                     "unresolve: loop {} materialize_pending cost {:?}",
@@ -182,7 +208,9 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             }
 
             let reason_start = log_enabled.then(std::time::Instant::now);
-            resolve_all_reason(db, &mut reason_resolve, loop_count);
+            crate::profile::phase("unresolve/resolve_all_reason", || {
+                resolve_all_reason(db, &mut reason_resolve, loop_count)
+            });
             if let Some(reason_start) = reason_start {
                 log::info!(
                     "unresolve: loop {} resolve_all_reason cost {:?}",
@@ -205,6 +233,31 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             loop_count += 1;
         }
 
+        // Applied once per pipeline run rather than per resolution: every apply
+        // rebuilds the index's whole derived contribution state.
+        let changed_signatures = db
+            .get_call_site_param_index_mut()
+            .flush_deferred_contributions();
+        if !changed_signatures.is_empty() {
+            requeue_flushed_call_site_returns(
+                db,
+                context,
+                &mut infer_manager,
+                &mut reason_resolve,
+                &changed_signatures,
+                log_enabled,
+            );
+            // The requeued wave can defer contributions of its own. Applying
+            // them here keeps the queue empty when this pipeline returns, as it
+            // was before the wave existed. Their changed set is deliberately
+            // dropped: acting on it would make the flush re-entrant, and the
+            // returns it would requeue are exactly as stale as they were before
+            // this fix rather than newly wrong.
+            let _ = db
+                .get_call_site_param_index_mut()
+                .flush_deferred_contributions();
+        }
+
         for (reason, unresolves) in reason_resolve {
             context.unresolves.extend(
                 unresolves
@@ -216,13 +269,67 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // Resolving deferred items mutates type/member indexes, so any inference
         // cached while resolution was still in progress can be stale.
         if had_unresolves {
-            infer_manager.clear();
+            crate::profile::phase("unresolve/infer_manager_clear", || infer_manager.clear());
         }
 
         // Return the infer_manager so later phases (e.g. dynamic field) can
         // reuse cached inference results rather than recomputing from scratch
         // when no deferred resolution changed the indexes.
         context.infer_manager = infer_manager;
+    }
+}
+
+/// Re-derives the inferred returns invalidated by the deferred-contribution
+/// flush.
+///
+/// A deferred call-site argument that only resolved in this run changes its
+/// callee's parameter type, which is an input to every return derived from it.
+/// The requeued items are serviced here rather than left in `context.unresolves`
+/// because no later wave is guaranteed to run, and a requeued signature parked
+/// at `SignatureReturnStatus::UnResolve` is worse than the stale answer.
+fn requeue_flushed_call_site_returns(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    infer_manager: &mut InferCacheManager,
+    reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
+    changed_signatures: &HashSet<LuaSignatureId>,
+    log_enabled: bool,
+) {
+    let consumers = db
+        .get_call_site_param_index()
+        .get_return_consumers(changed_signatures);
+    let consumers = consumers
+        .into_iter()
+        .filter_map(|consumer| materialize_call_result_consumer(db, consumer))
+        .collect();
+    context.requeue_call_site_inferred_returns(db, changed_signatures, consumers);
+
+    let mut requeued: FxHashMap<InferFailReason, Vec<UnResolve>> = FxHashMap::default();
+    for (unresolve, reason) in context.unresolves.drain(..) {
+        requeued.entry(reason).or_default().push(unresolve);
+    }
+    if requeued.is_empty() {
+        return;
+    }
+
+    // Pending template decls are index writes rather than cache entries, and
+    // `clear` drops them unmaterialized, so they are drained either side of it
+    // exactly as the main loop drains them around `clear_for_unresolve`.
+    materialize_pending_str_tpl_type_decls(db, infer_manager);
+    // The flush rewrote `inferred_params`, which is an input to every param type
+    // and so to every expression inferred from one. Replaying that memoised
+    // inference here would commit a pre-flush answer. Everything `clear` drops
+    // is derived from the indexes and recomputed on demand; the phase and
+    // dynamic-field visibility live on the manager and survive it.
+    infer_manager.clear();
+
+    let _ = try_resolve(db, infer_manager, &mut requeued, log_enabled);
+    materialize_pending_str_tpl_type_decls(db, infer_manager);
+
+    // Whatever is still unresolved rejoins the retained set, so it leaves this
+    // pipeline through the same path as the main loop's leftovers.
+    for (reason, unresolves) in requeued {
+        reason_resolve.entry(reason).or_default().extend(unresolves);
     }
 }
 
@@ -257,6 +364,45 @@ fn materialize_pending_str_tpl_type_decls(db: &mut DbIndex, infer_manager: &mut 
     }
 }
 
+fn attempt_resolve(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    file_id: FileId,
+    unresolve: &mut UnResolve,
+) -> ResolveResult {
+    let cache = infer_manager.get_infer_cache(file_id);
+    match unresolve {
+        UnResolve::Decl(un_resolve_decl) => try_resolve_decl(db, cache, un_resolve_decl),
+        UnResolve::Member(un_resolve_member) => try_resolve_member(db, cache, un_resolve_member),
+        UnResolve::Module(un_resolve_module) => try_resolve_module(db, cache, un_resolve_module),
+        UnResolve::Return(un_resolve_return) => {
+            try_resolve_return_point(db, cache, un_resolve_return)
+        }
+        UnResolve::ClosureParams(un_resolve_closure_params) => {
+            try_resolve_call_closure_params(db, cache, un_resolve_closure_params)
+        }
+        UnResolve::ClosureReturn(un_resolve_closure_return) => {
+            try_resolve_closure_return(db, cache, un_resolve_closure_return)
+        }
+        UnResolve::IterDecl(un_resolve_iter_var) => {
+            try_resolve_iter_var(db, cache, un_resolve_iter_var)
+        }
+        UnResolve::ModuleRef(module_ref) => try_resolve_module_ref(db, cache, module_ref),
+        UnResolve::ClosureParentParams(un_resolve_closure_params) => {
+            try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
+        }
+        UnResolve::TableField(un_resolve_table_field) => {
+            try_resolve_table_field(db, cache, un_resolve_table_field)
+        }
+        UnResolve::SpecialCall(un_resolve_special_call) => {
+            try_resolve_special_call(db, cache, un_resolve_special_call)
+        }
+        UnResolve::CallSiteContribution(contribution) => {
+            try_resolve_call_site_contribution(db, cache, contribution)
+        }
+    }
+}
+
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
@@ -269,6 +415,7 @@ fn try_resolve(
         let mut changed = false;
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
+        let mut parked = Vec::new();
         let mut retry_file_ids = HashSet::new();
 
         // Only re-sort keys when the set of reason groups has changed.
@@ -300,43 +447,9 @@ fn try_resolve(
             unresolves.sort_unstable_by(unresolve_stable_cmp);
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
-                let cache = infer_manager.get_infer_cache(file_id);
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
-                let resolve_result = match &mut unresolve {
-                    UnResolve::Decl(un_resolve_decl) => {
-                        try_resolve_decl(db, cache, un_resolve_decl)
-                    }
-                    UnResolve::Member(un_resolve_member) => {
-                        try_resolve_member(db, cache, un_resolve_member)
-                    }
-                    UnResolve::Module(un_resolve_module) => {
-                        try_resolve_module(db, cache, un_resolve_module)
-                    }
-                    UnResolve::Return(un_resolve_return) => {
-                        try_resolve_return_point(db, cache, un_resolve_return)
-                    }
-                    UnResolve::ClosureParams(un_resolve_closure_params) => {
-                        try_resolve_call_closure_params(db, cache, un_resolve_closure_params)
-                    }
-                    UnResolve::ClosureReturn(un_resolve_closure_return) => {
-                        try_resolve_closure_return(db, cache, un_resolve_closure_return)
-                    }
-                    UnResolve::IterDecl(un_resolve_iter_var) => {
-                        try_resolve_iter_var(db, cache, un_resolve_iter_var)
-                    }
-                    UnResolve::ModuleRef(module_ref) => {
-                        try_resolve_module_ref(db, cache, module_ref)
-                    }
-                    UnResolve::ClosureParentParams(un_resolve_closure_params) => {
-                        try_resolve_closure_parent_params(db, cache, un_resolve_closure_params)
-                    }
-                    UnResolve::TableField(un_resolve_table_field) => {
-                        try_resolve_table_field(db, cache, un_resolve_table_field)
-                    }
-                    UnResolve::SpecialCall(un_resolve_special_call) => {
-                        try_resolve_special_call(db, cache, un_resolve_special_call)
-                    }
-                };
+                let resolve_result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                let cache = infer_manager.get_infer_cache(file_id);
                 if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
                     profile.record_attempt(
                         &check_reason,
@@ -366,6 +479,20 @@ fn try_resolve(
                             changed = true;
                             retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
+                        } else {
+                            // Re-failing on the dependency the group was
+                            // reached on usually means the attempt replayed
+                            // a memoised `CacheEntry::Error` from before
+                            // that dependency landed, so the reason names a
+                            // stale fact. Purging the file and parking the
+                            // item gives it one genuine look per wave
+                            // against the settled index — dying here writes
+                            // no type cache at all, which leaves a decl
+                            // owner with none and lets
+                            // `stabilize_unknown_locals` fabricate a usage
+                            // guess.
+                            retry_file_ids.insert(file_id);
+                            parked.push((unresolve, reason));
                         }
                     }
                 }
@@ -378,11 +505,14 @@ fn try_resolve(
             reason_resolve.remove(&reason);
         }
 
-        let keys_changed = !retain_unresolve.is_empty();
+        let mut keys_changed = !retain_unresolve.is_empty();
         for (unresolve, reason) in retain_unresolve {
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
+        // Anything still parked is dropped with the wave: it never joins
+        // `reason_resolve` here, so it cannot keep a reason group alive into the
+        // outer round.
         if !changed || reason_resolve.is_empty() {
             break;
         }
@@ -392,6 +522,11 @@ fn try_resolve(
         // but discard inference results computed against the previous DB state.
         materialize_pending_str_tpl_type_decls(db, infer_manager);
         infer_manager.clear_files_deferred_results(&retry_file_ids);
+
+        keys_changed |= !parked.is_empty();
+        for (unresolve, reason) in parked {
+            reason_resolve.entry(reason).or_default().push(unresolve);
+        }
 
         // Re-use cached sorted keys if no new reason groups were added.
         // When retain_unresolve adds items to new/existing groups, the key
@@ -476,6 +611,19 @@ impl TryResolveProfile {
             .collect::<Vec<_>>();
         stats.sort_by_key(|(_, stats)| std::cmp::Reverse(stats.attempt_time + stats.reach_time));
         for (reason, stats) in stats.into_iter().take(12) {
+            if unresolve_profile_enabled() {
+                eprintln!(
+                    "  [unres] loop {loop_count} {reason:<28} groups={} unres={} reach={}/{} reach_t={:>7.3}s attempts={} ok={} attempt_t={:>7.3}s",
+                    stats.groups_seen,
+                    stats.unresolves_seen,
+                    stats.reach_hits,
+                    stats.reach_checks,
+                    stats.reach_time.as_secs_f64(),
+                    stats.attempts,
+                    stats.ok,
+                    stats.attempt_time.as_secs_f64(),
+                );
+            }
             log::info!(
                 "unresolve: loop {} reason {} groups={} unresolves={} reach={}/{} reach_time={:?} attempts={} ok={} same_err={} other_err={} field_err={} op_err={} none_err={} recursive_err={} attempt_time={:?}",
                 loop_count,
@@ -499,7 +647,7 @@ impl TryResolveProfile {
     }
 }
 
-fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
+pub(crate) fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
     match reason {
         InferFailReason::None => "none",
         InferFailReason::RecursiveInfer => "recursive_infer",
@@ -511,6 +659,8 @@ fn infer_fail_reason_label(reason: &InferFailReason) -> &'static str {
         InferFailReason::UnResolveSignatureReturn(_) => "signature_return",
         InferFailReason::UnResolveTypeDecl(_) => "type_decl",
         InferFailReason::UnResolveModuleExport(_) => "module_export",
+        InferFailReason::UnSealedDynamicFields => "unsealed_dynamic_fields",
+        InferFailReason::UnResolveIterTemplate => "iter_template",
     }
 }
 
@@ -524,16 +674,27 @@ fn sorted_reason_keys(
 
 fn infer_fail_reason_kind_rank(reason: &InferFailReason) -> u8 {
     match reason {
-        InferFailReason::None => 0,
-        InferFailReason::RecursiveInfer => 1,
-        InferFailReason::FieldNotFound => 2,
-        InferFailReason::UnResolveOperatorCall => 3,
-        InferFailReason::UnResolveDeclType(_) => 4,
-        InferFailReason::UnResolveMemberType(_) => 5,
-        InferFailReason::UnResolveExpr(_) => 6,
-        InferFailReason::UnResolveSignatureReturn(_) => 7,
-        InferFailReason::UnResolveTypeDecl(_) => 8,
-        InferFailReason::UnResolveModuleExport(_) => 9,
+        // Unlike every other reason, this one names the index's build state
+        // rather than another item's fact: it is unreachable until the
+        // seal, and once it is reachable the facts these items produce are
+        // *inputs* to the other groups. Ordering it last let a consumer
+        // resolve against the pre-seal picture and commit a floor, which is
+        // terminal — the item is gone before the fact it needed lands.
+        InferFailReason::UnSealedDynamicFields => 0,
+        InferFailReason::None => 1,
+        InferFailReason::RecursiveInfer => 2,
+        InferFailReason::FieldNotFound => 3,
+        // Ordered where these items sat while they shared the `FieldNotFound`
+        // group: they only upgrade their own placeholders, so the rank exists to
+        // keep that timing, not to express a dependency.
+        InferFailReason::UnResolveIterTemplate => 4,
+        InferFailReason::UnResolveOperatorCall => 5,
+        InferFailReason::UnResolveDeclType(_) => 6,
+        InferFailReason::UnResolveMemberType(_) => 7,
+        InferFailReason::UnResolveExpr(_) => 8,
+        InferFailReason::UnResolveSignatureReturn(_) => 9,
+        InferFailReason::UnResolveTypeDecl(_) => 10,
+        InferFailReason::UnResolveModuleExport(_) => 11,
     }
 }
 
@@ -588,8 +749,10 @@ fn infer_fail_reason_stable_cmp(a: &InferFailReason, b: &InferFailReason) -> Ord
 
 fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
     match unresolve {
-        UnResolve::Decl(_) => 0,
-        UnResolve::IterDecl(_) => 1,
+        // Ahead of every consumer: a loop variable is an input to the facts the
+        // body derives from it, and both sit in the same reason group.
+        UnResolve::IterDecl(_) => 0,
+        UnResolve::Decl(_) => 1,
         UnResolve::Member(_) => 2,
         UnResolve::Module(_) => 3,
         UnResolve::Return(_) => 4,
@@ -599,6 +762,7 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::ModuleRef(_) => 8,
         UnResolve::TableField(_) => 9,
         UnResolve::SpecialCall(_) => 10,
+        UnResolve::CallSiteContribution(_) => 11,
     }
 }
 
@@ -621,6 +785,7 @@ pub enum UnResolve {
     ModuleRef(Box<UnResolveModuleRef>),
     TableField(Box<UnResolveTableField>),
     SpecialCall(Box<UnResolveSpecialCall>),
+    CallSiteContribution(Box<UnResolveCallSiteContribution>),
 }
 
 #[allow(dead_code)]
@@ -646,6 +811,9 @@ impl UnResolve {
             UnResolve::SpecialCall(un_resolve_special_call) => {
                 Some(un_resolve_special_call.file_id)
             }
+            // The retry infers in the file the expression lives in, which is the
+            // callee's file for callback snapshots.
+            UnResolve::CallSiteContribution(contribution) => Some(contribution.expr_file_id),
         }
     }
 
@@ -687,6 +855,10 @@ impl UnResolve {
             UnResolve::SpecialCall(d) => (
                 d.file_id.id,
                 u32::from(d.call_expr.syntax().text_range().start()),
+            ),
+            UnResolve::CallSiteContribution(d) => (
+                d.expr_file_id.id,
+                u32::from(d.expr_syntax_id.get_range().start()),
             ),
         }
     }
@@ -849,6 +1021,42 @@ impl From<UnResolveSpecialCall> for UnResolve {
     }
 }
 
+/// Which call-site collection produced a contribution, and therefore how the
+/// retry re-derives it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CallSiteContributionKind {
+    /// Receiver of an exact `obj:method()` call bound to an explicit `self` param.
+    ExactReceiver,
+    /// A supported argument shape bound to a named callee parameter.
+    Argument,
+    /// A concrete table passed to a callback, snapshotted structurally.
+    CallbackTable,
+}
+
+/// A call-site parameter contribution whose type was not inferable yet.
+///
+/// Carries only ids so it can cross the per-file parallel collection boundary
+/// (rowan red nodes are `!Send`); the retry re-materializes the expression from
+/// `expr_file_id`'s red root and re-runs exactly that one collection.
+#[derive(Debug, Clone)]
+pub struct UnResolveCallSiteContribution {
+    /// File whose contribution set receives the recovered fact. Equal to
+    /// `expr_file_id` except for callback snapshots, which are attributed to the
+    /// caller file while the expression lives in the callee's.
+    pub file_id: FileId,
+    pub expr_file_id: FileId,
+    pub expr_syntax_id: glua_parser::LuaSyntaxId,
+    pub signature_id: LuaSignatureId,
+    pub param_idx: usize,
+    pub kind: CallSiteContributionKind,
+}
+
+impl From<UnResolveCallSiteContribution> for UnResolve {
+    fn from(contribution: UnResolveCallSiteContribution) -> Self {
+        UnResolve::CallSiteContribution(Box::new(contribution))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use rustc_hash::FxHashMap;
@@ -858,7 +1066,10 @@ mod tests {
 
     use crate::{FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaTypeDeclId};
 
-    use super::{UnResolve, UnResolveMember, partition_pre_dynamic_unresolves, sorted_reason_keys};
+    use super::{
+        UnResolve, UnResolveIterVar, UnResolveMember, partition_pre_dynamic_unresolves,
+        sorted_reason_keys,
+    };
 
     #[test]
     fn reason_group_order_is_stable_across_hashmap_insertion_order() {
@@ -882,6 +1093,46 @@ mod tests {
         }
 
         assert_eq!(sorted_reason_keys(&forward), sorted_reason_keys(&reverse));
+    }
+
+    #[test]
+    fn pre_dynamic_partition_defers_only_template_iter_vars() {
+        let tree = LuaParser::parse("for k, v in pairs(t) do end", ParserConfig::default());
+        let for_range = tree
+            .get_chunk_node()
+            .descendants::<glua_parser::LuaForRangeStat>()
+            .next()
+            .expect("for range stat");
+        let iter_var = |file_id| UnResolveIterVar {
+            file_id,
+            iter_exprs: for_range.get_expr_list().collect(),
+            iter_vars: for_range.get_var_name_list().collect(),
+        };
+
+        let (ready, deferred) = partition_pre_dynamic_unresolves(vec![
+            (
+                iter_var(FileId::new(1)).into(),
+                InferFailReason::UnResolveIterTemplate,
+            ),
+            (
+                iter_var(FileId::new(2)).into(),
+                InferFailReason::FieldNotFound,
+            ),
+        ]);
+
+        assert_eq!(deferred.len(), 1);
+        assert!(matches!(
+            deferred[0],
+            (
+                UnResolve::IterDecl(_),
+                InferFailReason::UnResolveIterTemplate
+            )
+        ));
+        assert_eq!(ready.len(), 1);
+        assert!(matches!(
+            ready[0],
+            (UnResolve::IterDecl(_), InferFailReason::FieldNotFound)
+        ));
     }
 
     #[test]

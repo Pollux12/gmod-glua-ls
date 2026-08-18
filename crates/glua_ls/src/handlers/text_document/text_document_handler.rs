@@ -339,25 +339,17 @@ pub async fn on_did_change_text_document(
     let supports_pull = context.lsp_features().supports_pull_diagnostic();
 
     // Single read-lock acquisition: get file_id + emmyrc + should_process
-    let (existing_file_id, previous_text, emmyrc, should_process) = {
+    let (existing_file_id, emmyrc, should_process) = {
         let analysis = context.analysis().read().await;
         let file_id = analysis.get_file_id(&uri);
-        let previous_text = file_id.and_then(|file_id| {
-            analysis
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_content(&file_id)
-                .cloned()
-        });
         let emmyrc = analysis.get_emmyrc();
         if file_id.is_some() {
-            (file_id, previous_text, emmyrc, true)
+            (file_id, emmyrc, true)
         } else {
             drop(analysis);
             let workspace_manager = context.workspace_manager().read().await;
             let should = workspace_manager.is_workspace_file(&uri);
-            (file_id, previous_text, emmyrc, should)
+            (file_id, emmyrc, should)
         }
     };
 
@@ -379,15 +371,6 @@ pub async fn on_did_change_text_document(
     }
 
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
-    context
-        .file_diagnostic()
-        .note_recent_edit(
-            &uri,
-            previous_text.as_deref(),
-            &text,
-            Duration::from_millis(interval),
-        )
-        .await;
     let preparsed = preparse_document(text.clone(), emmyrc.clone()).await;
     let syntax_diagnostics = preparsed
         .as_ref()
@@ -408,31 +391,18 @@ pub async fn on_did_change_text_document(
     }
 
     if !supports_pull && file_id.is_some() {
-        if let Some(cached_diagnostics) = context
+        let diagnostics = context
             .file_diagnostic()
-            .cached_display_diagnostics(&uri)
+            .cached_file_diagnostics(&uri)
             .await
-        {
-            context
-                .client()
-                .publish_diagnostics(PublishDiagnosticsParams {
-                    uri: uri.clone(),
-                    diagnostics: cached_diagnostics,
-                    version: Some(version),
-                });
-        } else {
-            let syntax_diagnostics = context
-                .file_diagnostic()
-                .filter_display_diagnostics(&uri, syntax_diagnostics)
-                .await;
-            context
-                .client()
-                .publish_diagnostics(PublishDiagnosticsParams {
-                    uri: uri.clone(),
-                    diagnostics: syntax_diagnostics,
-                    version: Some(version),
-                });
-        }
+            .unwrap_or(syntax_diagnostics);
+        context
+            .client()
+            .publish_diagnostics(PublishDiagnosticsParams {
+                uri: uri.clone(),
+                diagnostics,
+                version: Some(version),
+            });
     }
 
     // Schedule debounced reindex — rapid edits into a single reindex
@@ -464,7 +434,6 @@ pub async fn on_did_close_document(
     params: DidCloseTextDocumentParams,
 ) -> Option<()> {
     let uri = &params.text_document.uri;
-    context.file_diagnostic().clear_recent_edit(uri).await;
     let lsp_features = context.lsp_features();
     let (encoding, interval) = {
         let analysis = context.analysis().read().await;

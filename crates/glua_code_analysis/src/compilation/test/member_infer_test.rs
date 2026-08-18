@@ -1597,9 +1597,9 @@ mod test {
         end
         "#;
         let consumer_source = r#"
-        ---@type SWEP
-        local obj
-        A = obj.Target
+        function SWEP:Consume()
+            A = self.Target
+        end
         "#;
 
         let mut body_then_player_ws = VirtualWorkspace::new();
@@ -1645,6 +1645,34 @@ mod test {
 
         let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
         assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+    }
+
+    /// `if c then t.k = v end` does not dominate the other writes of `t.k`, so
+    /// re-indexing an unrelated writer must not evict it from the member index.
+    #[gtest]
+    fn conditional_member_writes_survive_partial_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/food/a.lua", "Food = { amount = 50 }");
+        let plain_path = "lua/food/b.lua";
+        let plain_source = "Food.amount = 1";
+        let plain_file = ws.def_file(plain_path, plain_source);
+        ws.def_file("lua/food/c.lua", "if Food then Food.amount = \"c\" end");
+        ws.def_file("lua/food/d.lua", "if Food then Food.amount = true end");
+
+        let baseline_ty = ws.expr_ty("Food.amount");
+        let baseline = ws.humanize_type(baseline_ty);
+        assert!(
+            baseline.contains("boolean"),
+            "the conditional writers must be visible on a cold build, got {baseline}"
+        );
+
+        let uri = ws.virtual_url_generator.new_uri(plain_path);
+        ws.analysis
+            .update_file_text_only(&uri, format!("{plain_source}\n"));
+        ws.analysis.reindex_files(vec![plain_file]);
+
+        let after_ty = ws.expr_ty("Food.amount");
+        assert_eq!(ws.humanize_type(after_ty), baseline);
     }
 
     #[gtest]
@@ -2388,6 +2416,62 @@ mod test {
         assert_that!(
             ws.humanize_type(post_edit_fuel_module_type).as_str(),
             not(contains_substring("table"))
+        );
+    }
+
+    /// A guarded bootstrap in one file and a real writer in another: the
+    /// bootstrap contributes only `{}`, so it must never replace the
+    /// writer's class, cold or after a re-index.
+    #[gtest]
+    fn test_incremental_edit_keeps_a_cross_file_bootstrap_off_the_visible_member() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let bootstrap_path = "lua/deco/sh_stock.lua";
+        let bootstrap_source = r#"
+        cityrp = cityrp or {}
+        cityrp.deco = cityrp.deco or {}
+        cityrp.deco.stock = cityrp.deco.stock or {}
+        "#;
+
+        ws.def_file(bootstrap_path, bootstrap_source);
+        ws.def_file(
+            "lua/deco/cl_stock.lua",
+            r#"
+            ---@class DecoStock
+            local Stock = {}
+
+            function Stock.Count()
+                return 1
+            end
+
+            cityrp.deco.stock = Stock
+            "#,
+        );
+
+        let consumer_file = ws.def_file(
+            "lua/deco/cl_use.lua",
+            r#"
+            local stock = cityrp.deco.stock
+            "#,
+        );
+
+        let baseline_type = local_name_type(&mut ws, consumer_file, "stock");
+        let baseline = ws.humanize_type(baseline_type);
+        assert_that!(baseline.as_str(), contains_substring("DecoStock"));
+
+        let bootstrap_uri = ws.virtual_url_generator.new_uri(bootstrap_path);
+        ws.analysis
+            .update_file_by_uri(&bootstrap_uri, Some(format!("{bootstrap_source}\n")));
+
+        let after_edit_type = local_name_type(&mut ws, consumer_file, "stock");
+        let after_edit = ws.humanize_type(after_edit_type);
+        assert_that!(
+            after_edit.as_str(),
+            eq(baseline.as_str()),
+            "re-indexing the bootstrap file must not hand it the visible member"
         );
     }
 
@@ -3364,6 +3448,213 @@ marauth.character = marauth.character or {}
             owner_range.file_id,
             eq(child_file),
             "child guarded field assignment should attach to the current file's table owner"
+        );
+    }
+
+    #[gtest]
+    fn loop_var_reassigned_from_its_own_member_keeps_the_element_type() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+
+        let file_id = ws.def_file(
+            "lua/autorun/sit.lua",
+            r#"
+            ---@class Ent1
+            ---@field GetClass fun(self: Ent1): string
+            local Ent1 = {}
+
+            ---@return Ent1[]
+            local function FindAll() end
+
+            for k, v in pairs(FindAll()) do
+                if k then
+                    v = v.SittingOnMe
+                end
+                print(v:GetClass())
+            end
+            "#,
+        );
+
+        // The reassignment makes inferring `v` depend on `v`, so the flow walk
+        // reaches `v`'s declaration position unresolved. A loop variable is
+        // assigned by the `for` header, so that must not be read as "nil here".
+        assert_that!(
+            file_diagnostic_messages(&mut ws, file_id, DiagnosticCode::UncheckedNilAccess),
+            is_empty(),
+        );
+    }
+
+    /// Two plain cross-file assignments to the same global field make the
+    /// member item `Many` with all-file-define members, so
+    /// `should_widen_file_defines` and `should_widen_table_literals` both hold
+    /// and each `TableConst` collapses to `table`.
+    #[test]
+    fn test_cross_file_member_merge_widens_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/widen_table/a.lua",
+            "Store = {}\nStore.cfg = { a = 1 }\n",
+        );
+        ws.def_file("lua/widen_table/b.lua", "Store.cfg = { b = 2 }\n");
+        let consumer = ws.def_file("lua/widen_table/c.lua", "local cfg = Store.cfg\n");
+
+        let cfg_type = local_name_type(&mut ws, consumer, "cfg");
+        assert!(
+            matches!(cfg_type, LuaType::Table),
+            "cross-file member merge should widen table literals to `table`, got {cfg_type:?}"
+        );
+    }
+
+    /// The same merge widens scalar literals through
+    /// `widen_literal_type_for_assignment`, so `1` and `2` become `integer`
+    /// rather than a literal union.
+    #[test]
+    fn test_cross_file_member_merge_widens_scalar_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/widen_scalar/a.lua", "Store = {}\nStore.n = 1\n");
+        ws.def_file("lua/widen_scalar/b.lua", "Store.n = 2\n");
+        let consumer = ws.def_file("lua/widen_scalar/c.lua", "local n = Store.n\n");
+
+        let n_type = local_name_type(&mut ws, consumer, "n");
+        assert!(
+            matches!(n_type, LuaType::Integer),
+            "cross-file member merge should widen scalar literals, got {n_type:?}"
+        );
+    }
+
+    /// `X = X or {}` members are non-overwriting assignments, which clears
+    /// `should_widen_table_literals`. The merged fields must stay as concrete
+    /// `TableConst`s so the guarded bootstrap keeps its shape.
+    #[test]
+    fn test_guarded_cross_file_member_merge_keeps_table_literals() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/no_widen_guarded/a.lua",
+            "Store = Store or {}\nStore.cfg = { a = 1 }\n",
+        );
+        ws.def_file(
+            "lua/no_widen_guarded/b.lua",
+            "Store = Store or {}\nStore.cfg = Store.cfg or { b = 2 }\n",
+        );
+        let consumer = ws.def_file("lua/no_widen_guarded/c.lua", "local cfg = Store.cfg\n");
+
+        let cfg_type = local_name_type(&mut ws, consumer, "cfg");
+        let LuaType::MergedTable(merged) = &cfg_type else {
+            panic!("guarded merge should keep concrete tables, got {cfg_type:?}");
+        };
+        assert!(
+            merged
+                .get_types()
+                .iter()
+                .all(|typ| matches!(typ, LuaType::TableConst(_))),
+            "guarded merge must not widen its table literals, got {cfg_type:?}"
+        );
+    }
+
+    /// Two files bootstrap the same global and each adds its own field. A read
+    /// in a third file must see both contributions, not whichever bootstrap
+    /// happened to settle first.
+    #[test]
+    fn test_cross_file_guarded_bootstrap_read_sees_every_contribution() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/bootstrap_read/a.lua",
+            "Store = Store or {}\nStore.a = 1\n",
+        );
+        ws.def_file(
+            "lua/bootstrap_read/b.lua",
+            "Store = Store or {}\nStore.b = 2\n",
+        );
+        let consumer = ws.def_file(
+            "lua/bootstrap_read/c.lua",
+            "local a = Store.a\nlocal b = Store.b\n",
+        );
+
+        assert_that!(
+            local_name_type(&mut ws, consumer, "a"),
+            eq(&LuaType::IntegerConst(1))
+        );
+        assert_that!(
+            local_name_type(&mut ws, consumer, "b"),
+            eq(&LuaType::IntegerConst(2))
+        );
+        assert_that!(
+            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::UndefinedField),
+            is_empty(),
+        );
+    }
+
+    /// `X.k = X.k or {}` installs an empty table, but a sibling assignment
+    /// inside a function can replace it at any time. A read outside that
+    /// function must not narrow to the empty bootstrap table.
+    #[test]
+    fn test_guarded_member_bootstrap_read_sees_function_scoped_reassignment() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_fn/a.lua", "holdem = holdem or {}\n");
+        let file_id = ws.def_file(
+            "lua/bootstrap_fn/b.lua",
+            r#"
+holdem.action = holdem.action or {}
+
+net.Receive("holdem.action", function()
+    holdem.action = { action = 1, time = CurTime() }
+end)
+
+hook.Add("Think", "x", function()
+    print(holdem.action.time)
+end)
+"#,
+        );
+
+        assert_that!(
+            file_diagnostic_messages(&mut ws, file_id, DiagnosticCode::UndefinedField),
+            is_empty(),
+        );
+    }
+
+    /// The same bootstrap still narrows normally when every writer is ordered
+    /// with the read: the last top-level assignment wins.
+    #[test]
+    fn test_guarded_member_bootstrap_keeps_top_level_reassignment_narrowing() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_top/a.lua", "holdem = holdem or {}\n");
+        let file_id = ws.def_file(
+            "lua/bootstrap_top/b.lua",
+            "holdem.action = holdem.action or {}\nholdem.action = { time = 1 }\nlocal act = holdem.action\n",
+        );
+
+        let act_type = local_name_type(&mut ws, file_id, "act");
+        assert!(
+            matches!(act_type, LuaType::TableConst(_)),
+            "an ordered reassignment must still narrow to its own table, got {act_type:?}"
+        );
+    }
+
+    /// A read that a `t[k] = t[k] or {}` bootstrap dominates is answered by that
+    /// statement, not by whichever sibling file's writer is attached to the
+    /// owner at the moment the read is inferred.
+    #[test]
+    fn test_dominating_guarded_bootstrap_answers_its_own_dynamic_key_read() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file("lua/bootstrap_dyn/a.lua", "orders = orders or {}\n");
+        ws.def_file(
+            "lua/bootstrap_dyn/sibling.lua",
+            "local other = \"k\"\norders[other] = orders[other] or {}\n",
+        );
+        let file_id = ws.def_file(
+            "lua/bootstrap_dyn/b.lua",
+            "local function get(key)\n    orders[key] = orders[key] or {}\n    local held = orders[key]\n    return held\nend\n",
+        );
+
+        let held_type = local_name_type(&mut ws, file_id, "held");
+        let LuaType::TableConst(table) = &held_type else {
+            panic!("expected the dominating bootstrap's table, got {held_type:?}");
+        };
+        assert_eq!(
+            table.file_id, file_id,
+            "the read must resolve to its own file's bootstrap, got {held_type:?}"
         );
     }
 }

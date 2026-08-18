@@ -1,11 +1,11 @@
 ---
 title: "@enum"
-description: Mark a Lua table as an enumeration with named values.
+description: Mark a set of named constants as an enumeration.
 ---
 
 ## Overview
 
-`@enum` marks a local table as an enum type. Table values become valid enum members. GLuaLS can report invalid enum values with `enum-value-mismatch` when you enable that diagnostic.
+`@enum` declares a set of named constants as a type. The constants can live in a Lua table, or be plain globals listed as fields. GLuaLS offers the member names in autocomplete, and can report invalid values with `enum-value-mismatch` when you enable that diagnostic.
 
 ---
 
@@ -13,12 +13,15 @@ description: Mark a Lua table as an enumeration with named values.
 
 ```lua
 ---@enum EnumName
+---@enum EnumName : BaseType
 ---@enum (key) EnumName
 ```
 
 ---
 
-## Basic enum
+## Table enum
+
+When your addon has a Lua table of named constants that code reads at runtime, annotate the table:
 
 ```lua
 ---@enum HTTPStatus
@@ -37,6 +40,48 @@ function HandleResponse(status)
     end
 end
 ```
+
+Autocomplete for a `HTTPStatus` parameter offers `HTTPStatus.OK` and inserts it.
+
+---
+
+## Flat enum
+
+Garry's Mod enums are not tables. Each constant is its own global, and the name is what belongs in your source. List those globals as `---|` fields:
+
+```lua
+---@readonly
+EF_BONEMERGE = 1
+---@readonly
+EF_NODRAW = 32
+
+---@enum EF : number
+---| EF_BONEMERGE # Performs bone merge on client side
+---| EF_NODRAW # Prevents the entity from drawing and networking
+
+---@param effect EF
+function Entity:AddEffects(effect) end
+```
+
+Autocomplete for an `EF` parameter now offers `EF_BONEMERGE`, and selecting it inserts `EF_BONEMERGE` rather than `1`. The text after `#` becomes the member's documentation.
+
+A flat enum reads its member values from the matching globals, so the globals must be declared. It does not bind to whatever statement follows the annotation.
+
+---
+
+## Base type
+
+`---@enum Name : BaseType` declares that any value of `BaseType` is valid, with the listed members being the named ones. Use it for numeric enums that code combines bitwise:
+
+```lua
+---@enum MASK : number
+---| MASK_SOLID # Anything solid
+---| MASK_SHOT # Anything a bullet hits
+
+util.TraceLine({ mask = bit.bor(MASK_SOLID, MASK_SHOT) }) -- ✅
+```
+
+Without the base type, only the listed values are accepted.
 
 ---
 
@@ -76,22 +121,17 @@ local d2 = "up"   -- ❌ not a Direction
 ## Enum vs. @alias
 
 Both `@enum` and `@alias` with `---|` can describe a fixed set of values. Use:
-- `@enum` when your addon has a Lua table of named constants that code reads at runtime
-- `@alias` with `---|` when a string parameter accepts a fixed set of text values
+- `@enum` when the values are named constants, whether they are table fields or globals
+- `@alias` with `---|` when a parameter accepts a fixed set of literals that have no names, such as a string parameter
 
 ---
 
 ## Common patterns in GMod
 
-```lua
----@enum DAMAGE
-local DAMAGE = {
-    GENERIC = 1,
-    CRUSH = 2,
-    BULLET = 4,
-    SLASH = 8,
-    BURN = 16,
-}
-```
+GMod's built-in enums, such as `EF`, `MASK`, `TEAM`, and `MOVETYPE`, come from the downloaded annotations as flat enums. You do not need to redeclare them.
 
-GMod's built-in enums, such as `DAMAGE`, `TEAM`, and `MOVETYPE`, come from the downloaded annotations. You do not need to redeclare them.
+`hint.enumParamHint` shows the member name beside a raw value. It is on by default; set it to `false` to turn it off:
+
+```lua
+Entity:AddEffects(32) -- EF_NODRAW
+```

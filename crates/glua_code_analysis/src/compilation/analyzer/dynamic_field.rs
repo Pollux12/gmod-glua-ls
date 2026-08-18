@@ -187,6 +187,43 @@ impl DynamicFieldAnalysisMode {
     }
 }
 
+/// The field-definition sites a statement contributes, as `(indexed target,
+/// assigned value)` pairs.
+fn field_definition_sites(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    node: &LuaSyntaxNode,
+) -> Vec<(glua_parser::LuaIndexExpr, Option<LuaExpr>)> {
+    if let Some(assign) = LuaAssignStat::cast(node.clone()) {
+        let (vars, exprs) = assign.get_var_and_expr_list();
+        return vars
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, var)| match var {
+                LuaVarExpr::IndexExpr(index_expr) => {
+                    Some((index_expr.clone(), exprs.get(idx).cloned()))
+                }
+                _ => None,
+            })
+            .collect();
+    }
+
+    if let Some(func_stat) = LuaFuncStat::cast(node.clone())
+        && let Some(LuaVarExpr::IndexExpr(index_expr)) = func_stat.get_func_name()
+        && index_expr
+            .get_index_token()
+            .is_some_and(|token| !token.is_colon())
+        && db
+            .get_member_index()
+            .get_current_owner(&LuaMemberId::new(index_expr.get_syntax_id(), file_id))
+            .is_none()
+    {
+        return vec![(index_expr, None)];
+    }
+
+    Vec::new()
+}
+
 /// Per-file dynamic-field collection. Reads only immutable `&DbIndex` state
 /// (lua/unresolve analysis is complete) plus the file's own AST, and writes
 /// nothing to the db — all results are returned for sequential merge. Uses a
@@ -205,7 +242,9 @@ fn collect_dynamic_fields_for_file(
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     Vec<FiniteNamedMemberEvidence>,
     std::collections::HashSet<LuaInferredGuardOwner>,
+    Vec<SmolStr>,
 ) {
+    let mut collected_unattributed: Vec<SmolStr> = Vec::new();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
@@ -216,18 +255,16 @@ fn collect_dynamic_fields_for_file(
         file_id,
         crate::CacheOptions {
             analysis_phase: crate::LuaAnalysisPhase::Force,
+            dynamic_fields_visible: true,
+            building_dynamic_field_index: true,
         },
     );
     let cache = &mut cache;
     let mut prefix_type_cache: FxHashMap<PrefixCacheKey, Option<LuaType>> = FxHashMap::default();
     let mut local_reassignment_positions = None;
-    for assign in root.descendants::<LuaAssignStat>() {
-        let (vars, exprs) = assign.get_var_and_expr_list();
-        for (idx, var) in vars.iter().enumerate() {
-            let LuaVarExpr::IndexExpr(index_expr) = var else {
-                continue;
-            };
-            let value_expr = exprs.get(idx);
+    for node in root.syntax().descendants() {
+        for (index_expr, value_expr) in field_definition_sites(db, file_id, &node) {
+            let value_expr = value_expr.as_ref();
             let Some(prefix_expr) = index_expr.get_prefix_expr() else {
                 continue;
             };
@@ -324,6 +361,7 @@ fn collect_dynamic_fields_for_file(
                     );
                 }
                 if mode.collect_direct_assignments() || collect_finite_direct_assignment {
+                    let before = collected.len();
                     collect_for_type(
                         &effective_type,
                         &field_name,
@@ -331,6 +369,12 @@ fn collect_dynamic_fields_for_file(
                         definition_range,
                         &mut collected,
                     );
+                    // The write is real but landed on no owner the index can
+                    // name, so record that the field exists somewhere even
+                    // though no table claims it.
+                    if collected.len() == before {
+                        collected_unattributed.push(field_name.clone());
+                    }
                 }
             }
         }
@@ -360,6 +404,7 @@ fn collect_dynamic_fields_for_file(
         collected_wildcards,
         collected_finite_members,
         cache.take_inferred_guard_dependencies(),
+        collected_unattributed,
     )
 }
 
@@ -400,7 +445,13 @@ fn analyze_dynamic_fields(
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_chunk_node())
         else {
-            return (Vec::new(), Vec::new(), Vec::new(), Default::default());
+            return (
+                Vec::new(),
+                Vec::new(),
+                Vec::new(),
+                Default::default(),
+                Vec::new(),
+            );
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
     });
@@ -408,12 +459,20 @@ fn analyze_dynamic_fields(
         profile.collection_time += collection_start.elapsed();
     }
     let merge_start = profile_enabled.then(std::time::Instant::now);
-    for ((file_collected, file_wildcards, file_finite_members, dependencies), file_id) in
-        per_file.into_iter().zip(file_ids)
+    let mut collected_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
+    for (
+        (file_collected, file_wildcards, file_finite_members, dependencies, file_unattributed),
+        file_id,
+    ) in per_file.into_iter().zip(file_ids)
     {
         collected.extend(file_collected);
         collected_wildcards.extend(file_wildcards);
         collected_finite_members.extend(file_finite_members);
+        collected_unattributed.extend(
+            file_unattributed
+                .into_iter()
+                .map(|field_name| (field_name, file_id)),
+        );
         context.add_inferred_guard_dependencies(file_id, dependencies);
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
@@ -428,6 +487,24 @@ fn analyze_dynamic_fields(
     let mut propagated: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     if mode.propagate_to_super_types() {
+        // The authoring globals of scripted-class scopes (`ENT`, `SWEP`,
+        // `TOOL`, `GM`, and their aliases) are supers of *every* per-file
+        // scoped class, so propagating there pools each file's fields onto
+        // one table the whole workspace writes. Those scopes are per-file
+        // by design: a `---@type SWEP` read is a read of the generic
+        // authoring table, not of any one weapon, so it should see the
+        // annotated `SWEP` fields and not every weapon's private ones.
+        let scoped_globals: FxHashSet<&str> = db
+            .get_emmyrc()
+            .gmod
+            .scripted_class_scopes
+            .resolved_definitions_slice()
+            .iter()
+            .flat_map(|definition| {
+                std::iter::once(definition.class_global.as_str())
+                    .chain(definition.aliases.iter().map(String::as_str))
+            })
+            .collect();
         for (owner, field_name, file_id, range) in &collected {
             let DynamicFieldOwner::Type(type_id) = owner else {
                 continue;
@@ -435,7 +512,9 @@ fn analyze_dynamic_fields(
             let mut super_types = Vec::new();
             type_id.collect_super_types(&*db, &mut super_types);
             for super_type in super_types {
-                if let LuaType::Ref(super_id) = &super_type {
+                if let LuaType::Ref(super_id) = &super_type
+                    && !scoped_globals.contains(super_id.get_name())
+                {
                     propagated.push((
                         DynamicFieldOwner::Type(super_id.clone()),
                         field_name.clone(),
@@ -452,6 +531,9 @@ fn analyze_dynamic_fields(
 
     let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
+    for (field_name, file_id) in collected_unattributed {
+        index.add_unattributed_field(field_name, file_id);
+    }
     for (owner, field_name, file_id, range) in &collected {
         index.add_field(owner.clone(), field_name.clone(), *file_id, *range);
     }

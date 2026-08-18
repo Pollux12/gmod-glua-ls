@@ -735,7 +735,7 @@ mod test {
                 &crate::LuaMemberKey::Name("IsKiller".into()),
                 None,
             )
-            .is_some(),
+            .is_ok_and(|resolution| resolution.is_some()),
             "generated IsKiller dynamic field resolves"
         );
 
