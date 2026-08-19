@@ -1,9 +1,10 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
     LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
-    LuaReturnStat, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaReturnStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
+use std::sync::Arc;
 
 use super::{
     InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
@@ -948,7 +949,7 @@ fn infer_param_type_from_call_sites(
         .get_signature_index()
         .local_func_decl_for(&signature_id)?;
     let call_sites =
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id);
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
     infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
 }
 
@@ -1061,7 +1062,7 @@ fn infer_unread_local_call_site_args(
     };
 
     let unread_args =
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id)
             .into_iter()
             .filter_map(|(_, call_expr)| {
                 call_expr
@@ -1139,21 +1140,52 @@ fn infer_forwarded_param_arg_type(
         .and_then(|local_func| local_func.get_local_name())?;
     let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
 
-    infer_param_type_from_local_call_sites_inner(
-        db,
-        cache,
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id),
-        idx,
-        false,
-    )
+    let call_sites =
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
+    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, idx, false)
 }
 
 fn local_function_call_sites(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     file_id: FileId,
     root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
 ) -> Vec<(FileId, LuaCallExpr)> {
+    // Parameter inference asks for the same function's call sites once per
+    // parameter index, and each miss walks the tree from the root for every
+    // reference. Derive the set once and re-resolve the ids on later calls.
+    let syntax_ids = match cache.local_function_call_sites_cache.get(&target_decl_id) {
+        Some(cached) => cached.clone(),
+        None => {
+            let ids = Arc::new(find_local_function_call_sites(
+                db,
+                file_id,
+                root,
+                target_decl_id,
+            ));
+            cache
+                .local_function_call_sites_cache
+                .insert(target_decl_id, ids.clone());
+            ids
+        }
+    };
+
+    syntax_ids
+        .iter()
+        .filter_map(|syntax_id| {
+            let node = syntax_id.to_node_from_root(root)?;
+            Some((file_id, LuaCallExpr::cast(node)?))
+        })
+        .collect()
+}
+
+fn find_local_function_call_sites(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaSyntaxNode,
+    target_decl_id: LuaDeclId,
+) -> Vec<LuaSyntaxId> {
     let Some(decl_refs) = db
         .get_reference_index()
         .get_local_reference(&file_id)
@@ -1175,7 +1207,7 @@ fn local_function_call_sites(
         })
         .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
         .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
-        .map(|call_expr| (file_id, call_expr))
+        .map(|call_expr| call_expr.get_syntax_id())
         .collect()
 }
 
