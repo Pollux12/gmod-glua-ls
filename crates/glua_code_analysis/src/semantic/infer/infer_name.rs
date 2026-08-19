@@ -1369,7 +1369,84 @@ fn find_param_type_from_sibling_members(
     final_type
 }
 
+type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
+
+thread_local! {
+    /// Memo for [`find_param_type_from_inherited_members`], paired with the
+    /// `type_structure_revision` it was built against.
+    ///
+    /// Thread-local rather than a field on `DbIndex` because `&DbIndex` is
+    /// shared across worker threads, so the memo cannot live behind a `RefCell`
+    /// on the struct without giving up `Sync`.
+    static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
+        std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
+}
+
+/// The parameter's type as declared by an inherited member, if any.
+///
+/// This is the single most expensive step of parameter inference: the
+/// unresolve pipeline's reachability probe calls it once per deferred
+/// parameter, and on the CityRP benchmark it accounted for ~0.29s of a 2.29s
+/// edit — almost entirely in the visibility-aware member lookup it performs per
+/// super type.
+///
+/// The same key is asked repeatedly across the retry loop's iterations, so the
+/// answer is memoized against `type_structure_revision`: any mutable access to
+/// the type or member index discards the memo, which makes a stale answer
+/// impossible even though the loop mutates the db as it resolves.
 fn find_param_type_from_inherited_members(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+    caller_file_id: FileId,
+    caller_position: TextSize,
+) -> Option<LuaType> {
+    let revision = db.type_structure_revision();
+    let key = (
+        current_member_id,
+        param_idx,
+        colon_define,
+        is_dots,
+        caller_file_id,
+        caller_position,
+    );
+
+    let cached = INHERITED_PARAM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.0 != revision {
+            memo.0 = revision;
+            memo.1.clear();
+            return None;
+        }
+        memo.1.get(&key).cloned()
+    });
+    if let Some(cached) = cached {
+        return cached;
+    }
+
+    let found = find_param_type_from_inherited_members_uncached(
+        db,
+        current_member_id,
+        param_idx,
+        colon_define,
+        is_dots,
+        caller_file_id,
+        caller_position,
+    );
+
+    INHERITED_PARAM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        // Only store if nothing bumped the revision while we were computing.
+        if memo.0 == revision {
+            memo.1.insert(key, found.clone());
+        }
+    });
+    found
+}
+
+fn find_param_type_from_inherited_members_uncached(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     param_idx: usize,
