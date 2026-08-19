@@ -360,6 +360,14 @@ impl DebouncedAnalysis {
             has_pending_file_work || has_in_flight_changes,
             Ordering::Release,
         );
+
+        // `in_flight_changes` is not covered by the locks above, so a
+        // concurrent `begin_in_flight_change()` could have published `true`
+        // between the load and the store. Its `fetch_add` precedes that store,
+        // so re-reading here cannot miss it.
+        if self.in_flight_changes.load(Ordering::Acquire) > 0 {
+            self.has_pending_changes.store(true, Ordering::Release);
+        }
     }
 }
 
