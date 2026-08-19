@@ -71,6 +71,11 @@ mod node_memo {
     use rustc_hash::FxHashMap;
 
     const MAX_ROOTS: usize = 4;
+    /// Each entry pins a red node, which holds an rc on its whole ancestor
+    /// chain, so a long-lived thread would otherwise retain most of a large
+    /// tree. Clearing beats evicting: the memo only pays off within one
+    /// traversal, so a fresh map costs a re-walk, not a lasting miss.
+    const MAX_ENTRIES_PER_ROOT: usize = 8192;
 
     #[derive(Default)]
     pub(super) struct NodeMemo {
@@ -103,7 +108,11 @@ mod node_memo {
                 return hit.clone();
             }
             let resolved = id.walk_from_root(root);
-            self.roots[index].1.insert(id, resolved.clone());
+            let entries = &mut self.roots[index].1;
+            if entries.len() >= MAX_ENTRIES_PER_ROOT {
+                entries.clear();
+            }
+            entries.insert(id, resolved.clone());
             resolved
         }
     }

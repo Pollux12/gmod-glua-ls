@@ -11,7 +11,8 @@
 //   LSP_ANNOTATIONS=/path/to/annotations/output \
 //   node tools/lsp_latency.js [--json] [--runs N] [--file relative/path.lua]
 //
-// LSP_SERVER overrides the binary (default: target/release/glua_ls[.exe]).
+// LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
+// else target/release/glua_ls[.exe] — see defaultServerPath, and prefer `dist`).
 // LSP_SERVER_ARGS passes extra space-separated arguments to the server, e.g.
 //   LSP_SERVER_ARGS='--log-level debug' to profile a slow path.
 // --file defaults to the largest .lua file in the workspace, which is the
