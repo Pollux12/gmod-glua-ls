@@ -89,30 +89,30 @@ pub fn load_workspace(
         config_root.display()
     );
     emmyrc.pre_process_emmyrc(&config_root);
+
+    if let Some(annotations_path) = gmod_annotations {
+        if annotations_path.is_dir() {
+            log::info!(
+                "Adding GMod annotations from: {}",
+                annotations_path.display()
+            );
+            emmyrc.prioritize_gmod_annotations_library(
+                annotations_path.to_string_lossy().into_owned(),
+            );
+        } else {
+            log::warn!(
+                "GMod annotations path is not an existing directory: {}",
+                annotations_path.display()
+            );
+        }
+    }
+
     let mut workspace_folders = cmd_workspace_folders
         .iter()
         .map(|p| WorkspaceFolder::new(p.clone(), false))
         .collect::<Vec<WorkspaceFolder>>();
 
     let mut analysis = EmmyLuaAnalysis::new();
-
-    // Add GMod annotations as library workspace if provided
-    if let Some(annotations_path) = gmod_annotations {
-        if annotations_path.exists() {
-            log::info!(
-                "Adding GMod annotations from: {}",
-                annotations_path.display()
-            );
-            analysis.add_library_workspace(annotations_path.clone());
-            workspace_folders.push(WorkspaceFolder::new(annotations_path, true));
-        } else {
-            log::warn!(
-                "GMod annotations path does not exist: {}",
-                annotations_path.display()
-            );
-        }
-    }
-
     for lib in &emmyrc.workspace.library {
         let path = PathBuf::from(lib.get_path().clone());
         workspace_folders.push(WorkspaceFolder::new(path.clone(), true));
