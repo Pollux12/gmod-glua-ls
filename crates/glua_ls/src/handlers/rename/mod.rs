@@ -122,13 +122,6 @@ fn rename_references(
     token: LuaSyntaxToken,
     new_name: String,
 ) -> Option<WorkspaceEdit> {
-    // `self` lexes as a plain name, so rename resolves it like any other and
-    // would rewrite its references. A colon method's `self` is implicit: there
-    // is no declaration to carry the new name, so the edit only breaks the code.
-    if token.text() == "self" {
-        return None;
-    }
-
     let mut result = HashMap::new();
     let semantic_decl = match get_target_node(token.clone()) {
         Some(node) => semantic_model.find_decl(node.into(), SemanticDeclLevel::NoTrace),
@@ -137,6 +130,18 @@ fn rename_references(
 
     match semantic_decl {
         LuaSemanticDeclId::LuaDecl(decl_id) => {
+            // A colon method's `self` is implicit: there is no declaration to
+            // carry the new name, so the edit would only break the code. A
+            // written `self` — an explicit parameter, or a `local self = self`
+            // capture — has one and renames normally.
+            if semantic_model
+                .get_db()
+                .get_decl_index()
+                .get_decl(&decl_id)?
+                .is_implicit_self()
+            {
+                return None;
+            }
             rename_decl_references(semantic_model, compilation, decl_id, new_name, &mut result);
         }
         LuaSemanticDeclId::Member(member_id) => {
