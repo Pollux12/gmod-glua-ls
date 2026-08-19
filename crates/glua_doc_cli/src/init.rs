@@ -68,6 +68,7 @@ pub fn load_workspace(
     config_paths: Option<Vec<PathBuf>>,
     exclude_pattern: Option<Vec<String>>,
     include_pattern: Option<Vec<String>>,
+    gmod_annotations: Option<PathBuf>,
 ) -> Result<EmmyLuaAnalysis, Box<dyn Error>> {
     let (config_files, config_root): (Vec<PathBuf>, PathBuf) =
         if let Some(config_paths) = config_paths {
@@ -94,6 +95,24 @@ pub fn load_workspace(
         .collect::<Vec<WorkspaceFolder>>();
 
     let mut analysis = EmmyLuaAnalysis::new();
+
+    // Add GMod annotations as library workspace if provided
+    if let Some(annotations_path) = gmod_annotations {
+        if annotations_path.exists() {
+            log::info!(
+                "Adding GMod annotations from: {}",
+                annotations_path.display()
+            );
+            analysis.add_library_workspace(annotations_path.clone());
+            workspace_folders.push(WorkspaceFolder::new(annotations_path, true));
+        } else {
+            log::warn!(
+                "GMod annotations path does not exist: {}",
+                annotations_path.display()
+            );
+        }
+    }
+
     for lib in &emmyrc.workspace.library {
         let path = PathBuf::from(lib.get_path().clone());
         workspace_folders.push(WorkspaceFolder::new(path.clone(), true));

@@ -51,6 +51,7 @@ pub fn run_doc_cli(mut cmd_args: CmdArgs) -> Result<(), Box<dyn std::error::Erro
         config_paths,
         cmd_args.exclude_pattern,
         cmd_args.include_pattern,
+        cmd_args.gmod_annotations,
     )?;
 
     match cmd_args.output_format {
