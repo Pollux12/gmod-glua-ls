@@ -12,7 +12,7 @@ use crate::{
     FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
-    semantic::cache::FlowOrigin,
+    semantic::cache::{FlowOrigin, VarRefCacheKey},
     semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -193,8 +193,17 @@ pub(super) fn get_type_at_flow_in_mode(
                 db.get_gmod_infer_index()
                     .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
             });
+            let memo_key = (
+                VarRefCacheKey::from(var_ref_id),
+                (flow_id, query_realm, policy.origin),
+            );
+            if let Some(narrow_type) = cache.baseline_flow_memo.get(&memo_key) {
+                return Ok(narrow_type.clone());
+            }
+
+            cache.baseline_flow_depth += 1;
             let mut visited_flow_ids = Vec::new();
-            get_type_at_flow_walk(
+            let result = get_type_at_flow_walk(
                 db,
                 tree,
                 cache,
@@ -204,7 +213,17 @@ pub(super) fn get_type_at_flow_in_mode(
                 flow_id,
                 &mut visited_flow_ids,
                 policy,
-            )
+            );
+            if let Ok(narrow_type) = &result {
+                cache
+                    .baseline_flow_memo
+                    .insert(memo_key, narrow_type.clone());
+            }
+            cache.baseline_flow_depth -= 1;
+            if cache.baseline_flow_depth == 0 {
+                cache.baseline_flow_memo.clear();
+            }
+            result
         }
     }
 }

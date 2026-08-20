@@ -8,6 +8,51 @@ mod test {
         EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
     }
 
+    /// A closure reading an outer local resolves its baseline type by walking
+    /// back past every branch merge ahead of it, so the branch count is the
+    /// exponent if a merge point is derived once per path instead of once.
+    fn index_branch_merges_before_closure(count: usize) -> std::time::Duration {
+        let mut body = String::from("local value = 1\n");
+        for i in 0..count {
+            body.push_str(&format!(
+                "if cond{i} then value = {i} else value = {} end\n",
+                i + 100
+            ));
+        }
+        body.push_str("local read = function() return value end\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// Regression guard: the closure-baseline flow walk once bypassed the memo
+    /// the normal walk goes through, so every merge point was re-derived once
+    /// per path reaching it. A file with a long run of `if` statements before a
+    /// closure then never finished analysing, which stalled the whole workspace
+    /// diagnostic sweep behind it.
+    #[test]
+    #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
+    fn closure_baseline_cost_stays_linear_in_branch_merges() {
+        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
+        let _ = index_branch_merges_before_closure(4);
+
+        let small = index_branch_merges_before_closure(10);
+        let large = index_branch_merges_before_closure(20);
+
+        // 10 more branches. Memoised this is linear; re-deriving per path
+        // doubles per branch, so the pre-fix ratio was ~1000x (0.03s vs 39s).
+        // A 20x ceiling is far above linear noise and far below exponential.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 20.0,
+            "closure-baseline narrowing scaled exponentially with branch merges \
+             (10 -> {small:?}, 20 -> {large:?}, ratio {ratio:.1}x); \
+             merge points are being re-derived once per path"
+        );
+    }
+
     /// Regression guard for issue #36: a field assigned a very large number of
     /// times under distinct (branched / guarded) writes used to drive
     /// `lua analyze` into O(N²) behaviour — each assignment re-scanned every

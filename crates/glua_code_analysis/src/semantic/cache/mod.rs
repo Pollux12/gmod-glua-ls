@@ -15,7 +15,7 @@ use crate::{
     semantic::infer::{InferFailReason, ParamInferenceSource},
 };
 
-type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
+pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub enum FlowOrigin {
@@ -89,6 +89,13 @@ pub struct LuaInferCache {
     pub flow_node_cache:
         FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
+    /// Scratch memo for one top-level closure-baseline query. That walk merges
+    /// antecedents recursively, so a branchy control-flow graph re-derives the
+    /// same node once per path into it — exponential without this. It is cleared
+    /// when the outermost baseline query returns, so nothing survives to answer
+    /// a later query with a type derived from earlier pass state.
+    pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
+    pub baseline_flow_depth: u32,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
     pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
@@ -144,6 +151,8 @@ impl LuaInferCache {
             call_arg_types_cache: FxHashMap::default(),
             flow_node_cache: FxHashMap::default(),
             flow_query_realm: None,
+            baseline_flow_memo: FxHashMap::default(),
+            baseline_flow_depth: 0,
             flow_node_realm_cache: FxHashMap::default(),
             index_ref_origin_type_cache: FxHashMap::default(),
             param_type_cache: FxHashMap::default(),
