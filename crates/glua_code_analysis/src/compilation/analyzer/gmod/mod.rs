@@ -517,6 +517,12 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
 
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let reach = HelperStartReachCache::default();
+        let helper_call_sites = crate::profile::phase("gmodnet/helper_call_sites", || {
+            let op_names = net_operation_names(&annotated_global_call_roles);
+            let mut names = net_producing_function_names(db, &op_names);
+            names.extend(op_names);
+            net_helper_call_sites(db, names)
+        });
         let collected = crate::profile::phase("gmodnet/collect_flows", || {
             super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
                 collect_file_network_flows(
@@ -525,10 +531,10 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
                     &helper_registry,
                     &annotated_global_call_roles,
                     &reach,
+                    &helper_call_sites,
                 )
             })
         });
-
         for (file_id, network_data) in file_ids.iter().zip(collected) {
             if network_data.send_flows.is_empty() && network_data.receive_flows.is_empty() {
                 continue;
@@ -545,6 +551,7 @@ fn collect_file_network_flows(
     helper_registry: &HelperRegistry,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     reach: &HelperStartReachCache,
+    helper_call_sites: &NetHelperCallSites,
 ) -> crate::db_index::FileNetworkData {
     let Some(root) = db
         .get_vfs()
@@ -574,6 +581,7 @@ fn collect_file_network_flows(
             &mut net,
             &mut resolve_memo,
             reach,
+            helper_call_sites,
         )
     });
 
@@ -587,6 +595,7 @@ fn collect_file_network_flows(
         &mut net,
         &mut resolve_memo,
         reach,
+        helper_call_sites,
     )
 }
 
@@ -1128,6 +1137,242 @@ impl HelperRegistryBuilder {
     }
 }
 
+
+/// The final written name of a value expression, for alias discovery.
+fn expr_written_name(expr: &LuaExpr) -> Option<SmolStr> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
+            LuaIndexKey::Name(name) => Some(SmolStr::new(name.get_name_text())),
+            LuaIndexKey::String(string) => Some(SmolStr::new(string.get_value())),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+
+/// The names the shipped net operations are declared under (`Start`,
+/// `Receive`, and any annotated wrapper of them).
+///
+/// Read straight out of the annotated call-role map the pre-analysis pass
+/// already built, which is keyed by access path and already tags these calls
+/// `NetStart`/`NetReceive`. The pre-pass records op *call sites* by path and so
+/// cannot see `local recv = net.Receive`; carrying the op names lets the same
+/// reference lookup and per-file binding closure that finds helper calls follow
+/// that alias to its call sites.
+fn net_operation_names(annotated_roles: &AnnotatedGmodGlobalCallRoleMap) -> HashSet<SmolStr> {
+    annotated_roles
+        .roles_by_path
+        .iter()
+        .filter(|(_, roles)| {
+            roles.system_roles.iter().any(|(kind, _)| {
+                matches!(
+                    kind,
+                    GmodSystemCallKind::NetStart | GmodSystemCallKind::NetReceive
+                )
+            })
+        })
+        .map(|(path, _)| SmolStr::new(path.rsplit_once('.').map_or(path.as_str(), |(_, last)| last)))
+        .collect()
+}
+
+/// The written name of a registry entry's declaration, used to decide which
+/// call sites could reach it.
+fn closure_declared_name(closure: &LuaClosureExpr) -> Option<SmolStr> {
+    if let Some(func_stat) = closure.get_parent::<LuaFuncStat>()
+        && let Some(func_name) = func_stat.get_func_name()
+    {
+        return var_expr_written_name(&func_name);
+    }
+    if let Some(local_func_stat) = closure.get_parent::<LuaLocalFuncStat>() {
+        return local_func_stat
+            .get_local_name()
+            .and_then(|local_name| local_name.get_name_token())
+            .map(|token| SmolStr::new(token.get_name_text()));
+    }
+    if let Some(assign_stat) = closure.get_parent::<LuaAssignStat>() {
+        let (vars, value_exprs) = assign_stat.get_var_and_expr_list();
+        let idx = value_exprs
+            .iter()
+            .position(|expr| expr.get_position() == closure.get_position())?;
+        return var_expr_written_name(vars.get(idx)?);
+    }
+    if let Some(table_field) = closure.get_parent::<LuaTableField>()
+        && let Some(field_key) = table_field.get_field_key()
+    {
+        return match field_key {
+            LuaIndexKey::Name(name) => Some(SmolStr::new(name.get_name_text())),
+            LuaIndexKey::String(string) => Some(SmolStr::new(string.get_value())),
+            _ => None,
+        };
+    }
+    if let Some(local_stat) = closure.get_parent::<LuaLocalStat>() {
+        let idx = local_stat
+            .get_value_exprs()
+            .position(|expr| expr.get_position() == closure.get_position())?;
+        return local_stat
+            .get_local_name_list()
+            .nth(idx)
+            .and_then(|local_name| local_name.get_name_token())
+            .map(|token| SmolStr::new(token.get_name_text()));
+    }
+    None
+}
+
+fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
+    match var_expr {
+        LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        LuaVarExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
+            LuaIndexKey::Name(name) => Some(SmolStr::new(name.get_name_text())),
+            LuaIndexKey::String(string) => Some(SmolStr::new(string.get_value())),
+            _ => None,
+        },
+    }
+}
+
+/// The names a call has to be written with for it to expand into a helper that
+/// can reach a `net.Start`.
+///
+/// `collect_unannotated_net_wrapper_send_flows` asks that of every call
+/// expression in the workspace and answers it by resolving each one — 88k
+/// prefix resolutions to materialise a few thousand flows. The helpers that can
+/// answer yes are a small fixed set, and resolution matches declarations by
+/// written name, so a call written with a name no such helper carries cannot
+/// expand into one.
+///
+/// Seeded from the net-op call sites the pre-analysis pass already recorded by
+/// access path, then grown outward: each site is walked *up* to the function
+/// containing it, and that function's own call sites come from the reference
+/// index, whose enclosing functions are the next level. The set settles when a
+/// round adds no new name.
+///
+/// Nothing is scanned. The cost is proportional to how much net code the
+/// workspace actually has, not to its size.
+fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> HashSet<SmolStr> {
+    let mut names: HashSet<SmolStr> = HashSet::new();
+    // Seeded from the net operations' own references rather than from the
+    // pre-pass's recorded call sites: that record is only written for files
+    // that also need hook metadata, so it is not a complete list of net ops.
+    // The reference index records every reference unconditionally.
+    let mut frontier: Vec<InFiled<LuaSyntaxId>> = op_names
+        .iter()
+        .flat_map(|name| name_reference_sites(db, name))
+        .collect();
+
+    while !frontier.is_empty() {
+        // Grouped so each file's red tree is built once per round rather than
+        // once per site.
+        let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
+        for site in frontier.drain(..) {
+            by_file.entry(site.file_id).or_default().push(site.value);
+        }
+
+        let mut fresh: Vec<SmolStr> = Vec::new();
+        for (file_id, syntax_ids) in by_file {
+            let Some(root) = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| tree.get_red_root())
+            else {
+                continue;
+            };
+            for syntax_id in syntax_ids {
+                let Some(node) = syntax_id.to_node_from_root(&root) else {
+                    continue;
+                };
+                let Some(name) = enclosing_function_name(&node) else {
+                    continue;
+                };
+                if names.insert(name.clone()) {
+                    fresh.push(name);
+                }
+            }
+        }
+
+        // A newly named function's callers are the next level, and the
+        // reference index already knows where they are.
+        for name in fresh {
+            frontier.extend(name_reference_sites(db, &name));
+        }
+    }
+
+    names
+}
+
+/// Every place a name is referenced, from the reference index.
+fn name_reference_sites(db: &DbIndex, name: &SmolStr) -> Vec<InFiled<LuaSyntaxId>> {
+    let reference_index = db.get_reference_index();
+    let member_key = LuaMemberKey::Name(name.clone());
+    reference_index
+        .get_index_references(&member_key)
+        .into_iter()
+        .flatten()
+        .chain(
+            reference_index
+                .get_global_references(name)
+                .into_iter()
+                .flatten(),
+        )
+        .collect()
+}
+
+/// The name of the function a node sits inside, when that function is bound to
+/// one.
+fn enclosing_function_name(node: &LuaSyntaxNode) -> Option<SmolStr> {
+    let closure = node.ancestors().find_map(LuaClosureExpr::cast)?;
+    closure_declared_name(&closure)
+}
+
+/// The call sites that can expand into a helper able to reach a `net.Start`.
+///
+/// Every reference to a name is recorded in the reference index while the
+/// workspace is indexed, so these call sites are a direct lookup. The previous
+/// implementation walked every call expression in every file and resolved each
+/// one to rediscover the same set, which on a 1120-file gamemode meant 88k
+/// prefix resolutions costing 11s to materialise ~3.3k flows.
+#[derive(Default)]
+struct NetHelperCallSites {
+    /// Syntax id of the callee reference node, per file.
+    by_file: FxHashMap<FileId, Vec<LuaSyntaxId>>,
+    /// The helper names themselves, needed per file to pick up locals: a
+    /// `local function send()` never enters the global reference table, so its
+    /// call sites are only reachable through its declaration's own references.
+    names: HashSet<SmolStr>,
+}
+
+fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCallSites {
+    let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
+    let reference_index = db.get_reference_index();
+    for name in &names {
+        let member_key = LuaMemberKey::Name(name.clone());
+        for reference in reference_index
+            .get_index_references(&member_key)
+            .into_iter()
+            .flatten()
+            .chain(
+                reference_index
+                    .get_global_references(name)
+                    .into_iter()
+                    .flatten(),
+            )
+        {
+            by_file
+                .entry(reference.file_id)
+                .or_default()
+                .push(reference.value);
+        }
+    }
+    // Source order, so a file's flows are collected in the same order the walk
+    // produced them.
+    for sites in by_file.values_mut() {
+        sites.sort_by_key(|syntax_id| syntax_id.get_range().start());
+        sites.dedup();
+    }
+    NetHelperCallSites { by_file, names }
+}
+
+
 /// Per-file function definition lookup. Built once and reused for all
 /// helper-resolution queries against the same file's syntax tree.
 struct FileFunctionMap {
@@ -1349,6 +1594,9 @@ fn collect_file_gmod_metadata(
                 &mut net,
                 &mut ResolveMemo::default(),
                 &reach,
+                // This walk collects hook metadata only; it never expands
+                // wrapper chains for send flows, so it needs no call sites.
+                &NetHelperCallSites::default(),
             );
         (hook_sites, system_metadata, gm_method_realms)
     });
@@ -1398,6 +1646,7 @@ fn collect_hook_and_receive_metadata(
     net: &mut NetCallResolver,
     resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
+    helper_call_sites: &NetHelperCallSites,
 ) -> (
     Vec<GmodHookSiteMetadata>,
     GmodSystemFileMetadata,
@@ -1426,7 +1675,31 @@ fn collect_hook_and_receive_metadata(
         net,
         resolve_memo,
         reach,
+        helper_call_sites,
     };
+
+    // Collecting receive flows alone needs no walk: the `net.Receive` sites are
+    // already recorded by annotation, and the calls that can expand into a
+    // wrapper that reaches one come from the reference index.
+    if !collect_non_net_metadata {
+        if collect_receive_flows {
+            for call_expr in net_candidate_call_exprs(db, &net_site, helper_call_sites, &[]) {
+                if let Some(receive_flow) =
+                    collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
+                {
+                    receive_flows.push(receive_flow);
+                } else if call_has_literal_string_arg(&call_expr) {
+                    receive_flows.extend(collect_unannotated_net_wrapper_receive_flows(
+                        &mut net_ctx,
+                        &net_site,
+                        &call_expr,
+                    ));
+                }
+            }
+            receive_flows.sort_by_key(|flow| flow.receive_range.start());
+        }
+        return (hook_sites, system_metadata, gm_method_realms, receive_flows);
+    }
 
     // Single descendants walk dispatching by node kind. Avoids two separate
     // O(N) walks for the LuaCallExpr and LuaFuncStat passes.
@@ -1495,6 +1768,7 @@ fn collect_network_flow_metadata(
     net: &mut NetCallResolver,
     resolve_memo: &mut ResolveMemo,
     reach: &HelperStartReachCache,
+    helper_call_sites: &NetHelperCallSites,
 ) -> crate::db_index::FileNetworkData {
     let site = NetWalkSite { root, file_id };
     let mut ctx = NetCollectCtx {
@@ -1504,6 +1778,7 @@ fn collect_network_flow_metadata(
         net,
         resolve_memo,
         reach,
+        helper_call_sites,
     };
     let mut send_flows = crate::profile::phase("gmodnet/send_direct", || {
         collect_net_send_flows(&mut ctx, &site)
@@ -1899,7 +2174,8 @@ fn collect_unannotated_net_wrapper_send_flows(
     let mut visited = HashSet::new();
     let empty_bindings = HashMap::new();
 
-    for call_expr in site.root.descendants::<LuaCallExpr>() {
+    let calls = net_candidate_call_exprs(ctx.db, site, ctx.helper_call_sites, &[]);
+    for call_expr in calls {
         if ctx.net.role(ctx.db, site.file_id, &call_expr).is_some() {
             continue;
         }
@@ -1915,6 +2191,116 @@ fn collect_unannotated_net_wrapper_send_flows(
     }
 
     flows
+}
+
+/// The calls in a file that can take part in net-flow collection.
+///
+/// Both walks used to find these by visiting every node in the file and
+/// resolving each call to ask whether it mattered. They are a lookup instead:
+/// `extra_sites` carries the net-op call sites the pre-analysis pass already
+/// recorded by annotation, and the helper call sites come from the reference
+/// index, which records every reference to a net-producing helper's name.
+fn net_candidate_call_exprs(
+    db: &DbIndex,
+    site: &NetWalkSite,
+    helper_call_sites: &NetHelperCallSites,
+    extra_sites: &[LuaSyntaxId],
+) -> Vec<LuaCallExpr> {
+    // The call sites that can expand into a net-producing helper come from the
+    // reference index, which already records every reference to those helpers'
+    // names. Walking every call expression in the file and resolving each one
+    // to rediscover them is what made this pass cost more than the rest of
+    // analysis put together.
+    let root_syntax = site.root.syntax().clone();
+    // Locals never enter the global reference table, so a helper declared
+    // `local function send()` is reached through its own declaration's
+    // references instead.
+    let mut local_sites: Vec<LuaSyntaxId> = Vec::new();
+    if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&site.file_id) {
+        let names = &helper_call_sites.names;
+        // `local sendString = MyLib.SendString` calls the helper under a name
+        // the reference index files under the local binding rather than under
+        // the helper, so this file's own bindings of a helper name count as
+        // call sites too. Chains settle by iterating, bounded by the number of
+        // bindings in the file.
+        let mut aliases: HashSet<SmolStr> = HashSet::new();
+        let bindings = decl_tree
+            .get_decls()
+            .values()
+            .filter_map(|decl| {
+                let source = decl
+                    .get_value_syntax_id()?
+                    .to_node_from_root(&root_syntax)
+                    .and_then(LuaExpr::cast)
+                    .as_ref()
+                    .and_then(expr_written_name)?;
+                Some((SmolStr::new(decl.get_name()), source))
+            })
+            .collect::<Vec<_>>();
+        loop {
+            let mut added = false;
+            for (bound, source) in &bindings {
+                if (names.contains(source) || aliases.contains(source))
+                    && !names.contains(bound)
+                    && aliases.insert(bound.clone())
+                {
+                    added = true;
+                }
+            }
+            if !added {
+                break;
+            }
+        }
+
+        for decl in decl_tree.get_decls().values() {
+            if !decl.is_local()
+                || !(names.contains(decl.get_name()) || aliases.contains(decl.get_name()))
+            {
+                continue;
+            }
+            let Some(references) = db
+                .get_reference_index()
+                .get_decl_references(&site.file_id, &decl.get_id())
+            else {
+                continue;
+            };
+            local_sites.extend(references.cells.iter().filter(|cell| !cell.is_write).map(
+                |cell| {
+                    LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range)
+                },
+            ));
+        }
+    }
+    let mut calls = helper_call_sites
+        .by_file
+        .get(&site.file_id)
+        .map(|syntax_ids| syntax_ids.as_slice())
+        .unwrap_or_default()
+        .iter()
+        .chain(local_sites.iter())
+        .filter_map(|syntax_id| syntax_id.to_node_from_root(&root_syntax))
+        .filter_map(|node| {
+            let call_expr = LuaCallExpr::cast(node.parent()?)?;
+            // The reference is the callee only when it is the call's prefix;
+            // `f(SendThing)` passes it as an argument instead.
+            (call_expr.get_prefix_expr()?.syntax() == &node).then_some(call_expr)
+        })
+        .collect::<Vec<_>>();
+
+    // Recorded net-op sites are the call expression itself, not a callee
+    // reference, so they need no prefix check.
+    calls.extend(
+        extra_sites
+            .iter()
+            .filter_map(|syntax_id| syntax_id.to_node_from_root(&root_syntax))
+            .filter_map(LuaCallExpr::cast),
+    );
+
+    // Source order, so flows are produced in the order the old walk produced
+    // them.
+    calls.sort_by_key(|call_expr| call_expr.get_range().start());
+    calls.dedup_by_key(|call_expr| call_expr.get_range());
+    calls
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2435,6 +2821,8 @@ struct NetCollectCtx<'a> {
     resolve_memo: &'a mut ResolveMemo,
     /// Shared across files; see [`HelperStartReachCache`].
     reach: &'a HelperStartReachCache,
+    /// See [`NetHelperCallSites`].
+    helper_call_sites: &'a NetHelperCallSites,
 }
 
 type ResolvedHelperFn = (String, LuaBlock, LuaChunk, FileId);
@@ -3067,6 +3455,13 @@ enum NetCallRole {
 struct NetCallResolver {
     caches: HashMap<FileId, LuaInferCache>,
     memo: HashMap<(FileId, LuaSyntaxId), Option<NetCallRole>>,
+    /// `role` memoises the *role*, but the signature behind it is asked for
+    /// twice per call site: once here and once by
+    /// [`resolve_call_to_function_block`]'s signature path. Resolving a call's
+    /// signature means resolving its prefix to a semantic decl, which is the
+    /// single most expensive operation in this pipeline, so the answer is
+    /// memoised on the same key the role is.
+    signature_memo: HashMap<(FileId, LuaSyntaxId), Option<LuaSignatureId>>,
 }
 
 impl NetCallResolver {
@@ -3151,6 +3546,22 @@ impl NetCallResolver {
     }
 
     fn signature_id(
+        &mut self,
+        db: &DbIndex,
+        file_id: FileId,
+        call_expr: &LuaCallExpr,
+    ) -> Option<LuaSignatureId> {
+        let key = (file_id, LuaSyntaxId::from_node(call_expr.syntax()));
+        if let Some(cached) = self.signature_memo.get(&key) {
+            return *cached;
+        }
+
+        let resolved = self.signature_id_uncached(db, file_id, call_expr);
+        self.signature_memo.insert(key, resolved);
+        resolved
+    }
+
+    fn signature_id_uncached(
         &mut self,
         db: &DbIndex,
         file_id: FileId,
