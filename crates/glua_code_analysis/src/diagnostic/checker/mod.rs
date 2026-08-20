@@ -31,6 +31,7 @@ mod local_const_reassign;
 mod missing_fields;
 mod need_check_nil;
 mod param_type_check;
+mod property_name_candidates;
 mod readonly_check;
 mod redefined_local;
 mod require_module_visibility;
@@ -80,6 +81,9 @@ pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
+pub use property_name_candidates::{
+    PrecomputedPropertyNameCandidates, precompute_property_name_candidates,
+};
 
 pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
 pub type AssignmentPrefixKey = (TextSize, TextSize, String);
@@ -291,6 +295,8 @@ pub struct SharedDiagnosticData {
     pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
     /// Static callee names whose signatures are marked @nodiscard.
     pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
+    /// Names the deprecated, readonly and visibility checkers could report on.
+    pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
     /// Precomputed declaration annotation realms for all workspace files.
     /// Avoids re-scanning syntax trees for @realm annotations per file.
     pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,

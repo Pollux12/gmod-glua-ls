@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::sync::Arc;
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaExpr, LuaIndexKey, LuaSyntaxId, LuaSyntaxKind,
@@ -10,7 +10,10 @@ use crate::{
     PropertyDeclFeature, SemanticDeclLevel, SemanticModel,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{
+    Checker, DiagnosticContext, PrecomputedPropertyNameCandidates,
+    precompute_property_name_candidates,
+};
 
 pub struct ReadOnlyChecker;
 
@@ -19,7 +22,7 @@ impl Checker for ReadOnlyChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let candidates = ReadOnlyCandidates::new(context);
+        let candidates = ReadOnlyCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
@@ -40,44 +43,25 @@ impl Checker for ReadOnlyChecker {
 }
 
 struct ReadOnlyCandidates {
-    names: HashSet<String>,
+    candidates: Arc<PrecomputedPropertyNameCandidates>,
 }
 
 impl ReadOnlyCandidates {
-    fn new(context: &DiagnosticContext) -> Self {
-        let db = context.db;
-        let mut names = HashSet::new();
-        for (owner_id, property) in db.get_property_index().iter_owner_properties() {
-            if !property_can_report_readonly(property) {
-                continue;
-            }
-
-            match owner_id {
-                LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
-                        names.insert(decl.get_name().to_string());
-                    }
-                }
-                LuaSemanticDeclId::Member(member_id) => {
-                    if let Some(member) = db.get_member_index().get_member(member_id)
-                        && let Some(name) = member.get_key().get_name()
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-                LuaSemanticDeclId::TypeDecl(type_decl_id) => {
-                    names.insert(type_decl_id.get_name().to_string());
-                    names.insert(type_decl_id.get_simple_name().to_string());
-                }
-                LuaSemanticDeclId::Signature(_) => {}
-            }
+    fn new(context: &DiagnosticContext, db: &crate::DbIndex) -> Self {
+        Self {
+            candidates: context
+                .get_shared_data_arc()
+                .map(|shared_data| shared_data.property_name_candidates.clone())
+                .unwrap_or_else(|| Arc::new(precompute_property_name_candidates(db))),
         }
+    }
 
-        Self { names }
+    fn names(&self) -> &std::collections::HashSet<String> {
+        &self.candidates.readonly
     }
 
     fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.names().is_empty()
     }
 
     fn should_check_expr(&self, expr: &LuaExpr) -> bool {
@@ -87,7 +71,7 @@ impl ReadOnlyCandidates {
                 LuaExpr::NameExpr(name_expr) => {
                     return name_expr
                         .get_name_text()
-                        .is_some_and(|name| self.names.contains(name.as_ref() as &str));
+                        .is_some_and(|name| self.names().contains(name.as_ref() as &str));
                 }
                 LuaExpr::IndexExpr(index_expr) => {
                     if let Some(index_key) = index_expr.get_index_key()
@@ -109,18 +93,18 @@ impl ReadOnlyCandidates {
         match index_key {
             LuaIndexKey::Name(name) => {
                 let name = name.get_name_text();
-                self.names.contains(name)
+                self.names().contains(name)
             }
             LuaIndexKey::String(string) => {
                 let value = string.get_value();
-                self.names.contains(value.as_str())
+                self.names().contains(value.as_str())
             }
             LuaIndexKey::Integer(_) | LuaIndexKey::Idx(_) | LuaIndexKey::Expr(_) => false,
         }
     }
 }
 
-fn property_can_report_readonly(property: &LuaCommonProperty) -> bool {
+pub(super) fn property_can_report_readonly(property: &LuaCommonProperty) -> bool {
     property
         .decl_features
         .has_feature(PropertyDeclFeature::ReadOnly)

@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::sync::Arc;
 
 use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaIndexExpr, LuaNameExpr, VisibilityKind};
 use rowan::TextRange;
@@ -8,7 +9,10 @@ use crate::{
     SemanticDeclLevel, SemanticModel,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{
+    Checker, DiagnosticContext, PrecomputedPropertyNameCandidates,
+    precompute_property_name_candidates,
+};
 
 pub struct AccessInvisibleChecker;
 
@@ -17,7 +21,7 @@ impl Checker for AccessInvisibleChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let candidates = AccessInvisibleCandidates::new(context);
+        let candidates = AccessInvisibleCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
@@ -97,52 +101,35 @@ fn check_index_expr(
 }
 
 struct AccessInvisibleCandidates {
-    explicit_names: HashSet<String>,
+    candidates: Arc<PrecomputedPropertyNameCandidates>,
     private_name_patterns: Vec<String>,
 }
 
 impl AccessInvisibleCandidates {
-    fn new(context: &DiagnosticContext) -> Self {
-        let db = context.db;
-        let mut explicit_names = HashSet::new();
-        for (owner_id, property) in db.get_property_index().iter_owner_properties() {
-            if !property_can_report_access_invisible(property) {
-                continue;
-            }
-
-            match owner_id {
-                LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
-                        explicit_names.insert(decl.get_name().to_string());
-                    }
-                }
-                LuaSemanticDeclId::Member(member_id) => {
-                    if let Some(member) = db.get_member_index().get_member(member_id)
-                        && let Some(name) = member.get_key().get_name()
-                    {
-                        explicit_names.insert(name.to_string());
-                    }
-                }
-                LuaSemanticDeclId::Signature(_) | LuaSemanticDeclId::TypeDecl(_) => {}
-            }
-        }
-
+    fn new(context: &DiagnosticContext, db: &crate::DbIndex) -> Self {
         Self {
-            explicit_names,
-            private_name_patterns: context.db.get_emmyrc().doc.private_name.clone(),
+            candidates: context
+                .get_shared_data_arc()
+                .map(|shared_data| shared_data.property_name_candidates.clone())
+                .unwrap_or_else(|| Arc::new(precompute_property_name_candidates(db))),
+            private_name_patterns: db.get_emmyrc().doc.private_name.clone(),
         }
+    }
+
+    fn explicit_names(&self) -> &HashSet<String> {
+        &self.candidates.access_invisible
     }
 
     fn is_empty(&self) -> bool {
-        self.explicit_names.is_empty() && self.private_name_patterns.is_empty()
+        self.explicit_names().is_empty() && self.private_name_patterns.is_empty()
     }
 
     fn should_check_name(&self, name: &str) -> bool {
-        self.explicit_names.contains(name)
+        self.explicit_names().contains(name)
     }
 
     fn should_check_member_name(&self, name: &str) -> bool {
-        self.explicit_names.contains(name) || self.matches_private_name_pattern(name)
+        self.explicit_names().contains(name) || self.matches_private_name_pattern(name)
     }
 
     fn matches_private_name_pattern(&self, name: &str) -> bool {
@@ -158,7 +145,7 @@ impl AccessInvisibleCandidates {
     }
 }
 
-fn property_can_report_access_invisible(property: &LuaCommonProperty) -> bool {
+pub(super) fn property_can_report_access_invisible(property: &LuaCommonProperty) -> bool {
     !matches!(property.visibility, VisibilityKind::Public) || property.version_conds().is_some()
 }
 
