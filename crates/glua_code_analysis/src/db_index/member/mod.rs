@@ -844,11 +844,6 @@ impl LuaMemberIndex {
 
     /// The owner's members whose key is an expression rather than a name, in
     /// the same order [`Self::get_members`] would yield them.
-    ///
-    /// Dynamic-key inference only reads these. Filtering them out of
-    /// `get_members` instead costs a walk of every named field, which on a
-    /// table like a shared registry is tens of thousands of members per
-    /// lookup.
     pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
         let owner_members = self.owner_members.get(owner)?;
         let mut member_ids = Vec::new();

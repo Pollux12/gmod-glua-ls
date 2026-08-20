@@ -89,11 +89,12 @@ pub struct LuaInferCache {
     pub flow_node_cache:
         FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
-    /// Scratch memo for one top-level closure-baseline query. That walk merges
-    /// antecedents recursively, so a branchy control-flow graph re-derives the
-    /// same node once per path into it — exponential without this. It is cleared
-    /// when the outermost baseline query returns, so nothing survives to answer
-    /// a later query with a type derived from earlier pass state.
+    /// Scratch memo for one top-level closure-baseline query. Without it that
+    /// walk re-derives each merge point once per path into it.
+    ///
+    /// Cleared when the outermost baseline query returns: a baseline answer
+    /// depends on how far the pass has got, which is not in the key, so one
+    /// must never answer a later query.
     pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
     pub baseline_flow_depth: u32,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,

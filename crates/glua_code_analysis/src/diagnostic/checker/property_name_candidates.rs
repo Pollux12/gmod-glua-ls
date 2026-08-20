@@ -6,13 +6,8 @@ use super::access_invisible::property_can_report_access_invisible;
 use super::deprecated::property_can_report_deprecated;
 use super::readonly_check::property_can_report_readonly;
 
-/// The names a property-driven checker could possibly report on.
-///
-/// Each of these checkers walks the file looking for a name it has something
-/// to say about, and the set of such names comes from the property index, not
-/// from the file. Rebuilding it per file meant three walks of every indexed
-/// property per file, which on a workspace of a thousand files is the bulk of
-/// what those checkers cost.
+/// The names a property-driven checker could possibly report on. Derived from
+/// the property index, so it is the same for every file in a run.
 #[derive(Debug, Default)]
 pub struct PrecomputedPropertyNameCandidates {
     pub deprecated: HashSet<String>,
@@ -65,8 +60,8 @@ pub fn precompute_property_name_candidates(db: &DbIndex) -> PrecomputedPropertyN
                     candidates.access_invisible.insert(name.to_string());
                 }
             }
-            // A type declaration names no runtime access the visibility
-            // checker looks at, so only the other two take it.
+            // A type declaration names no runtime access, so the visibility
+            // checker does not take it.
             LuaSemanticDeclId::TypeDecl(type_decl_id) => {
                 if deprecated {
                     candidates

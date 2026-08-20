@@ -360,11 +360,8 @@ pub async fn init_analysis(
         );
         log::info!("analyzing {} Lua files", file_count);
 
-        // `update_files_by_path` is one blocking call that runs every analysis
-        // pass, so without a sink the client sees "Analyzing Lua files 0/N"
-        // frozen for however long the whole index takes. The passes report the
-        // phase they enter; forward that to the status bar and the watchdog so
-        // a slow workspace says which pass it is slow in.
+        // `update_files_by_path` blocks for the whole index, so the phases it
+        // reports are the only progress the client can be given.
         let _progress =
             AnalysisProgressReporter::install(status_bar.clone(), watchdog_status.clone());
         mut_analysis.update_files_by_path(files);
@@ -449,14 +446,10 @@ pub async fn init_analysis(
     }
 
     if lsp_features.supports_workspace_diagnostic() {
-        // The whole workspace was just indexed, so it owes a full sweep. The
-        // pending level is *claimed* by whichever pull arrives first and reset
-        // to `None`, and only a document change or a cancelled sweep ever puts
-        // it back. A pull that races startup therefore consumes the one level
-        // the workspace is given, completes against a half-built index, and
-        // every pull after it answers empty — leaving only the open file
-        // diagnosed until the user happens to type. Asking the client to
-        // re-pull without re-arming the level is a no-op by construction.
+        // The pending level is claimed by whichever pull arrives first and
+        // reset to `None`, so a pull racing startup consumes the workspace's
+        // one level against a half-built index. Re-arm before asking the
+        // client to pull again, or the request is a no-op.
         workspace_diagnostic_level.fetch_max(
             crate::context::WorkspaceDiagnosticLevel::Slow.to_u8(),
             std::sync::atomic::Ordering::AcqRel,

@@ -487,11 +487,8 @@ impl FileDiagnostic {
                     }
                     count += 1;
                     let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                    // The watchdog is in-memory and is what a stall report is
-                    // read from, so it tracks every file. Only the notification
-                    // to the client is rate-limited: gating both meant the last
-                    // eleven files of a thousand all read "99%", which hid
-                    // which file the sweep was actually stuck on.
+                    // The watchdog tracks every file; only the notification to
+                    // the client is rate-limited on the percentage.
                     watchdog_status.set_progress(
                         "Diagnosing workspace files (slow pull)",
                         count,
@@ -622,8 +619,7 @@ impl FileDiagnostic {
 
                         count += 1;
                         let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                        // See the slow pull above: the watchdog tracks every
-                        // file, only the client notification is rate-limited.
+                        // See the slow pull above.
                         watchdog_status.set_progress(
                             "Diagnosing workspace files (fast pull)",
                             count,
@@ -740,12 +736,8 @@ fn spawn_workspace_diagnostic_workers(
     rx
 }
 
-/// The files the sweep has started and not finished.
-///
-/// A stalled sweep reports a count, and a count alone does not say which file
-/// to look at. Every file that is claimed is recorded here with when it was
-/// claimed, so the watchdog line can name the file that has been running
-/// longest, which is the one holding the sweep up.
+/// The files the sweep has started and not finished, with when each was
+/// claimed, so a watchdog line can name the longest-running one.
 #[derive(Default)]
 pub struct InFlightDiagnosticFiles {
     files: std::sync::Mutex<Vec<(FileId, std::time::Instant)>>,
@@ -790,9 +782,8 @@ impl InFlightDiagnosticFiles {
             if entries.is_empty() {
                 return None;
             }
-            // The read guard is only taken to turn ids into paths. If the
-            // sweep is stuck holding the lock this cannot get it, so the ids
-            // are reported bare rather than the watchdog going quiet.
+            // `try_read`, because a sweep stuck holding the lock must still get
+            // a line out. Ids are reported bare when the guard is unavailable.
             let described = match analysis.try_read() {
                 Ok(analysis) => {
                     let vfs = analysis.compilation.get_db().get_vfs();
@@ -947,8 +938,7 @@ async fn push_workspace_diagnostic(
                     }
                     count += 1;
                     let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
-                    // See the slow pull above: the watchdog tracks every file,
-                    // only the client notification is rate-limited.
+                    // See the slow pull above.
                     watchdog_status.set_progress(
                         "Diagnosing workspace files (push)",
                         count,

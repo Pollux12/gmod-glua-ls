@@ -1,21 +1,14 @@
 //! A stderr sink that drops lines rather than blocking the server.
 //!
-//! An editor that starts the server as a child process reads its stderr and
-//! shows it, which is what puts the log in front of a user. A client that does
-//! not read it leaves the pipe to fill, and a full pipe blocks the *writer* —
-//! which would be whichever analysis thread happened to log. A startup on a
-//! large workspace writes well over a pipe buffer's worth, so that is not a
-//! theoretical risk.
-//!
-//! Logging is diagnostics. It is never worth stalling analysis for, so lines
-//! are handed to a background thread through a bounded queue and dropped when
-//! that queue is full. Writing to the log file is unaffected.
+//! A client that does not read the server's stderr lets the pipe fill, and a
+//! full pipe blocks the writer, which here is whichever analysis thread logged.
+//! A startup writes more than a pipe buffer holds, so lines go to a background
+//! thread through a bounded queue and are dropped when it is full.
 
 use std::io::{self, Write};
 use std::sync::mpsc::{SyncSender, TrySendError, sync_channel};
 
-/// Lines allowed to queue before new ones are dropped. Enough to absorb the
-/// bursts a startup produces while a reader is briefly behind.
+/// Lines allowed to queue before new ones are dropped.
 const QUEUE_CAPACITY: usize = 4096;
 
 pub struct NonBlockingStderr {
@@ -26,16 +19,12 @@ impl NonBlockingStderr {
     pub fn new() -> Self {
         let (sender, receiver) = sync_channel::<Vec<u8>>(QUEUE_CAPACITY);
 
-        // Detached: it ends when the sender is dropped, which happens when the
-        // logger goes away, which happens when the process does.
         std::thread::Builder::new()
             .name("gluals-stderr".to_string())
             .spawn(move || {
                 let stderr = io::stderr();
                 for line in receiver {
                     let mut handle = stderr.lock();
-                    // Nothing to do about a failed write to stderr except stop
-                    // trying to report it.
                     let _ = handle.write_all(&line);
                     let _ = handle.flush();
                 }
@@ -49,8 +38,7 @@ impl NonBlockingStderr {
 impl Write for NonBlockingStderr {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         match self.sender.try_send(buf.to_vec()) {
-            // A dropped line is the intended outcome when the reader is not
-            // keeping up, so the caller is told the write succeeded.
+            // A dropped line is the intended outcome, so the write reports success.
             Ok(()) | Err(TrySendError::Full(_)) | Err(TrySendError::Disconnected(_)) => {
                 Ok(buf.len())
             }

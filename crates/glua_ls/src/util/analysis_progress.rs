@@ -1,10 +1,4 @@
 //! Forwards analysis phase reports to the status bar, the watchdog and the log.
-//!
-//! Indexing a workspace is a single blocking call into the analysis crate, so
-//! the client would otherwise see one message for its whole duration. The
-//! analysis passes report the phase they enter; this turns those into progress
-//! updates a user can watch, and into a log line per phase plus a summary at
-//! the end, so a report from a slow workspace says which pass was slow.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -36,8 +30,7 @@ struct ReporterState {
     phase: String,
     phase_started: Instant,
     last_update: Instant,
-    /// Total time per phase. Phases repeat, once per workspace group, so a
-    /// per-phase total is what says where the run actually went.
+    /// Total time per phase. A phase repeats once per workspace group.
     totals: HashMap<String, Duration>,
 }
 
@@ -48,9 +41,7 @@ impl ReporterState {
             return;
         }
         let elapsed = now.duration_since(self.phase_started);
-        // Only the slow ones. A phase runs once per workspace group, so
-        // logging every one buries the interesting lines under a hundred
-        // that took a millisecond.
+        // Only the slow ones: a phase repeats per workspace group.
         if elapsed >= NOTABLE_PHASE {
             log::info!("analysis phase '{}' took {:?}", self.phase, elapsed);
         }
@@ -93,9 +84,7 @@ impl AnalysisProgressReporter {
             state.last_update = now;
             drop(state);
 
-            // A pass counts its own batch, which for a workspace loaded in
-            // groups is not the whole file set, so the count is shown as what
-            // it is rather than dressed up as workspace progress.
+            // A pass counts its own batch, not the whole workspace.
             let message = if total > 1 {
                 format!("{phase} ({done}/{total} {unit})")
             } else {
@@ -124,8 +113,7 @@ impl Drop for AnalysisProgressReporter {
         let mut totals = state.totals.drain().collect::<Vec<_>>();
         drop(state);
 
-        // Ties broken on the name so the same run always reports the same
-        // order.
+        // Ties broken on the name so the order is stable.
         totals.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
         let slowest = totals
             .iter()
@@ -150,8 +138,7 @@ mod tests {
 
     #[test]
     fn clearing_the_sink_stops_reports() {
-        // The reporter owns the global sink, so dropping it must leave the
-        // analysis crate reporting to nobody.
+        // The reporter owns the global sink, so dropping it must clear it.
         progress::clear_sink();
         assert!(!progress::is_active());
 
@@ -171,8 +158,7 @@ mod tests {
 
     #[test]
     fn phase_totals_accumulate_across_repeats() {
-        // Phases repeat once per workspace group, so the summary has to add
-        // the repeats together rather than report only the last one.
+        // Phases repeat per workspace group, so the summary adds the repeats.
         let now = Instant::now();
         let mut state = ReporterState {
             phase: String::new(),

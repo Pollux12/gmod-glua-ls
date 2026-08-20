@@ -1,8 +1,7 @@
 use std::ops::Deref;
 
 // Every set below is a cycle guard for a graph walk: membership only, never
-// iterated, so the hasher cannot reach a result. The flow walk is hot enough
-// that hashing the ids with SipHash showed up in profiles.
+// iterated, so the hasher cannot reach a result.
 use rustc_hash::FxHashSet as HashSet;
 
 use glua_parser::{

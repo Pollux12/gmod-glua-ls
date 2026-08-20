@@ -1,14 +1,8 @@
 //! Reporting analysis progress back to whoever asked for the analysis.
 //!
-//! Indexing a workspace is one blocking call, so without this the editor shows
-//! a single frozen "analyzing" message for however long the whole run takes.
-//! The passes report the phase they are entering as they go, which is what the
-//! status bar and the long-running watchdog show.
-//!
-//! The sink is process-global for the same reason [`crate::profile`] is: the
-//! passes that need to report are threaded through `&mut DbIndex`, not through
-//! any object the caller owns, and adding a reporting channel to every pass
-//! signature buys nothing over a single install point.
+//! The sink is process-global for the same reason [`crate::profile`]'s is: the
+//! passes that report are threaded through `&mut DbIndex`, not through any
+//! object the caller owns.
 
 use std::sync::{Arc, RwLock};
 
@@ -30,8 +24,7 @@ pub type ProgressSink = Arc<dyn Fn(PhaseProgress<'_>) + Send + Sync>;
 static SINK: RwLock<Option<ProgressSink>> = RwLock::new(None);
 
 /// The phase last entered. One workspace analyses on one thread at a time, so
-/// the per-file loops inside a phase can report counts against it without
-/// threading the name through every pass.
+/// the per-file loops inside a phase can report counts against it.
 static CURRENT_PHASE: RwLock<Option<String>> = RwLock::new(None);
 
 /// Install `sink` for the duration of an analysis run. Replaces any previous
@@ -51,8 +44,7 @@ pub fn clear_sink() {
     }
 }
 
-/// Whether anything is listening. Callers that would have to do work to build
-/// a report should check this first.
+/// Whether anything is listening.
 pub fn is_active() -> bool {
     SINK.read().is_ok_and(|slot| slot.is_some())
 }
@@ -103,11 +95,8 @@ fn emit(progress: PhaseProgress<'_>) {
     }
 }
 
-/// A phase name to show a user, given the pipeline's Rust type name.
-///
-/// The type names are internal and read as such ("PreDynamicUnResolve"), so
-/// they are mapped rather than prettified. An unmapped pipeline falls back to
-/// its own name, which is still more informative than showing nothing.
+/// A phase name to show a user, given the pipeline's Rust type name. An
+/// unmapped pipeline falls back to its own name.
 pub fn phase_label(pipeline_type_name: &str) -> &str {
     match pipeline_type_name {
         "DeclAnalysisPipeline" => "Collecting declarations",

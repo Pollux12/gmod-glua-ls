@@ -8,8 +8,8 @@ pub use decl::{LocalAttribute, LuaDecl, LuaDeclInitializer};
 pub use decl_id::LuaDeclId;
 pub use decl_tree::{LuaDeclOrMemberId, LuaDeclarationTree};
 use rowan::TextRange;
-pub use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 use rustc_hash::FxHashMap;
+pub use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 
 use crate::{FileId, LuaMemberId};
 

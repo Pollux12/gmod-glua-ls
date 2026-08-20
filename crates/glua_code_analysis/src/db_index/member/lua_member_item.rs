@@ -368,11 +368,8 @@ fn member_hidden_by_enclosing_assignment(
         return false;
     };
     let member_range = member.get_range();
-    // Reaching the member by offset means `token_at_offset`, which rescans the
-    // siblings at every level it descends. GLua files are flat, so on a file
-    // with thousands of top-level statements that is a walk of the whole file
-    // per member resolution. The member's own node is addressable by its
-    // syntax id instead, and that lookup is memoised.
+    // By syntax id, not by offset: `token_at_offset` rescans the siblings at
+    // every level it descends, and this lookup is memoised.
     let Some(member_node) = member_id.get_syntax_id().to_node_from_root(&root) else {
         return false;
     };

@@ -426,9 +426,7 @@ fn try_resolve(
     // resolves an item or retires an `(item, reason)` pair, both of which are
     // finite, so the loop terminates.
     let mut requeued: HashSet<(UnResolveIdentity, InferFailReason)> = HashSet::new();
-    // Each wave can take seconds on a large workspace, and there is no file
-    // count to report, so the wave reports how much is still deferred. That
-    // number falling is what tells a user the loop is converging.
+    // Waves have no file count to report, so they report what is still deferred.
     let initial_outstanding: usize = reason_resolve.values().map(Vec::len).sum();
     loop {
         if crate::progress::is_active() {

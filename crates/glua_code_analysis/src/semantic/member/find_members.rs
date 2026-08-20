@@ -556,8 +556,7 @@ fn find_unscoped_owner_members(
     let mut members = Vec::new();
     let member_index = db.get_member_index();
     // A by-key search reads the index by key rather than walking the owner's
-    // whole member list: a shared GLua table can carry tens of thousands of
-    // fields, and every miss on one would otherwise cost a full pass.
+    // whole member list.
     let owner_members = match filter {
         FindMemberFilter::ByKey { member_key, .. } => {
             member_index.get_members_with_key(owner, member_key)?

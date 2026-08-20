@@ -27,11 +27,9 @@ mod test {
         start.elapsed()
     }
 
-    /// Regression guard: the closure-baseline flow walk once bypassed the memo
-    /// the normal walk goes through, so every merge point was re-derived once
-    /// per path reaching it. A file with a long run of `if` statements before a
-    /// closure then never finished analysing, which stalled the whole workspace
-    /// diagnostic sweep behind it.
+    /// The closure-baseline flow walk must memoise each merge point. Without
+    /// that it derives one per path reaching it, which is exponential in the
+    /// branch count.
     #[test]
     #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
     fn closure_baseline_cost_stays_linear_in_branch_merges() {
@@ -41,9 +39,8 @@ mod test {
         let small = index_branch_merges_before_closure(10);
         let large = index_branch_merges_before_closure(20);
 
-        // 10 more branches. Memoised this is linear; re-deriving per path
-        // doubles per branch, so the pre-fix ratio was ~1000x (0.03s vs 39s).
-        // A 20x ceiling is far above linear noise and far below exponential.
+        // Memoised this is linear; deriving per path doubles per branch. A 20x
+        // ceiling sits well above linear noise and well below exponential.
         let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
         assert!(
             ratio < 20.0,
@@ -399,16 +396,10 @@ local result = T["entry"].name
         start.elapsed()
     }
 
-    /// Regression guard: a read of a field the table does not declare used to
-    /// fall through to passes that materialised every member of the owner and
-    /// then kept only the expression-keyed ones. A shared registry table with
-    /// tens of thousands of named fields made each miss cost a full walk,
-    /// which is what turned a 600-file gamemode's indexing into 28s of member
-    /// scanning.
-    ///
-    /// Both halves do the same number of reads over the same number of fields
-    /// and differ only in how wide any single table gets, so the ratio between
-    /// them isolates per-access cost that grows with owner width.
+    /// A read of a field the table does not declare must not cost the width of
+    /// the owner. Both halves do the same number of reads over the same number
+    /// of fields and differ only in how wide any single table gets, so the
+    /// ratio isolates per-access cost that grows with owner width.
     #[test]
     #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
     fn named_field_misses_do_not_scan_every_owner_member() {
@@ -418,9 +409,8 @@ local result = T["entry"].name
         let narrow = index_misses_on_narrow_tables(2000);
         let wide = index_misses_on_one_wide_table(2000);
 
-        // Measured at 2000: ~50x before the member scans were removed, ~10x
-        // after. The remainder is flow narrowing over the writes, which is
-        // not what this guards, so the ceiling sits between the two.
+        // The residual gap is flow narrowing over the writes, which this does
+        // not guard, so the ceiling sits above that and below a full scan.
         let ratio = wide.as_secs_f64() / narrow.as_secs_f64().max(1e-6);
         assert!(
             ratio < 25.0,

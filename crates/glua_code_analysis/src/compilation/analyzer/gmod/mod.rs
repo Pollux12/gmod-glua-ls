@@ -1137,7 +1137,6 @@ impl HelperRegistryBuilder {
     }
 }
 
-
 /// The final written name of a value expression, for alias discovery.
 fn expr_written_name(expr: &LuaExpr) -> Option<SmolStr> {
     match expr {
@@ -1150,7 +1149,6 @@ fn expr_written_name(expr: &LuaExpr) -> Option<SmolStr> {
         _ => None,
     }
 }
-
 
 /// The names the shipped net operations are declared under (`Start`,
 /// `Receive`, and any annotated wrapper of them).
@@ -1173,7 +1171,12 @@ fn net_operation_names(annotated_roles: &AnnotatedGmodGlobalCallRoleMap) -> Hash
                 )
             })
         })
-        .map(|(path, _)| SmolStr::new(path.rsplit_once('.').map_or(path.as_str(), |(_, last)| last)))
+        .map(|(path, _)| {
+            SmolStr::new(
+                path.rsplit_once('.')
+                    .map_or(path.as_str(), |(_, last)| last),
+            )
+        })
         .collect()
 }
 
@@ -1371,7 +1374,6 @@ fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCall
     }
     NetHelperCallSites { by_file, names }
 }
-
 
 /// Per-file function definition lookup. Built once and reused for all
 /// helper-resolution queries against the same file's syntax tree.
@@ -2264,11 +2266,15 @@ fn net_candidate_call_exprs(
             else {
                 continue;
             };
-            local_sites.extend(references.cells.iter().filter(|cell| !cell.is_write).map(
-                |cell| {
-                    LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range)
-                },
-            ));
+            local_sites.extend(
+                references
+                    .cells
+                    .iter()
+                    .filter(|cell| !cell.is_write)
+                    .map(|cell| {
+                        LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range)
+                    }),
+            );
         }
     }
     let mut calls = helper_call_sites
@@ -9865,10 +9871,8 @@ fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Opti
         .get_vfs()
         .get_syntax_tree(&signature_id.get_file_id())?
         .get_red_root();
-    // A signature's position is the offset its closure starts at, so descend
-    // to that offset rather than scanning every node in the file. Scanning
-    // cost a full walk per signature, which on a file with many functions is
-    // quadratic in the file.
+    // A signature's position is the offset its closure starts at, so descend to
+    // that offset rather than scanning every node in the file.
     root.token_at_offset(signature_id.get_position())
         .right_biased()?
         .parent_ancestors()

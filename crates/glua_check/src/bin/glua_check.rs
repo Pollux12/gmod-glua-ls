@@ -6,10 +6,8 @@ use std::error::Error;
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;
 
-/// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread
-/// does on Windows, so the CLI has to ask for one explicitly. Without it a
-/// large workspace overflows the stack before it reports anything.
+/// Analysis recurses over deeply nested syntax, and a Windows process main
+/// thread has a far smaller stack than a spawned one.
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)

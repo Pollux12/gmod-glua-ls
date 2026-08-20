@@ -226,11 +226,9 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    // The exact-key lookup above already answered every member whose key is a
-    // literal, because two literal keys match only when they are equal. So a
-    // literal access that reaches here can only be answered by an
-    // expression-keyed member, and walking the rest costs the width of the
-    // table, which is tens of thousands of fields on a shared registry.
+    // Two literal keys match only when they are equal, which the exact-key
+    // lookup above already covered, so a literal access that reaches here can
+    // only be answered by an expression-keyed member.
     let member_index = db.get_member_index();
     let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
         member_index.get_expr_key_members(&member_owner)

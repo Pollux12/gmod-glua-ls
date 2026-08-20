@@ -13,11 +13,8 @@ pub struct LuaOwnerMembers {
     sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
     /// The subset of `members` keyed by an expression rather than a name.
     ///
-    /// Dynamic-key inference only ever looks at these, and a GLua table can
-    /// accumulate tens of thousands of named fields while holding a handful
-    /// of dynamic ones, so it is tracked here rather than rediscovered by
-    /// walking every member. Only `add_member` and `remove_member` change
-    /// the key set; the mutators that hand out an item leave keys alone.
+    /// Only `add_member` and `remove_member` change the key set; the mutators
+    /// that hand out an item leave keys alone.
     expr_keys: Vec<LuaMemberKey>,
     resolve_state: OwnerMemberStatus,
 }

@@ -85,10 +85,7 @@ where
                     if seq >= n {
                         break;
                     }
-                    // Coarse enough that reporting never becomes the work: at
-                    // most one update per 2% of the batch, from whichever
-                    // worker happens to claim that slot.
-                    if report_step != 0 && seq % report_step == 0 {
+                    if report_step != 0 && seq.is_multiple_of(report_step) {
                         crate::progress::advance_current_phase(seq, n, "files");
                     }
                     let idx = dispatch[seq];

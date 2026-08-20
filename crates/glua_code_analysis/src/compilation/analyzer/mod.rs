@@ -1030,9 +1030,6 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
         .rsplit("::")
         .next()
         .unwrap_or_default();
-    // Indexing a workspace is one blocking call from the client's point of
-    // view, so without this the editor shows one frozen message for the whole
-    // run. Only worth reporting for a batch large enough for a user to notice.
     if context.tree_list.len() > 1 {
         crate::progress::enter_phase(
             crate::progress::phase_label(name),

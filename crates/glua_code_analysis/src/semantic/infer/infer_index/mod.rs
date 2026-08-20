@@ -1426,8 +1426,7 @@ fn table_const_has_no_specific_data(
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
 ) -> bool {
-    db.get_member_index().get_member_len(owner) == 0
-        && db.get_metatable_index().get(inst).is_none()
+    db.get_member_index().get_member_len(owner) == 0 && db.get_metatable_index().get(inst).is_none()
 }
 
 fn infer_plain_table_member(
@@ -2663,9 +2662,7 @@ fn infer_member_by_index_table(
             let member_index = db.get_member_index();
             // A literal key matches a literal member key only when the two are
             // equal, so the candidates are that one key plus the
-            // expression-keyed members. Reading the whole member list instead
-            // makes each access cost the width of the table, which on a table
-            // that accumulates thousands of fields is quadratic.
+            // expression-keyed members.
             let members = match &access_key {
                 Some(key @ (LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))) => member_index
                     .get_members_with_key(&owner, key)

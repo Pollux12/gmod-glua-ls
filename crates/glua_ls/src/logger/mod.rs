@@ -4,11 +4,11 @@ mod non_blocking_stderr;
 use std::{env, fs, path::PathBuf};
 
 use best_log_path::get_best_log_dir;
-use non_blocking_stderr::NonBlockingStderr;
 use chrono::Local;
 use fern::Dispatch;
 use glua_code_analysis::file_path_to_uri;
 use log::{LevelFilter, info};
+use non_blocking_stderr::NonBlockingStderr;
 
 use crate::cmd_args::{CmdArgs, LogLevel};
 
@@ -29,8 +29,7 @@ fn thread_tag(level: log::Level) -> String {
     }
 }
 
-/// The shared line format. Applied once on the root dispatch so the log file
-/// and stderr carry identical text and a user can paste either at us.
+/// Applied on the root dispatch so the log file and stderr carry identical text.
 fn format_record(
     out: fern::FormatCallback<'_>,
     message: &std::fmt::Arguments<'_>,
@@ -105,12 +104,9 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
         }
     };
 
-    // Also to stderr, not only to the file. An editor that starts the server
-    // as a child process shows its stderr in its own output panel, so this is
-    // what puts the log in front of a user reporting a problem instead of
-    // behind a path they have to be told to go and find. It is the
-    // non-blocking sink: a client that never reads stderr must not be able to
-    // stall analysis by letting the pipe fill.
+    // Stderr as well as the file: an editor that starts the server as a child
+    // process shows stderr in its own output panel. It must be the
+    // non-blocking sink, or a client that never reads it stalls analysis.
     let logger = Dispatch::new()
         .format(format_record)
         .level(level)

@@ -44,8 +44,8 @@ impl LongRunningWatchdogSnapshot {
     }
 }
 
-/// Produces the "what is it stuck on" half of a watchdog line, if the task can
-/// say. Called only when the watchdog actually logs, so it may do real work.
+/// Names what the task is currently working on. Called only when the watchdog
+/// logs, so it may do real work.
 pub type WatchdogDetailSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
 
 #[derive(Clone)]
@@ -73,8 +73,6 @@ impl LongRunningWatchdogStatus {
     }
 
     /// Attach something that can name what the task is currently working on.
-    /// A count alone says a sweep is stuck; this says which file it is stuck
-    /// on, which is the part a user cannot work out for themselves.
     pub fn set_detail_source(&self, source: WatchdogDetailSource) {
         if let Ok(mut slot) = self.detail_source.lock() {
             *slot = Some(source);
@@ -110,9 +108,8 @@ impl LongRunningWatchdogStatus {
             .unwrap_or_else(|_| "status unavailable".to_string())
     }
 
-    /// [`Self::describe`] plus whatever the detail source can add. Used for
-    /// the watchdog's own log lines, not for the client-facing progress
-    /// message, which should stay short.
+    /// [`Self::describe`] plus whatever the detail source can add. For the
+    /// watchdog log, not the client-facing progress message.
     pub fn describe_verbose(&self) -> String {
         let described = self.describe();
         let detail = self

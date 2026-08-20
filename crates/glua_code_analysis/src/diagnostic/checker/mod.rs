@@ -101,8 +101,8 @@ pub trait Checker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel);
 }
 
-/// A bare `FileId` cannot be acted on: finding which file a checker is stuck on
-/// meant correlating ids across log lines that never print a path.
+/// The path a checker is running against, for log lines that would otherwise
+/// carry only a `FileId`.
 fn checker_file_label(context: &DiagnosticContext, semantic_model: &SemanticModel) -> String {
     let file_id = context.get_file_id();
     semantic_model
@@ -126,8 +126,7 @@ fn run_check<T: Checker>(
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
     {
-        // `checker slow` only reports on completion, so a checker that never
-        // returns leaves no trace of itself at all. This names it on entry.
+        // Named on entry: `checker slow` only reports on completion.
         if log::log_enabled!(log::Level::Trace) {
             log::trace!(
                 "checker start: {} for {}",
