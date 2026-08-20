@@ -411,6 +411,21 @@ fn try_resolve(
 ) -> Option<TryResolveProfile> {
     let mut profile = profile_enabled.then(TryResolveProfile::default);
     let mut cached_sorted_keys: Option<Vec<InferFailReason>> = None;
+    // Which `(item, reason)` pairs this call has already re-queued.
+    //
+    // A wave only continues while something `changed`, and moving an item to a
+    // *different* reason counts as change. Two items can hand each other the
+    // same pair of reasons indefinitely — A fails under X naming Y, B fails
+    // under Y naming X — so `changed` never settles and the wave loop never
+    // returns. Each wave also purges the inference caches of every file it
+    // touched, so the same failures are re-derived from scratch every time and
+    // the loop makes no progress at all.
+    //
+    // Re-queueing an item under a reason it has already been re-queued under is
+    // therefore not progress, and is parked instead. Every wave now either
+    // resolves an item or retires an `(item, reason)` pair, both of which are
+    // finite, so the loop terminates.
+    let mut requeued: HashSet<(UnResolveIdentity, InferFailReason)> = HashSet::new();
     loop {
         let mut changed = false;
         let mut to_be_remove = Vec::new();
@@ -475,7 +490,9 @@ fn try_resolve(
                         }
                     }
                     Err(reason) => {
-                        if reason != *check_reason {
+                        if reason != *check_reason
+                            && requeued.insert((unresolve_identity(&unresolve), reason.clone()))
+                        {
                             changed = true;
                             retry_file_ids.insert(file_id);
                             retain_unresolve.push((unresolve, reason));
@@ -764,6 +781,15 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
         UnResolve::SpecialCall(_) => 10,
         UnResolve::CallSiteContribution(_) => 11,
     }
+}
+
+/// Identifies an unresolve item across waves: the same syntax position in the
+/// same file for the same item kind is the same item.
+type UnResolveIdentity = (u8, u32, u32);
+
+fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
+    let (file_id, position) = unresolve.sort_key();
+    (unresolve_kind_rank(unresolve), file_id, position)
 }
 
 fn unresolve_stable_cmp(a: &UnResolve, b: &UnResolve) -> Ordering {
