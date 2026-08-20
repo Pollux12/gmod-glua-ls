@@ -1352,7 +1352,19 @@ fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[S
     true
 }
 
+/// Analysis recurses over deeply nested syntax. The server does that work on
+/// spawned threads, which get a far larger stack than a process main thread does
+/// on Windows, so the tools have to ask for one explicitly.
 fn main() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(run)
+        .expect("determinism worker thread should spawn")
+        .join()
+        .expect("determinism worker thread should not panic");
+}
+
+fn run() {
     alloc_sample::init();
     let codebase =
         PathBuf::from(std::env::var("DET_CODEBASE").expect("DET_CODEBASE env var is required"));

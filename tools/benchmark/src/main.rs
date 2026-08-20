@@ -215,8 +215,25 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-#[tokio::main]
-async fn main() {
+/// Analysis recurses over deeply nested syntax. The server does that work on
+/// spawned threads, which get a far larger stack than a process main thread does
+/// on Windows, so the tools have to ask for one explicitly.
+fn main() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build")
+                .block_on(run());
+        })
+        .expect("benchmark worker thread should spawn")
+        .join()
+        .expect("benchmark worker thread should not panic");
+}
+
+async fn run() {
     let _ = PROCESS_START.set(Instant::now());
     #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut alloc_mark = (0u64, 0u64);
