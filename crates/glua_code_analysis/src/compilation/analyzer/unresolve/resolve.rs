@@ -544,6 +544,21 @@ pub fn try_resolve_return_point(
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
+    // Deriving a return means inferring every return expression in the
+    // function, and `should_apply_resolved_return_docs` then discards the
+    // result whenever the signature already holds a concrete inferred return —
+    // it can only ever upgrade `unknown`/`any`. Asking that question first
+    // costs two field reads instead of a full inference, and this pass
+    // re-attempts the same signatures across waves.
+    if let Some(signature) = db.get_signature_index().get(&return_.signature_id)
+        && signature.resolve_return == SignatureReturnStatus::InferResolve
+    {
+        let current_return = signature.get_return_type();
+        if !current_return.is_unknown() && !current_return.is_any() {
+            return Ok(());
+        }
+    }
+
     let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
     let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
 
