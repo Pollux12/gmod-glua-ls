@@ -53,6 +53,8 @@ pub enum LogLevel {
     Info,
     /// Debug level
     Debug,
+    /// Trace level
+    Trace,
 }
 
 impl std::str::FromStr for LogLevel {
@@ -64,8 +66,9 @@ impl std::str::FromStr for LogLevel {
             "warn" => Ok(LogLevel::Warn),
             "info" => Ok(LogLevel::Info),
             "debug" => Ok(LogLevel::Debug),
+            "trace" => Ok(LogLevel::Trace),
             _ => Err(format!(
-                "Invalid log level: '{}'. Please choose 'error', 'warn', 'info', 'debug'",
+                "Invalid log level: '{}'. Please choose 'error', 'warn', 'info', 'debug', 'trace'",
                 input
             )),
         }

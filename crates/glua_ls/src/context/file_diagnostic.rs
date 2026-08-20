@@ -694,11 +694,14 @@ fn spawn_workspace_diagnostic_workers(
         tokio::spawn(async move {
             loop {
                 if cancel_token.is_cancelled() {
+                    log::trace!("workspace diagnostic worker exiting: cancelled");
                     break;
                 }
                 let Some(file_id) = claim_next_diagnostic_file(&file_ids, &next_file) else {
+                    log::trace!("workspace diagnostic worker exiting: queue drained");
                     break;
                 };
+                log::trace!("workspace diagnostic claim {:?}", file_id);
                 let result = diagnose_workspace_file_off_thread(
                     analysis.clone(),
                     file_id,
@@ -706,7 +709,9 @@ fn spawn_workspace_diagnostic_workers(
                     cancel_token.clone(),
                 )
                 .await;
+                log::trace!("workspace diagnostic done {:?}", file_id);
                 if tx.send(result).await.is_err() {
+                    log::trace!("workspace diagnostic worker exiting: receiver gone");
                     break;
                 }
             }
@@ -739,6 +744,7 @@ async fn diagnose_workspace_file_off_thread(
             return None;
         }
 
+        log::trace!("diagnosing {file_id:?} on this thread");
         // Diagnose under a blocking read lock to avoid starving Tokio worker threads.
         let guard = blocking_analysis.blocking_read();
         let diagnostics = guard.diagnose_file_with_shared(

@@ -97,6 +97,18 @@ pub trait Checker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel);
 }
 
+/// A bare `FileId` cannot be acted on: finding which file a checker is stuck on
+/// meant correlating ids across log lines that never print a path.
+fn checker_file_label(context: &DiagnosticContext, semantic_model: &SemanticModel) -> String {
+    let file_id = context.get_file_id();
+    semantic_model
+        .get_db()
+        .get_vfs()
+        .get_file_path(&file_id)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{file_id:?}"))
+}
+
 fn run_check<T: Checker>(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -110,6 +122,16 @@ fn run_check<T: Checker>(
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
     {
+        // `checker slow` only reports on completion, so a checker that never
+        // returns leaves no trace of itself at all. This names it on entry.
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "checker start: {} for {}",
+                std::any::type_name::<T>(),
+                checker_file_label(context, semantic_model)
+            );
+        }
+
         if !log::log_enabled!(log::Level::Info) {
             T::check(context, semantic_model);
             return;
@@ -124,12 +146,13 @@ fn run_check<T: Checker>(
                 .map(|c| c.get_name())
                 .collect::<Vec<_>>()
                 .join(",");
+            let path = checker_file_label(context, semantic_model);
             log::info!(
-                "checker slow: {}({}) cost {:?} for {:?}",
+                "checker slow: {}({}) cost {:?} for {}",
                 std::any::type_name::<T>(),
                 name,
                 elapsed,
-                context.get_file_id()
+                path
             );
         }
     }

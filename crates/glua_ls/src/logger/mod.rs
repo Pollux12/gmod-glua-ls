@@ -13,12 +13,27 @@ use crate::cmd_args::{CmdArgs, LogLevel};
 const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
 
+/// Work is spread over a thread pool, so interleaved debug/trace lines are only
+/// correlatable if each one says which thread wrote it.
+fn thread_tag(level: log::Level) -> String {
+    if level < log::Level::Debug {
+        return String::new();
+    }
+    // Pool threads all share one name, so the id is what actually distinguishes them.
+    let current = std::thread::current();
+    match current.name() {
+        Some(name) => format!(" {name}#{:?}", current.id()),
+        None => format!(" {:?}", current.id()),
+    }
+}
+
 pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
     let level = match cmd_args.log_level {
         LogLevel::Error => LevelFilter::Error,
         LogLevel::Warn => LevelFilter::Warn,
         LogLevel::Info => LevelFilter::Info,
         LogLevel::Debug => LevelFilter::Debug,
+        LogLevel::Trace => LevelFilter::Trace,
     };
 
     let cmd_log_path = cmd_args.log_path.clone();
@@ -74,10 +89,11 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
     let logger = Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[{} {} {}] {}",
+                "[{} {} {}{}] {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
                 record.level(),
                 record.target(),
+                thread_tag(record.level()),
                 message
             ))
         })
@@ -100,10 +116,11 @@ fn init_stderr_logger(level: LevelFilter) {
     let logger = Dispatch::new()
         .format(|out, message, record| {
             out.finish(format_args!(
-                "[{} {} {}] {}",
+                "[{} {} {}{}] {}",
                 Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
                 record.level(),
                 record.target(),
+                thread_tag(record.level()),
                 message
             ))
         })
