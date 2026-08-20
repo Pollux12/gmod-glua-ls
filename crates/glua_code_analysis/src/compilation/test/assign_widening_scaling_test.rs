@@ -367,4 +367,66 @@ local result = T["entry"].name
              (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
         );
     }
+
+    /// `count` reads of fields that do not exist, against one table that ends
+    /// up `count` fields wide.
+    fn index_misses_on_one_wide_table(count: usize) -> std::time::Duration {
+        let mut body = String::from("local store = {}\n");
+        for i in 0..count {
+            body.push_str(&format!("store.f{i} = {i}\nlocal miss{i} = store.g{i}\n"));
+        }
+        body.push_str("return store\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// The same reads and the same field count, spread so that no table is
+    /// more than one field wide.
+    fn index_misses_on_narrow_tables(count: usize) -> std::time::Duration {
+        let mut body = String::new();
+        for i in 0..count {
+            body.push_str(&format!(
+                "local store{i} = {{}}\nstore{i}.f{i} = {i}\nlocal miss{i} = store{i}.g{i}\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// Regression guard: a read of a field the table does not declare used to
+    /// fall through to passes that materialised every member of the owner and
+    /// then kept only the expression-keyed ones. A shared registry table with
+    /// tens of thousands of named fields made each miss cost a full walk,
+    /// which is what turned a 600-file gamemode's indexing into 28s of member
+    /// scanning.
+    ///
+    /// Both halves do the same number of reads over the same number of fields
+    /// and differ only in how wide any single table gets, so the ratio between
+    /// them isolates per-access cost that grows with owner width.
+    #[test]
+    #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
+    fn named_field_misses_do_not_scan_every_owner_member() {
+        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
+        let _ = index_misses_on_narrow_tables(100);
+
+        let narrow = index_misses_on_narrow_tables(2000);
+        let wide = index_misses_on_one_wide_table(2000);
+
+        // Measured at 2000: ~50x before the member scans were removed, ~10x
+        // after. The remainder is flow narrowing over the writes, which is
+        // not what this guards, so the ceiling sits between the two.
+        let ratio = wide.as_secs_f64() / narrow.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 25.0,
+            "field misses cost more on a wide table than on narrow ones \
+             (narrow -> {narrow:?}, wide -> {wide:?}, ratio {ratio:.1}x); \
+             a miss is probably walking every member of the owner again"
+        );
+    }
 }

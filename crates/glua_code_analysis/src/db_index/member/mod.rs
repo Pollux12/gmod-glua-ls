@@ -842,6 +842,57 @@ impl LuaMemberIndex {
         )
     }
 
+    /// The owner's members whose key is an expression rather than a name, in
+    /// the same order [`Self::get_members`] would yield them.
+    ///
+    /// Dynamic-key inference only reads these. Filtering them out of
+    /// `get_members` instead costs a walk of every named field, which on a
+    /// table like a shared registry is tens of thousands of members per
+    /// lookup.
+    pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner_members = self.owner_members.get(owner)?;
+        let mut member_ids = Vec::new();
+        for key in owner_members.expr_keys() {
+            match owner_members.get_member(key) {
+                Some(LuaMemberIndexItem::One(id)) => member_ids.push(*id),
+                Some(LuaMemberIndexItem::Many(ids)) => member_ids.extend(ids.iter().copied()),
+                None => {}
+            }
+        }
+        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        Some(
+            member_ids
+                .iter()
+                .filter_map(|member_id| self.get_member(member_id))
+                .collect(),
+        )
+    }
+
+    /// The owner's members under one key, in the same order
+    /// [`Self::get_members`] would yield them.
+    ///
+    /// Returns `None` only when the owner has no member map at all, so a
+    /// caller can still tell "no such owner" from "owner without that key".
+    pub fn get_members_with_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Option<Vec<&LuaMember>> {
+        let owner_members = self.owner_members.get(owner)?;
+        let mut member_ids = match owner_members.get_member(key) {
+            Some(LuaMemberIndexItem::One(id)) => vec![*id],
+            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
+            None => return Some(Vec::new()),
+        };
+        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        Some(
+            member_ids
+                .iter()
+                .filter_map(|member_id| self.get_member(member_id))
+                .collect(),
+        )
+    }
+
     pub fn get_member_keys<'a>(
         &'a self,
         owner: &LuaMemberOwner,

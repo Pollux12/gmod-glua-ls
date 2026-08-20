@@ -167,7 +167,16 @@ fn infer_owner_raw_member_type(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    let Some(owner_members) = db.get_member_index().get_members(&member_owner) else {
+    // See `infer_owner_raw_member_type_with_realm`: a literal access that got
+    // past the exact-key lookup can only be answered by an expression-keyed
+    // member, so the rest of the owner's members are not candidates.
+    let member_index = db.get_member_index();
+    let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
+        member_index.get_expr_key_members(&member_owner)
+    } else {
+        member_index.get_members(&member_owner)
+    };
+    let Some(owner_members) = owner_members else {
         return Err(InferFailReason::FieldNotFound);
     };
 
@@ -217,7 +226,18 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         return Err(InferFailReason::FieldNotFound);
     };
 
-    let Some(owner_members) = db.get_member_index().get_members(&member_owner) else {
+    // The exact-key lookup above already answered every member whose key is a
+    // literal, because two literal keys match only when they are equal. So a
+    // literal access that reaches here can only be answered by an
+    // expression-keyed member, and walking the rest costs the width of the
+    // table, which is tens of thousands of fields on a shared registry.
+    let member_index = db.get_member_index();
+    let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
+        member_index.get_expr_key_members(&member_owner)
+    } else {
+        member_index.get_members(&member_owner)
+    };
+    let Some(owner_members) = owner_members else {
         return Err(InferFailReason::FieldNotFound);
     };
 
