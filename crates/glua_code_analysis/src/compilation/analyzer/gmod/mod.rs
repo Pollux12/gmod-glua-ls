@@ -9862,7 +9862,13 @@ fn closure_from_signature_id(db: &DbIndex, signature_id: LuaSignatureId) -> Opti
         .get_vfs()
         .get_syntax_tree(&signature_id.get_file_id())?
         .get_red_root();
-    root.descendants()
+    // A signature's position is the offset its closure starts at, so descend
+    // to that offset rather than scanning every node in the file. Scanning
+    // cost a full walk per signature, which on a file with many functions is
+    // quadratic in the file.
+    root.token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
         .find(|closure| closure.get_position() == signature_id.get_position())
 }

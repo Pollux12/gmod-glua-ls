@@ -1131,8 +1131,12 @@ fn infer_forwarded_param_arg_type(
         .get_vfs()
         .get_syntax_tree(&signature_id.get_file_id())?
         .get_red_root();
+    // The signature's position is where its closure starts, so descend to that
+    // offset instead of scanning every node in the file.
     let closure = root
-        .descendants()
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
         .find(|closure| closure.get_position() == signature_id.get_position())?;
     let local_func_name = closure
