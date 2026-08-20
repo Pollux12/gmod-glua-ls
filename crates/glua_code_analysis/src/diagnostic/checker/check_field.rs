@@ -352,7 +352,7 @@ fn check_index_expr(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
     ) && !is_enum_type(db, &prefix_typ)
-        && is_nil_guarded_in_scope(index_expr)
+        && is_nil_guarded_in_scope(index_expr, code)
     {
         return Some(());
     }
@@ -1584,7 +1584,7 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
 /// Check if this index expression is inside an if-body where the condition
 /// guards the same field against nil (e.g., `if x.field ~= nil then ... end`
 /// or `if x.field then ... end`).
-fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
+fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, code: DiagnosticCode) -> bool {
     let target_text = index_expr.syntax().text().to_string();
     // Normalize colon-access to dot-access so that `obj:Method` matches `obj.Method`
     let normalized_target = target_text.replacen(':', ".", 1);
@@ -1701,6 +1701,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
                             if first_range.contains_range(node_range) {
                                 return true;
                             }
+                            // `obj.method and obj:method()` — the left operand
+                            // already tested this same member for presence.
+                            if is_truthy_check_in_condition(first, &normalized_target) {
+                                return true;
+                            }
                         }
                     }
                 }
@@ -1715,7 +1720,11 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr) -> bool {
 
     // Pattern: local assignment followed by nil-check of the assigned variable.
     // e.g., `local x = obj.field; if x then ...`
-    if is_local_assign_with_nil_check(index_expr, &normalized_target) {
+    //
+    // Not for `UndefinedMethod`, which is the code only for a receiver the
+    // checker is certain of. There the check speaks for the returned value and
+    // says nothing about whether the method name resolves.
+    if code != DiagnosticCode::UndefinedMethod && is_local_assign_with_nil_check(index_expr) {
         return true;
     }
 
@@ -1987,20 +1996,30 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
 /// Check if the field access is on the RHS of a local assignment, and the assigned
 /// variable is nil-checked in a following sibling statement.
 /// e.g., `local x = obj.field; if x then ...` or `local x = obj.field; if not x then return end`
-fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, _field_text: &str) -> bool {
+fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr) -> bool {
     // Walk up to find the parent LocalStat
     let local_stat = match index_expr.syntax().ancestors().find_map(LuaLocalStat::cast) {
         Some(s) => s,
         None => return false,
     };
 
-    // Get the variable name assigned in the local statement
-    let local_names: Vec<_> = local_stat.get_local_name_list().collect();
-    if local_names.is_empty() {
+    // The name the checked expression is bound to, which is the only one a
+    // guard can speak for. `local a, b = 1, obj.field` binds `b`, not `a`.
+    let Some(value_expr) = index_expr
+        .syntax()
+        .ancestors()
+        .find(|node| node.parent().as_ref() == Some(local_stat.syntax()))
+        .and_then(LuaExpr::cast)
+    else {
         return false;
-    }
-    let var_name = local_names[0].syntax().text().to_string();
-    let var_name = var_name.trim();
+    };
+    let Some(var_name) = local_stat
+        .get_local_name_by_value(value_expr)
+        .and_then(|name| name.get_name_token())
+    else {
+        return false;
+    };
+    let var_name = var_name.get_name_text();
 
     // Look at following sibling statements (up to 5) for a nil-check of the variable
     let local_stat_node = local_stat.syntax().clone();

@@ -4612,6 +4612,24 @@ owner:CompletelyMadeUpMethod()
         ));
     }
 
+    /// The guard has to name the local the field is bound to. Here the check is
+    /// on `a`, which is bound to `1`, so it says nothing about `unknownField`.
+    #[test]
+    fn test_nil_guard_local_assign_binds_the_checked_name() {
+        let mut ws = VirtualWorkspace::new();
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@class LocalAssignBindTest
+                local obj = {}
+                local a, b = 1, obj.unknownField
+                if a then
+                    print(a, b)
+                end
+            "#
+        ));
+    }
+
     #[test]
     fn test_nil_guard_early_return() {
         let mut ws = VirtualWorkspace::new();
