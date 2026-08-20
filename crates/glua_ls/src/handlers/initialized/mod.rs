@@ -191,6 +191,11 @@ pub async fn initialized_handler(
         workspace_diagnostic_configs,
         workspace_emmyrcs,
         watchdog_status.clone(),
+        context
+            .workspace_manager()
+            .read()
+            .await
+            .workspace_diagnostic_level_arc(),
     )
     .await;
 
@@ -211,6 +216,7 @@ pub async fn init_analysis(
     workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     watchdog_status: LongRunningWatchdogStatus,
+    workspace_diagnostic_level: Arc<std::sync::atomic::AtomicU8>,
 ) {
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
@@ -433,6 +439,18 @@ pub async fn init_analysis(
     }
 
     if lsp_features.supports_workspace_diagnostic() {
+        // The whole workspace was just indexed, so it owes a full sweep. The
+        // pending level is *claimed* by whichever pull arrives first and reset
+        // to `None`, and only a document change or a cancelled sweep ever puts
+        // it back. A pull that races startup therefore consumes the one level
+        // the workspace is given, completes against a half-built index, and
+        // every pull after it answers empty — leaving only the open file
+        // diagnosed until the user happens to type. Asking the client to
+        // re-pull without re-arming the level is a no-op by construction.
+        workspace_diagnostic_level.fetch_max(
+            crate::context::WorkspaceDiagnosticLevel::Slow.to_u8(),
+            std::sync::atomic::Ordering::AcqRel,
+        );
         if lsp_features.supports_refresh_diagnostic() {
             client.refresh_workspace_diagnostics();
         }
@@ -626,6 +644,9 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             LongRunningWatchdogStatus::new("test"),
+            Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::context::WorkspaceDiagnosticLevel::None.to_u8(),
+            )),
         ));
 
         let mut methods = Vec::new();

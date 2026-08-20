@@ -124,6 +124,7 @@ impl WorkspaceManager {
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
+        let workspace_diagnostic_level = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
             cancel_token.wait_for_reindex().await;
             if cancel_token.is_cancelled() {
@@ -157,6 +158,7 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
+                workspace_diagnostic_level,
             )
             .await;
             if lsp_features.supports_refresh_diagnostic() {
@@ -212,6 +214,7 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
+                workspace_diagnostic_status.clone(),
             )
             .await;
 
