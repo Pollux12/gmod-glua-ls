@@ -971,11 +971,39 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
-        self.get_member_history(owner)
-            .into_iter()
-            .filter(|member| member.get_global_id() == Some(global_id))
-            .map(|member| member.get_id())
-            .collect()
+        // A global path's last segment is the member key it is stored under, so
+        // the members declaring it are one bucket of the owner's history rather
+        // than all of it. Reading the whole history to filter it built and
+        // sorted every member the owner has ever held, once per resolution
+        // event, against paths that gain a member per assignment — on a
+        // workspace with 24k members under one path that was the single most
+        // expensive thing the unresolve phase did.
+        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            return Vec::new();
+        };
+        let name = global_id.get_name();
+        let last_segment = name.rsplit_once('.').map_or(name, |(_, last)| last);
+
+        let mut matched = Vec::new();
+        let collect = |key: &LuaMemberKey, matched: &mut Vec<LuaMemberId>| {
+            let Some(member_ids) = owner_items.get(key) else {
+                return;
+            };
+            matched.extend(member_ids.iter().copied().filter(|member_id| {
+                self.get_member(member_id)
+                    .and_then(|member| member.get_global_id())
+                    == Some(global_id)
+            }));
+        };
+        collect(&LuaMemberKey::Name(last_segment.into()), &mut matched);
+        // A numeric field is keyed by its integer, not by its spelling.
+        if let Ok(index) = last_segment.parse::<i64>() {
+            collect(&LuaMemberKey::Integer(index), &mut matched);
+        }
+
+        matched.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        matched.dedup();
+        matched
     }
 
     pub(crate) fn iter_current_owner_keys(
