@@ -3775,6 +3775,9 @@ fn collect_scripted_scope_type_bindings_with(
     if decls.is_empty() {
         return;
     }
+    // The class is anchored on the first declaration, so which one that is
+    // must not depend on the order the decl map happens to iterate in.
+    decls.sort_by_key(|(_, range)| (range.start(), range.end()));
 
     let class_decl_id = ensure_scoped_class_type_decl(
         db,
