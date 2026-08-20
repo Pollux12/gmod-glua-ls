@@ -1,4 +1,9 @@
-use std::{collections::HashSet, ops::Deref};
+use std::ops::Deref;
+
+// Every set below is a cycle guard for a graph walk: membership only, never
+// iterated, so the hasher cannot reach a result. The flow walk is hot enough
+// that hashing the ids with SipHash showed up in profiles.
+use rustc_hash::FxHashSet as HashSet;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
@@ -1617,7 +1622,7 @@ fn branch_has_relevant_special_call_effects(
         return false;
     };
 
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     antecedents.iter().copied().any(|flow_id| {
         antecedent_has_relevant_special_call_effect(
             db,
@@ -2016,7 +2021,7 @@ fn try_get_numeric_range_table_arg_population_type(
         rhs_expr,
         &query_root,
         key_name.as_deref(),
-        &mut HashSet::new(),
+        &mut HashSet::default(),
     ) {
         return Ok(None);
     }
@@ -2446,7 +2451,7 @@ fn call_effect_overlaps_mutation_roots(
             cache,
             call_expr,
             mutation_roots,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         ),
     };
     call_overlaps
@@ -3048,7 +3053,7 @@ fn antecedent_has_relevant_special_call_effect_before_node(
     flow_node: &FlowNode,
     var_ref_id: &VarRefId,
 ) -> bool {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     match flow_node.antecedent {
         Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
             db,
@@ -3533,7 +3538,7 @@ pub fn explicit_param_string_default_reaches_flow(
     use_flow_id: FlowId,
 ) -> bool {
     let var_ref_id = VarRefId::VarRef(decl_id);
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     explicit_default_reaches_inner(
         db,
         tree,
@@ -3741,7 +3746,7 @@ pub fn inferred_string_default_reaches_flow(
     default_source_range: rowan::TextRange,
 ) -> bool {
     let var_ref_id = VarRefId::VarRef(decl_id);
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     inferred_string_default_reaches_inner(
         db,
         tree,

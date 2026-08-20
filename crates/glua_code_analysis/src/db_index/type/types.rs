@@ -497,7 +497,11 @@ impl LuaType {
             1 => types[0].clone(),
             _ => {
                 let mut result_types = Vec::new();
-                let mut hash_set = HashSet::new();
+                // Membership only: the union's order comes from `result_types`,
+                // so the hasher cannot affect the result. Hashing a `LuaType`
+                // walks the whole type, and this runs on every union, which
+                // makes SipHash a measurable share of inference.
+                let mut hash_set = rustc_hash::FxHashSet::default();
                 for typ in types {
                     match typ {
                         LuaType::Union(u) => {
