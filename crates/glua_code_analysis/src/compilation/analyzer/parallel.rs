@@ -67,6 +67,11 @@ where
     // are claimed changes; each still holds its own file's result, so callers
     // see the same index-aligned `Vec` as before.
     let dispatch = dispatch_order(db, file_ids);
+    let report_step = if crate::progress::is_active() {
+        (n / 50).max(1)
+    } else {
+        0
+    };
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -79,6 +84,12 @@ where
                     let seq = next.fetch_add(1, Ordering::Relaxed);
                     if seq >= n {
                         break;
+                    }
+                    // Coarse enough that reporting never becomes the work: at
+                    // most one update per 2% of the batch, from whichever
+                    // worker happens to claim that slot.
+                    if report_step != 0 && seq % report_step == 0 {
+                        crate::progress::advance_current_phase(seq, n, "files");
                     }
                     let idx = dispatch[seq];
                     let file_id = file_ids[idx];

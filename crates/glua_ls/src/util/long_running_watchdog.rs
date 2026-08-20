@@ -44,15 +44,46 @@ impl LongRunningWatchdogSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Produces the "what is it stuck on" half of a watchdog line, if the task can
+/// say. Called only when the watchdog actually logs, so it may do real work.
+pub type WatchdogDetailSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct LongRunningWatchdogStatus {
     snapshot: Arc<Mutex<LongRunningWatchdogSnapshot>>,
+    /// Kept beside the snapshot rather than in it so the snapshot stays a
+    /// plain value that can be cloned and logged.
+    detail_source: Arc<Mutex<Option<WatchdogDetailSource>>>,
+}
+
+impl std::fmt::Debug for LongRunningWatchdogStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LongRunningWatchdogStatus")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LongRunningWatchdogStatus {
     pub fn new(phase: impl Into<String>) -> Self {
         Self {
             snapshot: Arc::new(Mutex::new(LongRunningWatchdogSnapshot::new(phase))),
+            detail_source: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Attach something that can name what the task is currently working on.
+    /// A count alone says a sweep is stuck; this says which file it is stuck
+    /// on, which is the part a user cannot work out for themselves.
+    pub fn set_detail_source(&self, source: WatchdogDetailSource) {
+        if let Ok(mut slot) = self.detail_source.lock() {
+            *slot = Some(source);
+        }
+    }
+
+    pub fn clear_detail_source(&self) {
+        if let Ok(mut slot) = self.detail_source.lock() {
+            *slot = None;
         }
     }
 
@@ -77,6 +108,23 @@ impl LongRunningWatchdogStatus {
             .lock()
             .map(|snapshot| snapshot.describe())
             .unwrap_or_else(|_| "status unavailable".to_string())
+    }
+
+    /// [`Self::describe`] plus whatever the detail source can add. Used for
+    /// the watchdog's own log lines, not for the client-facing progress
+    /// message, which should stay short.
+    pub fn describe_verbose(&self) -> String {
+        let described = self.describe();
+        let detail = self
+            .detail_source
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|source| source()))
+            .flatten();
+        match detail {
+            Some(detail) => format!("{described}; {detail}"),
+            None => described,
+        }
     }
 
     fn update(&self, update: impl FnOnce(&mut LongRunningWatchdogSnapshot)) {
@@ -148,7 +196,7 @@ pub fn spawn_long_running_watchdog(
                             "{} still running after {}s: {}",
                             task_name,
                             elapsed.as_secs(),
-                            status.describe()
+                            status.describe_verbose()
                         );
                     }
                 }

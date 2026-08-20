@@ -9,6 +9,7 @@ use crate::util::time_cancel_token;
 
 use super::ClientProxy;
 
+#[derive(Clone)]
 pub struct StatusBar {
     client: Arc<ClientProxy>,
     supports_work_done_progress: bool,

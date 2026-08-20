@@ -1,8 +1,10 @@
 mod best_log_path;
+mod non_blocking_stderr;
 
 use std::{env, fs, path::PathBuf};
 
 use best_log_path::get_best_log_dir;
+use non_blocking_stderr::NonBlockingStderr;
 use chrono::Local;
 use fern::Dispatch;
 use glua_code_analysis::file_path_to_uri;
@@ -25,6 +27,23 @@ fn thread_tag(level: log::Level) -> String {
         Some(name) => format!(" {name}#{:?}", current.id()),
         None => format!(" {:?}", current.id()),
     }
+}
+
+/// The shared line format. Applied once on the root dispatch so the log file
+/// and stderr carry identical text and a user can paste either at us.
+fn format_record(
+    out: fern::FormatCallback<'_>,
+    message: &std::fmt::Arguments<'_>,
+    record: &log::Record<'_>,
+) {
+    out.finish(format_args!(
+        "[{} {} {}{}] {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+        record.level(),
+        record.target(),
+        thread_tag(record.level()),
+        message
+    ))
 }
 
 pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
@@ -86,21 +105,17 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
         }
     };
 
+    // Also to stderr, not only to the file. An editor that starts the server
+    // as a child process shows its stderr in its own output panel, so this is
+    // what puts the log in front of a user reporting a problem instead of
+    // behind a path they have to be told to go and find. It is the
+    // non-blocking sink: a client that never reads stderr must not be able to
+    // stall analysis by letting the pipe fill.
     let logger = Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}{}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-                record.level(),
-                record.target(),
-                thread_tag(record.level()),
-                message
-            ))
-        })
-        // set level
+        .format(format_record)
         .level(level)
-        // set output
-        .chain(log_file);
+        .chain(log_file)
+        .chain(Box::new(NonBlockingStderr::new()) as Box<dyn std::io::Write + Send>);
 
     if let Err(e) = logger.apply() {
         eprintln!("Failed to apply logger: {:?}", e);
@@ -114,20 +129,9 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
 
 fn init_stderr_logger(level: LevelFilter) {
     let logger = Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}{}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-                record.level(),
-                record.target(),
-                thread_tag(record.level()),
-                message
-            ))
-        })
-        // set level
+        .format(format_record)
         .level(level)
-        // set output
-        .chain(std::io::stderr());
+        .chain(Box::new(NonBlockingStderr::new()) as Box<dyn std::io::Write + Send>);
 
     if let Err(e) = logger.apply() {
         eprintln!("Failed to apply logger: {:?}", e);

@@ -460,11 +460,14 @@ impl FileDiagnostic {
                 valid_file_count,
             );
         }
+        let in_flight = Arc::new(InFlightDiagnosticFiles::default());
+        watchdog_status.set_detail_source(in_flight.detail_source(self.analysis.clone()));
         let mut rx = spawn_workspace_diagnostic_workers(
             self.analysis.clone(),
             main_workspace_file_ids,
             shared_data,
             cancel_token.clone(),
+            in_flight,
         );
 
         let mut count = 0;
@@ -484,6 +487,16 @@ impl FileDiagnostic {
                     }
                     count += 1;
                     let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                    // The watchdog is in-memory and is what a stall report is
+                    // read from, so it tracks every file. Only the notification
+                    // to the client is rate-limited: gating both meant the last
+                    // eleven files of a thousand all read "99%", which hid
+                    // which file the sweep was actually stuck on.
+                    watchdog_status.set_progress(
+                        "Diagnosing workspace files (slow pull)",
+                        count,
+                        valid_file_count,
+                    );
                     if last_percentage != percentage_done {
                         last_percentage = percentage_done;
                         let message = format!(
@@ -494,11 +507,6 @@ impl FileDiagnostic {
                             ProgressTask::DiagnoseWorkspace,
                             Some(percentage_done),
                             Some(message),
-                        );
-                        watchdog_status.set_progress(
-                            "Diagnosing workspace files (slow pull)",
-                            count,
-                            valid_file_count,
                         );
                     }
                 }
@@ -511,6 +519,7 @@ impl FileDiagnostic {
             );
         }
 
+        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),
@@ -583,11 +592,14 @@ impl FileDiagnostic {
             );
         }
 
+        let in_flight = Arc::new(InFlightDiagnosticFiles::default());
+        watchdog_status.set_detail_source(in_flight.detail_source(self.analysis.clone()));
         let mut rx = spawn_workspace_diagnostic_workers(
             self.analysis.clone(),
             main_workspace_file_ids,
             shared_data,
             cancel_token.clone(),
+            in_flight,
         );
 
         let mut count = 0;
@@ -610,6 +622,13 @@ impl FileDiagnostic {
 
                         count += 1;
                         let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                        // See the slow pull above: the watchdog tracks every
+                        // file, only the client notification is rate-limited.
+                        watchdog_status.set_progress(
+                            "Diagnosing workspace files (fast pull)",
+                            count,
+                            valid_file_count,
+                        );
                         if last_percentage != percentage_done {
                             last_percentage = percentage_done;
                             let message = format!(
@@ -620,11 +639,6 @@ impl FileDiagnostic {
                                 ProgressTask::DiagnoseWorkspace,
                                 Some(percentage_done),
                                 Some(message),
-                            );
-                            watchdog_status.set_progress(
-                                "Diagnosing workspace files (fast pull)",
-                                count,
-                                valid_file_count,
                             );
                         }
                     }
@@ -638,6 +652,7 @@ impl FileDiagnostic {
             );
         }
 
+        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),
@@ -678,6 +693,7 @@ fn spawn_workspace_diagnostic_workers(
     file_ids: Vec<FileId>,
     shared_data: Arc<SharedDiagnosticData>,
     cancel_token: CancellationToken,
+    in_flight: Arc<InFlightDiagnosticFiles>,
 ) -> tokio::sync::mpsc::Receiver<WorkspaceDiagnosticResult> {
     let worker_count = workspace_diagnostic_parallelism().min(file_ids.len());
     let file_ids = Arc::new(file_ids);
@@ -690,6 +706,7 @@ fn spawn_workspace_diagnostic_workers(
         let next_file = next_file.clone();
         let shared_data = shared_data.clone();
         let cancel_token = cancel_token.clone();
+        let in_flight = in_flight.clone();
         let tx = tx.clone();
         tokio::spawn(async move {
             loop {
@@ -702,6 +719,7 @@ fn spawn_workspace_diagnostic_workers(
                     break;
                 };
                 log::trace!("workspace diagnostic claim {:?}", file_id);
+                in_flight.claim(file_id);
                 let result = diagnose_workspace_file_off_thread(
                     analysis.clone(),
                     file_id,
@@ -709,6 +727,7 @@ fn spawn_workspace_diagnostic_workers(
                     cancel_token.clone(),
                 )
                 .await;
+                in_flight.release(file_id);
                 log::trace!("workspace diagnostic done {:?}", file_id);
                 if tx.send(result).await.is_err() {
                     log::trace!("workspace diagnostic worker exiting: receiver gone");
@@ -719,6 +738,89 @@ fn spawn_workspace_diagnostic_workers(
     }
 
     rx
+}
+
+/// The files the sweep has started and not finished.
+///
+/// A stalled sweep reports a count, and a count alone does not say which file
+/// to look at. Every file that is claimed is recorded here with when it was
+/// claimed, so the watchdog line can name the file that has been running
+/// longest, which is the one holding the sweep up.
+#[derive(Default)]
+pub struct InFlightDiagnosticFiles {
+    files: std::sync::Mutex<Vec<(FileId, std::time::Instant)>>,
+}
+
+impl InFlightDiagnosticFiles {
+    fn claim(&self, file_id: FileId) {
+        if let Ok(mut files) = self.files.lock() {
+            files.push((file_id, std::time::Instant::now()));
+        }
+    }
+
+    fn release(&self, file_id: FileId) {
+        if let Ok(mut files) = self.files.lock()
+            && let Some(index) = files.iter().position(|(id, _)| *id == file_id)
+        {
+            files.remove(index);
+        }
+    }
+
+    /// The in-flight files, longest-running first.
+    fn oldest_first(&self) -> Vec<(FileId, std::time::Duration)> {
+        let Ok(files) = self.files.lock() else {
+            return Vec::new();
+        };
+        let mut entries = files
+            .iter()
+            .map(|(id, started)| (*id, started.elapsed()))
+            .collect::<Vec<_>>();
+        entries.sort_by_key(|(_, elapsed)| std::cmp::Reverse(*elapsed));
+        entries
+    }
+
+    /// A watchdog detail source naming the files the sweep is still inside.
+    pub fn detail_source(
+        self: &Arc<Self>,
+        analysis: Arc<RwLock<EmmyLuaAnalysis>>,
+    ) -> crate::util::WatchdogDetailSource {
+        let in_flight = self.clone();
+        Arc::new(move || {
+            let entries = in_flight.oldest_first();
+            if entries.is_empty() {
+                return None;
+            }
+            // The read guard is only taken to turn ids into paths. If the
+            // sweep is stuck holding the lock this cannot get it, so the ids
+            // are reported bare rather than the watchdog going quiet.
+            let described = match analysis.try_read() {
+                Ok(analysis) => {
+                    let vfs = analysis.compilation.get_db().get_vfs();
+                    entries
+                        .iter()
+                        .take(3)
+                        .map(|(file_id, elapsed)| {
+                            let path = vfs
+                                .get_file_path(file_id)
+                                .map(|path| path.to_string_lossy().to_string())
+                                .unwrap_or_else(|| format!("{file_id:?}"));
+                            format!("{path} ({}s)", elapsed.as_secs())
+                        })
+                        .collect::<Vec<_>>()
+                }
+                Err(_) => entries
+                    .iter()
+                    .take(3)
+                    .map(|(file_id, elapsed)| format!("{file_id:?} ({}s)", elapsed.as_secs()))
+                    .collect::<Vec<_>>(),
+            };
+            Some(format!(
+                "{} file(s) still being diagnosed, longest first: {}",
+                entries.len(),
+                described.join(", ")
+            ))
+        })
+    }
 }
 
 fn claim_next_diagnostic_file(file_ids: &[FileId], next_file: &AtomicUsize) -> Option<FileId> {
@@ -813,11 +915,14 @@ async fn push_workspace_diagnostic(
         watchdog_status.set_progress("Diagnosing workspace files (push)", 0, valid_file_count);
     }
 
+    let in_flight = Arc::new(InFlightDiagnosticFiles::default());
+    watchdog_status.set_detail_source(in_flight.detail_source(analysis.clone()));
     let mut rx = spawn_workspace_diagnostic_workers(
         analysis,
         main_workspace_file_ids,
         shared_data,
         cancel_token.clone(),
+        in_flight,
     );
 
     let mut count = 0;
@@ -842,6 +947,13 @@ async fn push_workspace_diagnostic(
                     }
                     count += 1;
                     let percentage_done = ((count as f32 / valid_file_count as f32) * 100.0) as u32;
+                    // See the slow pull above: the watchdog tracks every file,
+                    // only the client notification is rate-limited.
+                    watchdog_status.set_progress(
+                        "Diagnosing workspace files (push)",
+                        count,
+                        valid_file_count,
+                    );
                     if last_percentage != percentage_done {
                         last_percentage = percentage_done;
                         if !silent {
@@ -855,11 +967,6 @@ async fn push_workspace_diagnostic(
                                 Some(message),
                             );
                         }
-                        watchdog_status.set_progress(
-                            "Diagnosing workspace files (push)",
-                            count,
-                            valid_file_count,
-                        );
                     }
                 }
             }
@@ -873,6 +980,7 @@ async fn push_workspace_diagnostic(
     }
 
     if !silent {
+        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),

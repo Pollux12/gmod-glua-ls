@@ -87,11 +87,24 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let mut slow_file_summary = slow_log_enabled.then(SlowLuaAnalyzeSummary::default);
         let mut file_count: usize = 0;
         let mut level_shape = node_profile_enabled.then(LevelShape::default);
+        // Type inference is the longest phase of a cold index, and its widest
+        // level can hold most of the workspace, so it reports inside the level
+        // rather than only at level boundaries. Coarse enough that reporting
+        // never becomes the work.
+        let progress_total = file_ids.len();
+        let progress_step = if crate::progress::is_active() && progress_total > 1 {
+            (progress_total / 50).max(1)
+        } else {
+            0
+        };
         for level in levels {
             if let Some(shape) = level_shape.as_mut() {
                 shape.begin_level(level.len());
             }
             for file_id in level {
+                if progress_step != 0 && file_count % progress_step == 0 {
+                    crate::progress::advance_current_phase(file_count, progress_total, "files");
+                }
                 if let Some(root) = tree_map.get(&file_id) {
                     let file_start = slow_log_enabled.then(Instant::now);
                     let is_scripted = scripted_scope_files.contains(&file_id);

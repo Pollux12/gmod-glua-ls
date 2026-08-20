@@ -15,7 +15,7 @@ use crate::{
     },
     handlers::text_document::register_files_watch,
     logger::init_logger,
-    util::{LongRunningWatchdogStatus, spawn_long_running_watchdog},
+    util::{AnalysisProgressReporter, LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
 pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
@@ -359,7 +359,17 @@ pub async fn init_analysis(
             watchdog_status.describe(),
         );
         log::info!("analyzing {} Lua files", file_count);
+
+        // `update_files_by_path` is one blocking call that runs every analysis
+        // pass, so without a sink the client sees "Analyzing Lua files 0/N"
+        // frozen for however long the whole index takes. The passes report the
+        // phase they enter; forward that to the status bar and the watchdog so
+        // a slow workspace says which pass it is slow in.
+        let _progress =
+            AnalysisProgressReporter::install(status_bar.clone(), watchdog_status.clone());
         mut_analysis.update_files_by_path(files);
+        drop(_progress);
+
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
