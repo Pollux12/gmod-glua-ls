@@ -1426,7 +1426,7 @@ fn table_const_has_no_specific_data(
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
 ) -> bool {
-    db.get_member_index().get_member_len(owner) == 0 && db.get_metatable_index().get(inst).is_none()
+    !db.get_member_index().has_live_member(owner) && db.get_metatable_index().get(inst).is_none()
 }
 
 fn infer_plain_table_member(

@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use super::traits::LuaIndex;
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+
 pub use assignment_contribution::{
     MemberAssignmentContribution, MemberAssignmentContributionKey,
     MemberAssignmentContributionStore,
@@ -819,7 +820,6 @@ impl LuaMemberIndex {
 
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
         let owner_members = self.owner_members.get(owner)?;
-
         if owner_members.get_member_len() == 0 {
             return Some(Vec::new());
         }
@@ -929,6 +929,22 @@ impl LuaMemberIndex {
             .map_or(0, |map| map.get_member_len())
     }
 
+    /// Whether the owner holds at least one member that still resolves.
+    ///
+    /// Not the same as a non-zero [`Self::get_member_len`]: removing a member
+    /// whose entry is already gone leaves its id behind under the owner, so a
+    /// key can outlive the member it points at. Stops at the first live id
+    /// rather than materialising the owner's whole member list.
+    pub fn has_live_member(&self, owner: &LuaMemberOwner) -> bool {
+        let Some(owner_members) = self.owner_members.get(owner) else {
+            return false;
+        };
+        owner_members.get_member_items().any(|item| match item {
+            LuaMemberIndexItem::One(id) => self.get_member(id).is_some(),
+            LuaMemberIndexItem::Many(ids) => ids.iter().any(|id| self.get_member(id).is_some()),
+        })
+    }
+
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
         self.member_current_owner.get(id)
     }
@@ -1017,18 +1033,24 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
-        // A global path's last segment is the member key it is stored under, so
-        // the members declaring it are one bucket of the owner's history rather
-        // than all of it. Reading the whole history to filter it built and
-        // sorted every member the owner has ever held, once per resolution
-        // event, against paths that gain a member per assignment — on a
-        // workspace with 24k members under one path that was the single most
-        // expensive thing the unresolve phase did.
+        // The member key is the part of the path below the owner, so the members
+        // declaring it are one bucket of the owner's history rather than all of
+        // it. Reading the whole history to filter it built and sorted every
+        // member the owner has ever held, once per resolution event, against
+        // paths that gain a member per assignment.
         let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
             return Vec::new();
         };
         let name = global_id.get_name();
-        let last_segment = name.rsplit_once('.').map_or(name, |(_, last)| last);
+        // Not the last dotted segment: a bracketed string key keeps its dots, so
+        // `T["a.b"] = v` stores one member keyed `a.b` under `T`.
+        let key_text = match owner {
+            LuaMemberOwner::GlobalPath(owner_id) => name
+                .strip_prefix(owner_id.get_name())
+                .and_then(|rest| rest.strip_prefix('.'))
+                .unwrap_or(name),
+            _ => name.rsplit_once('.').map_or(name, |(_, last)| last),
+        };
 
         let mut matched = Vec::new();
         let collect = |key: &LuaMemberKey, matched: &mut Vec<LuaMemberId>| {
@@ -1041,9 +1063,9 @@ impl LuaMemberIndex {
                     == Some(global_id)
             }));
         };
-        collect(&LuaMemberKey::Name(last_segment.into()), &mut matched);
+        collect(&LuaMemberKey::Name(key_text.into()), &mut matched);
         // A numeric field is keyed by its integer, not by its spelling.
-        if let Ok(index) = last_segment.parse::<i64>() {
+        if let Ok(index) = key_text.parse::<i64>() {
             collect(&LuaMemberKey::Integer(index), &mut matched);
         }
 
@@ -2622,5 +2644,68 @@ mod tests {
             None
         );
         assert_eq!(index.member_function_scope_range(member_id), None);
+    }
+
+    /// `MYTBL["net.handler"] = f` keys one member `net.handler` under `MYTBL`.
+    /// Its global path is `MYTBL.net.handler`, whose last dotted segment is
+    /// `handler` — a key nothing is stored under.
+    #[test]
+    fn history_for_a_global_path_finds_a_member_whose_key_contains_dots() {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL"));
+        let global_id = GlobalId::new("MYTBL.net.handler");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("net.handler".into()),
+                LuaMemberFeature::FileFieldDecl,
+                Some(global_id.clone()),
+            ),
+        );
+
+        assert_eq!(
+            index.get_member_history_for_global_path(&owner, &global_id),
+            vec![member_id]
+        );
+    }
+
+    #[test]
+    fn history_for_a_global_path_still_finds_a_plain_nested_member() {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL.net"));
+        let global_id = GlobalId::new("MYTBL.net.handler");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("handler".into()),
+                LuaMemberFeature::FileFieldDecl,
+                Some(global_id.clone()),
+            ),
+        );
+
+        assert_eq!(
+            index.get_member_history_for_global_path(&owner, &global_id),
+            vec![member_id]
+        );
+    }
+
+    #[test]
+    fn an_owner_whose_only_member_is_gone_has_no_live_member() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let file_id = FileId::new(1);
+        let member_id = make_member_id(file_id, 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+        assert!(index.has_live_member(&owner));
+
+        index.remove(file_id);
+        assert!(!index.has_live_member(&owner));
     }
 }
