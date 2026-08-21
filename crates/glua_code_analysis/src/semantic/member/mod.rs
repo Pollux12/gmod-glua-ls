@@ -5,6 +5,8 @@ mod infer_raw_member;
 
 use std::collections::HashSet;
 
+use rustc_hash::FxHashSet;
+
 use crate::{
     DbIndex, FileId, GmodStateMask, InFiled, LuaDecl, LuaMemberFeature, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaSemanticDeclId, TypeOps,
@@ -146,11 +148,26 @@ pub(crate) fn local_class_table_member_ids(
 
     let member_index = db.get_member_index();
     let mut member_ids = Vec::new();
+    // A class declared several times in one file names that file once per
+    // declaration, and each of them would otherwise scan the same declarations.
+    let mut scanned_files = FxHashSet::default();
     for location in type_decl.get_locations() {
+        if !scanned_files.insert(location.file_id) {
+            continue;
+        }
         let Some(decl_tree) = db.get_decl_index().get_decl_tree(&location.file_id) else {
             continue;
         };
         for decl in decl_tree.get_decls().values() {
+            // `local_table_decl_member_owner` opens with these two conditions
+            // and they are field reads, so they run before the index lookups.
+            // Keep them in step with it.
+            if decl
+                .get_initializer()
+                .is_none_or(|initializer| initializer.get_ret_idx() != 0)
+            {
+                continue;
+            }
             if !decl_binds_type(db, decl, type_id) {
                 continue;
             }
