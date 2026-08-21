@@ -1,5 +1,8 @@
-use std::{collections::HashMap, sync::Arc};
-use tokio::sync::{Mutex, Notify, RwLock, RwLockReadGuard};
+use std::{
+    collections::HashMap,
+    sync::{Arc, Mutex, MutexGuard},
+};
+use tokio::sync::{Notify, RwLock, RwLockReadGuard};
 use tokio_util::sync::CancellationToken;
 
 use glua_code_analysis::EmmyLuaAnalysis;
@@ -75,8 +78,18 @@ impl ServerContextSnapshot {
         self.inner.debounced_analysis.clone()
     }
 
-    pub async fn note_document_seen_version(&self, uri: &Uri, version: i32) {
-        let mut versions = self.inner.document_versions.lock().await;
+    /// The document version map is a leaf: a synchronous lock, so it can never
+    /// be held across an `.await` and every caller is free to take it while
+    /// holding an analysis lock.
+    fn document_versions(&self) -> MutexGuard<'_, HashMap<Uri, DocumentVersionState>> {
+        self.inner
+            .document_versions
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    pub fn note_document_seen_version(&self, uri: &Uri, version: i32) {
+        let mut versions = self.document_versions();
         let applied_version = match versions.get(uri).copied() {
             Some(DocumentVersionState::Open {
                 applied_version, ..
@@ -94,15 +107,12 @@ impl ServerContextSnapshot {
         self.inner.document_version_notify.notify_waiters();
     }
 
-    pub async fn has_newer_seen_document_version(&self, uri: &Uri, version: i32) -> bool {
-        is_stale_document_version(
-            self.inner.document_versions.lock().await.get(uri).copied(),
-            version,
-        )
+    pub fn has_newer_seen_document_version(&self, uri: &Uri, version: i32) -> bool {
+        is_stale_document_version(self.document_versions().get(uri).copied(), version)
     }
 
-    pub async fn note_document_applied_version(&self, uri: &Uri, version: i32) {
-        let mut versions = self.inner.document_versions.lock().await;
+    pub fn note_document_applied_version(&self, uri: &Uri, version: i32) {
+        let mut versions = self.document_versions();
         let next_state = match versions.get(uri).copied() {
             Some(DocumentVersionState::Open { seen_version, .. }) => DocumentVersionState::Open {
                 seen_version,
@@ -129,7 +139,7 @@ impl ServerContextSnapshot {
             tokio::pin!(notified);
             notified.as_mut().enable();
 
-            let is_fresh = match self.inner.document_versions.lock().await.get(uri).copied() {
+            let is_fresh = match self.document_versions().get(uri).copied() {
                 Some(DocumentVersionState::Open {
                     seen_version,
                     applied_version,
@@ -149,18 +159,15 @@ impl ServerContextSnapshot {
         }
     }
 
-    pub async fn is_document_closed(&self, uri: &Uri) -> bool {
+    pub fn is_document_closed(&self, uri: &Uri) -> bool {
         matches!(
-            self.inner.document_versions.lock().await.get(uri).copied(),
+            self.document_versions().get(uri).copied(),
             Some(DocumentVersionState::Closed)
         )
     }
 
-    pub async fn mark_document_closed(&self, uri: &Uri) {
-        self.inner
-            .document_versions
-            .lock()
-            .await
+    pub fn mark_document_closed(&self, uri: &Uri) {
+        self.document_versions()
             .insert(uri.clone(), DocumentVersionState::Closed);
         self.inner.document_version_notify.notify_waiters();
     }
@@ -200,6 +207,7 @@ pub struct ServerContextInner {
     pub status_bar: Arc<StatusBar>,
     pub lsp_features: Arc<LspFeatures>,
     pub debounced_analysis: Arc<DebouncedAnalysis>,
+    /// Leaf lock: see [`ServerContextSnapshot::document_versions`].
     pub document_versions: Arc<Mutex<HashMap<Uri, DocumentVersionState>>>,
     pub document_version_notify: Arc<Notify>,
 }
@@ -249,8 +257,8 @@ mod tests {
             let snapshot = context.snapshot();
             let uri = Uri::from_str("file:///format.lua").expect("uri should parse");
 
-            snapshot.note_document_seen_version(&uri, 2).await;
-            snapshot.note_document_applied_version(&uri, 1).await;
+            snapshot.note_document_seen_version(&uri, 2);
+            snapshot.note_document_applied_version(&uri, 1);
 
             let waiter_snapshot = snapshot.clone();
             let waiter_uri = uri.clone();
@@ -266,7 +274,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
             verify_that!(waiter.is_finished(), eq(false))?;
 
-            snapshot.note_document_applied_version(&uri, 2).await;
+            snapshot.note_document_applied_version(&uri, 2);
 
             let completed = tokio::time::timeout(Duration::from_secs(1), waiter)
                 .await

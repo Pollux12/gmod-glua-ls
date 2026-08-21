@@ -70,9 +70,7 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot
-                .note_document_seen_version(&uri, params.text_document.version)
-                .await;
+            snapshot.note_document_seen_version(&uri, params.text_document.version);
             // Exempted requests wait for fresh data instead of being
             // cancelled: the client clears a file on a cancelled diagnostic
             // pull, and a cancelled executeCommand drops the user's command.
@@ -103,9 +101,7 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot
-                .note_document_seen_version(&uri, params.text_document.version)
-                .await;
+            snapshot.note_document_seen_version(&uri, params.text_document.version);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
@@ -138,7 +134,7 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot.mark_document_closed(&uri).await;
+            snapshot.mark_document_closed(&uri);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);

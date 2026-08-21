@@ -85,7 +85,7 @@ pub async fn on_pull_document_diagnostic(
 
     // Cache for `keep_client_state` replay — but not for a closed document,
     // whose final pull would re-insert the entry `didClose` just dropped.
-    if !context.is_document_closed(&uri).await {
+    if !context.is_document_closed(&uri) {
         context
             .file_diagnostic()
             .cache_fresh_file_diagnostics(&uri, &diagnostics)
