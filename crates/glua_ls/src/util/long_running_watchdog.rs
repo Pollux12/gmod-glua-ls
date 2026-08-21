@@ -79,12 +79,6 @@ impl LongRunningWatchdogStatus {
         }
     }
 
-    pub fn clear_detail_source(&self) {
-        if let Ok(mut slot) = self.detail_source.lock() {
-            *slot = None;
-        }
-    }
-
     pub fn set_phase(&self, phase: impl Into<String>) {
         self.update(|snapshot| {
             snapshot.phase = phase.into();

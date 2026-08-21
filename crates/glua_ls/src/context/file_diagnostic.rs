@@ -516,7 +516,6 @@ impl FileDiagnostic {
             );
         }
 
-        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),
@@ -648,7 +647,6 @@ impl FileDiagnostic {
             );
         }
 
-        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),
@@ -704,6 +702,9 @@ fn spawn_workspace_diagnostic_workers(
         let cancel_token = cancel_token.clone();
         let in_flight = in_flight.clone();
         let tx = tx.clone();
+        // Per worker, never per file: fern flushes every record, so a line per
+        // file turns a workspace sweep into a log-I/O hotspot. Per-file
+        // visibility comes from `InFlightDiagnosticFiles` via the watchdog.
         tokio::spawn(async move {
             loop {
                 if cancel_token.is_cancelled() {
@@ -714,7 +715,6 @@ fn spawn_workspace_diagnostic_workers(
                     log::trace!("workspace diagnostic worker exiting: queue drained");
                     break;
                 };
-                log::trace!("workspace diagnostic claim {:?}", file_id);
                 in_flight.claim(file_id);
                 let result = diagnose_workspace_file_off_thread(
                     analysis.clone(),
@@ -724,7 +724,6 @@ fn spawn_workspace_diagnostic_workers(
                 )
                 .await;
                 in_flight.release(file_id);
-                log::trace!("workspace diagnostic done {:?}", file_id);
                 if tx.send(result).await.is_err() {
                     log::trace!("workspace diagnostic worker exiting: receiver gone");
                     break;
@@ -837,7 +836,6 @@ async fn diagnose_workspace_file_off_thread(
             return None;
         }
 
-        log::trace!("diagnosing {file_id:?} on this thread");
         // Diagnose under a blocking read lock to avoid starving Tokio worker threads.
         let guard = blocking_analysis.blocking_read();
         let diagnostics = guard.diagnose_file_with_shared(
@@ -970,7 +968,6 @@ async fn push_workspace_diagnostic(
     }
 
     if !silent {
-        watchdog_status.clear_detail_source();
         status_bar.finish_progress_task(
             ProgressTask::DiagnoseWorkspace,
             Some("Diagnostics complete".to_string()),
