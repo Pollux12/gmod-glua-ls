@@ -33,6 +33,10 @@ pub struct DebouncedAnalysis {
     client: Arc<ClientProxy>,
     workspace_diagnostic_level: Arc<AtomicU8>,
     lsp_features: Arc<crate::context::LspFeatures>,
+    /// Entries into [`Self::wait_until_fresh_for`], so a test can synchronise
+    /// on a handler having reached the wait instead of on a deadline.
+    #[cfg(test)]
+    freshness_waits: AtomicUsize,
 }
 
 impl DebouncedAnalysis {
@@ -59,6 +63,8 @@ impl DebouncedAnalysis {
             client,
             workspace_diagnostic_level,
             lsp_features,
+            #[cfg(test)]
+            freshness_waits: AtomicUsize::new(0),
         }
     }
 
@@ -131,6 +137,11 @@ impl DebouncedAnalysis {
         self.in_flight_changes.load(Ordering::Acquire)
     }
 
+    #[cfg(test)]
+    pub(crate) fn freshness_wait_count(&self) -> usize {
+        self.freshness_waits.load(Ordering::Acquire)
+    }
+
     /// Wait until all pending document changes have been reindexed.
     ///
     /// Returns `true` when the analysis is fresh, `false` if the cancel token
@@ -141,6 +152,9 @@ impl DebouncedAnalysis {
         cancel_token: &CancellationToken,
         request_method: &'static str,
     ) -> bool {
+        #[cfg(test)]
+        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
+
         let started_at = Instant::now();
         let mut warned_stuck = false;
 
@@ -362,9 +376,12 @@ impl DebouncedAnalysis {
         );
 
         // `in_flight_changes` is not covered by the locks above, so a
-        // concurrent `begin_in_flight_change()` could have published `true`
-        // between the load and the store. Its `fetch_add` precedes that store,
-        // so re-reading here cannot miss it.
+        // concurrent `begin_in_flight_change()` can land between the load and
+        // the store and have its `true` overwritten. Re-reading narrows that
+        // window rather than closing it; what is guaranteed is only that the
+        // flag ends up `true` for any change whose `fetch_add` is visible by
+        // the time this second load runs. A change that arrives later still
+        // sets the flag itself, and `finish_in_flight_changes` calls back here.
         if self.in_flight_changes.load(Ordering::Acquire) > 0 {
             self.has_pending_changes.store(true, Ordering::Release);
         }

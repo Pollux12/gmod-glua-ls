@@ -20,7 +20,7 @@ use lsp_types::{ClientCapabilities, Uri};
 pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;
 pub use status_bar::StatusBar;
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 pub use workspace_manager::*;
@@ -31,9 +31,23 @@ use crate::context::snapshot::ServerContextInner;
 // 1. diagnostic_tokens  2. workspace_diagnostic_token  3. cached_file_diagnostics
 // 4. update_token  5. analysis(read)  6. workspace_manager(read)
 // 7. workspace_manager(write)  8. analysis(write)
-// Leaf: document_versions — statement-scoped only; never hold across an
-// `.await` that takes another lock. Never upgrade read→write in place; avoid
-// holding any lock across `.await`. Atomics are exempt.
+// Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
+// are released before anything above is taken.
+// Leaf: document_versions — a synchronous lock, so it can never be held across
+// an `.await`. Never upgrade read→write in place; avoid holding any lock across
+// `.await`. Atomics are exempt.
+
+/// Panics the debounce supervisor will restart before it stops trying.
+const DEBOUNCE_RESTART_LIMIT: u32 = 5;
+
+const DEBOUNCE_RESTART_BACKOFF_BASE: Duration = Duration::from_millis(200);
+const DEBOUNCE_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+fn debounce_restart_backoff(restarts: u32) -> Duration {
+    DEBOUNCE_RESTART_BACKOFF_BASE
+        .saturating_mul(1_u32 << restarts.min(16).saturating_sub(1))
+        .min(DEBOUNCE_RESTART_BACKOFF_MAX)
+}
 
 #[derive(Clone)]
 pub struct RequestTaskMetadata {
@@ -162,6 +176,7 @@ impl ServerContext {
             let da = debounced_analysis.clone();
             let shutdown = debounced_shutdown.clone();
             tokio::spawn(async move {
+                let mut restarts = 0_u32;
                 while !shutdown.is_cancelled() {
                     let task = tokio::spawn({
                         let da = da.clone();
@@ -171,11 +186,27 @@ impl ServerContext {
                         // `run` only returns on shutdown.
                         Ok(()) => return,
                         Err(err) => {
+                            restarts += 1;
+                            if restarts > DEBOUNCE_RESTART_LIMIT {
+                                log::error!(
+                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits park until their request is cancelled: {}",
+                                    restarts,
+                                    err
+                                );
+                                return;
+                            }
                             log::error!(
                                 "LS_DEBOUNCE_LOOP_PANIC debounced analysis loop died, restarting: {}",
                                 err
                             );
                         }
+                    }
+
+                    // A panic on entry would otherwise respawn at full CPU,
+                    // and every restart writes a log line.
+                    tokio::select! {
+                        _ = tokio::time::sleep(debounce_restart_backoff(restarts)) => {}
+                        _ = shutdown.cancelled() => return,
                     }
                 }
             });
@@ -189,7 +220,7 @@ impl ServerContext {
             status_bar,
             lsp_features,
             debounced_analysis,
-            document_versions: Arc::new(Mutex::new(HashMap::new())),
+            document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             document_version_notify: Arc::new(Notify::new()),
         });
 
@@ -339,7 +370,8 @@ impl ServerContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        LspFeatures, RequestTaskMetadata, ServerContext, WorkspaceDiagnosticLevel, cancel_error,
+        DEBOUNCE_RESTART_BACKOFF_MAX, LspFeatures, RequestTaskMetadata, ServerContext,
+        WorkspaceDiagnosticLevel, cancel_error, debounce_restart_backoff,
         keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
     };
     use googletest::prelude::*;
@@ -347,6 +379,13 @@ mod tests {
     use lsp_types::ClientCapabilities;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn debounce_restart_backoff_doubles_then_saturates() {
+        assert_eq!(debounce_restart_backoff(1), Duration::from_millis(200));
+        assert_eq!(debounce_restart_backoff(3), Duration::from_millis(800));
+        assert_eq!(debounce_restart_backoff(60), DEBOUNCE_RESTART_BACKOFF_MAX);
+    }
 
     #[gtest]
     fn stale_inlay_and_code_lens_response_requires_non_empty_array() -> Result<()> {

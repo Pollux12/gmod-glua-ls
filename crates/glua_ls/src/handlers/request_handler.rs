@@ -265,6 +265,7 @@ pub async fn on_request_handler(
 mod tests {
     use super::extract_uri_from_value;
     use glua_code_analysis::LuaDeclId;
+    use googletest::prelude::*;
     use rowan::TextSize;
     use serde_json::json;
     use std::str::FromStr;
@@ -276,11 +277,10 @@ mod tests {
         completion::{CompletionData, CompletionDataType},
     };
 
-    #[test]
-    fn fresh_index_requests_do_not_answer_until_analysis_settles() {
+    #[gtest]
+    fn fresh_index_requests_do_not_answer_until_analysis_settles() -> Result<()> {
         use super::{Completion, LspRequest, on_request_handler};
         use crate::context::ServerContext;
-        use googletest::prelude::*;
         use lsp_server::{Connection, Message};
         use lsp_types::ClientCapabilities;
         use std::time::Duration;
@@ -291,10 +291,11 @@ mod tests {
         runtime.block_on(async {
             let mut context = ServerContext::new(server_connection, ClientCapabilities::default());
             let snapshot = context.snapshot();
+            let debounced_analysis = snapshot.debounced_analysis_arc();
 
             // Mark analysis dirty exactly as a didChange does, before the
             // request arrives.
-            let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            let in_flight = debounced_analysis.begin_in_flight_change();
 
             let request = lsp_server::Request::new(
                 1.into(),
@@ -308,14 +309,17 @@ mod tests {
                 .await
                 .expect("dispatch should succeed");
 
-            // Dirty: the handler must still be parked in the freshness wait.
-            verify_that!(
-                peer.receiver
-                    .recv_timeout(Duration::from_millis(150))
-                    .is_err(),
-                eq(true)
-            )
-            .expect("no response may be sent while the index is stale");
+            // Wait for the condition, not for a deadline: once the handler is
+            // inside the freshness wait it cannot leave while the change is
+            // in flight, so an empty channel here is not a race.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while debounced_analysis.freshness_wait_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the handler should reach the freshness wait");
+            verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
 
             // Settling the change releases the wait.
             in_flight.finish().await;
@@ -324,9 +328,9 @@ mod tests {
                 .receiver
                 .recv_timeout(Duration::from_secs(5))
                 .expect("a response must arrive once analysis is fresh");
-            verify_that!(matches!(message, Message::Response(_)), eq(true))
-                .expect("the settled request should produce a response");
-        });
+            verify_that!(matches!(message, Message::Response(_)), eq(true))?;
+            Ok(())
+        })
     }
 
     #[test]
