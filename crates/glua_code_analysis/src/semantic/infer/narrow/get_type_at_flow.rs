@@ -1299,7 +1299,27 @@ fn call_flow_node_returns_never(
     call_expr_returns_never(db, cache, call_expr)
 }
 
+/// The flow walk asks this of every call node it reaches, and the same call is
+/// reached again by every later query that walks through it, so the answer is
+/// memoised for as long as the types it reads hold still.
 fn call_expr_returns_never(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: glua_parser::LuaCallExpr,
+) -> bool {
+    let syntax_id = call_expr.get_syntax_id();
+    if let Some(returns_never) = cache.call_returns_never_cache.get(&syntax_id) {
+        return *returns_never;
+    }
+
+    let returns_never = call_expr_returns_never_uncached(db, cache, call_expr);
+    cache
+        .call_returns_never_cache
+        .insert(syntax_id, returns_never);
+    returns_never
+}
+
+fn call_expr_returns_never_uncached(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: glua_parser::LuaCallExpr,
