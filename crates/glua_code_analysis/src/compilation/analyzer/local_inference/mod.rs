@@ -236,10 +236,31 @@ fn compare_unguarded_child_candidates(
         .then_with(|| left.stable_cmp(right))
 }
 
+fn in_filed_order(value: &InFiled<glua_parser::LuaSyntaxId>) -> (u32, u32, u32) {
+    let range = value.value.get_range();
+    (
+        value.file_id.id,
+        u32::from(range.start()),
+        u32::from(range.end()),
+    )
+}
+
 /// Declared member types already looked up in this pass. `infer_raw_member_type`
 /// reads the member index, so the answer only depends on the pair, and a member
 /// path repeats at every use of the declaration it hangs off.
 type DeclaredPathBases = FxHashMap<(LuaType, LuaMemberKey), Option<(LuaType, LuaTypeDeclId)>>;
+
+/// What every member path rooted at one declaration shares, plus the two
+/// accumulators the whole pass shares.
+struct MemberPathEvidence<'a> {
+    file_id: crate::FileId,
+    root_decl_id: crate::LuaDeclId,
+    declared_root_type: Option<&'a LuaType>,
+    direct_subtype_members: &'a DirectSubtypeMembers,
+    candidate_members: &'a FxHashSet<LuaMemberKey>,
+    declared_path_bases: &'a mut DeclaredPathBases,
+    scores: &'a mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
+}
 
 /// The evidence sites of one declaration, with whether each sits inside a
 /// `return`.
@@ -354,35 +375,30 @@ pub(super) fn stabilize_unguarded_children(
             let base_type = declaration_base_type(db, context, decl_id);
 
             // A member path reached from this declaration, e.g. `self.Owner` in
-            // `self.Owner:ConCommand()`. Collected here rather than from a walk
-            // of the file so it costs one parent hop per site already scanned.
-            for (name_expr, receiver) in &sites {
-                let Some(index_expr) = receiver
-                    .syntax()
-                    .parent()
-                    .and_then(LuaIndexExpr::cast)
-                    .filter(|parent| {
-                        parent
-                            .get_prefix_expr()
-                            .is_some_and(|prefix| prefix.syntax() == receiver.syntax())
-                    })
-                else {
-                    continue;
-                };
-                collect_member_path_unguarded_child_evidence(
-                    db,
-                    context,
-                    file_id,
-                    decl_id,
-                    base_type.as_ref(),
-                    name_expr,
-                    receiver,
-                    &index_expr,
-                    &direct_subtype_members,
-                    &nested_candidate_members,
-                    &mut declared_path_bases,
-                    &mut nested_scores,
-                );
+            // `self.Owner:ConCommand()`. Climbed from the sites already scanned
+            // rather than from a walk of the file, so each level of the path
+            // costs one parent hop.
+            let mut evidence = MemberPathEvidence {
+                file_id,
+                root_decl_id: decl_id,
+                declared_root_type: base_type.as_ref(),
+                direct_subtype_members: &direct_subtype_members,
+                candidate_members: &nested_candidate_members,
+                declared_path_bases: &mut declared_path_bases,
+                scores: &mut nested_scores,
+            };
+            for (_, receiver) in &sites {
+                let mut receiver = receiver.clone();
+                while let Some(index_expr) = member_path_parent(&receiver) {
+                    collect_member_path_unguarded_child_evidence(
+                        db,
+                        context,
+                        &mut evidence,
+                        &receiver,
+                        &index_expr,
+                    );
+                    receiver = index_expr;
+                }
             }
 
             let Some(base_type) = base_type else {
@@ -560,6 +576,10 @@ pub(super) fn stabilize_unguarded_children(
 
     let mut updates = Vec::new();
     let mut update_sources = Vec::new();
+    // Both score maps are hashed, and their entries decide the order facts are
+    // published and reported in.
+    let mut scores = scores.into_iter().collect::<Vec<_>>();
+    scores.sort_by(|(left, _), (right, _)| left.stable_cmp(right));
     for (definition, candidates) in scores {
         let found_type = candidates.parent_type;
         let candidates = candidates.children;
@@ -636,7 +656,9 @@ pub(super) fn stabilize_unguarded_children(
         ));
     }
 
-    for (_, candidates) in nested_scores {
+    let mut nested_scores = nested_scores.into_values().collect::<Vec<_>>();
+    nested_scores.sort_by_key(|candidates| in_filed_order(&candidates.source));
+    for candidates in nested_scores {
         let found_type = candidates.parent_type;
         let Some(max_score) = candidates.children.values().map(FxHashSet::len).max() else {
             continue;
@@ -671,8 +693,9 @@ pub(super) fn stabilize_unguarded_children(
         support.sort_by(LuaInferenceNodeId::stable_cmp);
         support.dedup();
         update_sources.push(candidates.source.clone());
-        let nodes = candidates
-            .receivers
+        let mut receivers = candidates.receivers.into_iter().collect::<Vec<_>>();
+        receivers.sort_by_key(in_filed_order);
+        let nodes = receivers
             .into_iter()
             .map(|receiver| LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(receiver)));
         let event_node =
@@ -749,27 +772,31 @@ pub(super) fn stabilize_unguarded_children(
     }
 }
 
-/// Records evidence for one member path use, e.g. `receiver` = `self.Owner` and
-/// `index_expr` = `self.Owner:ConCommand`.
-///
-/// The base type comes from the declared member, which is a member index lookup.
-/// Reading it off the receiver expression instead would run a flow walk, and the
-/// child lookup below discards most uses before their narrowed type matters.
-#[allow(clippy::too_many_arguments)]
+/// The next level of a member path, e.g. `self.Owner:ConCommand` from
+/// `self.Owner`.
+fn member_path_parent(receiver: &LuaIndexExpr) -> Option<LuaIndexExpr> {
+    receiver
+        .syntax()
+        .parent()
+        .and_then(LuaIndexExpr::cast)
+        .filter(|parent| {
+            parent
+                .get_prefix_expr()
+                .is_some_and(|prefix| prefix.syntax() == receiver.syntax())
+        })
+}
+
+/// Records evidence for one level of a member path, e.g. `receiver` =
+/// `self.Owner` and `index_expr` = `self.Owner:ConCommand`. A deeper path calls
+/// this once per level.
 fn collect_member_path_unguarded_child_evidence(
     db: &crate::DbIndex,
     context: &mut AnalyzeContext,
-    file_id: crate::FileId,
-    root_decl_id: crate::LuaDeclId,
-    declared_root_type: Option<&LuaType>,
-    name_expr: &LuaNameExpr,
+    evidence: &mut MemberPathEvidence<'_>,
     receiver: &LuaIndexExpr,
     index_expr: &LuaIndexExpr,
-    direct_subtype_members: &DirectSubtypeMembers,
-    candidate_members: &FxHashSet<LuaMemberKey>,
-    declared_path_bases: &mut DeclaredPathBases,
-    scores: &mut HashMap<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>,
 ) {
+    let file_id = evidence.file_id;
     let cache = context.infer_manager.get_infer_cache(file_id);
     let Some(index_key) = index_expr.get_index_key() else {
         return;
@@ -780,7 +807,7 @@ fn collect_member_path_unguarded_child_evidence(
     let Ok(member_key) = LuaMemberKey::from_index_key(db, cache, &index_key) else {
         return;
     };
-    if !candidate_members.contains(&member_key) {
+    if !evidence.candidate_members.contains(&member_key) {
         return;
     }
     if is_assignment_target(index_expr) {
@@ -795,12 +822,18 @@ fn collect_member_path_unguarded_child_evidence(
     else {
         return;
     };
-    // The declaration's own type, resolved once for this whole reference set.
-    // Reading it off each `name_expr` instead would run a flow walk per use, and
-    // the child lookup below rules most uses out before narrowing matters.
-    let prefix_type = match declared_root_type {
-        Some(typ) => typ.clone(),
-        None => match infer_expr(db, cache, LuaExpr::NameExpr(name_expr.clone())) {
+    let Some(prefix) = receiver.get_prefix_expr() else {
+        return;
+    };
+    // At the first level the prefix is the root declaration, whose type is
+    // already resolved for its whole reference set; reading it off the name
+    // expression would run a flow walk per use, and the child lookup below rules
+    // most uses out before narrowing matters. Deeper levels have no such
+    // shortcut and infer their prefix, which the narrowed type below then reads
+    // back from the same cache.
+    let prefix_type = match evidence.declared_root_type {
+        Some(typ) if matches!(prefix, LuaExpr::NameExpr(_)) => typ.clone(),
+        _ => match infer_expr(db, cache, prefix) {
             Ok(typ) => typ,
             Err(_) => return,
         },
@@ -813,7 +846,13 @@ fn collect_member_path_unguarded_child_evidence(
     {
         return;
     }
-    let declared_base = match declared_path_bases.get(&(prefix_type.clone(), receiver_key.clone()))
+    // `infer_raw_member_type` answers from the member and type indexes alone: it
+    // takes no file and no offset, and the cache it is handed only memoises a
+    // lookup keyed by the same type and member. The pair is therefore the whole
+    // key, and the indexes it reads do not change until this pass publishes.
+    let declared_base = match evidence
+        .declared_path_bases
+        .get(&(prefix_type.clone(), receiver_key.clone()))
     {
         Some(hit) => hit.clone(),
         None => {
@@ -827,7 +866,9 @@ fn collect_member_path_unguarded_child_evidence(
             .and_then(|declared| {
                 unguarded_child_base_id(&declared).map(|base_id| (declared, base_id))
             });
-            declared_path_bases.insert((prefix_type, receiver_key), resolved.clone());
+            evidence
+                .declared_path_bases
+                .insert((prefix_type, receiver_key), resolved.clone());
             resolved
         }
     };
@@ -835,7 +876,8 @@ fn collect_member_path_unguarded_child_evidence(
         // The declaration already names the base, so the child lookup can rule
         // the use out before its narrowed type is worth computing.
         Some((declared, base_id)) => {
-            if direct_subtype_members
+            if evidence
+                .direct_subtype_members
                 .get(&base_id)
                 .and_then(|members| members.get(&member_key))
                 .is_none()
@@ -851,17 +893,24 @@ fn collect_member_path_unguarded_child_evidence(
             (base_id, current)
         }
         // Nothing is declared for this path, so a guard is the only thing that
-        // could have given it a base.
+        // could have given it a base. A base read back from this pass's own
+        // published narrowing is not one: scoring against it would descend one
+        // more level of the class tree per round, so the receiver's pre-pass
+        // type is used instead.
         None => {
-            let current = infer_expr(db, cache, LuaExpr::IndexExpr(receiver.clone()))
-                .unwrap_or(LuaType::Unknown);
+            let current =
+                published_unguarded_child_base(db, file_id, receiver).unwrap_or_else(|| {
+                    infer_expr(db, cache, LuaExpr::IndexExpr(receiver.clone()))
+                        .unwrap_or(LuaType::Unknown)
+                });
             let Some(base_id) = unguarded_child_base_id(&current) else {
                 return;
             };
             (base_id, current)
         }
     };
-    let Some(children) = direct_subtype_members
+    let Some(children) = evidence
+        .direct_subtype_members
         .get(&base_id)
         .and_then(|members| members.get(&member_key))
     else {
@@ -881,19 +930,22 @@ fn collect_member_path_unguarded_child_evidence(
         return;
     }
     let cache = context.infer_manager.get_infer_cache(file_id);
-    let Some(target) = nested_unguarded_child_target(db, cache, receiver, root_decl_id) else {
+    let Some(target) = nested_unguarded_child_target(db, cache, receiver, evidence.root_decl_id)
+    else {
         return;
     };
     let source = InFiled::new(file_id, index_expr.get_syntax_id());
     let receiver = InFiled::new(file_id, receiver.get_syntax_id());
-    let candidates = scores
-        .entry(target)
-        .or_insert_with(|| NestedUnguardedChildCandidates {
-            parent_type: current.clone(),
-            children: HashMap::new(),
-            receivers: FxHashSet::default(),
-            source: source.clone(),
-        });
+    let candidates =
+        evidence
+            .scores
+            .entry(target)
+            .or_insert_with(|| NestedUnguardedChildCandidates {
+                parent_type: current.clone(),
+                children: HashMap::new(),
+                receivers: FxHashSet::default(),
+                source: source.clone(),
+            });
     if candidates.parent_type != current {
         return;
     }
@@ -908,6 +960,25 @@ fn collect_member_path_unguarded_child_evidence(
             .or_default()
             .insert(member_key.clone());
     }
+}
+
+/// What a receiver was before this pass narrowed it, when it did. Recorded on
+/// the published step, so it survives the fact that replaced it.
+fn published_unguarded_child_base(
+    db: &crate::DbIndex,
+    file_id: crate::FileId,
+    receiver: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let node = LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::SyntaxId(InFiled::new(
+        file_id,
+        receiver.get_syntax_id(),
+    )));
+    let fact = db.get_inference_fact(&node)?;
+    let step = fact
+        .provenance()
+        .iter()
+        .find(|step| step.event.kind == LuaInferenceProvenanceKind::UnguardedChild)?;
+    step.found_type.as_deref().cloned()
 }
 
 fn nested_unguarded_child_target(
