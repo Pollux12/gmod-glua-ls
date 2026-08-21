@@ -24,9 +24,9 @@
 //! preserves state — it cannot verify re-analysis, because its edit pair is
 //! exactly what that gate rejects as meaningless. `realedit` is the gate for
 //! re-analysis itself: its edit changes what the file means, so the incremental
-//! result has to land where a cold build of the edited source lands. It is a
-//! real gate and it does pass — measured IDENTICAL on CityRP at 11,655 entries
-//! — so a divergence there is a regression, not a known hole.
+//! result has to land where a cold build of the edited source lands. It does
+//! not reach zero today — see AGENTS.md for the known divergence and its cause
+//! — so measure it before and after a change and treat any *growth* as yours.
 //!
 //! `mainreindex`, `exact`, `editmid` and `split:N` are **bisect stages** — diagnostic
 //! instruments, not gates, and they are expected to diverge. Both `mainreindex`
@@ -141,8 +141,6 @@ use std::alloc::{GlobalAlloc, Layout};
 /// dividing by the phase's unit of work gives allocations-per-step directly.
 struct CountingMiMalloc;
 
-// SAFETY: every method forwards to MiMalloc with the same arguments; the
-// counters are plain relaxed atomics and do not affect allocation behavior.
 /// Sample one in every `DET_ALLOC_SAMPLE` allocations and record where it came
 /// from. This is a poor-man's allocation profiler: it attributes allocations to
 /// source locations, which a CPU sampling profiler cannot do (it blames the
@@ -155,6 +153,7 @@ mod alloc_sample {
     const MAX_FRAMES: usize = 64;
 
     // Documented in WinBase.h; returns the number of frames written.
+    #[cfg(windows)]
     unsafe extern "system" {
         fn RtlCaptureStackBackTrace(
             frames_to_skip: u32,
@@ -162,6 +161,41 @@ mod alloc_sample {
             back_trace: *mut *mut std::ffi::c_void,
             back_trace_hash: *mut u32,
         ) -> u16;
+    }
+
+    /// Raw instruction pointers for the current stack, innermost first. Returns
+    /// how many of `buffer` were filled.
+    ///
+    /// `backtrace::trace` goes through dbghelp's StackWalkEx on Windows, which
+    /// takes a process-wide lock and costs milliseconds per capture: a full run
+    /// never finished. `RtlCaptureStackBackTrace` unwinds via the x64 unwind
+    /// tables instead and costs microseconds. Elsewhere the crate's own unwinder
+    /// is already cheap enough.
+    #[cfg(windows)]
+    fn capture(buffer: &mut [*mut std::ffi::c_void]) -> usize {
+        let captured = unsafe {
+            RtlCaptureStackBackTrace(
+                1,
+                buffer.len() as u32,
+                buffer.as_mut_ptr(),
+                std::ptr::null_mut(),
+            )
+        };
+        captured as usize
+    }
+
+    #[cfg(not(windows))]
+    fn capture(buffer: &mut [*mut std::ffi::c_void]) -> usize {
+        let mut filled = 0;
+        backtrace::trace(|frame| {
+            if filled >= buffer.len() {
+                return false;
+            }
+            buffer[filled] = frame.ip();
+            filled += 1;
+            true
+        });
+        filled
     }
 
     static SAMPLE_RATE: AtomicUsize = AtomicUsize::new(0);
@@ -202,7 +236,7 @@ mod alloc_sample {
         }
         // Sample one phase only (GLUALS_PROFILE_SAMPLE), when asked to.
         if PHASE_SCOPED.load(Ordering::Relaxed)
-            && !glua_code_analysis::profile::SAMPLE_PHASE_ACTIVE.load(Ordering::Relaxed)
+            && !glua_code_analysis::profile::sample_phase_active()
         {
             return;
         }
@@ -218,24 +252,9 @@ mod alloc_sample {
             }
             sampling.set(true);
             // Raw instruction pointers only — no symbol resolution here.
-            //
-            // `backtrace::trace` goes through dbghelp's StackWalkEx, which takes
-            // a process-wide lock and costs milliseconds per capture: a full run
-            // never finished. RtlCaptureStackBackTrace unwinds via the x64
-            // unwind tables instead and costs microseconds.
             let mut buffer = [std::ptr::null_mut::<std::ffi::c_void>(); MAX_FRAMES];
-            let captured = unsafe {
-                RtlCaptureStackBackTrace(
-                    1,
-                    MAX_FRAMES as u32,
-                    buffer.as_mut_ptr(),
-                    std::ptr::null_mut(),
-                )
-            };
-            let mut ips: Vec<usize> = buffer[..captured as usize]
-                .iter()
-                .map(|&ip| ip as usize)
-                .collect();
+            let captured = capture(&mut buffer);
+            let mut ips: Vec<usize> = buffer[..captured].iter().map(|&ip| ip as usize).collect();
             {
                 let mut stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
                 *stacks
@@ -311,6 +330,10 @@ mod alloc_sample {
 
     /// Print the functions that appear most often across sampled allocations.
     pub fn report(top: usize) {
+        // Symbol resolution allocates, so a sample taken while reporting would
+        // re-enter and block on a lock this thread already holds.
+        SAMPLE_RATE.store(0, Ordering::Relaxed);
+
         let frames = FRAMES.lock().unwrap_or_else(|p| p.into_inner());
         let Some(frames) = frames.as_ref() else {
             return;
@@ -362,6 +385,8 @@ mod alloc_sample {
     }
 }
 
+// SAFETY: every method forwards to MiMalloc with the same arguments; the
+// counters are plain relaxed atomics and do not affect allocation behavior.
 unsafe impl GlobalAlloc for CountingMiMalloc {
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
         glua_code_analysis::profile::record_alloc(layout.size());
