@@ -30,12 +30,9 @@ mod tests {
         let mut result = Vec::new();
         let mut line = 0;
         let mut col = 0;
-        for chunk in data.chunks_exact(5) {
-            let delta_line = chunk[0];
-            let delta_start = chunk[1];
-            let length = chunk[2];
-            let token_type = chunk[3];
-            let token_modifiers = chunk[4];
+        let (chunks, _) = data.as_chunks::<5>();
+        for chunk in chunks {
+            let [delta_line, delta_start, length, token_type, token_modifiers] = *chunk;
 
             if delta_line > 0 {
                 line += delta_line;
