@@ -1388,16 +1388,20 @@ thread_local! {
 
 /// The parameter's type as declared by an inherited member, if any.
 ///
-/// This is the single most expensive step of parameter inference: the
-/// unresolve pipeline's reachability probe calls it once per deferred
-/// parameter, and on the CityRP benchmark it accounted for ~0.29s of a 2.29s
-/// edit — almost entirely in the visibility-aware member lookup it performs per
+/// This is the most expensive step of parameter inference: the unresolve
+/// pipeline's reachability probe calls it once per deferred parameter, and the
+/// cost is almost entirely the visibility-aware member lookup it performs per
 /// super type.
 ///
 /// The same key is asked repeatedly across the retry loop's iterations, so the
-/// answer is memoized against `type_structure_revision`: any mutable access to
-/// the type or member index discards the memo, which makes a stale answer
-/// impossible even though the loop mutates the db as it resolves.
+/// answer is memoized against `type_structure_revision`. Mutating the member,
+/// type, signature or module index bumps that revision, which covers the inputs
+/// the loop itself moves as it resolves.
+///
+/// It is not a complete read set. The visibility-aware lookup below also reads
+/// the dynamic-field and gmod-infer indexes, and neither bumps the revision, so
+/// a member that becomes visible between two unresolve runs can be missed by a
+/// memo entry computed before it existed.
 fn find_param_type_from_inherited_members(
     db: &DbIndex,
     current_member_id: LuaMemberId,

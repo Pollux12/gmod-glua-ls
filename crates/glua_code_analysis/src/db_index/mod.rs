@@ -89,8 +89,12 @@ pub struct DbIndex {
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
     file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
-    /// Bumped on every *mutable* handle to the type or member index; memos over
-    /// type/member-derived facts key on it. May over-invalidate, never misses.
+    /// Bumped on every *mutable* handle to the type, member, signature or module
+    /// index; memos over facts derived from those key on it. It covers those four
+    /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
+    /// mutate without bumping it, so a memo reading those is not protected here
+    /// and has to say how it stays correct. Widening a memo's read set means
+    /// widening this too. May over-invalidate, never misses.
     /// Values come from a process-global counter so they are unique across
     /// instances (the memos are thread-local and outlive any one `DbIndex`).
     type_structure_revision: u64,
@@ -338,6 +342,7 @@ impl DbIndex {
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.modules_index
     }
 
@@ -351,6 +356,7 @@ impl DbIndex {
     }
 
     pub fn get_signature_index_mut(&mut self) -> &mut LuaSignatureIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.signature_index
     }
 
