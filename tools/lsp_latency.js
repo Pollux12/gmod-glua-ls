@@ -17,6 +17,10 @@
 //   LSP_SERVER_ARGS='--log-level debug' to profile a slow path.
 // --file defaults to the largest .lua file in the workspace, which is the
 // pessimistic case and keeps runs comparable without naming a file per repo.
+//
+// Exits non-zero on a correctness check, not on a latency number: a cancelled
+// diagnostic pull answered with an empty full report, or a mid-edit completion
+// that disagrees with the settled one.
 'use strict';
 
 const { spawn } = require('child_process');
@@ -118,9 +122,15 @@ class LspClient {
     _dispatch(message) {
         if (message.id !== undefined && message.method) {
             // Server-initiated request. Record it and answer so the server is
-            // never left waiting on us.
+            // never left waiting on us. `workspace/configuration` has to come
+            // back as one entry per requested item; null is not a valid result
+            // and would have the server fall back to something a real client
+            // never makes it use.
             this.serverRequests.add(message.method);
-            this._write({ jsonrpc: '2.0', id: message.id, result: null });
+            const result = message.method === 'workspace/configuration'
+                ? ((message.params && message.params.items) || []).map(() => ({}))
+                : null;
+            this._write({ jsonrpc: '2.0', id: message.id, result });
             return;
         }
         if (message.id !== undefined) {
@@ -426,7 +436,7 @@ async function main() {
 
     if (opts.json) {
         console.log(JSON.stringify(report, null, 2));
-        return;
+        return failedChecks(report);
     }
 
     const rows = [
@@ -454,9 +464,32 @@ async function main() {
     const driftOk = drift.worstMissing === 0 && drift.worstExtra === 0;
     console.log(`completion drift mid-edit : -${drift.worstMissing} / +${drift.worstExtra}`
         + (driftOk ? '  (good)' : `  (differs from settled: ${drift.sampleMissing.join(', ')})`));
+
+    return failedChecks(report);
 }
 
-main().catch((error) => {
+// The correctness checks, as opposed to the timings. Timings are reported for
+// comparison and never fail; these two are defects whatever the latency was.
+function failedChecks(report) {
+    const failures = [];
+    if (report.checks.emptyFullReportsOnCancel > 0) {
+        failures.push(`${report.checks.emptyFullReportsOnCancel} cancelled diagnostic pull(s) `
+            + 'came back as an empty full report, which clears the file in the editor');
+    }
+    const drift = report.checks.completionDriftWhileTyping;
+    if (drift.worstMissing > 0 || drift.worstExtra > 0) {
+        failures.push(`completion mid-edit differed from settled by -${drift.worstMissing}`
+            + ` / +${drift.worstExtra} items`);
+    }
+    return failures;
+}
+
+main().then((failures) => {
+    if (!failures || failures.length === 0) return;
+    console.error('\nFAILED:');
+    for (const failure of failures) console.error(`  - ${failure}`);
+    process.exit(1);
+}).catch((error) => {
     console.error(String(error && error.message ? error.message : error));
     process.exit(1);
 });
