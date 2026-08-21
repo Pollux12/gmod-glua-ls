@@ -640,8 +640,12 @@ impl LuaModuleIndex {
         self.module_nodes.get(module_id)
     }
 
+    /// Sorted by file id: the result reaches completion output, so hash order
+    /// would let two runs of the same workspace disagree.
     pub fn get_module_infos(&self) -> Vec<&ModuleInfo> {
-        self.file_module_map.values().collect()
+        let mut module_infos: Vec<&ModuleInfo> = self.file_module_map.values().collect();
+        module_infos.sort_unstable_by_key(|module_info| module_info.file_id);
+        module_infos
     }
 
     pub fn get_workspace_kind(&self, workspace_id: WorkspaceId) -> WorkspaceKind {
@@ -945,6 +949,7 @@ impl LuaModuleIndex {
             }
         }
 
+        file_ids.sort_unstable();
         file_ids
     }
 

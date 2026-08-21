@@ -189,16 +189,22 @@ impl GmodSystemAggregate {
         file_id: FileId,
         name_range: TextRange,
     ) {
-        self.duplicate_registrations
+        let registrations = self
+            .duplicate_registrations
             .entry((kind, name.to_string()))
-            .or_default()
-            .push(GmodSystemRegistration {
-                kind,
-                convar_kind,
-                name: name.to_string(),
-                file_id,
-                name_range,
-            });
+            .or_default();
+        registrations.push(GmodSystemRegistration {
+            kind,
+            convar_kind,
+            name: name.to_string(),
+            file_id,
+            name_range,
+        });
+        // Which registration a duplicate report calls the original is read off
+        // this list, so it has to come from source position rather than from
+        // the order the files happened to be analysed in.
+        registrations
+            .sort_by_key(|registration| (registration.file_id, registration.name_range.start()));
     }
 
     pub fn registrations(
