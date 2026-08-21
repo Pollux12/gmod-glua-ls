@@ -19,8 +19,16 @@ pub static ALLOC_BYTES: AtomicU64 = AtomicU64::new(0);
 /// whole process — which is what makes sampling affordable, since the phase
 /// worth sampling (`lua analyze`) is single-threaded and the parallel phases
 /// would otherwise swamp the sample set and contend on the sampler's lock.
-pub static SAMPLE_PHASE_ACTIVE: std::sync::atomic::AtomicBool =
-    std::sync::atomic::AtomicBool::new(false);
+/// A count rather than a flag: the same phase name can be entered more than
+/// once at a time, and a plain flag would let the first exit turn sampling off
+/// underneath the others.
+static SAMPLE_PHASE_DEPTH: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Whether the phase named by `GLUALS_PROFILE_SAMPLE` is currently running.
+#[inline]
+pub fn sample_phase_active() -> bool {
+    SAMPLE_PHASE_DEPTH.load(Ordering::Relaxed) > 0
+}
 
 fn sampled_phase() -> Option<&'static str> {
     static NAME: OnceLock<Option<String>> = OnceLock::new();
@@ -150,7 +158,7 @@ fn phase_profile_enabled() -> bool {
 impl<'a> Profile<'a> {
     pub fn new(name: &'a str) -> Self {
         if sampled_phase() == Some(name) {
-            SAMPLE_PHASE_ACTIVE.store(true, Ordering::Relaxed);
+            SAMPLE_PHASE_DEPTH.fetch_add(1, Ordering::Relaxed);
         }
         Self {
             name,
@@ -171,7 +179,7 @@ impl<'a> Profile<'a> {
 impl<'a> Drop for Profile<'a> {
     fn drop(&mut self) {
         if sampled_phase() == Some(self.name) {
-            SAMPLE_PHASE_ACTIVE.store(false, Ordering::Relaxed);
+            SAMPLE_PHASE_DEPTH.fetch_sub(1, Ordering::Relaxed);
         }
         let duration = self.start.elapsed();
         if log::log_enabled!(log::Level::Info) {

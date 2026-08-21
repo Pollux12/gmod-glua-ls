@@ -23,8 +23,10 @@ pub type ProgressSink = Arc<dyn Fn(PhaseProgress<'_>) + Send + Sync>;
 
 static SINK: RwLock<Option<ProgressSink>> = RwLock::new(None);
 
-/// The phase last entered. One workspace analyses on one thread at a time, so
-/// the per-file loops inside a phase can report counts against it.
+/// The phase last entered. Only one phase is in flight at a time, so the
+/// per-file loops inside it can report counts against this without naming it —
+/// but those loops run on several worker threads, so reads and writes here are
+/// concurrent and a count may be reported against a phase that has just ended.
 static CURRENT_PHASE: RwLock<Option<String>> = RwLock::new(None);
 
 /// Install `sink` for the duration of an analysis run. Replaces any previous
