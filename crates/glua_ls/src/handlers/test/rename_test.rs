@@ -1,6 +1,6 @@
 #[cfg(test)]
 mod tests {
-    use crate::handlers::rename::rename;
+    use crate::handlers::rename::{prepare_rename, rename};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
     use googletest::prelude::*;
     use lsp_types::{Position, Range, TextEdit};
@@ -43,6 +43,12 @@ mod tests {
         let file_id = ws.def(&content);
         verify_that!(
             rename(&ws.analysis, file_id, position, "renamed".to_string()).is_none(),
+            eq(true)
+        )?;
+        // prepareRename must agree, or the client opens a rename box for an
+        // edit that never arrives.
+        verify_that!(
+            prepare_rename(&ws.analysis, file_id, position).is_none(),
             eq(true)
         )?;
         Ok(())
