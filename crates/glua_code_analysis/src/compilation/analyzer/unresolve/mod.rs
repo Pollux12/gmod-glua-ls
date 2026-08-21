@@ -537,9 +537,15 @@ fn try_resolve(
             reason_resolve.entry(reason).or_default().push(unresolve);
         }
 
-        // Anything still parked is dropped with the wave: it never joins
-        // `reason_resolve` here, so it cannot keep a reason group alive into the
-        // outer round.
+        // Parking is a within-wave retry, not a hand-back: an item parked on the
+        // settling wave is dropped with it, and nothing re-adds it, so it never
+        // reaches the outer round's `set_force` and `resolve_all_reason`. That is
+        // deliberate. A parked item's reason names a dependency it has already
+        // failed on, and carrying the reason into the outer round makes
+        // `resolve_as_unknown` floor that dependency's type cache to `Unknown`.
+        // The floor is terminal, and it lands on facts the later passes would
+        // otherwise still derive, so surviving the settle costs more inference
+        // than the missing floor does.
         if !changed || reason_resolve.is_empty() {
             break;
         }
@@ -793,13 +799,37 @@ fn unresolve_kind_rank(unresolve: &UnResolve) -> u8 {
     }
 }
 
+/// Separates items whose kind, file and position are shared with a sibling.
+/// Closure-argument and call-site-contribution items are all keyed on their
+/// call's start position, and a module ref is keyed on the module rather than on
+/// the owner receiving it.
+#[derive(PartialEq, Eq, Hash)]
+enum UnResolveDiscriminator {
+    None,
+    ParamIdx(usize),
+    Owner(LuaSemanticDeclId),
+}
+
 /// Identifies an unresolve item across waves: the same syntax position in the
-/// same file for the same item kind is the same item.
-type UnResolveIdentity = (u8, u32, u32);
+/// same file for the same item kind, plus the discriminator that separates
+/// siblings sharing that position, is the same item.
+type UnResolveIdentity = (u8, u32, u32, UnResolveDiscriminator);
 
 fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
     let (file_id, position) = unresolve.sort_key();
-    (unresolve_kind_rank(unresolve), file_id, position)
+    let discriminator = match unresolve {
+        UnResolve::ClosureParams(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
+        UnResolve::ClosureReturn(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
+        UnResolve::CallSiteContribution(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
+        UnResolve::ModuleRef(d) => UnResolveDiscriminator::Owner(d.owner_id.clone()),
+        _ => UnResolveDiscriminator::None,
+    };
+    (
+        unresolve_kind_rank(unresolve),
+        file_id,
+        position,
+        discriminator,
+    )
 }
 
 fn unresolve_stable_cmp(a: &UnResolve, b: &UnResolve) -> Ordering {
