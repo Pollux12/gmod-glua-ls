@@ -1,7 +1,7 @@
 mod file_reference;
 mod string_reference;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
 use glua_parser::LuaSyntaxId;
@@ -30,11 +30,11 @@ impl Default for LuaReferenceIndex {
 impl LuaReferenceIndex {
     pub fn new() -> Self {
         Self {
-            file_references: HashMap::new(),
-            index_reference: HashMap::new(),
-            global_references: HashMap::new(),
-            string_references: HashMap::new(),
-            type_references: HashMap::new(),
+            file_references: HashMap::default(),
+            index_reference: HashMap::default(),
+            global_references: HashMap::default(),
+            string_references: HashMap::default(),
+            type_references: HashMap::default(),
         }
     }
 

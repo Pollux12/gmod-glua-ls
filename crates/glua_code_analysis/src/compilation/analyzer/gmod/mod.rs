@@ -14410,7 +14410,7 @@ fn rebuild_realm_metadata(
     };
 
     if !detect_filename && !detect_calls {
-        let realm_metadata = file_ids
+        let realm_metadata: rustc_hash::FxHashMap<FileId, GmodRealmFileMetadata> = file_ids
             .into_iter()
             .map(|file_id| {
                 let ranges = if meta_file_ids.contains(&file_id) {
@@ -14436,13 +14436,13 @@ fn rebuild_realm_metadata(
                     },
                 )
             })
-            .collect::<HashMap<_, _>>();
+            .collect();
         db.get_gmod_infer_index_mut()
             .set_all_realm_file_metadata(realm_metadata);
         return;
     }
 
-    let mut realm_metadata = HashMap::new();
+    let mut realm_metadata = rustc_hash::FxHashMap::default();
     for file_id in file_ids {
         let ranges = if meta_file_ids.contains(&file_id) {
             Vec::new()

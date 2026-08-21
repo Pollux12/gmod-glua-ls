@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::OnceLock,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::OnceLock;
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
@@ -294,14 +292,14 @@ pub struct GmodInferIndex {
 impl GmodInferIndex {
     pub fn new() -> Self {
         Self {
-            hook_file_metadata: HashMap::new(),
-            system_file_metadata: HashMap::new(),
+            hook_file_metadata: HashMap::default(),
+            system_file_metadata: HashMap::default(),
             system_aggregate_cache: OnceLock::new(),
-            realm_file_metadata: HashMap::new(),
-            gm_method_realm_annotations: HashMap::new(),
-            member_realm_ranges: HashMap::new(),
-            fileparam_index: HashMap::new(),
-            scoped_class_info: HashMap::new(),
+            realm_file_metadata: HashMap::default(),
+            gm_method_realm_annotations: HashMap::default(),
+            member_realm_ranges: HashMap::default(),
+            fileparam_index: HashMap::default(),
+            scoped_class_info: HashMap::default(),
         }
     }
 

@@ -2,7 +2,7 @@ mod decl_feature;
 #[allow(clippy::module_inception)]
 mod property;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use decl_feature::{DeclFeatureFlag, PropertyDeclFeature};
 use glua_parser::{LuaAstNode, LuaDocTagField, LuaDocType, LuaVersionCondition, VisibilityKind};
@@ -53,12 +53,12 @@ impl LuaPropertyIndex {
     pub fn new() -> Self {
         Self {
             id_count: 0,
-            in_filed_owner: HashMap::new(),
-            properties: HashMap::new(),
-            property_owners_map: HashMap::new(),
-            signature_owner_by_property: HashMap::new(),
-            inferred_string_defaults: HashMap::new(),
-            inferred_string_defaults_file_owners: HashMap::new(),
+            in_filed_owner: HashMap::default(),
+            properties: HashMap::default(),
+            property_owners_map: HashMap::default(),
+            signature_owner_by_property: HashMap::default(),
+            inferred_string_defaults: HashMap::default(),
+            inferred_string_defaults_file_owners: HashMap::default(),
         }
     }
 

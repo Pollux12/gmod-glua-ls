@@ -3698,8 +3698,8 @@ mod tests {
     #[test]
     fn member_collection_assignment_widening_cache_respects_load_state_masks() {
         let mut db = DbIndex::new();
-        db.get_gmod_infer_index_mut()
-            .set_all_realm_file_metadata(std::collections::HashMap::from([
+        db.get_gmod_infer_index_mut().set_all_realm_file_metadata(
+            rustc_hash::FxHashMap::from_iter([
                 (
                     FileId::new(0),
                     crate::GmodRealmFileMetadata {
@@ -3714,7 +3714,8 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-            ]));
+            ]),
+        );
 
         let owner = LuaMemberOwner::Element(InFiled::new(
             FileId::new(0),
