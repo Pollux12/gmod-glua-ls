@@ -235,7 +235,7 @@ mod tests {
     }
 
     #[test]
-    fn levels_flatten_to_the_analysis_order() {
+    fn the_analysis_order_places_every_dependency_before_its_dependents() {
         let mut map = HashMap::new();
         map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
         map.insert(2.into(), [3.into()].into_iter().collect());
@@ -246,10 +246,22 @@ mod tests {
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
         let metas = HashSet::from_iter([FileId::new(5)]);
 
-        let levels = rel.get_analysis_levels(&files, &metas);
-        let flat: Vec<FileId> = levels.iter().flatten().copied().collect();
+        let order = rel.get_best_analysis_order(&files, &metas);
+        assert_eq!(order.len(), files.len());
 
-        assert_eq!(flat, rel.get_best_analysis_order(&files, &metas));
+        let position = |file: FileId| order.iter().position(|&f| f == file).expect("file ordered");
+        for (&file, deps) in &map {
+            for &dep in deps {
+                assert!(
+                    position(dep) < position(file),
+                    "{dep:?} is a dependency of {file:?} but was ordered after it: {order:?}"
+                );
+            }
+        }
+
+        // A meta file depends on nothing, so it must lead rather than merely
+        // land somewhere legal.
+        assert_eq!(order.first(), Some(&FileId::new(5)));
     }
 
     #[test]
