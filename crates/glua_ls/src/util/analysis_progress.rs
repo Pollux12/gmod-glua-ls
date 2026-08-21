@@ -1,6 +1,8 @@
 //! Forwards analysis phase reports to the status bar, the watchdog and the log.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -19,11 +21,24 @@ const SUMMARY_PHASE_COUNT: usize = 5;
 /// A phase is logged on its own only if it ran at least this long.
 const NOTABLE_PHASE: Duration = Duration::from_millis(250);
 
+/// Status messages allowed to queue before new ones are dropped.
+const STATUS_QUEUE_CAPACITY: usize = 64;
+
+/// Which reporter owns the process-global sink. `progress` keeps one slot, so
+/// two overlapping analyses share it and only the newest may clear it.
+static SINK_GENERATION: AtomicU64 = AtomicU64::new(0);
+
 /// Installs a progress sink for as long as it is alive, and logs a summary of
 /// where the time went when it is dropped.
 pub struct AnalysisProgressReporter {
     state: Arc<Mutex<ReporterState>>,
     started: Instant,
+    generation: u64,
+    /// Cleared on drop, so a queued message cannot reach the client after
+    /// whatever the caller reports next.
+    forwarding: Arc<AtomicBool>,
+    /// Dropping this ends the forwarding thread.
+    _status_sender: Option<SyncSender<String>>,
 }
 
 struct ReporterState {
@@ -52,6 +67,37 @@ impl ReporterState {
     }
 }
 
+/// Forwards status-bar messages off the analysis threads.
+///
+/// The status bar reaches `lsp_server`'s rendezvous channel, so a send parks
+/// the caller until the writer thread — itself parked on stdout — accepts it. A
+/// client that stops reading stdout would otherwise stall every analysis worker
+/// that reports progress. A progress update nobody sees costs nothing, so the
+/// hop drops rather than blocks.
+fn spawn_status_forwarder(
+    status_bar: StatusBar,
+    forwarding: Arc<AtomicBool>,
+) -> Option<SyncSender<String>> {
+    let (sender, receiver) = sync_channel::<String>(STATUS_QUEUE_CAPACITY);
+
+    match std::thread::Builder::new()
+        .name("gluals-progress".to_string())
+        .spawn(move || {
+            for message in receiver {
+                if !forwarding.load(Ordering::Acquire) {
+                    continue;
+                }
+                status_bar.update_startup_phase(ProgressTask::LoadWorkspace, None, message);
+            }
+        }) {
+        Ok(_handle) => Some(sender),
+        Err(error) => {
+            log::error!("could not start the progress forwarding thread: {error}");
+            None
+        }
+    }
+}
+
 impl AnalysisProgressReporter {
     pub fn install(status_bar: StatusBar, watchdog_status: LongRunningWatchdogStatus) -> Self {
         let now = Instant::now();
@@ -62,6 +108,10 @@ impl AnalysisProgressReporter {
             totals: HashMap::new(),
         }));
 
+        let generation = SINK_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+        let forwarding = Arc::new(AtomicBool::new(true));
+        let status_sender = spawn_status_forwarder(status_bar, forwarding.clone());
+        let sink_sender = status_sender.clone();
         let sink_state = state.clone();
         progress::set_sink(Arc::new(move |progress: progress::PhaseProgress<'_>| {
             let progress::PhaseProgress {
@@ -91,19 +141,29 @@ impl AnalysisProgressReporter {
                 phase.to_string()
             };
             watchdog_status.set_phase(message.clone());
-            status_bar.update_startup_phase(ProgressTask::LoadWorkspace, None, message);
+            if let Some(sender) = sink_sender.as_ref() {
+                let _ = sender.try_send(message);
+            }
         }));
 
         Self {
             state,
             started: now,
+            generation,
+            forwarding,
+            _status_sender: status_sender,
         }
     }
 }
 
 impl Drop for AnalysisProgressReporter {
     fn drop(&mut self) {
-        progress::clear_sink();
+        self.forwarding.store(false, Ordering::Release);
+
+        // A later reporter has taken the sink over; clearing would blind it.
+        if SINK_GENERATION.load(Ordering::Acquire) == self.generation {
+            progress::clear_sink();
+        }
 
         let Ok(mut state) = self.state.lock() else {
             return;
@@ -136,8 +196,13 @@ impl Drop for AnalysisProgressReporter {
 mod tests {
     use super::*;
 
+    /// The sink is process-global, so these tests cannot run alongside each
+    /// other.
+    static SINK: Mutex<()> = Mutex::new(());
+
     #[test]
     fn clearing_the_sink_stops_reports() {
+        let _guard = SINK.lock().unwrap_or_else(|error| error.into_inner());
         // The reporter owns the global sink, so dropping it must clear it.
         progress::clear_sink();
         assert!(!progress::is_active());
@@ -154,6 +219,28 @@ mod tests {
         progress::clear_sink();
         progress::enter_phase("phase", 0, "files");
         assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn an_overlapping_reporter_keeps_the_sink_until_the_newest_one_goes() {
+        let _guard = SINK.lock().unwrap_or_else(|error| error.into_inner());
+        progress::clear_sink();
+
+        let (connection, _peer) = lsp_server::Connection::memory();
+        let status_bar = StatusBar::new(
+            Arc::new(crate::context::ClientProxy::new(connection)),
+            false,
+        );
+        let watchdog = LongRunningWatchdogStatus::new("test");
+
+        let older = AnalysisProgressReporter::install(status_bar.clone(), watchdog.clone());
+        let newer = AnalysisProgressReporter::install(status_bar, watchdog);
+
+        drop(older);
+        assert!(progress::is_active());
+
+        drop(newer);
+        assert!(!progress::is_active());
     }
 
     #[test]
