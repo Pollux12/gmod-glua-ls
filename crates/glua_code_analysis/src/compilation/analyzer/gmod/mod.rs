@@ -142,9 +142,9 @@ fn scan_gmod_keywords(
 /// Pre-analysis phase: runs BEFORE lua_analyze.
 /// Collects purely syntactic metadata (hooks, network, realm, scripted class
 /// type declarations) so that lua_analyze has correct realm keys and scripted
-/// class types available from the start. This avoids the previous architecture
-/// where flow analysis used `GmodRealm::Unknown` during lua_analyze and had to
-/// recompute everything in the unresolve phase with the correct realm.
+/// class types available from the start. Without them lua_analyze would see
+/// `GmodRealm::Unknown` and the unresolve phase would have to recompute every
+/// flow once the realm became known.
 pub struct GmodPreAnalysisPipeline;
 
 impl AnalysisPipeline for GmodPreAnalysisPipeline {
@@ -471,14 +471,12 @@ impl GmodPreProfile {
 /// resolving `net.Start`/`net.Send` reached through a wrapper needs the
 /// wrapper's signature, its receiver's type, and the members those depend on.
 ///
-/// It used to run inside `GmodPreAnalysisPipeline`, before any of that existed.
-/// The collector therefore saw a far poorer index on a cold build than on any
-/// later re-index — on CityRP a cold index found 2592 flows where a re-index of
-/// the same unchanged source found 2845 — so `gmod-net-*` diagnostics changed
-/// across the workspace after the first edit. Nothing in the analysis pipeline
-/// reads the network index (only diagnostics do), so collecting it last costs
-/// nothing and is the only point at which the input state is the same for a
-/// cold build and a partial re-index.
+/// Collecting any earlier would let the collector see a poorer index on a cold
+/// build than on a re-index, which makes `gmod-net-*` diagnostics change across
+/// the workspace after the first edit. Nothing in the analysis pipeline reads
+/// the network index (only diagnostics do), so collecting it last costs nothing
+/// and is the only point at which the input state is the same for a cold build
+/// and a partial re-index.
 pub struct GmodNetworkAnalysisPipeline;
 
 impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
@@ -564,8 +562,8 @@ fn collect_file_network_flows(
     let mut local_fns = LocalFnCache::default();
     let mut net = NetCallResolver::default();
     // One memo for both walks: the receive walk and the three send walks start
-    // from the same call expressions and reach the same helpers, so resolving
-    // them twice was pure repeat work.
+    // from the same call expressions and reach the same helpers, so a shared
+    // memo resolves each of them once.
     let mut resolve_memo = ResolveMemo::default();
 
     let (_, _, _, receive_flows) = crate::profile::phase("gmodnet/receive_walk", || {
@@ -1237,23 +1235,20 @@ fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
 /// The names a call has to be written with for it to expand into a helper that
 /// can reach a `net.Start`.
 ///
-/// `collect_unannotated_net_wrapper_send_flows` asks that of every call
-/// expression in the workspace and answers it by resolving each one — 88k
-/// prefix resolutions to materialise a few thousand flows. The helpers that can
-/// answer yes are a small fixed set, and resolution matches declarations by
-/// written name, so a call written with a name no such helper carries cannot
-/// expand into one.
+/// The helpers that can answer yes are a small fixed set, and resolution
+/// matches declarations by written name, so a call written with a name no such
+/// helper carries cannot expand into one.
 ///
-/// Seeded from the net-op call sites the pre-analysis pass already recorded by
-/// access path, then grown outward: each site is walked *up* to the function
-/// containing it, and that function's own call sites come from the reference
-/// index, whose enclosing functions are the next level. The set settles when a
-/// round adds no new name.
+/// Seeded from the net operations' own references, then grown outward: each
+/// site is walked *up* to the function containing it, and that function's own
+/// call sites come from the reference index, whose enclosing functions are the
+/// next level. The set settles when a round adds no new site.
 ///
 /// Nothing is scanned. The cost is proportional to how much net code the
 /// workspace actually has, not to its size.
 fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> HashSet<SmolStr> {
     let mut names: HashSet<SmolStr> = HashSet::new();
+    let mut visited_decls: HashSet<LuaDeclId> = HashSet::new();
     // Seeded from the net operations' own references rather than from the
     // pre-pass's recorded call sites: that record is only written for files
     // that also need hook metadata, so it is not a complete list of net ops.
@@ -1272,6 +1267,7 @@ fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> Ha
         }
 
         let mut fresh: Vec<SmolStr> = Vec::new();
+        let mut next: Vec<InFiled<LuaSyntaxId>> = Vec::new();
         for (file_id, syntax_ids) in by_file {
             let Some(root) = db
                 .get_vfs()
@@ -1284,9 +1280,20 @@ fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> Ha
                 let Some(node) = syntax_id.to_node_from_root(&root) else {
                     continue;
                 };
-                let Some(name) = enclosing_function_name(&node) else {
+                let Some(closure) = node.ancestors().find_map(LuaClosureExpr::cast) else {
                     continue;
                 };
+                let Some(name) = closure_declared_name(&closure) else {
+                    continue;
+                };
+                // A local enters neither name-keyed reference table, so a chain
+                // through local wrappers only continues if the next level comes
+                // from the declaration's own references.
+                if let Some(decl_id) = closure_local_decl_id(file_id, &closure)
+                    && visited_decls.insert(decl_id)
+                {
+                    next.extend(decl_reference_sites(db, decl_id));
+                }
                 if names.insert(name.clone()) {
                     fresh.push(name);
                 }
@@ -1296,8 +1303,9 @@ fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> Ha
         // A newly named function's callers are the next level, and the
         // reference index already knows where they are.
         for name in fresh {
-            frontier.extend(name_reference_sites(db, &name));
+            next.extend(name_reference_sites(db, &name));
         }
+        frontier = next;
     }
 
     names
@@ -1320,20 +1328,53 @@ fn name_reference_sites(db: &DbIndex, name: &SmolStr) -> Vec<InFiled<LuaSyntaxId
         .collect()
 }
 
-/// The name of the function a node sits inside, when that function is bound to
-/// one.
-fn enclosing_function_name(node: &LuaSyntaxNode) -> Option<SmolStr> {
-    let closure = node.ancestors().find_map(LuaClosureExpr::cast)?;
-    closure_declared_name(&closure)
+/// Every place a local declaration is read, from the reference index.
+fn decl_reference_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<InFiled<LuaSyntaxId>> {
+    let Some(references) = db
+        .get_reference_index()
+        .get_decl_references(&decl_id.file_id, &decl_id)
+    else {
+        return Vec::new();
+    };
+    references
+        .cells
+        .iter()
+        .filter(|cell| !cell.is_write)
+        .map(|cell| {
+            InFiled::new(
+                decl_id.file_id,
+                LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range),
+            )
+        })
+        .collect()
+}
+
+/// The declaration a closure is bound to, when that binding is a local.
+///
+/// A declaration is identified by the position of its declared name, so the two
+/// local binding forms yield it without a lookup.
+fn closure_local_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<LuaDeclId> {
+    if let Some(local_func_stat) = closure.get_parent::<LuaLocalFuncStat>() {
+        return Some(LuaDeclId::new(
+            file_id,
+            local_func_stat.get_local_name()?.get_position(),
+        ));
+    }
+    let local_stat = closure.get_parent::<LuaLocalStat>()?;
+    let idx = local_stat
+        .get_value_exprs()
+        .position(|expr| expr.get_position() == closure.get_position())?;
+    Some(LuaDeclId::new(
+        file_id,
+        local_stat.get_local_name_list().nth(idx)?.get_position(),
+    ))
 }
 
 /// The call sites that can expand into a helper able to reach a `net.Start`.
 ///
 /// Every reference to a name is recorded in the reference index while the
-/// workspace is indexed, so these call sites are a direct lookup. The previous
-/// implementation walked every call expression in every file and resolved each
-/// one to rediscover the same set, which on a 1120-file gamemode meant 88k
-/// prefix resolutions costing 11s to materialise ~3.3k flows.
+/// workspace is indexed, so these call sites are a direct lookup rather than a
+/// walk that resolves every call expression in every file.
 #[derive(Default)]
 struct NetHelperCallSites {
     /// Syntax id of the callee reference node, per file.
@@ -1367,9 +1408,14 @@ fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCall
         }
     }
     // Source order, so a file's flows are collected in the same order the walk
-    // produced them.
+    // produced them. The key is the whole identity rather than just the start
+    // offset: sites arrive in hash order, and sorting on a partial key leaves
+    // equal ids non-adjacent, which silently defeats the dedup.
     for sites in by_file.values_mut() {
-        sites.sort_by_key(|syntax_id| syntax_id.get_range().start());
+        sites.sort_by_key(|syntax_id| {
+            let range = syntax_id.get_range();
+            (range.start(), range.end(), syntax_id.get_kind())
+        });
         sites.dedup();
     }
     NetHelperCallSites { by_file, names }
@@ -1579,9 +1625,8 @@ fn collect_file_gmod_metadata(
 
     let collect_non_net_metadata = keywords.needs_hook_metadata();
     // Network flows are collected later, by `GmodNetworkAnalysisPipeline`; see
-    // that pipeline for why. When a file needs no hook metadata either, the
-    // whole walk can now be skipped — previously it still had to run because
-    // receive-flow collection rode along with it.
+    // that pipeline for why. Receive-flow collection therefore no longer rides
+    // along here, so a file that needs no hook metadata skips the walk whole.
     let hook_metadata = collect_non_net_metadata.then(|| {
         let (hook_sites, system_metadata, gm_method_realms, _receive_flows) =
             collect_hook_and_receive_metadata(
@@ -1665,11 +1710,10 @@ fn collect_hook_and_receive_metadata(
         root: root.clone(),
         file_id,
     };
-    // Built once for the whole walk. `resolve_memo` is a pure function of
-    // `(file_id, call range)` for a fixed registry and index — see the
-    // field's own doc — but this context used to be constructed *inside*
-    // the loop, so every call expression started with an empty memo and
-    // paid a fresh `FxHashMap` allocation.
+    // Built once for the whole walk rather than per call expression, so the
+    // memo carries across the walk instead of being reallocated empty each
+    // time. `resolve_memo` is a pure function of `(file_id, call range)` for a
+    // fixed registry and index — see the field's own doc.
     let mut net_ctx = NetCollectCtx {
         db,
         helper_registry,
@@ -1685,7 +1729,7 @@ fn collect_hook_and_receive_metadata(
     // wrapper that reaches one come from the reference index.
     if !collect_non_net_metadata {
         if collect_receive_flows {
-            for call_expr in net_candidate_call_exprs(db, &net_site, helper_call_sites, &[]) {
+            for call_expr in net_candidate_call_exprs(db, &net_site, helper_call_sites) {
                 if let Some(receive_flow) =
                     collect_net_receive_flow(&mut net_ctx, &net_site, &call_expr)
                 {
@@ -2176,7 +2220,7 @@ fn collect_unannotated_net_wrapper_send_flows(
     let mut visited = HashSet::new();
     let empty_bindings = HashMap::new();
 
-    let calls = net_candidate_call_exprs(ctx.db, site, ctx.helper_call_sites, &[]);
+    let calls = net_candidate_call_exprs(ctx.db, site, ctx.helper_call_sites);
     for call_expr in calls {
         if ctx.net.role(ctx.db, site.file_id, &call_expr).is_some() {
             continue;
@@ -2197,22 +2241,14 @@ fn collect_unannotated_net_wrapper_send_flows(
 
 /// The calls in a file that can take part in net-flow collection.
 ///
-/// Both walks used to find these by visiting every node in the file and
-/// resolving each call to ask whether it mattered. They are a lookup instead:
-/// `extra_sites` carries the net-op call sites the pre-analysis pass already
-/// recorded by annotation, and the helper call sites come from the reference
-/// index, which records every reference to a net-producing helper's name.
+/// A lookup rather than a walk: the call sites that can expand into a
+/// net-producing helper come from the reference index, which already records
+/// every reference to those helpers' names.
 fn net_candidate_call_exprs(
     db: &DbIndex,
     site: &NetWalkSite,
     helper_call_sites: &NetHelperCallSites,
-    extra_sites: &[LuaSyntaxId],
 ) -> Vec<LuaCallExpr> {
-    // The call sites that can expand into a net-producing helper come from the
-    // reference index, which already records every reference to those helpers'
-    // names. Walking every call expression in the file and resolving each one
-    // to rediscover them is what made this pass cost more than the rest of
-    // analysis put together.
     let root_syntax = site.root.syntax().clone();
     // Locals never enter the global reference table, so a helper declared
     // `local function send()` is reached through its own declaration's
@@ -2293,18 +2329,13 @@ fn net_candidate_call_exprs(
         })
         .collect::<Vec<_>>();
 
-    // Recorded net-op sites are the call expression itself, not a callee
-    // reference, so they need no prefix check.
-    calls.extend(
-        extra_sites
-            .iter()
-            .filter_map(|syntax_id| syntax_id.to_node_from_root(&root_syntax))
-            .filter_map(LuaCallExpr::cast),
-    );
-
-    // Source order, so flows are produced in the order the old walk produced
-    // them.
-    calls.sort_by_key(|call_expr| call_expr.get_range().start());
+    // Source order. The key is the whole range so that equal calls reached
+    // through both the name and the local-declaration lookup end up adjacent
+    // and the dedup can see them.
+    calls.sort_by_key(|call_expr| {
+        let range = call_expr.get_range();
+        (range.start(), range.end())
+    });
     calls.dedup_by_key(|call_expr| call_expr.get_range());
     calls
 }
@@ -2335,8 +2366,8 @@ fn collect_send_flows_from_helper_call(
 
     // A send flow always starts at a `net.Start` somewhere in the expansion, so
     // a helper that cannot reach one contributes nothing however it is called.
-    // Answering that once per helper instead of walking its body once per
-    // calling file is the difference between ~438k body scans and ~2k.
+    // The answer depends only on the helper, so it is cached per helper rather
+    // than recomputed for each calling file.
     let helper_id = (helper_file_id, helper_key.clone());
     let (reaches_start, _) = helper_reaches_net_role(
         ctx,
