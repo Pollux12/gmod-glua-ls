@@ -5578,4 +5578,201 @@ owner:CompletelyMadeUpMethod()
             "unexpected UndefinedMethod diagnostics: {diagnostics:#?}"
         );
     }
+
+    fn def_nil_guard_scope_fixture(ws: &mut VirtualWorkspace) {
+        ws.def(
+            r#"
+                ---@meta
+
+                ---@class GuardOwner
+                function GuardOwner:IsAlive() end
+
+                ---@class GuardEnt
+                ---@field owner GuardOwner
+                function GuardEnt:IsAlive() end
+
+                ---@return GuardOwner
+                function GuardEnt:GetOwner() end
+            "#,
+        );
+    }
+
+    #[test]
+    fn test_local_assign_guard_does_not_cover_dot_call() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local tr = v.MissingDotCall(v)
+                    if tr then print(tr) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_covers_plain_field_read() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local tr = v.owner.NoSuchDotField
+                    if tr then print(tr) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_covers_weak_receiver_call() {
+        let mut ws = VirtualWorkspace::new();
+        def_valid_guard_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                local function use(ent)
+                    local phys = ent:GetPhysicsObject()
+                    if phys then phys:SetMass(100) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_does_not_escape_closure() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local cb = function() print(v.missingField) end
+                    if cb then print(cb) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_ignores_dotted_name_collision() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                ---@param cfg table
+                local function use(v, cfg)
+                    local mode = v.NoSuchField
+                    if cfg.mode then print(mode) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_accepts_matching_name_reference() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local mode = v.NoSuchField
+                    if mode then print(mode) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_negated_condition_does_not_guard_body() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(!ws.check_code_for(
+            DiagnosticCode::UndefinedMethod,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    if not v.Foo then
+                        v:Foo()
+                    end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_local_assign_guard_lookback_ignores_comments() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        assert!(ws.check_code_for(
+            DiagnosticCode::UndefinedField,
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local tr = v.NoSuchField
+
+                    -- one
+
+                    -- two
+
+                    -- three
+
+                    -- four
+
+                    -- five
+
+                    if tr then print(tr) end
+                end
+            "#,
+        ));
+    }
+
+    #[test]
+    fn test_early_return_guard_matches_chained_colon_path() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        let file_id = ws.def(
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    if not v:IsAlive() or not v:GetOwner():NoSuchMethod() then return end
+                    v:GetOwner():NoSuchMethod()
+                end
+            "#,
+        );
+        let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        let methods = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedMethod);
+        assert_eq!(
+            fields.len() + methods.len(),
+            1,
+            "fields: {fields:#?}\nmethods: {methods:#?}"
+        );
+    }
+
+    #[test]
+    fn test_call_argument_mention_is_not_a_guard() {
+        let mut ws = VirtualWorkspace::new();
+        def_nil_guard_scope_fixture(&mut ws);
+        let file_id = ws.def(
+            r#"
+                ---@param v GuardEnt
+                local function use(v)
+                    local ok = tostring(v.NoSuchField) and print(v.NoSuchField)
+                    return ok
+                end
+            "#,
+        );
+        let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
+        assert_eq!(fields.len(), 1, "{fields:#?}");
+    }
 }

@@ -5,8 +5,9 @@ use std::{
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
-    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaRepeatStat,
-    LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaVarExpr, LuaWhileStat, PathTrait,
+    LuaForRangeStat, LuaForStat, LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
+    LuaRepeatStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode, LuaTokenKind, LuaUnaryExpr, LuaVarExpr,
+    LuaWhileStat, PathTrait, UnaryOperator,
 };
 use smol_str::SmolStr;
 
@@ -76,6 +77,7 @@ impl Checker for CheckFieldChecker {
                                 semantic_model,
                                 index_expr,
                                 DiagnosticCode::InjectField,
+                                false,
                                 &mut state,
                                 profile.as_mut(),
                             );
@@ -93,6 +95,7 @@ impl Checker for CheckFieldChecker {
                             semantic_model,
                             &index_expr,
                             DiagnosticCode::InjectField,
+                            false,
                             &mut state,
                             profile.as_mut(),
                         );
@@ -127,6 +130,7 @@ impl Checker for CheckFieldChecker {
                         semantic_model,
                         &index_expr,
                         code,
+                        weak_receiver,
                         &mut state,
                         profile.as_mut(),
                     );
@@ -255,6 +259,7 @@ fn check_index_expr(
     semantic_model: &SemanticModel,
     index_expr: &LuaIndexExpr,
     code: DiagnosticCode,
+    weak_receiver: bool,
     state: &mut CheckFieldState,
     mut profile: Option<&mut CheckFieldProfile>,
 ) -> Option<()> {
@@ -352,7 +357,7 @@ fn check_index_expr(
         code,
         DiagnosticCode::UndefinedField | DiagnosticCode::UndefinedMethod
     ) && !is_enum_type(db, &prefix_typ)
-        && is_nil_guarded_in_scope(index_expr, code)
+        && is_nil_guarded_in_scope(index_expr, weak_receiver)
     {
         return Some(());
     }
@@ -1584,10 +1589,8 @@ fn get_keyof_keys(db: &DbIndex, alias_call: &LuaAliasCallType) -> Option<Vec<Lua
 /// Check if this index expression is inside an if-body where the condition
 /// guards the same field against nil (e.g., `if x.field ~= nil then ... end`
 /// or `if x.field then ... end`).
-fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, code: DiagnosticCode) -> bool {
-    let target_text = index_expr.syntax().text().to_string();
-    // Normalize colon-access to dot-access so that `obj:Method` matches `obj.Method`
-    let normalized_target = target_text.replacen(':', ".", 1);
+fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bool {
+    let normalized_target = normalize_colon_access(&index_expr.syntax().text().to_string());
     let node_range = index_expr.syntax().text_range();
     let target_root_name = extract_root_identifier(&normalized_target);
 
@@ -1703,7 +1706,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, code: DiagnosticCode) -> b
                             }
                             // `obj.method and obj:method()` — the left operand
                             // already tested this same member for presence.
-                            if is_truthy_check_in_condition(first, &normalized_target) {
+                            if is_positive_member_test(first, &normalized_target) {
                                 return true;
                             }
                         }
@@ -1720,11 +1723,7 @@ fn is_nil_guarded_in_scope(index_expr: &LuaIndexExpr, code: DiagnosticCode) -> b
 
     // Pattern: local assignment followed by nil-check of the assigned variable.
     // e.g., `local x = obj.field; if x then ...`
-    //
-    // Not for `UndefinedMethod`, which is the code only for a receiver the
-    // checker is certain of. There the check speaks for the returned value and
-    // says nothing about whether the method name resolves.
-    if code != DiagnosticCode::UndefinedMethod && is_local_assign_with_nil_check(index_expr) {
+    if is_local_assign_with_nil_check(index_expr, weak_receiver) {
         return true;
     }
 
@@ -1810,12 +1809,54 @@ fn node_reassigns_root_name(node: &LuaSyntaxNode, root_name: &str) -> bool {
     false
 }
 
+/// Colon-access normalized to dot-access, so that `obj:Method` matches `obj.Method`.
+/// Every colon is normalized: a chained path such as `obj:Get():Method` has more
+/// than one.
+fn normalize_colon_access(text: &str) -> String {
+    text.replace(':', ".")
+}
+
+fn is_not_expr(unary: &LuaUnaryExpr) -> bool {
+    unary
+        .get_op_token()
+        .is_some_and(|op| op.get_op() == UnaryOperator::OpNot)
+}
+
+/// Whether `expr` tests `field_text` itself for presence: the member read alone,
+/// or as an operand of `and`/`or`. A negation inverts the test, and a mention in
+/// an unrelated call's arguments (`tostring(obj.x)`) does not test anything, so
+/// neither vouches for the member.
+fn is_positive_member_test(expr: &LuaExpr, field_text: &str) -> bool {
+    match expr {
+        LuaExpr::IndexExpr(idx) => {
+            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
+        }
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| is_positive_member_test(&inner, field_text)),
+        LuaExpr::BinaryExpr(binary) => {
+            let has_and_or = binary.syntax().children_with_tokens().any(|child| {
+                let kind = child.kind();
+                kind == LuaTokenKind::TkAnd.into() || kind == LuaTokenKind::TkOr.into()
+            });
+            has_and_or
+                && binary
+                    .syntax()
+                    .children()
+                    .filter_map(LuaExpr::cast)
+                    .any(|operand| is_positive_member_test(&operand, field_text))
+        }
+        _ => false,
+    }
+}
+
 /// Check if a field is being used as a direct truthy/nil check in a condition.
-/// Handles: `field`, `not field`, `field or other`, `field and other`, `a or field`, etc.
+/// Handles: `field`, `field or other`, `field and other`, `a or field`,
+/// `field ~= nil`, and predicate calls taking the field.
 fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
     match condition {
         LuaExpr::IndexExpr(idx) => {
-            idx.syntax().text().to_string().replacen(':', ".", 1) == field_text
+            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
         }
         LuaExpr::BinaryExpr(binary) => {
             let has_and_or = binary.syntax().children_with_tokens().any(|child| {
@@ -1843,8 +1884,8 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
                 if exprs.len() == 2 {
                     let lhs = exprs[0].syntax().text().to_string();
                     let rhs = exprs[1].syntax().text().to_string();
-                    if (lhs.replacen(':', ".", 1) == field_text && rhs.trim() == "nil")
-                        || (rhs.replacen(':', ".", 1) == field_text && lhs.trim() == "nil")
+                    if (normalize_colon_access(&lhs) == field_text && rhs.trim() == "nil")
+                        || (normalize_colon_access(&rhs) == field_text && lhs.trim() == "nil")
                     {
                         return true;
                     }
@@ -1860,6 +1901,9 @@ fn is_truthy_check_in_condition(condition: &LuaExpr, field_text: &str) -> bool {
             false
         }
         LuaExpr::UnaryExpr(unary) => {
+            if is_not_expr(unary) {
+                return false;
+            }
             for child in unary.syntax().children().filter_map(LuaExpr::cast) {
                 if is_truthy_check_in_condition(&child, field_text) {
                     return true;
@@ -1960,7 +2004,7 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
             false
         }
         LuaExpr::IndexExpr(idx) => {
-            idx.syntax().text().to_string().replacen(':', ".", 1) == field_text
+            normalize_colon_access(&idx.syntax().text().to_string()) == field_text
         }
         LuaExpr::ParenExpr(paren) => {
             if let Some(inner) = paren.get_expr() {
@@ -1981,7 +2025,10 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
             false
         }
         LuaExpr::UnaryExpr(unary) => {
-            // Handle `not field` patterns
+            // `not field` inverts the guard: the body runs when the field is absent.
+            if is_not_expr(unary) {
+                return false;
+            }
             for child in unary.syntax().children().filter_map(LuaExpr::cast) {
                 if condition_nil_guards_field(&child, field_text) {
                     return true;
@@ -1996,7 +2043,7 @@ fn condition_nil_guards_field(condition: &LuaExpr, field_text: &str) -> bool {
 /// Check if the field access is on the RHS of a local assignment, and the assigned
 /// variable is nil-checked in a following sibling statement.
 /// e.g., `local x = obj.field; if x then ...` or `local x = obj.field; if not x then return end`
-fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr) -> bool {
+fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr, weak_receiver: bool) -> bool {
     // Walk up to find the parent LocalStat
     let local_stat = match index_expr.syntax().ancestors().find_map(LuaLocalStat::cast) {
         Some(s) => s,
@@ -2013,6 +2060,16 @@ fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr) -> bool {
     else {
         return false;
     };
+
+    // The guard tests the bound value, so it only vouches for the member when the
+    // member read *is* that value. `local x = obj.Missing(...)` binds the call's
+    // result, and testing a result says nothing about whether the callee resolves.
+    // An uncertain receiver is exempt: there the checker cannot claim the member is
+    // missing in the first place.
+    if !weak_receiver && value_expr.syntax() != index_expr.syntax() {
+        return false;
+    }
+
     let Some(var_name) = local_stat
         .get_local_name_by_value(value_expr)
         .and_then(|name| name.get_name_token())
@@ -2037,18 +2094,20 @@ fn is_local_assign_with_nil_check(index_expr: &LuaIndexExpr) -> bool {
             }
             continue;
         }
+        let kind: LuaSyntaxKind = sibling.kind().into();
+        if !LuaStat::can_cast(kind) {
+            continue;
+        }
         checked += 1;
         if checked > 5 {
             break;
         }
 
-        let kind: LuaSyntaxKind = sibling.kind().into();
         if kind == LuaSyntaxKind::IfStat {
             // Check if the if-condition references the variable
             if let Some(if_stat) = LuaIfStat::cast(sibling) {
                 if let Some(cond) = if_stat.get_condition_expr() {
-                    let cond_text = cond.syntax().text().to_string();
-                    if condition_references_var(&cond_text, var_name) {
+                    if condition_references_var(&cond, var_name) {
                         return true;
                     }
                 }
@@ -2099,8 +2158,8 @@ fn is_guarded_by_early_return(index_expr: &LuaIndexExpr, field_text: &str) -> bo
         if let Some(if_stat) = LuaIfStat::cast(sibling) {
             // Check if the condition references our field
             if let Some(cond) = if_stat.get_condition_expr() {
-                let cond_text = cond.syntax().text().to_string();
-                let cond_text_normalized = cond_text.replacen(':', ".", 1);
+                let cond_text_normalized =
+                    normalize_colon_access(&cond.syntax().text().to_string());
                 if !cond_text_contains_field_exact(&cond_text_normalized, field_text) {
                     continue;
                 }
@@ -2144,16 +2203,18 @@ fn cond_text_contains_field_exact(cond_text: &str, field_text: &str) -> bool {
     false
 }
 
-/// Check if a condition text references a variable name.
-fn condition_references_var(cond_text: &str, var_name: &str) -> bool {
-    // Simple text search: the variable appears as a word boundary in the condition
-    // This handles: `if x then`, `if not x then`, `if x ~= nil then`, predicate guards, etc.
-    for part in cond_text.split(|c: char| !c.is_alphanumeric() && c != '_') {
-        if part == var_name {
-            return true;
-        }
-    }
-    false
+/// Whether a condition reads the named variable. Only a name reference counts:
+/// `cfg.mode` reads `cfg`, not a local called `mode`.
+fn condition_references_var(condition: &LuaExpr, var_name: &str) -> bool {
+    condition
+        .syntax()
+        .descendants()
+        .filter_map(LuaNameExpr::cast)
+        .any(|name_expr| {
+            name_expr
+                .get_name_text()
+                .is_some_and(|name| name == var_name)
+        })
 }
 
 /// Check if the body of an if-statement contains a return statement.
