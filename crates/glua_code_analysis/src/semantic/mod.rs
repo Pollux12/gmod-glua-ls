@@ -15,6 +15,11 @@ mod visibility;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Test-only work counter, re-exported so scaling guards can assert on the
+/// number of walks rather than on how long they took.
+#[cfg(test)]
+pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
+
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{

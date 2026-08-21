@@ -179,6 +179,18 @@ pub fn get_type_at_flow_with_origin(
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Closure-baseline walks that missed the memo, on this thread.
+    ///
+    /// The memo turns a per-path derivation into a per-merge-point one, and the
+    /// difference is a count, not a duration — asserting on the count instead of
+    /// on wall-clock keeps the guard immune to how loaded the machine is. A
+    /// single-file `VirtualWorkspace` analyses inline, so the walks land on the
+    /// thread that asked for them and one test cannot see another's.
+    pub(crate) static BASELINE_FLOW_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn get_type_at_flow_in_mode(
     db: &DbIndex,
     tree: &FlowTree,
@@ -204,6 +216,9 @@ pub(super) fn get_type_at_flow_in_mode(
             if let Some(narrow_type) = cache.baseline_flow_memo.get(&memo_key) {
                 return Ok(narrow_type.clone());
             }
+
+            #[cfg(test)]
+            BASELINE_FLOW_WALKS.with(|walks| walks.set(walks.get() + 1));
 
             cache.baseline_flow_depth += 1;
             let mut visited_flow_ids = Vec::new();
