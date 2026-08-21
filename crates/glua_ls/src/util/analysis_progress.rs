@@ -4,6 +4,7 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{SyncSender, sync_channel};
 use std::sync::{Arc, Mutex};
+use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use glua_code_analysis::progress;
@@ -38,7 +39,10 @@ pub struct AnalysisProgressReporter {
     /// whatever the caller reports next.
     forwarding: Arc<AtomicBool>,
     /// Dropping this ends the forwarding thread.
-    _status_sender: Option<SyncSender<String>>,
+    status_sender: Option<SyncSender<String>>,
+    /// Joined on drop, so a message already being delivered lands before the
+    /// caller's next report rather than racing it.
+    status_thread: Option<JoinHandle<()>>,
 }
 
 struct ReporterState {
@@ -77,7 +81,7 @@ impl ReporterState {
 fn spawn_status_forwarder(
     status_bar: StatusBar,
     forwarding: Arc<AtomicBool>,
-) -> Option<SyncSender<String>> {
+) -> Option<(SyncSender<String>, JoinHandle<()>)> {
     let (sender, receiver) = sync_channel::<String>(STATUS_QUEUE_CAPACITY);
 
     match std::thread::Builder::new()
@@ -90,7 +94,7 @@ fn spawn_status_forwarder(
                 status_bar.update_startup_phase(ProgressTask::LoadWorkspace, None, message);
             }
         }) {
-        Ok(_handle) => Some(sender),
+        Ok(handle) => Some((sender, handle)),
         Err(error) => {
             log::error!("could not start the progress forwarding thread: {error}");
             None
@@ -110,7 +114,11 @@ impl AnalysisProgressReporter {
 
         let generation = SINK_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
         let forwarding = Arc::new(AtomicBool::new(true));
-        let status_sender = spawn_status_forwarder(status_bar, forwarding.clone());
+        let (status_sender, status_thread) =
+            match spawn_status_forwarder(status_bar, forwarding.clone()) {
+                Some((sender, handle)) => (Some(sender), Some(handle)),
+                None => (None, None),
+            };
         let sink_sender = status_sender.clone();
         let sink_state = state.clone();
         progress::set_sink(Arc::new(move |progress: progress::PhaseProgress<'_>| {
@@ -151,7 +159,8 @@ impl AnalysisProgressReporter {
             started: now,
             generation,
             forwarding,
-            _status_sender: status_sender,
+            status_sender,
+            status_thread,
         }
     }
 }
@@ -163,6 +172,21 @@ impl Drop for AnalysisProgressReporter {
         // A later reporter has taken the sink over; clearing would blind it.
         if SINK_GENERATION.load(Ordering::Acquire) == self.generation {
             progress::clear_sink();
+        }
+
+        // Closing the channel ends the loop; joining then waits out the one
+        // message that may already be inside `update_startup_phase`, so it
+        // cannot land after whatever the caller reports next. Everything still
+        // queued is discarded by the flag above, so this waits on at most one
+        // send — on the same channel the caller is about to use anyway.
+        //
+        // Safe to block here because the reporter is dropped after the analysis
+        // it wraps has finished, on the thread that started it rather than on a
+        // worker. A caller that installs a reporter around work whose threads
+        // outlive it would be blocking one of them here.
+        self.status_sender = None;
+        if let Some(handle) = self.status_thread.take() {
+            let _ = handle.join();
         }
 
         let Ok(mut state) = self.state.lock() else {
@@ -241,6 +265,53 @@ mod tests {
 
         drop(newer);
         assert!(!progress::is_active());
+    }
+
+    /// Progress is forwarded off the analysis threads, so a report can still be
+    /// in flight when the reporter goes. Whatever the caller says next has to be
+    /// the last thing the client hears, or a finished workspace is left showing
+    /// a phase name. A report still queued at that point is discarded outright;
+    /// one already being delivered is waited out by the join in `Drop`.
+    #[test]
+    fn no_forwarded_report_arrives_after_the_caller_closes_the_task() {
+        let _guard = SINK.lock().unwrap_or_else(|error| error.into_inner());
+        progress::clear_sink();
+
+        let (connection, peer) = lsp_server::Connection::memory();
+        // The status bar drops every notification unless the client asked for
+        // work-done progress.
+        let status_bar =
+            StatusBar::new(Arc::new(crate::context::ClientProxy::new(connection)), true);
+        let watchdog = LongRunningWatchdogStatus::new("test");
+
+        // The client side is a rendezvous channel, so someone has to be reading
+        // it for a send to complete at all.
+        let reader = std::thread::spawn(move || {
+            let mut messages = Vec::new();
+            for message in &peer.receiver {
+                let lsp_server::Message::Notification(notification) = message else {
+                    continue;
+                };
+                if let Some(text) = notification.params["value"]["message"].as_str() {
+                    messages.push(text.to_string());
+                }
+            }
+            messages
+        });
+
+        let reporter = AnalysisProgressReporter::install(status_bar.clone(), watchdog);
+        progress::enter_phase("Indexing", 0, "files");
+        drop(reporter);
+
+        status_bar.update_startup_phase(ProgressTask::LoadWorkspace, Some(100), "done");
+        drop(status_bar);
+
+        let messages = reader.join().expect("reader thread");
+        assert_eq!(
+            messages.last().map(String::as_str),
+            Some("done"),
+            "the closing update must be the last thing the client hears, got {messages:?}"
+        );
     }
 
     #[test]
