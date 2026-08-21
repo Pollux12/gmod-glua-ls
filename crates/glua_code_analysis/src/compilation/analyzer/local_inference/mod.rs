@@ -32,36 +32,38 @@ pub(super) fn stabilize_unknown_locals(
 ) -> bool {
     let _profile =
         crate::profile::Profile::cond_new("local inference stabilize", context.tree_list.len() > 1);
-    let mut candidates = context
-        .tree_list
-        .iter()
-        .filter_map(|tree| {
-            db.get_reference_index()
-                .get_decl_references_map(&tree.file_id)
-                .map(|references| (tree.file_id, references.clone()))
-        })
-        .flat_map(|(file_id, references)| {
-            references
-                .into_iter()
-                .map(move |(decl_id, references)| (file_id, decl_id, references))
-        })
-        .filter(|(_, decl_id, _)| {
-            db.get_decl_index()
+    // Two index lookups decide this, so they run before the reference list is
+    // cloned.
+    let mut candidates = Vec::new();
+    for tree in &context.tree_list {
+        let file_id = tree.file_id;
+        let Some(references) = db.get_reference_index().get_decl_references_map(&file_id) else {
+            continue;
+        };
+        for (decl_id, decl_references) in references {
+            let is_local = db
+                .get_decl_index()
                 .get_decl(decl_id)
-                .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }))
-                && db
-                    .get_type_index()
-                    .get_type_cache(&(*decl_id).into())
-                    // `never` is the bottom of the same uninformative band
-                    // as `unknown` (see `LuaTypeCache::supersedes`), and it
-                    // is what an initialiser resolves to when the member it
-                    // reads is not in the index *yet*.
-                    .is_none_or(|cache| {
-                        cache.is_infer()
-                            && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
-                    })
-        })
-        .collect::<Vec<_>>();
+                .is_some_and(|decl| matches!(decl.extra, crate::LuaDeclExtra::Local { .. }));
+            if !is_local {
+                continue;
+            }
+            // `never` is the bottom of the same uninformative band as
+            // `unknown` (see `LuaTypeCache::supersedes`), and it is what an
+            // initialiser resolves to when the member it reads is not in the
+            // index *yet*.
+            let uninformative = db
+                .get_type_index()
+                .get_type_cache(&(*decl_id).into())
+                .is_none_or(|cache| {
+                    cache.is_infer() && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
+                });
+            if !uninformative {
+                continue;
+            }
+            candidates.push((file_id, *decl_id, decl_references.clone()));
+        }
+    }
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
 
     let mut evidence_by_node =
@@ -234,13 +236,13 @@ fn compare_unguarded_child_candidates(
         .then_with(|| left.stable_cmp(right))
 }
 
-/// The evidence sites of one declaration, with whether each sits inside a
-/// `return`.
 /// Declared member types already looked up in this pass. `infer_raw_member_type`
 /// reads the member index, so the answer only depends on the pair, and a member
 /// path repeats at every use of the declaration it hangs off.
 type DeclaredPathBases = FxHashMap<(LuaType, LuaMemberKey), Option<(LuaType, LuaTypeDeclId)>>;
 
+/// The evidence sites of one declaration, with whether each sits inside a
+/// `return`.
 pub(super) type UnguardedChildSiteCache =
     HashMap<(crate::FileId, crate::LuaDeclId), Vec<(LuaNameExpr, LuaIndexExpr, bool)>>;
 
@@ -284,10 +286,10 @@ pub(super) fn stabilize_unguarded_children(
         .map(|tree| tree.file_id)
         .collect::<Vec<_>>();
     for file_id in file_ids {
-        let Some(references) = db
+        let Some(decl_ids) = db
             .get_reference_index()
             .get_decl_references_map(&file_id)
-            .cloned()
+            .map(|references| references.keys().copied().collect::<Vec<_>>())
         else {
             continue;
         };
@@ -300,38 +302,45 @@ pub(super) fn stabilize_unguarded_children(
         };
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
 
-        for (decl_id, references) in references {
+        for decl_id in decl_ids {
             // The syntactic prerequisites for evidence — a read reference
             // that is the prefix of an index expression — are pure tree
             // lookups, while `declaration_base_type` infers a parameter's
-            // type.
+            // type. Only a declaration missing from the cache reads its
+            // reference list, so a second pass re-reads none of them.
             let all_sites = site_cache.entry((file_id, decl_id)).or_insert_with(|| {
-                references
-                    .cells
-                    .iter()
-                    .filter(|cell| !cell.is_write)
-                    .filter_map(|cell| {
-                        let name_expr = root
-                            .covering_element(cell.range)
-                            .ancestors()
-                            .find_map(LuaNameExpr::cast)
-                            .filter(|name| name.get_range() == cell.range)?;
-                        let index_expr = name_expr
-                            .syntax()
-                            .ancestors()
-                            .find_map(LuaIndexExpr::cast)
-                            .filter(|index| {
-                                index
-                                    .get_prefix_expr()
-                                    .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
-                            })?;
-                        let in_return = index_expr
-                            .syntax()
-                            .ancestors()
-                            .any(|node| LuaReturnStat::cast(node).is_some());
-                        Some((name_expr, index_expr, in_return))
+                db.get_reference_index()
+                    .get_decl_references_map(&file_id)
+                    .and_then(|references| references.get(&decl_id))
+                    .map(|references| {
+                        references
+                            .cells
+                            .iter()
+                            .filter(|cell| !cell.is_write)
+                            .filter_map(|cell| {
+                                let name_expr = root
+                                    .covering_element(cell.range)
+                                    .ancestors()
+                                    .find_map(LuaNameExpr::cast)
+                                    .filter(|name| name.get_range() == cell.range)?;
+                                let index_expr = name_expr
+                                    .syntax()
+                                    .ancestors()
+                                    .find_map(LuaIndexExpr::cast)
+                                    .filter(|index| {
+                                        index.get_prefix_expr().is_some_and(|prefix| {
+                                            prefix.syntax() == name_expr.syntax()
+                                        })
+                                    })?;
+                                let in_return = index_expr
+                                    .syntax()
+                                    .ancestors()
+                                    .any(|node| LuaReturnStat::cast(node).is_some());
+                                Some((name_expr, index_expr, in_return))
+                            })
+                            .collect::<Vec<_>>()
                     })
-                    .collect::<Vec<_>>()
+                    .unwrap_or_default()
             });
             let sites = all_sites
                 .iter()
