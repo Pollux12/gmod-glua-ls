@@ -247,6 +247,16 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
 
     let table_type = infer_expr(db, cache, table_arg)?;
+    if matches!(table_type, LuaType::Global) {
+        // The global table has no enumerable answer: its member types are the very
+        // thing analysis is computing, and a loop over it can declare further
+        // globals whose types are then part of the same union. Any snapshot is a
+        // record of how far inference had progressed, not a fact about the program.
+        return Ok(Some(VariadicType::Multi(vec![
+            LuaType::String,
+            LuaType::Any,
+        ])));
+    }
     if let LuaType::TableOf(inner) = &table_type {
         // Keep the value as T[K] instead of materializing every member type. Large
         // scripted-class hierarchies can contain hundreds of callable members.
