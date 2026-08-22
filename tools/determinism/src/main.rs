@@ -94,6 +94,21 @@
 //!                               inherits that state and its diff is
 //!                               meaningless. Honours DET_INDEX_DIFF (cold index
 //!                               snapshot vs the state each target leaves behind).
+//!                     editrevert
+//!                               apply a real edit through the single-file
+//!                               update path and then take it back out. The
+//!                               source ends where it started, so the INDEX and
+//!                               the diagnostics have to as well — a difference
+//!                               is drift the edit path introduced, not a fact
+//!                               about the code. Needs DET_EDIT_FIND; without it
+//!                               the stage skips. Runs before `realedit`, which
+//!                               leaves the edited file re-indexed behind it.
+//!                               Covers what the other stages cannot:
+//!                               `indexrepeat` re-indexes with the text
+//!                               untouched and so never exercises an edit's
+//!                               invalidation, and `noopedit`'s pair is
+//!                               semantically neutral, so the update path skips
+//!                               the re-index outright.
 //!                     realedit  apply a real edit (DET_EDIT_FIND replaced by
 //!                               DET_EDIT_REPLACE) to each DET_TARGETS entry and
 //!                               compare the incremental result against a cold
@@ -1454,6 +1469,69 @@ fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
     }
 }
 
+/// Edit a file through the single-file update path, then put it back.
+///
+/// The source ends up exactly as it started, so the index has to as well. Any
+/// difference is drift the edit path introduced rather than a fact about the
+/// code: state the edit added and the revert did not take away, or state the
+/// edit dropped and the revert did not restore.
+///
+/// This is the update-path counterpart of `indexrepeat`. That stage re-indexes
+/// with the text untouched, so it never exercises the invalidation an edit
+/// triggers; this one does, and unlike `realedit` it needs no ground-truth
+/// build, because the pre-edit index *is* the truth. `noopedit` does not cover
+/// it either: its edit pair is semantically neutral, so the update path skips
+/// the re-index outright and nothing is invalidated.
+fn edit_revert(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
+    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
+        eprintln!("[editrevert] SKIPPED: DET_EDIT_FIND is not set, so no drift gate ran");
+        return;
+    };
+    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
+
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[editrevert] file not indexed: {}", path.display());
+            continue;
+        };
+        let Some(original) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if !original.contains(find.as_str()) {
+            eprintln!("[editrevert] {find:?} not present in {}", path.display());
+            continue;
+        }
+        let edited = original.replace(find.as_str(), replace.as_str());
+
+        let before_index = collect_index(analysis, "before_editrevert");
+        let before = collect(analysis, "before_editrevert");
+
+        let t = Instant::now();
+        analysis.update_file_by_uri(&uri, Some(edited));
+        analysis.update_file_by_uri(&uri, Some(original));
+        eprintln!(
+            "[editrevert] {target} edited and reverted ({:.2}s)",
+            t.elapsed().as_secs_f64()
+        );
+
+        let label = format!("after_editrevert[{target}]");
+        let after_index = collect_index(analysis, &label);
+        let after = collect(analysis, &label);
+        diff_index("before_editrevert", &before_index, &label, &after_index);
+        diff("before_editrevert", &before, &label, &after);
+    }
+}
+
 /// Applies a **real** edit and compares the incremental result against a cold
 /// build of the same edited source.
 ///
@@ -1584,7 +1662,7 @@ fn run() {
         std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS env var is required"),
     );
     let stages = std::env::var("DET_STAGES")
-        .unwrap_or_else(|_| "repeat,noopedit,realedit,indexrepeat".to_string())
+        .unwrap_or_else(|_| "repeat,noopedit,editrevert,realedit,indexrepeat".to_string())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1784,6 +1862,11 @@ fn run() {
 
     if stages.iter().any(|s| s == "faithful") {
         refresh_faithfulness(&analysis);
+    }
+
+    // Before `realedit`, which leaves the edited file re-indexed behind it.
+    if stages.iter().any(|s| s == "editrevert") {
+        edit_revert(&mut analysis, &codebase, &targets);
     }
 
     if stages.iter().any(|s| s == "realedit") {
