@@ -1127,7 +1127,7 @@ impl LuaUnionType {
     /// Callables are matched and rendered in declaration order, and template
     /// refs drive `` `T` ``|T dispatch, so a union containing either keeps the
     /// order it was built with.
-    fn is_order_insensitive_member(typ: &LuaType) -> bool {
+    pub(crate) fn is_order_insensitive_member(typ: &LuaType) -> bool {
         !matches!(
             typ,
             LuaType::Signature(_)
