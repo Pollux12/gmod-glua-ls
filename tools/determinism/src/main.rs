@@ -142,6 +142,10 @@
 //!   DET_SHOW_EXPANSION  print the reindex expansion set for each edit
 //!   DET_DUMP        write the cold diagnostic set to this path
 //!   DET_DUMP_FILE_IDS   print the main-workspace file id table
+//!   DET_DUMP_EXPANSION  list every file `indexrepeat` re-indexes, so a drifting
+//!                   entry can be told apart from one merely near the batch:
+//!                   whether the writer of a fact sits inside or outside it is
+//!                   what decides whether the reader saw it settled
 //!   DET_DUMP_CLASS  print the member list of this class at each snapshot
 //!   DET_LIMIT       max diff lines printed per bucket (default 40)
 //!   DET_FILTER      substring an index-diff entry line must contain to be
@@ -1035,6 +1039,13 @@ fn run_index_repeat(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[
             target,
             expanded.len()
         );
+        if std::env::var_os("DET_DUMP_EXPANSION").is_some() {
+            for id in &expanded {
+                if let Some(path) = analysis.compilation.get_db().get_vfs().get_file_path(id) {
+                    eprintln!("[expansion] {}", path.display());
+                }
+            }
+        }
 
         let before = collect_index(analysis, "before_indexrepeat");
         analysis.reindex_files(vec![file_id]);
