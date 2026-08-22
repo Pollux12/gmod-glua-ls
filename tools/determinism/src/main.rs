@@ -64,6 +64,25 @@
 //!                               and skipping must preserve state. It does not
 //!                               exercise re-analysis — `realedit` gates that,
 //!                               and `editmid` bisects it.
+//!                     indexrepeat
+//!                               re-index each DET_TARGETS entry with its text
+//!                               untouched and require the INDEX to come back
+//!                               identical. The diagnostic gates cannot see
+//!                               this: re-analysing a file can attach different
+//!                               members, or settle a decl's type differently
+//!                               from the cold build, and still produce the same
+//!                               diagnostics — `repeat` and `noopedit` both
+//!                               report IDENTICAL while the index underneath has
+//!                               drifted. That drift is why no incremental work
+//!                               can be skipped: every "did this actually
+//!                               change?" test answers yes. Does **not** pass
+//!                               today (CityRP: 82 type caches, 3 signatures and
+//!                               11 class members change), and it is a real
+//!                               defect rather than a harness artefact, so treat
+//!                               any *growth* in those counts as yours. Listed
+//!                               last in the default set because it re-indexes
+//!                               in place and leaves that warm state behind, so
+//!                               an in-place stage after it inherits it.
 //!                     editmid   offset-shifting no-op edit pair (newline at the
 //!                               front of the file, then removed): the semantic
 //!                               no-op gate cannot fire, so both edits run the
@@ -989,6 +1008,42 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
     }
 }
 
+/// Re-index the targets without touching their text and require the index to
+/// come back byte-identical.
+///
+/// The diagnostic gates cannot see this: re-analysing a file can attach members
+/// or settle a decl's type differently from the cold build and still produce the
+/// same diagnostics, so `repeat` and `noopedit` both report IDENTICAL while the
+/// index underneath has drifted. That drift is what makes incremental work
+/// impossible to skip — every "did this actually change?" test reports yes — so
+/// it needs a gate of its own.
+fn run_index_repeat(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            eprintln!("[indexrepeat] cannot build uri for {}", path.display());
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[indexrepeat] file not indexed: {}", path.display());
+            continue;
+        };
+
+        let expanded = analysis.expand_reindex_file_ids(vec![file_id]);
+        eprintln!(
+            "[indexrepeat] {} re-indexes {} files with no text change",
+            target,
+            expanded.len()
+        );
+
+        let before = collect_index(analysis, "before_indexrepeat");
+        analysis.reindex_files(vec![file_id]);
+        let label = format!("after_indexrepeat[{target}]");
+        let after = collect_index(analysis, &label);
+        diff_index("before_indexrepeat", &before, &label, &after);
+    }
+}
+
 /// Applies a semantically-neutral edit pair and lets the analysis settle.
 ///
 /// `at_front` decides which kind: appending a trailing newline is a semantic
@@ -1397,7 +1452,7 @@ fn run() {
         std::env::var("DET_ANNOTATIONS").expect("DET_ANNOTATIONS env var is required"),
     );
     let stages = std::env::var("DET_STAGES")
-        .unwrap_or_else(|_| "repeat,noopedit,realedit".to_string())
+        .unwrap_or_else(|_| "repeat,noopedit,realedit,indexrepeat".to_string())
         .split(',')
         .map(|s| s.trim().to_string())
         .filter(|s| !s.is_empty())
@@ -1457,6 +1512,10 @@ fn run() {
             previous = after;
             previous_label = label;
         }
+    }
+
+    if stages.iter().any(|s| s == "indexrepeat") {
+        run_index_repeat(&mut analysis, &codebase, &targets);
     }
 
     if stages.iter().any(|s| s == "editmid") {
