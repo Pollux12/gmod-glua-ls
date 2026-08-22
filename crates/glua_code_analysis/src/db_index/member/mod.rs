@@ -112,6 +112,12 @@ impl LuaMemberIndex {
         &self.assignment_contributions
     }
 
+    pub fn member_assignment_contributions_mut(
+        &mut self,
+    ) -> &mut MemberAssignmentContributionStore {
+        &mut self.assignment_contributions
+    }
+
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
         let id = member.get_id();
         let file_id = member.get_file_id();

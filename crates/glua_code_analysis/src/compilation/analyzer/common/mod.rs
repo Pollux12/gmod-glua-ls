@@ -2,7 +2,7 @@ mod migrate_global_member;
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 pub(super) use migrate_global_member::{
     migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
-    reconcile_parked_global_path_members,
+    reconcile_directly_attached_candidate_members, reconcile_parked_global_path_members,
 };
 use rowan::TextRange;
 

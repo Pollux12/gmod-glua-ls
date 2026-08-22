@@ -258,6 +258,16 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             common::reconcile_parked_global_path_members(db);
         }
 
+        // Writes that inferred their prefix to one concrete declaration of a
+        // multi-declaration global attach directly to that table and never
+        // park, so which table won depends on batch composition. Re-apply the
+        // ownership rule to them now that every declaration stands. See
+        // `reconcile_directly_attached_candidate_members`.
+        {
+            let _p = Profile::new("reconcile_directly_attached_candidate_members");
+            common::reconcile_directly_attached_candidate_members(db);
+        }
+
         // Runs last of the settled passes: it needs every member to have reached
         // its final owner, because the writer set it merges is grouped by owner.
         {
@@ -273,6 +283,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         {
             let _p = Profile::new("attach_settled_index_expr_members (late)");
             attach_settled_index_expr_members(db, &mut context);
+        }
+
+        // The late attach can still place members straight onto whichever
+        // candidate table its prefix resolved to, so the direct-attached
+        // repair has to see its results too.
+        {
+            let _p = Profile::new("reconcile_directly_attached_candidate_members (late)");
+            common::reconcile_directly_attached_candidate_members(db);
         }
 
         // Net flows are collected last: the collector resolves wrappers through
@@ -630,10 +648,12 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                             building_dynamic_field_index: false,
                         },
                     );
-                    let blind_type =
-                        select_result_fact(infer_expr_fact_with_cache(db, &mut blind_cache, expr), ret_idx)
-                            .typ()
-                            .clone();
+                    let blind_type = select_result_fact(
+                        infer_expr_fact_with_cache(db, &mut blind_cache, expr),
+                        ret_idx,
+                    )
+                    .typ()
+                    .clone();
                     current_cache
                         .as_ref()
                         .is_some_and(|current| current.as_type() == &blind_type)

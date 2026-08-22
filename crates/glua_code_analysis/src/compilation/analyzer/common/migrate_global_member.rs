@@ -1,6 +1,7 @@
 use std::collections::HashSet;
 
 use crate::{DbIndex, GlobalId, InFiled, LuaDeclId, LuaMemberId, LuaMemberOwner, LuaTypeOwner};
+use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, PathTrait};
 
 use super::get_owner_id;
 use crate::compilation::analyzer::lua::is_guarded_table_assignment_member;
@@ -219,6 +220,171 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 if Some(alias_owner) != target_owner.as_ref() {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
                 }
+            }
+        }
+    }
+}
+
+/// Whether this member is a write through *this* global's path.
+///
+/// A candidate table can hold members that arrived through other prefixes (a
+/// local alias, a sibling global whose type resolved to the same literal);
+/// those must not take part in this global's ownership repair. The path is
+/// normally recorded on the member when declaration analysis parks it; a
+/// member the lua pass attached directly carries none, so its own syntax
+/// decides — the write site is stable under batching either way.
+fn member_targets_global_path(db: &DbIndex, member_id: LuaMemberId, global_id: &GlobalId) -> bool {
+    if let Some(member) = db.get_member_index().get_member(&member_id)
+        && let Some(recorded) = member.get_global_id()
+    {
+        // The record is the write's full access path (`cityrp.LoadedOnce`);
+        // this repair belongs to the root global's candidates.
+        let recorded_root = recorded.get_name().split('.').next().unwrap_or_default();
+        return recorded_root == global_id.get_name();
+    }
+
+    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let Some(node) = member_id
+        .get_syntax_id()
+        .to_node_from_root(&tree.get_red_root())
+    else {
+        return false;
+    };
+    let Some(index_expr) = LuaIndexExpr::cast(node) else {
+        return false;
+    };
+    let Some(access_path) = index_expr.get_access_path() else {
+        return false;
+    };
+    let root = access_path.split('.').next().unwrap_or_default();
+    if root != global_id.get_name() {
+        return false;
+    }
+    // The root segment must actually read the global: a local (or parameter)
+    // of the same name writes somewhere else entirely. A read bound to one of
+    // the root's own global declarations still counts as the global itself.
+    match index_expr.get_prefix_expr() {
+        Some(LuaExpr::NameExpr(name_expr)) => db
+            .get_reference_index()
+            .get_local_reference(&member_id.file_id)
+            .and_then(|reference| reference.get_decl_id(&name_expr.get_range()))
+            .and_then(|decl_id| db.get_decl_index().get_decl(&decl_id))
+            .map(|decl| decl.is_global())
+            .unwrap_or(false),
+        // A deeper index (`a.b.c`) belongs to the nested path's own
+        // reconciliation, not to the root global's.
+        _ => false,
+    }
+}
+
+/// Re-homes members that reached a candidate table *directly*.
+///
+/// A write whose prefix inferred to one concrete declaration while sibling
+/// declarations of the same global were still unresolved attaches straight to
+/// that table instead of parking on the global path, so the parked-member
+/// reconciliation above never revisits it — and which table won depends on how
+/// far the batch had run when the write was analysed. Applying the same target
+/// rule the parked path uses (a declaring file keeps its own table, everyone
+/// else belongs to the canonical owner) to every member sitting on a candidate
+/// owner makes the outcome a function of the declared candidate set alone.
+pub fn reconcile_directly_attached_candidate_members(db: &mut DbIndex) {
+    for global_id in db.get_global_index().sorted_multi_declaration_globals() {
+        let Some(candidates) = elected_global_owners(db, &global_id) else {
+            continue;
+        };
+        if candidates.len() < 2 {
+            continue;
+        }
+        let Some((_, canonical_owner)) = candidates.first() else {
+            continue;
+        };
+        let declaring_files = declaring_files(db, &global_id);
+        rehome_directly_attached_candidate_members(
+            db,
+            &global_id,
+            &candidates,
+            &declaring_files,
+            canonical_owner,
+        );
+    }
+}
+
+fn rehome_directly_attached_candidate_members(
+    db: &mut DbIndex,
+    global_id: &GlobalId,
+    candidates: &[(crate::FileId, LuaMemberOwner)],
+    declaring_files: &HashSet<crate::FileId>,
+    canonical_owner: &LuaMemberOwner,
+) {
+    if candidates.len() < 2 {
+        return;
+    }
+
+    let mut seen = HashSet::new();
+    let writers = candidates
+        .iter()
+        .flat_map(|(_, owner)| db.get_member_index().get_member_history(owner))
+        .filter(|member| seen.insert(member.get_id()))
+        .filter(|member| {
+            !db.get_member_index()
+                .has_synthesized_owner(&member.get_id())
+                && !file_hands_global_to_scripted_class(db, member.get_file_id(), global_id)
+                && member_targets_global_path(db, member.get_id(), global_id)
+        })
+        .map(|member| (member.get_id(), member.get_key().clone()))
+        .collect::<Vec<_>>();
+    for (member_id, member_key) in writers {
+        let Some(current) = db.get_member_index().get_member_owner(&member_id) else {
+            continue;
+        };
+        let target = match candidates
+            .iter()
+            .find(|(file_id, _)| *file_id == member_id.file_id)
+        {
+            Some((_, owner)) => owner.clone(),
+            // See the parked-path rule: a file that declares the global but
+            // has not resolved its table keeps its members parked rather
+            // than sharing a sibling's overwrite slot.
+            None if declaring_files.contains(&member_id.file_id) => continue,
+            None => canonical_owner.clone(),
+        };
+        let needs_move = *current != target && candidates.iter().any(|(_, owner)| owner == current);
+        let contribution_group_owner = db
+            .get_member_index()
+            .member_assignment_contributions()
+            .contribution_group_of(&member_id)
+            .map(|(owner, _)| owner);
+        let needs_contribution_move = contribution_group_owner
+            .as_ref()
+            .is_some_and(|owner| *owner != target);
+        if needs_contribution_move
+            && let Some(contribution) = db
+                .get_member_index()
+                .member_assignment_contributions()
+                .contribution_of(&member_id)
+                .cloned()
+        {
+            db.get_member_index_mut()
+                .member_assignment_contributions_mut()
+                .record(target.clone(), member_key.clone(), member_id, contribution);
+        }
+        if needs_move {
+            restore_non_overwriting_mark(db, member_id);
+            let member_index = db.get_member_index_mut();
+            member_index.set_member_owner(target.clone(), member_id.file_id, member_id);
+            member_index.add_member_to_owner(target.clone(), member_id);
+        }
+        let member_index = db.get_member_index_mut();
+        // Aliasing the remaining candidates is what makes a global declared
+        // once per realm behave like the single table it is at runtime, and it
+        // has to run even when nothing moved: re-indexing a file rebuilds its
+        // members from scratch, so the aliases the original migration created
+        // are gone.
+        for (_, alias_owner) in candidates {
+            if *alias_owner != target {
+                member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
             }
         }
     }
