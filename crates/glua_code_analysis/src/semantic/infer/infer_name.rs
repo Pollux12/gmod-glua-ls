@@ -2489,6 +2489,21 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
         }
     }
 
+    // A global's type is the merge of every declaration of it, so a declaration
+    // whose type cache is missing is a writer this merge cannot see. Answering
+    // anyway makes the result depend on how far the batch has run rather than on
+    // the source: `remove_index` clears the batch's caches up front, so which
+    // declarations are visible is decided by batch composition. Every branch
+    // below is affected — the callable union loses an arm, `def_or_ref_type` and
+    // the table merge pick a different winner, and `saw_nil` cannot know whether
+    // the absent declaration was nil.
+    //
+    // Defer instead. The unresolve pass retries once that declaration carries a
+    // type and floors it to `Unknown` if it never does, so this cannot stall.
+    if !matches!(last_resolve_reason, InferFailReason::None) {
+        return Err(last_resolve_reason);
+    }
+
     if let Some(callable_type) = callable_type {
         return Ok(callable_type);
     }
