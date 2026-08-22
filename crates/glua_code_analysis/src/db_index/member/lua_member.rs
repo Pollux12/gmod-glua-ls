@@ -139,7 +139,7 @@ impl LuaMemberKey {
         }
     }
 
-    fn from_expr_type(expr_type: LuaType) -> Self {
+    pub(crate) fn from_expr_type(expr_type: LuaType) -> Self {
         match expr_type {
             LuaType::StringConst(s) => LuaMemberKey::Name(s.deref().clone()),
             LuaType::DocStringConst(s) => LuaMemberKey::Name(s.deref().clone()),

@@ -444,17 +444,16 @@ pub fn try_resolve_table_field(
     let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
     let field_expr = field_key.get_expr().ok_or(InferFailReason::None)?;
     let field_type = infer_expr(db, cache, field_expr.clone())?;
-    let member_key: LuaMemberKey = match field_type {
-        LuaType::StringConst(s) => LuaMemberKey::Name((*s).clone()),
-        LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
-        _ => {
-            if field_type.is_table() {
-                LuaMemberKey::ExprType(field_type)
-            } else {
-                return Err(InferFailReason::None);
-            }
-        }
-    };
+    // The same mapping the immediate path uses. Re-deriving it here used to
+    // drop the member for every key type that is neither a literal nor a table,
+    // so a table field whose key type was known straight away got a member while
+    // an identical one that had to wait for inference got none — the analysis
+    // disagreed with itself depending on the order files happened to be
+    // analysed in.
+    let member_key = LuaMemberKey::from_expr_type(field_type);
+    if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+        return Err(InferFailReason::None);
+    }
     let file_id = unresolve_table_field.file_id;
     let table_expr = unresolve_table_field.table_expr.clone();
     let owner_id = LuaMemberOwner::Element(InFiled {
