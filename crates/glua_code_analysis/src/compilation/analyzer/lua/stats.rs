@@ -1414,7 +1414,7 @@ fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
 }
 
 fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
-    matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_))
+    crate::compilation::analyzer::initializer_reads_through_call_or_index(expr)
 }
 
 /// Whether an initializer that inferred to a type carrying no information
