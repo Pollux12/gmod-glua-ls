@@ -897,7 +897,10 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 })
                 .collect::<Vec<_>>();
             ids.sort();
-            contribution_groups.insert(format!("{:?}|{:?}", group_key.0, group_key.1), ids.join(","));
+            contribution_groups.insert(
+                format!("{:?}|{:?}", group_key.0, group_key.1),
+                ids.join(","),
+            );
         }
     }
 
