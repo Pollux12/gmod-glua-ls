@@ -3359,10 +3359,36 @@ enum BranchKind {
     ElseIf,
 }
 
+/// The node's text up to its first newline.
+///
+/// `node.text().to_string()` walks and concatenates every token underneath, so
+/// asking an `if` statement for its header used to materialise the statement's
+/// whole body — thousands of lines for a large branch — to read one line of it.
+/// Network flow analysis does that for every branch around every `net` call in
+/// every re-analysed file, which made it one of the more expensive things a
+/// keystroke paid for.
+fn first_line_text(node: &LuaSyntaxNode) -> String {
+    let mut line = String::new();
+    for token in node
+        .descendants_with_tokens()
+        .filter_map(|element| element.into_token())
+    {
+        let text = token.text();
+        match text.find('\n') {
+            Some(end) => {
+                line.push_str(&text[..end]);
+                break;
+            }
+            None => line.push_str(text),
+        }
+    }
+    line
+}
+
 /// Pulls the header text for an `elseif cond then` clause from source.
 fn extract_branch_header(node: &LuaSyntaxNode, kind: BranchKind) -> Option<String> {
     const MAX_HEADER_LEN: usize = 80;
-    let full = node.text().to_string();
+    let full = first_line_text(node);
     let trimmed = full.trim_start();
     let nl_idx = trimmed.find('\n').unwrap_or(trimmed.len());
     let first_line = &trimmed[..nl_idx];
@@ -3397,7 +3423,9 @@ fn extract_branch_header(node: &LuaSyntaxNode, kind: BranchKind) -> Option<Strin
 /// back to a generic label in that case.
 fn extract_flow_header(stat_node: &LuaSyntaxNode, kind: NetFlowKind) -> Option<String> {
     const MAX_HEADER_LEN: usize = 80;
-    let full = stat_node.text().to_string();
+    // Only the opener is ever read, and it bails on a multi-line one, so there
+    // is no reason to materialise the statement's whole body first.
+    let full = first_line_text(stat_node);
     let header_raw = match kind {
         NetFlowKind::Repeat => {
             // `repeat` itself has no condition until `until` at the end.
