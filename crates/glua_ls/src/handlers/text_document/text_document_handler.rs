@@ -402,7 +402,10 @@ pub async fn on_did_change_text_document(
 
     // Schedule debounced reindex — rapid edits into a single reindex
     if let Some(file_id) = file_id {
-        context.debounced_analysis().schedule(file_id).await;
+        context
+            .debounced_analysis()
+            .schedule(file_id, uri.clone())
+            .await;
     }
 
     // Handle reindex without holding locks

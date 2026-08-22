@@ -131,14 +131,36 @@ macro_rules! dispatch_request {
                     if let Ok((id, params)) = $request.extract::<<$fresh_req_type as LspRequest>::Params>(<$fresh_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
                             // Symbol resolution against a stale index silently
-                            // returns empty; wait for the reindex.
-                            if !snapshot
-                                .debounced_analysis()
-                                .wait_until_fresh_for(&cancel_token, <$fresh_req_type>::METHOD)
-                                .await
-                            {
+                            // returns empty; wait for the reindex. A request
+                            // aimed at one file only needs that file's own
+                            // entries to match its text, so it waits for those
+                            // rather than for the edit's whole dependency
+                            // ripple — seconds apart on a large gamemode.
+                            let fresh = match target_uri.as_ref() {
+                                Some(uri) => {
+                                    snapshot
+                                        .debounced_analysis()
+                                        .wait_until_file_fresh_for(
+                                            &cancel_token,
+                                            <$fresh_req_type>::METHOD,
+                                            uri,
+                                        )
+                                        .await
+                                }
+                                None => {
+                                    snapshot
+                                        .debounced_analysis()
+                                        .wait_until_fresh_for(
+                                            &cancel_token,
+                                            <$fresh_req_type>::METHOD,
+                                        )
+                                        .await
+                                }
+                            };
+                            if !fresh {
                                 return None;
                             }
                             let result = $fresh_handler(snapshot, params, cancel_token).await;

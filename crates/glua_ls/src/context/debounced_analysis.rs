@@ -1,5 +1,6 @@
 use glua_code_analysis::{EmmyLuaAnalysis, FileId};
-use std::collections::HashSet;
+use lsp_types::Uri;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::time::{Duration, Instant};
@@ -18,6 +19,17 @@ const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
     reindexing_files: Mutex<HashSet<FileId>>,
+    /// Documents whose own index entries do not match their text yet, either
+    /// because their edit is still queued or because the batch re-indexing them
+    /// has not reached them.
+    ///
+    /// Holds the URI the *client* used, so a request can be tested against its
+    /// own params without taking the analysis lock — which the re-index holds
+    /// for its whole duration, so resolving a file id first would wait out
+    /// exactly what this exists to avoid. Keyed by file id so entries are
+    /// cleared by identity rather than by matching that URI against the one the
+    /// VFS derived from a path, which need not be spelled the same way.
+    blocked_documents: Mutex<HashMap<FileId, Uri>>,
     /// True when document changes have arrived but reindex has not yet completed.
     /// Set synchronously by `begin_in_flight_change()` (called inline in the
     /// notification handler, before the didChange task is spawned) so that any
@@ -52,6 +64,7 @@ impl DebouncedAnalysis {
         Self {
             pending_files: Mutex::new(HashSet::new()),
             reindexing_files: Mutex::new(HashSet::new()),
+            blocked_documents: Mutex::new(HashMap::new()),
             has_pending_changes: AtomicBool::new(false),
             in_flight_changes: AtomicUsize::new(0),
             notify: Notify::new(),
@@ -69,10 +82,14 @@ impl DebouncedAnalysis {
     }
 
     /// Add a file to the pending reindex set and reset the debounce timer.
-    pub async fn schedule(&self, file_id: FileId) {
+    pub async fn schedule(&self, file_id: FileId, uri: Uri) {
         {
             let mut pending = self.pending_files.lock().await;
             pending.insert(file_id);
+        }
+        {
+            let mut blocked = self.blocked_documents.lock().await;
+            blocked.insert(file_id, uri);
         }
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
@@ -182,6 +199,71 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Wait until the document at `uri` has index entries matching its text.
+    ///
+    /// A request positioned inside a file needs that file's entries to line up
+    /// with the tree it is resolving against — they are keyed by position, so an
+    /// edit that shifts offsets is what makes them stop matching, and answering
+    /// from the old ones is what silently returns a thinner list. It does *not*
+    /// need the edit's dependency ripple to have finished; that settles other
+    /// files' inferences, and waiting for it costs seconds on a large gamemode
+    /// for an answer that is already correct.
+    ///
+    /// Callers with no URI to aim at want [`wait_until_fresh_for`] instead.
+    ///
+    /// [`wait_until_fresh_for`]: Self::wait_until_fresh_for
+    pub async fn wait_until_file_fresh_for(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        uri: &Uri,
+    ) -> bool {
+        #[cfg(test)]
+        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
+
+        let started_at = Instant::now();
+        let mut warned_stuck = false;
+
+        loop {
+            let notified = self.reindex_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.file_is_answerable(uri).await {
+                return true;
+            }
+
+            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
+
+            tokio::select! {
+                _ = notified => {}
+                _ = cancel_token.cancelled() => return false,
+                _ = tokio::time::sleep(remaining), if !warned_stuck => {
+                    self.log_freshness_stuck(request_method, started_at).await;
+                    warned_stuck = true;
+                }
+            }
+        }
+    }
+
+    async fn file_is_answerable(&self, uri: &Uri) -> bool {
+        // An edit whose text has not been applied yet would have the request
+        // resolve a position against the previous tree.
+        if self.in_flight_changes.load(Ordering::Acquire) > 0 {
+            return false;
+        }
+        if !self.has_pending_changes.load(Ordering::Acquire) {
+            return true;
+        }
+        // Only ever a handful of documents are mid-edit at once.
+        !self
+            .blocked_documents
+            .lock()
+            .await
+            .values()
+            .any(|blocked| blocked == uri)
+    }
+
     async fn log_freshness_stuck(&self, request_method: &'static str, started_at: Instant) {
         let in_flight = self.in_flight_changes.load(Ordering::Acquire);
         let pending_count = self.pending_files.lock().await.len();
@@ -218,7 +300,43 @@ impl DebouncedAnalysis {
         }
     }
 
-    async fn reindex_files_without_queuing(&self, file_ids: Vec<FileId>) -> bool {
+    /// Re-index the edited files' own entries, and report the dependency
+    /// expansion the ripple still owes them.
+    ///
+    /// The expansion is captured *before* the self-index, because deriving it
+    /// from a partly-updated index under-expands and leaves dependents holding
+    /// inferences a cold build would not produce.
+    ///
+    /// This takes the write lock and gives it back, which is the whole point: a
+    /// freshness flag published while the lock is still held buys a waiting
+    /// request nothing, since it cannot read the index until the lock is free.
+    async fn self_index_without_queuing(&self, file_ids: Vec<FileId>) -> Option<Vec<FileId>> {
+        let analysis = self.analysis.clone();
+        let cache = self.shared_diagnostic_data_cache.clone();
+
+        tokio::select! {
+            _ = self.shutdown.cancelled() => None,
+            result = tokio::task::spawn_blocking(move || {
+                let mut guard = analysis.blocking_write();
+                let expansion = guard.expand_reindex_file_ids(file_ids.clone());
+                guard.self_index_files(file_ids);
+                cache.invalidate();
+                expansion
+            }) => match result {
+                Ok(expansion) => Some(expansion),
+                Err(err) => {
+                    log::error!("self-index task failed: {}", err);
+                    None
+                }
+            }
+        }
+    }
+
+    async fn reindex_files_without_queuing(
+        &self,
+        file_ids: Vec<FileId>,
+        expansion: Vec<FileId>,
+    ) -> bool {
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
@@ -228,7 +346,7 @@ impl DebouncedAnalysis {
             _ = self.shutdown.cancelled() => false,
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
-                guard.reindex_files(file_ids);
+                guard.reindex_expanded_files(file_ids, expansion);
                 // Invalidate under the write lock so no reader can observe the
                 // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
@@ -291,7 +409,44 @@ impl DebouncedAnalysis {
                     self.debounce_duration.as_millis()
                 );
 
-                let reindex_completed = self.reindex_files_without_queuing(file_ids.clone()).await;
+                // Re-index the edited files themselves first and release the
+                // write lock, so a completion or hover positioned inside one of
+                // them can be answered against entries that match its text
+                // instead of waiting out the whole dependency ripple. The
+                // ripple is by far the larger half — measured on a gamemode
+                // workspace, 106ms against 5.1s.
+                let Some(expansion) = self.self_index_without_queuing(file_ids.clone()).await
+                else {
+                    if self.shutdown.is_cancelled() {
+                        return;
+                    }
+                    // Release the batch, or every request aimed at these
+                    // documents parks until some later edit happens to cover
+                    // them.
+                    let mut reindexing = self.reindexing_files.lock().await;
+                    let mut blocked = self.blocked_documents.lock().await;
+                    for id in &file_ids {
+                        reindexing.remove(id);
+                        blocked.remove(id);
+                    }
+                    drop(blocked);
+                    drop(reindexing);
+                    self.refresh_dirty_state().await;
+                    self.reindex_notify.notify_waiters();
+                    continue;
+                };
+
+                {
+                    let mut blocked = self.blocked_documents.lock().await;
+                    for file_id in &file_ids {
+                        blocked.remove(file_id);
+                    }
+                }
+                self.reindex_notify.notify_waiters();
+
+                let reindex_completed = self
+                    .reindex_files_without_queuing(file_ids.clone(), expansion)
+                    .await;
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
@@ -437,10 +592,12 @@ mod tests {
     use std::sync::atomic::AtomicU8;
     use std::time::Duration;
 
-    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, file_path_to_uri};
+    use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, FileId, file_path_to_uri};
     use googletest::prelude::*;
     use lsp_server::Connection;
+    use lsp_types::Uri;
     use lsp_types::{ClientCapabilities, Diagnostic, NumberOrString};
+    use std::str::FromStr;
     use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
@@ -517,6 +674,48 @@ mod tests {
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// The point of the per-file gate: an edit to one document must not park
+    /// requests aimed at a different one, and must park requests aimed at
+    /// itself until its own entries have been rebuilt.
+    #[gtest]
+    fn a_pending_edit_blocks_only_its_own_document() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let edited = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+            let untouched =
+                Uri::from_str("file:///workspace/untouched.lua").expect("uri should parse");
+
+            debounced_analysis
+                .schedule(FileId { id: 1 }, edited.clone())
+                .await;
+
+            let cancel = CancellationToken::new();
+            let untouched_answered = tokio::time::timeout(
+                Duration::from_millis(250),
+                debounced_analysis.wait_until_file_fresh_for(
+                    &cancel,
+                    "textDocument/completion",
+                    &untouched,
+                ),
+            )
+            .await;
+            verify_that!(untouched_answered.unwrap_or(false), eq(true))?;
+
+            let edited_answered = tokio::time::timeout(
+                Duration::from_millis(250),
+                debounced_analysis.wait_until_file_fresh_for(
+                    &cancel,
+                    "textDocument/completion",
+                    &edited,
+                ),
+            )
+            .await;
+            verify_that!(edited_answered.is_err(), eq(true))?;
             Ok(())
         })
     }
@@ -599,7 +798,7 @@ mod tests {
             );
             verify_that!(
                 debounced_analysis
-                    .reindex_files_without_queuing(vec![api_file_id])
+                    .reindex_files_without_queuing(vec![api_file_id], vec![api_file_id])
                     .await,
                 eq(true)
             )?;
