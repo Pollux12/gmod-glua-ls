@@ -140,6 +140,18 @@ fn run_incremental_edits(
     let mut total = std::time::Duration::ZERO;
     let mut worst = std::time::Duration::ZERO;
     let mut edited = 0usize;
+    // `BENCH_EDIT_REPEAT=N` edits each file N times, which both fills a
+    // sampling profiler's edit window and separates first-edit cache warming
+    // from the steady-state cost of typing.
+    let repeats: usize = std::env::var("BENCH_EDIT_REPEAT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let sample: Vec<(FileId, usize)> = sample
+        .into_iter()
+        .flat_map(|entry| std::iter::repeat_n(entry, repeats))
+        .collect();
     for (file_id, expansion) in sample {
         let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
             continue;
@@ -169,9 +181,46 @@ fn run_incremental_edits(
                     .map_or(0.0, |s| s.elapsed().as_secs_f64())
             );
         }
-        let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited_text));
-        let reindex = t.elapsed();
+        // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
+        // position-based request actually depends on: re-indexing the edited
+        // file alone, then the dependency ripple. It reports what a handler
+        // gated on the edited file's own freshness would wait for.
+        let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
+            // The expansion has to be captured before the edit lands, exactly as
+            // the production edit path does; recomputing it after the edited
+            // file has been re-indexed under-expands.
+            let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+            analysis.update_file_text_only(&uri, edited_text);
+            // Just the edited file's own entries — no cross-file stabilization
+            // and no expansion. This is the floor a position-based request has
+            // to wait for if it is gated on its own file rather than on the
+            // whole ripple.
+            let t = Instant::now();
+            analysis.compilation.remove_index(vec![file_id]);
+            analysis.compilation.update_index(vec![file_id]);
+            let self_only = t.elapsed();
+            // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
+            // entries, so a profile of the run contains nothing but the cost a
+            // per-file freshness gate would pay.
+            let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+                std::time::Duration::ZERO
+            } else {
+                let t = Instant::now();
+                analysis.reindex_expanded_files(vec![file_id], expansion);
+                t.elapsed()
+            };
+            eprintln!(
+                "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
+                self_only.as_secs_f64(),
+                ripple.as_secs_f64()
+            );
+            self_only + ripple
+        } else {
+            let t = Instant::now();
+            analysis.update_file_by_uri(&uri, Some(edited_text));
+            t.elapsed()
+        };
+
         let t = Instant::now();
         let shared = analysis.precompute_diagnostic_shared_data();
         analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
@@ -296,6 +345,34 @@ async fn run() {
     // Add annotations as library workspace
     analysis.add_library_workspace(annotations_path.clone());
 
+    // The server resolves the gamemode base and loads it as a library, so a
+    // benchmark without those roots re-indexes a much smaller dependency
+    // expansion than a keystroke really pays for. `BENCH_LIBS` lists the extra
+    // library roots (e.g. the `sandbox` and `base` gamemodes) so the harness
+    // measures the workspace the editor actually has open.
+    let extra_libraries = std::env::var("BENCH_LIBS")
+        .ok()
+        .into_iter()
+        .flat_map(|libs| {
+            libs.split(',')
+                .map(str::trim)
+                .filter(|lib| !lib.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for library in &extra_libraries {
+        if !library.exists() {
+            eprintln!(
+                "ERROR: BENCH_LIBS path does not exist: {}",
+                library.display()
+            );
+            std::process::exit(1);
+        }
+        eprintln!("Library: {}", library.display());
+        analysis.add_library_workspace(library.clone());
+    }
+
     // Add main workspace
     analysis.add_main_workspace(large_path.clone());
     results.push(BenchmarkResult {
@@ -305,10 +382,13 @@ async fn run() {
 
     // Phase 3: Collect files
     let t = Instant::now();
-    let mut workspace_folders = vec![
-        WorkspaceFolder::new(annotations_path.clone(), true),
-        WorkspaceFolder::new(large_path.clone(), false),
-    ];
+    let mut workspace_folders = vec![WorkspaceFolder::new(annotations_path.clone(), true)];
+    workspace_folders.extend(
+        extra_libraries
+            .iter()
+            .map(|library| WorkspaceFolder::new(library.clone(), true)),
+    );
+    workspace_folders.push(WorkspaceFolder::new(large_path.clone(), false));
 
     // Add library paths from config
     for lib in &emmyrc.workspace.library {
@@ -380,7 +460,12 @@ async fn run() {
         // the ranking pass, which costs ~27s and swamps a CPU profile.
         let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
         if let Some(targets) = &explicit_targets {
-            let wanted: Vec<&str> = targets.split(',').map(str::trim).collect();
+            // A target is either a bare file name or a path suffix, so that a
+            // common name like `shared.lua` can be pinned to one entity.
+            let wanted: Vec<String> = targets
+                .split(',')
+                .map(|target| target.trim().replace('\\', "/").to_lowercase())
+                .collect();
             let sample: Vec<(FileId, usize)> = main_ids
                 .iter()
                 .filter(|id| {
@@ -389,10 +474,12 @@ async fn run() {
                         .get_db()
                         .get_vfs()
                         .get_file_path(id)
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                        .is_some_and(|name| wanted.iter().any(|w| name == *w))
+                        .map(|path| path.to_string_lossy().replace('\\', "/").to_lowercase())
+                        .is_some_and(|path| {
+                            wanted.iter().any(|wanted| path.ends_with(wanted.as_str()))
+                        })
                 })
-                .map(|id| (*id, 0))
+                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
                 .collect();
             #[cfg(feature = "dhat-heap")]
             let dhat_edit = dhat::Profiler::builder()
