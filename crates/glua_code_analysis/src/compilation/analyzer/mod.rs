@@ -266,6 +266,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             lua::rederive_contributed_member_assignments(db, &analyzed_files);
         }
 
+        // Every settled pass above refines the types the member attach retry
+        // reads, so candidates it could not place on the first attempt can be
+        // placed now. Without this a member's existence depends on how far
+        // inference had progressed when its file happened to be walked.
+        {
+            let _p = Profile::new("attach_settled_index_expr_members (late)");
+            attach_settled_index_expr_members(db, &mut context);
+        }
+
         // Net flows are collected last: the collector resolves wrappers through
         // signatures, receiver types and members, none of which exist yet when
         // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
@@ -312,6 +321,7 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
     }
     candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
     candidates.dedup();
+    let mut retry = Vec::new();
 
     // Only the candidate files are re-inferred, so only their caches are stale.
     // Clearing the whole manager would also discard caches the passes that ran
@@ -353,8 +363,17 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
             ret_idx: 0,
         };
         let cache = context.infer_manager.get_infer_cache(file_id);
-        let _ = unresolve::try_resolve_member(db, cache, &mut unresolve_member);
+        if unresolve::try_resolve_member(db, cache, &mut unresolve_member).is_err() {
+            // The prefix still has not settled. Dropping it here is what made a
+            // member's existence depend on analysis order: the passes that run
+            // after this one go on refining the very types this retry needs, so
+            // a candidate that fails now can succeed once they have. Keep it
+            // queued for the next attempt instead.
+            retry.push(candidate);
+        }
     }
+
+    context.settled_member_attach_candidates = retry;
 }
 
 /// Re-resolves inferred returns that settled on `any`/`unknown`.
