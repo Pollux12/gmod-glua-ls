@@ -288,13 +288,29 @@ impl LuaMemberIndex {
         match item {
             LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
             _ => {
-                let winner = latest_defined_member(&old_member_ids, id);
-                if matches!(item, LuaMemberIndexItem::One(current) if *current == winner) {
+                // Ids this owner only *aliases* belong to another owner, and
+                // `add_member_alias_to_owner` never displaces what it finds. Letting
+                // one win this slot -- or evicting one -- would make the outcome
+                // depend on whether the owner's own write or the alias arrived
+                // first, which is a property of the batch, not of the source.
+                let (aliased, owned): (Vec<_>, Vec<_>) = old_member_ids
+                    .iter()
+                    .copied()
+                    .partition(|old_id| self.member_current_owner.get(old_id) != Some(owner));
+                let winner = latest_defined_member(&owned, id);
+                let mut visible = aliased;
+                visible.push(winner);
+                visible.sort_by_key(|visible_id| member_id_sort_key(*visible_id));
+                let new_item = match visible.as_slice() {
+                    [only] => LuaMemberIndexItem::One(*only),
+                    _ => LuaMemberIndexItem::Many(visible),
+                };
+                if item == &new_item {
                     return MemberInsertAction::Noop;
                 }
                 MemberInsertAction::StoreRemovingVisibleOldIds {
-                    item: LuaMemberIndexItem::One(winner),
-                    old_ids: old_member_ids
+                    item: new_item,
+                    old_ids: owned
                         .into_iter()
                         .chain(std::iter::once(id))
                         .filter(|candidate| {
@@ -2231,6 +2247,37 @@ mod tests {
                 aliased_member_id,
             ])),
             "an alias only ever adds; it must never replace the owner's own writer"
+        );
+    }
+
+    #[test]
+    fn a_table_field_write_arriving_after_an_alias_still_takes_the_slot() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
+        let key = LuaMemberKey::Name("field".into());
+        // A table-literal field is a `FileDefine` that is not an index-expr
+        // assignment, so it falls through to the latest-defined rule.
+        let own_member_id = make_member_id(FileId::new(1), 10);
+        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            other_owner,
+            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                own_member_id,
+                aliased_member_id,
+            ])),
+            "which of the two arrived first must not decide the slot"
         );
     }
 
