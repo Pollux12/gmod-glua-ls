@@ -13,7 +13,7 @@ use crate::{
     },
     db_index::{
         LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType,
-        MemberAssignmentContribution,
+        MemberAssignmentContribution, member_id_sort_key,
     },
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
@@ -2136,6 +2136,19 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
     for related_member in related_members {
         let related_member_id = related_member.get_id();
         if related_member_id == *member_id {
+            continue;
+        }
+        // Only writers that come before this one are evidence for it. The walk
+        // otherwise settles that with "the sibling already has a type cache",
+        // which reports how far the batch has run rather than anything about
+        // the source: a re-index clears the batch's caches and leaves the rest
+        // standing, so the same sibling counts on one run and not on another.
+        // Reading the order off the source makes the set identical on both,
+        // and it is the rule the settled re-derivation already applies - a
+        // later write must not widen the type it is itself checked against.
+        if !preserve_table_literals
+            && member_id_sort_key(related_member_id) >= member_id_sort_key(*member_id)
+        {
             continue;
         }
         if !is_member_realm_compatible(db, *member_id, related_member_id) {
