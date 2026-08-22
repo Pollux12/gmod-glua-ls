@@ -382,7 +382,14 @@ pub fn try_resolve_member(
         }
 
         let member_id = unresolve_member.member_id;
-        bind_resolved_type(db, member_id.into(), LuaTypeCache::InferType(expr_type));
+        bind_resolved_type(
+            db,
+            member_id.into(),
+            LuaTypeCache::InferType(expr_type.clone()),
+        );
+        crate::compilation::analyzer::lua::record_resolved_member_assignment_contribution(
+            db, member_id, &expr_type,
+        );
     }
 
     Ok(())

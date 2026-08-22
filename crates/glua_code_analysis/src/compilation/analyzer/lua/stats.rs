@@ -1958,8 +1958,25 @@ fn record_member_assignment_contribution(
     guarded_bootstrap: bool,
     preserve_table_literals: bool,
 ) {
-    let doc_type = analyzer
-        .db
+    record_member_assignment_contribution_in(
+        analyzer.db,
+        member_id,
+        bound_type,
+        source_type,
+        guarded_bootstrap,
+        preserve_table_literals,
+    );
+}
+
+fn record_member_assignment_contribution_in(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+    bound_type: &LuaType,
+    source_type: Option<LuaType>,
+    guarded_bootstrap: bool,
+    preserve_table_literals: bool,
+) {
+    let doc_type = db
         .get_type_index()
         .get_type_cache(&member_id.into())
         .filter(|cache| cache.is_doc())
@@ -1971,10 +1988,44 @@ fn record_member_assignment_contribution(
         guarded_bootstrap,
         preserve_table_literals,
     };
-    analyzer
-        .db
-        .get_member_index_mut()
+    db.get_member_index_mut()
         .record_member_assignment_contribution(member_id, contribution);
+}
+
+/// Records the evidence of an assignment whose value only resolved after the
+/// walk had moved on.
+///
+/// The walk records a contribution as it binds each write, so a write whose
+/// right-hand side deferred contributes nothing and the settled merge never
+/// sees it. Whether a write deferred is a fact about how far the batch had
+/// run - a re-index keeps out-of-batch types standing and resolves inline what
+/// a cold build had to defer - so the writer set the merge reads would
+/// otherwise differ between the two.
+pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contribution(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+    bound_type: &LuaType,
+) {
+    if !is_assignment_file_define_member(db, member_id) {
+        return;
+    }
+    if db
+        .get_member_index()
+        .member_assignment_contributions()
+        .contribution_of(&member_id)
+        .is_some()
+    {
+        return;
+    }
+    let guarded_bootstrap = is_guarded_table_assignment_member(db, member_id);
+    record_member_assignment_contribution_in(
+        db,
+        member_id,
+        bound_type,
+        None,
+        guarded_bootstrap,
+        false,
+    );
 }
 
 fn record_member_assignment_widening_cache(
