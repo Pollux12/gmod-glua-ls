@@ -1157,7 +1157,12 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
 /// index underneath has drifted. That drift is what makes incremental work
 /// impossible to skip — every "did this actually change?" test reports yes — so
 /// it needs a gate of its own.
-fn run_index_repeat(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
+///
+/// Like `editrevert` it builds its own analysis, for the same reason: sharing
+/// one with the other index gate lets whichever runs second measure against an
+/// already-converged index and report a clean 0.
+fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
+    let analysis = &mut build_analysis(codebase, annotations);
     for target in targets {
         let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
         let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
@@ -1482,12 +1487,19 @@ fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
 /// build, because the pre-edit index *is* the truth. `noopedit` does not cover
 /// it either: its edit pair is semantically neutral, so the update path skips
 /// the re-index outright and nothing is invalidated.
-fn edit_revert(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
+///
+/// It builds its own analysis rather than sharing the caller's. Both index
+/// gates re-index in place and leave a converged index behind, so whichever ran
+/// second would measure drift against the other's converged state instead of
+/// against a cold build and report a clean 0 — the drift does not go away, it
+/// stops being visible.
+fn edit_revert(codebase: &Path, annotations: &Path, targets: &[String]) {
     let Ok(find) = std::env::var("DET_EDIT_FIND") else {
         eprintln!("[editrevert] SKIPPED: DET_EDIT_FIND is not set, so no drift gate ran");
         return;
     };
     let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
+    let analysis = &mut build_analysis(codebase, annotations);
 
     for target in targets {
         let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1724,10 +1736,6 @@ fn run() {
         }
     }
 
-    if stages.iter().any(|s| s == "indexrepeat") {
-        run_index_repeat(&mut analysis, &codebase, &targets);
-    }
-
     if stages.iter().any(|s| s == "editmid") {
         let cold_index =
             std::env::var_os("DET_INDEX_DIFF").map(|_| collect_index(&analysis, "cold"));
@@ -1864,13 +1872,16 @@ fn run() {
         refresh_faithfulness(&analysis);
     }
 
-    // Before `realedit`, which leaves the edited file re-indexed behind it.
     if stages.iter().any(|s| s == "editrevert") {
-        edit_revert(&mut analysis, &codebase, &targets);
+        edit_revert(&codebase, &annotations, &targets);
     }
 
     if stages.iter().any(|s| s == "realedit") {
         real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+    }
+
+    if stages.iter().any(|s| s == "indexrepeat") {
+        run_index_repeat(&codebase, &annotations, &targets);
     }
 
     if stages.iter().any(|s| s == "fresh") {
