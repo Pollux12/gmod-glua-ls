@@ -10,6 +10,20 @@
 //   LSP_CODEBASE=/path/to/workspace \
 //   LSP_ANNOTATIONS=/path/to/annotations/output \
 //   node tools/lsp_latency.js [--json] [--runs N] [--file relative/path.lua]
+//                             [--edit code|comment]
+//                             [--edit-find TEXT --edit-replace TEXT]
+//                             [--completion-find TEXT]
+//
+// --edit-find/--edit-replace swap one snippet back and forth on every edit, so
+// a specific real change to real code can be reproduced. --completion-find puts
+// the cursor immediately after a given snippet instead of at the first member
+// access in the file. Together they reproduce one user's exact complaint.
+//
+// --edit code (default) inserts a global function declaration, so each edit
+// really changes what the file exports and the full dependency ripple runs.
+// --edit comment inserts a comment line instead: cheaper, and useful for
+// isolating offset-shift cost, but an optimisation that only helps this case
+// has not made real typing any faster.
 //
 // LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
 // else target/release/glua_ls[.exe] — see defaultServerPath, and prefer `dist`).
@@ -30,14 +44,28 @@ const path = require('path');
 // ---------------------------------------------------------------- config ---
 
 function parseArgs(argv) {
-    const opts = { json: false, runs: 5, file: null };
+    const opts = {
+        json: false, runs: 5, file: null, edit: 'code',
+        editFind: null, editReplace: null, completionFind: null,
+    };
     for (let i = 2; i < argv.length; i++) {
         const a = argv[i];
         if (a === '--json') opts.json = true;
         else if (a === '--runs') opts.runs = Number(argv[++i]);
         else if (a === '--file') opts.file = argv[++i];
+        else if (a === '--edit') opts.edit = argv[++i];
+        else if (a === '--edit-find') opts.editFind = argv[++i];
+        else if (a === '--edit-replace') opts.editReplace = argv[++i];
+        else if (a === '--completion-find') opts.completionFind = argv[++i];
         else throw new Error(`unknown argument: ${a}`);
     }
+    if (opts.edit !== 'code' && opts.edit !== 'comment') {
+        throw new Error('--edit must be "code" or "comment"');
+    }
+    if ((opts.editFind === null) !== (opts.editReplace === null)) {
+        throw new Error('--edit-find and --edit-replace must be given together');
+    }
+    if (opts.editFind === '') throw new Error('--edit-find must not be empty');
     if (!Number.isFinite(opts.runs) || opts.runs < 1) {
         throw new Error('--runs must be a positive integer');
     }
@@ -99,7 +127,13 @@ class LspClient {
         this.onNotification = null;
         this.serverRequests = new Set();
         proc.stdout.on('data', (chunk) => this._receive(chunk));
-        proc.stderr.on('data', () => {});
+        // The server's phase profiler writes to stderr, so LSP_SERVER_STDERR
+        // makes those numbers reachable instead of dropping them on the floor.
+        const stderrPath = process.env.LSP_SERVER_STDERR;
+        if (stderrPath) fs.writeFileSync(stderrPath, '');
+        proc.stderr.on('data', (chunk) => {
+            if (stderrPath) fs.appendFileSync(stderrPath, chunk);
+        });
     }
 
     _receive(chunk) {
@@ -317,11 +351,25 @@ async function main() {
     });
     await sleep(1500);
 
-    const position = memberAccessPosition(text);
+    // `--completion-find` puts the cursor immediately after a given snippet, so
+    // a specific completion can be reproduced instead of whatever member access
+    // happens to come first in the file.
+    const completionPosition = (currentText) => {
+        if (opts.completionFind === null) return memberAccessPosition(currentText);
+        const index = currentText.indexOf(opts.completionFind);
+        if (index < 0) {
+            throw new Error(`--completion-find text not present in document: ${JSON.stringify(opts.completionFind)}`);
+        }
+        const lines = currentText.slice(0, index + opts.completionFind.length).split('\n');
+        return { line: lines.length - 1, character: lines[lines.length - 1].length };
+    };
+
     const editOffset = text.indexOf('\n') + 1;
     const settledCompletion = [];
     const typingCompletion = [];
     const settledDiagnostic = [];
+    const typingHover = [];
+    const typingCompletionConcurrent = [];
     const editToFresh = [];
     const cancelledPulls = [];
     const completionDrift = [];
@@ -334,15 +382,42 @@ async function main() {
     // once would drift and silently start measuring an empty completion.
     const completionAt = async () => client.request('textDocument/completion', {
         textDocument: { uri },
-        position: memberAccessPosition(text),
+        position: completionPosition(text),
         context: { triggerKind: 2, triggerCharacter: '.' },
     });
 
+    let editSerial = 0;
     const editDocument = () => {
         version += 1;
-        // A comment line keeps the edit syntactically inert while still being a
-        // real content change, so runs stay comparable.
-        text = text.slice(0, editOffset) + '-- perf\n' + text.slice(editOffset);
+        editSerial += 1;
+
+        // `--edit-find`/`--edit-replace` reproduce one specific edit, swapping
+        // back and forth so every keystroke is a real change to real code. Use
+        // it to measure the edit a user actually complained about.
+        if (opts.editFind !== null) {
+            const [from, to] = editSerial % 2 === 1
+                ? [opts.editFind, opts.editReplace]
+                : [opts.editReplace, opts.editFind];
+            if (!text.includes(from)) {
+                throw new Error(`--edit-find text not present in document: ${JSON.stringify(from)}`);
+            }
+            text = text.replace(from, to);
+            client.notify('textDocument/didChange', {
+                textDocument: { uri, version },
+                contentChanges: [{ text }],
+            });
+            return;
+        }
+
+        // `--edit comment` keeps the edit syntactically inert, which makes runs
+        // comparable but is also the case an early-cutoff optimisation can make
+        // fast without helping anyone. `--edit code` (the default) declares a
+        // global function instead, so the edit really does change what the file
+        // exports and the whole dependency ripple has to run.
+        const inserted = opts.edit === 'comment'
+            ? '-- perf\n'
+            : `function _PerfProbe${editSerial}(a) return a end\n`;
+        text = text.slice(0, editOffset) + inserted + text.slice(editOffset);
         client.notify('textDocument/didChange', {
             textDocument: { uri, version },
             contentChanges: [{ text }],
@@ -394,6 +469,20 @@ async function main() {
         completionDrift.push({ missing: missing.length, extra: extra.length,
             sampleMissing: missing.slice(0, 5) });
 
+        // Completion is not the only thing gated on freshness. Hover is issued
+        // from the same keystroke and measured separately, so a fix that makes
+        // completion answer early but leaves every other position-based feature
+        // parked shows up here instead of looking like a win.
+        editDocument();
+        const [hovered, completed] = await Promise.all([
+            client.request('textDocument/hover', {
+                textDocument: { uri }, position: completionPosition(text),
+            }),
+            completionAt(),
+        ]);
+        typingHover.push(hovered.ms);
+        typingCompletionConcurrent.push(completed.ms);
+
         // Keystroke to the first answer any index-reading handler can give.
         editDocument();
         const fresh = await client.request('textDocument/diagnostic', {
@@ -420,6 +509,8 @@ async function main() {
     report.measurements.completionSettled = summarise(settledCompletion);
     report.measurements.completionWhileTyping = summarise(typingCompletion);
     report.measurements.diagnosticSettled = summarise(settledDiagnostic);
+    report.measurements.hoverWhileTyping = summarise(typingHover);
+    report.measurements.completionWhileTypingConcurrent = summarise(typingCompletionConcurrent);
     report.measurements.editToFreshAnswer = summarise(editToFresh);
     report.checks.emptyFullReportsOnCancel =
         cancelledPulls.filter((p) => p.emptyFullReport).length;
@@ -444,6 +535,8 @@ async function main() {
         ['completion (settled)', report.measurements.completionSettled],
         ['completion (while typing)', report.measurements.completionWhileTyping],
         ['diagnostic (settled)', report.measurements.diagnosticSettled],
+        ['hover (while typing)', report.measurements.hoverWhileTyping],
+        ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
     ];
     console.log(`workspace : ${report.workspace}`);
