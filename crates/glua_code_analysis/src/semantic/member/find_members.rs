@@ -856,11 +856,31 @@ fn find_merged_table_members(
             continue;
         };
 
-        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        // One component can hold several writers of the same key. Keeping only
+        // the first discards what the rest assign, and which one comes first is
+        // the member sort order rather than anything the source says - the
+        // table then disagrees with the union every other reader of that slot
+        // gets from `resolve_member_item_type`. Union within the component,
+        // then merge components as table fragments below.
+        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+        let mut component_order: Vec<LuaMemberKey> = Vec::new();
         for member in sub_members {
-            if !component_seen.insert(member.key.clone()) {
-                continue;
+            match component_members.entry(member.key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    component_order.push(member.key.clone());
+                    entry.insert(member);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let unioned = crate::TypeOps::Union.apply(db, &entry.get().typ, &member.typ);
+                    entry.get_mut().typ = unioned;
+                }
             }
+        }
+
+        for key in component_order {
+            let Some(member) = component_members.remove(&key) else {
+                continue;
+            };
 
             match members.entry(member.key.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {
