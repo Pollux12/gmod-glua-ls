@@ -153,7 +153,11 @@ pub fn try_resolve_closure_return(
         .get_mut(&closure_return.signature_id)
         .ok_or(InferFailReason::None)?;
 
-    if ret_type.contain_tpl() {
+    // An `unknown`/`any` contextual return carries no information, but taking it
+    // would clear the body-derived return below and stamp `DocResolve` over the
+    // result, which every later repair pass then refuses to touch. Fall back to
+    // the body exactly as an unbound template return does.
+    if ret_type.contain_tpl() || ret_type.is_unknown() || ret_type.is_any() {
         return try_convert_to_func_body_infer(db, cache, closure_return);
     }
 

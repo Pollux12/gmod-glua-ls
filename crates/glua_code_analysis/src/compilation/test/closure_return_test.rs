@@ -1,9 +1,9 @@
 #[cfg(test)]
 mod test {
-    use glua_parser::{LuaAstNode, LuaNameExpr};
+    use glua_parser::{LuaAstNode, LuaClosureExpr, LuaNameExpr};
     use tokio_util::sync::CancellationToken;
 
-    use crate::{DiagnosticCode, VirtualWorkspace};
+    use crate::{DiagnosticCode, LuaSignatureId, LuaType, VirtualWorkspace};
 
     fn local_name_type(
         ws: &VirtualWorkspace,
@@ -209,5 +209,42 @@ mod test {
 
         assert!(before.is_empty(), "unexpected diagnostics: {before:?}");
         assert_eq!(before, after);
+    }
+
+    /// An `any`/`unknown` return on the expected callback type says nothing
+    /// about what this callback returns. Taking it cleared the body-derived
+    /// return and stamped `DocResolve` over the result, and every later repair
+    /// pass refuses to correct a documented return.
+    #[test]
+    fn uninformative_callback_return_keeps_body_inference() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@param cb fun(): any
+            local function register(cb) end
+
+            register(function()
+                _side_effect = 1
+            end)
+            "#,
+        );
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        let closure = semantic_model
+            .get_root()
+            .descendants::<LuaClosureExpr>()
+            .last()
+            .expect("callback closure");
+        let signature = semantic_model
+            .get_db()
+            .get_signature_index()
+            .get(&LuaSignatureId::from_closure(file_id, &closure))
+            .expect("callback signature");
+
+        assert_eq!(signature.get_return_type(), LuaType::Nil);
     }
 }
