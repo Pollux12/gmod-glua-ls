@@ -80,6 +80,12 @@ impl InferCacheManager {
         self.current_phase = LuaAnalysisPhase::Force;
         for infer_cache in self.infer_map.values_mut() {
             infer_cache.set_phase(LuaAnalysisPhase::Force);
+            // The force phase answers a failed inference with a floor instead
+            // of an error, so a failure recorded under the previous phase is
+            // not the answer this one would give. Replaying it lets whichever
+            // expression in a chain happened to be walked first decide the
+            // result, which is the batch's settling order leaking into a type.
+            infer_cache.clear_deferred_inference_results();
         }
     }
 
