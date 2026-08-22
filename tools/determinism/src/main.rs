@@ -650,6 +650,17 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
 /// Snapshot of the derived index state that diagnostics read from.
 struct IndexSnapshot {
     type_caches: BTreeMap<String, String>,
+    /// How each cached type was reached, under `DET_PROVENANCE`. Diffed apart
+    /// from the type so a value that stayed put while the reasoning behind it
+    /// moved is still visible.
+    type_facts: BTreeMap<String, String>,
+    /// The assignment-contribution store, under `DET_PROVENANCE`: which writers
+    /// each owner/key group merges. A member's type is a function of this, so a
+    /// group that gains or loses a writer explains a drifting type directly.
+    contribution_groups: BTreeMap<String, String>,
+    /// Where each member is currently homed, under `DET_PROVENANCE`. Class
+    /// member lists and contribution groups are both keyed off this.
+    member_owners: BTreeMap<String, String>,
     members: BTreeSet<String>,
     net_flows: Vec<String>,
     inferred_params: BTreeMap<String, String>,
@@ -665,10 +676,58 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     let db = analysis.compilation.get_db();
     let type_index = db.get_type_index();
     let mut type_caches = BTreeMap::new();
+    let mut type_facts: BTreeMap<String, String> = BTreeMap::new();
+    // `DET_PROVENANCE=1` records how each cached type was reached, not just what
+    // it is. Drift entries then carry the pass that produced them on both sides,
+    // so the whole set can be grouped by cause in one run rather than traced one
+    // at a time.
+    let with_provenance = std::env::var_os("DET_PROVENANCE").is_some();
     for (owner, cache) in type_index.iter_type_caches() {
+        let value = format!("{:?}", cache.as_type());
+        if with_provenance {
+            let fact = type_index.get_type_fact(owner);
+            let (confidence, base, steps) = match &fact {
+                Some(fact) => (
+                    format!("{:?}", fact.confidence()),
+                    format!("{:?}", fact.base_provenance_kind()),
+                    fact.provenance()
+                        .iter()
+                        .map(|step| format!("{:?}", step.event.kind))
+                        .collect::<Vec<_>>()
+                        .join("+"),
+                ),
+                None => ("-".into(), "-".into(), String::new()),
+            };
+            let doc = if cache.is_doc() { "doc" } else { "infer" };
+            // How many writers this member's value is merged from, and whether
+            // any of them contributed an unsettled type. If drift tracks these
+            // rather than the individual site, the cause is the merge, not the
+            // sites.
+            let writers = match owner {
+                glua_code_analysis::LuaTypeOwner::Member(member_id) => {
+                    let member_index = db.get_member_index();
+                    member_index
+                        .get_member(member_id)
+                        .zip(member_index.get_member_owner(member_id))
+                        .and_then(|(member, member_owner)| {
+                            member_index
+                                .member_assignment_contributions()
+                                .contributions(&(member_owner.clone(), member.get_key().clone()))
+                                .map(|group| group.len())
+                        })
+                        .map(|len| format!("w{len}"))
+                        .unwrap_or_else(|| "w-".into())
+                }
+                _ => "w-".into(),
+            };
+            type_facts.insert(
+                format!("{}|{owner:?}", file_label(analysis, owner.get_file_id())),
+                format!("{doc}/{confidence}/{base}/[{steps}]/{writers}"),
+            );
+        }
         type_caches.insert(
             format!("{}|{owner:?}", file_label(analysis, owner.get_file_id())),
-            format!("{:?}", cache.as_type()),
+            value,
         );
     }
 
@@ -781,8 +840,57 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         members.len(),
         net_flows.len()
     );
+    // Where every member ended up. Contribution groups and class member lists
+    // are both keyed off this, so a member homed differently explains drift in
+    // either without having to trace them apart.
+    let mut member_owners = BTreeMap::new();
+    if with_provenance {
+        for file_id in db.get_vfs().get_all_file_ids() {
+            for member in member_index.get_file_members(file_id) {
+                member_owners.insert(
+                    format!(
+                        "{}:{:?}|{:?}",
+                        file_id.id,
+                        u32::from(member.get_id().get_position()),
+                        member.get_key()
+                    ),
+                    format!("{:?}", member_index.get_current_owner(&member.get_id())),
+                );
+            }
+        }
+    }
+
+    // Every assignment-contribution group, so a writer that landed under the
+    // wrong owner is visible as a group that moved rather than as a member
+    // whose type merely changed.
+    let mut contribution_groups = BTreeMap::new();
+    if with_provenance {
+        let all_files = db.get_vfs().get_all_file_ids().into_iter().collect();
+        let store = member_index.member_assignment_contributions();
+        for group_key in store.keys_for_files(&all_files) {
+            let Some(group) = store.contributions(&group_key) else {
+                continue;
+            };
+            let mut ids = group
+                .keys()
+                .map(|member_id| {
+                    format!(
+                        "{}:{:?}",
+                        member_id.file_id.id,
+                        u32::from(member_id.get_position())
+                    )
+                })
+                .collect::<Vec<_>>();
+            ids.sort();
+            contribution_groups.insert(format!("{:?}|{:?}", group_key.0, group_key.1), ids.join(","));
+        }
+    }
+
     let snapshot = IndexSnapshot {
         type_caches,
+        type_facts,
+        contribution_groups,
+        member_owners,
         members,
         net_flows,
         inferred_params,
@@ -890,6 +998,19 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
 
     for (name, prefix, base_map, other_map) in [
         ("type_caches", "TC", &base.type_caches, &other.type_caches),
+        ("type_facts", "TF", &base.type_facts, &other.type_facts),
+        (
+            "contribution_groups",
+            "CG",
+            &base.contribution_groups,
+            &other.contribution_groups,
+        ),
+        (
+            "member_owners",
+            "MO",
+            &base.member_owners,
+            &other.member_owners,
+        ),
         (
             "super_types",
             "SUPER",
