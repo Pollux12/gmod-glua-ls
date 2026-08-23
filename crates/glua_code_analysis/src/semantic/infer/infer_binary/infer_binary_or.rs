@@ -207,13 +207,6 @@ pub fn special_or_rule(
         _ => {}
     }
 
-    // `X = X or {}` with an unresolved `X`: the fallback arm is real
-    // evidence, the left arm is not, so keep both rather than widening the
-    // pair to `any`.
-    if left_type.is_unknown() {
-        return Some(TypeOps::Union.apply(db, &LuaType::Unknown, right_type));
-    }
-
     None
 }
 

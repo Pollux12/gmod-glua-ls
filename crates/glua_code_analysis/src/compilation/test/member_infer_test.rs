@@ -3692,3 +3692,50 @@ mod undefined_global_reads_as_nil {
         assert_eq!(ws.expr_ty("bare_read"), LuaType::Nil);
     }
 }
+
+#[cfg(test)]
+mod default_value_idiom_is_walk_order_independent {
+    use crate::VirtualWorkspace;
+
+    /// `p = p or DEFAULT` must mean the same thing whichever file declared
+    /// `DEFAULT` first.
+    ///
+    /// `special_or_rule` used to answer `unknown | right` whenever the left arm
+    /// was `unknown`, which contradicted the general rule beneath it ("an
+    /// unresolved left operand has no enumerable truthy half, so it contributes
+    /// nothing"). Whether the left arm had resolved yet is a property of how far
+    /// the walk had run, so the same source read `integer` when the constant's
+    /// file came first and `integer|unknown` when it came second — and a
+    /// re-index of a subset then disagreed with the build that produced it.
+    fn default_type_for_order(files: Vec<(&str, &str)>, probe: &str) -> crate::LuaType {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(files);
+        ws.expr_ty(probe)
+    }
+
+    const READER: &str = r#"
+        function SetData(dataType)
+            dataType = dataType or DATA_PLAYER
+            probe_result = dataType
+        end
+        "#;
+    const CONST_DEF: &str = "DATA_PLAYER = 2";
+
+    #[test]
+    fn constant_declared_after_the_reader() {
+        let ty = default_type_for_order(
+            vec![("a.lua", READER), ("b.lua", CONST_DEF)],
+            "probe_result",
+        );
+        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+    }
+
+    #[test]
+    fn constant_declared_before_the_reader() {
+        let ty = default_type_for_order(
+            vec![("a.lua", CONST_DEF), ("b.lua", READER)],
+            "probe_result",
+        );
+        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+    }
+}

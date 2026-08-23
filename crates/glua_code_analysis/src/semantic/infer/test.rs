@@ -1083,12 +1083,11 @@ mod test {
     }
 
     #[test]
-    fn test_or_with_local_unknown_does_not_coerce_to_nil() {
+    fn test_or_with_unknown_left_yields_the_fallback() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let ty = infer_last_name_expr_type(
             &mut ws,
             r#"
-            ---@type unknown
             local maybe
             local result = maybe or {}
             print(result)
@@ -1096,16 +1095,16 @@ mod test {
             "result",
         );
 
-        // Both arms survive: the fallback table is real evidence and the
-        // unresolved left arm is not, so neither erases the other.
-        let LuaType::Union(union) = &ty else {
-            panic!("expected a union, got: {ty:?}");
-        };
-        let arms = union.into_vec();
+        // `unknown` on the left is a report that inference could not tell what
+        // the left arm holds, not a type the expression can evaluate to. Whether
+        // it could tell depends on how far the batch had run, so carrying it
+        // into the answer pins the file walk order into the type: the same
+        // source read `integer` or `integer|unknown` depending on which file
+        // declared a constant first. The fallback is the only real evidence
+        // here, so it stands alone.
         assert!(
-            arms.iter().any(|arm| matches!(arm, LuaType::TableConst(_)))
-                && arms.iter().any(|arm| matches!(arm, LuaType::Unknown)),
-            "expected `unknown | table`, got: {arms:?}"
+            matches!(ty, LuaType::TableConst(_)),
+            "expected the fallback table, got: {ty:?}"
         );
     }
 
