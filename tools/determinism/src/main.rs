@@ -120,6 +120,18 @@
 //!                               Always diffs the index, DET_INDEX_DIFF or not.
 //!                               Needs DET_EDIT_FIND; without it the stage
 //!                               skips loudly instead of gating anything.
+//!                     burst     three edits per DET_TARGETS entry, each one
+//!                               self-indexed on its own, then ONE ripple over
+//!                               the union of the three separately-captured
+//!                               expansions — the sequence a debounce that
+//!                               defers the ripple behind a longer idle timer
+//!                               produces. Gates that union against a cold build
+//!                               of the final text. An expansion recomputed
+//!                               after a self-index under-expands badly (739
+//!                               files collapsed to 8), so union is the only
+//!                               shape that can work; this measures whether it
+//!                               does. Needs DET_EDIT_FIND; without it the stage
+//!                               skips loudly instead of gating anything.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
@@ -1660,6 +1672,173 @@ fn real_edit(
     }
 }
 
+/// Gate the deferred ripple: several self-indexes, then one re-index over the
+/// union of their separately-captured expansions.
+///
+/// The LSP debounce runs the edited file's own re-index on a short timer and
+/// owes the dependency ripple afterwards. Deferring that ripple behind a longer
+/// idle timer means a typing burst produces several self-indexes before one
+/// ripple, so the ripple has to run against a *union* of expansions each
+/// captured at a different point.
+///
+/// That union is the whole risk. An expansion recomputed after a self-index is
+/// known to under-expand badly — 739 files collapsed to 8 — which is why the
+/// production path captures before self-indexing. Union survives that, because
+/// a collapsed later capture only ever adds files and the burst's first capture
+/// is taken before any self-index, exactly as today. What it cannot rule out by
+/// argument is a dependent present in *no* capture, and that is what this
+/// stage measures: the burst's result against a cold build of the final text.
+fn burst_edit(
+    analysis: &mut EmmyLuaAnalysis,
+    codebase: &Path,
+    annotations: &Path,
+    targets: &[String],
+    cold: &BTreeSet<Snapshot>,
+) {
+    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
+        eprintln!("[burst] SKIPPED: DET_EDIT_FIND is not set, so no burst gate ran");
+        return;
+    };
+    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
+    let cold_index = collect_index(analysis, "cold");
+
+    struct Target {
+        path: std::path::PathBuf,
+        uri: lsp_types::Uri,
+        file_id: FileId,
+        original: String,
+    }
+
+    let mut resolved = Vec::new();
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[burst] file not indexed: {}", path.display());
+            continue;
+        };
+        let Some(original) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if !original.contains(find.as_str()) {
+            eprintln!("[burst] {find:?} not present in {}", path.display());
+            continue;
+        }
+        resolved.push(Target {
+            path,
+            uri,
+            file_id,
+            original,
+        });
+    }
+
+    if resolved.is_empty() {
+        eprintln!("[burst] SKIPPED: no target matched, so no burst gate ran");
+        return;
+    }
+
+    // Three keystroke groups, chosen to cover what a burst can do that a single
+    // edit cannot: change meaning, shift offsets only, and introduce a class
+    // definition partway through — the case where reusing the first capture
+    // would miss the new dependents outright.
+    let step_text = |target: &Target, step: usize| -> String {
+        let mut text = target.original.replace(find.as_str(), replace.as_str());
+        if step >= 1 {
+            text.push_str("\n-- burst\n");
+        }
+        if step >= 2 {
+            text.push_str("\n---@class DetBurstClass\nlocal DetBurst = {}\n");
+        }
+        text
+    };
+
+    let mut owed_files: BTreeSet<FileId> = BTreeSet::new();
+    let mut owed_expansion: BTreeSet<FileId> = BTreeSet::new();
+
+    let t = Instant::now();
+    for step in 0..3 {
+        for target in &resolved {
+            // Production order: didChange installs the text, then phase A
+            // captures the expansion and self-indexes under one lock.
+            analysis.update_file_text_only(&target.uri, step_text(target, step));
+            let expansion = analysis.expand_reindex_file_ids(vec![target.file_id]);
+            analysis.self_index_files(vec![target.file_id]);
+            owed_files.insert(target.file_id);
+            owed_expansion.extend(expansion);
+        }
+    }
+
+    let self_indexed = t.elapsed();
+    let t = Instant::now();
+    analysis.reindex_expanded_files(
+        owed_files.iter().copied().collect(),
+        owed_expansion.iter().copied().collect(),
+    );
+    eprintln!(
+        "[burst] {} file(s) x 3 edits: {} self-index(es) in {:.2}s, then one ripple over {} files ({:.2}s)",
+        resolved.len(),
+        resolved.len() * 3,
+        self_indexed.as_secs_f64(),
+        owed_expansion.len(),
+        t.elapsed().as_secs_f64()
+    );
+
+    let warm_index = collect_index(analysis, "warm");
+    let warm = collect(analysis, "warm");
+
+    // The control: the same three edits through today's path, one ripple each.
+    // Deferral is only a regression if it drifts further than this does — the
+    // incremental path already drifts from cold on its own, so comparing the
+    // burst against cold alone would charge it for drift it did not cause.
+    for target in &resolved {
+        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+    }
+    let t = Instant::now();
+    for step in 0..3 {
+        for target in &resolved {
+            analysis.update_file_by_uri(&target.uri, Some(step_text(target, step)));
+        }
+    }
+    eprintln!(
+        "[burst] control: same edits through {} separate ripples ({:.2}s)",
+        resolved.len() * 3,
+        t.elapsed().as_secs_f64()
+    );
+    let control_index = collect_index(analysis, "control");
+    let control = collect(analysis, "control");
+
+    let overrides = resolved
+        .iter()
+        .map(|target| (target.path.clone(), step_text(target, 2)))
+        .collect::<Vec<_>>();
+    let ground_truth = build_analysis_with(codebase, annotations, Order::Natural, 1, &overrides);
+    let truth_index = collect_index(&ground_truth, "cold_burst");
+    let truth = collect(&ground_truth, "cold_burst");
+
+    // What the burst genuinely moves, so a reader can tell a real miss from a
+    // change the edits were always going to make.
+    diff_index("cold", &cold_index, "cold_burst", &truth_index);
+    diff("cold", cold, "cold_burst", &truth);
+    // What today's path already gets wrong about it.
+    diff_index("cold_burst", &truth_index, "control", &control_index);
+    diff("cold_burst", &truth, "control", &control);
+    // The gate: deferring the ripple must not get more wrong than the control.
+    diff_index("cold_burst", &truth_index, "warm", &warm_index);
+    diff("cold_burst", &truth, "warm", &warm);
+
+    for target in &resolved {
+        analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
+    }
+}
+
 fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[String]) -> bool {
     let mut file_ids = Vec::new();
     for relative in relatives {
@@ -1947,6 +2126,10 @@ fn run() {
 
     if stages.iter().any(|s| s == "realedit") {
         real_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+    }
+
+    if stages.iter().any(|s| s == "burst") {
+        burst_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
     }
 
     if stages.iter().any(|s| s == "indexrepeat") {
