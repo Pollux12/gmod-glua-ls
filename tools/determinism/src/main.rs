@@ -123,6 +123,17 @@
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
 //!                               re-analysis perturbs a fact)
+//!                     perfile   remove and re-add every file ON ITS OWN, so
+//!                               each one is re-derived against the complete
+//!                               settled workspace instead of the prefix the
+//!                               cold walk had built when it reached that file.
+//!                               Says whether the cold answer is simply one
+//!                               computed from an incomplete view. It is, and it
+//!                               converges: on CityRP round 1 moves 4277 type
+//!                               caches away from cold and round 2 moves
+//!                               nothing. Honours DET_PERFILE_ROUNDS (default
+//!                               2). Slow -- ~830s a round -- because every file
+//!                               pays the whole pipeline.
 //!                     reindex   full clear + rebuild, the ground truth
 //!                     order     rebuild with the file list reversed
 //!                     split:N   rebuild in N batches instead of one
@@ -1853,6 +1864,43 @@ fn run() {
             );
             let after = collect(&analysis, &label);
             diff("cold", &cold, &label, &after);
+        }
+    }
+
+    // Remove and re-add each file ON ITS OWN, so every file is re-derived
+    // against the complete settled workspace rather than against the prefix the
+    // cold walk had built when it reached that file. This is the "fully
+    // informed" fixed point: if the index converges here, the cold answer is
+    // simply one computed from an incomplete view, and a subset re-index — which
+    // also sees a settled workspace — is agreeing with the informed answer
+    // rather than drifting.
+    if stages.iter().any(|s| s == "perfile") {
+        let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
+        let rounds = std::env::var("DET_PERFILE_ROUNDS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(2);
+        let mut previous_index = collect_index(&analysis, "cold");
+        let mut previous_diagnostics = cold.clone();
+        let mut previous_label = "cold".to_string();
+        for round in 1..=rounds {
+            let t = Instant::now();
+            for file_id in &all_ids {
+                analysis.reindex_files_without_expansion(vec![*file_id]);
+            }
+            let label = format!("after_perfile_{round}");
+            eprintln!(
+                "[perfile] round {round} over {} files ({:.2}s)",
+                all_ids.len(),
+                t.elapsed().as_secs_f64()
+            );
+            let after_index = collect_index(&analysis, &label);
+            diff_index(&previous_label, &previous_index, &label, &after_index);
+            let after = collect(&analysis, &label);
+            diff(&previous_label, &previous_diagnostics, &label, &after);
+            previous_index = after_index;
+            previous_diagnostics = after;
+            previous_label = label;
         }
     }
 
