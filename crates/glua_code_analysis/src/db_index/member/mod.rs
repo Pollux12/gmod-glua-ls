@@ -588,6 +588,50 @@ impl LuaMemberIndex {
         Some(())
     }
 
+    /// Whether every write
+    /// [`add_member_alias_to_owner`](Self::add_member_alias_to_owner) would
+    /// perform for `(owner, id)` is already in the index, so calling it would
+    /// leave the index unchanged.
+    pub(crate) fn alias_to_owner_is_recorded(
+        &self,
+        owner: &LuaMemberOwner,
+        id: LuaMemberId,
+    ) -> bool {
+        let Some(member) = self.get_member(&id) else {
+            return false;
+        };
+        let key = member.get_key();
+
+        let is_indexed = |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
+            index
+                .get(owner)
+                .and_then(|members_by_key| members_by_key.get(key))
+                .is_some_and(|member_ids| member_ids.contains(&id))
+        };
+        if self.member_current_owner.get(&id) != Some(owner)
+            && !(is_indexed(&self.member_owner_key_index)
+                && is_indexed(&self.member_owner_key_history_index))
+        {
+            return false;
+        }
+
+        let item_holds_member = self
+            .owner_members
+            .get(owner)
+            .and_then(|owner_members| owner_members.get_member(key))
+            .is_some_and(|item| match item {
+                LuaMemberIndexItem::One(existing_id) => *existing_id == id,
+                LuaMemberIndexItem::Many(ids) => ids.contains(&id),
+            });
+        if !item_holds_member {
+            return false;
+        }
+
+        self.in_filed
+            .get(&member.get_file_id())
+            .is_some_and(|objects| objects.contains(&MemberOrOwner::Owner(owner.clone())))
+    }
+
     fn should_preserve_assignment_file_define_member(
         &self,
         owner: &LuaMemberOwner,
@@ -2333,6 +2377,64 @@ mod tests {
             "aliasing an id already in the item must not add it again"
         );
         assert_eq!(owner_member_ids(&index, &owner).len(), 2);
+    }
+
+    #[test]
+    fn alias_to_owner_is_recorded_exactly_when_the_alias_is_a_no_op() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
+        let own_member_id = make_index_member_id(FileId::new(1), 10);
+        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            other_owner,
+            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        // Everything `add_member_alias_to_owner` writes, read back in a
+        // deterministic order. Comparing the index's `Debug` instead would
+        // compare `HashSet` iteration order, which varies per process and makes
+        // the assertion pass or fail at random.
+        let key = LuaMemberKey::Name("field".into());
+        let written_state = |index: &LuaMemberIndex| {
+            let mut in_filed = index
+                .in_filed
+                .get(&aliased_member_id.file_id)
+                .map(|objects| objects.iter().map(|object| format!("{object:?}")).collect())
+                .unwrap_or_else(Vec::new);
+            in_filed.sort();
+            (
+                index.get_member_item(&owner, &key).cloned(),
+                index
+                    .member_owner_key_index
+                    .get(&owner)
+                    .and_then(|keys| keys.get(&key))
+                    .cloned(),
+                index
+                    .member_owner_key_history_index
+                    .get(&owner)
+                    .and_then(|keys| keys.get(&key))
+                    .cloned(),
+                in_filed,
+            )
+        };
+
+        assert!(!index.alias_to_owner_is_recorded(&owner, aliased_member_id));
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        assert!(index.alias_to_owner_is_recorded(&owner, aliased_member_id));
+
+        let recorded = written_state(&index);
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        assert_eq!(
+            recorded,
+            written_state(&index),
+            "a recorded alias must write nothing when applied again"
+        );
     }
 
     #[test]

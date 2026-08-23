@@ -217,7 +217,14 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 if hidden.contains(&member_id) && *alias_file_id != member_id.file_id {
                     continue;
                 }
-                if Some(alias_owner) != target_owner.as_ref() {
+                // Re-indexing one file leaves every other file's aliases in
+                // place, so on an incremental batch nearly all of these are
+                // already recorded. Skipping those is not an approximation:
+                // the alias write is a no-op exactly when
+                // `alias_to_owner_is_recorded` holds.
+                if Some(alias_owner) != target_owner.as_ref()
+                    && !member_index.alias_to_owner_is_recorded(alias_owner, member_id)
+                {
                     member_index.add_member_alias_to_owner(alias_owner.clone(), member_id);
                 }
             }
