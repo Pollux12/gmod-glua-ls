@@ -1290,23 +1290,45 @@ fn is_expr_guarded_by_current_truthiness_condition(
     false
 }
 
-/// Whether evaluating `condition` truthily proves `expr` truthy. Only `and`
-/// chains qualify: every operand of a truthy `and` is itself truthy, while an
-/// `or` proves nothing about either side.
+/// Whether evaluating `condition` truthily proves `expr` non-nil.
+///
+/// A bare truthiness test does, and so does `expr ~= nil`. Only `and` chains
+/// carry that through: every operand of a truthy `and` held, while an `or`
+/// proves nothing about either side.
 fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
     match condition {
         LuaExpr::ParenExpr(paren) => paren
             .get_expr()
             .is_some_and(|inner| condition_proves_expr_truthy(&inner, expr)),
         LuaExpr::BinaryExpr(binary) => {
-            binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpAnd)
-                && binary.get_exprs().is_some_and(|(left, right)| {
+            let Some(op) = binary.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            match op {
+                BinaryOperator::OpAnd => binary.get_exprs().is_some_and(|(left, right)| {
                     condition_proves_expr_truthy(&left, expr)
                         || condition_proves_expr_truthy(&right, expr)
-                })
+                }),
+                BinaryOperator::OpNe => binary.get_exprs().is_some_and(|(left, right)| {
+                    (is_nil_literal_expr(&right) && expr_text_matches(&left, expr))
+                        || (is_nil_literal_expr(&left) && expr_text_matches(&right, expr))
+                }),
+                _ => false,
+            }
         }
         _ => expr_text_matches(condition, expr),
     }
+}
+
+fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
+    matches!(
+        expr,
+        LuaExpr::LiteralExpr(literal)
+            if matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Nil(_))
+            )
+    )
 }
 
 fn condition_is_positive_type_guard_call(
