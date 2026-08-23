@@ -403,6 +403,7 @@ pub fn try_resolve_member(
         crate::compilation::analyzer::lua::record_resolved_member_assignment_contribution(
             db, member_id, &expr_type,
         );
+        crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
     }
 
     Ok(())

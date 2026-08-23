@@ -1744,7 +1744,7 @@ fn assign_merge_type_owner_and_expr_type(
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         let conditional_branch_assignment =
-            is_member_assignment_in_conditional_branch(analyzer, *member_id);
+            is_member_assignment_in_conditional_branch(analyzer.db, *member_id);
         if !dynamic_expr_key_member {
             record_member_assignment_contribution(
                 analyzer,
@@ -2032,6 +2032,38 @@ pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contri
     );
 }
 
+/// Applies the visibility marks a write earns from its own syntax, for a write
+/// the walk did not get to classify.
+///
+/// The walk marks each assignment as it binds it — guarded bootstrap, or
+/// conditional branch — and those marks decide which writers stay visible for
+/// the slot. A write whose right-hand side could not be inferred in time is
+/// finished by the unresolve pass instead, which binds the type and stops, so
+/// the marks are never applied. Both tests read syntax alone, so the answer is
+/// the same either way; only whether anything asks was in question, and that is
+/// a fact about how far the batch had run.
+pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+) {
+    if !is_assignment_file_define_member(db, member_id) {
+        return;
+    }
+    if is_guarded_table_assignment_member(db, member_id) {
+        if !db
+            .get_member_index()
+            .is_non_overwriting_assignment_member(member_id)
+        {
+            db.get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            preserve_guarded_table_assignment_members(db, member_id);
+        }
+    } else if is_member_assignment_in_conditional_branch(db, member_id) {
+        db.get_member_index_mut()
+            .mark_conditional_branch_assignment_member(member_id);
+    }
+}
+
 fn record_member_assignment_widening_cache(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -2107,11 +2139,8 @@ pub(in crate::compilation::analyzer) fn preserve_guarded_table_assignment_member
 /// ```
 ///
 /// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
-fn is_member_assignment_in_conditional_branch(
-    analyzer: &LuaAnalyzer,
-    member_id: LuaMemberId,
-) -> bool {
-    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
         return false;
     };
     let root = tree.get_red_root();

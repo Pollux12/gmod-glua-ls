@@ -34,7 +34,8 @@ use stats::{
 pub(in crate::compilation::analyzer) use stats::{
     get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
     is_guarded_table_assignment_index_expr, is_guarded_table_assignment_member,
-    preserve_guarded_table_assignment_members, record_resolved_member_assignment_contribution,
+    mark_resolved_member_assignment, preserve_guarded_table_assignment_members,
+    record_resolved_member_assignment_contribution,
 };
 
 use log::info;
