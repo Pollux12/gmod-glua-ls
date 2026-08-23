@@ -242,7 +242,18 @@ fn run_incremental_edits(
             reindex.as_secs_f64(),
             diagnostics.as_secs_f64()
         );
-        analysis.update_file_by_uri(&uri, Some(text));
+        // Reverting through the full path costs a whole ripple per iteration —
+        // several times the self-index being measured, and untimed, so it
+        // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
+        // exists to leave nothing but the self-index in the profile, so the
+        // revert has to match it.
+        if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+            analysis.update_file_text_only(&uri, text);
+            analysis.compilation.remove_index(vec![file_id]);
+            analysis.compilation.update_index(vec![file_id]);
+        } else {
+            analysis.update_file_by_uri(&uri, Some(text));
+        }
     }
     if edited == 0 {
         return None;
