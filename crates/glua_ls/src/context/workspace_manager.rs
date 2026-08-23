@@ -71,14 +71,31 @@ impl WorkspaceManager {
         }
     }
 
-    pub fn get_workspace_diagnostic_level(&self) -> WorkspaceDiagnosticLevel {
-        let value = self.workspace_diagnostic_level.load(Ordering::Acquire);
-        WorkspaceDiagnosticLevel::from_u8(value)
+    pub fn workspace_diagnostic_level_arc(&self) -> Arc<AtomicU8> {
+        self.workspace_diagnostic_level.clone()
     }
 
+    /// Take the pending diagnostic level and reset it to `None` in one atomic
+    /// step; a separate load+store pair races with concurrent writers.
+    pub fn claim_workspace_diagnostic_level(&self) -> WorkspaceDiagnosticLevel {
+        let previous = self
+            .workspace_diagnostic_level
+            .swap(WorkspaceDiagnosticLevel::None.to_u8(), Ordering::AcqRel);
+        WorkspaceDiagnosticLevel::from_u8(previous)
+    }
+
+    /// Put a claimed level back after a sweep failed to finish; keeps the
+    /// higher of it and anything requested since.
+    pub fn restore_workspace_diagnostic_level(&self, level: WorkspaceDiagnosticLevel) {
+        self.workspace_diagnostic_level
+            .fetch_max(level.to_u8(), Ordering::AcqRel);
+    }
+
+    /// Request at least `level` of workspace diagnostics. A max, not a store:
+    /// a concurrent request must never downgrade a pending `Slow` sweep.
     pub fn update_workspace_version(&self, level: WorkspaceDiagnosticLevel, add_version: bool) {
         self.workspace_diagnostic_level
-            .store(level.to_u8(), Ordering::Release);
+            .fetch_max(level.to_u8(), Ordering::AcqRel);
         if add_version {
             self.workspace_version.fetch_add(1, Ordering::AcqRel);
         }
@@ -107,6 +124,7 @@ impl WorkspaceManager {
         let file_diagnostic = self.file_diagnostic.clone();
         let lsp_features = self.lsp_features.clone();
         let client = self.client.clone();
+        let workspace_diagnostic_level = self.workspace_diagnostic_level.clone();
         tokio::spawn(async move {
             cancel_token.wait_for_reindex().await;
             if cancel_token.is_cancelled() {
@@ -140,9 +158,10 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
+                workspace_diagnostic_level,
             )
             .await;
-            if lsp_features.supports_workspace_diagnostic() {
+            if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             }
             // After completion, remove from HashMap
@@ -195,16 +214,17 @@ impl WorkspaceManager {
                 loaded.workspace_diagnostic_configs,
                 loaded.workspace_emmyrcs,
                 watchdog_status,
+                workspace_diagnostic_status.clone(),
             )
             .await;
 
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
+            // Raise, never lower — a pending `Slow` request must survive.
             workspace_diagnostic_status
-                .store(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::Release);
+                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
 
-            // Trigger diagnostics refresh
-            if lsp_features.supports_workspace_diagnostic() {
+            if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             } else {
                 file_diagnostic
@@ -259,12 +279,15 @@ impl WorkspaceManager {
             // Cancel diagnostics and update status without holding analysis lock
             file_diagnostic.cancel_workspace_diagnostic().await;
             workspace_diagnostic_status
-                .store(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::Release);
+                .fetch_max(WorkspaceDiagnosticLevel::Fast.to_u8(), Ordering::AcqRel);
 
-            // Trigger diagnostics refresh
-            client.refresh_semantic_tokens();
-            client.refresh_inlay_hints();
-            if lsp_features.supports_workspace_diagnostic() {
+            if lsp_features.supports_semantic_tokens_refresh() {
+                client.refresh_semantic_tokens();
+            }
+            if lsp_features.supports_inlay_hint_refresh() {
+                client.refresh_inlay_hints();
+            }
+            if lsp_features.supports_refresh_diagnostic() {
                 client.refresh_workspace_diagnostics();
             } else {
                 file_diagnostic

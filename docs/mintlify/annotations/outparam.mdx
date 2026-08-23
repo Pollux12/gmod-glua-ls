@@ -15,11 +15,34 @@ Some functions write results into a table you pass in, instead of returning them
 
 ```lua
 ---@outparam paramName.fieldPath Type
+---@outparam paramName Type
 ```
 
 - **`paramName`** — a parameter on the same function (must match an `@param`).
-- **`fieldPath`** — the field the function writes to. Use dots for nested fields.
+- **`fieldPath`** — the field the function writes to. Use dots for nested fields. Leave it out to type the argument itself.
 - **`Type`** — the type the field will have after the call.
+
+---
+
+## Typing the argument itself
+
+Leave off the field path when the function fills in the table you pass, instead of a field inside it:
+
+```lua
+---@class HUDStackLayout
+---@field rowHeight integer
+
+---@outparam out HUDStackLayout
+---@param out table Table owned by the caller.
+function Glide.GetHUDStackLayout(out) end
+```
+
+```lua
+local layout = {}
+Glide.GetHUDStackLayout(layout)
+
+local h = layout.rowHeight  -- ✅ integer
+```
 
 ---
 

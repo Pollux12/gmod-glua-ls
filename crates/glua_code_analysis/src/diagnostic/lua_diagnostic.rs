@@ -13,6 +13,7 @@ use super::checker::precompute_gm_method_realms;
 use super::checker::precompute_missing_required_fields;
 use super::checker::precompute_nodiscard_candidates;
 use super::checker::precompute_param_type_candidates;
+use super::checker::precompute_property_name_candidates;
 use super::checker::precompute_sorted_send_flows;
 use super::{checker::check_file, lua_diagnostic_config::LuaDiagnosticConfig};
 use crate::semantic::LuaAnalysisPhase;
@@ -136,6 +137,7 @@ impl LuaDiagnostic {
             nodiscard_candidates,
             decl_annotation_realms,
             sorted_send_flows,
+            property_name_candidates,
         ) = std::thread::scope(|s| {
             let workspace_realms = s.spawn(|| {
                 let mut gm_method_realms = HashMap::new();
@@ -169,6 +171,7 @@ impl LuaDiagnostic {
             let await_c = s.spawn(|| precompute_await_candidates(db));
             let param_type = s.spawn(|| precompute_param_type_candidates(db));
             let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
+            let property_names = s.spawn(|| precompute_property_name_candidates(db));
             let decl_realms =
                 s.spawn(|| precompute_decl_annotation_realms(db, workspace_file_ids_ref));
             let send_flows =
@@ -197,6 +200,9 @@ impl LuaDiagnostic {
                         .join()
                         .expect("precompute_sorted_send_flows panicked"),
                 ),
+                property_names
+                    .join()
+                    .expect("precompute_property_name_candidates panicked"),
             )
         });
         let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =
@@ -210,6 +216,7 @@ impl LuaDiagnostic {
             await_candidates: Arc::new(await_candidates),
             param_type_candidates: Arc::new(param_type_candidates),
             nodiscard_candidates: Arc::new(nodiscard_candidates),
+            property_name_candidates: Arc::new(property_name_candidates),
             decl_annotation_realms: Arc::new(decl_annotation_realms),
             sorted_send_flows,
         })

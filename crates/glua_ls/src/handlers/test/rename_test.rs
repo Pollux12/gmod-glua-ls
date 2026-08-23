@@ -1,8 +1,58 @@
 #[cfg(test)]
 mod tests {
+    use crate::handlers::rename::{prepare_rename, rename};
     use crate::handlers::test_lib::{ProviderVirtualWorkspace, check};
     use googletest::prelude::*;
     use lsp_types::{Position, Range, TextEdit};
+
+    /// A written `self` has a declaration to carry the new name; only a colon
+    /// method's implicit receiver does not.
+    #[gtest]
+    fn test_rename_self_only_refused_for_the_implicit_receiver() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        check!(ws.check_rename(
+            r#"
+                local <??>self = 1
+                print(self)
+            "#,
+            "captured".to_string(),
+            vec![(
+                "virtual_0.lua".to_string(),
+                vec![
+                    TextEdit {
+                        range: Range::new(Position::new(1, 22), Position::new(1, 26)),
+                        new_text: "captured".to_string(),
+                    },
+                    TextEdit {
+                        range: Range::new(Position::new(2, 22), Position::new(2, 26)),
+                        new_text: "captured".to_string(),
+                    },
+                ],
+            )]
+        ));
+
+        let mut ws = ProviderVirtualWorkspace::new();
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+                local Class = {}
+                function Class:Method()
+                    return <??>self
+                end
+            "#,
+        )?;
+        let file_id = ws.def(&content);
+        verify_that!(
+            rename(&ws.analysis, file_id, position, "renamed".to_string()).is_none(),
+            eq(true)
+        )?;
+        // prepareRename must agree, or the client opens a rename box for an
+        // edit that never arrives.
+        verify_that!(
+            prepare_rename(&ws.analysis, file_id, position).is_none(),
+            eq(true)
+        )?;
+        Ok(())
+    }
 
     #[gtest]
     fn test_int_key() -> Result<()> {

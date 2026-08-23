@@ -13,7 +13,7 @@ use crate::{
     },
     db_index::{
         LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType,
-        MemberAssignmentContribution,
+        MemberAssignmentContribution, member_id_sort_key,
     },
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
@@ -1414,7 +1414,7 @@ fn should_defer_none_infer_expr(expr: &LuaExpr) -> bool {
 }
 
 fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
-    matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_))
+    crate::compilation::analyzer::initializer_reads_through_call_or_index(expr)
 }
 
 /// Whether an initializer that inferred to a type carrying no information
@@ -1703,21 +1703,25 @@ fn assign_merge_type_owner_and_expr_type(
                 // Where one did not, the merge below is provisional and the
                 // settled pass re-derives it against the complete writer set.
                 let mut skipped_uncached_sibling = false;
-                if let Some(widened_type) = get_widened_member_assignment_type(
+                let widened = get_widened_member_assignment_type(
                     analyzer.db,
                     &type_owner,
                     &expr_type,
                     preserve_table_literals,
                     &mut skipped_uncached_sibling,
-                ) {
-                    if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner
-                    {
-                        analyzer.context.record_settled_member_widening_candidate(
-                            *member_id,
-                            expr_type.clone(),
-                            preserve_table_literals,
-                        );
-                    }
+                );
+                // Recorded on the skip, not on the answer: a walk that read no
+                // sibling type declines to widen at all, and that write needs
+                // the settled re-derivation just as much as one that widened
+                // from a partial set.
+                if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner {
+                    analyzer.context.record_settled_member_widening_candidate(
+                        *member_id,
+                        expr_type.clone(),
+                        preserve_table_literals,
+                    );
+                }
+                if let Some(widened_type) = widened {
                     expr_type = widened_type;
                 }
             }
@@ -1740,7 +1744,7 @@ fn assign_merge_type_owner_and_expr_type(
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         let conditional_branch_assignment =
-            is_member_assignment_in_conditional_branch(analyzer, *member_id);
+            is_member_assignment_in_conditional_branch(analyzer.db, *member_id);
         if !dynamic_expr_key_member {
             record_member_assignment_contribution(
                 analyzer,
@@ -1958,8 +1962,25 @@ fn record_member_assignment_contribution(
     guarded_bootstrap: bool,
     preserve_table_literals: bool,
 ) {
-    let doc_type = analyzer
-        .db
+    record_member_assignment_contribution_in(
+        analyzer.db,
+        member_id,
+        bound_type,
+        source_type,
+        guarded_bootstrap,
+        preserve_table_literals,
+    );
+}
+
+fn record_member_assignment_contribution_in(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+    bound_type: &LuaType,
+    source_type: Option<LuaType>,
+    guarded_bootstrap: bool,
+    preserve_table_literals: bool,
+) {
+    let doc_type = db
         .get_type_index()
         .get_type_cache(&member_id.into())
         .filter(|cache| cache.is_doc())
@@ -1971,10 +1992,76 @@ fn record_member_assignment_contribution(
         guarded_bootstrap,
         preserve_table_literals,
     };
-    analyzer
-        .db
-        .get_member_index_mut()
+    db.get_member_index_mut()
         .record_member_assignment_contribution(member_id, contribution);
+}
+
+/// Records the evidence of an assignment whose value only resolved after the
+/// walk had moved on.
+///
+/// The walk records a contribution as it binds each write, so a write whose
+/// right-hand side deferred contributes nothing and the settled merge never
+/// sees it. Whether a write deferred is a fact about how far the batch had
+/// run - a re-index keeps out-of-batch types standing and resolves inline what
+/// a cold build had to defer - so the writer set the merge reads would
+/// otherwise differ between the two.
+pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contribution(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+    bound_type: &LuaType,
+) {
+    if !is_assignment_file_define_member(db, member_id) {
+        return;
+    }
+    if db
+        .get_member_index()
+        .member_assignment_contributions()
+        .contribution_of(&member_id)
+        .is_some()
+    {
+        return;
+    }
+    let guarded_bootstrap = is_guarded_table_assignment_member(db, member_id);
+    record_member_assignment_contribution_in(
+        db,
+        member_id,
+        bound_type,
+        None,
+        guarded_bootstrap,
+        false,
+    );
+}
+
+/// Applies the visibility marks a write earns from its own syntax, for a write
+/// the walk did not get to classify.
+///
+/// The walk marks each assignment as it binds it — guarded bootstrap, or
+/// conditional branch — and those marks decide which writers stay visible for
+/// the slot. A write whose right-hand side could not be inferred in time is
+/// finished by the unresolve pass instead, which binds the type and stops, so
+/// the marks are never applied. Both tests read syntax alone, so the answer is
+/// the same either way; only whether anything asks was in question, and that is
+/// a fact about how far the batch had run.
+pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
+    db: &mut DbIndex,
+    member_id: LuaMemberId,
+) {
+    if !is_assignment_file_define_member(db, member_id) {
+        return;
+    }
+    if is_guarded_table_assignment_member(db, member_id) {
+        if !db
+            .get_member_index()
+            .is_non_overwriting_assignment_member(member_id)
+        {
+            db.get_member_index_mut()
+                .mark_non_overwriting_assignment_member(member_id);
+            preserve_guarded_table_assignment_members(db, member_id);
+        }
+    } else if is_member_assignment_in_conditional_branch(db, member_id) {
+        db.get_member_index_mut()
+            .mark_conditional_branch_assignment_member(member_id);
+    }
 }
 
 fn record_member_assignment_widening_cache(
@@ -2052,11 +2139,8 @@ pub(in crate::compilation::analyzer) fn preserve_guarded_table_assignment_member
 /// ```
 ///
 /// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
-fn is_member_assignment_in_conditional_branch(
-    analyzer: &LuaAnalyzer,
-    member_id: LuaMemberId,
-) -> bool {
-    let Some(tree) = analyzer.db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
         return false;
     };
     let root = tree.get_red_root();
@@ -2138,6 +2222,19 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
         if related_member_id == *member_id {
             continue;
         }
+        // Only writers that come before this one are evidence for it. The walk
+        // otherwise settles that with "the sibling already has a type cache",
+        // which reports how far the batch has run rather than anything about
+        // the source: a re-index clears the batch's caches and leaves the rest
+        // standing, so the same sibling counts on one run and not on another.
+        // Reading the order off the source makes the set identical on both,
+        // and it is the rule the settled re-derivation already applies - a
+        // later write must not widen the type it is itself checked against.
+        if !preserve_table_literals
+            && member_id_sort_key(related_member_id) >= member_id_sort_key(*member_id)
+        {
+            continue;
+        }
         if !is_member_realm_compatible(db, *member_id, related_member_id) {
             continue;
         }
@@ -2186,9 +2283,13 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
                 previous_states.iter(),
             )
         }
-        MemberAssignmentWideningDecision::NoPreviousAssignments => {
-            widen_related_assignment_type(incoming_type, false)
-        }
+        // Only reachable once a preceding writer has been seen but every one of
+        // them was skipped for having no type yet: siblings exist, and not one
+        // of them is evidence. Widening the literal here guesses at writers this
+        // pass has not read, and how many it has read is how far the batch has
+        // run, not anything about the source. Leave the write as it stands and
+        // let the settled re-derivation decide against the complete set.
+        MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
     };
 
     Some(if preserve_table_literals {
@@ -3698,8 +3799,8 @@ mod tests {
     #[test]
     fn member_collection_assignment_widening_cache_respects_load_state_masks() {
         let mut db = DbIndex::new();
-        db.get_gmod_infer_index_mut()
-            .set_all_realm_file_metadata(std::collections::HashMap::from([
+        db.get_gmod_infer_index_mut().set_all_realm_file_metadata(
+            rustc_hash::FxHashMap::from_iter([
                 (
                     FileId::new(0),
                     crate::GmodRealmFileMetadata {
@@ -3714,7 +3815,8 @@ mod tests {
                         ..Default::default()
                     },
                 ),
-            ]));
+            ]),
+        );
 
         let owner = LuaMemberOwner::Element(InFiled::new(
             FileId::new(0),

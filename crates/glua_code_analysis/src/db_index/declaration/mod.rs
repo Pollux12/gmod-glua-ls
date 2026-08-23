@@ -8,8 +8,8 @@ pub use decl::{LocalAttribute, LuaDecl, LuaDeclInitializer};
 pub use decl_id::LuaDeclId;
 pub use decl_tree::{LuaDeclOrMemberId, LuaDeclarationTree};
 use rowan::TextRange;
+use rustc_hash::FxHashMap;
 pub use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
-use std::collections::HashMap;
 
 use crate::{FileId, LuaMemberId};
 
@@ -17,13 +17,13 @@ use super::traits::LuaIndex;
 
 #[derive(Debug)]
 pub struct LuaDeclIndex {
-    decl_trees: HashMap<FileId, LuaDeclarationTree>,
+    decl_trees: FxHashMap<FileId, LuaDeclarationTree>,
     /// The table literal a global declaration is written with — the `{}` of
     /// `X = {}` or of the GLua-idiomatic `X = X or {}`.
-    global_initializer_tables: HashMap<LuaDeclId, TextRange>,
+    global_initializer_tables: FxHashMap<LuaDeclId, TextRange>,
     /// The same fact for a *nested* global path: the `{}` of `X.k = {}` or
     /// of `X.k = X.k or {}`, keyed by the member that declares it.
-    global_member_initializer_tables: HashMap<LuaMemberId, TextRange>,
+    global_member_initializer_tables: FxHashMap<LuaMemberId, TextRange>,
 }
 
 impl Default for LuaDeclIndex {
@@ -35,9 +35,9 @@ impl Default for LuaDeclIndex {
 impl LuaDeclIndex {
     pub fn new() -> Self {
         Self {
-            decl_trees: HashMap::new(),
-            global_initializer_tables: HashMap::new(),
-            global_member_initializer_tables: HashMap::new(),
+            decl_trees: FxHashMap::default(),
+            global_initializer_tables: FxHashMap::default(),
+            global_member_initializer_tables: FxHashMap::default(),
         }
     }
 

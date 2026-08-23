@@ -44,15 +44,38 @@ impl LongRunningWatchdogSnapshot {
     }
 }
 
-#[derive(Debug, Clone)]
+/// Names what the task is currently working on. Called only when the watchdog
+/// logs, so it may do real work.
+pub type WatchdogDetailSource = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct LongRunningWatchdogStatus {
     snapshot: Arc<Mutex<LongRunningWatchdogSnapshot>>,
+    /// Kept beside the snapshot rather than in it so the snapshot stays a
+    /// plain value that can be cloned and logged.
+    detail_source: Arc<Mutex<Option<WatchdogDetailSource>>>,
+}
+
+impl std::fmt::Debug for LongRunningWatchdogStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("LongRunningWatchdogStatus")
+            .field("snapshot", &self.snapshot)
+            .finish_non_exhaustive()
+    }
 }
 
 impl LongRunningWatchdogStatus {
     pub fn new(phase: impl Into<String>) -> Self {
         Self {
             snapshot: Arc::new(Mutex::new(LongRunningWatchdogSnapshot::new(phase))),
+            detail_source: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    /// Attach something that can name what the task is currently working on.
+    pub fn set_detail_source(&self, source: WatchdogDetailSource) {
+        if let Ok(mut slot) = self.detail_source.lock() {
+            *slot = Some(source);
         }
     }
 
@@ -77,6 +100,22 @@ impl LongRunningWatchdogStatus {
             .lock()
             .map(|snapshot| snapshot.describe())
             .unwrap_or_else(|_| "status unavailable".to_string())
+    }
+
+    /// [`Self::describe`] plus whatever the detail source can add. For the
+    /// watchdog log, not the client-facing progress message.
+    pub fn describe_verbose(&self) -> String {
+        let described = self.describe();
+        let detail = self
+            .detail_source
+            .lock()
+            .ok()
+            .and_then(|slot| slot.as_ref().map(|source| source()))
+            .flatten();
+        match detail {
+            Some(detail) => format!("{described}; {detail}"),
+            None => described,
+        }
     }
 
     fn update(&self, update: impl FnOnce(&mut LongRunningWatchdogSnapshot)) {
@@ -148,7 +187,7 @@ pub fn spawn_long_running_watchdog(
                             "{} still running after {}s: {}",
                             task_name,
                             elapsed.as_secs(),
-                            status.describe()
+                            status.describe_verbose()
                         );
                     }
                 }

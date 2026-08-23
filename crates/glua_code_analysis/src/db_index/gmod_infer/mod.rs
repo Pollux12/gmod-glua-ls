@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::OnceLock,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::OnceLock;
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextRange;
@@ -191,16 +189,22 @@ impl GmodSystemAggregate {
         file_id: FileId,
         name_range: TextRange,
     ) {
-        self.duplicate_registrations
+        let registrations = self
+            .duplicate_registrations
             .entry((kind, name.to_string()))
-            .or_default()
-            .push(GmodSystemRegistration {
-                kind,
-                convar_kind,
-                name: name.to_string(),
-                file_id,
-                name_range,
-            });
+            .or_default();
+        registrations.push(GmodSystemRegistration {
+            kind,
+            convar_kind,
+            name: name.to_string(),
+            file_id,
+            name_range,
+        });
+        // Which registration a duplicate report calls the original is read off
+        // this list, so it has to come from source position rather than from
+        // the order the files happened to be analysed in.
+        registrations
+            .sort_by_key(|registration| (registration.file_id, registration.name_range.start()));
     }
 
     pub fn registrations(
@@ -294,14 +298,14 @@ pub struct GmodInferIndex {
 impl GmodInferIndex {
     pub fn new() -> Self {
         Self {
-            hook_file_metadata: HashMap::new(),
-            system_file_metadata: HashMap::new(),
+            hook_file_metadata: HashMap::default(),
+            system_file_metadata: HashMap::default(),
             system_aggregate_cache: OnceLock::new(),
-            realm_file_metadata: HashMap::new(),
-            gm_method_realm_annotations: HashMap::new(),
-            member_realm_ranges: HashMap::new(),
-            fileparam_index: HashMap::new(),
-            scoped_class_info: HashMap::new(),
+            realm_file_metadata: HashMap::default(),
+            gm_method_realm_annotations: HashMap::default(),
+            member_realm_ranges: HashMap::default(),
+            fileparam_index: HashMap::default(),
+            scoped_class_info: HashMap::default(),
         }
     }
 

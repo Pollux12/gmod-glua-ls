@@ -368,12 +368,14 @@ fn member_hidden_by_enclosing_assignment(
         return false;
     };
     let member_range = member.get_range();
-    let Some(token) = root.token_at_offset(member_range.start()).right_biased() else {
+    // By syntax id, not by offset: `token_at_offset` rescans the siblings at
+    // every level it descends, and this lookup is memoised.
+    let Some(member_node) = member_id.get_syntax_id().to_node_from_root(&root) else {
         return false;
     };
 
-    token
-        .parent_ancestors()
+    member_node
+        .ancestors()
         .find_map(LuaAssignStat::cast)
         .is_some_and(|assign_stat| {
             assign_stat.get_range().contains(caller_position)
@@ -423,7 +425,7 @@ fn assignment_rhs_self_coalesces_member(
     false
 }
 
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

@@ -2,10 +2,86 @@
 mod test {
     use std::time::Instant;
 
+    use crate::semantic::BASELINE_FLOW_WALKS;
     use crate::{Emmyrc, EmmyrcGmodScriptedClassScopeEntry, VirtualWorkspace};
 
     fn legacy_scope(pattern: &str) -> EmmyrcGmodScriptedClassScopeEntry {
         EmmyrcGmodScriptedClassScopeEntry::LegacyGlob(pattern.to_string())
+    }
+
+    /// A closure reading an outer local resolves its baseline type by walking
+    /// back past every branch merge ahead of it, so the branch count is the
+    /// exponent if a merge point is derived once per path instead of once.
+    fn index_branch_merges_before_closure(count: usize) -> std::time::Duration {
+        let mut body = String::from("local value = 1\n");
+        for i in 0..count {
+            body.push_str(&format!(
+                "if cond{i} then value = {i} else value = {} end\n",
+                i + 100
+            ));
+        }
+        body.push_str("local read = function() return value end\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// Closure-baseline walks performed while indexing `count` branch merges.
+    fn baseline_walks_for_branch_merges(count: usize) -> u64 {
+        BASELINE_FLOW_WALKS.with(|walks| walks.set(0));
+        let _ = index_branch_merges_before_closure(count);
+        BASELINE_FLOW_WALKS.with(|walks| walks.get())
+    }
+
+    /// The closure-baseline flow walk must memoise each merge point. Without
+    /// that it derives one per path reaching the merge, which is `2^n` in the
+    /// branch count rather than `n`.
+    ///
+    /// Counted rather than timed. The two behaviours differ by orders of
+    /// magnitude in *work done*, so counting says so directly, runs in
+    /// milliseconds, and cannot flake when the test suite saturates the CPU —
+    /// which a wall-clock ceiling here demonstrably does.
+    #[test]
+    fn closure_baseline_memoises_branch_merges() {
+        let small = baseline_walks_for_branch_merges(8);
+        let large = baseline_walks_for_branch_merges(16);
+
+        assert!(
+            small > 0,
+            "no closure-baseline walk ran; the guard is vacuous"
+        );
+        // Twice the branches. Memoised that is about twice the walks; deriving
+        // once per path would be squaring it, so anything near linear passes and
+        // the regression cannot.
+        assert!(
+            large <= small * 4,
+            "closure-baseline walks grew from {small} to {large} when the branch \
+             count doubled; merge points are being re-derived once per path"
+        );
+    }
+
+    /// The ratio form of [`closure_baseline_memoises_branch_merges`], for
+    /// bisecting a regression that test has already caught.
+    #[test]
+    #[ignore = "wall-clock ratio, for bisecting; the counted guard above runs by default"]
+    fn closure_baseline_cost_stays_linear_in_branch_merges() {
+        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
+        let _ = index_branch_merges_before_closure(4);
+
+        let small = index_branch_merges_before_closure(10);
+        let large = index_branch_merges_before_closure(20);
+
+        // Memoised this is linear; deriving per path doubles per branch. A 20x
+        // ceiling sits well above linear noise and well below exponential.
+        let ratio = large.as_secs_f64() / small.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 20.0,
+            "closure-baseline narrowing scaled exponentially with branch merges \
+             (10 -> {small:?}, 20 -> {large:?}, ratio {ratio:.1}x); \
+             merge points are being re-derived once per path"
+        );
     }
 
     /// Regression guard for issue #36: a field assigned a very large number of
@@ -74,8 +150,15 @@ local unrelated = {}
         (start.elapsed(), ws.humanize_type(result_type))
     }
 
+    /// Ignored because it is wall-clock: the ratio is stable against machine
+    /// speed but not against the test suite saturating the CPU around it, and
+    /// the sizes it needs to separate linear from quadratic take too long to
+    /// belong in a default run. There is no counted stand-in — the widening does
+    /// not route through an owner-scoped lookup that could be counted — so this
+    /// regression has no default-run guard. Run it before and after changes to
+    /// member assignment widening.
     #[test]
-    #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
+    #[ignore = "wall-clock ratio; run manually when touching member assignment widening"]
     fn repeated_field_assignment_indexing_stays_near_linear() {
         // Warm up so the first-file fixed costs (std/global setup) don't skew the
         // ratio, then measure two sizes that differ by 4×.
@@ -215,7 +298,7 @@ local unrelated = {}
     }
 
     #[test]
-    #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
+    #[ignore = "wall-clock ratio, for bisecting"]
     fn distinct_self_field_assignments_index_near_linearly() {
         let _ = index_distinct_self_field_assignments(200);
 
@@ -305,7 +388,7 @@ local result = T["entry"].name
     }
 
     #[test]
-    #[ignore = "wall-clock performance smoke; direct cache unit tests cover the hot path in default runs"]
+    #[ignore = "wall-clock ratio, for bisecting"]
     fn dynamic_key_collection_assignments_do_not_scan_owner_members_quadratically() {
         let _ = index_dynamic_key_collection_assignments(100);
 
@@ -320,6 +403,66 @@ local result = T["entry"].name
             ratio < 12.0,
             "indexing scaled super-linearly with dynamic-key collection assignments \
              (500 -> {small:?}, 2000 -> {large:?}, ratio {ratio:.1}x)"
+        );
+    }
+
+    /// `count` reads of fields that do not exist, against one table that ends
+    /// up `count` fields wide.
+    fn index_misses_on_one_wide_table(count: usize) -> std::time::Duration {
+        let mut body = String::from("local store = {}\n");
+        for i in 0..count {
+            body.push_str(&format!("store.f{i} = {i}\nlocal miss{i} = store.g{i}\n"));
+        }
+        body.push_str("return store\n");
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// The same reads and the same field count, spread so that no table is
+    /// more than one field wide.
+    fn index_misses_on_narrow_tables(count: usize) -> std::time::Duration {
+        let mut body = String::new();
+        for i in 0..count {
+            body.push_str(&format!(
+                "local store{i} = {{}}\nstore{i}.f{i} = {i}\nlocal miss{i} = store{i}.g{i}\n"
+            ));
+        }
+
+        let mut ws = VirtualWorkspace::new();
+        let start = Instant::now();
+        ws.def(&body);
+        start.elapsed()
+    }
+
+    /// A read of a field the table does not declare must not cost the width of
+    /// the owner. Both halves do the same number of reads over the same number
+    /// of fields and differ only in how wide any single table gets, so the ratio
+    /// isolates per-access cost that grows with owner width.
+    ///
+    /// Ignored because it is wall-clock, and the wide half takes tens of seconds
+    /// even when it is behaving — the residual is flow narrowing over the
+    /// writes, which this does not guard and which no cheap absolute ceiling can
+    /// separate from a regression. So this one has no default-run guard either.
+    #[test]
+    #[ignore = "wall-clock ratio; run manually when touching owner member lookup"]
+    fn named_field_misses_do_not_scan_every_owner_member() {
+        // Warm up so first-file fixed costs (std/global setup) don't skew the ratio.
+        let _ = index_misses_on_narrow_tables(100);
+
+        let narrow = index_misses_on_narrow_tables(2000);
+        let wide = index_misses_on_one_wide_table(2000);
+
+        // The residual gap is flow narrowing over the writes, which this does
+        // not guard, so the ceiling sits above that and below a full scan.
+        let ratio = wide.as_secs_f64() / narrow.as_secs_f64().max(1e-6);
+        assert!(
+            ratio < 25.0,
+            "field misses cost more on a wide table than on narrow ones \
+             (narrow -> {narrow:?}, wide -> {wide:?}, ratio {ratio:.1}x); \
+             a miss is probably walking every member of the owner again"
         );
     }
 }

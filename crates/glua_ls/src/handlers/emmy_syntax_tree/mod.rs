@@ -20,6 +20,15 @@ pub async fn on_emmy_syntax_tree_handler(
     cancel_token: CancellationToken,
 ) -> Option<SyntaxTreeResponse> {
     let uri = Uri::from_str(&params.uri).ok()?;
+
+    // Tree-offset answer: needs the latest document version, not a fresh index.
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;

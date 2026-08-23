@@ -1,10 +1,30 @@
 use crate::LuaAstNode;
+use smol_str::SmolStr;
 
 use super::{LuaExpr, LuaIndexKey};
 
+/// Join path segments with `.` into a single `SmolStr`, sizing the buffer once.
+fn join_path(paths: &[SmolStr]) -> SmolStr {
+    let width = paths.iter().map(|part| part.len() + 1).sum::<usize>();
+    let mut joined = String::with_capacity(width);
+    for (index, part) in paths.iter().enumerate() {
+        if index > 0 {
+            joined.push('.');
+        }
+        joined.push_str(part);
+    }
+    SmolStr::new(joined)
+}
+
 pub trait PathTrait: LuaAstNode {
-    fn get_access_path(&self) -> Option<String> {
-        let mut paths = Vec::new();
+    /// The dotted access path of this expression, e.g. `foo.bar.baz`.
+    ///
+    /// Returns `SmolStr` because paths are short and this is one of the hottest
+    /// allocation sites in analysis. A bare name — by far the common case —
+    /// returns without allocating at all: `paths` stays empty, so its backing
+    /// buffer is never allocated, and a name of 22 bytes or fewer lives inline.
+    fn get_access_path(&self) -> Option<SmolStr> {
+        let mut paths: Vec<SmolStr> = Vec::new();
         let mut current_node = self.syntax().clone();
         loop {
             match LuaExpr::cast(current_node)? {
@@ -15,7 +35,7 @@ pub trait PathTrait: LuaAstNode {
                     } else {
                         paths.push(name);
                         paths.reverse();
-                        return Some(paths.join("."));
+                        return Some(join_path(&paths));
                     }
                 }
                 LuaExpr::CallExpr(call_expr) => {
@@ -25,21 +45,19 @@ pub trait PathTrait: LuaAstNode {
                 LuaExpr::IndexExpr(index_expr) => {
                     match index_expr.get_index_key()? {
                         LuaIndexKey::String(s) => {
-                            paths.push(s.get_value());
+                            paths.push(SmolStr::new(s.get_value()));
                         }
                         LuaIndexKey::Name(name) => {
-                            paths.push(name.get_name_text().to_string());
+                            paths.push(SmolStr::new(name.get_name_text()));
                         }
                         LuaIndexKey::Integer(i) => {
-                            paths.push(i.get_number_value().to_string());
+                            paths.push(SmolStr::new(i.get_number_value().to_string()));
                         }
                         LuaIndexKey::Expr(expr) => {
-                            let text = format!("[{}]", expr.syntax().text());
-                            paths.push(text);
+                            paths.push(SmolStr::new(format!("[{}]", expr.syntax().text())));
                         }
                         LuaIndexKey::Idx(idx) => {
-                            let text = format!("[{}]", idx);
-                            paths.push(text);
+                            paths.push(SmolStr::new(format!("[{}]", idx)));
                         }
                     }
 

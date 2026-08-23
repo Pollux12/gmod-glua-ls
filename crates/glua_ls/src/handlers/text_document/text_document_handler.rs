@@ -23,12 +23,12 @@ fn spawn_deferred_drop(deferred_drop: DeferredVfsDrop) {
     tokio::task::spawn_blocking(move || drop(deferred_drop));
 }
 
-async fn should_drop_stale_version(
+fn should_drop_stale_version(
     context: &ServerContextSnapshot,
     uri: &lsp_types::Uri,
     version: i32,
 ) -> bool {
-    context.has_newer_seen_document_version(uri, version).await
+    context.has_newer_seen_document_version(uri, version)
 }
 
 async fn apply_document_update_without_queuing(
@@ -39,67 +39,62 @@ async fn apply_document_update_without_queuing(
     mut preparsed: Option<PreparsedDocument>,
     trigger_reindex: bool,
 ) -> Option<FileId> {
-    let mut pending_text = Some(text);
-    let mut retries = 0u32;
-
-    loop {
-        if should_drop_stale_version(context, uri, version).await {
-            return None;
-        }
-
-        if let Ok(mut analysis) = context.analysis().try_write() {
-            let text = pending_text
-                .take()
-                .expect("document text should still be available");
-            let (file_id, deferred_drop) = if let Some(preparsed) = preparsed.take() {
-                if trigger_reindex {
-                    (
-                        analysis.update_file_preparsed(
-                            uri.clone(),
-                            Some(text),
-                            preparsed.tree,
-                            preparsed.line_index,
-                            Some(version),
-                            true,
-                        ),
-                        None,
-                    )
-                } else {
-                    let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
-                        uri.clone(),
-                        Some(text),
-                        preparsed.tree,
-                        preparsed.line_index,
-                        Some(version),
-                    )?;
-                    (Some(file_id), Some(deferred_drop))
-                }
-            } else if trigger_reindex {
-                (analysis.update_file_by_uri(uri, Some(text)), None)
-            } else {
-                (analysis.update_file_text_only(uri, text), None)
-            };
-            if file_id.is_some() {
-                context
-                    .file_diagnostic()
-                    .invalidate_shared_diagnostic_data();
-            }
-            drop(analysis);
-
-            if let Some(deferred_drop) = deferred_drop {
-                spawn_deferred_drop(deferred_drop);
-            }
-
-            return file_id;
-        }
-
-        retries += 1;
-        if retries <= 20 {
-            tokio::task::yield_now().await;
-        } else {
-            tokio::time::sleep(Duration::from_millis(2)).await;
-        }
+    if should_drop_stale_version(context, uri, version) {
+        return None;
     }
+
+    // Fair-queued `write().await`, not a `try_write` spin, which can starve
+    // for seconds under a stream of readers.
+    let mut analysis = context.analysis().write().await;
+
+    // The lock wait is unbounded, so re-check staleness now that we hold it.
+    if should_drop_stale_version(context, uri, version) {
+        return None;
+    }
+
+    let (file_id, deferred_drop) = if let Some(preparsed) = preparsed.take() {
+        if trigger_reindex {
+            (
+                analysis.update_file_preparsed(
+                    uri.clone(),
+                    Some(text),
+                    preparsed.tree,
+                    preparsed.line_index,
+                    Some(version),
+                    true,
+                ),
+                None,
+            )
+        } else {
+            let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
+                uri.clone(),
+                Some(text),
+                preparsed.tree,
+                preparsed.line_index,
+                Some(version),
+            )?;
+            (Some(file_id), Some(deferred_drop))
+        }
+    } else if trigger_reindex {
+        (analysis.update_file_by_uri(uri, Some(text)), None)
+    } else {
+        (analysis.update_file_text_only(uri, text), None)
+    };
+
+    // Text-only updates leave the index alone; the debounced reindex
+    // invalidates under its own write lock.
+    if file_id.is_some() && trigger_reindex {
+        context
+            .file_diagnostic()
+            .invalidate_shared_diagnostic_data();
+    }
+    drop(analysis);
+
+    if let Some(deferred_drop) = deferred_drop {
+        spawn_deferred_drop(deferred_drop);
+    }
+
+    file_id
 }
 
 async fn check_schema_update(context: &ServerContextSnapshot) {
@@ -236,11 +231,11 @@ pub async fn on_did_open_text_document(
     };
 
     if !should_process {
-        context.mark_document_closed(&uri).await;
+        context.mark_document_closed(&uri);
         return None;
     }
 
-    if should_drop_stale_version(&context, &uri, version).await {
+    if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
 
@@ -250,7 +245,7 @@ pub async fn on_did_open_text_document(
     };
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
     let preparsed = preparse_document(text.clone(), emmyrc).await;
-    if should_drop_stale_version(&context, &uri, version).await {
+    if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
 
@@ -261,7 +256,7 @@ pub async fn on_did_open_text_document(
     let file_id =
         apply_document_update_without_queuing(&context, &uri, text, version, preparsed, true).await;
     if file_id.is_some() {
-        context.note_document_applied_version(&uri, version).await;
+        context.note_document_applied_version(&uri, version);
         if context.lsp_features().supports_semantic_tokens_refresh() {
             context.client().refresh_semantic_tokens();
         }
@@ -362,11 +357,11 @@ pub async fn on_did_change_text_document(
     }
 
     if !should_process {
-        context.mark_document_closed(&uri).await;
+        context.mark_document_closed(&uri);
         return None;
     }
 
-    if should_drop_stale_version(&context, &uri, version).await {
+    if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
 
@@ -375,7 +370,7 @@ pub async fn on_did_change_text_document(
     let syntax_diagnostics = preparsed
         .as_ref()
         .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
-    if should_drop_stale_version(&context, &uri, version).await {
+    if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
 
@@ -383,10 +378,10 @@ pub async fn on_did_change_text_document(
         apply_document_update_without_queuing(&context, &uri, text, version, preparsed, false)
             .await;
     if file_id.is_some() {
-        context.note_document_applied_version(&uri, version).await;
+        context.note_document_applied_version(&uri, version);
     }
 
-    if should_drop_stale_version(&context, &uri, version).await {
+    if should_drop_stale_version(&context, &uri, version) {
         return Some(());
     }
 
@@ -407,7 +402,10 @@ pub async fn on_did_change_text_document(
 
     // Schedule debounced reindex — rapid edits into a single reindex
     if let Some(file_id) = file_id {
-        context.debounced_analysis().schedule(file_id).await;
+        context
+            .debounced_analysis()
+            .schedule(file_id, uri.clone())
+            .await;
     }
 
     // Handle reindex without holding locks
@@ -435,6 +433,15 @@ pub async fn on_did_close_document(
 ) -> Option<()> {
     let uri = &params.text_document.uri;
     let lsp_features = context.lsp_features();
+
+    // A closed document has no reader for its cached replay report.
+    if lsp_features.supports_pull_diagnostic() {
+        context
+            .file_diagnostic()
+            .forget_cached_file_diagnostics(uri)
+            .await;
+    }
+
     let (encoding, interval) = {
         let analysis = context.analysis().read().await;
         let emmyrc = analysis.get_emmyrc();
@@ -452,13 +459,13 @@ pub async fn on_did_close_document(
     if let Some(file_path) = uri_to_file_path(uri) {
         if file_path.exists() {
             if let Some(text) = read_file_with_encoding(&file_path, &encoding) {
-                if !context.is_document_closed(uri).await {
+                if !context.is_document_closed(uri) {
                     return Some(());
                 }
 
                 let file_id = {
                     let mut analysis = context.analysis().write().await;
-                    if !context.is_document_closed(uri).await {
+                    if !context.is_document_closed(uri) {
                         return Some(());
                     }
                     let file_id = analysis.update_file_by_uri(uri, Some(text));
@@ -473,7 +480,7 @@ pub async fn on_did_close_document(
                 if !lsp_features.supports_pull_diagnostic()
                     && let Some(file_id) = file_id
                 {
-                    if !context.is_document_closed(uri).await {
+                    if !context.is_document_closed(uri) {
                         return Some(());
                     }
                     context
@@ -487,11 +494,11 @@ pub async fn on_did_close_document(
                 }
             }
         } else {
-            if !context.is_document_closed(uri).await {
+            if !context.is_document_closed(uri) {
                 return Some(());
             }
             let mut mut_analysis = context.analysis().write().await;
-            if !context.is_document_closed(uri).await {
+            if !context.is_document_closed(uri) {
                 return Some(());
             }
             mut_analysis.remove_file_by_uri(uri);
@@ -611,7 +618,7 @@ mod tests {
                 .update_file_by_uri(&uri, Some("local x = 1".to_string()));
 
             // Mark a newer version as seen so the version 1 is considered stale
-            snapshot.note_document_seen_version(&uri, 2).await;
+            snapshot.note_document_seen_version(&uri, 2);
 
             on_did_open_text_document(
                 snapshot.clone(),

@@ -1,5 +1,5 @@
 use rowan::TextRange;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::db_index::LuaDeclId;
 
@@ -18,8 +18,8 @@ impl Default for FileReference {
 impl FileReference {
     pub fn new() -> Self {
         Self {
-            decl_references: HashMap::new(),
-            references_to_decl: HashMap::new(),
+            decl_references: HashMap::default(),
+            references_to_decl: HashMap::default(),
         }
     }
 

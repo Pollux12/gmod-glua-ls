@@ -18,7 +18,9 @@ use super::{
     },
     gmod::ensure_scoped_class_type_decl_for_file,
 };
-use glua_parser::{LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaSyntaxKind, LuaVarExpr};
+use glua_parser::{
+    LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaIfStat, LuaSyntaxKind, LuaVarExpr,
+};
 use rowan::{TextRange, TextSize, WalkEvent};
 
 use crate::{
@@ -85,6 +87,25 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
     }
 }
 
+/// Records where each branch of `stat` begins and ends, and which `if` they
+/// belong to. Writes in different branches of one `if` are alternatives and all
+/// of them stay visible; every other pair of writes is successive, so the later
+/// one wins. Recorded on the decl walk, which every file gets, so the answer
+/// does not depend on how far inference reached.
+fn record_if_branch_ranges(analyzer: &mut DeclAnalyzer, stat: &LuaIfStat) {
+    let if_range = stat.get_range();
+    let file_id = analyzer.get_file_id();
+    let branches = stat
+        .get_block()
+        .map(|block| block.get_range())
+        .into_iter()
+        .chain(stat.get_all_clause().map(|clause| clause.get_range()));
+    let member_index = analyzer.db.get_member_index_mut();
+    for branch in branches {
+        member_index.add_conditional_branch_range(file_id, branch, if_range);
+    }
+}
+
 fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
     match node {
         LuaAst::LuaChunk(chunk) => {
@@ -101,6 +122,9 @@ fn walk_node_enter(analyzer: &mut DeclAnalyzer, node: LuaAst) {
         LuaAst::LuaAssignStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::LocalOrAssignStat);
             stats::analyze_assign_stat(analyzer, stat);
+        }
+        LuaAst::LuaIfStat(stat) => {
+            record_if_branch_ranges(analyzer, &stat);
         }
         LuaAst::LuaForStat(stat) => {
             analyzer.create_scope(stat.get_range(), LuaScopeKind::Normal);

@@ -15,7 +15,7 @@ use table_generic_check::check_table_generic_type_compact;
 use tuple_type_check::check_tuple_type_compact;
 
 use crate::{
-    LuaObjectType, LuaType, LuaUnionType, TypeSubstitutor,
+    LuaObjectType, LuaType, LuaUnionType, TypeOps, TypeSubstitutor,
     semantic::{member::find_members, type_check::type_check_context::TypeCheckContext},
 };
 
@@ -196,10 +196,23 @@ fn check_merged_table_type_compact(
 
 fn structural_object_from_members(context: &TypeCheckContext, typ: &LuaType) -> Option<LuaType> {
     let members = find_members(context.db, typ).unwrap_or_default();
-    let fields: BTreeMap<_, _> = members
-        .into_iter()
-        .map(|member| (member.key, member.typ))
-        .collect();
+    // A key several members write to is worth all of them. Collecting straight
+    // into the map would keep whichever one `find_members` happened to yield
+    // last, so a field written `nil` in one place and a panel in another could
+    // read as either - and the same table compared against itself would then
+    // disagree with the union `resolve_member_item_type` gives the other side.
+    let mut fields: BTreeMap<_, LuaType> = BTreeMap::new();
+    for member in members {
+        match fields.entry(member.key) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(member.typ);
+            }
+            std::collections::btree_map::Entry::Occupied(mut entry) => {
+                let merged = TypeOps::Union.apply(context.db, entry.get(), &member.typ);
+                entry.insert(merged);
+            }
+        }
+    }
     let mut index_access = Vec::new();
     collect_index_access_from_type(typ, &mut index_access);
     if fields.is_empty() && index_access.is_empty() {

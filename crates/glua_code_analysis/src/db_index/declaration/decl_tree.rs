@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 use super::{LuaDeclId, decl, scope};
 use crate::{FileId, db_index::LuaMemberId};
@@ -9,8 +10,8 @@ use scope::{LuaScope, LuaScopeId, LuaScopeKind, ScopeOrDeclId};
 #[derive(Debug)]
 pub struct LuaDeclarationTree {
     file_id: FileId,
-    decls: HashMap<LuaDeclId, LuaDecl>,
-    module_decls_by_name: HashMap<String, BTreeMap<TextSize, LuaDeclId>>,
+    decls: FxHashMap<LuaDeclId, LuaDecl>,
+    module_decls_by_name: FxHashMap<String, BTreeMap<TextSize, LuaDeclId>>,
     scopes: Vec<LuaScope>,
 }
 
@@ -18,8 +19,8 @@ impl LuaDeclarationTree {
     pub fn new(file_id: FileId) -> Self {
         Self {
             file_id,
-            decls: HashMap::new(),
-            module_decls_by_name: HashMap::new(),
+            decls: FxHashMap::default(),
+            module_decls_by_name: FxHashMap::default(),
             scopes: Vec::new(),
         }
     }
@@ -288,7 +289,7 @@ impl LuaDeclarationTree {
         self.scopes.get(scope_id.id as usize)
     }
 
-    pub fn get_decls(&self) -> &HashMap<LuaDeclId, LuaDecl> {
+    pub fn get_decls(&self) -> &FxHashMap<LuaDeclId, LuaDecl> {
         &self.decls
     }
 }

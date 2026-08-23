@@ -9,7 +9,6 @@ use lsp_types::{
         DidChangeWorkspaceFolders, DidCloseTextDocument, DidOpenTextDocument, DidRenameFiles,
         DidSaveTextDocument, Notification as LspNotification, SetTrace,
     },
-    request::{Request as LspRequest, WorkspaceDiagnosticRequest},
 };
 
 use crate::context::{ServerContext, WorkspaceDiagnosticLevel};
@@ -71,17 +70,18 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot
-                .note_document_seen_version(&uri, params.text_document.version)
-                .await;
-            if snapshot.lsp_features().supports_workspace_diagnostic() {
-                let workspace = snapshot.workspace_manager().read().await;
-                workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
-            }
-            // Keep stale-aware UI requests alive so they can wait for fresh
-            // data instead of flickering while typing.
+            snapshot.note_document_seen_version(&uri, params.text_document.version);
+            // Exempted requests wait for fresh data instead of being
+            // cancelled: the client clears a file on a cancelled diagnostic
+            // pull, and a cancelled executeCommand drops the user's command.
             server_context
-                .cancel_all_requests_except(&["textDocument/codeLens", "textDocument/inlayHint"])
+                .cancel_all_requests_except(&[
+                    "textDocument/codeLens",
+                    "textDocument/inlayHint",
+                    "textDocument/diagnostic",
+                    "workspace/diagnostic",
+                    "workspace/executeCommand",
+                ])
                 .await;
             // Mark analysis dirty BEFORE handing the update to the coalescer so
             // follow-up requests see the stale state immediately.
@@ -101,18 +101,15 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot
-                .note_document_seen_version(&uri, params.text_document.version)
-                .await;
+            snapshot.note_document_seen_version(&uri, params.text_document.version);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.insert(uri.clone());
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            server_context
-                .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
-                .await;
+            // The in-flight workspace sweep is deliberately left to finish:
+            // cancelling restarts it from scratch, which livelocks large scans.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {
@@ -137,16 +134,15 @@ pub async fn on_notification_handler(
         {
             let uri = params.text_document.uri.clone();
             let snapshot = server_context.snapshot();
-            snapshot.mark_document_closed(&uri).await;
+            snapshot.mark_document_closed(&uri);
             {
                 let mut workspace = snapshot.workspace_manager().write().await;
                 workspace.current_open_files.remove(&uri);
                 workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, true);
             }
             server_context.cancel_text_requests_for_uri(&uri).await;
-            server_context
-                .cancel_requests_by_method(WorkspaceDiagnosticRequest::METHOD)
-                .await;
+            // The in-flight workspace sweep is deliberately left to finish —
+            // see the didOpen branch above.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
             let task_snapshot = snapshot.clone();
             tokio::spawn(async move {

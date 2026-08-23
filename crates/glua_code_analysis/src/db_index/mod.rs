@@ -89,6 +89,22 @@ pub struct DbIndex {
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
     file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
+    /// Bumped on every *mutable* handle to the type, member, signature or module
+    /// index; memos over facts derived from those key on it. It covers those four
+    /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
+    /// mutate without bumping it, so a memo reading those is not protected here
+    /// and has to say how it stays correct. Widening a memo's read set means
+    /// widening this too. May over-invalidate, never misses.
+    /// Values come from a process-global counter so they are unique across
+    /// instances (the memos are thread-local and outlive any one `DbIndex`).
+    type_structure_revision: u64,
+}
+
+/// See [`DbIndex::type_structure_revision`] — process-global so revision values
+/// are unique across instances.
+fn next_type_structure_revision() -> u64 {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+    NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
 }
 
 /// Type-erased, revision-keyed cache slot (see `DbIndex::helper_registry_cache`).
@@ -114,6 +130,7 @@ impl Default for DbIndex {
 impl DbIndex {
     pub fn new() -> Self {
         Self {
+            type_structure_revision: next_type_structure_revision(),
             decl_index: LuaDeclIndex::new(),
             references_index: LuaReferenceIndex::new(),
             types_index: LuaTypeIndex::new(),
@@ -233,7 +250,14 @@ impl DbIndex {
     }
 
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.types_index
+    }
+
+    /// See [`Self::type_structure_revision`]. Memos over type/member-derived
+    /// facts must be discarded when this changes.
+    pub fn type_structure_revision(&self) -> u64 {
+        self.type_structure_revision
     }
 
     pub fn get_inference_fact(&self, node: &LuaInferenceNodeId) -> Option<LuaTypeFact> {
@@ -259,6 +283,9 @@ impl DbIndex {
         &mut self,
         mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
     ) -> HashSet<FileId> {
+        // Writes into `types_index` below go direct rather than through
+        // `get_type_index_mut`, so bump the revision here too.
+        self.type_structure_revision = next_type_structure_revision();
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
         let mut conflicting_nodes = HashSet::new();
@@ -315,10 +342,12 @@ impl DbIndex {
     }
 
     pub fn get_module_index_mut(&mut self) -> &mut LuaModuleIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.modules_index
     }
 
     pub fn get_member_index_mut(&mut self) -> &mut LuaMemberIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.members_index
     }
 
@@ -327,6 +356,7 @@ impl DbIndex {
     }
 
     pub fn get_signature_index_mut(&mut self) -> &mut LuaSignatureIndex {
+        self.type_structure_revision = next_type_structure_revision();
         &mut self.signature_index
     }
 
@@ -511,6 +541,7 @@ impl DbIndex {
 
 impl LuaIndex for DbIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.type_structure_revision = next_type_structure_revision();
         self.decl_index.remove(file_id);
         self.references_index.remove(file_id);
         self.types_index.remove(file_id);
@@ -537,6 +568,7 @@ impl LuaIndex for DbIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
+        self.type_structure_revision = next_type_structure_revision();
         if let [file_id] = file_ids {
             self.remove(*file_id);
             return;
@@ -609,6 +641,7 @@ impl LuaIndex for DbIndex {
     }
 
     fn clear(&mut self) {
+        self.type_structure_revision = next_type_structure_revision();
         self.decl_index.clear();
         self.references_index.clear();
         self.types_index.clear();

@@ -375,4 +375,42 @@ mod test {
         assert_that!(wrapped_flow.is_wrapped, eq(true));
         assert_that!(wrapped_flow.send_range, eq(wrapped_flow.start_range));
     }
+
+    #[gtest]
+    fn test_send_flow_through_two_local_wrapper_levels() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let file_id = ws.def_file(
+            "addons/mytest/lua/autorun/server/net_local_chain.lua",
+            r#"
+            local function fwd(name)
+                net.Start(name)
+                net.WriteString("payload")
+                net.Broadcast()
+            end
+
+            local function api(name)
+                fwd(name)
+            end
+
+            api("ChainedMessage")
+            "#,
+        );
+
+        let data = ws
+            .get_db_mut()
+            .get_gmod_network_index()
+            .get_file_data(file_id)
+            .expect("expected network data");
+
+        let chained: Vec<_> = data
+            .send_flows
+            .iter()
+            .filter(|flow| flow.message_name == "ChainedMessage")
+            .collect();
+
+        assert_that!(chained.len(), ge(1usize));
+        assert_that!(send_op_kinds(chained[0]), eq(&vec!["string".to_string()]));
+    }
 }

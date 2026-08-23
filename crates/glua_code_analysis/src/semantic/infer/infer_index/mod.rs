@@ -880,12 +880,12 @@ fn infer_table_dynamic_key_member_type(
     }
 
     let access_key_type = member_key_as_type(key)?;
-    let members = db.get_member_index().get_members(owner)?;
+    let members = db.get_member_index().get_expr_key_members(owner)?;
     let mut result_type = LuaType::Never;
 
     for member in members {
         let dynamic_key = member.get_key();
-        if dynamic_key == key || !dynamic_key.is_expr() {
+        if dynamic_key == key {
             continue;
         }
         if is_literal_member_key(key)
@@ -917,15 +917,11 @@ fn owner_has_precise_dynamic_value(
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
 ) -> bool {
-    let Some(members) = db.get_member_index().get_members(owner) else {
+    let Some(members) = db.get_member_index().get_expr_key_members(owner) else {
         return false;
     };
 
     members.iter().any(|member| {
-        if !member.get_key().is_expr() {
-            return false;
-        }
-
         let member_item = LuaMemberIndexItem::One(member.get_id());
         resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
             .is_ok_and(|typ| is_precise_unknown_wildcard_value_type(&typ))
@@ -1187,15 +1183,14 @@ fn infer_cross_file_matching_expr_key_member_type(
 
     let allow_wildcard_expr_literal_match =
         is_literal_member_key(key) && owner_wildcard_covers_literal_key(db, owner);
-    let members = db.get_member_index().get_members(owner)?;
+    let members = db.get_member_index().get_expr_key_members(owner)?;
     let mut result = LuaType::Never;
     // See `infer_gmod_same_file_expr_key_member_type`: matching is tracked
     // separately so an Unknown member type does not read as "no match".
     let mut saw_match = false;
 
     for member in members {
-        if !member.get_key().is_expr()
-            || member.get_file_id() == access_file_id
+        if member.get_file_id() == access_file_id
             || !is_dynamic_field_fallback_realm_compatible(
                 db,
                 access_realm,
@@ -1260,11 +1255,10 @@ fn table_has_cross_file_matching_expr_key_member(
         .unwrap_or(crate::GmodRealm::Unknown);
 
     db.get_member_index()
-        .get_members(owner)
+        .get_expr_key_members(owner)
         .is_some_and(|members| {
             members.iter().any(|member| {
-                member.get_key().is_expr()
-                    && member.get_file_id() != access_file_id
+                member.get_file_id() != access_file_id
                     && (!is_literal_member_key(key)
                         || !member_is_finite_named_dynamic_assignment(db, owner, member))
                     && is_dynamic_field_fallback_realm_compatible(
@@ -1432,10 +1426,7 @@ fn table_const_has_no_specific_data(
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
 ) -> bool {
-    db.get_member_index()
-        .get_members(owner)
-        .is_none_or(|members| members.is_empty())
-        && db.get_metatable_index().get(inst).is_none()
+    !db.get_member_index().has_live_member(owner) && db.get_metatable_index().get(inst).is_none()
 }
 
 fn infer_plain_table_member(
@@ -1796,7 +1787,17 @@ fn infer_custom_type_member(
         return Err(InferFailReason::UnSealedDynamicFields);
     }
 
-    if let Some(dynamic_field) = dynamic_field_result.unwrap_or_default() {
+    // An entry that carries `unknown`/`nil` names a field without saying what it
+    // holds, and answering with it ends the lookup: this type's own super walk
+    // stops, and so does the walk of whichever type asked, before either reaches
+    // a super that has a real type. Whether the index holds that entry at the
+    // moment of the read is how far the batch has run — it is unsealed on a cold
+    // walk and populated on a warm one — so the uninformative entry decides the
+    // answer on one build and not the other. Treat it as no entry at all.
+    if let Some(dynamic_field) = dynamic_field_result
+        .unwrap_or_default()
+        .filter(|dynamic_field| !dynamic_field.typ.is_unknown() && !dynamic_field.typ.is_nil())
+    {
         if type_decl.is_class()
             && let Some(super_types) =
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
@@ -1818,10 +1819,6 @@ fn infer_custom_type_member(
                                 dynamic_field.typ,
                                 super_member_type,
                             ]));
-                        }
-
-                        if dynamic_field.typ.is_nil() || dynamic_field.typ.is_unknown() {
-                            return Ok(super_member_type);
                         }
 
                         return Ok(dynamic_field.typ);
@@ -2598,8 +2595,8 @@ fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Opt
     }
 
     match expr {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path().map(Into::into),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().map(Into::into),
         _ => None,
     }
 }
@@ -2667,7 +2664,24 @@ fn infer_member_by_index_table(
             let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
             let key_type = index_key_access_type(db, cache, &index_key)?;
             let owner = LuaMemberOwner::Element(table_range.clone());
-            let members = db.get_member_index().get_members(&owner);
+            let access_key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key).ok();
+            let member_index = db.get_member_index();
+            // A literal key matches a literal member key only when the two are
+            // equal, so the candidates are that one key plus the
+            // expression-keyed members.
+            let members = match &access_key {
+                Some(key @ (LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))) => member_index
+                    .get_members_with_key(&owner, key)
+                    .map(|mut candidates| {
+                        candidates.extend(
+                            member_index
+                                .get_expr_key_members(&owner)
+                                .unwrap_or_default(),
+                        );
+                        candidates
+                    }),
+                _ => member_index.get_members(&owner),
+            };
             if let Some(mut members) = members {
                 members.sort_by(|a, b| a.get_key().cmp(b.get_key()));
                 let mut result_type = LuaType::Never;

@@ -56,7 +56,11 @@ impl DidChangeCoalescer {
             // Wait for at least one message.
             let first = match rx.recv().await {
                 Some(params) => params,
-                None => return, // channel closed
+                None => {
+                    // Every sender is gone: shutdown.
+                    log::info!("didChange coalescer stopped: channel closed");
+                    return;
+                }
             };
 
             // Drain remaining messages without blocking.

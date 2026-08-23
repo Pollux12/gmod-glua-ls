@@ -254,6 +254,37 @@ pub struct GmodVguiParentCallMetadata {
     pub parent: GmodVguiParentSource,
     pub relations: Vec<GmodVguiParentRelation>,
     pub origin: GmodVguiParentCallOrigin,
+    /// This call resolved against its file's syntax tree, before the
+    /// inheritance chain is walked.
+    ///
+    /// The chain walk is global and has to see every call, but resolving a call
+    /// means walking the declaring file's syntax tree — and re-analysing one
+    /// file cannot change what another file's call resolves to on its own.
+    /// Caching it here means a re-analysis only walks the files it rebuilt:
+    /// analysis creates calls with this empty, so a rebuilt file recomputes and
+    /// an untouched file reuses, with no dirty set to keep in step.
+    pub resolved_source: Option<GmodVguiResolvedParentSource>,
+}
+
+/// How a vgui parent call names its parent, resolved to type ids.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GmodVguiParentSourceResolution {
+    Direct(Vec<LuaTypeDeclId>),
+    AssignedField {
+        field_type_ids: Vec<LuaTypeDeclId>,
+        assignment_parent_type_ids: Vec<LuaTypeDeclId>,
+    },
+    ReceiverField {
+        field_type_ids: Vec<LuaTypeDeclId>,
+        receiver_type_ids: Vec<LuaTypeDeclId>,
+        receiver_field_parent_type_ids: Option<Vec<LuaTypeDeclId>>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GmodVguiResolvedParentSource {
+    pub child_type_ids: Vec<LuaTypeDeclId>,
+    pub parent: GmodVguiParentSourceResolution,
 }
 
 impl GmodScriptedClassFileMetadata {
@@ -628,6 +659,25 @@ impl GmodClassMetadataIndex {
             .get(file_id)
             .map(|metadata| metadata.vgui_parent_calls.as_slice())
             .unwrap_or_default()
+    }
+
+    /// Cache each call's pre-chain resolution, so the next re-analysis only
+    /// walks the syntax trees of files it rebuilt.
+    pub fn set_vgui_resolved_parent_sources(
+        &mut self,
+        resolved_by_file: &[(FileId, Vec<(LuaSyntaxId, GmodVguiResolvedParentSource)>)],
+    ) {
+        for (file_id, resolved) in resolved_by_file {
+            let Some(metadata) = self.file_metadata.get_mut(file_id) else {
+                continue;
+            };
+            for call in &mut metadata.vgui_parent_calls {
+                call.resolved_source = resolved
+                    .iter()
+                    .find(|(syntax_id, _)| *syntax_id == call.syntax_id)
+                    .map(|(_, source)| source.clone());
+            }
+        }
     }
 
     pub fn set_vgui_parent_relations(

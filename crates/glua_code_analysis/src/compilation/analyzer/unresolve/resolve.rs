@@ -25,8 +25,8 @@ use crate::{
             snapshot_callback_table_type,
         },
         common::{
-            TypeCacheWriteMode, add_member, bind_resolved_type, holds_unbound_iter_template,
-            write_type_cache,
+            TypeCacheWriteMode, add_member, bind_resolved_type, bind_type,
+            holds_unbound_iter_template, write_type_cache,
         },
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
@@ -163,7 +163,20 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    // Narrowing an uninformative decl cache is reserved for a right-hand side
+    // that reads through a call or index: that is the boundary both routes into
+    // this pass enforce before they queue an item
+    // (`should_retry_uninformative_initializer`,
+    // `should_retry_narrowing_decl_assignment`). A write that landed here only
+    // because its right-hand side could not be inferred while its file was
+    // walked arrives without that check, so applying the narrowing policy to it
+    // let any shape overwrite an authoritative `any` — but only in the builds
+    // where the inference happened to fail.
+    if crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr) {
+        bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    } else {
+        bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    }
     Ok(())
 }
 
@@ -382,7 +395,15 @@ pub fn try_resolve_member(
         }
 
         let member_id = unresolve_member.member_id;
-        bind_resolved_type(db, member_id.into(), LuaTypeCache::InferType(expr_type));
+        bind_resolved_type(
+            db,
+            member_id.into(),
+            LuaTypeCache::InferType(expr_type.clone()),
+        );
+        crate::compilation::analyzer::lua::record_resolved_member_assignment_contribution(
+            db, member_id, &expr_type,
+        );
+        crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
     }
 
     Ok(())
@@ -444,17 +465,16 @@ pub fn try_resolve_table_field(
     let field_key = field.get_field_key().ok_or(InferFailReason::None)?;
     let field_expr = field_key.get_expr().ok_or(InferFailReason::None)?;
     let field_type = infer_expr(db, cache, field_expr.clone())?;
-    let member_key: LuaMemberKey = match field_type {
-        LuaType::StringConst(s) => LuaMemberKey::Name((*s).clone()),
-        LuaType::IntegerConst(i) => LuaMemberKey::Integer(i),
-        _ => {
-            if field_type.is_table() {
-                LuaMemberKey::ExprType(field_type)
-            } else {
-                return Err(InferFailReason::None);
-            }
-        }
-    };
+    // The same mapping the immediate path uses. Re-deriving it here used to
+    // drop the member for every key type that is neither a literal nor a table,
+    // so a table field whose key type was known straight away got a member while
+    // an identical one that had to wait for inference got none — the analysis
+    // disagreed with itself depending on the order files happened to be
+    // analysed in.
+    let member_key = LuaMemberKey::from_expr_type(field_type);
+    if matches!(member_key, LuaMemberKey::ExprType(ref typ) if typ.is_unknown()) {
+        return Err(InferFailReason::None);
+    }
     let file_id = unresolve_table_field.file_id;
     let table_expr = unresolve_table_field.table_expr.clone();
     let owner_id = LuaMemberOwner::Element(InFiled {
@@ -544,6 +564,21 @@ pub fn try_resolve_return_point(
     cache: &mut LuaInferCache,
     return_: &mut UnResolveReturn,
 ) -> ResolveResult {
+    // Deriving a return means inferring every return expression in the
+    // function, and `should_apply_resolved_return_docs` then discards the
+    // result whenever the signature already holds a concrete inferred return —
+    // it can only ever upgrade `unknown`/`any`. Asking that question first
+    // costs two field reads instead of a full inference, and this pass
+    // re-attempts the same signatures across waves.
+    if let Some(signature) = db.get_signature_index().get(&return_.signature_id)
+        && signature.resolve_return == SignatureReturnStatus::InferResolve
+    {
+        let current_return = signature.get_return_type();
+        if !current_return.is_unknown() && !current_return.is_any() {
+            return Ok(());
+        }
+    }
+
     let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
     let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
 
@@ -2128,7 +2163,7 @@ fn semantic_decl_from_var_ref_id(var_ref_id: &VarRefId) -> Option<LuaSemanticDec
 fn get_expr_access_path(expr: &LuaExpr) -> Option<String> {
     match expr {
         LuaExpr::NameExpr(name_expr) => Some(name_expr.get_name_text()?.to_string()),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().map(Into::into),
         _ => None,
     }
 }

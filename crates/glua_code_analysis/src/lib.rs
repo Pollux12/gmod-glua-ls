@@ -15,7 +15,8 @@ mod db_index;
 mod diagnostic;
 mod gamemode_base;
 mod library_collision;
-mod profile;
+pub mod profile;
+pub mod progress;
 mod resources;
 mod semantic;
 mod test_lib;
@@ -512,24 +513,10 @@ impl EmmyLuaAnalysis {
             return Some(file_id);
         }
 
-        let is_removed = text.is_none();
-        let removed_file_ids = existing_file_id
-            .filter(|_| is_removed)
-            .into_iter()
-            .collect::<HashSet<_>>();
-        let mut existing_reindex_file_ids = profile::phase("edit/expand", || {
+        // The expansion has to be derived before the new text lands, because
+        // re-indexing a file drops the record of what depends on it.
+        let existing_reindex_file_ids = profile::phase("edit/expand", || {
             existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]))
-        });
-        if let Some(reindex_file_ids) = &mut existing_reindex_file_ids {
-            self.add_vgui_forwarding_removal_seed(&removed_file_ids, reindex_file_ids);
-        }
-        let old_guard_fact_file_ids = existing_reindex_file_ids
-            .iter()
-            .flatten()
-            .copied()
-            .collect::<HashSet<_>>();
-        let old_guard_facts = profile::phase("edit/guard_snapshot", || {
-            self.inferred_guard_snapshot(&old_guard_fact_file_ids)
         });
 
         let file_id = self
@@ -537,42 +524,11 @@ impl EmmyLuaAnalysis {
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content(uri, text);
-        let incremental_source_file_ids = HashSet::from([file_id]);
 
-        let reindex_file_ids = existing_reindex_file_ids
+        let expansion = existing_reindex_file_ids
             .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
-        profile::phase("edit/remove_index", || {
-            self.compilation.remove_index(reindex_file_ids.clone())
-        });
-
-        let update_file_ids = reindex_file_ids
-            .iter()
-            .copied()
-            .filter(|id| !is_removed || *id != file_id)
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            profile::phase("edit/update_index", || {
-                self.compilation.update_index(update_file_ids.clone())
-            });
-            profile::phase("edit/stabilize_type_caches", || {
-                self.stabilize_cross_file_type_caches(&update_file_ids)
-            });
-        }
-        self.compilation
-            .get_db_mut()
-            .get_call_site_param_index_mut()
-            .refresh_file_source_dependencies(file_id);
-        let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
-        profile::phase("edit/guard_reference_reindex", || {
-            self.reindex_changed_inferred_guard_references(
-                &guard_fact_file_ids,
-                &old_guard_facts,
-                &reindex_file_ids,
-                &incremental_source_file_ids,
-            )
-        });
-        profile::phase("edit/param_consumer_reindex", || {
-            self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids)
+        profile::phase("edit/reindex", || {
+            self.reindex_expanded_files(vec![file_id], expansion)
         });
         profile::phase_report("update_file_by_uri");
 
@@ -776,6 +732,22 @@ impl EmmyLuaAnalysis {
     /// Reindex specific files: remove old index entries + run full analysis pipeline.
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
+        let expansion = self.expand_reindex_file_ids(file_ids.clone());
+        self.reindex_expanded_files(file_ids, expansion);
+    }
+
+    /// [`reindex_files`](Self::reindex_files) against an expansion that was
+    /// computed earlier.
+    ///
+    /// The expansion has to be derived from the state *before* the edit landed,
+    /// so a caller that wants to do anything in between — re-index the edited
+    /// file on its own first, say, and release the write lock so a completion
+    /// can be answered — has to capture it up front and hand it back here.
+    /// Recomputing it against a partly-updated index under-expands badly:
+    /// measured on a gamemode workspace, an expansion of 739 files collapsed to
+    /// 8 and the workspace ended up with 18 diagnostics that a cold build does
+    /// not produce.
+    pub fn reindex_expanded_files(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
         let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let removed_file_ids = file_ids
             .iter()
@@ -788,13 +760,21 @@ impl EmmyLuaAnalysis {
                     .is_none()
             })
             .collect::<HashSet<_>>();
-        let mut file_ids = self.expand_reindex_file_ids(file_ids);
+
+        let mut file_ids = expansion;
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
         self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids.clone());
-        self.stabilize_cross_file_type_caches(&file_ids);
+        let update_file_ids = file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| !removed_file_ids.contains(file_id))
+            .collect::<Vec<_>>();
+        if !update_file_ids.is_empty() {
+            self.compilation.update_index(update_file_ids.clone());
+            self.stabilize_cross_file_type_caches(&update_file_ids);
+        }
         for file_id in &incremental_source_file_ids {
             self.compilation
                 .get_db_mut()
@@ -808,6 +788,21 @@ impl EmmyLuaAnalysis {
             &incremental_source_file_ids,
         );
         self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
+    }
+
+    /// Rebuilds only these files' own index entries.
+    ///
+    /// Nothing cross-file is settled: dependents keep whatever they inferred
+    /// before, and the caller still owes them a
+    /// [`reindex_expanded_files`](Self::reindex_expanded_files) against an
+    /// expansion captured beforehand. What this does buy is that the edited
+    /// file's declarations, members and signatures line up with its text again,
+    /// which is all a request positioned *inside that file* needs — the index
+    /// entries are keyed by position, so an edit that shifts offsets is exactly
+    /// what makes them stop matching the tree.
+    pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
+        self.compilation.remove_index(file_ids.clone());
+        self.compilation.update_index(file_ids);
     }
 
     /// Re-analyses exactly `file_ids`, skipping dependency expansion.
@@ -2359,6 +2354,7 @@ mod tests {
                     child: GmodVguiParentSource::Unknown,
                     parent: GmodVguiParentSource::Unknown,
                     relations: Vec::new(),
+                    resolved_source: None,
                     origin: GmodVguiParentCallOrigin::Annotated,
                 },
             );
@@ -2368,6 +2364,106 @@ mod tests {
         analysis.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
 
         assert_eq!(reindex_file_ids, vec![main_file_id, helper_file_id]);
+    }
+
+    /// The language server re-indexes an edited file on its own before running
+    /// its dependency ripple, so a completion positioned in that file can be
+    /// answered without waiting seconds for the ripple. This checks the split
+    /// path reaches the same diagnostics as doing it in one go.
+    ///
+    /// It does **not** pin the ordering constraint that makes the split safe —
+    /// that the expansion is captured *before* the self-index, because a
+    /// self-index drops the edited file's declarations and inbound dependency
+    /// edges and an expansion taken afterwards under-invalidates. That was
+    /// measured on a gamemode workspace (739 files before the self-index, 6
+    /// after) and this fixture is far too small to reproduce it: it passes with
+    /// the two swapped. The real guard is `tools/determinism` against a real
+    /// workspace, and the reasoning lives on `reindex_expanded_files`.
+    #[test]
+    fn two_phase_reindex_matches_single_phase_diagnostics() {
+        // A class definition plus a consumer whose inferred type references it:
+        // the expansion reaches the consumer through the type-cache relation,
+        // which is the one that collapses once the definition site is dropped.
+        let producer_source = |member: &str| {
+            format!(
+                "---@class Thing
+local Thing = {{}}
+function Thing:{member}() end
+return Thing
+"
+            )
+        };
+        let consumer_source = "---@type Thing
+local thing
+thing:name()
+consume(thing)
+";
+        let helper_source = "function consume(value) end
+";
+
+        let build = |dir: &str| {
+            let workspace = std::env::temp_dir().join(dir);
+            let uri = |name: &str| {
+                Uri::parse_from_file_path(&workspace.join(name)).expect("uri should parse")
+            };
+            let uris = [uri("producer.lua"), uri("consumer.lua"), uri("helper.lua")];
+            let mut analysis = EmmyLuaAnalysis::new();
+            analysis.add_main_workspace(workspace);
+            analysis.update_files_by_uri(vec![
+                (uris[0].clone(), Some(producer_source("name"))),
+                (uris[1].clone(), Some(consumer_source.to_string())),
+                (uris[2].clone(), Some(helper_source.to_string())),
+            ]);
+            (analysis, uris)
+        };
+
+        let snapshot = |analysis: &EmmyLuaAnalysis, uris: &[Uri; 3]| {
+            let shared = analysis.precompute_diagnostic_shared_data();
+            uris.iter()
+                .map(|uri| {
+                    let file_id = analysis.get_file_id(uri).expect("file should be indexed");
+                    analysis
+                        .diagnose_file_with_shared(
+                            file_id,
+                            CancellationToken::new(),
+                            shared.clone(),
+                        )
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+        };
+
+        // Renaming the produced field is a real change: the consumer reads the
+        // old name, so the edit has to reach it.
+        let (mut single, single_uris) = build("gmod_glua_ls_two_phase_single");
+        let single_producer = single
+            .update_file_text_only(&single_uris[0], producer_source("title"))
+            .expect("producer should exist");
+        single.reindex_files(vec![single_producer]);
+
+        let (mut split, split_uris) = build("gmod_glua_ls_two_phase_split");
+        let split_producer = split
+            .get_file_id(&split_uris[0])
+            .expect("producer should be indexed");
+        let expansion = split.expand_reindex_file_ids(vec![split_producer]);
+        split
+            .update_file_text_only(&split_uris[0], producer_source("title"))
+            .expect("producer should exist");
+        split.self_index_files(vec![split_producer]);
+        split.reindex_expanded_files(vec![split_producer], expansion);
+
+        let single_diagnostics = snapshot(&single, &single_uris);
+        assert!(
+            single_diagnostics
+                .iter()
+                .any(|diagnostics| !diagnostics.is_empty()),
+            "fixture should exercise observable diagnostics"
+        );
+        assert_eq!(
+            snapshot(&split, &split_uris),
+            single_diagnostics,
+            "self-indexing the edited file first must not change the outcome"
+        );
     }
 
     #[test]

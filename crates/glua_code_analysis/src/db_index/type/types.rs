@@ -497,7 +497,9 @@ impl LuaType {
             1 => types[0].clone(),
             _ => {
                 let mut result_types = Vec::new();
-                let mut hash_set = HashSet::new();
+                // Membership only: the union's order comes from `result_types`,
+                // so the hasher cannot affect the result.
+                let mut hash_set = rustc_hash::FxHashSet::default();
                 for typ in types {
                     match typ {
                         LuaType::Union(u) => {
@@ -1125,7 +1127,7 @@ impl LuaUnionType {
     /// Callables are matched and rendered in declaration order, and template
     /// refs drive `` `T` ``|T dispatch, so a union containing either keeps the
     /// order it was built with.
-    fn is_order_insensitive_member(typ: &LuaType) -> bool {
+    pub(crate) fn is_order_insensitive_member(typ: &LuaType) -> bool {
         !matches!(
             typ,
             LuaType::Signature(_)

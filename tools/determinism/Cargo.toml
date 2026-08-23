@@ -11,6 +11,10 @@ glua_parser.workspace = true
 tokio-util.workspace = true
 lsp_types.workspace = true
 mimalloc.workspace = true
+# Allocation sampling (DET_ALLOC_SAMPLE): capture raw frame addresses cheaply
+# during the run and resolve them only when reporting. Resolving per sample is
+# orders of magnitude slower — slow enough to never finish a full run.
+backtrace = "0.3"
 
 [[bin]]
 name = "determinism"

@@ -11,6 +11,7 @@ pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
 use rowan::TextSize;
+use rustc_hash::FxHashMap;
 pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
@@ -26,13 +27,13 @@ use std::{
 pub struct LuaModuleIndex {
     module_patterns: Vec<Regex>,
     module_root_id: ModuleNodeId,
-    module_nodes: HashMap<ModuleNodeId, ModuleNode>,
-    file_module_map: HashMap<FileId, ModuleInfo>,
-    file_module_paths: HashMap<FileId, String>,
-    module_name_to_file_ids: HashMap<String, Vec<FileId>>,
-    legacy_module_envs: HashMap<FileId, Vec<LegacyModuleEnv>>,
+    module_nodes: FxHashMap<ModuleNodeId, ModuleNode>,
+    file_module_map: FxHashMap<FileId, ModuleInfo>,
+    file_module_paths: FxHashMap<FileId, String>,
+    module_name_to_file_ids: FxHashMap<String, Vec<FileId>>,
+    legacy_module_envs: FxHashMap<FileId, Vec<LegacyModuleEnv>>,
     workspaces: Vec<Workspace>,
-    workspace_kind_map: HashMap<WorkspaceId, WorkspaceKind>,
+    workspace_kind_map: FxHashMap<WorkspaceId, WorkspaceKind>,
     id_counter: u32,
     fuzzy_search: bool,
     module_replace_vec: Vec<(Regex, String)>,
@@ -50,13 +51,13 @@ impl LuaModuleIndex {
         let mut index = Self {
             module_patterns: Vec::new(),
             module_root_id: ModuleNodeId { id: 0 },
-            module_nodes: HashMap::new(),
-            file_module_map: HashMap::new(),
-            file_module_paths: HashMap::new(),
-            module_name_to_file_ids: HashMap::new(),
-            legacy_module_envs: HashMap::new(),
+            module_nodes: FxHashMap::default(),
+            file_module_map: FxHashMap::default(),
+            file_module_paths: FxHashMap::default(),
+            module_name_to_file_ids: FxHashMap::default(),
+            legacy_module_envs: FxHashMap::default(),
             workspaces: Vec::new(),
-            workspace_kind_map: HashMap::new(),
+            workspace_kind_map: FxHashMap::default(),
             id_counter: 1,
             fuzzy_search: false,
             module_replace_vec: Vec::new(),
@@ -639,8 +640,12 @@ impl LuaModuleIndex {
         self.module_nodes.get(module_id)
     }
 
+    /// Sorted by file id: the result reaches completion output, so hash order
+    /// would let two runs of the same workspace disagree.
     pub fn get_module_infos(&self) -> Vec<&ModuleInfo> {
-        self.file_module_map.values().collect()
+        let mut module_infos: Vec<&ModuleInfo> = self.file_module_map.values().collect();
+        module_infos.sort_unstable_by_key(|module_info| module_info.file_id);
+        module_infos
     }
 
     pub fn get_workspace_kind(&self, workspace_id: WorkspaceId) -> WorkspaceKind {
@@ -944,6 +949,7 @@ impl LuaModuleIndex {
             }
         }
 
+        file_ids.sort_unstable();
         file_ids
     }
 

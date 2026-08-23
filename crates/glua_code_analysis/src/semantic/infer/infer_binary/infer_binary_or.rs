@@ -186,7 +186,16 @@ pub fn special_or_rule(
                 _ => return None,
             }
 
-            if right_type.is_nil() || left_type.is_const() {
+            // The answer below is the left arm's truthy half on its own, which
+            // stands as the whole answer only while there is one: the
+            // compatibility check has established the right arm adds nothing to
+            // it. A left arm that is falsy throughout always evaluates to the
+            // right arm, and its truthy half is empty, so answering with that
+            // half drops the only operand the expression can return and hands
+            // back a `nil` the source cannot produce. `and` already declines on
+            // the same condition; leave this to the general rule, which returns
+            // the right arm.
+            if right_type.is_nil() || left_type.is_const() || left_type.is_always_falsy() {
                 return None;
             }
 
@@ -196,13 +205,6 @@ pub fn special_or_rule(
         }
 
         _ => {}
-    }
-
-    // `X = X or {}` with an unresolved `X`: the fallback arm is real
-    // evidence, the left arm is not, so keep both rather than widening the
-    // pair to `any`.
-    if left_type.is_unknown() {
-        return Some(TypeOps::Union.apply(db, &LuaType::Unknown, right_type));
     }
 
     None

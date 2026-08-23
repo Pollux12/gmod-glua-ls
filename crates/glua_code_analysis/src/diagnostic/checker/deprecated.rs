@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::sync::Arc;
 
 use glua_parser::{LuaAst, LuaAstNode, LuaIndexExpr, LuaNameExpr};
 
@@ -7,7 +7,10 @@ use crate::{
     LuaType, SemanticDeclLevel, SemanticModel,
 };
 
-use super::{Checker, DiagnosticContext};
+use super::{
+    Checker, DiagnosticContext, PrecomputedPropertyNameCandidates,
+    precompute_property_name_candidates,
+};
 
 pub struct DeprecatedChecker;
 
@@ -16,7 +19,7 @@ impl Checker for DeprecatedChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let candidates = DeprecatedCandidates::new(context);
+        let candidates = DeprecatedCandidates::new(context, semantic_model.get_db());
         if candidates.is_empty() {
             return;
         }
@@ -36,52 +39,29 @@ impl Checker for DeprecatedChecker {
 }
 
 struct DeprecatedCandidates {
-    names: HashSet<String>,
+    candidates: Arc<PrecomputedPropertyNameCandidates>,
 }
 
 impl DeprecatedCandidates {
-    fn new(context: &DiagnosticContext) -> Self {
-        let db = context.db;
-        let mut names = HashSet::new();
-        for (owner_id, property) in db.get_property_index().iter_owner_properties() {
-            if !property_can_report_deprecated(property) {
-                continue;
-            }
-
-            match owner_id {
-                LuaSemanticDeclId::LuaDecl(decl_id) => {
-                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
-                        names.insert(decl.get_name().to_string());
-                    }
-                }
-                LuaSemanticDeclId::Member(member_id) => {
-                    if let Some(member) = db.get_member_index().get_member(member_id)
-                        && let Some(name) = member.get_key().get_name()
-                    {
-                        names.insert(name.to_string());
-                    }
-                }
-                LuaSemanticDeclId::TypeDecl(type_decl_id) => {
-                    names.insert(type_decl_id.get_name().to_string());
-                    names.insert(type_decl_id.get_simple_name().to_string());
-                }
-                LuaSemanticDeclId::Signature(_) => {}
-            }
+    fn new(context: &DiagnosticContext, db: &crate::DbIndex) -> Self {
+        Self {
+            candidates: context
+                .get_shared_data_arc()
+                .map(|shared_data| shared_data.property_name_candidates.clone())
+                .unwrap_or_else(|| Arc::new(precompute_property_name_candidates(db))),
         }
-
-        Self { names }
     }
 
     fn is_empty(&self) -> bool {
-        self.names.is_empty()
+        self.candidates.deprecated.is_empty()
     }
 
     fn should_check(&self, name: &str) -> bool {
-        self.names.contains(name)
+        self.candidates.deprecated.contains(name)
     }
 }
 
-fn property_can_report_deprecated(property: &LuaCommonProperty) -> bool {
+pub(super) fn property_can_report_deprecated(property: &LuaCommonProperty) -> bool {
     property.deprecated().is_some()
         || property.attribute_uses().is_some_and(|attribute_uses| {
             attribute_uses

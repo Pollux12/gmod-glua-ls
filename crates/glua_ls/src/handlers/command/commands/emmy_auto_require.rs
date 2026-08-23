@@ -15,6 +15,11 @@ impl CommandSpec for AutoRequireCommand {
     const COMMAND: &str = "gluals.auto.require";
 
     async fn handle(context: ServerContextSnapshot, args: Vec<Value>) -> Option<()> {
+        if !context.lsp_features().supports_apply_edit() {
+            log::warn!("auto-require skipped: client does not support workspace/applyEdit");
+            return None;
+        }
+
         let add_to: FileId = serde_json::from_value(args.first()?.clone()).ok()?;
         let need_require_file_id: FileId = serde_json::from_value(args.get(1)?.clone()).ok()?;
         let position: Position = serde_json::from_value(args.get(2)?.clone()).ok()?;

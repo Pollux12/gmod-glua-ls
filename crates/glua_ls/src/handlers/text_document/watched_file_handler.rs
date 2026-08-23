@@ -105,6 +105,14 @@ pub async fn on_did_change_watched_files(
                 .clear_push_file_diagnostics(uri.clone())
                 .await;
         }
+    } else {
+        // Never replay a report for a file that no longer exists.
+        for uri in &deleted_lua_uris {
+            context
+                .file_diagnostic()
+                .forget_cached_file_diagnostics(uri)
+                .await;
+        }
     }
 
     context

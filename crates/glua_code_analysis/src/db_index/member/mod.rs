@@ -12,6 +12,7 @@ use std::collections::BTreeMap;
 
 use super::traits::LuaIndex;
 use crate::{FileId, GlobalId, db_index::member::lua_owner_members::LuaOwnerMembers};
+
 pub use assignment_contribution::{
     MemberAssignmentContribution, MemberAssignmentContributionKey,
     MemberAssignmentContributionStore,
@@ -44,6 +45,9 @@ pub struct LuaMemberIndex {
     /// type read mid-fixpoint.
     deferred_index_expr_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
+    /// Per file, each `if` branch's range paired with the range of the `if` it
+    /// belongs to, sorted by branch start. Recorded on the decl walk.
+    conditional_branch_ranges: HashMap<FileId, Vec<(TextRange, TextRange)>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
     /// Per-writer evidence for the member assignment widening merge. See
     /// [`MemberAssignmentContribution`].
@@ -89,6 +93,7 @@ impl LuaMemberIndex {
             synthesized_owner_members: HashSet::default(),
             deferred_index_expr_members: HashSet::default(),
             function_scope_ranges: HashMap::default(),
+            conditional_branch_ranges: HashMap::default(),
             member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
         }
@@ -109,6 +114,12 @@ impl LuaMemberIndex {
 
     pub fn member_assignment_contributions(&self) -> &MemberAssignmentContributionStore {
         &self.assignment_contributions
+    }
+
+    pub fn member_assignment_contributions_mut(
+        &mut self,
+    ) -> &mut MemberAssignmentContributionStore {
+        &mut self.assignment_contributions
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
@@ -281,13 +292,29 @@ impl LuaMemberIndex {
         match item {
             LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
             _ => {
-                let winner = latest_defined_member(&old_member_ids, id);
-                if matches!(item, LuaMemberIndexItem::One(current) if *current == winner) {
+                // Ids this owner only *aliases* belong to another owner, and
+                // `add_member_alias_to_owner` never displaces what it finds. Letting
+                // one win this slot -- or evicting one -- would make the outcome
+                // depend on whether the owner's own write or the alias arrived
+                // first, which is a property of the batch, not of the source.
+                let (aliased, owned): (Vec<_>, Vec<_>) = old_member_ids
+                    .iter()
+                    .copied()
+                    .partition(|old_id| self.member_current_owner.get(old_id) != Some(owner));
+                let winner = latest_defined_member(&owned, id);
+                let mut visible = aliased;
+                visible.push(winner);
+                visible.sort_by_key(|visible_id| member_id_sort_key(*visible_id));
+                let new_item = match visible.as_slice() {
+                    [only] => LuaMemberIndexItem::One(*only),
+                    _ => LuaMemberIndexItem::Many(visible),
+                };
+                if item == &new_item {
                     return MemberInsertAction::Noop;
                 }
                 MemberInsertAction::StoreRemovingVisibleOldIds {
-                    item: LuaMemberIndexItem::One(winner),
-                    old_ids: old_member_ids
+                    item: new_item,
+                    old_ids: owned
                         .into_iter()
                         .chain(std::iter::once(id))
                         .filter(|candidate| {
@@ -326,21 +353,41 @@ impl LuaMemberIndex {
         })
     }
 
-    /// The visible item for a slot that `candidates` write to, when at least one
-    /// of them is a conditional-branch write: every conditional writer, plus the
-    /// latest plain one because plain writers do dominate each other. Ordered by
-    /// [`member_id_sort_key`], so it is a pure function of the candidate set.
+    /// The visible item for a slot at least one conditional write reaches.
+    ///
+    /// Only writes that run in the same flow can overwrite each other, so the
+    /// candidates are bucketed by function scope: two writes in different scopes
+    /// are parallel -- each runs on its own object, which is how a class collects
+    /// a callback field from every instance that sets one -- and both stay
+    /// visible. Within one scope the writes are successive, so only the last one
+    /// survives, unless they sit in different branches of the same `if`, where
+    /// exactly one of them runs and all of them survive.
+    ///
+    /// Ordered by [`member_id_sort_key`], so it is a pure function of the
+    /// candidate set.
     fn conditional_branch_item(&self, candidates: &[LuaMemberId]) -> Option<LuaMemberIndexItem> {
-        let (mut kept, plain): (Vec<_>, Vec<_>) =
-            candidates.iter().copied().partition(|candidate| {
-                self.conditional_branch_assignment_members
-                    .contains(candidate)
-            });
-        if kept.is_empty() {
+        if !candidates.iter().any(|candidate| {
+            self.conditional_branch_assignment_members
+                .contains(candidate)
+        }) {
             return None;
         }
-        if let Some(latest_plain) = plain.into_iter().max_by_key(|id| member_id_sort_key(*id)) {
-            kept.push(latest_plain);
+
+        let mut scopes: Vec<(Option<TextRange>, Vec<LuaMemberId>)> = Vec::new();
+        for candidate in candidates.iter().copied() {
+            let scope = self.member_function_scope_range(candidate);
+            match scopes.iter_mut().find(|(seen, _)| *seen == scope) {
+                Some((_, members)) => members.push(candidate),
+                None => scopes.push((scope, vec![candidate])),
+            }
+        }
+
+        let mut kept = Vec::new();
+        for (_, members) in &scopes {
+            kept.extend(self.live_writes_in_one_scope(members));
+        }
+        if kept.is_empty() {
+            return None;
         }
         kept.sort_by_key(|id| member_id_sort_key(*id));
 
@@ -348,6 +395,60 @@ impl LuaMemberIndex {
             [only] => LuaMemberIndexItem::One(*only),
             _ => LuaMemberIndexItem::Many(kept),
         })
+    }
+
+    /// The writes among `members` that can still be live at the end of the one
+    /// function scope they share: the branches of an `if` they write to from more
+    /// than one side, because exactly one of those runs, and otherwise just the
+    /// latest write, because successive writes in one flow overwrite each other.
+    fn live_writes_in_one_scope(&self, members: &[LuaMemberId]) -> Vec<LuaMemberId> {
+        let chains = members
+            .iter()
+            .map(|member_id| self.enclosing_conditional_branches(*member_id))
+            .collect::<Vec<_>>();
+
+        // A write survives its scope only if some other write sits in a different
+        // branch of an `if` that encloses them both. Two survivors in the same
+        // branch still overwrite each other, so a branch contributes its latest.
+        let mut latest_per_branch: Vec<(Option<(TextRange, TextRange)>, LuaMemberId)> = Vec::new();
+        for (index, member_id) in members.iter().copied().enumerate() {
+            let has_alternative = chains.iter().enumerate().any(|(other, other_chain)| {
+                other != index
+                    && chains[index].iter().any(|(branch, if_range)| {
+                        other_chain
+                            .iter()
+                            .any(|(seen, seen_if)| seen_if == if_range && seen != branch)
+                    })
+            });
+            if !has_alternative {
+                continue;
+            }
+            let branch = chains[index].first().copied();
+            match latest_per_branch
+                .iter_mut()
+                .find(|(seen, _)| *seen == branch)
+            {
+                Some(entry) => {
+                    if member_id_sort_key(member_id) > member_id_sort_key(entry.1) {
+                        entry.1 = member_id;
+                    }
+                }
+                None => latest_per_branch.push((branch, member_id)),
+            }
+        }
+        if !latest_per_branch.is_empty() {
+            return latest_per_branch
+                .into_iter()
+                .map(|(_, member_id)| member_id)
+                .collect();
+        }
+
+        members
+            .iter()
+            .copied()
+            .max_by_key(|member_id| member_id_sort_key(*member_id))
+            .into_iter()
+            .collect()
     }
 
     /// Re-resolves the slot `member_id` writes to, now that it is known to
@@ -485,6 +586,50 @@ impl LuaMemberIndex {
 
         self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
         Some(())
+    }
+
+    /// Whether every write
+    /// [`add_member_alias_to_owner`](Self::add_member_alias_to_owner) would
+    /// perform for `(owner, id)` is already in the index, so calling it would
+    /// leave the index unchanged.
+    pub(crate) fn alias_to_owner_is_recorded(
+        &self,
+        owner: &LuaMemberOwner,
+        id: LuaMemberId,
+    ) -> bool {
+        let Some(member) = self.get_member(&id) else {
+            return false;
+        };
+        let key = member.get_key();
+
+        let is_indexed = |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
+            index
+                .get(owner)
+                .and_then(|members_by_key| members_by_key.get(key))
+                .is_some_and(|member_ids| member_ids.contains(&id))
+        };
+        if self.member_current_owner.get(&id) != Some(owner)
+            && !(is_indexed(&self.member_owner_key_index)
+                && is_indexed(&self.member_owner_key_history_index))
+        {
+            return false;
+        }
+
+        let item_holds_member = self
+            .owner_members
+            .get(owner)
+            .and_then(|owner_members| owner_members.get_member(key))
+            .is_some_and(|item| match item {
+                LuaMemberIndexItem::One(existing_id) => *existing_id == id,
+                LuaMemberIndexItem::Many(ids) => ids.contains(&id),
+            });
+        if !item_holds_member {
+            return false;
+        }
+
+        self.in_filed
+            .get(&member.get_file_id())
+            .is_some_and(|objects| objects.contains(&MemberOrOwner::Owner(owner.clone())))
     }
 
     fn should_preserve_assignment_file_define_member(
@@ -819,7 +964,6 @@ impl LuaMemberIndex {
 
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
         let owner_members = self.owner_members.get(owner)?;
-
         if owner_members.get_member_len() == 0 {
             return Some(Vec::new());
         }
@@ -836,6 +980,52 @@ impl LuaMemberIndex {
         Some(
             owner_members
                 .sorted_member_ids()
+                .iter()
+                .filter_map(|member_id| self.get_member(member_id))
+                .collect(),
+        )
+    }
+
+    /// The owner's members whose key is an expression rather than a name, in
+    /// the same order [`Self::get_members`] would yield them.
+    pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner_members = self.owner_members.get(owner)?;
+        let mut member_ids = Vec::new();
+        for key in owner_members.expr_keys() {
+            match owner_members.get_member(key) {
+                Some(LuaMemberIndexItem::One(id)) => member_ids.push(*id),
+                Some(LuaMemberIndexItem::Many(ids)) => member_ids.extend(ids.iter().copied()),
+                None => {}
+            }
+        }
+        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        Some(
+            member_ids
+                .iter()
+                .filter_map(|member_id| self.get_member(member_id))
+                .collect(),
+        )
+    }
+
+    /// The owner's members under one key, in the same order
+    /// [`Self::get_members`] would yield them.
+    ///
+    /// Returns `None` only when the owner has no member map at all, so a
+    /// caller can still tell "no such owner" from "owner without that key".
+    pub fn get_members_with_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Option<Vec<&LuaMember>> {
+        let owner_members = self.owner_members.get(owner)?;
+        let mut member_ids = match owner_members.get_member(key) {
+            Some(LuaMemberIndexItem::One(id)) => vec![*id],
+            Some(LuaMemberIndexItem::Many(ids)) => ids.clone(),
+            None => return Some(Vec::new()),
+        };
+        member_ids.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        Some(
+            member_ids
                 .iter()
                 .filter_map(|member_id| self.get_member(member_id))
                 .collect(),
@@ -881,6 +1071,22 @@ impl LuaMemberIndex {
         self.owner_members
             .get(owner)
             .map_or(0, |map| map.get_member_len())
+    }
+
+    /// Whether the owner holds at least one member that still resolves.
+    ///
+    /// Not the same as a non-zero [`Self::get_member_len`]: removing a member
+    /// whose entry is already gone leaves its id behind under the owner, so a
+    /// key can outlive the member it points at. Stops at the first live id
+    /// rather than materialising the owner's whole member list.
+    pub fn has_live_member(&self, owner: &LuaMemberOwner) -> bool {
+        let Some(owner_members) = self.owner_members.get(owner) else {
+            return false;
+        };
+        owner_members.get_member_items().any(|item| match item {
+            LuaMemberIndexItem::One(id) => self.get_member(id).is_some(),
+            LuaMemberIndexItem::Many(ids) => ids.iter().any(|id| self.get_member(id).is_some()),
+        })
     }
 
     pub fn get_current_owner(&self, id: &LuaMemberId) -> Option<&LuaMemberOwner> {
@@ -971,11 +1177,45 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
-        self.get_member_history(owner)
-            .into_iter()
-            .filter(|member| member.get_global_id() == Some(global_id))
-            .map(|member| member.get_id())
-            .collect()
+        // The member key is the part of the path below the owner, so the members
+        // declaring it are one bucket of the owner's history rather than all of
+        // it. Reading the whole history to filter it built and sorted every
+        // member the owner has ever held, once per resolution event, against
+        // paths that gain a member per assignment.
+        let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
+            return Vec::new();
+        };
+        let name = global_id.get_name();
+        // Not the last dotted segment: a bracketed string key keeps its dots, so
+        // `T["a.b"] = v` stores one member keyed `a.b` under `T`.
+        let key_text = match owner {
+            LuaMemberOwner::GlobalPath(owner_id) => name
+                .strip_prefix(owner_id.get_name())
+                .and_then(|rest| rest.strip_prefix('.'))
+                .unwrap_or(name),
+            _ => name.rsplit_once('.').map_or(name, |(_, last)| last),
+        };
+
+        let mut matched = Vec::new();
+        let collect = |key: &LuaMemberKey, matched: &mut Vec<LuaMemberId>| {
+            let Some(member_ids) = owner_items.get(key) else {
+                return;
+            };
+            matched.extend(member_ids.iter().copied().filter(|member_id| {
+                self.get_member(member_id)
+                    .and_then(|member| member.get_global_id())
+                    == Some(global_id)
+            }));
+        };
+        collect(&LuaMemberKey::Name(key_text.into()), &mut matched);
+        // A numeric field is keyed by its integer, not by its spelling.
+        if let Ok(index) = key_text.parse::<i64>() {
+            collect(&LuaMemberKey::Integer(index), &mut matched);
+        }
+
+        matched.sort_unstable_by_key(|member_id| member_id_sort_key(*member_id));
+        matched.dedup();
+        matched
     }
 
     pub(crate) fn iter_current_owner_keys(
@@ -991,6 +1231,41 @@ impl LuaMemberIndex {
         match ranges.binary_search_by_key(&range.start(), |range| range.start()) {
             Ok(index) | Err(index) => ranges.insert(index, range),
         }
+    }
+
+    pub fn add_conditional_branch_range(
+        &mut self,
+        file_id: FileId,
+        branch: TextRange,
+        if_range: TextRange,
+    ) {
+        let ranges = self.conditional_branch_ranges.entry(file_id).or_default();
+        match ranges.binary_search_by_key(&branch.start(), |(branch, _)| branch.start()) {
+            Ok(index) | Err(index) => ranges.insert(index, (branch, if_range)),
+        }
+    }
+
+    /// Every `if` branch containing `member_id`, each paired with the `if` it
+    /// belongs to, innermost first. Empty when the write is not inside any
+    /// branch.
+    fn enclosing_conditional_branches(
+        &self,
+        member_id: LuaMemberId,
+    ) -> Vec<(TextRange, TextRange)> {
+        let Some(ranges) = self.conditional_branch_ranges.get(&member_id.file_id) else {
+            return Vec::new();
+        };
+        let position = member_id.get_position();
+        let mut enclosing = Vec::new();
+        let mut index = ranges.partition_point(|(branch, _)| branch.start() <= position);
+        while index > 0 {
+            index -= 1;
+            let entry = ranges[index];
+            if entry.0.contains(position) {
+                enclosing.push(entry);
+            }
+        }
+        enclosing
     }
 
     pub fn enclosing_function_scope_range(
@@ -1298,6 +1573,7 @@ impl LuaMemberIndex {
             }
         }
         self.function_scope_ranges.remove(&file_id);
+        self.conditional_branch_ranges.remove(&file_id);
     }
 }
 
@@ -1331,6 +1607,7 @@ impl LuaIndex for LuaMemberIndex {
         self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
+        self.conditional_branch_ranges.clear();
         self.member_function_scope_ranges.clear();
         self.assignment_contributions.clear();
     }
@@ -2103,6 +2380,64 @@ mod tests {
     }
 
     #[test]
+    fn alias_to_owner_is_recorded_exactly_when_the_alias_is_a_no_op() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
+        let own_member_id = make_index_member_id(FileId::new(1), 10);
+        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            other_owner,
+            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        // Everything `add_member_alias_to_owner` writes, read back in a
+        // deterministic order. Comparing the index's `Debug` instead would
+        // compare `HashSet` iteration order, which varies per process and makes
+        // the assertion pass or fail at random.
+        let key = LuaMemberKey::Name("field".into());
+        let written_state = |index: &LuaMemberIndex| {
+            let mut in_filed: Vec<String> = index
+                .in_filed
+                .get(&aliased_member_id.file_id)
+                .map(|objects| objects.iter().map(|object| format!("{object:?}")).collect())
+                .unwrap_or_default();
+            in_filed.sort();
+            (
+                index.get_member_item(&owner, &key).cloned(),
+                index
+                    .member_owner_key_index
+                    .get(&owner)
+                    .and_then(|keys| keys.get(&key))
+                    .cloned(),
+                index
+                    .member_owner_key_history_index
+                    .get(&owner)
+                    .and_then(|keys| keys.get(&key))
+                    .cloned(),
+                in_filed,
+            )
+        };
+
+        assert!(!index.alias_to_owner_is_recorded(&owner, aliased_member_id));
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        assert!(index.alias_to_owner_is_recorded(&owner, aliased_member_id));
+
+        let recorded = written_state(&index);
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        assert_eq!(
+            recorded,
+            written_state(&index),
+            "a recorded alias must write nothing when applied again"
+        );
+    }
+
+    #[test]
     fn alias_adds_to_an_existing_file_define_without_displacing_it() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
         let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
@@ -2129,6 +2464,37 @@ mod tests {
                 aliased_member_id,
             ])),
             "an alias only ever adds; it must never replace the owner's own writer"
+        );
+    }
+
+    #[test]
+    fn a_table_field_write_arriving_after_an_alias_still_takes_the_slot() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
+        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
+        let key = LuaMemberKey::Name("field".into());
+        // A table-literal field is a `FileDefine` that is not an index-expr
+        // assignment, so it falls through to the latest-defined rule.
+        let own_member_id = make_member_id(FileId::new(1), 10);
+        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            other_owner,
+            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
+        );
+
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::Many(vec![
+                own_member_id,
+                aliased_member_id,
+            ])),
+            "which of the two arrived first must not decide the slot"
         );
     }
 
@@ -2548,5 +2914,68 @@ mod tests {
             None
         );
         assert_eq!(index.member_function_scope_range(member_id), None);
+    }
+
+    /// `MYTBL["net.handler"] = f` keys one member `net.handler` under `MYTBL`.
+    /// Its global path is `MYTBL.net.handler`, whose last dotted segment is
+    /// `handler` — a key nothing is stored under.
+    #[test]
+    fn history_for_a_global_path_finds_a_member_whose_key_contains_dots() {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL"));
+        let global_id = GlobalId::new("MYTBL.net.handler");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("net.handler".into()),
+                LuaMemberFeature::FileFieldDecl,
+                Some(global_id.clone()),
+            ),
+        );
+
+        assert_eq!(
+            index.get_member_history_for_global_path(&owner, &global_id),
+            vec![member_id]
+        );
+    }
+
+    #[test]
+    fn history_for_a_global_path_still_finds_a_plain_nested_member() {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new("MYTBL.net"));
+        let global_id = GlobalId::new("MYTBL.net.handler");
+        let member_id = make_index_member_id(FileId::new(1), 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            LuaMember::new(
+                member_id,
+                LuaMemberKey::Name("handler".into()),
+                LuaMemberFeature::FileFieldDecl,
+                Some(global_id.clone()),
+            ),
+        );
+
+        assert_eq!(
+            index.get_member_history_for_global_path(&owner, &global_id),
+            vec![member_id]
+        );
+    }
+
+    #[test]
+    fn an_owner_whose_only_member_is_gone_has_no_live_member() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
+        let file_id = FileId::new(1);
+        let member_id = make_member_id(file_id, 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_member(member_id, "field"));
+        assert!(index.has_live_member(&owner));
+
+        index.remove(file_id);
+        assert!(!index.has_live_member(&owner));
     }
 }

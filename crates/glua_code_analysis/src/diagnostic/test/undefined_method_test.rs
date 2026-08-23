@@ -1506,4 +1506,40 @@ mod tests {
             .unwrap();
         assert_eq!(diagnostic.severity, Some(DiagnosticSeverity::ERROR));
     }
+
+    /// A nil check on a call result speaks for the value, not for the method
+    /// name that produced it, so it cannot excuse an undefined method.
+    #[test]
+    fn nil_check_of_the_call_result_does_not_excuse_the_method() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Entity
+            ---@class Holder
+            ---@field owner Entity
+            ---@type Holder
+            local holder = nil
+            local trace = holder.owner:MissingEntityMethod()
+            if trace.Entity then print(1) end
+            "#,
+        );
+
+        assert!(has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
+
+    /// `obj.method and obj:method()` tests the member itself before calling it,
+    /// which is a presence check the diagnostic must respect.
+    #[test]
+    fn short_circuit_presence_check_excuses_the_call_it_guards() {
+        let diagnostics = gmod_diagnostics(
+            r#"
+            ---@class Entity
+            ---@type Entity
+            local ent = nil
+            local owned = ent.CPPIGetOwner and ent:CPPIGetOwner() == nil
+            print(owned)
+            "#,
+        );
+
+        assert!(!has_code(&diagnostics, DiagnosticCode::UndefinedMethod));
+    }
 }

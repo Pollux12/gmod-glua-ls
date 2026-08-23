@@ -1083,12 +1083,11 @@ mod test {
     }
 
     #[test]
-    fn test_or_with_local_unknown_does_not_coerce_to_nil() {
+    fn test_or_with_unknown_left_yields_the_fallback() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let ty = infer_last_name_expr_type(
             &mut ws,
             r#"
-            ---@type unknown
             local maybe
             local result = maybe or {}
             print(result)
@@ -1096,16 +1095,16 @@ mod test {
             "result",
         );
 
-        // Both arms survive: the fallback table is real evidence and the
-        // unresolved left arm is not, so neither erases the other.
-        let LuaType::Union(union) = &ty else {
-            panic!("expected a union, got: {ty:?}");
-        };
-        let arms = union.into_vec();
+        // `unknown` on the left is a report that inference could not tell what
+        // the left arm holds, not a type the expression can evaluate to. Whether
+        // it could tell depends on how far the batch had run, so carrying it
+        // into the answer pins the file walk order into the type: the same
+        // source read `integer` or `integer|unknown` depending on which file
+        // declared a constant first. The fallback is the only real evidence
+        // here, so it stands alone.
         assert!(
-            arms.iter().any(|arm| matches!(arm, LuaType::TableConst(_)))
-                && arms.iter().any(|arm| matches!(arm, LuaType::Unknown)),
-            "expected `unknown | table`, got: {arms:?}"
+            matches!(ty, LuaType::TableConst(_)),
+            "expected the fallback table, got: {ty:?}"
         );
     }
 
@@ -1489,6 +1488,34 @@ mod test {
         );
     }
 
+    /// `X or false` evaluates to the left arm when it is truthy and to `false`
+    /// otherwise, so it cannot be nil whatever `X` is. A left arm that is falsy
+    /// throughout has no truthy half to answer with, and the fallback arm is the
+    /// only value the expression can produce.
+    #[test]
+    fn test_or_with_all_falsy_left_arm_yields_the_fallback_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@param flag false|nil
+            local function pick(flag)
+                local enabled = flag or false
+                return enabled
+            end
+            local chosen = pick(nil)
+            print(chosen)
+            "#,
+            "chosen",
+        );
+
+        assert!(
+            !ty.is_nil(),
+            "`X or false` must not infer as nil, got: {}",
+            ws.humanize_type_detailed(ty)
+        );
+    }
+
     /// A call shape the reader cannot interpret leaves the type unresolved.
     /// `any` would claim the author opted out of checking instead.
     #[test]
@@ -1508,5 +1535,60 @@ mod test {
             "#,
         );
         assert_eq!(ws.expr_ty("require(some_computed_path)"), LuaType::Unknown);
+    }
+
+    /// An `__index` metamethod on a super that sits after a diamond in the
+    /// inheritance graph must still be found. `Leaf : Mid, Root, Store` reaches
+    /// `Root` twice — directly and through `Mid` — and the operator walk shares
+    /// one infer guard across siblings, so the second arrival reported recursion.
+    /// Treating that as fatal dropped the remaining siblings, losing `Store`'s
+    /// index operator entirely.
+    #[test]
+    fn test_index_operator_survives_super_diamond() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class DiamondRoot
+            local DiamondRoot = {}
+
+            ---@class DiamondMid : DiamondRoot
+            local DiamondMid = {}
+
+            ---@class DiamondStore
+            ---@field [string] number
+            local DiamondStore = {}
+
+            ---@class DiamondLeaf : DiamondMid, DiamondRoot, DiamondStore
+            local DiamondLeaf = {}
+
+            ---@type DiamondLeaf
+            leafValue = nil
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("leafValue.anythingAtAll"), LuaType::Number);
+    }
+
+    /// Sibling super branches get their own guard fork, so cycle detection now
+    /// rests entirely on the guard's parent chain. Mutually recursive classes
+    /// must still terminate rather than recurse forever, and an absent field
+    /// stays an absent field rather than degrading to unknown.
+    #[test]
+    fn test_mutually_recursive_supers_terminate() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            ---@class CycleFirst : CycleSecond
+            local CycleFirst = {}
+
+            ---@class CycleSecond : CycleFirst
+            local CycleSecond = {}
+
+            ---@type CycleFirst
+            cycleValue = nil
+            "#,
+        );
+
+        assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Nil);
     }
 }

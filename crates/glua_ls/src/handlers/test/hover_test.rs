@@ -4404,4 +4404,182 @@ local EscapeStringMap: {
 
         Ok(())
     }
+
+    /// `self` inside a scripted-class method is an instance of the class the
+    /// authoring table stands for, so hover must name that class.
+    ///
+    /// `ENT` is virtual inside a scripted scope, so it has no decl and the
+    /// receiver lookup used to fall back to the enclosing method's member. That
+    /// is the shared semantic decl id, so goto-definition, references,
+    /// implementation and rename all pointed at the method too; hover is just
+    /// the cheapest place to observe it.
+    #[gtest]
+    fn test_hover_self_in_scripted_entity_method_shows_class() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        let source = r#"
+            --- Implement this base class function.
+            function ENT:OnSeatInput(seatIndex, action, pressed)
+                local t = SELF_ANCHOR
+                return t
+            end
+        "#;
+
+        let (self_content, self_position) = ProviderVirtualWorkspace::handle_file_content(
+            &source.replace("SELF_ANCHOR", "se<??>lf"),
+        )?;
+        let self_file = ws.def_file("lua/entities/base_glide_car/init.lua", &self_content);
+        let self_hover = extract_hover_markdown(&ws, self_file, self_position);
+
+        let (ent_content, ent_position) = ProviderVirtualWorkspace::handle_file_content(
+            &source
+                .replace("SELF_ANCHOR", "self")
+                .replace("function ENT:OnSeatInput", "function E<??>NT:OnSeatInput"),
+        )?;
+        let ent_file = ws.def_file("lua/entities/base_glide_boat/init.lua", &ent_content);
+        let ent_hover = extract_hover_markdown(&ws, ent_file, ent_position);
+
+        assert!(
+            self_hover.contains("self: base_glide_car") && !self_hover.contains("(method)"),
+            "hovering `self` must name the class it is an instance of, not the \
+             enclosing method, got: {self_hover}"
+        );
+        assert!(
+            ent_hover.contains("base_glide_boat") && !ent_hover.contains("(method)"),
+            "hovering the authoring table must name the class, got: {ent_hover}"
+        );
+
+        // Goto-definition shares the same semantic decl and used to land on the
+        // enclosing method's name token, so pin that it no longer does.
+        let self_def =
+            crate::handlers::definition::definition(&ws.analysis, self_file, self_position)
+                .expect("goto-definition on `self`");
+        let lsp_types::GotoDefinitionResponse::Scalar(location) = self_def else {
+            panic!("expected a single goto-definition location, got: {self_def:?}");
+        };
+        let method_name_start = self_content
+            .lines()
+            .nth(location.range.start.line as usize)
+            .and_then(|line| line.find("OnSeatInput"))
+            .expect("the method name is on the target line");
+        assert!(
+            (location.range.start.character as usize) < method_name_start,
+            "goto-definition on `self` must not land on the method name, got: {location:?}"
+        );
+        Ok(())
+    }
+
+    /// `PLAYER` and `PLUGIN` author their class through a real local, unlike the
+    /// virtual `ENT` / `SWEP` / `GM` tables. `self` must still be typed as that
+    /// file's scripted class in both styles — the local is the authoring
+    /// mechanism, not a different entity.
+    #[gtest]
+    fn test_self_in_player_class_resolves_to_class_like_the_token() -> Result<()> {
+        let source = r#"
+            local PLAYER = {}
+
+            function PLAYER:Loadout()
+                local t = ANCHOR
+                return t
+            end
+        "#;
+
+        let mut ws = enable_gmod_workspace();
+        let (self_content, self_position) =
+            ProviderVirtualWorkspace::handle_file_content(&source.replace("ANCHOR", "se<??>lf"))?;
+        let self_file = ws.def_file("lua/gamemode/player_class/player_x.lua", &self_content);
+        let self_hover = extract_hover_markdown(&ws, self_file, self_position);
+
+        let (token_content, token_position) = ProviderVirtualWorkspace::handle_file_content(
+            &source
+                .replace("ANCHOR", "self")
+                .replace("function PLAYER:Loadout", "function PLA<??>YER:Loadout"),
+        )?;
+        let token_file = ws.def_file("lua/gamemode/player_class/player_y.lua", &token_content);
+        let token_hover = extract_hover_markdown(&ws, token_file, token_position);
+
+        assert!(
+            self_hover.contains("self: player_x") && !self_hover.contains("(method)"),
+            "hovering `self` in a player class must name the class, got: {self_hover}"
+        );
+        assert!(
+            token_hover.contains("player_y"),
+            "hovering the authoring token must name the class, got: {token_hover}"
+        );
+        Ok(())
+    }
+
+    /// A scripted class inherits both the GMod `ENT` annotation chain and its
+    /// own scripted base, so the super graph is a diamond: `ENT : ENTITY :
+    /// Entity` sits alongside a direct `Entity` super, and the real base comes
+    /// last. Walking the siblings with one shared infer guard marked `Entity`
+    /// visited in the `ENT` branch, so the direct `Entity` sibling failed with
+    /// `RecursiveInfer` and aborted the rest of the walk — the real base was
+    /// never searched and the inherited method lost its signature.
+    #[gtest]
+    fn test_inherited_scripted_method_survives_super_diamond() -> Result<()> {
+        let mut ws = enable_gmod_workspace();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+
+        ws.def_files(vec![
+            (
+                "lua/annotations/ent.lua",
+                r#"
+---@class Entity
+local Entity = {}
+---@class ENTITY : Entity
+ENTITY = Entity
+---@class ENT : ENTITY
+ENT = {}
+"#,
+            ),
+            (
+                "lua/entities/base_glide/shared.lua",
+                "ENT.Type = \"anim\"\nENT.Base = \"base_anim\"\n",
+            ),
+            (
+                "lua/entities/base_glide/sv_input.lua",
+                r#"
+--- Get the action's boolean value from a specific seat.
+---@param seatIndex number The seat index
+function ENT:GetInputBool(seatIndex)
+    return false
+end
+"#,
+            ),
+            (
+                "lua/entities/base_glide_car/shared.lua",
+                "ENT.Type = \"anim\"\nENT.Base = \"base_glide\"\n",
+            ),
+        ]);
+
+        let (content, position) = ProviderVirtualWorkspace::handle_file_content(
+            r#"
+function ENT:OnSeatInput()
+    local held = self:GetInput<??>Bool(1)
+    return held
+end
+"#,
+        )?;
+        let file = ws.def_file("lua/entities/base_glide_car/init.lua", &content);
+        let hover = extract_hover_markdown(&ws, file, position);
+
+        assert!(
+            hover.contains("(method) base_glide:GetInputBool"),
+            "an inherited scripted-class method must keep its signature when the \
+             super graph forms a diamond, got: {hover}"
+        );
+        Ok(())
+    }
 }

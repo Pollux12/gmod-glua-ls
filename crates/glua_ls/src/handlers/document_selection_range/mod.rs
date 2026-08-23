@@ -16,6 +16,15 @@ pub async fn on_document_selection_range_handle(
     cancel_token: CancellationToken,
 ) -> Option<Vec<SelectionRange>> {
     let uri = params.text_document.uri;
+
+    // Tree-offset answer: needs the latest document version, not a fresh index.
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let position = params.positions;
 
     let analysis = context.read_analysis(&cancel_token).await?;

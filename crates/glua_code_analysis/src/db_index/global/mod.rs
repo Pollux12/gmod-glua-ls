@@ -64,6 +64,19 @@ impl LuaGlobalIndex {
         self.global_decl.get(&id)
     }
 
+    /// Every global name that more than one declaration writes, sorted by
+    /// name so parents settle before the nested paths derived from them.
+    pub fn sorted_multi_declaration_globals(&self) -> Vec<GlobalId> {
+        let mut global_ids = self
+            .global_decl
+            .iter()
+            .filter(|(_, decl_ids)| decl_ids.len() > 1)
+            .map(|(global_id, _)| global_id.clone())
+            .collect::<Vec<_>>();
+        global_ids.sort_unstable_by(|left, right| left.get_name().cmp(right.get_name()));
+        global_ids
+    }
+
     pub fn get_global_decl_ids_in_workspace(
         &self,
         name: &str,

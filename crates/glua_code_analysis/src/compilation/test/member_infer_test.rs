@@ -3658,3 +3658,84 @@ end)
         );
     }
 }
+
+#[cfg(test)]
+mod undefined_global_reads_as_nil {
+    use crate::{LuaType, VirtualWorkspace};
+
+    /// Reading a name that is declared nowhere yields `nil` at runtime, so an
+    /// assignment from one contributes `nil` to the target — not `unknown`.
+    ///
+    /// The flow walk used to take `unknown` from the failed inference and let it
+    /// swallow everything the other branches had established, so one undefined
+    /// name erased the type of a local for the rest of its life and then rode
+    /// into every member that local was assigned to.
+    #[test]
+    fn assignment_from_an_undefined_global_narrows_to_nil() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def(
+            r#"
+            local tax = 1
+            if tax > 0 then
+                tax = never_declared_anywhere
+            end
+            after_branch = tax
+            bare_read = never_declared_anywhere
+            "#,
+        );
+
+        assert_eq!(
+            ws.expr_ty("after_branch"),
+            ws.ty("integer?"),
+            "an undefined global contributes nil, so the local stays integer?"
+        );
+        assert_eq!(ws.expr_ty("bare_read"), LuaType::Nil);
+    }
+}
+
+#[cfg(test)]
+mod default_value_idiom_is_walk_order_independent {
+    use crate::VirtualWorkspace;
+
+    /// `p = p or DEFAULT` must mean the same thing whichever file declared
+    /// `DEFAULT` first.
+    ///
+    /// `special_or_rule` used to answer `unknown | right` whenever the left arm
+    /// was `unknown`, which contradicted the general rule beneath it ("an
+    /// unresolved left operand has no enumerable truthy half, so it contributes
+    /// nothing"). Whether the left arm had resolved yet is a property of how far
+    /// the walk had run, so the same source read `integer` when the constant's
+    /// file came first and `integer|unknown` when it came second — and a
+    /// re-index of a subset then disagreed with the build that produced it.
+    fn default_type_for_order(files: Vec<(&str, &str)>, probe: &str) -> crate::LuaType {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_files(files);
+        ws.expr_ty(probe)
+    }
+
+    const READER: &str = r#"
+        function SetData(dataType)
+            dataType = dataType or DATA_PLAYER
+            probe_result = dataType
+        end
+        "#;
+    const CONST_DEF: &str = "DATA_PLAYER = 2";
+
+    #[test]
+    fn constant_declared_after_the_reader() {
+        let ty = default_type_for_order(
+            vec![("a.lua", READER), ("b.lua", CONST_DEF)],
+            "probe_result",
+        );
+        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+    }
+
+    #[test]
+    fn constant_declared_before_the_reader() {
+        let ty = default_type_for_order(
+            vec![("a.lua", CONST_DEF), ("b.lua", READER)],
+            "probe_result",
+        );
+        assert_eq!(ty, crate::LuaType::Integer, "got: {ty:?}");
+    }
+}

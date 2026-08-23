@@ -33,6 +33,15 @@ pub async fn on_folding_range_handler(
         return None;
     }
     let uri = params.text_document.uri;
+
+    // Tree-offset answer: needs the latest document version, not a fresh index.
+    if !context
+        .wait_until_latest_document_version_applied(&uri, &cancel_token)
+        .await
+    {
+        return None;
+    }
+
     let client_id = context
         .read_workspace_manager(&cancel_token)
         .await?

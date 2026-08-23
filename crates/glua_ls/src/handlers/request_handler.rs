@@ -107,6 +107,8 @@ fn content_modified(id: lsp_server::RequestId) -> Option<Response> {
 macro_rules! dispatch_request {
     ($request:expr, $context:expr, {
         $($req_type:ty => $handler:expr),* $(,)?
+    }, wait_for_fresh_index: {
+        $($fresh_req_type:ty => $fresh_handler:expr),* $(,)?
     }, content_modified_if_client_retries: {
         $($retry_req_type:ty => $retry_handler:expr),* $(,)?
     }) => {
@@ -125,40 +127,119 @@ macro_rules! dispatch_request {
                 }
             )*
             $(
+                <$fresh_req_type>::METHOD => {
+                    if let Ok((id, params)) = $request.extract::<<$fresh_req_type as LspRequest>::Params>(<$fresh_req_type>::METHOD) {
+                        let snapshot = $context.snapshot();
+                        let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
+                        $context.task(id.clone(), task_metadata, |cancel_token| async move {
+                            // Symbol resolution against a stale index silently
+                            // returns empty; wait for the reindex. A request
+                            // aimed at one file only needs that file's own
+                            // entries to match its text, so it waits for those
+                            // rather than for the edit's whole dependency
+                            // ripple — seconds apart on a large gamemode.
+                            // The handoff is held across the handler so the
+                            // ripple waits for this request to take its read
+                            // lock rather than putting it behind the ripple it
+                            // was just released from.
+                            let (fresh, _handoff) = match target_uri.as_ref() {
+                                Some(uri) => {
+                                    let debounced = snapshot.debounced_analysis_arc();
+                                    let handoff = debounced.begin_reader_handoff();
+                                    let fresh = debounced
+                                        .wait_until_file_fresh_for(
+                                            &cancel_token,
+                                            <$fresh_req_type>::METHOD,
+                                            uri,
+                                        )
+                                        .await;
+                                    (fresh, Some(handoff))
+                                }
+                                None => {
+                                    let fresh = snapshot
+                                        .debounced_analysis()
+                                        .wait_until_fresh_for(
+                                            &cancel_token,
+                                            <$fresh_req_type>::METHOD,
+                                        )
+                                        .await;
+                                    (fresh, None)
+                                }
+                            };
+                            if !fresh {
+                                return None;
+                            }
+                            let result = $fresh_handler(snapshot, params, cancel_token).await;
+                            Some(Response::new_ok(id, result))
+                        }).await;
+                        return Ok(());
+                    }
+                }
+            )*
+            $(
                 <$retry_req_type>::METHOD => {
                     if let Ok((id, params)) = $request.extract::<<$retry_req_type as LspRequest>::Params>(<$retry_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$retry_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // ContentModified is only useful to a client that
-                            // re-sends afterwards. Anyone else reads it as "no
-                            // result" and clears the feature, so they get
-                            // whatever can be computed from the current state.
+                            let debounced = snapshot.debounced_analysis_arc();
+                            // Aimed at one document, so its own entries are what
+                            // it needs. Waiting on the workspace instead parks it
+                            // behind the whole dependency ripple, and refuses it
+                            // outright while any other file is mid-edit.
+                            let _handoff = target_uri
+                                .as_ref()
+                                .map(|_| debounced.begin_reader_handoff());
+                            let stale = || async {
+                                match target_uri.as_ref() {
+                                    Some(uri) => !debounced.file_is_answerable(uri).await,
+                                    None => debounced.is_dirty(),
+                                }
+                            };
+
+                            // A client that doesn't retry ContentModified must
+                            // get a real result: wait for freshness instead.
                             if !snapshot
                                 .lsp_features()
                                 .retries_on_content_modified(<$retry_req_type>::METHOD)
                             {
+                                let fresh = match target_uri.as_ref() {
+                                    Some(uri) => {
+                                        debounced
+                                            .wait_until_file_fresh_for(
+                                                &cancel_token,
+                                                <$retry_req_type>::METHOD,
+                                                uri,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        debounced
+                                            .wait_until_fresh_for(
+                                                &cancel_token,
+                                                <$retry_req_type>::METHOD,
+                                            )
+                                            .await
+                                    }
+                                };
+                                if !fresh {
+                                    return None;
+                                }
                                 let result = $retry_handler(snapshot, params, cancel_token).await;
                                 return Some(Response::new_ok(id, result));
                             }
 
-                            // A pending reindex means the index still describes
-                            // the previous text, and unresolved symbols are
-                            // silently dropped from the result rather than
-                            // reported. Answering would repaint the file with a
-                            // near-empty result; the refresh after reindex
-                            // drives the corrective re-pull instead.
-                            if snapshot.debounced_analysis().is_dirty() {
+                            if stale().await {
                                 return content_modified(id);
                             }
 
                             let result =
                                 $retry_handler(snapshot.clone(), params, cancel_token).await;
 
-                            // An edit landed while we worked, so this result
-                            // describes neither the text the client asked
-                            // about nor the text it now holds.
-                            if snapshot.debounced_analysis().is_dirty() {
+                            // An edit landed while we worked.
+                            if stale().await {
                                 return content_modified(id);
                             }
 
@@ -186,47 +267,53 @@ pub async fn on_request_handler(
     server_context: &mut ServerContext,
 ) -> Result<(), Box<dyn Error + Sync + Send>> {
     dispatch_request!(req, server_context, {
-        HoverRequest => on_hover,
-        DocumentSymbolRequest => on_document_symbol,
+        // Must not resolve declarations/members/globals through the index —
+        // those need the `wait_for_fresh_index` arm.
         FoldingRangeRequest => on_folding_range_handler,
-        DocumentColor => on_document_color,
-        ColorPresentationRequest => on_document_color_presentation,
-        DocumentLinkRequest => on_document_link_handler,
-        DocumentLinkResolve => on_document_link_resolve_handler,
-        EmmyGutterRequest => on_emmy_gutter_handler,
-        EmmyGutterDetailRequest => on_emmy_gutter_detail_handler,
         EmmySyntaxTreeRequest => on_emmy_syntax_tree_handler,
-        EmmyAnnotatorRequest => on_emmy_annotator_handler,
         SelectionRangeRequest => on_document_selection_range_handle,
+        Formatting => on_formatting_handler,
+        RangeFormatting => on_range_formatting_handler,
+        OnTypeFormatting => on_type_formatting_handler,
+
+        // Reads the index but performs its own wait to control the cancel
+        // response.
+        EmmyAnnotatorRequest => on_emmy_annotator_handler,
+        CodeLensRequest => on_code_lens_handler,
+        InlayHintRequest => on_inlay_hint_handler,
+        DocumentDiagnosticRequest => on_pull_document_diagnostic,
+        WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
+    }, wait_for_fresh_index: {
         Completion => on_completion_handler,
         ResolveCompletionItem => on_completion_resolve_handler,
-        InlayHintResolveRequest => on_resolve_inlay_hint,
-        CodeLensRequest => on_code_lens_handler,
+        HoverRequest => on_hover,
+        GluaHoverExpandRequest => on_hover_expand_handler,
         GotoDefinition => on_goto_definition_handler,
         GotoImplementation => on_implementation_handler,
         References => on_references_handler,
         Rename => on_rename_handler,
         PrepareRenameRequest => on_prepare_rename_handler,
-        CodeLensResolve => on_resolve_code_lens_handler,
         SignatureHelpRequest => on_signature_helper_handler,
         DocumentHighlightRequest => on_document_highlight_handler,
-        ExecuteCommand => on_execute_command_handler,
+        DocumentSymbolRequest => on_document_symbol,
+        WorkspaceSymbolRequest => on_workspace_symbol_handler,
         CodeActionRequest => on_code_action_handler,
         InlineValueRequest => on_inline_values_handler,
-        WorkspaceSymbolRequest => on_workspace_symbol_handler,
-        GluaDocSearchRequest => on_doc_search_handler,
-        GluaHoverExpandRequest => on_hover_expand_handler,
-        GmodScriptedClassesRequest => on_gmod_scripted_classes_handler,
-        GmodScriptedClassesV2Request => on_gmod_scripted_classes_v2_handler,
-        InlayHintRequest => on_inlay_hint_handler,
-        Formatting => on_formatting_handler,
-        RangeFormatting => on_range_formatting_handler,
-        OnTypeFormatting => on_type_formatting_handler,
+        DocumentColor => on_document_color,
+        ColorPresentationRequest => on_document_color_presentation,
+        DocumentLinkRequest => on_document_link_handler,
+        DocumentLinkResolve => on_document_link_resolve_handler,
+        CodeLensResolve => on_resolve_code_lens_handler,
+        InlayHintResolveRequest => on_resolve_inlay_hint,
+        EmmyGutterRequest => on_emmy_gutter_handler,
+        EmmyGutterDetailRequest => on_emmy_gutter_detail_handler,
         CallHierarchyPrepare => on_prepare_call_hierarchy_handler,
         CallHierarchyIncomingCalls => on_incoming_calls_handler,
         CallHierarchyOutgoingCalls => on_outgoing_calls_handler,
-        DocumentDiagnosticRequest => on_pull_document_diagnostic,
-        WorkspaceDiagnosticRequest => on_pull_workspace_diagnostic,
+        GluaDocSearchRequest => on_doc_search_handler,
+        GmodScriptedClassesRequest => on_gmod_scripted_classes_handler,
+        GmodScriptedClassesV2Request => on_gmod_scripted_classes_v2_handler,
+        ExecuteCommand => on_execute_command_handler,
     }, content_modified_if_client_retries: {
         SemanticTokensFullRequest => on_semantic_token_handler,
     });
@@ -238,6 +325,7 @@ pub async fn on_request_handler(
 mod tests {
     use super::extract_uri_from_value;
     use glua_code_analysis::LuaDeclId;
+    use googletest::prelude::*;
     use rowan::TextSize;
     use serde_json::json;
     use std::str::FromStr;
@@ -248,6 +336,62 @@ mod tests {
         code_lens::{CodeLensData, CodeLensResolveData},
         completion::{CompletionData, CompletionDataType},
     };
+
+    #[gtest]
+    fn fresh_index_requests_do_not_answer_until_analysis_settles() -> Result<()> {
+        use super::{Completion, LspRequest, on_request_handler};
+        use crate::context::ServerContext;
+        use lsp_server::{Connection, Message};
+        use lsp_types::ClientCapabilities;
+        use std::time::Duration;
+
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (server_connection, peer) = Connection::memory();
+
+        runtime.block_on(async {
+            let mut context = ServerContext::new(server_connection, ClientCapabilities::default());
+            let snapshot = context.snapshot();
+            let debounced_analysis = snapshot.debounced_analysis_arc();
+
+            // Mark analysis dirty exactly as a didChange does, before the
+            // request arrives.
+            let in_flight = debounced_analysis.begin_in_flight_change();
+
+            let request = lsp_server::Request::new(
+                1.into(),
+                Completion::METHOD.to_string(),
+                json!({
+                    "textDocument": { "uri": "file:///test.lua" },
+                    "position": { "line": 0, "character": 0 }
+                }),
+            );
+            on_request_handler(request, &mut context)
+                .await
+                .expect("dispatch should succeed");
+
+            // Wait for the condition, not for a deadline: once the handler is
+            // inside the freshness wait it cannot leave while the change is
+            // in flight, so an empty channel here is not a race.
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while debounced_analysis.freshness_wait_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the handler should reach the freshness wait");
+            verify_that!(peer.receiver.try_recv().is_err(), eq(true))?;
+
+            // Settling the change releases the wait.
+            in_flight.finish().await;
+
+            let message = peer
+                .receiver
+                .recv_timeout(Duration::from_secs(5))
+                .expect("a response must arrive once analysis is fresh");
+            verify_that!(matches!(message, Message::Response(_)), eq(true))?;
+            Ok(())
+        })
+    }
 
     #[test]
     fn extracts_text_document_uri() {

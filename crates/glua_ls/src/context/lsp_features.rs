@@ -24,6 +24,24 @@ impl LspFeatures {
         false
     }
 
+    /// Gates `window/workDoneProgress/create` and its `$/progress` traffic.
+    pub fn supports_work_done_progress(&self) -> bool {
+        self.client_capabilities
+            .window
+            .as_ref()
+            .and_then(|window| window.work_done_progress)
+            .unwrap_or(false)
+    }
+
+    /// Gates `workspace/applyEdit`.
+    pub fn supports_apply_edit(&self) -> bool {
+        self.client_capabilities
+            .workspace
+            .as_ref()
+            .and_then(|workspace| workspace.apply_edit)
+            .unwrap_or(false)
+    }
+
     pub fn supports_config_request(&self) -> bool {
         if let Some(workspace) = &self.client_capabilities.workspace {
             if let Some(supports) = workspace.configuration {

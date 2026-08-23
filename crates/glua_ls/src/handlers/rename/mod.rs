@@ -43,7 +43,14 @@ pub async fn on_prepare_rename_handler(
     let uri = params.text_document.uri;
     let analysis = context.read_analysis(&cancel_token).await?;
     let file_id = analysis.get_file_id(&uri)?;
-    let position = params.position;
+    prepare_rename(&analysis, file_id, params.position)
+}
+
+pub fn prepare_rename(
+    analysis: &glua_code_analysis::EmmyLuaAnalysis,
+    file_id: glua_code_analysis::FileId,
+    position: lsp_types::Position,
+) -> Option<PrepareRenameResponse> {
     let semantic_model = analysis.compilation.get_semantic_model(file_id)?;
     let root = semantic_model.get_root();
     let document = semantic_model.get_document();
@@ -73,6 +80,11 @@ pub async fn on_prepare_rename_handler(
         token.kind().into(),
         LuaTokenKind::TkName | LuaTokenKind::TkInt | LuaTokenKind::TkString
     ) {
+        // The rename handler refuses these, so offering them would only give
+        // the user a rename box whose edit never arrives.
+        if token_is_unrenameable(&semantic_model, &token) {
+            return None;
+        }
         let range = document.to_lsp_range(token.text_range())?;
         let placeholder = token.text().to_string();
         Some(PrepareRenameResponse::RangeWithPlaceholder { range, placeholder })
@@ -115,6 +127,36 @@ pub fn rename(
     rename_references(&semantic_model, &analysis.compilation, token, new_name)
 }
 
+fn find_rename_target(
+    semantic_model: &SemanticModel,
+    token: &LuaSyntaxToken,
+) -> Option<LuaSemanticDeclId> {
+    match get_target_node(token.clone()) {
+        Some(node) => semantic_model.find_decl(node.into(), SemanticDeclLevel::NoTrace),
+        None => semantic_model.find_decl(token.clone().into(), SemanticDeclLevel::NoTrace),
+    }
+}
+
+/// A colon method's `self` is implicit: there is no declaration to carry the
+/// new name, so the edit would only break the code. A written `self` — an
+/// explicit parameter, or a `local self = self` capture — has one and renames
+/// normally.
+fn is_unrenameable(semantic_model: &SemanticModel, semantic_decl: &LuaSemanticDeclId) -> bool {
+    let LuaSemanticDeclId::LuaDecl(decl_id) = semantic_decl else {
+        return false;
+    };
+
+    match semantic_model.get_db().get_decl_index().get_decl(decl_id) {
+        Some(decl) => decl.is_implicit_self(),
+        None => true,
+    }
+}
+
+fn token_is_unrenameable(semantic_model: &SemanticModel, token: &LuaSyntaxToken) -> bool {
+    find_rename_target(semantic_model, token)
+        .is_some_and(|semantic_decl| is_unrenameable(semantic_model, &semantic_decl))
+}
+
 #[allow(clippy::mutable_key_type)]
 fn rename_references(
     semantic_model: &SemanticModel,
@@ -123,10 +165,10 @@ fn rename_references(
     new_name: String,
 ) -> Option<WorkspaceEdit> {
     let mut result = HashMap::new();
-    let semantic_decl = match get_target_node(token.clone()) {
-        Some(node) => semantic_model.find_decl(node.into(), SemanticDeclLevel::NoTrace),
-        None => semantic_model.find_decl(token.into(), SemanticDeclLevel::NoTrace),
-    }?;
+    let semantic_decl = find_rename_target(semantic_model, &token)?;
+    if is_unrenameable(semantic_model, &semantic_decl) {
+        return None;
+    }
 
     match semantic_decl {
         LuaSemanticDeclId::LuaDecl(decl_id) => {

@@ -22,10 +22,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::db_index::DbIndex;
 use crate::{FileId, profile::Profile};
 
+/// Below this many files, `thread::scope` spawn/join and atomic dispatch cost
+/// more than the per-file work itself saves, so the batch runs inline. Picked
+/// from the profiled cost of one pass over a handful of small files versus
+/// spawning/parking a worker pool for it.
+const MIN_PARALLEL_FILES: usize = 8;
+
 /// Number of worker threads to use for per-file analysis passes. Capped at 16 to
 /// match the diagnostics path and avoid oversubscription on large machines.
 fn worker_count(file_count: usize) -> usize {
-    if file_count <= 1 {
+    if file_count < MIN_PARALLEL_FILES {
         return 1;
     }
     let cores = std::thread::available_parallelism()
@@ -67,6 +73,11 @@ where
     // are claimed changes; each still holds its own file's result, so callers
     // see the same index-aligned `Vec` as before.
     let dispatch = dispatch_order(db, file_ids);
+    let report_step = if crate::progress::is_active() {
+        (n / 50).max(1)
+    } else {
+        0
+    };
 
     std::thread::scope(|scope| {
         for _ in 0..workers {
@@ -79,6 +90,9 @@ where
                     let seq = next.fetch_add(1, Ordering::Relaxed);
                     if seq >= n {
                         break;
+                    }
+                    if report_step != 0 && seq.is_multiple_of(report_step) {
+                        crate::progress::advance_current_phase(seq, n, "files");
                     }
                     let idx = dispatch[seq];
                     let file_id = file_ids[idx];

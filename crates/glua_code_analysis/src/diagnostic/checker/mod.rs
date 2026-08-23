@@ -31,6 +31,7 @@ mod local_const_reassign;
 mod missing_fields;
 mod need_check_nil;
 mod param_type_check;
+mod property_name_candidates;
 mod readonly_check;
 mod redefined_local;
 mod require_module_visibility;
@@ -80,6 +81,9 @@ pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
 pub use param_type_check::{PrecomputedParamTypeCandidates, precompute_param_type_candidates};
+pub use property_name_candidates::{
+    PrecomputedPropertyNameCandidates, precompute_property_name_candidates,
+};
 
 pub type PrecomputedMissingRequiredFields = HashMap<LuaTypeDeclId, Arc<HashSet<String>>>;
 pub type AssignmentPrefixKey = (TextSize, TextSize, String);
@@ -97,6 +101,18 @@ pub trait Checker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel);
 }
 
+/// The path a checker is running against, for log lines that would otherwise
+/// carry only a `FileId`.
+fn checker_file_label(context: &DiagnosticContext, semantic_model: &SemanticModel) -> String {
+    let file_id = context.get_file_id();
+    semantic_model
+        .get_db()
+        .get_vfs()
+        .get_file_path(&file_id)
+        .map(|path| path.to_string_lossy().to_string())
+        .unwrap_or_else(|| format!("{file_id:?}"))
+}
+
 fn run_check<T: Checker>(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -110,6 +126,15 @@ fn run_check<T: Checker>(
         .iter()
         .any(|code| context.is_checker_enable_by_code(code))
     {
+        // Named on entry: `checker slow` only reports on completion.
+        if log::log_enabled!(log::Level::Trace) {
+            log::trace!(
+                "checker start: {} for {}",
+                std::any::type_name::<T>(),
+                checker_file_label(context, semantic_model)
+            );
+        }
+
         if !log::log_enabled!(log::Level::Info) {
             T::check(context, semantic_model);
             return;
@@ -124,12 +149,13 @@ fn run_check<T: Checker>(
                 .map(|c| c.get_name())
                 .collect::<Vec<_>>()
                 .join(",");
+            let path = checker_file_label(context, semantic_model);
             log::info!(
-                "checker slow: {}({}) cost {:?} for {:?}",
+                "checker slow: {}({}) cost {:?} for {}",
                 std::any::type_name::<T>(),
                 name,
                 elapsed,
-                context.get_file_id()
+                path
             );
         }
     }
@@ -268,6 +294,8 @@ pub struct SharedDiagnosticData {
     pub param_type_candidates: Arc<PrecomputedParamTypeCandidates>,
     /// Static callee names whose signatures are marked @nodiscard.
     pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
+    /// Names the deprecated, readonly and visibility checkers could report on.
+    pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
     /// Precomputed declaration annotation realms for all workspace files.
     /// Avoids re-scanning syntax trees for @realm annotations per file.
     pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,

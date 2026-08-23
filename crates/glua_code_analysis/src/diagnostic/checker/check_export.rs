@@ -348,7 +348,7 @@ fn module_source_declares_exported_key(
                     };
 
                     local_assigned_keys
-                        .entry(prefix_name_text)
+                        .entry(prefix_name_text.to_string())
                         .or_default()
                         .insert(index_key.get_path_part());
                 }
@@ -374,7 +374,7 @@ fn module_source_declares_exported_key(
                 };
 
                 local_assigned_keys
-                    .entry(prefix_name_text)
+                    .entry(prefix_name_text.to_string())
                     .or_default()
                     .insert(index_key.get_path_part());
             }
@@ -384,10 +384,10 @@ fn module_source_declares_exported_key(
 
     if !exported_local_names.is_empty() {
         for name in exported_local_names {
-            if let Some(keys) = local_table_init_keys.get(&name) {
+            if let Some(keys) = local_table_init_keys.get(name.as_str()) {
                 exported_keys.extend(keys.iter().cloned());
             }
-            if let Some(keys) = local_assigned_keys.get(&name) {
+            if let Some(keys) = local_assigned_keys.get(name.as_str()) {
                 exported_keys.extend(keys.iter().cloned());
             }
         }

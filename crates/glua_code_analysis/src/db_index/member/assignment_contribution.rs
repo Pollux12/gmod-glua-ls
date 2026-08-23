@@ -76,6 +76,27 @@ impl MemberAssignmentContributionStore {
         self.by_owner_key.get(store_key)
     }
 
+    /// The contribution this member recorded, wherever its writer group
+    /// currently sits.
+    pub fn contribution_of(
+        &self,
+        member_id: &LuaMemberId,
+    ) -> Option<&MemberAssignmentContribution> {
+        let store_key = self.by_file.get(&member_id.file_id)?.get(member_id)?;
+        self.by_owner_key.get(store_key)?.get(member_id)
+    }
+
+    /// The `(owner, key)` group this member's write currently contributes to.
+    pub fn contribution_group_of(
+        &self,
+        member_id: &LuaMemberId,
+    ) -> Option<(LuaMemberOwner, LuaMemberKey)> {
+        self.by_file
+            .get(&member_id.file_id)?
+            .get(member_id)
+            .cloned()
+    }
+
     /// The distinct groups the given files wrote to.
     pub fn keys_for_files(
         &self,

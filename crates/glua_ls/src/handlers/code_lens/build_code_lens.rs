@@ -348,7 +348,7 @@ fn add_net_call_code_lens(
         return Some(());
     }
     let kind_label = match kind {
-        NetCodeLensCallKind::Define => call_path.clone(),
+        NetCodeLensCallKind::Define => call_path.to_string(),
         NetCodeLensCallKind::Start => {
             resolve_start_kind_label(semantic_model, &call_expr, &call_path, message_arg_idx)
         }

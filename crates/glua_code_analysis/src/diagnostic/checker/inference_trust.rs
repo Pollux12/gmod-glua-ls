@@ -1,8 +1,14 @@
+use glua_parser::{LuaAstNode, LuaIndexExpr, LuaIndexKey, LuaSyntaxId};
+
 use crate::{
-    DiagnosticCode, LuaInferenceProvenanceKind, RenderLevel, SemanticModel, humanize_type,
+    DiagnosticCode, FileId, InFiled, LuaInferenceProvenanceKind, LuaType, RenderLevel,
+    SemanticModel, humanize_type,
 };
 
 use super::{Checker, DiagnosticContext};
+
+/// A tie lists this many candidate children before it falls back to a count.
+const MAX_LISTED_CHILDREN: usize = 3;
 
 pub struct InferenceTrustChecker;
 
@@ -53,12 +59,15 @@ impl Checker for InferenceTrustChecker {
                         .and_then(|step| step.found_type.as_deref())
                         .map_or_else(
                             || "unknown".to_string(),
-                            |typ| {
-                                humanize_type(semantic_model.get_db(), typ, RenderLevel::Simple)
-                            },
+                            |typ| humanize_type(semantic_model.get_db(), typ, RenderLevel::Simple),
                         );
-                    format!(
-                        "expected `{typ}` but found `{found}`. Add a guard to narrow the parent to `{typ}`."
+                    unguarded_child_message(
+                        semantic_model,
+                        context.get_file_id(),
+                        &inference.event.source,
+                        inferred_type,
+                        &typ,
+                        &found,
                     )
                 } else {
                     format!("Type `{typ}` was inferred from usage context and may be incorrect.")
@@ -66,5 +75,67 @@ impl Checker for InferenceTrustChecker {
                 None,
             );
         }
+    }
+}
+
+/// A single winning child can be written into a guard, so it is named directly.
+/// A tie cannot: its union is not a type the user can narrow to, so the message
+/// names the member that drove the inference and the children that define it.
+fn unguarded_child_message(
+    semantic_model: &SemanticModel,
+    file_id: FileId,
+    source: &InFiled<LuaSyntaxId>,
+    inferred_type: &LuaType,
+    inferred_text: &str,
+    found: &str,
+) -> String {
+    let LuaType::Union(union) = inferred_type else {
+        return format!(
+            "expected `{inferred_text}` but found `{found}`. Add a guard to narrow the parent to `{inferred_text}`."
+        );
+    };
+    // A union orders its arms by a content hash, so the names are sorted before
+    // the cap decides which of them the message keeps.
+    let mut children = union
+        .types()
+        .map(|child| humanize_type(semantic_model.get_db(), child, RenderLevel::Simple))
+        .collect::<Vec<_>>();
+    children.sort();
+    let listed = children
+        .iter()
+        .take(MAX_LISTED_CHILDREN)
+        .map(|child| format!("`{child}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = children.len().saturating_sub(MAX_LISTED_CHILDREN);
+    let candidates = if remaining == 0 {
+        listed
+    } else {
+        format!("{listed} and {remaining} more")
+    };
+    match used_member_name(semantic_model, file_id, source) {
+        Some(member) => format!(
+            "`{member}` is not defined on `{found}`. Add a guard that narrows the parent to one of {candidates}."
+        ),
+        None => format!(
+            "this member is not defined on `{found}`. Add a guard that narrows the parent to one of {candidates}."
+        ),
+    }
+}
+
+fn used_member_name(
+    semantic_model: &SemanticModel,
+    file_id: FileId,
+    source: &InFiled<LuaSyntaxId>,
+) -> Option<String> {
+    if source.file_id != file_id {
+        return None;
+    }
+    let root = semantic_model.get_root().syntax().clone();
+    let index_expr = LuaIndexExpr::cast(source.value.to_node_from_root(&root)?)?;
+    match index_expr.get_index_key()? {
+        LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+        LuaIndexKey::String(string) => Some(string.get_value().to_string()),
+        _ => None,
     }
 }

@@ -18,6 +18,11 @@ include = [
 [lib]
 doctest = false
 
+[features]
+# Cross-checks the type-cache reverse index against a full scan on every query.
+# Off by default: it makes incremental expansion quadratic again.
+verify_type_cache_refs = []
+
 [dev-dependencies]
 googletest.workspace = true
 

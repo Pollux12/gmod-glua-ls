@@ -210,7 +210,7 @@ fn add_direct_special_call_var_expr(
             }
             matcher
                 .access_paths
-                .entry(access_path)
+                .entry(access_path.to_string())
                 .or_default()
                 .push(binding);
         }
@@ -1468,9 +1468,9 @@ fn extract_literal_or_name(expr: &LuaExpr) -> Option<GmodClassCallLiteral> {
             LuaLiteralToken::Nil(_) => Some(GmodClassCallLiteral::Nil),
             _ => None,
         },
-        LuaExpr::NameExpr(name_expr) => {
-            name_expr.get_name_text().map(GmodClassCallLiteral::NameRef)
-        }
+        LuaExpr::NameExpr(name_expr) => name_expr
+            .get_name_text()
+            .map(|name| GmodClassCallLiteral::NameRef(name.to_string())),
         _ => None,
     }
 }

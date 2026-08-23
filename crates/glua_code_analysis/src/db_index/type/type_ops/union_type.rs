@@ -1,5 +1,6 @@
 use std::ops::Deref;
 
+use crate::db_index::r#type::types::lua_type_sort_key;
 use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
 
 // Union member *order* is preserved here, but the member *set* is
@@ -44,11 +45,92 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
         return LuaType::from_vec_structural(types);
     }
 
-    let mut result = LuaType::Never;
-    for typ in types {
-        result = union_type_shallow(&result, &typ);
+    if visiting_order_is_observable(&types) {
+        return types.into_iter().fold(LuaType::Never, |result, typ| {
+            union_type_shallow(&result, &typ)
+        });
     }
-    result
+    union_all_absorbed(types)
+}
+
+/// `union_type_all`'s fold without the per-step canonicalisation.
+///
+/// The pairwise fold rebuilds, de-duplicates and re-sorts the whole accumulated
+/// union on every step, so joining n members costs O(n² log n) — and GMod
+/// workspaces routinely produce unions with thousands of members (a `pairs()`
+/// key type over a large config table, for one). Absorbing into a single member
+/// list and canonicalising once gives the same answer for the same reason
+/// `from_vec_structural` is safe to call last: the intermediate sorting cannot
+/// change which members survive, only the order they are visited in, and the
+/// final order comes from that last call either way.
+///
+/// Only valid where that visiting order is not observable, which
+/// [`visiting_order_is_observable`] decides for the caller.
+fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
+    let mut members: Vec<LuaType> = Vec::with_capacity(types.len());
+    for typ in types {
+        match typ {
+            // `never` is absorbed by any sibling, so it only survives when it is
+            // all there is — and then the answer is `never`, not the empty union
+            // `from_vec_structural` would turn into `nil`.
+            LuaType::Never => {}
+            LuaType::Union(union) => {
+                for member in union.into_vec() {
+                    if !matches!(member, LuaType::Never) {
+                        absorb(&mut members, member);
+                    }
+                }
+            }
+            other => absorb(&mut members, other),
+        }
+    }
+
+    if members.is_empty() {
+        return LuaType::Never;
+    }
+    LuaType::from_vec_structural(members)
+}
+
+/// Whether the order `union_type_all` visits members in can change its answer.
+///
+/// A `MultiLineUnion` always matters: it matches an incoming literal against its
+/// own arms rather than going through the absorption rules, so which side of the
+/// join it lands on decides the result.
+///
+/// Otherwise the two paths can only disagree about member *order*, and only
+/// when both of these hold. Sorting settles it if every member is
+/// order-insensitive, since the final `from_vec_structural` orders them anyway.
+/// And splicing only happens for a nested union: the pairwise rule joining a
+/// plain accumulator to a union puts that union's members *first* and the
+/// accumulator last, where absorbing in sequence keeps the accumulator first.
+/// With no nested union to splice, the two visit members identically.
+fn visiting_order_is_observable(types: &[LuaType]) -> bool {
+    fn is_multi_line_union(typ: &LuaType) -> bool {
+        matches!(typ, LuaType::MultiLineUnion(_))
+    }
+
+    let union_members = |typ: &LuaType, predicate: &dyn Fn(&LuaType) -> bool| match typ {
+        LuaType::Union(union) => match union.as_ref() {
+            LuaUnionType::Nullable(inner) => predicate(inner),
+            LuaUnionType::Multi(members) => members.iter().any(predicate),
+        },
+        other => predicate(other),
+    };
+
+    if types
+        .iter()
+        .any(|typ| union_members(typ, &is_multi_line_union))
+    {
+        return true;
+    }
+
+    let order_sensitive = types.iter().any(|typ| {
+        union_members(typ, &|member| {
+            !LuaUnionType::is_order_insensitive_member(member)
+        })
+    });
+
+    order_sensitive && types.iter().any(LuaType::is_union)
 }
 
 /// Whether `LuaType::from_vec_structural` alone matches the pairwise fold.
@@ -132,6 +214,9 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
         }
         // union
         (LuaType::Union(left), right) if !right.is_union() => {
+            if let Some(merged) = union_sorted_insert(left, source, right) {
+                return merged;
+            }
             let mut members = left.deref().clone().into_vec();
             absorb(&mut members, right.clone());
             LuaType::from_vec_structural(members)
@@ -247,4 +332,242 @@ fn absorb(members: &mut Vec<LuaType>, ty: LuaType) {
 
 fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::Nullable(LuaType::Any).into())
+}
+
+/// Adding one member to an already-canonical union, without rebuilding it.
+///
+/// The general arm clones every member, rescans them all for something to
+/// collapse with (its last rule is a full structural equality), then
+/// de-duplicates through a hash set and re-sorts — and the sort key hashes a
+/// type's *name*. That is O(n log n) with an expensive constant, paid for every
+/// `or` in a chain, and GMod workspaces build unions thousands of members wide:
+/// measured on a gamemode edit, this arm alone walked 12.5M members across 23k
+/// calls for a single keystroke.
+///
+/// `LuaUnionType::from_vec` leaves an order-insensitive union sorted by
+/// `lua_type_sort_key`, so for those the same answer is a binary search. Returns
+/// `None` whenever that shortcut cannot be justified, leaving the general arm to
+/// decide.
+fn union_sorted_insert(left: &LuaUnionType, source: &LuaType, right: &LuaType) -> Option<LuaType> {
+    let LuaUnionType::Multi(members) = left else {
+        // A `Nullable` is not stored in sort order.
+        return None;
+    };
+    // `any` and `never` have absorbing rules of their own, and a multi-line
+    // union matches by value rather than by these rules.
+    if matches!(
+        right,
+        LuaType::Never | LuaType::Any | LuaType::MultiLineUnion(_)
+    ) || !LuaUnionType::is_order_insensitive_member(right)
+    {
+        return None;
+    }
+    if !members.iter().all(|member| {
+        LuaUnionType::is_order_insensitive_member(member)
+            && !matches!(member, LuaType::Never | LuaType::MultiLineUnion(_))
+    }) {
+        return None;
+    }
+
+    // Anything `right` could collapse with sorts under a known discriminant, so
+    // its absence is a binary search rather than a scan. Finding one means a
+    // merge is due, which the general arm performs.
+    if collapse_partner_ordinals(right)
+        .iter()
+        .any(|ordinal| contains_ordinal(members, *ordinal))
+    {
+        return None;
+    }
+
+    let key = lua_type_sort_key(right);
+    match members.binary_search_by(|member| lua_type_sort_key(member).cmp(&key)) {
+        // Equal sort keys: usually the same member already present, leaving the
+        // union unchanged. Otherwise two types collided on the key and the
+        // general arm settles it.
+        Ok(hit) => {
+            let mut start = hit;
+            while start > 0 && lua_type_sort_key(&members[start - 1]) == key {
+                start -= 1;
+            }
+            members[start..]
+                .iter()
+                .take_while(|member| lua_type_sort_key(member) == key)
+                .any(|member| member == right)
+                .then(|| source.clone())
+        }
+        Err(at) => {
+            let mut inserted = Vec::with_capacity(members.len() + 1);
+            inserted.extend_from_slice(&members[..at]);
+            inserted.push(right.clone());
+            inserted.extend_from_slice(&members[at..]);
+            // Already at least three members, so `from_vec`'s nullable collapse
+            // cannot apply and this is the order it would have produced.
+            Some(LuaType::Union(LuaUnionType::Multi(inserted).into()))
+        }
+    }
+}
+
+/// The `lua_type_sort_key` discriminants of everything [`try_collapse`] would
+/// merge `typ` with, other than an equal member.
+fn collapse_partner_ordinals(typ: &LuaType) -> &'static [u8] {
+    match typ {
+        LuaType::IntegerConst(_) | LuaType::DocIntegerConst(_) => &[4, 7],
+        LuaType::FloatConst(_) => &[7],
+        LuaType::StringConst(_) | LuaType::DocStringConst(_) => &[9],
+        LuaType::BooleanConst(_) => &[1, 2],
+        LuaType::TableConst(_) => &[12],
+        LuaType::DocFunction(_) | LuaType::Signature(_) => &[16],
+        LuaType::Integer => &[5, 6, 7],
+        LuaType::Number => &[4, 5, 6, 8],
+        LuaType::String => &[10, 11],
+        LuaType::Boolean => &[2],
+        LuaType::Table => &[13],
+        LuaType::Function => &[17, 38],
+        _ => &[],
+    }
+}
+
+/// Whether a sorted member list holds any type with this sort discriminant.
+fn contains_ordinal(members: &[LuaType], ordinal: u8) -> bool {
+    let at = members.partition_point(|member| lua_type_sort_key(member).0 < ordinal);
+    members
+        .get(at)
+        .is_some_and(|member| lua_type_sort_key(member).0 == ordinal)
+}
+
+#[cfg(test)]
+mod union_shortcut_tests {
+    use super::*;
+    use crate::LuaTypeDeclId;
+    use internment::ArcIntern;
+    use smol_str::SmolStr;
+
+    /// The pairwise fold both shortcuts replace.
+    fn fold(types: Vec<LuaType>) -> LuaType {
+        types.into_iter().fold(LuaType::Never, |result, typ| {
+            union_type_shallow(&result, &typ)
+        })
+    }
+
+    fn sample(pick: u64) -> LuaType {
+        match pick % 16 {
+            0 => LuaType::Nil,
+            1 => LuaType::Boolean,
+            2 => LuaType::BooleanConst(pick % 32 < 16),
+            3 => LuaType::Integer,
+            4 => LuaType::IntegerConst((pick % 5) as i64),
+            5 => LuaType::Number,
+            6 => LuaType::FloatConst((pick % 3) as f64),
+            7 => LuaType::String,
+            8 => LuaType::StringConst(ArcIntern::new(SmolStr::new(match pick % 4 {
+                0 => "a",
+                1 => "b",
+                2 => "c",
+                _ => "d",
+            }))),
+            9 => LuaType::Table,
+            10 => LuaType::Function,
+            11 => LuaType::Userdata,
+            12 => LuaType::Thread,
+            13 => LuaType::Ref(LuaTypeDeclId::global(match pick % 3 {
+                0 => "Alpha",
+                1 => "Beta",
+                _ => "Gamma",
+            })),
+            14 => LuaType::Unknown,
+            _ => LuaType::Never,
+        }
+    }
+
+    fn rng(seed: u64) -> impl FnMut() -> u64 {
+        let mut state = seed;
+        move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        }
+    }
+
+    /// `union_all_absorbed` exists only to be a faster spelling of the fold, so
+    /// the thing worth testing is that it never disagrees with it — including
+    /// the collapses that cascade (`1 | 2 | integer`) and the merges that move a
+    /// member into an earlier slot.
+    #[test]
+    fn absorbing_in_one_pass_matches_the_pairwise_fold() {
+        let mut next = rng(0x2545_f491_4f6c_dd1d);
+        for _ in 0..2000 {
+            let count = (next() % 10) as usize + 1;
+            let types = (0..count).map(|_| sample(next())).collect::<Vec<_>>();
+            if visiting_order_is_observable(&types) {
+                continue;
+            }
+            assert_eq!(
+                union_all_absorbed(types.clone()),
+                fold(types.clone()),
+                "absorbed and folded unions disagree for {types:?}"
+            );
+        }
+    }
+
+    /// Likewise the sorted insert: it has to decline the collapses (a literal
+    /// meeting its primitive), spot the duplicates, and reproduce the ordering.
+    #[test]
+    fn sorted_insert_matches_rebuilding_the_union() {
+        let mut next = rng(0x9e37_79b9_7f4a_7c15);
+        let mut exercised = 0;
+        for _ in 0..4000 {
+            let count = (next() % 8) as usize + 2;
+            let members = (0..count).map(|_| sample(next())).collect::<Vec<_>>();
+            let LuaType::Union(union) = LuaType::from_vec_structural(members) else {
+                continue;
+            };
+            let incoming = sample(next());
+            let source = LuaType::Union(union.clone());
+
+            let general = {
+                let mut rebuilt = union.deref().clone().into_vec();
+                absorb(&mut rebuilt, incoming.clone());
+                LuaType::from_vec_structural(rebuilt)
+            };
+            if let Some(fast) = union_sorted_insert(&union, &source, &incoming) {
+                exercised += 1;
+                assert_eq!(
+                    fast, general,
+                    "sorted insert disagreed for {union:?} | {incoming:?}"
+                );
+            }
+        }
+        assert!(
+            exercised > 100,
+            "fixture never exercised the fast path ({exercised} hits)"
+        );
+    }
+
+    #[test]
+    fn a_primitive_absorbs_every_literal_of_its_family_at_once() {
+        let types = vec![
+            LuaType::IntegerConst(1),
+            LuaType::IntegerConst(2),
+            LuaType::IntegerConst(3),
+            LuaType::Integer,
+        ];
+        assert_eq!(union_all_absorbed(types.clone()), fold(types));
+    }
+
+    #[test]
+    fn two_different_boolean_literals_collapse_to_boolean() {
+        let types = vec![LuaType::BooleanConst(true), LuaType::BooleanConst(false)];
+        assert_eq!(union_all_absorbed(types.clone()), fold(types));
+    }
+
+    #[test]
+    fn distinct_class_references_are_not_confused_by_sharing_a_variant() {
+        let types = vec![
+            LuaType::Ref(LuaTypeDeclId::global("Alpha")),
+            LuaType::Ref(LuaTypeDeclId::global("Beta")),
+            LuaType::Ref(LuaTypeDeclId::global("Alpha")),
+        ];
+        assert_eq!(union_all_absorbed(types.clone()), fold(types));
+    }
 }

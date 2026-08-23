@@ -100,7 +100,7 @@ fn collect_local_alias(
                 };
 
                 local_alias_set.insert(
-                    access_path,
+                    access_path.to_string(),
                     preferred_name.to_string(),
                     semantic_id,
                     ref_var,

@@ -11,6 +11,11 @@ pub struct LuaOwnerMembers {
     // invalidation surface: `add_member`, `get_member_mut`, `iter_mut`, and
     // `remove_member`.
     sorted_ids_cache: OnceLock<Vec<LuaMemberId>>,
+    /// The subset of `members` keyed by an expression rather than a name.
+    ///
+    /// Only `add_member` and `remove_member` change the key set; the mutators
+    /// that hand out an item leave keys alone.
+    expr_keys: Vec<LuaMemberKey>,
     resolve_state: OwnerMemberStatus,
 }
 
@@ -20,13 +25,21 @@ impl LuaOwnerMembers {
         Self {
             members: HashMap::new(),
             sorted_ids_cache: OnceLock::new(),
+            expr_keys: Vec::new(),
             resolve_state: OwnerMemberStatus::UnResolved,
         }
     }
 
     pub fn add_member(&mut self, key: LuaMemberKey, item: LuaMemberIndexItem) {
         self.invalidate_sorted_member_ids();
+        if key.is_expr() && !self.members.contains_key(&key) {
+            self.expr_keys.push(key.clone());
+        }
         self.members.insert(key, item);
+    }
+
+    pub fn expr_keys(&self) -> impl Iterator<Item = &LuaMemberKey> {
+        self.expr_keys.iter()
     }
 
     pub fn get_member(&self, key: &LuaMemberKey) -> Option<&LuaMemberIndexItem> {
@@ -75,6 +88,9 @@ impl LuaOwnerMembers {
 
     pub fn remove_member(&mut self, key: &LuaMemberKey) -> Option<LuaMemberIndexItem> {
         self.invalidate_sorted_member_ids();
+        if key.is_expr() {
+            self.expr_keys.retain(|expr_key| expr_key != key);
+        }
         self.members.remove(key)
     }
 

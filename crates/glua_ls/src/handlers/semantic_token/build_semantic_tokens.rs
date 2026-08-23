@@ -268,6 +268,8 @@ fn build_tokens_semantic_token(
         | LuaTokenKind::TkTagUsing
         | LuaTokenKind::TkTagSource
         | LuaTokenKind::TkTagRealm
+        | LuaTokenKind::TkTagFileparam
+        | LuaTokenKind::TkTagOutparam
         | LuaTokenKind::TkTagReturnCast
         | LuaTokenKind::TkTagExport
         | LuaTokenKind::TkLanguage
@@ -489,6 +491,18 @@ fn build_node_semantic_token(
                 builder.push_with_modifiers(
                     realm.syntax(),
                     SemanticTokenType::ENUM_MEMBER,
+                    &[
+                        SemanticTokenModifier::DECLARATION,
+                        SemanticTokenModifier::DOCUMENTATION,
+                    ],
+                );
+            }
+        }
+        LuaAst::LuaDocTagOutparam(doc_outparam) => {
+            if let Some(path) = doc_outparam.get_path_token() {
+                builder.push_with_modifiers(
+                    path.syntax(),
+                    SemanticTokenType::PARAMETER,
                     &[
                         SemanticTokenModifier::DECLARATION,
                         SemanticTokenModifier::DOCUMENTATION,
@@ -2117,7 +2131,7 @@ fn inferred_alias_target_token_type(
     }
 }
 
-fn expr_access_path(value_expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(value_expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match value_expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),

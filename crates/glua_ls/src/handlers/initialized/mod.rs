@@ -15,7 +15,7 @@ use crate::{
     },
     handlers::text_document::register_files_watch,
     logger::init_logger,
-    util::{LongRunningWatchdogStatus, spawn_long_running_watchdog},
+    util::{AnalysisProgressReporter, LongRunningWatchdogStatus, spawn_long_running_watchdog},
 };
 pub use client_config::{ClientConfig, get_client_config};
 use codestyle::load_editorconfig;
@@ -191,6 +191,11 @@ pub async fn initialized_handler(
         workspace_diagnostic_configs,
         workspace_emmyrcs,
         watchdog_status.clone(),
+        context
+            .workspace_manager()
+            .read()
+            .await
+            .workspace_diagnostic_level_arc(),
     )
     .await;
 
@@ -211,6 +216,7 @@ pub async fn init_analysis(
     workspace_diagnostic_configs: HashMap<PathBuf, LuaDiagnosticConfig>,
     workspace_emmyrcs: HashMap<PathBuf, Arc<Emmyrc>>,
     watchdog_status: LongRunningWatchdogStatus,
+    workspace_diagnostic_level: Arc<std::sync::atomic::AtomicU8>,
 ) {
     if let Ok(emmyrc_json) = serde_json::to_string_pretty(emmyrc.as_ref()) {
         log::info!("current config : {}", emmyrc_json);
@@ -353,7 +359,14 @@ pub async fn init_analysis(
             watchdog_status.describe(),
         );
         log::info!("analyzing {} Lua files", file_count);
+
+        // `update_files_by_path` blocks for the whole index, so the phases it
+        // reports are the only progress the client can be given.
+        let _progress =
+            AnalysisProgressReporter::install(status_bar.clone(), watchdog_status.clone());
         mut_analysis.update_files_by_path(files);
+        drop(_progress);
+
         watchdog_status.set_progress("Analyzing Lua files", file_count, file_count);
         status_bar.update_startup_phase(
             ProgressTask::LoadWorkspace,
@@ -432,13 +445,23 @@ pub async fn init_analysis(
         client.refresh_code_lens();
     }
 
-    if !lsp_features.supports_workspace_diagnostic() {
+    if lsp_features.supports_workspace_diagnostic() {
+        // The pending level is claimed by whichever pull arrives first and
+        // reset to `None`, so a pull racing startup consumes the workspace's
+        // one level against a half-built index. Re-arm before asking the
+        // client to pull again, or the request is a no-op.
+        workspace_diagnostic_level.fetch_max(
+            crate::context::WorkspaceDiagnosticLevel::Slow.to_u8(),
+            std::sync::atomic::Ordering::AcqRel,
+        );
+        if lsp_features.supports_refresh_diagnostic() {
+            client.refresh_workspace_diagnostics();
+        }
+    } else {
         log::info!("client does not support workspace diagnostics; scheduling push diagnostics");
         file_diagnostic
             .add_workspace_diagnostic_task(0, false)
             .await;
-    } else {
-        log::info!("client supports workspace diagnostics; waiting for diagnostic pull requests");
     }
 }
 
@@ -560,8 +583,9 @@ mod tests {
     use googletest::prelude::*;
     use lsp_server::{Connection, Message};
     use lsp_types::{
-        ClientCapabilities, CodeLensWorkspaceClientCapabilities,
-        InlayHintWorkspaceClientCapabilities, SemanticTokensWorkspaceClientCapabilities,
+        ClientCapabilities, CodeLensWorkspaceClientCapabilities, DiagnosticClientCapabilities,
+        DiagnosticWorkspaceClientCapabilities, InlayHintWorkspaceClientCapabilities,
+        SemanticTokensWorkspaceClientCapabilities, TextDocumentClientCapabilities,
         WorkspaceClientCapabilities,
     };
     use tokio::sync::RwLock;
@@ -589,13 +613,23 @@ mod tests {
                 code_lens: Some(CodeLensWorkspaceClientCapabilities {
                     refresh_support: Some(true),
                 }),
+                diagnostics: Some(DiagnosticWorkspaceClientCapabilities {
+                    refresh_support: Some(true),
+                }),
+                ..Default::default()
+            }),
+            text_document: Some(TextDocumentClientCapabilities {
+                diagnostic: Some(DiagnosticClientCapabilities {
+                    dynamic_registration: Some(true),
+                    related_document_support: Some(true),
+                }),
                 ..Default::default()
             }),
             ..Default::default()
         };
         let lsp_features = LspFeatures::new(capabilities);
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let status_bar = Arc::new(StatusBar::new(client.clone(), true));
         let file_diagnostic = Arc::new(FileDiagnostic::new(
             analysis.clone(),
             status_bar.clone(),
@@ -613,10 +647,13 @@ mod tests {
             HashMap::new(),
             HashMap::new(),
             LongRunningWatchdogStatus::new("test"),
+            Arc::new(std::sync::atomic::AtomicU8::new(
+                crate::context::WorkspaceDiagnosticLevel::None.to_u8(),
+            )),
         ));
 
         let mut methods = Vec::new();
-        while methods.len() < 3 {
+        while methods.len() < 4 {
             let message = peer_connection
                 .receiver
                 .recv_timeout(Duration::from_secs(1))
@@ -633,6 +670,7 @@ mod tests {
             methods,
             vec![
                 "workspace/codeLens/refresh".to_string(),
+                "workspace/diagnostic/refresh".to_string(),
                 "workspace/inlayHint/refresh".to_string(),
                 "workspace/semanticTokens/refresh".to_string(),
             ]

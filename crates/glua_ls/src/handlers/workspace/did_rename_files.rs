@@ -18,6 +18,11 @@ pub async fn on_did_rename_files_handler(
     context: ServerContextSnapshot,
     params: RenameFilesParams,
 ) -> Option<()> {
+    if !context.lsp_features().supports_apply_edit() {
+        log::warn!("rename import update skipped: client does not support workspace/applyEdit");
+        return None;
+    }
+
     let mut all_renames: Vec<RenameInfo> = vec![];
 
     let analysis = context.analysis().read().await;

@@ -9,8 +9,10 @@ use crate::util::time_cancel_token;
 
 use super::ClientProxy;
 
+#[derive(Clone)]
 pub struct StatusBar {
     client: Arc<ClientProxy>,
+    supports_work_done_progress: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -36,11 +38,19 @@ impl ProgressTask {
 }
 
 impl StatusBar {
-    pub fn new(client: Arc<ClientProxy>) -> Self {
-        Self { client }
+    pub fn new(client: Arc<ClientProxy>, supports_work_done_progress: bool) -> Self {
+        Self {
+            client,
+            supports_work_done_progress,
+        }
     }
 
     pub async fn create_progress_task(&self, task: ProgressTask) {
+        // create/update/finish all no-op without the client capability.
+        if !self.supports_work_done_progress {
+            return;
+        }
+
         let request_id = self.client.next_id();
         let cancel_token = time_cancel_token(std::time::Duration::from_secs(5));
         let _ = self
@@ -76,6 +86,9 @@ impl StatusBar {
         percentage: Option<u32>,
         message: Option<String>,
     ) {
+        if !self.supports_work_done_progress {
+            return;
+        }
         self.client.send_notification(
             "$/progress",
             ProgressParams {
@@ -101,6 +114,9 @@ impl StatusBar {
     }
 
     pub fn finish_progress_task(&self, task: ProgressTask, message: Option<String>) {
+        if !self.supports_work_done_progress {
+            return;
+        }
         self.client.send_notification(
             "$/progress",
             ProgressParams {

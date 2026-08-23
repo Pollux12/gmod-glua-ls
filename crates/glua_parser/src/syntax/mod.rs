@@ -11,7 +11,6 @@ use std::marker::PhantomData;
 use rowan::{Language, TextRange, TextSize};
 
 use crate::kind::{LuaKind, LuaSyntaxKind, LuaTokenKind};
-pub use node::*;
 pub use traits::*;
 pub use tree::{LuaSyntaxTree, LuaTreeBuilder};
 
@@ -61,6 +60,66 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
     fn from(kind: rowan::SyntaxKind) -> Self {
         LuaKind::from_raw(kind.0).into()
     }
+}
+
+/// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
+/// (MRU, a few roots kept). Holding each root alive keeps its green tree
+/// alive, which is what makes identity comparison sound.
+mod node_memo {
+    use super::{LuaSyntaxId, LuaSyntaxNode};
+    use rustc_hash::FxHashMap;
+
+    const MAX_ROOTS: usize = 4;
+    /// Each entry pins a red node, which holds an rc on its whole ancestor
+    /// chain, so a long-lived thread would otherwise retain most of a large
+    /// tree. Clearing beats evicting: the memo only pays off within one
+    /// traversal, so a fresh map costs a re-walk, not a lasting miss.
+    const MAX_ENTRIES_PER_ROOT: usize = 8192;
+
+    #[derive(Default)]
+    pub(super) struct NodeMemo {
+        roots: Vec<(LuaSyntaxNode, FxHashMap<LuaSyntaxId, Option<LuaSyntaxNode>>)>,
+    }
+
+    impl NodeMemo {
+        pub(super) fn resolve(
+            &mut self,
+            id: LuaSyntaxId,
+            root: &LuaSyntaxNode,
+        ) -> Option<LuaSyntaxNode> {
+            let found = self.roots.iter().position(|(cached, _)| cached == root);
+            let index = match found {
+                Some(0) => 0,
+                Some(index) => {
+                    self.roots.swap(0, index);
+                    0
+                }
+                None => {
+                    if self.roots.len() == MAX_ROOTS {
+                        self.roots.pop();
+                    }
+                    self.roots.insert(0, (root.clone(), FxHashMap::default()));
+                    0
+                }
+            };
+
+            if let Some(hit) = self.roots[index].1.get(&id) {
+                return hit.clone();
+            }
+            let resolved = id.walk_from_root(root);
+            let entries = &mut self.roots[index].1;
+            if entries.len() >= MAX_ENTRIES_PER_ROOT {
+                entries.clear();
+            }
+            entries.insert(id, resolved.clone());
+            resolved
+        }
+    }
+}
+
+thread_local! {
+    static NODE_MEMO: std::cell::RefCell<node_memo::NodeMemo> =
+        std::cell::RefCell::new(node_memo::NodeMemo::default());
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -123,7 +182,13 @@ impl LuaSyntaxId {
         self.to_node_from_root(&root)
     }
 
+    /// Resolve this id to its node, memoized per thread: an uncached walk
+    /// allocates a red node per nesting level.
     pub fn to_node_from_root(&self, root: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
+        NODE_MEMO.with(|memo| memo.borrow_mut().resolve(*self, root))
+    }
+
+    fn walk_from_root(&self, root: &LuaSyntaxNode) -> Option<LuaSyntaxNode> {
         successors(Some(root.clone()), |node| {
             node.child_or_token_at_range(self.range)?.into_node()
         })

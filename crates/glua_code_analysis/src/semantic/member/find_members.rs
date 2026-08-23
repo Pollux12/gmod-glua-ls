@@ -555,7 +555,14 @@ fn find_unscoped_owner_members(
 ) -> FindMembersResult {
     let mut members = Vec::new();
     let member_index = db.get_member_index();
-    let owner_members = member_index.get_members(owner)?;
+    // A by-key search reads the index by key rather than walking the owner's
+    // whole member list.
+    let owner_members = match filter {
+        FindMemberFilter::ByKey { member_key, .. } => {
+            member_index.get_members_with_key(owner, member_key)?
+        }
+        FindMemberFilter::All => member_index.get_members(owner)?,
+    };
 
     for member in owner_members {
         let member_key = member.get_key().clone();
@@ -849,11 +856,31 @@ fn find_merged_table_members(
             continue;
         };
 
-        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        // One component can hold several writers of the same key. Keeping only
+        // the first discards what the rest assign, and which one comes first is
+        // the member sort order rather than anything the source says - the
+        // table then disagrees with the union every other reader of that slot
+        // gets from `resolve_member_item_type`. Union within the component,
+        // then merge components as table fragments below.
+        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+        let mut component_order: Vec<LuaMemberKey> = Vec::new();
         for member in sub_members {
-            if !component_seen.insert(member.key.clone()) {
-                continue;
+            match component_members.entry(member.key.clone()) {
+                std::collections::hash_map::Entry::Vacant(entry) => {
+                    component_order.push(member.key.clone());
+                    entry.insert(member);
+                }
+                std::collections::hash_map::Entry::Occupied(mut entry) => {
+                    let unioned = crate::TypeOps::Union.apply(db, &entry.get().typ, &member.typ);
+                    entry.get_mut().typ = unioned;
+                }
             }
+        }
+
+        for key in component_order {
+            let Some(member) = component_members.remove(&key) else {
+                continue;
+            };
 
             match members.entry(member.key.clone()) {
                 std::collections::hash_map::Entry::Vacant(entry) => {

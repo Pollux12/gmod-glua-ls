@@ -1,7 +1,7 @@
 mod lua_operator;
 mod lua_operator_meta_method;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::FileId;
 
@@ -11,10 +11,10 @@ pub use lua_operator_meta_method::LuaOperatorMetaMethod;
 
 #[derive(Debug)]
 pub struct LuaOperatorIndex {
-    operators: HashMap<LuaOperatorId, LuaOperator>,
+    operators: FxHashMap<LuaOperatorId, LuaOperator>,
     type_operators_map:
-        HashMap<LuaOperatorOwner, HashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
-    in_filed_operator_map: HashMap<FileId, Vec<LuaOperatorId>>,
+        FxHashMap<LuaOperatorOwner, FxHashMap<LuaOperatorMetaMethod, Vec<LuaOperatorId>>>,
+    in_filed_operator_map: FxHashMap<FileId, Vec<LuaOperatorId>>,
 }
 
 impl Default for LuaOperatorIndex {
@@ -26,9 +26,9 @@ impl Default for LuaOperatorIndex {
 impl LuaOperatorIndex {
     pub fn new() -> Self {
         Self {
-            operators: HashMap::new(),
-            type_operators_map: HashMap::new(),
-            in_filed_operator_map: HashMap::new(),
+            operators: FxHashMap::default(),
+            type_operators_map: FxHashMap::default(),
+            in_filed_operator_map: FxHashMap::default(),
         }
     }
 

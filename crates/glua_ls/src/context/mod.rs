@@ -20,88 +20,34 @@ use lsp_types::{ClientCapabilities, Uri};
 pub use snapshot::ServerContextSnapshot;
 pub use status_bar::ProgressTask;
 pub use status_bar::StatusBar;
-use std::{collections::HashMap, future::Future, sync::Arc};
+use std::{collections::HashMap, future::Future, sync::Arc, time::Duration};
 use tokio::sync::{Mutex, Notify, RwLock};
 use tokio_util::sync::CancellationToken;
 pub use workspace_manager::*;
 
 use crate::context::snapshot::ServerContextInner;
 
-// ============================================================================
-// LOCK ORDERING GUIDELINES (CRITICAL - Must Follow to Avoid Deadlocks)
-// ============================================================================
-//
-// This module uses multiple locks (RwLock and Mutex) for concurrent access to shared state.
-// To prevent deadlocks, **ALL code must acquire locks in the following order**:
-//
-// ## Global Lock Order (Low to High Priority):
-// 1. **diagnostic_tokens** (Mutex) - File diagnostic task tokens
-// 2. **workspace_diagnostic_token** (Mutex) - Workspace diagnostic task token
-// 3. **cached_file_diagnostics** (Mutex) - UI state
-// 4. **update_token** (Mutex) - Reindex/config update token
-// 5. **analysis** (RwLock - READ) - Read-only access to EmmyLuaAnalysis
-// 6. **workspace_manager** (RwLock - READ) - Read-only access to WorkspaceManager
-// 7. **workspace_manager** (RwLock - WRITE) - Exclusive access to WorkspaceManager
-// 8. **analysis** (RwLock - WRITE) - Exclusive access to EmmyLuaAnalysis
-//
-// ## Lock Ordering Rules:
-// - **NEVER acquire a lower-priority lock while holding a higher-priority lock**
-// - **ALWAYS release locks in reverse order (LIFO) or use explicit scope blocks**
-// - **NEVER upgrade a read lock to a write lock (release read, then acquire write)**
-// - **Minimize lock scope**: only hold locks for the minimum necessary time
-// - **Avoid holding locks across `.await` points when possible**
-// - **NEVER call async methods that might acquire locks while holding a lock**
-//
-// ## Examples:
-//
-// ### ✅ CORRECT - Proper lock ordering:
-// ```rust
-// // Acquire workspace_manager read lock first, then release before analysis write
-// let should_process = {
-//     let workspace_manager = context.workspace_manager().read().await;
-//     workspace_manager.is_workspace_file(&uri)
-// };
-// if should_process {
-//     let mut analysis = context.analysis().write().await;
-//     analysis.update_file(&uri, text);
-// }
-// ```
-//
-// ### ❌ WRONG - ABBA deadlock risk:
-// ```rust
-// let mut analysis = context.analysis().write().await;  // Lock A
-// // ... operations ...
-// let workspace = context.workspace_manager().write().await;  // Lock B (while holding A!)
-// // DEADLOCK RISK: Another thread might hold B and wait for A
-// ```
-//
-// ### ✅ CORRECT - Release before calling async methods:
-// ```rust
-// let data = {
-//     let workspace = context.workspace_manager().read().await;
-//     workspace.get_config().clone()  // Clone data
-// }; // Lock released
-// init_analysis(data).await;  // Safe to call async method
-// ```
-//
-// ### ❌ WRONG - Holding lock while calling async method:
-// ```rust
-// let workspace = context.workspace_manager().write().await;
-// workspace.reload_workspace().await;  // May acquire analysis lock internally!
-// ```
-//
-// ## Atomic Operations (Lock-Free):
-// The following atomics can be accessed without lock ordering concerns:
-// - `workspace_initialized` (AtomicBool)
-// - `workspace_diagnostic_level` (AtomicU8)
-// - `workspace_version` (AtomicI64)
-//
-// ## Notes:
-// - Use `drop(lock_guard)` explicitly to release locks early when needed
-// - Use scope blocks `{ ... }` to limit lock lifetime
-// - When in doubt, release all locks before performing complex operations
-// - If you need to modify this ordering, update this documentation AND review all call sites
-// ============================================================================
+// LOCK ORDER (acquire low → high; never a lower lock while holding a higher):
+// 1. diagnostic_tokens  2. workspace_diagnostic_token  3. cached_file_diagnostics
+// 4. update_token  5. analysis(read)  6. workspace_manager(read)
+// 7. workspace_manager(write)  8. analysis(write)
+// Within `DebouncedAnalysis`: pending_files before reindexing_files, and both
+// are released before anything above is taken.
+// Leaf: document_versions — a synchronous lock, so it can never be held across
+// an `.await`. Never upgrade read→write in place; avoid holding any lock across
+// `.await`. Atomics are exempt.
+
+/// Panics the debounce supervisor will restart before it stops trying.
+const DEBOUNCE_RESTART_LIMIT: u32 = 5;
+
+const DEBOUNCE_RESTART_BACKOFF_BASE: Duration = Duration::from_millis(200);
+const DEBOUNCE_RESTART_BACKOFF_MAX: Duration = Duration::from_secs(5);
+
+fn debounce_restart_backoff(restarts: u32) -> Duration {
+    DEBOUNCE_RESTART_BACKOFF_BASE
+        .saturating_mul(1_u32 << restarts.min(16).saturating_sub(1))
+        .min(DEBOUNCE_RESTART_BACKOFF_MAX)
+}
 
 #[derive(Clone)]
 pub struct RequestTaskMetadata {
@@ -123,49 +69,40 @@ struct InFlightRequest {
     metadata: RequestTaskMetadata,
 }
 
+// Methods answered with their computed result on cancel instead of an error,
+// so the client keeps its current UI state.
+// - semantic tokens excluded: relative offsets make a stale set wrong.
+// - workspace/diagnostic included: vscode-languageclient permanently stops
+//   workspace pulls after 6 non-cancellation errors.
+// - textDocument/diagnostic excluded: the client rewrites a cancelled pull's
+//   result to an empty full report; an error reschedules instead.
 fn keep_stale_editor_data_on_cancel(method: &str) -> bool {
-    // When these requests are cancelled (typically because a new didChange
-    // arrived and cancel_all_requests() fired), prefer sending whatever
-    // result was already computed rather than RequestCanceled. Per the LSP
-    // spec, "the result even computed on an older state might still be
-    // useful for the client". Sending RequestCanceled for these methods
-    // causes brief visual flickering as the client clears its display.
-    //
-    // Semantic tokens are deliberately excluded: their result carries no
-    // version and is encoded as offsets relative to the previous token, so a
-    // set computed against superseded text does not degrade — every offset
-    // past the edit lands on the wrong word. They get ContentModified
-    // instead, via `cancel_error_code`.
     matches!(
         method,
-        "textDocument/codeLens" | "textDocument/inlayHint" | "gluals/annotator"
+        "textDocument/codeLens"
+            | "textDocument/inlayHint"
+            | "gluals/annotator"
+            | "workspace/diagnostic"
     )
 }
 
-fn cancel_error_code(features: &LspFeatures, method: &str) -> ErrorCode {
-    // Pull diagnostics are explicitly server-cancellable. LSP 3.17: "A server
-    // is also allowed to return an error with code `ServerCancelled`
-    // indicating that the server can't compute the result right now... If no
-    // data is provided it defaults to `{ retriggerRequest: true }`." That is
-    // exactly this situation — our own state was invalidated and we want the
-    // client to ask again — and the default spares us a `data` payload.
+/// The error code — and any `data` payload — for a cancelled request.
+fn cancel_error(features: &LspFeatures, method: &str) -> (ErrorCode, Option<serde_json::Value>) {
+    // The client only retriggers when `data` is present; it ignores the
+    // spec's default-when-absent.
     if matches!(method, "textDocument/diagnostic" | "workspace/diagnostic") {
-        return ErrorCode::ServerCancelled;
+        return (
+            ErrorCode::ServerCancelled,
+            Some(serde_json::json!({ "retriggerRequest": true })),
+        );
     }
 
-    // LSP 3.17 implementation considerations: "Use ContentModified only when
-    // the server's own internal state invalidates an in-flight result." A
-    // cancelled request is exactly that — `didChange` fired
-    // `cancel_all_requests_except`, so the text it describes is gone.
-    //
-    // Only worth saying to a client that re-sends the request afterwards.
-    // `retryOnContentModified` is the client's own per-method declaration of
-    // that; for anything absent from it, ContentModified reads as "no result"
-    // and clears the feature's UI, so those keep RequestCanceled.
+    // ContentModified only for methods the client declares it re-sends;
+    // others read it as "no result" and clear the feature's UI.
     if features.retries_on_content_modified(method) {
-        ErrorCode::ContentModified
+        (ErrorCode::ContentModified, None)
     } else {
-        ErrorCode::RequestCanceled
+        (ErrorCode::RequestCanceled, None)
     }
 }
 
@@ -179,9 +116,7 @@ fn should_send_stale_response_on_cancel(method: &str, response: &Response) -> bo
     }
 
     if matches!(method, "textDocument/codeLens" | "textDocument/inlayHint") {
-        // Returning stale-but-empty results for inlay hints/code lens can clear
-        // currently rendered UI while typing. Let RequestCanceled keep the
-        // previous output visible until fresh results are ready.
+        // A stale-but-empty result would clear rendered UI while typing.
         return result.as_array().is_some_and(|hints| !hints.is_empty());
     }
 
@@ -205,20 +140,25 @@ impl ServerContext {
         }));
 
         let analysis = Arc::new(RwLock::new(EmmyLuaAnalysis::new()));
-        let status_bar = Arc::new(StatusBar::new(client.clone()));
+        let lsp_features = Arc::new(LspFeatures::new(client_capabilities));
+        let status_bar = Arc::new(StatusBar::new(
+            client.clone(),
+            lsp_features.supports_work_done_progress(),
+        ));
         let file_diagnostic = Arc::new(FileDiagnostic::new(
             analysis.clone(),
             status_bar.clone(),
             client.clone(),
         ));
-        let lsp_features = Arc::new(LspFeatures::new(client_capabilities));
-        let workspace_manager = Arc::new(RwLock::new(WorkspaceManager::new(
+        let workspace_manager_inner = WorkspaceManager::new(
             analysis.clone(),
             client.clone(),
             status_bar.clone(),
             file_diagnostic.clone(),
             lsp_features.clone(),
-        )));
+        );
+        let workspace_diagnostic_level = workspace_manager_inner.workspace_diagnostic_level_arc();
+        let workspace_manager = Arc::new(RwLock::new(workspace_manager_inner));
         let debounced_shutdown = CancellationToken::new();
         let debounced_analysis = Arc::new(DebouncedAnalysis::new(
             analysis.clone(),
@@ -226,12 +166,50 @@ impl ServerContext {
             debounced_shutdown.clone(),
             client.clone(),
             file_diagnostic.shared_diagnostic_data_cache(),
+            workspace_diagnostic_level,
+            lsp_features.clone(),
         ));
 
-        // Spawn the debounced analysis background loop
+        // Supervise the debounce loop: freshness waiters park on it with no
+        // deadline, so if it dies the whole server silently goes quiet.
         {
             let da = debounced_analysis.clone();
-            tokio::spawn(async move { da.run().await });
+            let shutdown = debounced_shutdown.clone();
+            tokio::spawn(async move {
+                let mut restarts = 0_u32;
+                while !shutdown.is_cancelled() {
+                    let task = tokio::spawn({
+                        let da = da.clone();
+                        async move { da.run().await }
+                    });
+                    match task.await {
+                        // `run` only returns on shutdown.
+                        Ok(()) => return,
+                        Err(err) => {
+                            restarts += 1;
+                            if restarts > DEBOUNCE_RESTART_LIMIT {
+                                log::error!(
+                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits park until their request is cancelled: {}",
+                                    restarts,
+                                    err
+                                );
+                                return;
+                            }
+                            log::error!(
+                                "LS_DEBOUNCE_LOOP_PANIC debounced analysis loop died, restarting: {}",
+                                err
+                            );
+                        }
+                    }
+
+                    // A panic on entry would otherwise respawn at full CPU,
+                    // and every restart writes a log line.
+                    tokio::select! {
+                        _ = tokio::time::sleep(debounce_restart_backoff(restarts)) => {}
+                        _ = shutdown.cancelled() => return,
+                    }
+                }
+            });
         }
 
         let inner = Arc::new(ServerContextInner {
@@ -242,7 +220,7 @@ impl ServerContext {
             status_bar,
             lsp_features,
             debounced_analysis,
-            document_versions: Arc::new(Mutex::new(HashMap::new())),
+            document_versions: Arc::new(std::sync::Mutex::new(HashMap::new())),
             document_version_notify: Arc::new(Notify::new()),
         });
 
@@ -276,42 +254,55 @@ impl ServerContext {
         F: FnOnce(CancellationToken) -> Fut + Send + 'static,
         Fut: Future<Output = Option<Response>> + Send + 'static,
     {
-        let cancel_token = CancellationToken::new();
-        let request_method = metadata.method.clone();
-
-        {
-            let mut requests = self.requests.lock().await;
-            requests.insert(
-                req_id.clone(),
-                InFlightRequest {
-                    cancel_token: cancel_token.clone(),
-                    metadata,
-                },
-            );
-        }
-
         let sender = self.conn.sender.clone();
-        let requests = self.requests.clone();
+        let cancel_token = CancellationToken::new();
         let lsp_features = self.inner.lsp_features.clone();
+        let request_method = metadata.method.to_string();
+
+        let mut requests = self.requests.lock().await;
+        requests.insert(
+            req_id.clone(),
+            InFlightRequest {
+                metadata,
+                cancel_token: cancel_token.clone(),
+            },
+        );
+        drop(requests);
+
+        let requests = self.requests.clone();
 
         tokio::spawn(async move {
-            let res = exec(cancel_token.clone()).await;
+            // Own task per handler: a panic must not skip the response or the
+            // `requests` cleanup below.
+            let handler_token = cancel_token.clone();
+            let res = match tokio::spawn(exec(handler_token)).await {
+                Ok(res) => res,
+                Err(err) => {
+                    log::error!(
+                        "LS_REQUEST_PANIC method={} request failed: {}",
+                        request_method,
+                        err
+                    );
+                    None
+                }
+            };
             if cancel_token.is_cancelled() {
                 if keep_stale_editor_data_on_cancel(&request_method)
                     && let Some(response) = res
                     && should_send_stale_response_on_cancel(&request_method, &response)
                 {
-                    // Handler completed with a non-null result before/during
-                    // cancellation — send it. Per LSP spec, "the result even
-                    // computed on an older state might still be useful for the
-                    // client."
                     let _ = sender.send(Message::Response(response.clone()));
                 } else {
-                    let response = Response::new_err(
-                        req_id.clone(),
-                        cancel_error_code(&lsp_features, &request_method) as i32,
-                        "cancel".to_string(),
-                    );
+                    let (code, data) = cancel_error(&lsp_features, &request_method);
+                    let response = Response {
+                        id: req_id.clone(),
+                        result: None,
+                        error: Some(lsp_server::ResponseError {
+                            code: code as i32,
+                            message: "cancel".to_string(),
+                            data,
+                        }),
+                    };
                     let _ = sender.send(Message::Response(response));
                 }
             } else if res.is_none() {
@@ -365,15 +356,6 @@ impl ServerContext {
         }
     }
 
-    pub async fn cancel_requests_by_method(&self, method: &str) {
-        let requests = self.requests.lock().await;
-        for request in requests.values() {
-            if request.metadata.method == method {
-                request.cancel_token.cancel();
-            }
-        }
-    }
-
     pub async fn close(&self) {
         self.debounced_shutdown.cancel();
         let mut workspace_manager = self.inner.workspace_manager.write().await;
@@ -388,14 +370,22 @@ impl ServerContext {
 #[cfg(test)]
 mod tests {
     use super::{
-        LspFeatures, RequestTaskMetadata, ServerContext, cancel_error_code,
+        DEBOUNCE_RESTART_BACKOFF_MAX, LspFeatures, RequestTaskMetadata, ServerContext,
+        WorkspaceDiagnosticLevel, cancel_error, debounce_restart_backoff,
         keep_stale_editor_data_on_cancel, should_send_stale_response_on_cancel,
     };
     use googletest::prelude::*;
-    use lsp_server::{ErrorCode, RequestId, Response};
+    use lsp_server::{Connection, ErrorCode, RequestId, Response};
     use lsp_types::ClientCapabilities;
     use serde_json::json;
     use std::time::Duration;
+
+    #[test]
+    fn debounce_restart_backoff_doubles_then_saturates() {
+        assert_eq!(debounce_restart_backoff(1), Duration::from_millis(200));
+        assert_eq!(debounce_restart_backoff(3), Duration::from_millis(800));
+        assert_eq!(debounce_restart_backoff(60), DEBOUNCE_RESTART_BACKOFF_MAX);
+    }
 
     #[gtest]
     fn stale_inlay_and_code_lens_response_requires_non_empty_array() -> Result<()> {
@@ -445,18 +435,19 @@ mod tests {
             .expect("capabilities should deserialize"),
         );
         verify_that!(
-            cancel_error_code(&features, "textDocument/semanticTokens/full") as i32,
+            cancel_error(&features, "textDocument/semanticTokens/full").0 as i32,
             eq(ErrorCode::ContentModified as i32)
         )?;
         verify_that!(
-            cancel_error_code(&features, "textDocument/inlayHint") as i32,
+            cancel_error(&features, "textDocument/inlayHint").0 as i32,
             eq(ErrorCode::RequestCanceled as i32)
         )?;
         verify_that!(
-            cancel_error_code(
+            cancel_error(
                 &LspFeatures::new(ClientCapabilities::default()),
                 "textDocument/semanticTokens/full"
-            ) as i32,
+            )
+            .0 as i32,
             eq(ErrorCode::RequestCanceled as i32)
         )?;
         Ok(())
@@ -470,6 +461,77 @@ mod tests {
             should_send_stale_response_on_cancel("textDocument/inlayHint", &null_result),
             eq(false)
         )?;
+        Ok(())
+    }
+
+    #[gtest]
+    fn a_cancelled_workspace_sweep_restores_the_level_it_claimed() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        let (connection, _peer) = Connection::memory();
+
+        runtime.block_on(async {
+            let context = ServerContext::new(connection, ClientCapabilities::default());
+            let workspace = context.snapshot().workspace_manager_arc();
+            let workspace = workspace.read().await;
+
+            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
+            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
+            verify_that!(
+                workspace.claim_workspace_diagnostic_level(),
+                eq(WorkspaceDiagnosticLevel::Slow)
+            )?;
+
+            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
+
+            // Claiming empties it, so a second pull finds nothing to do.
+            verify_that!(
+                workspace.claim_workspace_diagnostic_level(),
+                eq(WorkspaceDiagnosticLevel::Slow)
+            )?;
+            verify_that!(
+                workspace.claim_workspace_diagnostic_level(),
+                eq(WorkspaceDiagnosticLevel::None)
+            )?;
+
+            // A `Fast` request arriving mid-sweep must not survive as the
+            // restored value in place of the interrupted `Slow`.
+            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Fast, false);
+            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Slow);
+            verify_that!(
+                workspace.claim_workspace_diagnostic_level(),
+                eq(WorkspaceDiagnosticLevel::Slow)
+            )?;
+
+            // And restoring never lowers an already-higher pending level.
+            workspace.update_workspace_version(WorkspaceDiagnosticLevel::Slow, false);
+            workspace.restore_workspace_diagnostic_level(WorkspaceDiagnosticLevel::Fast);
+            verify_that!(
+                workspace.claim_workspace_diagnostic_level(),
+                eq(WorkspaceDiagnosticLevel::Slow)
+            )?;
+            Ok(())
+        })
+    }
+
+    /// See `keep_stale_editor_data_on_cancel`: cancelled document pulls must
+    /// answer with an error, workspace pulls with a success.
+    #[gtest]
+    fn cancelled_document_diagnostics_answer_with_an_error() -> Result<()> {
+        verify_that!(
+            keep_stale_editor_data_on_cancel("textDocument/diagnostic"),
+            eq(false)
+        )?;
+        verify_that!(
+            keep_stale_editor_data_on_cancel("workspace/diagnostic"),
+            eq(true)
+        )?;
+
+        let features = LspFeatures::new(ClientCapabilities::default());
+        for method in ["textDocument/diagnostic", "workspace/diagnostic"] {
+            let (code, data) = cancel_error(&features, method);
+            verify_that!(code as i32, eq(ErrorCode::ServerCancelled as i32))?;
+            verify_that!(data, eq(&Some(json!({ "retriggerRequest": true }))))?;
+        }
         Ok(())
     }
 
@@ -516,7 +578,19 @@ mod tests {
                 )
                 .await;
 
-            let (inlay_token, code_lens_token, hover_token) = {
+            let diag_id: RequestId = 4.into();
+            context
+                .task(
+                    diag_id.clone(),
+                    RequestTaskMetadata::new("textDocument/diagnostic", None),
+                    |_cancel_token| async move {
+                        tokio::time::sleep(Duration::from_millis(250)).await;
+                        Some(Response::new_ok(diag_id, json!({"kind": "unChanged", "resultId": "abc"})))
+                    },
+                )
+                .await;
+
+            let (inlay_token, code_lens_token, hover_token, diag_token) = {
                 let requests = context.requests.lock().await;
                 let inlay = requests
                     .get(&RequestId::from(1))
@@ -533,15 +607,24 @@ mod tests {
                     .expect("hover request should exist")
                     .cancel_token
                     .clone();
-                (inlay, code_lens, hover)
+                let diag = requests
+                    .get(&RequestId::from(4))
+                    .expect("diagnostic request should exist")
+                    .cancel_token
+                    .clone();
+                (inlay, code_lens, hover, diag)
             };
 
             context
-                .cancel_all_requests_except(&["textDocument/inlayHint", "textDocument/codeLens"])
+                .cancel_all_requests_except(&[
+                    "textDocument/inlayHint",
+                    "textDocument/codeLens",
+                ])
                 .await;
 
             verify_that!(inlay_token.is_cancelled(), eq(false))?;
             verify_that!(code_lens_token.is_cancelled(), eq(false))?;
+            verify_that!(diag_token.is_cancelled(), eq(true))?;
             verify_that!(hover_token.is_cancelled(), eq(true))?;
             Ok(())
         })

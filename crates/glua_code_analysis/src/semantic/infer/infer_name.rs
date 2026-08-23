@@ -1,9 +1,10 @@
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
     LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
-    LuaReturnStat, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaReturnStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
+use std::sync::Arc;
 
 use super::{
     InferFailReason, InferResult, infer_expr, infer_table_field_value_should_be,
@@ -948,7 +949,7 @@ fn infer_param_type_from_call_sites(
         .get_signature_index()
         .local_func_decl_for(&signature_id)?;
     let call_sites =
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id);
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
     infer_param_type_from_local_call_sites_inner(db, cache, call_sites, param_idx, true)
 }
 
@@ -1061,7 +1062,7 @@ fn infer_unread_local_call_site_args(
     };
 
     let unread_args =
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id)
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id)
             .into_iter()
             .filter_map(|(_, call_expr)| {
                 call_expr
@@ -1130,8 +1131,12 @@ fn infer_forwarded_param_arg_type(
         .get_vfs()
         .get_syntax_tree(&signature_id.get_file_id())?
         .get_red_root();
+    // The signature's position is where its closure starts, so descend to that
+    // offset instead of scanning every node in the file.
     let closure = root
-        .descendants()
+        .token_at_offset(signature_id.get_position())
+        .right_biased()?
+        .parent_ancestors()
         .filter_map(LuaClosureExpr::cast)
         .find(|closure| closure.get_position() == signature_id.get_position())?;
     let local_func_name = closure
@@ -1139,21 +1144,52 @@ fn infer_forwarded_param_arg_type(
         .and_then(|local_func| local_func.get_local_name())?;
     let target_decl_id = LuaDeclId::new(signature_id.get_file_id(), local_func_name.get_position());
 
-    infer_param_type_from_local_call_sites_inner(
-        db,
-        cache,
-        local_function_call_sites(db, signature_id.get_file_id(), &root, target_decl_id),
-        idx,
-        false,
-    )
+    let call_sites =
+        local_function_call_sites(db, cache, signature_id.get_file_id(), &root, target_decl_id);
+    infer_param_type_from_local_call_sites_inner(db, cache, call_sites, idx, false)
 }
 
 fn local_function_call_sites(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     file_id: FileId,
     root: &LuaSyntaxNode,
     target_decl_id: LuaDeclId,
 ) -> Vec<(FileId, LuaCallExpr)> {
+    // Parameter inference asks for the same function's call sites once per
+    // parameter index, and each miss walks the tree from the root for every
+    // reference. Derive the set once and re-resolve the ids on later calls.
+    let syntax_ids = match cache.local_function_call_sites_cache.get(&target_decl_id) {
+        Some(cached) => cached.clone(),
+        None => {
+            let ids = Arc::new(find_local_function_call_sites(
+                db,
+                file_id,
+                root,
+                target_decl_id,
+            ));
+            cache
+                .local_function_call_sites_cache
+                .insert(target_decl_id, ids.clone());
+            ids
+        }
+    };
+
+    syntax_ids
+        .iter()
+        .filter_map(|syntax_id| {
+            let node = syntax_id.to_node_from_root(root)?;
+            Some((file_id, LuaCallExpr::cast(node)?))
+        })
+        .collect()
+}
+
+fn find_local_function_call_sites(
+    db: &DbIndex,
+    file_id: FileId,
+    root: &LuaSyntaxNode,
+    target_decl_id: LuaDeclId,
+) -> Vec<LuaSyntaxId> {
     let Some(decl_refs) = db
         .get_reference_index()
         .get_local_reference(&file_id)
@@ -1175,7 +1211,7 @@ fn local_function_call_sites(
         })
         .filter_map(|name_expr| name_expr.get_parent::<LuaCallExpr>())
         .filter(|call_expr| matches!(call_expr.get_prefix_expr(), Some(LuaExpr::NameExpr(_))))
-        .map(|call_expr| (file_id, call_expr))
+        .map(|call_expr| call_expr.get_syntax_id())
         .collect()
 }
 
@@ -1337,7 +1373,88 @@ fn find_param_type_from_sibling_members(
     final_type
 }
 
+type InheritedParamKey = (LuaMemberId, usize, bool, bool, FileId, TextSize);
+
+thread_local! {
+    /// Memo for [`find_param_type_from_inherited_members`], paired with the
+    /// `type_structure_revision` it was built against.
+    ///
+    /// Thread-local rather than a field on `DbIndex` because `&DbIndex` is
+    /// shared across worker threads, so the memo cannot live behind a `RefCell`
+    /// on the struct without giving up `Sync`.
+    static INHERITED_PARAM_MEMO: std::cell::RefCell<(u64, rustc_hash::FxHashMap<InheritedParamKey, Option<LuaType>>)> =
+        std::cell::RefCell::new((u64::MAX, rustc_hash::FxHashMap::default()));
+}
+
+/// The parameter's type as declared by an inherited member, if any.
+///
+/// This is the most expensive step of parameter inference: the unresolve
+/// pipeline's reachability probe calls it once per deferred parameter, and the
+/// cost is almost entirely the visibility-aware member lookup it performs per
+/// super type.
+///
+/// The same key is asked repeatedly across the retry loop's iterations, so the
+/// answer is memoized against `type_structure_revision`. Mutating the member,
+/// type, signature or module index bumps that revision, which covers the inputs
+/// the loop itself moves as it resolves.
+///
+/// It is not a complete read set. The visibility-aware lookup below also reads
+/// the dynamic-field and gmod-infer indexes, and neither bumps the revision, so
+/// a member that becomes visible between two unresolve runs can be missed by a
+/// memo entry computed before it existed.
 fn find_param_type_from_inherited_members(
+    db: &DbIndex,
+    current_member_id: LuaMemberId,
+    param_idx: usize,
+    colon_define: bool,
+    is_dots: bool,
+    caller_file_id: FileId,
+    caller_position: TextSize,
+) -> Option<LuaType> {
+    let revision = db.type_structure_revision();
+    let key = (
+        current_member_id,
+        param_idx,
+        colon_define,
+        is_dots,
+        caller_file_id,
+        caller_position,
+    );
+
+    let cached = INHERITED_PARAM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        if memo.0 != revision {
+            memo.0 = revision;
+            memo.1.clear();
+            return None;
+        }
+        memo.1.get(&key).cloned()
+    });
+    if let Some(cached) = cached {
+        return cached;
+    }
+
+    let found = find_param_type_from_inherited_members_uncached(
+        db,
+        current_member_id,
+        param_idx,
+        colon_define,
+        is_dots,
+        caller_file_id,
+        caller_position,
+    );
+
+    INHERITED_PARAM_MEMO.with(|memo| {
+        let mut memo = memo.borrow_mut();
+        // Only store if nothing bumped the revision while we were computing.
+        if memo.0 == revision {
+            memo.1.insert(key, found.clone());
+        }
+    });
+    found
+}
+
+fn find_param_type_from_inherited_members_uncached(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     param_idx: usize,
@@ -1541,7 +1658,7 @@ fn member_receiver_name(func: &LuaFuncStat) -> Option<smol_str::SmolStr> {
     let LuaExpr::NameExpr(name_expr) = index_expr.get_prefix_expr()? else {
         return None;
     };
-    name_expr.get_name_text().map(Into::into)
+    name_expr.get_name_text()
 }
 
 fn find_overload_param_type_from_type(
@@ -2370,6 +2487,21 @@ fn infer_global_type_from_decl_ids(db: &DbIndex, decl_ids: Vec<LuaDeclId>) -> In
                 last_resolve_reason = InferFailReason::UnResolveDeclType(decl_id);
             }
         }
+    }
+
+    // A global's type is the merge of every declaration of it, so a declaration
+    // whose type cache is missing is a writer this merge cannot see. Answering
+    // anyway makes the result depend on how far the batch has run rather than on
+    // the source: `remove_index` clears the batch's caches up front, so which
+    // declarations are visible is decided by batch composition. Every branch
+    // below is affected — the callable union loses an arm, `def_or_ref_type` and
+    // the table merge pick a different winner, and `saw_nil` cannot know whether
+    // the absent declaration was nil.
+    //
+    // Defer instead. The unresolve pass retries once that declaration carries a
+    // type and floors it to `Unknown` if it never does, so this cannot stall.
+    if !matches!(last_resolve_reason, InferFailReason::None) {
+        return Err(last_resolve_reason);
     }
 
     if let Some(callable_type) = callable_type {

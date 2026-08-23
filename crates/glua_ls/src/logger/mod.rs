@@ -1,4 +1,5 @@
 mod best_log_path;
+mod non_blocking_stderr;
 
 use std::{env, fs, path::PathBuf};
 
@@ -7,11 +8,42 @@ use chrono::Local;
 use fern::Dispatch;
 use glua_code_analysis::file_path_to_uri;
 use log::{LevelFilter, info};
+use non_blocking_stderr::NonBlockingStderr;
 
 use crate::cmd_args::{CmdArgs, LogLevel};
 
 const CRATE_NAME: &str = env!("CARGO_PKG_NAME");
 const CRATE_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// Work is spread over a thread pool, so interleaved debug/trace lines are only
+/// correlatable if each one says which thread wrote it.
+fn thread_tag(level: log::Level) -> String {
+    if level < log::Level::Debug {
+        return String::new();
+    }
+    // Pool threads all share one name, so the id is what actually distinguishes them.
+    let current = std::thread::current();
+    match current.name() {
+        Some(name) => format!(" {name}#{:?}", current.id()),
+        None => format!(" {:?}", current.id()),
+    }
+}
+
+/// Applied on the root dispatch so the log file and stderr carry identical text.
+fn format_record(
+    out: fern::FormatCallback<'_>,
+    message: &std::fmt::Arguments<'_>,
+    record: &log::Record<'_>,
+) {
+    out.finish(format_args!(
+        "[{} {} {}{}] {}",
+        Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
+        record.level(),
+        record.target(),
+        thread_tag(record.level()),
+        message
+    ))
+}
 
 pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
     let level = match cmd_args.log_level {
@@ -19,6 +51,7 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
         LogLevel::Warn => LevelFilter::Warn,
         LogLevel::Info => LevelFilter::Info,
         LogLevel::Debug => LevelFilter::Debug,
+        LogLevel::Trace => LevelFilter::Trace,
     };
 
     let cmd_log_path = cmd_args.log_path.clone();
@@ -71,20 +104,14 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
         }
     };
 
+    // Stderr as well as the file: an editor that starts the server as a child
+    // process shows stderr in its own output panel. It must be the
+    // non-blocking sink, or a client that never reads it stalls analysis.
     let logger = Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        // set level
+        .format(format_record)
         .level(level)
-        // set output
-        .chain(log_file);
+        .chain(log_file)
+        .chain(Box::new(NonBlockingStderr::new()) as Box<dyn std::io::Write + Send>);
 
     if let Err(e) = logger.apply() {
         eprintln!("Failed to apply logger: {:?}", e);
@@ -98,19 +125,9 @@ pub fn init_logger(root: Option<&str>, cmd_args: &CmdArgs) {
 
 fn init_stderr_logger(level: LevelFilter) {
     let logger = Dispatch::new()
-        .format(|out, message, record| {
-            out.finish(format_args!(
-                "[{} {} {}] {}",
-                Local::now().format("%Y-%m-%d %H:%M:%S %:z"),
-                record.level(),
-                record.target(),
-                message
-            ))
-        })
-        // set level
+        .format(format_record)
         .level(level)
-        // set output
-        .chain(std::io::stderr());
+        .chain(Box::new(NonBlockingStderr::new()) as Box<dyn std::io::Write + Send>);
 
     if let Err(e) = logger.apply() {
         eprintln!("Failed to apply logger: {:?}", e);

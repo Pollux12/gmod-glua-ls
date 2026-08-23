@@ -30,12 +30,9 @@ mod tests {
         let mut result = Vec::new();
         let mut line = 0;
         let mut col = 0;
-        for chunk in data.chunks_exact(5) {
-            let delta_line = chunk[0];
-            let delta_start = chunk[1];
-            let length = chunk[2];
-            let token_type = chunk[3];
-            let token_modifiers = chunk[4];
+        let (chunks, _) = data.as_chunks::<5>();
+        for chunk in chunks {
+            let [delta_line, delta_start, length, token_type, token_modifiers] = *chunk;
 
             if delta_line > 0 {
                 line += delta_line;
@@ -157,6 +154,50 @@ local x = 1
                     && (*modifiers & doc_modifier) == doc_modifier
                     && *len >= 5
             }),
+            eq(true)
+        )?;
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_doc_tag_outparam_highlights_tag_and_path() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let main = ws.def_file(
+            "main.lua",
+            r#"---@outparam config.output string
+---@param config table
+function fill(config) end
+"#,
+        );
+
+        let data = ws.get_semantic_token_data_for_file(main)?;
+        let tokens = decode(&data);
+        let doc_modifiers = &[
+            SemanticTokenModifier::DECLARATION,
+            SemanticTokenModifier::DOCUMENTATION,
+        ];
+
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                4,
+                8,
+                SemanticTokenType::KEYWORD,
+                &[SemanticTokenModifier::DOCUMENTATION]
+            ),
+            eq(true)
+        )?;
+        verify_that!(
+            has_token(
+                &tokens,
+                0,
+                13,
+                13,
+                SemanticTokenType::PARAMETER,
+                doc_modifiers
+            ),
             eq(true)
         )?;
 

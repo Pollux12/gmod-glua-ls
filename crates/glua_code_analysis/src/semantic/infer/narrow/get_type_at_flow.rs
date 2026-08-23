@@ -1,4 +1,8 @@
-use std::{collections::HashSet, ops::Deref};
+use std::ops::Deref;
+
+// Every set below is a cycle guard for a graph walk: membership only, never
+// iterated, so the hasher cannot reach a result.
+use rustc_hash::FxHashSet as HashSet;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
@@ -12,7 +16,7 @@ use crate::{
     FlowTree, GlobalId, GmodRealm, InferFailReason, LuaArrayType, LuaDeclId, LuaInferCache,
     LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaSemanticDeclId, LuaSignatureId, LuaType,
     LuaTypeDeclId, LuaTypeOwner, LuaUnionType, TypeOps, infer_expr,
-    semantic::cache::FlowOrigin,
+    semantic::cache::{FlowOrigin, VarRefCacheKey},
     semantic::gmod_call_effect::{GmodCallWriteEffect, gmod_call_write_effect},
     semantic::infer::{
         InferResult, VarRefId, infer_expr_list_value_type_at,
@@ -175,6 +179,18 @@ pub fn get_type_at_flow_with_origin(
     result
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Closure-baseline walks that missed the memo, on this thread.
+    ///
+    /// The memo turns a per-path derivation into a per-merge-point one, and the
+    /// difference is a count, not a duration — asserting on the count instead of
+    /// on wall-clock keeps the guard immune to how loaded the machine is. A
+    /// single-file `VirtualWorkspace` analyses inline, so the walks land on the
+    /// thread that asked for them and one test cannot see another's.
+    pub(crate) static BASELINE_FLOW_WALKS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 pub(super) fn get_type_at_flow_in_mode(
     db: &DbIndex,
     tree: &FlowTree,
@@ -193,8 +209,20 @@ pub(super) fn get_type_at_flow_in_mode(
                 db.get_gmod_infer_index()
                     .get_realm_at_offset(&cache.get_file_id(), var_ref_id.get_position())
             });
+            let memo_key = (
+                VarRefCacheKey::from(var_ref_id),
+                (flow_id, query_realm, policy.origin),
+            );
+            if let Some(narrow_type) = cache.baseline_flow_memo.get(&memo_key) {
+                return Ok(narrow_type.clone());
+            }
+
+            #[cfg(test)]
+            BASELINE_FLOW_WALKS.with(|walks| walks.set(walks.get() + 1));
+
+            cache.baseline_flow_depth += 1;
             let mut visited_flow_ids = Vec::new();
-            get_type_at_flow_walk(
+            let result = get_type_at_flow_walk(
                 db,
                 tree,
                 cache,
@@ -204,7 +232,17 @@ pub(super) fn get_type_at_flow_in_mode(
                 flow_id,
                 &mut visited_flow_ids,
                 policy,
-            )
+            );
+            if let Ok(narrow_type) = &result {
+                cache
+                    .baseline_flow_memo
+                    .insert(memo_key, narrow_type.clone());
+            }
+            cache.baseline_flow_depth -= 1;
+            if cache.baseline_flow_depth == 0 {
+                cache.baseline_flow_memo.clear();
+            }
+            result
         }
     }
 }
@@ -1276,7 +1314,27 @@ fn call_flow_node_returns_never(
     call_expr_returns_never(db, cache, call_expr)
 }
 
+/// The flow walk asks this of every call node it reaches, and the same call is
+/// reached again by every later query that walks through it, so the answer is
+/// memoised for as long as the types it reads hold still.
 fn call_expr_returns_never(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    call_expr: glua_parser::LuaCallExpr,
+) -> bool {
+    let syntax_id = call_expr.get_syntax_id();
+    if let Some(returns_never) = cache.call_returns_never_cache.get(&syntax_id) {
+        return *returns_never;
+    }
+
+    let returns_never = call_expr_returns_never_uncached(db, cache, call_expr);
+    cache
+        .call_returns_never_cache
+        .insert(syntax_id, returns_never);
+    returns_never
+}
+
+fn call_expr_returns_never_uncached(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     call_expr: glua_parser::LuaCallExpr,
@@ -1598,7 +1656,7 @@ fn branch_has_relevant_special_call_effects(
         return false;
     };
 
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     antecedents.iter().copied().any(|flow_id| {
         antecedent_has_relevant_special_call_effect(
             db,
@@ -1706,6 +1764,56 @@ fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &Va
         )
 }
 
+/// The type an assignment writes, with a read of an undefined global counted as
+/// the `nil` it is at runtime.
+///
+/// `infer_expr` reports an undefined global as `InferFailReason::None` rather
+/// than a type, so propagating that failure abandons the whole flow walk and
+/// the variable falls back to `unknown` — one unresolvable name erases what
+/// every other branch established about it. `analyze_assign_stat` already
+/// applies this rule when it binds the assignment's own cache ("undefined-global
+/// RHS is `nil` at runtime, not unknown"); the flow walk has to agree with it,
+/// or the same assignment means two different things depending on which path
+/// asked.
+fn infer_assigned_value_type_at(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    exprs: &[LuaExpr],
+    value_idx: usize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let is_undefined_global = exprs
+        .get(value_idx)
+        .is_some_and(|expr| expr_reads_undefined_global(db, cache, expr));
+    match infer_expr_list_value_type_at(db, cache, exprs, value_idx) {
+        Err(InferFailReason::None) if is_undefined_global => Ok(Some(LuaType::Nil)),
+        Ok(Some(typ)) if typ.is_unknown() && is_undefined_global => Ok(Some(LuaType::Nil)),
+        other => other,
+    }
+}
+
+/// Whether `expr` is a bare name that resolves to no declaration at all.
+fn expr_reads_undefined_global(db: &DbIndex, cache: &LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    if name == "self" || name == "_G" || name == "_ENV" {
+        return false;
+    }
+    let file_id = cache.get_file_id();
+    let has_local = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+        .is_some();
+    if has_local {
+        return false;
+    }
+    db.get_global_index().get_global_decl_ids(&name).is_none()
+}
+
 fn get_type_at_assign_stat(
     db: &DbIndex,
     tree: &FlowTree,
@@ -1729,7 +1837,7 @@ fn get_type_at_assign_stat(
         };
 
         if numeric_table_index_query_key_name(var_ref_id)
-            .map(str::to_string)
+            .map(smol_str::SmolStr::new)
             .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
             .is_some_and(|key_name| var_ref_is_name(db, &maybe_ref_id, &key_name))
         {
@@ -1758,7 +1866,7 @@ fn get_type_at_assign_stat(
                 )?));
             }
             if numeric_table_index_query_key_name(var_ref_id)
-                .map(str::to_string)
+                .map(smol_str::SmolStr::new)
                 .or_else(|| {
                     numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id)
                 })
@@ -1768,7 +1876,7 @@ fn get_type_at_assign_stat(
             {
                 return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
             }
-            let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)? else {
+            let Some(expr_type) = infer_assigned_value_type_at(db, cache, &exprs, i)? else {
                 return Ok(ResultTypeOrContinue::Continue);
             };
             return Ok(ResultTypeOrContinue::Result(expr_type));
@@ -1787,7 +1895,7 @@ fn get_type_at_assign_stat(
         }
 
         if numeric_table_index_query_key_name(var_ref_id)
-            .map(str::to_string)
+            .map(smol_str::SmolStr::new)
             .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id))
             .is_some_and(|key_name| {
                 assignment_vars_write_dynamic_key_name(db, cache, &vars, &key_name)
@@ -1818,7 +1926,7 @@ fn get_type_at_assign_stat(
 
         let expr_type = match guarded_global_type {
             Some(typ) => Some(typ),
-            None => infer_expr_list_value_type_at(db, cache, &exprs, i)?,
+            None => infer_assigned_value_type_at(db, cache, &exprs, i)?,
         };
         let Some(expr_type) = expr_type else {
             return Ok(ResultTypeOrContinue::Continue);
@@ -1929,7 +2037,7 @@ fn try_get_numeric_range_table_arg_population_type(
         return Ok(None);
     };
     let key_name = numeric_table_index_query_key_name(var_ref_id)
-        .map(str::to_string)
+        .map(smol_str::SmolStr::new)
         .or_else(|| numeric_table_index_query_key_name_from_initializer(db, root, var_ref_id));
 
     let args = call_expr
@@ -1997,7 +2105,7 @@ fn try_get_numeric_range_table_arg_population_type(
         rhs_expr,
         &query_root,
         key_name.as_deref(),
-        &mut HashSet::new(),
+        &mut HashSet::default(),
     ) {
         return Ok(None);
     }
@@ -2202,7 +2310,7 @@ fn numeric_global_table_index_query(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     index_expr: &LuaIndexExpr,
-) -> Option<(String, i64, Option<String>)> {
+) -> Option<(smol_str::SmolStr, i64, Option<smol_str::SmolStr>)> {
     let LuaExpr::NameExpr(table_name) = index_expr.get_prefix_expr()? else {
         return None;
     };
@@ -2427,7 +2535,7 @@ fn call_effect_overlaps_mutation_roots(
             cache,
             call_expr,
             mutation_roots,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         ),
     };
     call_overlaps
@@ -2566,7 +2674,7 @@ fn var_expr_may_mutate_global_table(var: &LuaVarExpr, mutation_roots: &[&str]) -
     }
 }
 
-fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<String> {
+fn index_expr_global_root_name(index_expr: &LuaIndexExpr) -> Option<smol_str::SmolStr> {
     let mut prefix = index_expr.get_prefix_expr()?;
     while let LuaExpr::IndexExpr(parent_index) = prefix {
         prefix = parent_index.get_prefix_expr()?;
@@ -2785,7 +2893,7 @@ fn numeric_table_index_query_key_name_from_initializer(
     db: &DbIndex,
     root: &LuaChunk,
     var_ref_id: &VarRefId,
-) -> Option<String> {
+) -> Option<smol_str::SmolStr> {
     let decl_id = match var_ref_id {
         VarRefId::IndexRef(query_root, _) => query_root.as_decl_id(),
         _ => var_ref_id.get_decl_id_ref(),
@@ -3029,7 +3137,7 @@ fn antecedent_has_relevant_special_call_effect_before_node(
     flow_node: &FlowNode,
     var_ref_id: &VarRefId,
 ) -> bool {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     match flow_node.antecedent {
         Some(FlowAntecedent::Single(prev)) => antecedent_has_relevant_special_call_effect(
             db,
@@ -3394,7 +3502,7 @@ fn infer_collection_base_types<'a>(
     base_type
 }
 
-fn expr_access_path(expr: &LuaExpr) -> Option<String> {
+fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     match expr {
         LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
         LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
@@ -3514,7 +3622,7 @@ pub fn explicit_param_string_default_reaches_flow(
     use_flow_id: FlowId,
 ) -> bool {
     let var_ref_id = VarRefId::VarRef(decl_id);
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     explicit_default_reaches_inner(
         db,
         tree,
@@ -3722,7 +3830,7 @@ pub fn inferred_string_default_reaches_flow(
     default_source_range: rowan::TextRange,
 ) -> bool {
     let var_ref_id = VarRefId::VarRef(decl_id);
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     inferred_string_default_reaches_inner(
         db,
         tree,

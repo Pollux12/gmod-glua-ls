@@ -297,14 +297,6 @@ pub fn analyze_outparam(analyzer: &mut DocAnalyzer, tag: LuaDocTagOutparam) -> O
         return None;
     };
     let field_path = path_segments.collect::<Vec<_>>();
-    if field_path.is_empty() {
-        report_invalid_outparam(
-            analyzer,
-            &tag,
-            format!("outparam `{path}` must target at least one field"),
-        );
-        return None;
-    }
 
     let type_ref = tag
         .get_type()
@@ -760,7 +752,7 @@ fn extract_func_name_from_ast(ast: &LuaAst) -> Option<String> {
                     LuaIndexKey::String(string_token) => Some(string_token.get_value()),
                     _ => None,
                 },
-                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+                LuaVarExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
             }
         }
         LuaAst::LuaLocalFuncStat(local_func) => local_func

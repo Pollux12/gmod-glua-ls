@@ -247,6 +247,16 @@ fn try_infer_pairs_iter_types_from_table_members(
     }
 
     let table_type = infer_expr(db, cache, table_arg)?;
+    if matches!(table_type, LuaType::Global) {
+        // The global table has no enumerable answer: its member types are the very
+        // thing analysis is computing, and a loop over it can declare further
+        // globals whose types are then part of the same union. Any snapshot is a
+        // record of how far inference had progressed, not a fact about the program.
+        return Ok(Some(VariadicType::Multi(vec![
+            LuaType::String,
+            LuaType::Any,
+        ])));
+    }
     if let LuaType::TableOf(inner) = &table_type {
         // Keep the value as T[K] instead of materializing every member type. Large
         // scripted-class hierarchies can contain hundreds of callable members.
@@ -273,12 +283,29 @@ fn try_infer_pairs_iter_types_from_table_members(
         .map(|(key, member_infos)| (key.clone(), member_infos.clone()))
         .collect::<Vec<_>>();
     member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
+
+    // A dynamic key aliases every access whose key infers to the same type
+    // rather than naming a member, so once one is present the literal keys
+    // beside it are a sample of the indices some file happened to write, not
+    // the table's key domain. Which samples are in the map depends on how far
+    // inference had progressed, so the keys are reported by kind.
+    let keys_are_sampled = member_entries
+        .iter()
+        .any(|(key, _)| matches!(key, LuaMemberKey::ExprType(_)));
+
     for (key, member_infos) in member_entries {
-        let key_type = match key {
-            LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
-            LuaMemberKey::Name(name) => LuaType::StringConst(name.into()),
-            LuaMemberKey::ExprType(typ) => typ,
-            LuaMemberKey::None => continue,
+        let key_type = if keys_are_sampled {
+            match table_projection_member_key_type(&key) {
+                Some(typ) => typ,
+                None => continue,
+            }
+        } else {
+            match key {
+                LuaMemberKey::Integer(i) => LuaType::IntegerConst(i),
+                LuaMemberKey::Name(name) => LuaType::StringConst(name.into()),
+                LuaMemberKey::ExprType(typ) => typ,
+                LuaMemberKey::None => continue,
+            }
         };
         keys.push(key_type);
 

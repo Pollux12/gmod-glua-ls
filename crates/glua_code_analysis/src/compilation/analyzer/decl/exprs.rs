@@ -185,7 +185,7 @@ fn inferred_guard_candidate_references_param(expr: &LuaExpr, param_names: &[Stri
         && expr.descendants::<LuaNameExpr>().any(|name_expr| {
             name_expr
                 .get_name_text()
-                .is_some_and(|name| param_names.iter().any(|param| param == &name))
+                .is_some_and(|name| param_names.iter().any(|param| *param == name))
         })
 }
 
@@ -652,7 +652,7 @@ fn dependency_call_has_no_args(expr: &LuaCallExpr) -> bool {
 
 fn get_call_name(expr: &LuaCallExpr) -> Option<String> {
     match expr.get_prefix_expr()? {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
         LuaExpr::IndexExpr(index_expr) => match index_expr.get_index_key()? {
             LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
             LuaIndexKey::String(string) => Some(string.get_value()),

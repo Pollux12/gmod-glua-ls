@@ -91,6 +91,31 @@ mod test {
             .collect()
     }
 
+    fn member_path_receiver_types(
+        ws: &VirtualWorkspace,
+        file_id: crate::FileId,
+        path_text: &str,
+    ) -> Vec<String> {
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("semantic model");
+        semantic_model
+            .get_root()
+            .descendants::<LuaIndexExpr>()
+            .filter_map(|index_expr| match index_expr.get_prefix_expr() {
+                Some(LuaExpr::IndexExpr(receiver))
+                    if receiver.syntax().text().to_string().trim() == path_text =>
+                {
+                    semantic_model.infer_expr(LuaExpr::IndexExpr(receiver)).ok()
+                }
+                _ => None,
+            })
+            .map(|typ| ws.humanize_type(typ))
+            .collect()
+    }
+
     #[derive(Debug, PartialEq, Eq)]
     struct NestedCallbackState {
         receiver_types: Vec<String>,
@@ -1868,6 +1893,283 @@ mod test {
         assert_eq!(
             diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnknown),
             0
+        );
+    }
+
+    #[test]
+    fn declared_field_narrows_to_the_only_child_defining_the_member() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field ConCommand fun(self: Player, cmd: string)
+            ---@class Holder
+            ---@field Owner Entity
+            ---@type Holder
+            local h
+            h.Owner:ConCommand("kill")
+            h.Owner:ConCommand("say")
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Player` but found `Entity`. Add a guard to narrow the parent to `Player`."
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "h.Owner"),
+            vec!["Player", "Player"]
+        );
+    }
+
+    #[test]
+    fn declared_field_narrows_from_a_single_use() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field ConCommand fun(self: Player, cmd: string)
+            ---@class Holder
+            ---@field Owner Entity
+            ---@type Holder
+            local h
+            h.Owner:ConCommand("kill")
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "h.Owner"),
+            vec!["Player"]
+        );
+    }
+
+    #[test]
+    fn declared_field_narrowing_follows_a_deeper_member_path() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field ConCommand fun(self: Player, cmd: string)
+            ---@class Inner
+            ---@field Owner Entity
+            ---@class Outer
+            ---@field data Inner
+            ---@type Outer
+            local o
+            o.data.Owner:ConCommand("kill")
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            1
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "o.data.Owner"),
+            vec!["Player"]
+        );
+    }
+
+    #[test]
+    fn declared_field_member_owned_by_the_base_is_not_narrowed() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@field GetClass fun(self: Entity): string
+            ---@class Player: Entity
+            ---@field GetClass fun(self: Player): string
+            ---@class Holder
+            ---@field Owner Entity
+            ---@type Holder
+            local h
+            local class = h.Owner:GetClass()
+            print(class)
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "h.Owner"),
+            vec!["Entity"]
+        );
+    }
+
+    #[test]
+    fn guarded_declared_field_is_not_unguarded_child_evidence() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Player: Entity
+            ---@field ConCommand fun(self: Player, cmd: string)
+
+            ---@return boolean
+            ---@return_cast self Player
+            function Entity:IsPlayer() end
+
+            ---@class Holder
+            ---@field Owner Entity
+            ---@type Holder
+            local h
+            if h.Owner:IsPlayer() then
+                h.Owner:ConCommand("kill")
+            end
+            "#,
+        );
+
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::UndefinedMethod),
+            0
+        );
+        assert_eq!(
+            diagnostic_count(&mut ws, file_id, DiagnosticCode::InferUnguardedChild),
+            0
+        );
+    }
+
+    #[test]
+    fn declared_field_tie_names_the_member_instead_of_an_unwritable_union() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Bravo: Entity
+            ---@field Shared fun(self: Bravo)
+            ---@class Alpha: Entity
+            ---@field Shared fun(self: Alpha)
+            ---@class Holder
+            ---@field Owner Entity
+            ---@type Holder
+            local h
+            h.Owner:Shared()
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "`Shared` is not defined on `Entity`. Add a guard that narrows the parent to one of \
+             `Alpha`, `Bravo`."
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "h.Owner"),
+            vec!["(Alpha|Bravo)"]
+        );
+    }
+
+    #[test]
+    fn unguarded_child_tie_caps_the_listed_candidate_types() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@class DAlpha: Panel
+            ---@field Shared fun(self: DAlpha)
+            ---@class DBravo: Panel
+            ---@field Shared fun(self: DBravo)
+            ---@class DCharlie: Panel
+            ---@field Shared fun(self: DCharlie)
+            ---@class DDelta: Panel
+            ---@field Shared fun(self: DDelta)
+            ---@class DEcho: Panel
+            ---@field Shared fun(self: DEcho)
+            ---@type Panel
+            local value
+            value:Shared()
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "`Shared` is not defined on `Panel`. Add a guard that narrows the parent to one of \
+             `DAlpha`, `DBravo`, `DCharlie` and 2 more."
+        );
+    }
+
+    /// `Alpha` and `Bravo` sit inside a `return`, so the early evidence pass
+    /// narrows their receiver to `Middle` and publishes it. The late pass then
+    /// sees that narrowed receiver again at the `Shared` use, and `Shared` is
+    /// defined on `Leaf`, a child of `Middle`. Scoring against the published
+    /// type would descend one more level of the class tree per pass, so every
+    /// use has to keep scoring against `Entity`.
+    #[test]
+    fn unguarded_child_path_does_not_rescore_against_its_own_narrowing() {
+        let mut ws = VirtualWorkspace::new();
+        enable_gmod(&mut ws);
+        let file_id = ws.def(
+            r#"
+            ---@class Entity
+            ---@class Middle: Entity
+            ---@field Alpha fun(self: Middle)
+            ---@field Bravo fun(self: Middle)
+            ---@class Other: Entity
+            ---@field Shared fun(self: Other)
+            ---@class Leaf: Middle
+            ---@field Shared fun(self: Leaf)
+
+            ---@param value any
+            ---@return TypeGuard<Entity>
+            function isentity(value) end
+
+            ---@class Holder
+            ---@field proc unknown
+
+            ---@type Holder
+            local h
+
+            local function run(a, b)
+                if not isentity(h.proc) then return end
+                if a then return h.proc:Alpha() end
+                if b then return h.proc:Bravo() end
+                return h.proc:Shared()
+            end
+            "#,
+        );
+
+        let diagnostics = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnguardedChild);
+        assert_eq!(diagnostics.len(), 1, "{diagnostics:?}");
+        assert_eq!(
+            diagnostics[0].message,
+            "expected `Middle` but found `Entity`. Add a guard to narrow the parent to `Middle`."
+        );
+        assert_eq!(
+            member_path_receiver_types(&ws, file_id, "h.proc"),
+            vec!["Middle", "Middle", "Middle"]
         );
     }
 

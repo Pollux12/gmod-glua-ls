@@ -788,6 +788,38 @@ mod test {
     }
 
     #[test]
+    fn test_outparam_without_field_updates_the_parameter_itself() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "layout.lua",
+            r#"
+                ---@class HUDStackLayout
+                ---@field rowHeight integer
+
+                glide = {}
+
+                ---@outparam out HUDStackLayout
+                ---@param out table
+                function glide.GetHUDStackLayout(out) end
+                "#,
+        );
+        let file_id = ws.def_file(
+            "test.lua",
+            r#"
+                local layout = {}
+
+                glide.GetHUDStackLayout(layout)
+
+                local rowHeight = layout.rowHeight
+                "#,
+        );
+        assert_eq!(
+            index_expr_ty(&ws, file_id, "layout.rowHeight"),
+            ws.ty("integer")
+        );
+    }
+
+    #[test]
     fn test_outparam_updates_assigned_output_field() {
         let mut ws = VirtualWorkspace::new();
         ws.def_file(

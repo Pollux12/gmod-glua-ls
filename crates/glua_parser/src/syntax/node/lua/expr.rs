@@ -8,6 +8,8 @@ use crate::{
     },
 };
 
+use smol_str::SmolStr;
+
 use super::{
     LuaBlock, LuaCallArgList, LuaIndexKey, LuaParamList, LuaTableField, path_trait::PathTrait,
 };
@@ -236,9 +238,15 @@ impl LuaNameExpr {
         self.token()
     }
 
-    pub fn get_name_text(&self) -> Option<String> {
+    /// The identifier's text.
+    ///
+    /// Returns `SmolStr` rather than `String`: the token's text is already
+    /// `&str`, so building a `String` allocated for every name read. `SmolStr`
+    /// stores up to 22 bytes inline, which covers essentially every Lua
+    /// identifier, so the common case allocates nothing.
+    pub fn get_name_text(&self) -> Option<SmolStr> {
         self.get_name_token()
-            .map(|it| it.get_name_text().to_string())
+            .map(|it| SmolStr::new(it.get_name_text()))
     }
 }
 

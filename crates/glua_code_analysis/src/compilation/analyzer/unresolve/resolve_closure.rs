@@ -153,7 +153,11 @@ pub fn try_resolve_closure_return(
         .get_mut(&closure_return.signature_id)
         .ok_or(InferFailReason::None)?;
 
-    if ret_type.contain_tpl() {
+    // An `unknown`/`any` contextual return carries no information, but taking it
+    // would clear the body-derived return below and stamp `DocResolve` over the
+    // result, which every later repair pass then refuses to touch. Fall back to
+    // the body exactly as an unbound template return does.
+    if ret_type.contain_tpl() || ret_type.is_unknown() || ret_type.is_any() {
         return try_convert_to_func_body_infer(db, cache, closure_return);
     }
 
@@ -486,6 +490,15 @@ fn resolve_closure_member_type(
             let signature = db.get_signature_index().get(id);
 
             if let Some(signature) = signature {
+                // An empty `return_docs` renders as `-> nil`, so a base whose
+                // return has not settled yet hands out a contract claiming it
+                // returns nothing. `resolve_doc_function` stamps that as
+                // `DocResolve`, which no later pass reopens, so the override
+                // would keep whichever answer the base happened to hold when
+                // this ran. Wait for the base to settle instead.
+                if !signature.is_resolve_return() {
+                    return Err(InferFailReason::UnResolveSignatureReturn(*id));
+                }
                 let fake_doc_function = signature.to_doc_func_type();
                 resolve_doc_function(db, closure_params, &fake_doc_function, self_type)
             } else {

@@ -34,7 +34,8 @@ use stats::{
 pub(in crate::compilation::analyzer) use stats::{
     get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
     is_guarded_table_assignment_index_expr, is_guarded_table_assignment_member,
-    preserve_guarded_table_assignment_members,
+    mark_resolved_member_assignment, preserve_guarded_table_assignment_members,
+    record_resolved_member_assignment_contribution,
 };
 
 use log::info;
@@ -78,7 +79,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         };
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();
-        let order = file_dependency.get_best_analysis_order(&file_ids, &context.metas);
+        let levels = file_dependency.get_analysis_levels(&file_ids, &context.metas);
         let stderr_profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
         let slow_log_enabled = log::log_enabled!(log::Level::Info) || stderr_profile_enabled;
         let node_profile_enabled = stderr_profile_enabled;
@@ -86,69 +87,92 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let mut workspace_profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
         let mut slow_file_summary = slow_log_enabled.then(SlowLuaAnalyzeSummary::default);
         let mut file_count: usize = 0;
-        for file_id in order {
-            if let Some(root) = tree_map.get(&file_id) {
-                let file_start = slow_log_enabled.then(Instant::now);
-                let is_scripted = scripted_scope_files.contains(&file_id);
-                let mut analyzer = LuaAnalyzer::new(
-                    db,
-                    file_id,
-                    context,
-                    gmod_enabled,
-                    is_scripted,
-                    &special_call_direct_matcher,
-                );
-                let mut profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
-                for node in root.descendants::<LuaAst>() {
-                    if let Some(profile) = profile.as_mut() {
-                        let kind = lua_ast_profile_kind(&node);
-                        let node_start = Instant::now();
-                        analyze_node(&mut analyzer, node);
-                        profile.record(kind, node_start.elapsed());
-                    } else {
-                        analyze_node(&mut analyzer, node);
-                    }
+        let mut level_shape = node_profile_enabled.then(LevelShape::default);
+        // Reported inside the level rather than only at level boundaries: the
+        // widest level can hold most of the workspace.
+        let progress_total = file_ids.len();
+        let progress_step = if crate::progress::is_active() && progress_total > 1 {
+            (progress_total / 50).max(1)
+        } else {
+            0
+        };
+        for level in levels {
+            if let Some(shape) = level_shape.as_mut() {
+                shape.begin_level(level.len());
+            }
+            for file_id in level {
+                if progress_step != 0 && file_count.is_multiple_of(progress_step) {
+                    crate::progress::advance_current_phase(file_count, progress_total, "files");
                 }
-                if let (Some(workspace_profile), Some(profile)) =
-                    (workspace_profile.as_mut(), profile.as_ref())
-                {
-                    workspace_profile.merge(profile);
-                }
-                analyze_chunk_return(&mut analyzer, root.clone());
-                flush_pending_dynamic_key_collection_widenings(&mut analyzer);
-                file_count += 1;
-                if let Some(file_start) = file_start {
-                    let file_elapsed = file_start.elapsed();
-                    if let Some(summary) = slow_file_summary.as_mut() {
-                        summary.record(file_id, file_elapsed);
-                    }
-
-                    // Detailed per-file logging is intentionally reserved for explicit profiling.
-                    // Info logging can be enabled in normal server sessions, and logging every
-                    // >1ms file turns large workspace analysis into a log-I/O hotspot.
-                    let should_log_file = if stderr_profile_enabled {
-                        file_elapsed.as_millis() > 1
-                    } else {
-                        file_elapsed >= Duration::from_millis(50)
-                    };
-                    if should_log_file {
-                        let path = db
-                            .get_vfs()
-                            .get_uri(&file_id)
-                            .map(|u| u.to_string())
-                            .unwrap_or_else(|| format!("{:?}", file_id));
-                        info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
-                        if let Some(profile) = profile.as_ref() {
-                            profile.log_slow_file(&path);
+                if let Some(root) = tree_map.get(&file_id) {
+                    let file_start = slow_log_enabled.then(Instant::now);
+                    let is_scripted = scripted_scope_files.contains(&file_id);
+                    let mut analyzer = LuaAnalyzer::new(
+                        db,
+                        file_id,
+                        context,
+                        gmod_enabled,
+                        is_scripted,
+                        &special_call_direct_matcher,
+                    );
+                    let mut profile = node_profile_enabled.then(LuaAnalyzeProfile::default);
+                    for node in root.descendants::<LuaAst>() {
+                        if let Some(profile) = profile.as_mut() {
+                            let kind = lua_ast_profile_kind(&node);
+                            let node_start = Instant::now();
+                            analyze_node(&mut analyzer, node);
+                            profile.record(kind, node_start.elapsed());
+                        } else {
+                            analyze_node(&mut analyzer, node);
                         }
-                        if stderr_profile_enabled {
-                            eprintln!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
+                    }
+                    if let (Some(workspace_profile), Some(profile)) =
+                        (workspace_profile.as_mut(), profile.as_ref())
+                    {
+                        workspace_profile.merge(profile);
+                    }
+                    analyze_chunk_return(&mut analyzer, root.clone());
+                    flush_pending_dynamic_key_collection_widenings(&mut analyzer);
+                    file_count += 1;
+                    if let Some(file_start) = file_start {
+                        let file_elapsed = file_start.elapsed();
+                        if let Some(summary) = slow_file_summary.as_mut() {
+                            summary.record(file_id, file_elapsed);
+                        }
+                        if let Some(shape) = level_shape.as_mut() {
+                            shape.record_file(file_elapsed);
+                        }
+
+                        // Detailed per-file logging is intentionally reserved for explicit profiling.
+                        // Info logging can be enabled in normal server sessions, and logging every
+                        // >1ms file turns large workspace analysis into a log-I/O hotspot.
+                        let should_log_file = if stderr_profile_enabled {
+                            file_elapsed.as_millis() > 1
+                        } else {
+                            file_elapsed >= Duration::from_millis(50)
+                        };
+                        if should_log_file {
+                            let path = db
+                                .get_vfs()
+                                .get_uri(&file_id)
+                                .map(|u| u.to_string())
+                                .unwrap_or_else(|| format!("{:?}", file_id));
+                            info!("lua analyze slow file: {} cost {:?}", path, file_elapsed);
                             if let Some(profile) = profile.as_ref() {
+                                profile.log_slow_file(&path);
+                            }
+                            if stderr_profile_enabled {
                                 eprintln!(
-                                    "lua analyze slow file node profile: {} [{}]",
-                                    path,
-                                    profile.summary(8)
+                                    "lua analyze slow file: {} cost {:?}",
+                                    path, file_elapsed
                                 );
+                                if let Some(profile) = profile.as_ref() {
+                                    eprintln!(
+                                        "lua analyze slow file node profile: {} [{}]",
+                                        path,
+                                        profile.summary(8)
+                                    );
+                                }
                             }
                         }
                     }
@@ -178,8 +202,78 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         workspace_profile.summary(8)
                     );
                 }
+                if let Some(level_shape) = level_shape.as_ref() {
+                    eprintln!("lua analyze level shape: {}", level_shape.summary());
+                }
             }
         }
+    }
+}
+
+/// Measures how much of `lua analyze` could overlap if each dependency level ran
+/// concurrently: the critical path is the sum of each level's slowest file.
+/// Profiling only (`GLUALS_PROFILE=1`).
+#[derive(Default)]
+struct LevelShape {
+    levels: usize,
+    widths: Vec<usize>,
+    maxes: Vec<Duration>,
+    total: Duration,
+    critical_path: Duration,
+    level_max: Duration,
+}
+
+impl LevelShape {
+    fn begin_level(&mut self, width: usize) {
+        let previous = std::mem::take(&mut self.level_max);
+        self.critical_path += previous;
+        if self.levels > 0 {
+            self.maxes.push(previous);
+        }
+        self.levels += 1;
+        self.widths.push(width);
+    }
+
+    fn record_file(&mut self, elapsed: Duration) {
+        self.total += elapsed;
+        self.level_max = self.level_max.max(elapsed);
+    }
+
+    fn summary(&self) -> String {
+        let critical_path = self.critical_path + self.level_max;
+        let widest = self.widths.iter().copied().max().unwrap_or(0);
+        let files: usize = self.widths.iter().sum();
+        let speedup = if critical_path.is_zero() {
+            0.0
+        } else {
+            self.total.as_secs_f64() / critical_path.as_secs_f64()
+        };
+        let mut heaviest: Vec<(usize, usize, Duration)> = self
+            .widths
+            .iter()
+            .zip(self.maxes.iter().chain(std::iter::once(&self.level_max)))
+            .enumerate()
+            .map(|(level, (&width, &max))| (level, width, max))
+            .collect();
+        heaviest.sort_unstable_by_key(|&(_, _, max)| std::cmp::Reverse(max));
+        let heaviest: Vec<String> = heaviest
+            .iter()
+            .take(6)
+            .map(|(level, width, max)| format!("L{level}(w={width}) {max:?}"))
+            .collect();
+        format!(
+            "{} levels over {} files (widest {}, mean width {:.1}); \
+             sequential {:?}, critical path {:?}, ideal speedup {:.1}x; \
+             heaviest levels: {}",
+            self.levels,
+            files,
+            widest,
+            files as f64 / self.levels.max(1) as f64,
+            self.total,
+            critical_path,
+            speedup,
+            heaviest.join(", "),
+        )
     }
 }
 
@@ -334,7 +428,10 @@ struct LuaAnalyzer<'a> {
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
     guarded_table_assignment_type_cache: FxHashMap<MemberAssignmentWideningCacheKey, LuaType>,
     direct_local_table_member_owner_cache: FxHashMap<LuaDeclId, Option<LuaMemberOwner>>,
-    literal_index_member_owner_cache: FxHashMap<String, LuaMemberOwner>,
+    literal_index_member_owner_cache: FxHashMap<smol_str::SmolStr, LuaMemberOwner>,
+    /// A closure's own `return` statements (excluding nested closures').
+    closure_own_returns_cache:
+        FxHashMap<glua_parser::LuaSyntaxId, std::rc::Rc<Vec<glua_parser::LuaReturnStat>>>,
 }
 
 impl LuaAnalyzer<'_> {
@@ -359,6 +456,7 @@ impl LuaAnalyzer<'_> {
             guarded_table_assignment_type_cache: FxHashMap::default(),
             direct_local_table_member_owner_cache: FxHashMap::default(),
             literal_index_member_owner_cache: FxHashMap::default(),
+            closure_own_returns_cache: FxHashMap::default(),
         }
     }
 

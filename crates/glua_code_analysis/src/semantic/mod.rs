@@ -15,6 +15,11 @@ mod visibility;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
+/// Test-only work counter, re-exported so scaling guards can assert on the
+/// number of walks rather than on how long they took.
+#[cfg(test)]
+pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
+
 pub use cache::{CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl};
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
@@ -95,9 +100,7 @@ pub(crate) use infer::is_authoritative_self_receiver_type;
 pub(crate) use infer::remove_false_or_nil;
 pub(crate) use infer::type_decl_is_vgui_panel;
 pub use infer::{SelfRefId, VarRefId, VarRefRootId};
-pub(crate) use infer::{
-    contains_gmod_null_type, expr_may_have_condition_narrowing, get_var_expr_var_ref_id,
-};
+pub(crate) use infer::{contains_gmod_null_type, get_var_expr_var_ref_id};
 pub use infer::{infer_param, infer_param_with_cache};
 use overload_resolve::resolve_signature;
 pub use semantic_info::SemanticDeclLevel;

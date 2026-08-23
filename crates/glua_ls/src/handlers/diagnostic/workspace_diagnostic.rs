@@ -32,13 +32,12 @@ pub async fn on_pull_workspace_diagnostic(
     let Some(workspace_manager) = context.read_workspace_manager(&token).await else {
         return WorkspaceDiagnosticReport { items: vec![] };
     };
-    let status = workspace_manager.get_workspace_diagnostic_level();
+    let status = workspace_manager.claim_workspace_diagnostic_level();
     if status == WorkspaceDiagnosticLevel::None {
         return WorkspaceDiagnosticReport { items: vec![] };
     }
     let client_id = workspace_manager.client_config.client_id;
     let open_files = workspace_manager.current_open_files.clone();
-    workspace_manager.update_workspace_version(WorkspaceDiagnosticLevel::None, false);
     drop(workspace_manager);
 
     if client_id.is_vscode() && context.lsp_features().supports_refresh_diagnostic() {
@@ -51,16 +50,24 @@ pub async fn on_pull_workspace_diagnostic(
         WorkspaceDiagnosticLevel::Fast => {
             context
                 .file_diagnostic()
-                .pull_workspace_diagnostics_fast(token)
+                .pull_workspace_diagnostics_fast(token.clone())
                 .await
         }
         WorkspaceDiagnosticLevel::Slow => {
             context
                 .file_diagnostic()
-                .pull_workspace_diagnostics_slow(token)
+                .pull_workspace_diagnostics_slow(token.clone())
                 .await
         }
     };
+
+    // A cut-short sweep covered only part of the workspace: restore the
+    // claimed level so the rest is re-swept.
+    if token.is_cancelled() {
+        let workspace_manager = context.workspace_manager().read().await;
+        workspace_manager.restore_workspace_diagnostic_level(status);
+    }
+
     let analysis = context.analysis().read().await;
     let vfs = analysis.compilation.get_db().get_vfs();
     build_report(

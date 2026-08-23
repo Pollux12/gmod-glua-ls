@@ -1,6 +1,6 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId, LuaType,
-    LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId,
+    LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
@@ -108,7 +108,10 @@ fn extend_global_path_members(
     }
 }
 
-fn global_expr_access_path(semantic_model: &SemanticModel, expr: &LuaExpr) -> Option<String> {
+fn global_expr_access_path(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> Option<smol_str::SmolStr> {
     if !expr_root_is_global(semantic_model, expr) {
         return None;
     }
@@ -221,7 +224,7 @@ fn gmod_hook_owner_name(prefix_expr: &LuaExpr, prefix_type: &LuaType) -> Option<
     match prefix_type {
         LuaType::Ref(owner_type_decl_id) => Some(owner_type_decl_id.get_simple_name().to_string()),
         _ => match prefix_expr {
-            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text(),
+            LuaExpr::NameExpr(name_expr) => name_expr.get_name_text().map(Into::into),
             _ => None,
         },
     }
@@ -275,12 +278,14 @@ fn add_completions_for_members_with_gmod_owner(
     let mut sorted_entries: Vec<_> = members.iter().collect();
     sorted_entries.sort_unstable_by_key(|(name, _)| *name);
 
+    let mut realm_filter = RealmFilter::new(builder);
     for (_, member_infos) in sorted_entries {
         add_resolve_member_infos(
             builder,
             member_infos,
             completion_status,
             gmod_fallback_owner,
+            &mut realm_filter,
         );
     }
 
@@ -292,10 +297,11 @@ fn add_resolve_member_infos(
     member_infos: &Vec<LuaMemberInfo>,
     completion_status: CompletionTriggerStatus,
     gmod_fallback_owner: Option<GmodFallbackOwner<'_>>,
+    realm_filter: &mut RealmFilter,
 ) -> Option<()> {
     if member_infos.len() == 1 {
         let member_info = &member_infos[0];
-        if !is_member_realm_compatible(builder, member_info) {
+        if !realm_filter.accepts(builder, member_info) {
             return Some(());
         }
         let overload_count = match &member_info.typ {
@@ -333,7 +339,7 @@ fn add_resolve_member_infos(
     let resolve_state = get_resolve_state(builder.semantic_model.get_db(), &filtered_member_infos);
 
     for member_info in filtered_member_infos {
-        if !is_member_realm_compatible(builder, member_info) {
+        if !realm_filter.accepts(builder, member_info) {
             continue;
         }
 
@@ -558,28 +564,122 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
         || owner_name.eq_ignore_ascii_case("PLUGIN")
 }
 
-fn is_member_realm_compatible(builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {
-    if !builder.semantic_model.get_emmyrc().gmod.enabled {
-        return true;
+/// Realm filtering state shared by every candidate member of one request.
+///
+/// The call-site mask depends only on the request's own position, and a file's
+/// `---@realm` annotations are the same for every member declared in it. Both
+/// used to be re-derived per member, which meant walking the declaring file's
+/// entire syntax tree once per candidate — 98ms of a 200ms completion on a
+/// gamemode workspace. The analyzer already indexes those ranges, so prefer its
+/// binary search and fall back to one cached walk per file, exactly as the
+/// realm-misuse checker does.
+struct RealmFilter {
+    enabled: bool,
+    call_mask: GmodStateMask,
+    walked: HashMap<FileId, Vec<(rowan::TextRange, GmodRealm)>>,
+}
+
+impl RealmFilter {
+    fn new(builder: &CompletionBuilder) -> Self {
+        let enabled = builder.semantic_model.get_emmyrc().gmod.enabled;
+        let call_mask = if enabled {
+            builder
+                .semantic_model
+                .get_db()
+                .get_gmod_infer_index()
+                .get_state_mask_at_offset(
+                    &builder.semantic_model.get_file_id(),
+                    builder.position_offset,
+                )
+        } else {
+            GmodStateMask::empty()
+        };
+        Self {
+            enabled,
+            call_mask,
+            walked: HashMap::new(),
+        }
     }
 
-    let infer_index = builder.semantic_model.get_db().get_gmod_infer_index();
-    let call_mask = infer_index.get_state_mask_at_offset(
-        &builder.semantic_model.get_file_id(),
-        builder.position_offset,
-    );
+    fn annotation_realm(
+        &mut self,
+        semantic_model: &SemanticModel,
+        file_id: &FileId,
+        offset: TextSize,
+    ) -> Option<GmodRealm> {
+        let infer_index = semantic_model.get_db().get_gmod_infer_index();
+        if infer_index.has_member_realm_ranges(file_id) {
+            return infer_index.get_member_annotation_realm_at_offset(file_id, offset);
+        }
 
-    let Some(property_owner_id) = &info.property_owner_id else {
-        return true;
-    };
-    let Some((decl_file_id, decl_offset)) = semantic_decl_position(property_owner_id) else {
-        return true;
-    };
+        let ranges = match self.walked.get(file_id) {
+            Some(ranges) => ranges,
+            None => {
+                let ranges = collect_decl_annotation_realms(semantic_model, file_id);
+                self.walked.entry(*file_id).or_insert(ranges)
+            }
+        };
+        ranges
+            .iter()
+            .find(|(range, _)| range.contains(offset))
+            .map(|(_, realm)| *realm)
+    }
 
-    let decl_mask = resolve_decl_realm(&builder.semantic_model, property_owner_id)
-        .map(GmodRealm::state_mask)
-        .unwrap_or_else(|| infer_index.get_state_mask_at_offset(&decl_file_id, decl_offset));
-    call_mask.is_compatible_with(decl_mask)
+    fn accepts(&mut self, builder: &CompletionBuilder, info: &LuaMemberInfo) -> bool {
+        if !self.enabled {
+            return true;
+        }
+
+        let Some(property_owner_id) = &info.property_owner_id else {
+            return true;
+        };
+        let Some((decl_file_id, decl_offset)) = semantic_decl_position(property_owner_id) else {
+            return true;
+        };
+
+        let decl_mask = self
+            .annotation_realm(&builder.semantic_model, &decl_file_id, decl_offset)
+            .or_else(|| {
+                resolve_decl_realm_without_annotation(&builder.semantic_model, property_owner_id)
+            })
+            .map(GmodRealm::state_mask)
+            .unwrap_or_else(|| {
+                builder
+                    .semantic_model
+                    .get_db()
+                    .get_gmod_infer_index()
+                    .get_state_mask_at_offset(&decl_file_id, decl_offset)
+            });
+        self.call_mask.is_compatible_with(decl_mask)
+    }
+}
+
+/// Every `---@realm` covered range in a file, in one walk.
+fn collect_decl_annotation_realms(
+    semantic_model: &SemanticModel,
+    file_id: &FileId,
+) -> Vec<(rowan::TextRange, GmodRealm)> {
+    let Some(tree) = semantic_model.get_db().get_vfs().get_syntax_tree(file_id) else {
+        return Vec::new();
+    };
+    let mut ranges = Vec::new();
+    for node in tree.get_chunk_node().syntax().descendants() {
+        if let Some(func_stat) = LuaFuncStat::cast(node.clone()) {
+            if let Some(comment) = func_stat.get_left_comment()
+                && let Some(realm) = realm_from_doc_comment(&comment)
+            {
+                ranges.push((func_stat.get_range(), realm));
+            }
+            continue;
+        }
+        if let Some(local_func_stat) = LuaLocalFuncStat::cast(node)
+            && let Some(comment) = local_func_stat.get_left_comment()
+            && let Some(realm) = realm_from_doc_comment(&comment)
+        {
+            ranges.push((local_func_stat.get_range(), realm));
+        }
+    }
+    ranges
 }
 
 fn semantic_decl_position(property_owner_id: &LuaSemanticDeclId) -> Option<(FileId, TextSize)> {
@@ -593,50 +693,18 @@ fn semantic_decl_position(property_owner_id: &LuaSemanticDeclId) -> Option<(File
     }
 }
 
-fn resolve_decl_realm(
+/// The declaration's realm once its `---@realm` annotation has been ruled out.
+fn resolve_decl_realm_without_annotation(
     semantic_model: &SemanticModel,
     property_owner_id: &LuaSemanticDeclId,
 ) -> Option<GmodRealm> {
     let (decl_file_id, decl_offset) = semantic_decl_position(property_owner_id)?;
-    if let Some(annotation_realm) =
-        resolve_decl_annotation_realm_at_offset(semantic_model, &decl_file_id, decl_offset)
-    {
-        return Some(annotation_realm);
-    }
-
     Some(
         semantic_model
             .get_db()
             .get_gmod_infer_index()
             .get_realm_at_offset(&decl_file_id, decl_offset),
     )
-}
-
-fn resolve_decl_annotation_realm_at_offset(
-    semantic_model: &SemanticModel,
-    file_id: &FileId,
-    offset: TextSize,
-) -> Option<GmodRealm> {
-    let tree = semantic_model.get_db().get_vfs().get_syntax_tree(file_id)?;
-    for func_stat in tree.get_chunk_node().descendants::<LuaFuncStat>() {
-        if func_stat.get_range().contains(offset)
-            && let Some(comment) = func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            return Some(realm);
-        }
-    }
-
-    for local_func_stat in tree.get_chunk_node().descendants::<LuaLocalFuncStat>() {
-        if local_func_stat.get_range().contains(offset)
-            && let Some(comment) = local_func_stat.get_left_comment()
-            && let Some(realm) = realm_from_doc_comment(&comment)
-        {
-            return Some(realm);
-        }
-    }
-
-    None
 }
 
 fn realm_from_doc_comment(comment: &LuaComment) -> Option<GmodRealm> {

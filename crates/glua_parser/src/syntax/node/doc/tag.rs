@@ -1611,6 +1611,10 @@ impl LuaAstNode for LuaDocTagOutparam {
 impl LuaDocDescriptionOwner for LuaDocTagOutparam {}
 
 impl LuaDocTagOutparam {
+    pub fn get_path_token(&self) -> Option<LuaNameToken> {
+        self.token()
+    }
+
     pub fn get_path(&self) -> Option<String> {
         let mut path = String::new();
         for child in self.syntax.children_with_tokens() {

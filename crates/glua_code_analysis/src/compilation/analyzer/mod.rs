@@ -30,8 +30,8 @@ use crate::{
     semantic::infer_expr_fact_with_cache,
 };
 use glua_parser::{
-    LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr, LuaSyntaxId,
-    LuaSyntaxNode,
+    BinaryOperator, LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr,
+    LuaSyntaxId, LuaSyntaxNode,
 };
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
@@ -258,12 +258,39 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             common::reconcile_parked_global_path_members(db);
         }
 
+        // Writes that inferred their prefix to one concrete declaration of a
+        // multi-declaration global attach directly to that table and never
+        // park, so which table won depends on batch composition. Re-apply the
+        // ownership rule to them now that every declaration stands. See
+        // `reconcile_directly_attached_candidate_members`.
+        {
+            let _p = Profile::new("reconcile_directly_attached_candidate_members");
+            common::reconcile_directly_attached_candidate_members(db);
+        }
+
         // Runs last of the settled passes: it needs every member to have reached
         // its final owner, because the writer set it merges is grouped by owner.
         {
             let _p = Profile::new("rederive_contributed_member_assignments");
             let analyzed_files = context.analyzed_file_ids();
             lua::rederive_contributed_member_assignments(db, &analyzed_files);
+        }
+
+        // Every settled pass above refines the types the member attach retry
+        // reads, so candidates it could not place on the first attempt can be
+        // placed now. Without this a member's existence depends on how far
+        // inference had progressed when its file happened to be walked.
+        {
+            let _p = Profile::new("attach_settled_index_expr_members (late)");
+            attach_settled_index_expr_members(db, &mut context);
+        }
+
+        // The late attach can still place members straight onto whichever
+        // candidate table its prefix resolved to, so the direct-attached
+        // repair has to see its results too.
+        {
+            let _p = Profile::new("reconcile_directly_attached_candidate_members (late)");
+            common::reconcile_directly_attached_candidate_members(db);
         }
 
         // Net flows are collected last: the collector resolves wrappers through
@@ -312,6 +339,7 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
     }
     candidates.sort_by_key(|candidate| (candidate.file_id, candidate.value.get_range().start()));
     candidates.dedup();
+    let mut retry = Vec::new();
 
     // Only the candidate files are re-inferred, so only their caches are stale.
     // Clearing the whole manager would also discard caches the passes that ran
@@ -353,8 +381,17 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
             ret_idx: 0,
         };
         let cache = context.infer_manager.get_infer_cache(file_id);
-        let _ = unresolve::try_resolve_member(db, cache, &mut unresolve_member);
+        if unresolve::try_resolve_member(db, cache, &mut unresolve_member).is_err() {
+            // The prefix still has not settled. Dropping it here is what made a
+            // member's existence depend on analysis order: the passes that run
+            // after this one go on refining the very types this retry needs, so
+            // a candidate that fails now can succeed once they have. Keep it
+            // queued for the next attempt instead.
+            retry.push(candidate);
+        }
     }
+
+    context.settled_member_attach_candidates = retry;
 }
 
 /// Re-resolves inferred returns that settled on `any`/`unknown`.
@@ -571,21 +608,64 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                     .get_reference_index()
                     .get_decl_references(&decl_id.file_id, decl_id)
                     .is_none_or(|references| !references.mutable);
-            if !current_is_uninformative && !can_refine_nominal_type && !can_upgrade_authority {
-                continue;
-            }
-
             let Some((ret_idx, expr)) = local_initializer_expr(db, &root, *decl_id) else {
                 continue;
             };
-            if !matches!(expr, LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_)) {
+            if !initializer_reads_through_call_or_index(&expr) {
                 continue;
             }
+
+            // Every pass before the dynamic-field one ran without those facts,
+            // so an initializer that reads a dynamic field was answered blind
+            // and the answer was cached as if it were final. Re-inferring with
+            // the index hidden reproduces exactly that blind answer, so where
+            // it differs from the settled one *and* matches what is cached, the
+            // cache is provably the guess and the settled read replaces it.
+            // Whether the field's writer had been walked yet is a property of
+            // the batch, not of the source: cold cached `false` for
+            // `local on = LocalPlayer()._flag or false` where re-analysing the
+            // same unchanged file cached `true`.
             let inferred_fact = select_result_fact(
-                infer_expr_fact_with_cache(db, &mut infer_cache, expr),
+                infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone()),
                 ret_idx,
             );
             let inferred_type = inferred_fact.typ().clone();
+
+            // Only asked when nothing else would let the settled read through
+            // and it actually disagrees with the cache, so the second inference
+            // is paid for the handful of decls whose answer it can change.
+            let cached_a_blind_dynamic_field_read = !current_is_uninformative
+                && dynamic_fields_visible
+                && current_cache
+                    .as_ref()
+                    .is_some_and(|current| current.as_type() != &inferred_type)
+                && {
+                    let mut blind_cache = crate::LuaInferCache::new(
+                        file_id,
+                        crate::CacheOptions {
+                            analysis_phase,
+                            dynamic_fields_visible: false,
+                            building_dynamic_field_index: false,
+                        },
+                    );
+                    let blind_type = select_result_fact(
+                        infer_expr_fact_with_cache(db, &mut blind_cache, expr),
+                        ret_idx,
+                    )
+                    .typ()
+                    .clone();
+                    current_cache
+                        .as_ref()
+                        .is_some_and(|current| current.as_type() == &blind_type)
+                        && blind_type != inferred_type
+                };
+            if !current_is_uninformative
+                && !can_refine_nominal_type
+                && !can_upgrade_authority
+                && !cached_a_blind_dynamic_field_read
+            {
+                continue;
+            }
             if type_is_uninformative(&inferred_type) {
                 // When the cache and the settled re-derivation disagree
                 // over *which* bottom an unresolvable initializer has, both
@@ -644,6 +724,7 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
             } else if has_stronger_declared_authority
                 || is_nominal_refinement
                 || is_settled_widening
+                || cached_a_blind_dynamic_field_read
             {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
@@ -919,6 +1000,30 @@ fn single_nominal_type_id(typ: &LuaType) -> Option<LuaTypeDeclId> {
     }
 }
 
+/// Whether an initializer's type is decided by a call or index read.
+///
+/// `or`, `and` and parentheses take their type from an operand, so they inherit
+/// exactly the same sensitivity to what the batch has indexed so far while
+/// hiding it behind a different syntax node.
+pub(crate) fn initializer_reads_through_call_or_index(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::CallExpr(_) | LuaExpr::IndexExpr(_) => true,
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| initializer_reads_through_call_or_index(&inner)),
+        LuaExpr::BinaryExpr(binary) => {
+            matches!(
+                binary.get_op_token().map(|op| op.get_op()),
+                Some(BinaryOperator::OpOr | BinaryOperator::OpAnd)
+            ) && binary.get_exprs().is_some_and(|(left, right)| {
+                initializer_reads_through_call_or_index(&left)
+                    || initializer_reads_through_call_or_index(&right)
+            })
+        }
+        _ => false,
+    }
+}
+
 fn local_initializer_expr(
     db: &DbIndex,
     root: &LuaSyntaxNode,
@@ -1030,6 +1135,13 @@ fn run_analysis<T: AnalysisPipeline>(db: &mut DbIndex, context: &mut AnalyzeCont
         .rsplit("::")
         .next()
         .unwrap_or_default();
+    if context.tree_list.len() > 1 {
+        crate::progress::enter_phase(
+            crate::progress::phase_label(name),
+            context.tree_list.len(),
+            "files",
+        );
+    }
     // Timed through the phase accumulator rather than a `Profile`: several
     // pipelines already carry their own `Profile`, and an unconditional one
     // here would add a log line per pipeline per batch on a live server.

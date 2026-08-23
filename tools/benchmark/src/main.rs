@@ -140,6 +140,25 @@ fn run_incremental_edits(
     let mut total = std::time::Duration::ZERO;
     let mut worst = std::time::Duration::ZERO;
     let mut edited = 0usize;
+    // `BENCH_EDIT_REPEAT=N` edits each file N times, which both fills a
+    // sampling profiler's edit window and separates first-edit cache warming
+    // from the steady-state cost of typing.
+    let repeats: usize = std::env::var("BENCH_EDIT_REPEAT")
+        .ok()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(1)
+        .max(1);
+    let sample: Vec<(FileId, usize)> = sample
+        .into_iter()
+        .flat_map(|entry| std::iter::repeat_n(entry, repeats))
+        .collect();
+    if std::env::var_os("BENCH_IDEMPOTENCY").is_some() {
+        if let Some((file_id, _)) = sample.first().copied() {
+            report_reindex_idempotency(analysis, file_id);
+        }
+        return None;
+    }
+
     for (file_id, expansion) in sample {
         let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
             continue;
@@ -169,9 +188,46 @@ fn run_incremental_edits(
                     .map_or(0.0, |s| s.elapsed().as_secs_f64())
             );
         }
-        let t = Instant::now();
-        analysis.update_file_by_uri(&uri, Some(edited_text));
-        let reindex = t.elapsed();
+        // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
+        // position-based request actually depends on: re-indexing the edited
+        // file alone, then the dependency ripple. It reports what a handler
+        // gated on the edited file's own freshness would wait for.
+        let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
+            // The expansion has to be captured before the edit lands, exactly as
+            // the production edit path does; recomputing it after the edited
+            // file has been re-indexed under-expands.
+            let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+            analysis.update_file_text_only(&uri, edited_text);
+            // Just the edited file's own entries — no cross-file stabilization
+            // and no expansion. This is the floor a position-based request has
+            // to wait for if it is gated on its own file rather than on the
+            // whole ripple.
+            let t = Instant::now();
+            analysis.compilation.remove_index(vec![file_id]);
+            analysis.compilation.update_index(vec![file_id]);
+            let self_only = t.elapsed();
+            // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
+            // entries, so a profile of the run contains nothing but the cost a
+            // per-file freshness gate would pay.
+            let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+                std::time::Duration::ZERO
+            } else {
+                let t = Instant::now();
+                analysis.reindex_expanded_files(vec![file_id], expansion);
+                t.elapsed()
+            };
+            eprintln!(
+                "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
+                self_only.as_secs_f64(),
+                ripple.as_secs_f64()
+            );
+            self_only + ripple
+        } else {
+            let t = Instant::now();
+            analysis.update_file_by_uri(&uri, Some(edited_text));
+            t.elapsed()
+        };
+
         let t = Instant::now();
         let shared = analysis.precompute_diagnostic_shared_data();
         analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
@@ -186,7 +242,18 @@ fn run_incremental_edits(
             reindex.as_secs_f64(),
             diagnostics.as_secs_f64()
         );
-        analysis.update_file_by_uri(&uri, Some(text));
+        // Reverting through the full path costs a whole ripple per iteration —
+        // several times the self-index being measured, and untimed, so it
+        // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
+        // exists to leave nothing but the self-index in the profile, so the
+        // revert has to match it.
+        if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+            analysis.update_file_text_only(&uri, text);
+            analysis.compilation.remove_index(vec![file_id]);
+            analysis.compilation.update_index(vec![file_id]);
+        } else {
+            analysis.update_file_by_uri(&uri, Some(text));
+        }
     }
     if edited == 0 {
         return None;
@@ -198,6 +265,98 @@ fn run_incremental_edits(
         worst.as_secs_f64()
     );
     Some(worst)
+}
+
+/// Everything a *consumer* of a file could observe from it: the members it
+/// attaches and the types it has inferred.
+fn contribution_entries(analysis: &EmmyLuaAnalysis, file_id: FileId) -> Vec<String> {
+    let db = analysis.compilation.get_db();
+    let member_index = db.get_member_index();
+    let mut entries = Vec::new();
+    for (owner, cache) in db.get_type_index().iter_type_caches() {
+        if owner.get_file_id() == file_id {
+            entries.push(format!("type {owner:?} = {:?}", cache.as_type()));
+        }
+    }
+    for member in member_index.get_file_members(file_id) {
+        entries.push(format!(
+            "member {:?} owner={:?}",
+            member.get_key(),
+            member_index.get_member_owner(&member.get_id())
+        ));
+    }
+    entries.sort();
+    entries
+}
+
+/// `BENCH_IDEMPOTENCY=1` re-indexes the target with its text untouched and
+/// reports what the workspace disagrees with itself about afterwards.
+///
+/// Re-analysing a file whose text and inputs are unchanged ought to reproduce
+/// exactly what was already there. Where it does not, every "has this actually
+/// changed?" optimisation downstream is dead on arrival, because every file
+/// reports itself as changed.
+fn report_reindex_idempotency(analysis: &mut EmmyLuaAnalysis, file_id: FileId) {
+    let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+    let before = expansion
+        .iter()
+        .map(|id| (*id, contribution_entries(analysis, *id)))
+        .collect::<Vec<_>>();
+
+    analysis.reindex_files(vec![file_id]);
+
+    let mut changed = 0usize;
+    let mut shown = 0usize;
+    for (id, was) in &before {
+        let now = contribution_entries(analysis, *id);
+        if &now == was {
+            continue;
+        }
+        changed += 1;
+        let show_limit: usize = std::env::var("BENCH_IDEMPOTENCY_SHOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2);
+        if shown >= show_limit {
+            continue;
+        }
+        shown += 1;
+        let name = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_path(id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("{id:?}"));
+        eprintln!("  [idempotency] {name}");
+        let count = |lines: &[String]| {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for line in lines {
+                *counts.entry(line.clone()).or_default() += 1;
+            }
+            counts
+        };
+        let (was_counts, now_counts) = (count(was), count(&now));
+        let mut shown_lines = 0;
+        for (line, was_n) in &was_counts {
+            let now_n = now_counts.get(line).copied().unwrap_or(0);
+            if *was_n != now_n && shown_lines < 6 {
+                shown_lines += 1;
+                eprintln!("      {was_n} -> {now_n}: {line}");
+            }
+        }
+        for (line, now_n) in &now_counts {
+            if !was_counts.contains_key(line) && shown_lines < 6 {
+                shown_lines += 1;
+                eprintln!("      0 -> {now_n}: {line}");
+            }
+        }
+    }
+    eprintln!(
+        "  [idempotency] no-op reindex of {} files changed {} of them",
+        expansion.len(),
+        changed
+    );
 }
 
 fn discover_config_files(root: &Path) -> Vec<PathBuf> {
@@ -215,8 +374,25 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
     .collect()
 }
 
-#[tokio::main]
-async fn main() {
+/// Analysis recurses over deeply nested syntax. The server does that work on
+/// spawned threads, which get a far larger stack than a process main thread does
+/// on Windows, so the tools have to ask for one explicitly.
+fn main() {
+    std::thread::Builder::new()
+        .stack_size(256 * 1024 * 1024)
+        .spawn(|| {
+            tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("tokio runtime should build")
+                .block_on(run());
+        })
+        .expect("benchmark worker thread should spawn")
+        .join()
+        .expect("benchmark worker thread should not panic");
+}
+
+async fn run() {
     let _ = PROCESS_START.set(Instant::now());
     #[allow(unused_mut, unused_assignments, unused_variables)]
     let mut alloc_mark = (0u64, 0u64);
@@ -279,6 +455,34 @@ async fn main() {
     // Add annotations as library workspace
     analysis.add_library_workspace(annotations_path.clone());
 
+    // The server resolves the gamemode base and loads it as a library, so a
+    // benchmark without those roots re-indexes a much smaller dependency
+    // expansion than a keystroke really pays for. `BENCH_LIBS` lists the extra
+    // library roots (e.g. the `sandbox` and `base` gamemodes) so the harness
+    // measures the workspace the editor actually has open.
+    let extra_libraries = std::env::var("BENCH_LIBS")
+        .ok()
+        .into_iter()
+        .flat_map(|libs| {
+            libs.split(',')
+                .map(str::trim)
+                .filter(|lib| !lib.is_empty())
+                .map(PathBuf::from)
+                .collect::<Vec<_>>()
+        })
+        .collect::<Vec<_>>();
+    for library in &extra_libraries {
+        if !library.exists() {
+            eprintln!(
+                "ERROR: BENCH_LIBS path does not exist: {}",
+                library.display()
+            );
+            std::process::exit(1);
+        }
+        eprintln!("Library: {}", library.display());
+        analysis.add_library_workspace(library.clone());
+    }
+
     // Add main workspace
     analysis.add_main_workspace(large_path.clone());
     results.push(BenchmarkResult {
@@ -288,10 +492,13 @@ async fn main() {
 
     // Phase 3: Collect files
     let t = Instant::now();
-    let mut workspace_folders = vec![
-        WorkspaceFolder::new(annotations_path.clone(), true),
-        WorkspaceFolder::new(large_path.clone(), false),
-    ];
+    let mut workspace_folders = vec![WorkspaceFolder::new(annotations_path.clone(), true)];
+    workspace_folders.extend(
+        extra_libraries
+            .iter()
+            .map(|library| WorkspaceFolder::new(library.clone(), true)),
+    );
+    workspace_folders.push(WorkspaceFolder::new(large_path.clone(), false));
 
     // Add library paths from config
     for lib in &emmyrc.workspace.library {
@@ -363,7 +570,12 @@ async fn main() {
         // the ranking pass, which costs ~27s and swamps a CPU profile.
         let explicit_targets = std::env::var("BENCH_EDIT_TARGETS").ok();
         if let Some(targets) = &explicit_targets {
-            let wanted: Vec<&str> = targets.split(',').map(str::trim).collect();
+            // A target is either a bare file name or a path suffix, so that a
+            // common name like `shared.lua` can be pinned to one entity.
+            let wanted: Vec<String> = targets
+                .split(',')
+                .map(|target| target.trim().replace('\\', "/").to_lowercase())
+                .collect();
             let sample: Vec<(FileId, usize)> = main_ids
                 .iter()
                 .filter(|id| {
@@ -372,10 +584,12 @@ async fn main() {
                         .get_db()
                         .get_vfs()
                         .get_file_path(id)
-                        .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
-                        .is_some_and(|name| wanted.iter().any(|w| name == *w))
+                        .map(|path| path.to_string_lossy().replace('\\', "/").to_lowercase())
+                        .is_some_and(|path| {
+                            wanted.iter().any(|wanted| path.ends_with(wanted.as_str()))
+                        })
                 })
-                .map(|id| (*id, 0))
+                .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
                 .collect();
             #[cfg(feature = "dhat-heap")]
             let dhat_edit = dhat::Profiler::builder()
@@ -393,6 +607,36 @@ async fn main() {
                 .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
                 .collect();
             ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            {
+                // What an edit costs depends almost entirely on how many files
+                // it drags in, so the shape of that distribution matters more
+                // than the worst case the sample below reports.
+                let sizes: Vec<usize> = ranked.iter().map(|(_, n)| *n).collect();
+                let total = sizes.len();
+                let pct = |p: usize| sizes[(total.saturating_sub(1)) * (100 - p) / 100];
+                let buckets = [1usize, 5, 20, 100, 500, usize::MAX];
+                let mut counts = vec![0usize; buckets.len()];
+                for n in &sizes {
+                    for (idx, limit) in buckets.iter().enumerate() {
+                        if n <= limit {
+                            counts[idx] += 1;
+                            break;
+                        }
+                    }
+                }
+                eprintln!(
+                    "  [incremental] expansion distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
+                    pct(50),
+                    pct(75),
+                    pct(90),
+                    pct(99),
+                    sizes.first().copied().unwrap_or(0)
+                );
+                eprintln!(
+                    "  [incremental] <=1: {} | <=5: {} | <=20: {} | <=100: {} | <=500: {} | >500: {}",
+                    counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+                );
+            }
             eprintln!(
                 "  [incremental] ranked {} files by reindex expansion in {:.3}s",
                 ranked.len(),

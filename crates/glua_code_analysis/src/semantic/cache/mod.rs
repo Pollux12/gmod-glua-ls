@@ -15,7 +15,7 @@ use crate::{
     semantic::infer::{InferFailReason, ParamInferenceSource},
 };
 
-type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
+pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub enum FlowOrigin {
@@ -89,6 +89,14 @@ pub struct LuaInferCache {
     pub flow_node_cache:
         FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
+    /// Scratch memo for one top-level closure-baseline query. Without it that
+    /// walk re-derives each merge point once per path into it.
+    ///
+    /// Cleared when the outermost baseline query returns: a baseline answer
+    /// depends on how far the pass has got, which is not in the key, so one
+    /// must never answer a later query.
+    pub baseline_flow_memo: FxHashMap<(VarRefCacheKey, FlowCacheInnerKey), LuaType>,
+    pub baseline_flow_depth: u32,
     pub flow_node_realm_cache: FxHashMap<FlowId, GmodRealm>,
     pub index_ref_origin_type_cache: FxHashMap<VarRefCacheKey, CacheEntry<LuaType>>,
     pub param_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
@@ -128,6 +136,14 @@ pub struct LuaInferCache {
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
+    /// Call sites of a local function, keyed by its declaration. Syntax ids,
+    /// not nodes: red nodes are `!Send`.
+    pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
+    /// Whether a call diverges, keyed by the call expression. The flow walk asks
+    /// this of every call node it reaches, and answering means resolving what
+    /// the call targets through the reference, property, member and signature
+    /// indexes.
+    pub call_returns_never_cache: FxHashMap<LuaSyntaxId, bool>,
     inferred_guard_dependencies: HashSet<LuaInferredGuardOwner>,
 }
 
@@ -141,6 +157,8 @@ impl LuaInferCache {
             call_arg_types_cache: FxHashMap::default(),
             flow_node_cache: FxHashMap::default(),
             flow_query_realm: None,
+            baseline_flow_memo: FxHashMap::default(),
+            baseline_flow_depth: 0,
             flow_node_realm_cache: FxHashMap::default(),
             index_ref_origin_type_cache: FxHashMap::default(),
             param_type_cache: FxHashMap::default(),
@@ -161,6 +179,8 @@ impl LuaInferCache {
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
             vgui_parent_fallback_calls: FxHashSet::default(),
+            local_function_call_sites_cache: FxHashMap::default(),
+            call_returns_never_cache: FxHashMap::default(),
             inferred_guard_dependencies: HashSet::new(),
         }
     }
@@ -241,6 +261,7 @@ impl LuaInferCache {
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
+        self.call_returns_never_cache.clear();
     }
 
     /// Discards the inference a wave of deferred resolution can have
@@ -249,6 +270,9 @@ impl LuaInferCache {
         self.expr_cache.clear();
         self.call_cache.clear();
         self.call_arg_types_cache.clear();
+        // A resolved signature return is exactly what turns this answer from
+        // `false` to `true`, so it cannot survive a wave.
+        self.call_returns_never_cache.clear();
         self.flow_node_cache.retain(|_, inner| {
             inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
             !inner.is_empty()
@@ -274,6 +298,7 @@ impl LuaInferCache {
         self.index_ref_origin_type_cache.clear();
         self.param_type_cache.clear();
         self.param_type_source_cache.clear();
+        self.call_returns_never_cache.clear();
         // Local reference identities come directly from immutable reference
         // indexes and are safe to retain. Global/member/self roots can be
         // selected through types and overloads that unresolve is about to
