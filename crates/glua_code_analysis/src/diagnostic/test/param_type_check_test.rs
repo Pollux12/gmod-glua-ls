@@ -4574,4 +4574,49 @@ mod test {
             "#,
         ));
     }
+
+    /// `if a.x ~= nil` on an untyped container narrows the field to `never`,
+    /// because the flow antecedent for a field it cannot resolve is `nil`. The
+    /// branch is not actually unreachable, so nothing may be reported against a
+    /// value inside it - and a runtime `TypeGuard` cannot recover one either,
+    /// since `never & T` is `never`.
+    #[test]
+    fn neq_nil_on_an_untyped_container_field_reports_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local function base(a)
+                if a.x ~= nil then math.max(0, a.x) end
+            end
+            "#,
+        ));
+    }
+
+    /// A `never` *member* is a declared shape contradicting itself
+    /// (`integer & string`), which is a real defect and keeps reporting.
+    #[test]
+    fn contradictory_intersection_member_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class NevA
+            ---@field y integer
+
+            ---@class NevB
+            ---@field y string
+
+            local c ---@type NevA & NevB
+
+            ---@class NevC
+            ---@field y integer
+
+            ---@type NevC
+            _ = c
+            "#
+        ));
+    }
 }

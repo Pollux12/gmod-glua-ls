@@ -120,6 +120,20 @@ fn check_general_type_compact(
         return Ok(());
     }
 
+    // `never` is the bottom of the lattice: it holds no values, so there is no
+    // value it could fail to be. It is what narrowing produces where the
+    // analyzer's own picture is contradictory — `if a.x ~= nil` on a field it
+    // could only see as `nil` — and reporting a type error against code we
+    // believe unreachable says nothing about the source. Nor can a runtime
+    // guard recover it, since `never & T` is `never`.
+    //
+    // Only the value the caller asked about. A `never` *member* is a declared
+    // shape that contradicts itself (`integer & string`), which is worth
+    // reporting on its own merits.
+    if compact_type.is_never() && check_guard.is_top_level() {
+        return Ok(());
+    }
+
     if fast_eq_check(source, compact_type) {
         return Ok(());
     }
