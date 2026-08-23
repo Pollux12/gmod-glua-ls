@@ -4527,4 +4527,28 @@ mod test {
             "inferred dynamic key field values should respect inferred mismatch diagnostics policy: {diagnostics:?}"
         );
     }
+
+    /// The same runtime write also reached table compatibility, which reported
+    /// the literal as missing a member the class never declared.
+    #[test]
+    fn undeclared_field_written_to_a_container_element_is_not_expected_of_a_literal() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Fires
+            ---@field ID string
+
+            ---@type table<string, Fires>
+            local storeF = {}
+
+            ---@param t Fires
+            local function makeF(t) return t.ID end
+
+            makeF({ ID = "a" })
+            for _, v in pairs(storeF) do v.X = 5 end
+            "#,
+        ));
+    }
 }

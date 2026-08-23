@@ -68,6 +68,17 @@ impl LuaMember {
     pub fn get_global_id(&self) -> Option<&GlobalId> {
         self.global_id.as_ref()
     }
+
+    /// Whether this member exists because something assigned to it (`v.X = 1`),
+    /// rather than because a declaration named it.
+    ///
+    /// An assignment adds a field to a value; only a declaration states what the
+    /// type requires of one. Checkers that ask "must a literal supply this?"
+    /// have to tell the two apart.
+    pub fn is_assignment_define(&self) -> bool {
+        self.feature == LuaMemberFeature::FileDefine
+            && self.member_id.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
+    }
 }
 
 #[derive(Debug, Eq, PartialEq, Clone, Copy, Hash, Serialize, Deserialize)]

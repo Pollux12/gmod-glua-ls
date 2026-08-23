@@ -10,9 +10,9 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_structural_method_member,
-    member_has_documented_default, type_check_fail_reason::TypeCheckFailReason,
-    type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_assignment_added_member,
+    is_structural_method_member, member_has_documented_default,
+    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
 pub fn check_generic_type_compact(
@@ -205,6 +205,7 @@ fn check_generic_type_compact_table(
                 }
             }
             None if !source_member_type.is_optional()
+                && !is_assignment_added_member(context.db, property_owner_id.as_ref())
                 && !member_has_documented_default(
                     context.db,
                     property_owner_id.as_ref(),
