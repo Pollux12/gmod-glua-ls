@@ -152,6 +152,13 @@ fn run_incremental_edits(
         .into_iter()
         .flat_map(|entry| std::iter::repeat_n(entry, repeats))
         .collect();
+    if std::env::var_os("BENCH_IDEMPOTENCY").is_some() {
+        if let Some((file_id, _)) = sample.first().copied() {
+            report_reindex_idempotency(analysis, file_id);
+        }
+        return None;
+    }
+
     for (file_id, expansion) in sample {
         let Some(uri) = analysis.compilation.get_db().get_vfs().get_uri(&file_id) else {
             continue;
@@ -247,6 +254,98 @@ fn run_incremental_edits(
         worst.as_secs_f64()
     );
     Some(worst)
+}
+
+/// Everything a *consumer* of a file could observe from it: the members it
+/// attaches and the types it has inferred.
+fn contribution_entries(analysis: &EmmyLuaAnalysis, file_id: FileId) -> Vec<String> {
+    let db = analysis.compilation.get_db();
+    let member_index = db.get_member_index();
+    let mut entries = Vec::new();
+    for (owner, cache) in db.get_type_index().iter_type_caches() {
+        if owner.get_file_id() == file_id {
+            entries.push(format!("type {owner:?} = {:?}", cache.as_type()));
+        }
+    }
+    for member in member_index.get_file_members(file_id) {
+        entries.push(format!(
+            "member {:?} owner={:?}",
+            member.get_key(),
+            member_index.get_member_owner(&member.get_id())
+        ));
+    }
+    entries.sort();
+    entries
+}
+
+/// `BENCH_IDEMPOTENCY=1` re-indexes the target with its text untouched and
+/// reports what the workspace disagrees with itself about afterwards.
+///
+/// Re-analysing a file whose text and inputs are unchanged ought to reproduce
+/// exactly what was already there. Where it does not, every "has this actually
+/// changed?" optimisation downstream is dead on arrival, because every file
+/// reports itself as changed.
+fn report_reindex_idempotency(analysis: &mut EmmyLuaAnalysis, file_id: FileId) {
+    let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+    let before = expansion
+        .iter()
+        .map(|id| (*id, contribution_entries(analysis, *id)))
+        .collect::<Vec<_>>();
+
+    analysis.reindex_files(vec![file_id]);
+
+    let mut changed = 0usize;
+    let mut shown = 0usize;
+    for (id, was) in &before {
+        let now = contribution_entries(analysis, *id);
+        if &now == was {
+            continue;
+        }
+        changed += 1;
+        let show_limit: usize = std::env::var("BENCH_IDEMPOTENCY_SHOW")
+            .ok()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(2);
+        if shown >= show_limit {
+            continue;
+        }
+        shown += 1;
+        let name = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_path(id)
+            .map(|path| path.display().to_string())
+            .unwrap_or_else(|| format!("{id:?}"));
+        eprintln!("  [idempotency] {name}");
+        let count = |lines: &[String]| {
+            let mut counts = std::collections::BTreeMap::<String, usize>::new();
+            for line in lines {
+                *counts.entry(line.clone()).or_default() += 1;
+            }
+            counts
+        };
+        let (was_counts, now_counts) = (count(was), count(&now));
+        let mut shown_lines = 0;
+        for (line, was_n) in &was_counts {
+            let now_n = now_counts.get(line).copied().unwrap_or(0);
+            if *was_n != now_n && shown_lines < 6 {
+                shown_lines += 1;
+                eprintln!("      {was_n} -> {now_n}: {line}");
+            }
+        }
+        for (line, now_n) in &now_counts {
+            if !was_counts.contains_key(line) && shown_lines < 6 {
+                shown_lines += 1;
+                eprintln!("      0 -> {now_n}: {line}");
+            }
+        }
+    }
+    eprintln!(
+        "  [idempotency] no-op reindex of {} files changed {} of them",
+        expansion.len(),
+        changed
+    );
 }
 
 fn discover_config_files(root: &Path) -> Vec<PathBuf> {
@@ -497,6 +596,36 @@ async fn run() {
                 .map(|id| (*id, analysis.expand_reindex_file_ids(vec![*id]).len()))
                 .collect();
             ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
+            {
+                // What an edit costs depends almost entirely on how many files
+                // it drags in, so the shape of that distribution matters more
+                // than the worst case the sample below reports.
+                let sizes: Vec<usize> = ranked.iter().map(|(_, n)| *n).collect();
+                let total = sizes.len();
+                let pct = |p: usize| sizes[(total.saturating_sub(1)) * (100 - p) / 100];
+                let buckets = [1usize, 5, 20, 100, 500, usize::MAX];
+                let mut counts = vec![0usize; buckets.len()];
+                for n in &sizes {
+                    for (idx, limit) in buckets.iter().enumerate() {
+                        if n <= limit {
+                            counts[idx] += 1;
+                            break;
+                        }
+                    }
+                }
+                eprintln!(
+                    "  [incremental] expansion distribution over {total} files: median {} p75 {} p90 {} p99 {} max {}",
+                    pct(50),
+                    pct(75),
+                    pct(90),
+                    pct(99),
+                    sizes.first().copied().unwrap_or(0)
+                );
+                eprintln!(
+                    "  [incremental] <=1: {} | <=5: {} | <=20: {} | <=100: {} | <=500: {} | >500: {}",
+                    counts[0], counts[1], counts[2], counts[3], counts[4], counts[5]
+                );
+            }
             eprintln!(
                 "  [incremental] ranked {} files by reindex expansion in {:.3}s",
                 ranked.len(),
