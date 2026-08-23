@@ -3970,19 +3970,9 @@ pub(crate) fn resolve_scoped_authoring_type(
         .then(|| get_scripted_class_type_decl_id(&info.global_name, &info.class_name))
 }
 
-#[derive(Clone)]
-enum ResolvedVguiParentSource {
-    Direct(Vec<LuaTypeDeclId>),
-    AssignedField {
-        field_type_ids: Vec<LuaTypeDeclId>,
-        assignment_parent_type_ids: Vec<LuaTypeDeclId>,
-    },
-    ReceiverField {
-        field_type_ids: Vec<LuaTypeDeclId>,
-        receiver_type_ids: Vec<LuaTypeDeclId>,
-        receiver_field_parent_type_ids: Option<Vec<LuaTypeDeclId>>,
-    },
-}
+use crate::{
+    GmodVguiParentSourceResolution as ResolvedVguiParentSource, GmodVguiResolvedParentSource,
+};
 
 #[derive(Clone)]
 struct ResolvedVguiParentRelation {
@@ -4082,6 +4072,26 @@ fn resolve_vgui_parent_relations(
         if calls.is_empty() {
             continue;
         }
+        // Every call already resolved means this file was not rebuilt, so
+        // walking its syntax tree would reproduce what is cached. Skipping it is
+        // the whole point: only a handful of the workspace's vgui files are
+        // touched by any one edit.
+        if let Some(cached) = calls
+            .iter()
+            .map(|call| {
+                call.resolved_source
+                    .as_ref()
+                    .map(|source| ResolvedVguiParentRelation {
+                        syntax_id: call.syntax_id,
+                        child_type_ids: source.child_type_ids.clone(),
+                        parent: source.parent.clone(),
+                    })
+            })
+            .collect::<Option<Vec<_>>>()
+        {
+            relations_by_file.push((file_id, cached));
+            continue;
+        }
         let Some(root) = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -4124,6 +4134,27 @@ fn resolve_vgui_parent_relations(
         }
         relations_by_file.push((file_id, relations));
     }
+
+    let resolved_sources_by_file = relations_by_file
+        .iter()
+        .map(|(file_id, relations)| {
+            let sources = relations
+                .iter()
+                .map(|relation| {
+                    (
+                        relation.syntax_id,
+                        GmodVguiResolvedParentSource {
+                            child_type_ids: relation.child_type_ids.clone(),
+                            parent: relation.parent.clone(),
+                        },
+                    )
+                })
+                .collect();
+            (*file_id, sources)
+        })
+        .collect::<Vec<_>>();
+    db.get_gmod_class_metadata_index_mut()
+        .set_vgui_resolved_parent_sources(&resolved_sources_by_file);
 
     let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::new();
     let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::new();
@@ -4384,6 +4415,7 @@ fn collect_vgui_forwarding_parent_calls(
                 child: GmodVguiParentSource::Expr(child.get_syntax_id()),
                 parent: GmodVguiParentSource::LiteralName(parent_type_id.get_name().to_string()),
                 relations: Vec::new(),
+                resolved_source: None,
                 origin: GmodVguiParentCallOrigin::Forwarded,
             });
         }
@@ -10305,6 +10337,7 @@ fn collect_annotated_scripted_class_call_metadata(
                 child,
                 parent,
                 relations: Vec::new(),
+                resolved_source: None,
                 origin: GmodVguiParentCallOrigin::Annotated,
             }));
         }

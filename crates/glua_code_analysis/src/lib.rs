@@ -2354,6 +2354,7 @@ mod tests {
                     child: GmodVguiParentSource::Unknown,
                     parent: GmodVguiParentSource::Unknown,
                     relations: Vec::new(),
+                    resolved_source: None,
                     origin: GmodVguiParentCallOrigin::Annotated,
                 },
             );
