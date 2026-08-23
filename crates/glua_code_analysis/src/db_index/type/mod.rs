@@ -477,6 +477,111 @@ fn is_guarded_table_bootstrap_branch(db: &DbIndex, typ: &LuaType) -> bool {
     }
 }
 
+/// What a cached type points at, as tracked by [`TypeCacheRefIndex`].
+///
+/// Class references are keyed by declaration id rather than by file: a class's
+/// definition sites move as files are indexed, so the file set behind a
+/// `Decl` key is resolved from the live declaration at query time.
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum TypeCacheRef {
+    File(FileId),
+    Decl(LuaTypeDeclId),
+}
+
+/// Reverse map of `referenced thing -> files whose cached types reference it`,
+/// so incremental expansion is a lookup instead of a scan over every cache.
+#[derive(Debug, Default, PartialEq, Eq)]
+struct TypeCacheRefIndex {
+    owner_refs: HashMap<FileId, HashMap<TypeCacheRef, u32>>,
+    ref_owners: HashMap<TypeCacheRef, HashSet<FileId>>,
+}
+
+impl TypeCacheRefIndex {
+    fn add(&mut self, owner_file_id: FileId, typ: &LuaType) {
+        let owner_entry = self.owner_refs.entry(owner_file_id).or_default();
+        for type_ref in collect_type_cache_refs(typ) {
+            let count = owner_entry.entry(type_ref.clone()).or_insert(0);
+            *count += 1;
+            if *count == 1 {
+                self.ref_owners
+                    .entry(type_ref)
+                    .or_default()
+                    .insert(owner_file_id);
+            }
+        }
+    }
+
+    fn remove(&mut self, owner_file_id: FileId, typ: &LuaType) {
+        let Some(owner_entry) = self.owner_refs.get_mut(&owner_file_id) else {
+            return;
+        };
+        for type_ref in collect_type_cache_refs(typ) {
+            let Some(count) = owner_entry.get_mut(&type_ref) else {
+                continue;
+            };
+            *count -= 1;
+            if *count > 0 {
+                continue;
+            }
+            owner_entry.remove(&type_ref);
+            if let Some(owners) = self.ref_owners.get_mut(&type_ref) {
+                owners.remove(&owner_file_id);
+                if owners.is_empty() {
+                    self.ref_owners.remove(&type_ref);
+                }
+            }
+        }
+
+        if owner_entry.is_empty() {
+            self.owner_refs.remove(&owner_file_id);
+        }
+    }
+
+    fn remove_file(&mut self, owner_file_id: FileId) {
+        let Some(owner_entry) = self.owner_refs.remove(&owner_file_id) else {
+            return;
+        };
+        for type_ref in owner_entry.into_keys() {
+            if let Some(owners) = self.ref_owners.get_mut(&type_ref) {
+                owners.remove(&owner_file_id);
+                if owners.is_empty() {
+                    self.ref_owners.remove(&type_ref);
+                }
+            }
+        }
+    }
+
+    fn owners(&self, type_ref: &TypeCacheRef) -> Option<&HashSet<FileId>> {
+        self.ref_owners.get(type_ref)
+    }
+}
+
+fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
+    let mut refs = HashSet::default();
+    typ.visit_type(&mut |inner| {
+        match inner {
+            LuaType::TableConst(range) => {
+                refs.insert(TypeCacheRef::File(range.file_id));
+            }
+            LuaType::Instance(instance) => {
+                refs.insert(TypeCacheRef::File(instance.get_range().file_id));
+            }
+            LuaType::Signature(signature_id) => {
+                refs.insert(TypeCacheRef::File(signature_id.get_file_id()));
+            }
+            LuaType::ModuleRef(file_id) => {
+                refs.insert(TypeCacheRef::File(*file_id));
+            }
+            LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+                refs.insert(TypeCacheRef::Decl(type_id.clone()));
+            }
+            _ => {}
+        };
+    });
+
+    refs
+}
+
 #[derive(Debug)]
 pub struct LuaTypeIndex {
     file_namespace: HashMap<FileId, String>,
@@ -486,6 +591,7 @@ pub struct LuaTypeIndex {
     generic_params: HashMap<LuaTypeDeclId, Vec<GenericParam>>,
     supers: HashMap<LuaTypeDeclId, Vec<InFiled<LuaSuperType>>>,
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
+    cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
@@ -509,6 +615,7 @@ impl LuaTypeIndex {
             generic_params: HashMap::default(),
             supers: HashMap::default(),
             types: HashMap::default(),
+            cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
             fact_metadata: HashMap::default(),
             definition_facts: HashMap::default(),
@@ -825,7 +932,7 @@ impl LuaTypeIndex {
             return;
         }
         let file_id = owner.get_file_id();
-        let replaced = self.types.insert(owner.clone(), cache).is_some();
+        let replaced = self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
@@ -837,7 +944,7 @@ impl LuaTypeIndex {
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
-        self.types.insert(owner.clone(), cache);
+        self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
@@ -863,7 +970,7 @@ impl LuaTypeIndex {
 
         let file_id = owner.get_file_id();
         let metadata = metadata.normalized();
-        self.types.insert(owner.clone(), cache);
+        self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
@@ -937,13 +1044,25 @@ impl LuaTypeIndex {
     ) -> FileId {
         let file_id = owner.get_file_id();
         let metadata = metadata.normalized();
-        self.types.insert(owner.clone(), cache);
+        self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
             .entry(file_id)
             .or_default()
             .insert(owner.clone());
         self.fact_metadata.insert(owner, metadata);
         file_id
+    }
+
+    /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
+    /// whether a cache was replaced.
+    fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
+        let file_id = owner.get_file_id();
+        self.cache_refs.add(file_id, cache.as_type());
+        let Some(previous) = self.types.insert(owner, cache) else {
+            return false;
+        };
+        self.cache_refs.remove(file_id, previous.as_type());
+        true
     }
 
     pub(crate) fn bind_definition_fact_unchecked(
@@ -1034,7 +1153,7 @@ impl LuaTypeIndex {
         let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
-            self.types.insert(owner, new_cache);
+            self.insert_type_cache(owner, new_cache);
         }
         self.rebuild_inference_derived_state(&changed_files);
     }
@@ -1064,7 +1183,7 @@ impl LuaTypeIndex {
         let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
-            self.types.insert(owner, new_cache);
+            self.insert_type_cache(owner, new_cache);
         }
         self.rebuild_inference_derived_state(&changed_files);
     }
@@ -1074,16 +1193,54 @@ impl LuaTypeIndex {
         file_ids: &std::collections::HashSet<FileId, S>,
     ) -> HashSet<FileId> {
         let mut dependent_files = HashSet::default();
-        for (owner, cache) in &self.types {
-            let owner_file_id = owner.get_file_id();
-            if file_ids.contains(&owner_file_id) {
-                continue;
+        let mut visited_decls = HashSet::default();
+        for file_id in file_ids {
+            if let Some(owners) = self.cache_refs.owners(&TypeCacheRef::File(*file_id)) {
+                dependent_files.extend(owners.iter().copied().filter(|o| !file_ids.contains(o)));
             }
 
-            if self.type_references_any_file(cache.as_type(), file_ids, owner_file_id) {
-                dependent_files.insert(owner_file_id);
+            // A file that only *names* a class still has to be re-analysed when
+            // a changed file is one of that class's definition sites: its
+            // inference reads the class's full member set, which that file
+            // contributes to.
+            let Some(decl_ids) = self.file_types.get(file_id) else {
+                continue;
+            };
+            for decl_id in decl_ids {
+                if !visited_decls.insert(decl_id) {
+                    continue;
+                }
+
+                let Some(owners) = self.cache_refs.owners(&TypeCacheRef::Decl(decl_id.clone()))
+                else {
+                    continue;
+                };
+                let Some(decl) = self.full_name_type_map.get(decl_id) else {
+                    continue;
+                };
+                let locations = decl.get_locations();
+                if !locations
+                    .iter()
+                    .any(|location| file_ids.contains(&location.file_id))
+                {
+                    continue;
+                }
+
+                dependent_files.extend(owners.iter().copied().filter(|owner_file_id| {
+                    !file_ids.contains(owner_file_id)
+                        && !locations
+                            .iter()
+                            .any(|location| location.file_id == *owner_file_id)
+                }));
             }
         }
+
+        #[cfg(feature = "verify_type_cache_refs")]
+        assert_eq!(
+            dependent_files,
+            self.files_with_type_caches_referencing_files_by_scan(file_ids),
+            "type cache reverse index disagrees with a full scan"
+        );
 
         dependent_files
     }
@@ -1102,6 +1259,31 @@ impl LuaTypeIndex {
 
         dependent_files
     }
+    /// Reference implementation of
+    /// [`files_with_type_caches_referencing_files`](Self::files_with_type_caches_referencing_files):
+    /// the same answer by scanning every cached type. Kept so tests can pin the
+    /// indexed lookup to it.
+    #[cfg(any(test, feature = "verify_type_cache_refs"))]
+    pub fn files_with_type_caches_referencing_files_by_scan<S: std::hash::BuildHasher>(
+        &self,
+        file_ids: &std::collections::HashSet<FileId, S>,
+    ) -> HashSet<FileId> {
+        let mut dependent_files = HashSet::default();
+        for (owner, cache) in &self.types {
+            let owner_file_id = owner.get_file_id();
+            if file_ids.contains(&owner_file_id) {
+                continue;
+            }
+
+            if self.type_references_any_file(cache.as_type(), file_ids, owner_file_id) {
+                dependent_files.insert(owner_file_id);
+            }
+        }
+
+        dependent_files
+    }
+
+    #[cfg(any(test, feature = "verify_type_cache_refs"))]
     fn type_references_any_file<S: std::hash::BuildHasher>(
         &self,
         typ: &LuaType,
@@ -1215,6 +1397,7 @@ impl LuaIndex for LuaTypeIndex {
         self.generic_params.clear();
         self.supers.clear();
         self.types.clear();
+        self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
         self.definition_facts.clear();
@@ -1256,6 +1439,8 @@ impl LuaTypeIndex {
                 self.fact_metadata.remove(&type_owner);
             }
         }
+
+        self.cache_refs.remove_file(file_id);
     }
 }
 
@@ -1586,6 +1771,7 @@ mod batch_removal_tests {
             right.inference_events_by_file
         );
         assert_eq!(left.support_file_dependents, right.support_file_dependents);
+        assert_eq!(left.cache_refs, right.cache_refs);
     }
 
     #[test]

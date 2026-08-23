@@ -12,7 +12,8 @@ mod test {
     use crate::{
         DbIndex, FileId, InFiled, LuaDeclId, LuaDeclLocation, LuaDefinitionId,
         LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
-        LuaInferenceProvenanceKind, LuaInferenceStep, LuaType, LuaTypeCache, LuaTypeDecl,
+        LuaInferenceProvenanceKind, LuaInferenceStep, LuaSignatureId, LuaType, LuaTypeCache,
+        LuaTypeDecl,
         LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner, resolve_alias_type,
     };
 
@@ -315,6 +316,100 @@ mod test {
             ),
             [consumer].into_iter().collect::<HashSet<_>>()
         );
+    }
+
+    fn class_decl(file_id: FileId, name: &str, type_id: LuaTypeDeclId) -> LuaTypeDecl {
+        LuaTypeDecl::new(
+            file_id,
+            TextRange::new(0.into(), 1.into()),
+            name.to_string(),
+            LuaDeclTypeKind::Class,
+            LuaTypeFlag::None.into(),
+            type_id,
+        )
+    }
+
+    fn decl_location(file_id: FileId) -> LuaDeclLocation {
+        LuaDeclLocation {
+            file_id,
+            range: TextRange::new(0.into(), 1.into()),
+            flag: LuaTypeFlag::None.into(),
+        }
+    }
+
+    fn assert_reference_lookup_matches_scan(index: &LuaTypeIndex, files: &[FileId]) {
+        for size in 1..=files.len() {
+            for window in files.windows(size) {
+                let query = window.iter().copied().collect::<HashSet<_>>();
+                assert_eq!(
+                    index.files_with_type_caches_referencing_files(&query),
+                    index.files_with_type_caches_referencing_files_by_scan(&query),
+                    "reverse index disagrees with the scan for {window:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn type_cache_reference_lookup_matches_a_full_scan() {
+        let files = (1..=6).map(FileId::new).collect::<Vec<_>>();
+        let (provider, contributor, consumer, table_owner, signature_owner, module_owner) =
+            (files[0], files[1], files[2], files[3], files[4], files[5]);
+        let shared_id = LuaTypeDeclId::global("SharedType");
+        let provider_id = LuaTypeDeclId::global("ProviderType");
+
+        let mut index = LuaTypeIndex::new();
+        index.add_type_decl(provider, class_decl(provider, "SharedType", shared_id.clone()));
+        index.add_type_decl_location(contributor, &shared_id, decl_location(contributor));
+        index.add_type_decl(
+            provider,
+            class_decl(provider, "ProviderType", provider_id.clone()),
+        );
+
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::from_vec(vec![
+                LuaType::Ref(shared_id.clone()),
+                LuaType::Def(provider_id.clone()),
+            ])),
+        );
+        index.bind_type(
+            owner_in(contributor, 10),
+            LuaTypeCache::DocType(LuaType::Ref(shared_id.clone())),
+        );
+        index.bind_type(
+            owner_in(table_owner, 10),
+            LuaTypeCache::DocType(LuaType::TableConst(InFiled::new(
+                provider,
+                TextRange::new(0.into(), 1.into()),
+            ))),
+        );
+        index.bind_type(
+            owner_in(signature_owner, 10),
+            LuaTypeCache::DocType(LuaType::from_vec(vec![
+                LuaType::Signature(LuaSignatureId::new(consumer, 5.into())),
+                LuaType::Ref(shared_id.clone()),
+            ])),
+        );
+        index.bind_type(
+            owner_in(module_owner, 10),
+            LuaTypeCache::DocType(LuaType::ModuleRef(table_owner)),
+        );
+
+        assert_reference_lookup_matches_scan(&index, &files);
+
+        // Rebinding must retire the superseded type's references.
+        index.force_bind_type(
+            owner_in(signature_owner, 10),
+            LuaTypeCache::DocType(LuaType::ModuleRef(provider)),
+        );
+        assert_reference_lookup_matches_scan(&index, &files);
+
+        index.remove_files(&[contributor]);
+        assert_reference_lookup_matches_scan(&index, &files);
+
+        index.remove_files(&[provider, table_owner]);
+        assert_reference_lookup_matches_scan(&index, &files);
     }
 
     #[test]
