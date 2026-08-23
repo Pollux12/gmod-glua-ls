@@ -15,6 +15,20 @@ const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 /// is re-diagnosed.
 const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 
+/// How long the user must stay idle before the dependency ripple runs.
+///
+/// The edited file's own re-index runs on the much shorter debounce, which is
+/// all a request positioned inside that file needs. This timer governs only the
+/// cross-file settle, which holds the write lock for seconds on a large
+/// gamemode — and while it does, no keystroke can even be applied. Starting it
+/// after every brief pause is what put a ripple in flight for nearly every
+/// completion.
+const RIPPLE_QUIET: Duration = Duration::from_millis(1000);
+
+/// Cap on how long one typing burst can hold the ripple off, so diagnostics
+/// still settle during sustained typing.
+const MAX_RIPPLE_DEFERRAL: Duration = Duration::from_secs(5);
+
 /// How long the ripple gives requests released by the self-index to take their
 /// read lock before it takes the write lock back.
 ///
@@ -425,10 +439,39 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Hold the owed ripple until typing has stopped for [`RIPPLE_QUIET`].
+    ///
+    /// Returns `true` when the caller should run the ripple now, `false` when
+    /// another edit arrived and the loop should self-index that first — the
+    /// ripple it owes then joins the one already outstanding.
+    async fn ripple_quiet_elapsed(&self, burst_started_at: Instant) -> bool {
+        let extra = RIPPLE_QUIET.saturating_sub(self.debounce_duration);
+        let deferral_left = MAX_RIPPLE_DEFERRAL.saturating_sub(burst_started_at.elapsed());
+        if extra.is_zero() || deferral_left.is_zero() {
+            return true;
+        }
+
+        tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => return true,
+            _ = self.notify.notified() => return false,
+            _ = tokio::time::sleep(extra.min(deferral_left)) => {}
+        }
+
+        // A notify landing before the select registered would be lost, so the
+        // timer expiring is not on its own proof that nothing arrived.
+        self.pending_files.lock().await.is_empty()
+    }
+
     /// Background loop: waits for events, debounces, then runs reindex.
     /// Spawn this once at server startup.
     pub async fn run(&self) {
         let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
+        // The ripple owed by the self-indexes run so far in this typing burst,
+        // and the union of the expansions each of them captured.
+        let mut owed_files: HashSet<FileId> = HashSet::new();
+        let mut owed_expansion: HashSet<FileId> = HashSet::new();
+        let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
             // no permit, so a signal landing in between would be lost.
@@ -437,7 +480,8 @@ impl DebouncedAnalysis {
             notified.as_mut().enable();
 
             let needs_work = !self.pending_files.lock().await.is_empty()
-                || self.has_pending_changes.load(Ordering::Acquire);
+                || self.has_pending_changes.load(Ordering::Acquire)
+                || !owed_files.is_empty();
             if !needs_work {
                 tokio::select! {
                     _ = notified => {}
@@ -514,16 +558,56 @@ impl DebouncedAnalysis {
                 // would put them behind the whole ripple.
                 self.await_reader_handoff().await;
 
+                owed_files.extend(file_ids.iter().copied());
+                owed_expansion.extend(expansion);
+                burst_started_at.get_or_insert_with(Instant::now);
+            }
+
+            if owed_files.is_empty() {
+                self.refresh_dirty_state().await;
+                self.reindex_notify.notify_waiters();
+                continue;
+            }
+
+            // Hold the ripple until typing has genuinely stopped. Another edit
+            // sends us back for its own self-index, and the ripple it owes
+            // joins this one.
+            let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
+            if !self.ripple_quiet_elapsed(burst_started_at_instant).await {
+                continue;
+            }
+
+            {
+                let ripple_files: Vec<FileId> = {
+                    let mut ids: Vec<FileId> = owed_files.iter().copied().collect();
+                    ids.sort();
+                    ids
+                };
+                let ripple_expansion: Vec<FileId> = {
+                    let mut ids: Vec<FileId> = owed_expansion.iter().copied().collect();
+                    ids.sort();
+                    ids
+                };
+                log::info!(
+                    "ripple: {} edited file(s) over {} file(s) after {}ms quiet",
+                    ripple_files.len(),
+                    ripple_expansion.len(),
+                    RIPPLE_QUIET.as_millis()
+                );
+
                 let reindex_completed = self
-                    .reindex_files_without_queuing(file_ids.clone(), expansion)
+                    .reindex_files_without_queuing(ripple_files.clone(), ripple_expansion)
                     .await;
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
-                    for id in &file_ids {
+                    for id in &ripple_files {
                         reindexing.remove(id);
                     }
                 }
+                owed_files.clear();
+                owed_expansion.clear();
+                burst_started_at = None;
 
                 self.reindex_notify.notify_waiters();
                 if !reindex_completed {
@@ -534,7 +618,7 @@ impl DebouncedAnalysis {
                     }
                     log::error!(
                         "LS_REINDEX_FAILED reindex of {} file(s) did not complete; continuing so freshness waiters are released",
-                        file_ids.len()
+                        ripple_files.len()
                     );
                 }
 
@@ -677,7 +761,7 @@ mod tests {
     use std::sync::atomic::AtomicU8;
     use std::time::{Duration, Instant};
 
-    use super::READER_HANDOFF_GRACE;
+    use super::{MAX_RIPPLE_DEFERRAL, READER_HANDOFF_GRACE};
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, FileId, file_path_to_uri};
     use googletest::prelude::*;
@@ -761,6 +845,58 @@ mod tests {
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// Typing must send the ripple back rather than let it start: while it
+    /// runs, no keystroke can even be applied.
+    #[gtest]
+    fn a_new_edit_sends_the_ripple_back() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let uri = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+
+            let scheduler = debounced_analysis.clone();
+            tokio::spawn(async move {
+                tokio::time::sleep(Duration::from_millis(20)).await;
+                scheduler.schedule(FileId { id: 1 }, uri).await;
+            });
+
+            let run_the_ripple = tokio::time::timeout(
+                Duration::from_millis(500),
+                debounced_analysis.ripple_quiet_elapsed(Instant::now()),
+            )
+            .await
+            .expect("an edit should send the ripple back well inside the quiet window");
+
+            verify_that!(run_the_ripple, eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// Sustained typing must not hold diagnostics off indefinitely.
+    #[gtest]
+    fn a_long_burst_cannot_hold_the_ripple_off_forever() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let uri = Uri::from_str("file:///workspace/edited.lua").expect("uri should parse");
+            debounced_analysis.schedule(FileId { id: 1 }, uri).await;
+
+            let started_at = Instant::now()
+                .checked_sub(MAX_RIPPLE_DEFERRAL)
+                .expect("the deferral cap should fit before now");
+
+            let run_the_ripple = tokio::time::timeout(
+                Duration::from_millis(100),
+                debounced_analysis.ripple_quiet_elapsed(started_at),
+            )
+            .await
+            .expect("the cap should release the ripple immediately");
+
+            verify_that!(run_the_ripple, eq(true))?;
             Ok(())
         })
     }
