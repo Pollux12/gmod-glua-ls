@@ -22,10 +22,16 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use crate::db_index::DbIndex;
 use crate::{FileId, profile::Profile};
 
+/// Below this many files, `thread::scope` spawn/join and atomic dispatch cost
+/// more than the per-file work itself saves, so the batch runs inline. Picked
+/// from the profiled cost of one pass over a handful of small files versus
+/// spawning/parking a worker pool for it.
+const MIN_PARALLEL_FILES: usize = 8;
+
 /// Number of worker threads to use for per-file analysis passes. Capped at 16 to
 /// match the diagnostics path and avoid oversubscription on large machines.
 fn worker_count(file_count: usize) -> usize {
-    if file_count <= 1 {
+    if file_count < MIN_PARALLEL_FILES {
         return 1;
     }
     let cores = std::thread::available_parallelism()
