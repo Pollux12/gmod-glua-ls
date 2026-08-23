@@ -14533,4 +14533,29 @@ mod test {
         assert_that!(diagnostics.len(), eq(1_usize));
         assert_that!(diagnostics[0].range.start.line, eq(19_u32));
     }
+
+    /// A truthiness test excludes `nil` *and* `false`, so it can never narrow
+    /// less than `~= nil` does. An undeclared field resolves to `unknown?`, and
+    /// that was the one shape where it did.
+    #[test]
+    fn truthiness_guard_narrows_an_unknown_typed_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hFire
+            ---@param h hFire
+            local function fires(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
 }

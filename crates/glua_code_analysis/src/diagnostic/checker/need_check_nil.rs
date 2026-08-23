@@ -315,6 +315,7 @@ fn report_unsafe_receiver(
                     receiver,
                 )
                 || is_expr_guarded_by_current_type_guard_condition(semantic_model, receiver)
+                || is_expr_guarded_by_current_truthiness_condition(semantic_model, receiver)
         };
         if guarded {
             return false;
@@ -1232,6 +1233,80 @@ fn preceding_path_sibling_nodes(if_stat: &LuaIfStat) -> Vec<LuaSyntaxNode> {
 
     nodes.sort_by_key(|node| (node.text_range().start(), node.text_range().end()));
     nodes
+}
+
+/// Whether a plain truthiness test on this very expression dominates its use.
+///
+/// `if x.f then x.f:m() end` proves `x.f` is neither `nil` nor `false` inside the
+/// block — that is the whole meaning of the test. A field with a declared nilable
+/// type already narrows through ordinary inference; one the analyzer could not
+/// resolve does not, because the read fails before narrowing runs and the caller
+/// substitutes the runtime `nil`. Reading the guard off the source recovers what
+/// the narrowing would have said.
+fn is_expr_guarded_by_current_truthiness_condition(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let expr_range = expr.syntax().text_range();
+    for ancestor in expr.syntax().ancestors() {
+        if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
+            if if_stat
+                .get_block()
+                .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                && if_stat
+                    .get_condition_expr()
+                    .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+                && !then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr)
+                && !loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr)
+            {
+                return true;
+            }
+
+            for elseif_clause in if_stat.get_else_if_clause_list() {
+                if elseif_clause
+                    .get_block()
+                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+                    && elseif_clause
+                        .get_condition_expr()
+                        .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+                {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(while_stat) = glua_parser::LuaWhileStat::cast(ancestor.clone())
+            && while_stat
+                .get_block()
+                .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
+            && while_stat
+                .get_condition_expr()
+                .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Whether evaluating `condition` truthily proves `expr` truthy. Only `and`
+/// chains qualify: every operand of a truthy `and` is itself truthy, while an
+/// `or` proves nothing about either side.
+fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| condition_proves_expr_truthy(&inner, expr)),
+        LuaExpr::BinaryExpr(binary) => {
+            binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpAnd)
+                && binary.get_exprs().is_some_and(|(left, right)| {
+                    condition_proves_expr_truthy(&left, expr)
+                        || condition_proves_expr_truthy(&right, expr)
+                })
+        }
+        _ => expr_text_matches(condition, expr),
+    }
 }
 
 fn condition_is_positive_type_guard_call(
