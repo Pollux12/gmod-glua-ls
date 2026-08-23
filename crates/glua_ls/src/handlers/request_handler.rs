@@ -139,25 +139,32 @@ macro_rules! dispatch_request {
                             // entries to match its text, so it waits for those
                             // rather than for the edit's whole dependency
                             // ripple — seconds apart on a large gamemode.
-                            let fresh = match target_uri.as_ref() {
+                            // The handoff is held across the handler so the
+                            // ripple waits for this request to take its read
+                            // lock rather than putting it behind the ripple it
+                            // was just released from.
+                            let (fresh, _handoff) = match target_uri.as_ref() {
                                 Some(uri) => {
-                                    snapshot
-                                        .debounced_analysis()
+                                    let debounced = snapshot.debounced_analysis_arc();
+                                    let handoff = debounced.begin_reader_handoff();
+                                    let fresh = debounced
                                         .wait_until_file_fresh_for(
                                             &cancel_token,
                                             <$fresh_req_type>::METHOD,
                                             uri,
                                         )
-                                        .await
+                                        .await;
+                                    (fresh, Some(handoff))
                                 }
                                 None => {
-                                    snapshot
+                                    let fresh = snapshot
                                         .debounced_analysis()
                                         .wait_until_fresh_for(
                                             &cancel_token,
                                             <$fresh_req_type>::METHOD,
                                         )
-                                        .await
+                                        .await;
+                                    (fresh, None)
                                 }
                             };
                             if !fresh {

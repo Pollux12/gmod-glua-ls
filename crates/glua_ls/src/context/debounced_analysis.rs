@@ -15,6 +15,13 @@ const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 /// is re-diagnosed.
 const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 
+/// How long the ripple gives requests released by the self-index to take their
+/// read lock before it takes the write lock back.
+///
+/// Bounded so a stream of requests cannot starve the ripple: past this, the
+/// ripple proceeds and the stragglers wait it out as they did before.
+const READER_HANDOFF_GRACE: Duration = Duration::from_millis(250);
+
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
@@ -36,6 +43,16 @@ pub struct DebouncedAnalysis {
     /// request handler dispatched afterwards sees the flag immediately.
     has_pending_changes: AtomicBool,
     in_flight_changes: AtomicUsize,
+    /// Requests aimed at one document that are waiting for, or reading against,
+    /// that document's own index entries.
+    ///
+    /// The self-index releases them and then immediately queues the ripple's
+    /// write lock. A woken request still has to be polled before it can queue
+    /// its read, and the lock is fair-FIFO, so without this the ripple wins the
+    /// race every time and the request waits out the whole ripple it was just
+    /// released from.
+    pending_readers: AtomicUsize,
+    readers_idle_notify: Notify,
     notify: Notify,
     reindex_notify: Notify,
     analysis: Arc<RwLock<EmmyLuaAnalysis>>,
@@ -67,6 +84,8 @@ impl DebouncedAnalysis {
             blocked_documents: Mutex::new(HashMap::new()),
             has_pending_changes: AtomicBool::new(false),
             in_flight_changes: AtomicUsize::new(0),
+            pending_readers: AtomicUsize::new(0),
+            readers_idle_notify: Notify::new(),
             notify: Notify::new(),
             reindex_notify: Notify::new(),
             analysis,
@@ -157,6 +176,52 @@ impl DebouncedAnalysis {
     #[cfg(test)]
     pub(crate) fn freshness_wait_count(&self) -> usize {
         self.freshness_waits.load(Ordering::Acquire)
+    }
+
+    /// Register that a request is waiting on, or reading against, one
+    /// document's own index entries.
+    ///
+    /// Hold the guard until the request has finished reading. The ripple yields
+    /// to outstanding guards — up to [`READER_HANDOFF_GRACE`] — before it takes
+    /// the write lock back, so a request the self-index just released is not
+    /// made to wait out the ripple anyway.
+    pub fn begin_reader_handoff(self: &Arc<Self>) -> ReaderHandoff {
+        self.pending_readers.fetch_add(1, Ordering::AcqRel);
+        ReaderHandoff {
+            analysis: self.clone(),
+        }
+    }
+
+    /// Let outstanding [`ReaderHandoff`]s take their read lock before the
+    /// caller takes the write lock.
+    ///
+    /// Returns as soon as none are outstanding, or after
+    /// [`READER_HANDOFF_GRACE`] so a stream of requests cannot starve the
+    /// ripple.
+    async fn await_reader_handoff(&self) {
+        let deadline = Instant::now() + READER_HANDOFF_GRACE;
+
+        loop {
+            // Register before testing, or a drop landing in between is lost.
+            let idle = self.readers_idle_notify.notified();
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+
+            if self.pending_readers.load(Ordering::Acquire) == 0 {
+                return;
+            }
+
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() {
+                return;
+            }
+
+            tokio::select! {
+                _ = idle => {}
+                _ = tokio::time::sleep(remaining) => return,
+                _ = self.shutdown.cancelled() => return,
+            }
+        }
     }
 
     /// Wait until all pending document changes have been reindexed.
@@ -444,6 +509,11 @@ impl DebouncedAnalysis {
                 }
                 self.reindex_notify.notify_waiters();
 
+                // The requests just released still have to be polled before
+                // they can queue their read. Taking the write lock back now
+                // would put them behind the whole ripple.
+                self.await_reader_handoff().await;
+
                 let reindex_completed = self
                     .reindex_files_without_queuing(file_ids.clone(), expansion)
                     .await;
@@ -543,6 +613,21 @@ impl DebouncedAnalysis {
     }
 }
 
+/// Keeps the ripple off the write lock while one request takes its read lock.
+///
+/// See [`DebouncedAnalysis::begin_reader_handoff`].
+pub struct ReaderHandoff {
+    analysis: Arc<DebouncedAnalysis>,
+}
+
+impl Drop for ReaderHandoff {
+    fn drop(&mut self) {
+        if self.analysis.pending_readers.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.analysis.readers_idle_notify.notify_waiters();
+        }
+    }
+}
+
 pub struct InFlightChangeGuard {
     analysis: Option<Arc<DebouncedAnalysis>>,
     count: usize,
@@ -590,7 +675,9 @@ impl Drop for InFlightChangeGuard {
 mod tests {
     use std::sync::Arc;
     use std::sync::atomic::AtomicU8;
-    use std::time::Duration;
+    use std::time::{Duration, Instant};
+
+    use super::READER_HANDOFF_GRACE;
 
     use glua_code_analysis::{DiagnosticCode, EmmyLuaAnalysis, FileId, file_path_to_uri};
     use googletest::prelude::*;
@@ -674,6 +761,59 @@ mod tests {
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// The ripple must yield to a request the self-index just released, or the
+    /// request queues behind the write lock and waits out the ripple anyway.
+    #[gtest]
+    fn the_ripple_waits_for_an_outstanding_reader() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+
+            // Nothing outstanding: the ripple must not pay the grace.
+            tokio::time::timeout(
+                Duration::from_millis(50),
+                debounced_analysis.await_reader_handoff(),
+            )
+            .await
+            .expect("no readers should let the ripple straight through");
+
+            let handoff = debounced_analysis.begin_reader_handoff();
+            let held = tokio::time::timeout(
+                Duration::from_millis(50),
+                debounced_analysis.await_reader_handoff(),
+            )
+            .await;
+            verify_that!(held.is_err(), eq(true))?;
+
+            drop(handoff);
+            tokio::time::timeout(
+                Duration::from_millis(250),
+                debounced_analysis.await_reader_handoff(),
+            )
+            .await
+            .expect("dropping the last handoff should release the ripple");
+
+            Ok(())
+        })
+    }
+
+    /// A stream of requests must not starve the ripple.
+    #[gtest]
+    fn an_outstanding_reader_only_delays_the_ripple_by_the_grace() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            let _never_dropped = debounced_analysis.begin_reader_handoff();
+
+            let started_at = Instant::now();
+            debounced_analysis.await_reader_handoff().await;
+
+            verify_that!(started_at.elapsed() >= READER_HANDOFF_GRACE, eq(true))?;
+            verify_that!(started_at.elapsed() < READER_HANDOFF_GRACE * 4, eq(true))?;
             Ok(())
         })
     }
