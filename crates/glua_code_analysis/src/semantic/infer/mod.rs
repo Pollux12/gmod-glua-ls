@@ -346,6 +346,47 @@ where
 
                 break;
             }
+            // A union that carries a multi-return still spreads. An `unknown`
+            // arm - what an unannotated recursive function leaves behind, since
+            // its own return cannot inform itself - says nothing about arity or
+            // about any slot, so the informative arms decide both. Falling
+            // through instead pushed the whole union as a single value, which
+            // mistyped the first argument and dropped every later one.
+            LuaType::Union(ref union)
+                if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) =>
+            {
+                let arms = union
+                    .types()
+                    .filter_map(|typ| match typ {
+                        LuaType::Variadic(variadic) => Some(variadic.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                let slots = arms
+                    .iter()
+                    .map(|variadic| match variadic.deref() {
+                        VariadicType::Multi(types) => types.len(),
+                        VariadicType::Base(_) => usize::MAX,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let wanted = match var_count {
+                    Some(var_count) => var_count.saturating_sub(value_types.len()),
+                    None => slots,
+                };
+                for slot in 0..wanted.min(slots) {
+                    let slot_type = arms
+                        .iter()
+                        .filter_map(|variadic| variadic.get_type(slot).cloned())
+                        .reduce(|left, right| crate::TypeOps::Union.apply(db, &left, &right));
+                    let Some(slot_type) = slot_type else {
+                        break;
+                    };
+                    value_types.push((slot_type, expr.get_range()));
+                }
+
+                break;
+            }
             LuaType::Unknown if matches!(expr, LuaExpr::CallExpr(_)) && var_count.is_some() => {
                 let remaining = var_count
                     .unwrap_or(value_types.len())

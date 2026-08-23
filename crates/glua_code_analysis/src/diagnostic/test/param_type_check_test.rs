@@ -4551,4 +4551,27 @@ mod test {
             "#,
         ));
     }
+    /// An unannotated recursive function reaches its return type through its
+    /// base case, so `((1,2)|unknown)` must not leave the first value typed as
+    /// the whole union when it spreads into an argument list.
+    #[test]
+    fn recursive_multi_return_spreads_into_an_argument_list() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x number
+            ---@param y number
+            local function takesTwo(x, y) end
+
+            local function r2(n)
+                if n and n > 0 then return r2(n - 1) end
+                return 1, 2
+            end
+
+            takesTwo(r2(5))
+            "#,
+        ));
+    }
 }
