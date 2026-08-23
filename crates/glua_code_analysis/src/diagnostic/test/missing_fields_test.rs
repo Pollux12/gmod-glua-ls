@@ -769,4 +769,30 @@ foo({})
             "#,
         ));
     }
+
+    /// A field attached to a container element at runtime is not part of the
+    /// class contract, so it must never become a *required* member of it. The
+    /// same write at file scope already promotes nothing; sitting inside a block
+    /// must not change the answer.
+    #[test]
+    fn undeclared_field_written_to_a_container_element_is_not_required() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingFields,
+            r#"
+            ---@class Fires
+            ---@field ID string
+
+            ---@type table<string, Fires>
+            local storeF = {}
+
+            ---@param t Fires
+            local function makeF(t) return t.ID end
+
+            makeF({ ID = "a" })
+            for _, v in pairs(storeF) do v.X = 5 end
+            "#,
+        ));
+    }
 }

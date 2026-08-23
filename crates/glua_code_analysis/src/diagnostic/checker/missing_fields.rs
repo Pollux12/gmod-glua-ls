@@ -490,6 +490,16 @@ fn get_required_fields_for_types(
                 continue;
             }
             let name = member.get_key().to_path();
+
+            // A field the class never declared, attached by a plain `v.X = ...`
+            // write somewhere, is an addition to a value — not part of the
+            // contract a constructor has to satisfy. Only what the class
+            // declares can be required of a literal; runtime writes make the
+            // field available to read, at most optional to write.
+            if member.is_assignment_define() {
+                type_optional_fields.insert(name);
+                continue;
+            }
             let decl_type = db
                 .get_type_index()
                 .get_type_cache(&member.get_id().into())

@@ -35,6 +35,17 @@ fn is_structural_method_member(feature: Option<LuaMemberFeature>) -> bool {
     feature.is_some_and(|feature| feature.is_method_decl())
 }
 
+/// A member that exists only because something assigned to it is an addition to
+/// a value, not part of what the type requires a literal to supply.
+fn is_assignment_added_member(db: &DbIndex, property_owner_id: Option<&LuaSemanticDeclId>) -> bool {
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner_id else {
+        return false;
+    };
+    db.get_member_index()
+        .get_member(member_id)
+        .is_some_and(crate::LuaMember::is_assignment_define)
+}
+
 // A documented default makes a member optional for presence only.
 fn member_has_documented_default(
     db: &DbIndex,
