@@ -47,7 +47,8 @@ mod unused;
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaClosureExpr, LuaComment,
-    LuaExpr, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    LuaExpr, LuaIfStat, LuaIndexExpr, LuaReturnStat, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
+    UnaryOperator,
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
@@ -535,6 +536,23 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
             let is_table_literal = exprs
                 .get(idx)
                 .is_some_and(|expr| assignment_guarantees_table(var.syntax(), expr));
+            if is_table_literal
+                && let Some((outer_start, outer_end, after)) =
+                    absence_guard_seed_scope(assign_stat.syntax(), &prefix_text)
+            {
+                // `if not t.k then t.k = {} end` runs exactly when `t.k` is
+                // absent, so `t.k` is a table on every path out of the `if`.
+                // The event otherwise stays keyed to the branch's own block and
+                // the statements after the `if` never see it, so writes through
+                // `t.k` there are checked as if it had never been seeded.
+                events
+                    .entry((outer_start, outer_end, prefix_text.clone()))
+                    .or_default()
+                    .push(AssignmentPrefixEvent {
+                        offset: after,
+                        is_table_literal,
+                    });
+            }
             events
                 .entry((block_start, block_end, prefix_text))
                 .or_default()
@@ -545,7 +563,61 @@ fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
         }
     }
 
+    for entries in events.values_mut() {
+        entries.sort_by_key(|event| event.offset);
+    }
+
     events
+}
+
+/// The block an `if not <prefix> then <prefix> = {} end` seed reaches, and the
+/// offset it is in force from.
+///
+/// Only an absence guard qualifies: its branch runs exactly when the target is
+/// missing, so the target is a table afterwards whichever way the test went. A
+/// plain `if cond then t.k = {} end` guarantees nothing after the `if`.
+fn absence_guard_seed_scope(
+    assign_syntax: &LuaSyntaxNode,
+    prefix_text: &str,
+) -> Option<(TextSize, TextSize, TextSize)> {
+    let branch_block = assign_syntax.parent()?;
+    let if_stat = LuaIfStat::cast(branch_block.parent()?)?;
+    // Only the `then` block: an `else` runs when the target is present.
+    if if_stat.get_block()?.syntax() != &branch_block {
+        return None;
+    }
+    if !condition_tests_absence(&if_stat.get_condition_expr()?, prefix_text) {
+        return None;
+    }
+
+    let (outer_start, outer_end) = assignment_block_range(if_stat.syntax())?;
+    Some((outer_start, outer_end, if_stat.syntax().text_range().end()))
+}
+
+fn condition_tests_absence(condition: &LuaExpr, prefix_text: &str) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| condition_tests_absence(&inner, prefix_text)),
+        LuaExpr::UnaryExpr(unary) => {
+            unary.get_op_token().map(|op| op.get_op()) == Some(UnaryOperator::OpNot)
+                && unary
+                    .get_expr()
+                    .is_some_and(|inner| normalized_syntax_text(inner.syntax()) == prefix_text)
+        }
+        LuaExpr::BinaryExpr(binary) => {
+            binary.get_op_token().map(|op| op.get_op()) == Some(BinaryOperator::OpEq)
+                && binary.get_exprs().is_some_and(|(left, right)| {
+                    (matches!(right, LuaExpr::LiteralExpr(_))
+                        && normalized_syntax_text(right.syntax()) == "nil"
+                        && normalized_syntax_text(left.syntax()) == prefix_text)
+                        || (matches!(left, LuaExpr::LiteralExpr(_))
+                            && normalized_syntax_text(left.syntax()) == "nil"
+                            && normalized_syntax_text(right.syntax()) == prefix_text)
+                })
+        }
+        _ => false,
+    }
 }
 
 fn assignment_guarantees_table(var: &LuaSyntaxNode, expr: &LuaExpr) -> bool {
@@ -585,14 +657,41 @@ pub fn is_initialized_assignment_prefix(
         return false;
     }
 
-    let key = (block_start, block_end, prefix_text);
-    let Some(events) = assignment_prefixes.get(&key) else {
-        return false;
-    };
-
     let current_offset = assign_stat.syntax().text_range().start();
-    let last_event_idx = events.partition_point(|event| event.offset < current_offset);
-    last_event_idx > 0 && events[last_event_idx - 1].is_table_literal
+    // A seed in an enclosing block still reaches here: `t.k = {}` before an
+    // `if` initialises `t.k` for the writes inside it just as much as for the
+    // ones after it. Only a closure breaks the chain, since its body runs
+    // somewhere else entirely.
+    for (block_start, block_end) in enclosing_assignment_block_ranges(assign_stat.syntax()) {
+        let key = (block_start, block_end, prefix_text.clone());
+        let Some(events) = assignment_prefixes.get(&key) else {
+            continue;
+        };
+        let last_event_idx = events.partition_point(|event| event.offset < current_offset);
+        if last_event_idx > 0 {
+            return events[last_event_idx - 1].is_table_literal;
+        }
+    }
+
+    let _ = (block_start, block_end);
+    false
+}
+
+/// Every block that encloses `node` within its own function, innermost first.
+fn enclosing_assignment_block_ranges(node: &LuaSyntaxNode) -> Vec<(TextSize, TextSize)> {
+    let mut ranges = Vec::new();
+    let mut current = node.parent();
+    while let Some(block) = current {
+        if LuaClosureExpr::can_cast(block.kind().into()) {
+            break;
+        }
+        if LuaSyntaxKind::Block == block.kind().into() {
+            let range = block.text_range();
+            ranges.push((range.start(), range.end()));
+        }
+        current = block.parent();
+    }
+    ranges
 }
 
 pub fn assignment_prefix_key_for_syntax(
