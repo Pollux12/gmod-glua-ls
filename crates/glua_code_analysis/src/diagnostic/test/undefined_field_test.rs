@@ -5775,4 +5775,38 @@ owner:CompletelyMadeUpMethod()
         let fields = diagnostics_for_code(&mut ws, file_id, DiagnosticCode::UndefinedField);
         assert_eq!(fields.len(), 1, "{fields:#?}");
     }
+
+    /// Every file in a multi-file namespace opens with the same
+    /// `X.sub = X.sub or {}` guard. Each guard produces its own `sub` member, so
+    /// their types have to unify — otherwise a file that re-guards the namespace
+    /// resolves its reads against its own fresh empty table and loses whatever
+    /// another file attached.
+    #[test]
+    fn repeated_namespace_guards_share_the_fields_attached_through_an_alias() {
+        let mut ws = VirtualWorkspace::new();
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/01_define.lua",
+                r#"
+                MCP = MCP or {}
+                MCP.wp = MCP.wp or {}
+                local wp_ = MCP.wp
+                function wp_.Foo() return 1 end
+                "#,
+            ),
+            (
+                "lua/02_read.lua",
+                r#"
+                MCP.wp = MCP.wp or {}
+                local wp_ = MCP.wp
+                local a = wp_.Foo()
+                return a
+                "#,
+            ),
+        ]);
+
+        let found = diagnostics_for_code(&mut ws, file_ids[1], DiagnosticCode::UndefinedField);
+
+        assert!(found.is_empty(), "{found:#?}");
+    }
 }

@@ -1032,10 +1032,18 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 .request_member_initializer_reinfer(*member_id);
         }
 
-        let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
+        let mut expr_type =
+            member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
+        assign_merge_type_owner_and_expr_type(analyzer, type_owner.clone(), &expr_type, 0, false);
+        // The member is only homed onto its owner above, so the sibling guards
+        // this one shares a table with are not visible until here.
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && let Some(canonical) = canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+        {
+            expr_type = canonical;
+        }
         update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
     }
 
@@ -1675,10 +1683,34 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = bootstrap_type;
     }
 
+    // Where every writer of this member is a `x.y = x.y or {}` guard they all
+    // name one table, so there are no competing writes to merge — each writer
+    // resolves to the earliest one's literal and the sibling widening is
+    // skipped. Widening them against each other unions two literals into a bare
+    // `table`, which drops the members another file attached to the namespace.
+    let canonical_guarded_bootstrap = match &type_owner {
+        LuaTypeOwner::Member(member_id) => {
+            canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+        }
+        _ => None,
+    };
+
+    // A repeated `x.y = x.y or {}` guard names one table, however many files
+    // open with it: each writer means "reuse it if it is there". Widening those
+    // literals against each other answers `table`, which drops whatever another
+    // file attached to it — so the guard has to preserve them here too, the same
+    // way the contribution record below already reads it.
+    let preserve_table_literals = preserve_table_literals
+        || matches!(&type_owner, LuaTypeOwner::Member(member_id)
+            if is_guarded_table_assignment_member(analyzer.db, *member_id));
+
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // What this write carries on its own, before any sibling merge widens it.
     let mut source_type = None;
-    if !dynamic_expr_key_member {
+    if let Some(canonical) = canonical_guarded_bootstrap {
+        expr_type = canonical;
+        source_type = Some(expr_type.clone());
+    } else if !dynamic_expr_key_member {
         if let Some(widened_type) =
             get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
         {
@@ -2449,12 +2481,38 @@ fn guarded_table_bootstrap_member_type(
     member_id: LuaMemberId,
     empty_only: bool,
 ) -> Option<LuaType> {
+    let range = guarded_table_bootstrap_range(db, member_id, empty_only)?;
+
+    Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
+}
+
+fn guarded_table_bootstrap_range(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
     let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
     let root = tree.get_red_root();
     let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
-    let range = guarded_table_assignment_bootstrap_range(&index_expr, empty_only)?;
+    guarded_table_assignment_bootstrap_range(&index_expr, empty_only)
+}
 
-    Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
+/// The one table a repeated `x.y = x.y or {}` guard names.
+///
+/// Every such writer means "reuse it if it is there", so at runtime they are all
+/// the same table and only the first to run creates it. Giving each writer its
+/// own literal instead makes a file that re-guards the namespace read its own
+/// empty table and lose whatever another file attached, so they resolve to the
+/// earliest writer's literal — the one that would have won at runtime.
+fn canonical_guarded_table_bootstrap_type(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id)?
+        .into_iter()
+        .min_by_key(|candidate| member_id_sort_key(*candidate))?;
+
+    guarded_table_bootstrap_member_type(db, canonical, false)
 }
 
 fn merge_type_owner_and_unresolve_expr(
