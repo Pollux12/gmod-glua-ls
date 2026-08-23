@@ -13,6 +13,12 @@ impl TypeCheckGuard {
         Self { stack_level: 0 }
     }
 
+    /// Whether this is the value the caller asked about, rather than something
+    /// reached by recursing into it.
+    pub fn is_top_level(&self) -> bool {
+        self.stack_level == 0
+    }
+
     pub fn next_level(&self) -> TypeCheckLevelResult {
         let next_level = self.stack_level + 1;
         if next_level > MAX_TYPE_CHECK_LEVEL {
