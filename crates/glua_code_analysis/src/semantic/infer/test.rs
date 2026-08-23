@@ -1489,6 +1489,34 @@ mod test {
         );
     }
 
+    /// `X or false` evaluates to the left arm when it is truthy and to `false`
+    /// otherwise, so it cannot be nil whatever `X` is. A left arm that is falsy
+    /// throughout has no truthy half to answer with, and the fallback arm is the
+    /// only value the expression can produce.
+    #[test]
+    fn test_or_with_all_falsy_left_arm_yields_the_fallback_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+        let ty = infer_last_name_expr_type(
+            &mut ws,
+            r#"
+            ---@param flag false|nil
+            local function pick(flag)
+                local enabled = flag or false
+                return enabled
+            end
+            local chosen = pick(nil)
+            print(chosen)
+            "#,
+            "chosen",
+        );
+
+        assert!(
+            !ty.is_nil(),
+            "`X or false` must not infer as nil, got: {}",
+            ws.humanize_type_detailed(ty)
+        );
+    }
+
     /// A call shape the reader cannot interpret leaves the type unresolved.
     /// `any` would claim the author opted out of checking instead.
     #[test]
