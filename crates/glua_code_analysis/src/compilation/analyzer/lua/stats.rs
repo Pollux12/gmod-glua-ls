@@ -1703,21 +1703,25 @@ fn assign_merge_type_owner_and_expr_type(
                 // Where one did not, the merge below is provisional and the
                 // settled pass re-derives it against the complete writer set.
                 let mut skipped_uncached_sibling = false;
-                if let Some(widened_type) = get_widened_member_assignment_type(
+                let widened = get_widened_member_assignment_type(
                     analyzer.db,
                     &type_owner,
                     &expr_type,
                     preserve_table_literals,
                     &mut skipped_uncached_sibling,
-                ) {
-                    if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner
-                    {
-                        analyzer.context.record_settled_member_widening_candidate(
-                            *member_id,
-                            expr_type.clone(),
-                            preserve_table_literals,
-                        );
-                    }
+                );
+                // Recorded on the skip, not on the answer: a walk that read no
+                // sibling type declines to widen at all, and that write needs
+                // the settled re-derivation just as much as one that widened
+                // from a partial set.
+                if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner {
+                    analyzer.context.record_settled_member_widening_candidate(
+                        *member_id,
+                        expr_type.clone(),
+                        preserve_table_literals,
+                    );
+                }
+                if let Some(widened_type) = widened {
                     expr_type = widened_type;
                 }
             }
@@ -2250,9 +2254,13 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
                 previous_states.iter(),
             )
         }
-        MemberAssignmentWideningDecision::NoPreviousAssignments => {
-            widen_related_assignment_type(incoming_type, false)
-        }
+        // Only reachable once a preceding writer has been seen but every one of
+        // them was skipped for having no type yet: siblings exist, and not one
+        // of them is evidence. Widening the literal here guesses at writers this
+        // pass has not read, and how many it has read is how far the batch has
+        // run, not anything about the source. Leave the write as it stands and
+        // let the settled re-derivation decide against the complete set.
+        MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
     };
 
     Some(if preserve_table_literals {
