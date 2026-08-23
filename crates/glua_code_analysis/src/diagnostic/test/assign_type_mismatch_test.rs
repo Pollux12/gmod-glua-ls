@@ -3099,3 +3099,82 @@ fn empty_table_seed_survives_a_sibling_closure_clearing_an_element() {
         "#
     ));
 }
+
+/// `if not t.k then t.k = {} end` runs exactly when `t.k` is missing, so `t.k`
+/// is a table on every path out of the `if` — the same seed a plain
+/// `t.k = {}` gives. Keeping that fact inside the branch left the writes after
+/// it checked as if the table had never been seeded, so each was reported
+/// against whichever sibling write the walk happened to record last.
+#[test]
+fn absence_guarded_seed_initialises_the_table_for_later_writes() {
+    for seed in [
+        "if not ext.slots then ext.slots = {} end",
+        "if ext.slots == nil then ext.slots = {} end",
+        "ext.slots = ext.slots or {}",
+    ] {
+        let mut ws = crate::VirtualWorkspace::new();
+        assert!(
+            ws.check_code_for(
+                crate::DiagnosticCode::AssignTypeMismatch,
+                &format!(
+                    r#"
+                    ---@class SeedPart
+                    ---@class SeedExt
+                    ---@param ext SeedExt
+                    ---@param part SeedPart
+                    local function use(ext, part)
+                        {seed}
+                        if part then ext.slots[1] = part end
+                        ext.slots[1] = false
+                    end
+                    "#
+                )
+            ),
+            "seed: {seed}"
+        );
+    }
+}
+
+/// Order must not decide it either: the same two writes the other way round
+/// used to report the `false` against the part instead.
+#[test]
+fn absence_guarded_seed_is_order_independent() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class OrdPart
+        ---@class OrdExt
+        ---@param ext OrdExt
+        ---@param part OrdPart
+        local function use(ext, part)
+            if not ext.slots then ext.slots = {} end
+            ext.slots[1] = false
+            ext.slots[1] = part
+        end
+        "#
+    ));
+}
+
+/// A plain `if cond then t.k = {} end` guarantees nothing afterwards, so it
+/// must not count as a seed.
+#[test]
+fn conditional_seed_that_is_not_an_absence_guard_is_not_an_initialiser() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class CondOwner
+        ---@field slots integer[]
+        local O = {}
+
+        ---@param cond boolean
+        function O:seed(cond)
+            if cond then self.slots = {} end
+            self.slots[1] = "not an integer"
+        end
+        "#
+    ));
+}
