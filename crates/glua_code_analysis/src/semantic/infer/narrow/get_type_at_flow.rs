@@ -1764,6 +1764,56 @@ fn special_call_effect_matches_var_ref(effect_target: &VarRefId, var_ref_id: &Va
         )
 }
 
+/// The type an assignment writes, with a read of an undefined global counted as
+/// the `nil` it is at runtime.
+///
+/// `infer_expr` reports an undefined global as `InferFailReason::None` rather
+/// than a type, so propagating that failure abandons the whole flow walk and
+/// the variable falls back to `unknown` — one unresolvable name erases what
+/// every other branch established about it. `analyze_assign_stat` already
+/// applies this rule when it binds the assignment's own cache ("undefined-global
+/// RHS is `nil` at runtime, not unknown"); the flow walk has to agree with it,
+/// or the same assignment means two different things depending on which path
+/// asked.
+fn infer_assigned_value_type_at(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    exprs: &[LuaExpr],
+    value_idx: usize,
+) -> Result<Option<LuaType>, InferFailReason> {
+    let is_undefined_global = exprs
+        .get(value_idx)
+        .is_some_and(|expr| expr_reads_undefined_global(db, cache, expr));
+    match infer_expr_list_value_type_at(db, cache, exprs, value_idx) {
+        Err(InferFailReason::None) if is_undefined_global => Ok(Some(LuaType::Nil)),
+        Ok(Some(typ)) if typ.is_unknown() && is_undefined_global => Ok(Some(LuaType::Nil)),
+        other => other,
+    }
+}
+
+/// Whether `expr` is a bare name that resolves to no declaration at all.
+fn expr_reads_undefined_global(db: &DbIndex, cache: &LuaInferCache, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    let Some(name) = name_expr.get_name_text() else {
+        return false;
+    };
+    if name == "self" || name == "_G" || name == "_ENV" {
+        return false;
+    }
+    let file_id = cache.get_file_id();
+    let has_local = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+        .is_some();
+    if has_local {
+        return false;
+    }
+    db.get_global_index().get_global_decl_ids(&name).is_none()
+}
+
 fn get_type_at_assign_stat(
     db: &DbIndex,
     tree: &FlowTree,
@@ -1826,7 +1876,7 @@ fn get_type_at_assign_stat(
             {
                 return Ok(ResultTypeOrContinue::Result(LuaType::Nil));
             }
-            let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)? else {
+            let Some(expr_type) = infer_assigned_value_type_at(db, cache, &exprs, i)? else {
                 return Ok(ResultTypeOrContinue::Continue);
             };
             return Ok(ResultTypeOrContinue::Result(expr_type));
@@ -1876,7 +1926,7 @@ fn get_type_at_assign_stat(
 
         let expr_type = match guarded_global_type {
             Some(typ) => Some(typ),
-            None => infer_expr_list_value_type_at(db, cache, &exprs, i)?,
+            None => infer_assigned_value_type_at(db, cache, &exprs, i)?,
         };
         let Some(expr_type) = expr_type else {
             return Ok(ResultTypeOrContinue::Continue);
