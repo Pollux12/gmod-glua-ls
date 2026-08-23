@@ -1024,7 +1024,29 @@ pub(crate) fn initializer_reads_through_call_or_index(expr: &LuaExpr) -> bool {
     }
 }
 
-fn local_initializer_expr(
+/// Whether an initializer's uninformative result may still improve once the
+/// unresolve pass settles what it reads.
+///
+/// An operator expression contributes no type of its own: `w - 1` is `unknown`
+/// only while `w` is, so the answer the file walk cached is a placeholder in
+/// exactly the way a call or index read is, and it has to be retried on the same
+/// terms. Without this it stays `unknown` forever and usage-context inference
+/// guesses at it instead.
+pub(crate) fn initializer_may_improve_after_resolve(expr: &LuaExpr) -> bool {
+    initializer_reads_through_call_or_index(expr) || initializer_is_operator_expr(expr)
+}
+
+pub(crate) fn initializer_is_operator_expr(expr: &LuaExpr) -> bool {
+    match expr {
+        LuaExpr::BinaryExpr(_) | LuaExpr::UnaryExpr(_) => true,
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| initializer_is_operator_expr(&inner)),
+        _ => false,
+    }
+}
+
+pub(crate) fn local_initializer_expr(
     db: &DbIndex,
     root: &LuaSyntaxNode,
     decl_id: LuaDeclId,

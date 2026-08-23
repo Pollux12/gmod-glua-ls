@@ -65,6 +65,7 @@ pub(super) fn stabilize_unknown_locals(
         }
     }
     candidates.sort_by_key(|(_, decl_id, _)| (decl_id.file_id, decl_id.position));
+    rederive_settled_initializers(db, context, &mut candidates);
 
     let mut evidence_by_node =
         FxHashMap::<LuaInferenceNodeId, Vec<ContextualTypeEvidence>>::default();
@@ -160,6 +161,76 @@ pub(super) fn stabilize_unknown_locals(
         context.infer_manager.clear();
     }
     changed_any
+}
+
+/// Re-derives what each candidate's own initializer says before anything is
+/// guessed from how it is used.
+///
+/// Inferring from usage context is the fallback, so it only applies to a value
+/// the analyzer genuinely cannot derive. The unresolve pass reaches its answer
+/// in waves and retires an item after a fixed number of them, so a chain like
+/// `local w = frame:GetWide()` / `local x = w - 1` can leave `x` parked at the
+/// placeholder `w` had when `x` was last retried, even though `w` settled
+/// afterwards. Asking the initializer again here costs one inference per
+/// candidate and removes the guess entirely where the value was derivable.
+///
+/// Candidates arrive in source order, and this binds as it walks, so a chain
+/// settles front to back in a single pass.
+fn rederive_settled_initializers(
+    db: &mut crate::DbIndex,
+    context: &mut AnalyzeContext,
+    candidates: &mut Vec<(crate::FileId, crate::LuaDeclId, crate::DeclReference)>,
+) {
+    let mut roots = FxHashMap::<crate::FileId, glua_parser::LuaSyntaxNode>::default();
+    candidates.retain(|(file_id, decl_id, _)| {
+        let root = match roots.entry(*file_id) {
+            std::collections::hash_map::Entry::Occupied(entry) => entry.into_mut(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                let Some(root) = db
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .map(|tree| tree.get_red_root())
+                else {
+                    return true;
+                };
+                entry.insert(root)
+            }
+        };
+        let Some((ret_idx, expr)) =
+            crate::compilation::analyzer::local_initializer_expr(db, root, *decl_id)
+        else {
+            return true;
+        };
+        // Initializers that read through a call or index — including the
+        // `x = y or {}` guard — have their own reconciliation pass, which
+        // carries policy this cannot see. Only the operator shape is re-asked
+        // here, because nothing else re-derives it.
+        if !crate::compilation::analyzer::initializer_is_operator_expr(&expr)
+            || crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
+        {
+            return true;
+        }
+        let cache = context.infer_manager.get_infer_cache(*file_id);
+        let Ok(typ) = infer_expr(db, cache, expr) else {
+            return true;
+        };
+        let typ = match &typ {
+            LuaType::Variadic(multi) => match multi.get_type(ret_idx) {
+                Some(typ) => typ.clone(),
+                None => return true,
+            },
+            _ => typ,
+        };
+        if !crate::db_index::is_informative_type(&typ) {
+            return true;
+        }
+        crate::compilation::analyzer::common::bind_resolved_type(
+            db,
+            (*decl_id).into(),
+            crate::LuaTypeCache::InferType(typ),
+        );
+        false
+    });
 }
 
 fn contextual_type_support(

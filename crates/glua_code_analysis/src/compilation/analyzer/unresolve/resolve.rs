@@ -164,15 +164,15 @@ pub fn try_resolve_decl(
     }
 
     // Narrowing an uninformative decl cache is reserved for a right-hand side
-    // that reads through a call or index: that is the boundary both routes into
-    // this pass enforce before they queue an item
-    // (`should_retry_uninformative_initializer`,
+    // whose answer can still improve — a call or index read, or an operator over
+    // one: that is the boundary both routes into this pass enforce before they
+    // queue an item (`should_retry_uninformative_initializer`,
     // `should_retry_narrowing_decl_assignment`). A write that landed here only
     // because its right-hand side could not be inferred while its file was
     // walked arrives without that check, so applying the narrowing policy to it
     // let any shape overwrite an authoritative `any` — but only in the builds
     // where the inference happened to fail.
-    if crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr) {
+    if crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr) {
         bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     } else {
         bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
