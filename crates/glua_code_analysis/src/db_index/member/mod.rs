@@ -2402,11 +2402,11 @@ mod tests {
         // the assertion pass or fail at random.
         let key = LuaMemberKey::Name("field".into());
         let written_state = |index: &LuaMemberIndex| {
-            let mut in_filed = index
+            let mut in_filed: Vec<String> = index
                 .in_filed
                 .get(&aliased_member_id.file_id)
                 .map(|objects| objects.iter().map(|object| format!("{object:?}")).collect())
-                .unwrap_or_else(Vec::new);
+                .unwrap_or_default();
             in_filed.sort();
             (
                 index.get_member_item(&owner, &key).cloned(),

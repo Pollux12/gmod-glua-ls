@@ -41,6 +41,9 @@ const { spawn } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 
+// LSP ContentModified. The client is expected to re-send rather than wait.
+const CONTENT_MODIFIED = -32801;
+
 // ---------------------------------------------------------------- config ---
 
 function parseArgs(argv) {
@@ -370,6 +373,8 @@ async function main() {
     const settledDiagnostic = [];
     const typingHover = [];
     const typingCompletionConcurrent = [];
+    const highlightAfterEdit = [];
+    const highlightRetries = [];
     const editToFresh = [];
     const cancelledPulls = [];
     const completionDrift = [];
@@ -483,6 +488,24 @@ async function main() {
         typingHover.push(hovered.ms);
         typingCompletionConcurrent.push(completed.ms);
 
+        // Syntax highlighting. The client retries on ContentModified rather than
+        // waiting, so the number the user feels is the time until a real token
+        // set arrives, not the latency of any single request.
+        editDocument();
+        const highlightStarted = Date.now();
+        let highlightRetried = 0;
+        for (;;) {
+            const tokens = await client.request('textDocument/semanticTokens/full', {
+                textDocument: { uri },
+            });
+            const code = tokens.message.error && tokens.message.error.code;
+            if (code !== CONTENT_MODIFIED) break;
+            highlightRetried++;
+            await sleep(50);
+        }
+        highlightAfterEdit.push(Date.now() - highlightStarted);
+        highlightRetries.push(highlightRetried);
+
         // Keystroke to the first answer any index-reading handler can give.
         editDocument();
         const fresh = await client.request('textDocument/diagnostic', {
@@ -511,6 +534,8 @@ async function main() {
     report.measurements.diagnosticSettled = summarise(settledDiagnostic);
     report.measurements.hoverWhileTyping = summarise(typingHover);
     report.measurements.completionWhileTypingConcurrent = summarise(typingCompletionConcurrent);
+    report.measurements.highlightAfterEdit = summarise(highlightAfterEdit);
+    report.checks.highlightRetries = highlightRetries.reduce((a, b) => a + b, 0);
     report.measurements.editToFreshAnswer = summarise(editToFresh);
     report.checks.emptyFullReportsOnCancel =
         cancelledPulls.filter((p) => p.emptyFullReport).length;
@@ -537,6 +562,7 @@ async function main() {
         ['diagnostic (settled)', report.measurements.diagnosticSettled],
         ['hover (while typing)', report.measurements.hoverWhileTyping],
         ['completion (concurrent)', report.measurements.completionWhileTypingConcurrent],
+        ['highlight after edit', report.measurements.highlightAfterEdit],
         ['edit -> fresh answer', report.measurements.editToFreshAnswer],
     ];
     console.log(`workspace : ${report.workspace}`);

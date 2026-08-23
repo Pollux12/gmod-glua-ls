@@ -182,25 +182,56 @@ macro_rules! dispatch_request {
                     if let Ok((id, params)) = $request.extract::<<$retry_req_type as LspRequest>::Params>(<$retry_req_type>::METHOD) {
                         let snapshot = $context.snapshot();
                         let task_metadata = request_task_metadata(<$retry_req_type>::METHOD, &params);
+                        let target_uri = task_metadata.uri.clone();
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
+                            let debounced = snapshot.debounced_analysis_arc();
+                            // Aimed at one document, so its own entries are what
+                            // it needs. Waiting on the workspace instead parks it
+                            // behind the whole dependency ripple, and refuses it
+                            // outright while any other file is mid-edit.
+                            let _handoff = target_uri
+                                .as_ref()
+                                .map(|_| debounced.begin_reader_handoff());
+                            let stale = || async {
+                                match target_uri.as_ref() {
+                                    Some(uri) => !debounced.file_is_answerable(uri).await,
+                                    None => debounced.is_dirty(),
+                                }
+                            };
+
                             // A client that doesn't retry ContentModified must
                             // get a real result: wait for freshness instead.
                             if !snapshot
                                 .lsp_features()
                                 .retries_on_content_modified(<$retry_req_type>::METHOD)
                             {
-                                if !snapshot
-                                    .debounced_analysis()
-                                    .wait_until_fresh_for(&cancel_token, <$retry_req_type>::METHOD)
-                                    .await
-                                {
+                                let fresh = match target_uri.as_ref() {
+                                    Some(uri) => {
+                                        debounced
+                                            .wait_until_file_fresh_for(
+                                                &cancel_token,
+                                                <$retry_req_type>::METHOD,
+                                                uri,
+                                            )
+                                            .await
+                                    }
+                                    None => {
+                                        debounced
+                                            .wait_until_fresh_for(
+                                                &cancel_token,
+                                                <$retry_req_type>::METHOD,
+                                            )
+                                            .await
+                                    }
+                                };
+                                if !fresh {
                                     return None;
                                 }
                                 let result = $retry_handler(snapshot, params, cancel_token).await;
                                 return Some(Response::new_ok(id, result));
                             }
 
-                            if snapshot.debounced_analysis().is_dirty() {
+                            if stale().await {
                                 return content_modified(id);
                             }
 
@@ -208,7 +239,7 @@ macro_rules! dispatch_request {
                                 $retry_handler(snapshot.clone(), params, cancel_token).await;
 
                             // An edit landed while we worked.
-                            if snapshot.debounced_analysis().is_dirty() {
+                            if stale().await {
                                 return content_modified(id);
                             }
 

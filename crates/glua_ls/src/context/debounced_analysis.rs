@@ -325,7 +325,14 @@ impl DebouncedAnalysis {
         }
     }
 
-    async fn file_is_answerable(&self, uri: &Uri) -> bool {
+    /// Whether a request aimed at `uri` can be answered against entries that
+    /// match its text.
+    ///
+    /// Workspace-wide dirtiness is the wrong question for a request positioned
+    /// inside one document: an edit to some other file leaves this one's entries
+    /// matching its own text, so refusing it buys nothing and blanks the answer
+    /// for every open document whenever anything is typed anywhere.
+    pub async fn file_is_answerable(&self, uri: &Uri) -> bool {
         // An edit whose text has not been applied yet would have the request
         // resolve a position against the previous tree.
         if self.in_flight_changes.load(Ordering::Acquire) > 0 {
