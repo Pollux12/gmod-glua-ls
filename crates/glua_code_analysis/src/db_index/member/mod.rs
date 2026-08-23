@@ -45,6 +45,9 @@ pub struct LuaMemberIndex {
     /// type read mid-fixpoint.
     deferred_index_expr_members: HashSet<LuaMemberId>,
     function_scope_ranges: HashMap<FileId, Vec<TextRange>>,
+    /// Per file, each `if` branch's range paired with the range of the `if` it
+    /// belongs to, sorted by branch start. Recorded on the decl walk.
+    conditional_branch_ranges: HashMap<FileId, Vec<(TextRange, TextRange)>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
     /// Per-writer evidence for the member assignment widening merge. See
     /// [`MemberAssignmentContribution`].
@@ -90,6 +93,7 @@ impl LuaMemberIndex {
             synthesized_owner_members: HashSet::default(),
             deferred_index_expr_members: HashSet::default(),
             function_scope_ranges: HashMap::default(),
+            conditional_branch_ranges: HashMap::default(),
             member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
         }
@@ -349,21 +353,41 @@ impl LuaMemberIndex {
         })
     }
 
-    /// The visible item for a slot that `candidates` write to, when at least one
-    /// of them is a conditional-branch write: every conditional writer, plus the
-    /// latest plain one because plain writers do dominate each other. Ordered by
-    /// [`member_id_sort_key`], so it is a pure function of the candidate set.
+    /// The visible item for a slot at least one conditional write reaches.
+    ///
+    /// Only writes that run in the same flow can overwrite each other, so the
+    /// candidates are bucketed by function scope: two writes in different scopes
+    /// are parallel -- each runs on its own object, which is how a class collects
+    /// a callback field from every instance that sets one -- and both stay
+    /// visible. Within one scope the writes are successive, so only the last one
+    /// survives, unless they sit in different branches of the same `if`, where
+    /// exactly one of them runs and all of them survive.
+    ///
+    /// Ordered by [`member_id_sort_key`], so it is a pure function of the
+    /// candidate set.
     fn conditional_branch_item(&self, candidates: &[LuaMemberId]) -> Option<LuaMemberIndexItem> {
-        let (mut kept, plain): (Vec<_>, Vec<_>) =
-            candidates.iter().copied().partition(|candidate| {
-                self.conditional_branch_assignment_members
-                    .contains(candidate)
-            });
-        if kept.is_empty() {
+        if !candidates.iter().any(|candidate| {
+            self.conditional_branch_assignment_members
+                .contains(candidate)
+        }) {
             return None;
         }
-        if let Some(latest_plain) = plain.into_iter().max_by_key(|id| member_id_sort_key(*id)) {
-            kept.push(latest_plain);
+
+        let mut scopes: Vec<(Option<TextRange>, Vec<LuaMemberId>)> = Vec::new();
+        for candidate in candidates.iter().copied() {
+            let scope = self.member_function_scope_range(candidate);
+            match scopes.iter_mut().find(|(seen, _)| *seen == scope) {
+                Some((_, members)) => members.push(candidate),
+                None => scopes.push((scope, vec![candidate])),
+            }
+        }
+
+        let mut kept = Vec::new();
+        for (_, members) in &scopes {
+            kept.extend(self.live_writes_in_one_scope(members));
+        }
+        if kept.is_empty() {
+            return None;
         }
         kept.sort_by_key(|id| member_id_sort_key(*id));
 
@@ -371,6 +395,60 @@ impl LuaMemberIndex {
             [only] => LuaMemberIndexItem::One(*only),
             _ => LuaMemberIndexItem::Many(kept),
         })
+    }
+
+    /// The writes among `members` that can still be live at the end of the one
+    /// function scope they share: the branches of an `if` they write to from more
+    /// than one side, because exactly one of those runs, and otherwise just the
+    /// latest write, because successive writes in one flow overwrite each other.
+    fn live_writes_in_one_scope(&self, members: &[LuaMemberId]) -> Vec<LuaMemberId> {
+        let chains = members
+            .iter()
+            .map(|member_id| self.enclosing_conditional_branches(*member_id))
+            .collect::<Vec<_>>();
+
+        // A write survives its scope only if some other write sits in a different
+        // branch of an `if` that encloses them both. Two survivors in the same
+        // branch still overwrite each other, so a branch contributes its latest.
+        let mut latest_per_branch: Vec<(Option<(TextRange, TextRange)>, LuaMemberId)> = Vec::new();
+        for (index, member_id) in members.iter().copied().enumerate() {
+            let has_alternative = chains.iter().enumerate().any(|(other, other_chain)| {
+                other != index
+                    && chains[index].iter().any(|(branch, if_range)| {
+                        other_chain
+                            .iter()
+                            .any(|(seen, seen_if)| seen_if == if_range && seen != branch)
+                    })
+            });
+            if !has_alternative {
+                continue;
+            }
+            let branch = chains[index].first().copied();
+            match latest_per_branch
+                .iter_mut()
+                .find(|(seen, _)| *seen == branch)
+            {
+                Some(entry) => {
+                    if member_id_sort_key(member_id) > member_id_sort_key(entry.1) {
+                        entry.1 = member_id;
+                    }
+                }
+                None => latest_per_branch.push((branch, member_id)),
+            }
+        }
+        if !latest_per_branch.is_empty() {
+            return latest_per_branch
+                .into_iter()
+                .map(|(_, member_id)| member_id)
+                .collect();
+        }
+
+        members
+            .iter()
+            .copied()
+            .max_by_key(|member_id| member_id_sort_key(*member_id))
+            .into_iter()
+            .collect()
     }
 
     /// Re-resolves the slot `member_id` writes to, now that it is known to
@@ -1111,6 +1189,41 @@ impl LuaMemberIndex {
         }
     }
 
+    pub fn add_conditional_branch_range(
+        &mut self,
+        file_id: FileId,
+        branch: TextRange,
+        if_range: TextRange,
+    ) {
+        let ranges = self.conditional_branch_ranges.entry(file_id).or_default();
+        match ranges.binary_search_by_key(&branch.start(), |(branch, _)| branch.start()) {
+            Ok(index) | Err(index) => ranges.insert(index, (branch, if_range)),
+        }
+    }
+
+    /// Every `if` branch containing `member_id`, each paired with the `if` it
+    /// belongs to, innermost first. Empty when the write is not inside any
+    /// branch.
+    fn enclosing_conditional_branches(
+        &self,
+        member_id: LuaMemberId,
+    ) -> Vec<(TextRange, TextRange)> {
+        let Some(ranges) = self.conditional_branch_ranges.get(&member_id.file_id) else {
+            return Vec::new();
+        };
+        let position = member_id.get_position();
+        let mut enclosing = Vec::new();
+        let mut index = ranges.partition_point(|(branch, _)| branch.start() <= position);
+        while index > 0 {
+            index -= 1;
+            let entry = ranges[index];
+            if entry.0.contains(position) {
+                enclosing.push(entry);
+            }
+        }
+        enclosing
+    }
+
     pub fn enclosing_function_scope_range(
         &self,
         file_id: FileId,
@@ -1416,6 +1529,7 @@ impl LuaMemberIndex {
             }
         }
         self.function_scope_ranges.remove(&file_id);
+        self.conditional_branch_ranges.remove(&file_id);
     }
 }
 
@@ -1449,6 +1563,7 @@ impl LuaIndex for LuaMemberIndex {
         self.synthesized_owner_members.clear();
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
+        self.conditional_branch_ranges.clear();
         self.member_function_scope_ranges.clear();
         self.assignment_contributions.clear();
     }
