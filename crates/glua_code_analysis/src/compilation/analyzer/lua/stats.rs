@@ -1276,6 +1276,16 @@ fn should_skip_nil_table_shape_assignment(
         return false;
     };
 
+    // A prefix that has not settled yet cannot answer this, and the write is a
+    // delete either way: `t[k] = nil` removes an entry, it never adds a member
+    // typed `nil`. A receiver typed by a `fun(self: T)` callback slot is still
+    // `unknown` while its file is walked, so attaching one here reached back
+    // into a sibling closure and made its empty `{}` seed fail against the
+    // element type the field itself declares.
+    if matches!(prefix_type, LuaType::Unknown | LuaType::Never) {
+        return true;
+    }
+
     if !is_table_shape_cleanup_type(&prefix_type) {
         return false;
     }

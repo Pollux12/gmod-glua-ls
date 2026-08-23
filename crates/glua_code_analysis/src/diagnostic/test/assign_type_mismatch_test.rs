@@ -3076,3 +3076,26 @@ fn declared_empty_container_controls_remain_clean() {
         "#
     ));
 }
+
+/// An empty `{}` is a valid value for any container type. A `[k] = nil` write in
+/// a *second* closure bound to the same `fun(self: T)` slot made the element
+/// type nilable, and that re-inference reached back and rejected the seed.
+#[test]
+fn empty_table_seed_survives_a_sibling_closure_clearing_an_element() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class element
+        ---@class holder
+        ---@field map table<any, element>
+
+        ---@param f fun(self: holder)
+        local function hook(f) end
+
+        hook(function(self) self.map = {} end)
+        hook(function(self) self.map["k"] = nil end)
+        "#
+    ));
+}

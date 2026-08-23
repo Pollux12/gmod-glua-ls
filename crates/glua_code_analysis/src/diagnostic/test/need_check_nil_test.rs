@@ -14558,4 +14558,67 @@ mod test {
 
         assert_that!(diagnostics, is_empty());
     }
+
+    /// The report's own controls: `~= nil`, a cached local, and a declared
+    /// nilable field all narrow the same field, and none of them may start
+    /// reporting when the bare truthiness form stops.
+    #[test]
+    fn nil_guard_controls_on_an_unknown_typed_field_stay_clean() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hC1
+            ---@param h hC1
+            local function c1(h)
+                if h.snd ~= nil then h.snd:Stop() end
+            end
+
+            ---@class hC2
+            ---@param h hC2
+            local function c2(h)
+                local s = h.snd
+                if s then s:Stop() end
+            end
+
+            ---@class hC3
+            ---@field snd snd_obj?
+            ---@param h hC3
+            local function c3(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    /// An unguarded access still reports, so the guard above is doing the work
+    /// rather than the check having been switched off for unknown fields.
+    #[test]
+    fn unguarded_unknown_typed_field_access_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hBare
+            ---@param h hBare
+            local function bare(h)
+                h.snd:Stop()
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
 }
