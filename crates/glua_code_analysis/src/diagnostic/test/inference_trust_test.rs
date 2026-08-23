@@ -1082,4 +1082,109 @@ mod tests {
             (ws.ty("Entity"), LuaType::Number, Vec::new())
         );
     }
+
+    /// A callback-slot receiver types its method call through the unresolve
+    /// pass, so arithmetic over that call was cached `unknown` while the
+    /// operand was still settling. Nothing retried the operator expression, so
+    /// usage-context inference guessed at a value the analyzer already knew.
+    #[test]
+    fn arithmetic_over_callback_slot_receiver_does_not_infer_from_usage_context() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "callback_arithmetic.lua",
+            r#"
+            ---@class Frame
+            ---@field GetWide fun(self: Frame): number
+
+            ---@param n number
+            local function sink(n) end
+
+            ---@param func fun(frame: Frame)
+            local function AddScreen(func) end
+
+            AddScreen(function(frame)
+                local w = frame:GetWide()
+                local x = w - 1
+                sink(x)
+            end)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        // The operand must still resolve, so silence above cannot come from a
+        // workspace where the receiver never attached.
+        assert_eq!(
+            (
+                local_type(&ws, file_id, "w"),
+                local_type(&ws, file_id, "x"),
+                found,
+            ),
+            (LuaType::Number, LuaType::Number, Vec::new())
+        );
+    }
+
+    /// Screen layout chains arithmetic several locals deep, so each retry has to
+    /// wait for the one it reads. Retiring a retry that still answered
+    /// `unknown` froze every value past the first link.
+    #[test]
+    fn chained_arithmetic_over_a_callback_slot_receiver_resolves_every_link() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        // The registrar lives in another file, so the slot that types `frame`
+        // only resolves in a later unresolve wave than the arithmetic that
+        // reads it — which is what the real screen files do.
+        ws.def_file(
+            "lua/registrar.lua",
+            r#"
+            ---@class Frame
+            ---@field GetWide fun(self: Frame): number
+            ---@field GetTall fun(self: Frame): number
+
+            ---@class Registry
+            Registry = {}
+
+            ---@param name string
+            ---@param func fun(self: Registry, frame: Frame)
+            function Registry:AddScreen(name, func) end
+            "#,
+        );
+        let file_id = ws.def_file(
+            "lua/screen.lua",
+            r#"
+            ---@param w number
+            ---@param h number
+            local function setSize(w, h) end
+
+            Registry:AddScreen("Destination", function(self, frame)
+                local w = frame:GetWide()
+                local h = frame:GetTall()
+                local d = 0.05 * math.min(w, h)
+                local panel_w = (w - 3 * d) / 2
+                local panel_h = (h - 4 * d) / 3
+                local elem_w = (panel_w - 5 * d) / 4
+                local elem_h = (panel_h - 4 * d) / 3
+                setSize(elem_w, elem_h)
+            end)
+            "#,
+        );
+
+        let found = diagnostics_for(&mut ws, file_id, DiagnosticCode::InferUnknown);
+
+        // Each link must resolve on its own, so silence cannot come from a
+        // workspace where the receiver never attached.
+        assert_eq!(
+            (
+                local_type(&ws, file_id, "d"),
+                local_type(&ws, file_id, "panel_w"),
+                local_type(&ws, file_id, "elem_w"),
+                found,
+            ),
+            (
+                LuaType::Number,
+                LuaType::Number,
+                LuaType::Number,
+                Vec::new()
+            )
+        );
+    }
 }

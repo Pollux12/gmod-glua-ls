@@ -1420,7 +1420,8 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
 /// Whether an initializer that inferred to a type carrying no information
 /// has to be queued for the unresolve pass as well as committed here.
 fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
-    is_call_or_index_expr(expr) && !crate::db_index::is_informative_type(expr_type)
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+        && !crate::db_index::is_informative_type(expr_type)
 }
 
 /// Whether an assignment that *would* narrow an uninformative decl cache
