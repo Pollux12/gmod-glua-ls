@@ -336,4 +336,28 @@ mod test {
         "#
         ));
     }
+
+    /// The `unknown` arm of an unannotated recursive function's return must not
+    /// make its arity look like 1: the base case returns two values, so the
+    /// spread fills both parameters.
+    #[test]
+    fn recursive_multi_return_fills_every_parameter() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::MissingParameter,
+            r#"
+            ---@param x number
+            ---@param y number
+            local function takesTwo(x, y) end
+
+            local function r2(n)
+                if n and n > 0 then return r2(n - 1) end
+                return 1, 2
+            end
+
+            takesTwo(r2(5))
+            "#
+        ));
+    }
 }

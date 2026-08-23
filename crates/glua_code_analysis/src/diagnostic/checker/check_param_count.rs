@@ -154,9 +154,10 @@ fn check_call_expr(
         }
         // 对调用参数的最后一个参数进行特殊处理
         if let Some(last_arg) = call_args.last()
-            && let Ok(LuaType::Variadic(variadic)) = semantic_model.infer_expr(last_arg.clone())
+            && let Ok(last_arg_type) = semantic_model.infer_expr(last_arg.clone())
+            && let Some(spread_len) = spread_arg_max_len(&last_arg_type)
         {
-            let len = match variadic.get_max_len() {
+            let len = match spread_len {
                 Some(len) => len,
                 None => {
                     return Some(());
@@ -272,6 +273,35 @@ fn check_call_expr(
     }
 
     Some(())
+}
+
+/// How many values the trailing argument spreads into, when it spreads at all.
+///
+/// `Some(None)` is an unbounded spread. A union counts too: an unannotated
+/// recursive function returns `(a, b) | unknown`, and the `unknown` arm says
+/// nothing about arity, so the multi-return arms decide it.
+fn spread_arg_max_len(typ: &LuaType) -> Option<Option<usize>> {
+    match typ {
+        LuaType::Variadic(variadic) => Some(variadic.get_max_len()),
+        LuaType::Union(union) => {
+            let mut max_len = None;
+            let mut saw_variadic = false;
+            for arm in union.types() {
+                let LuaType::Variadic(variadic) = arm else {
+                    continue;
+                };
+                saw_variadic = true;
+                match variadic.get_max_len() {
+                    Some(len) => {
+                        max_len = Some(max_len.map_or(len, |current: usize| current.max(len)))
+                    }
+                    None => return Some(None),
+                }
+            }
+            saw_variadic.then_some(max_len)
+        }
+        _ => None,
+    }
 }
 
 fn is_nonliteral_index_dispatch_call(call_expr: &LuaCallExpr) -> bool {
