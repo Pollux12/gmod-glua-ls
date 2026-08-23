@@ -1787,7 +1787,17 @@ fn infer_custom_type_member(
         return Err(InferFailReason::UnSealedDynamicFields);
     }
 
-    if let Some(dynamic_field) = dynamic_field_result.unwrap_or_default() {
+    // An entry that carries `unknown`/`nil` names a field without saying what it
+    // holds, and answering with it ends the lookup: this type's own super walk
+    // stops, and so does the walk of whichever type asked, before either reaches
+    // a super that has a real type. Whether the index holds that entry at the
+    // moment of the read is how far the batch has run — it is unsealed on a cold
+    // walk and populated on a warm one — so the uninformative entry decides the
+    // answer on one build and not the other. Treat it as no entry at all.
+    if let Some(dynamic_field) = dynamic_field_result
+        .unwrap_or_default()
+        .filter(|dynamic_field| !dynamic_field.typ.is_unknown() && !dynamic_field.typ.is_nil())
+    {
         if type_decl.is_class()
             && let Some(super_types) =
                 visible_super_types_for_index(db, cache, &prefix_type_id, &index_expr)
@@ -1809,10 +1819,6 @@ fn infer_custom_type_member(
                                 dynamic_field.typ,
                                 super_member_type,
                             ]));
-                        }
-
-                        if dynamic_field.typ.is_nil() || dynamic_field.typ.is_unknown() {
-                            return Ok(super_member_type);
                         }
 
                         return Ok(dynamic_field.typ);
