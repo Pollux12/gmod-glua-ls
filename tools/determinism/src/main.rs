@@ -1191,11 +1191,29 @@ fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
             }
         }
 
-        let before = collect_index(analysis, "before_indexrepeat");
-        analysis.reindex_files(vec![file_id]);
-        let label = format!("after_indexrepeat[{target}]");
-        let after = collect_index(analysis, &label);
-        diff_index("before_indexrepeat", &before, &label, &after);
+        // Re-indexing the same unchanged file again asks whether the index is
+        // converging on a fixed point or just oscillating. Round 1 measures the
+        // cold build against a re-index; every later round measures a re-index
+        // against the one before it, so a shrinking count means the cold build
+        // had simply not settled, while a steady one means each pass invents a
+        // fresh answer.
+        let rounds = std::env::var("DET_INDEXREPEAT_ROUNDS")
+            .ok()
+            .and_then(|raw| raw.parse::<usize>().ok())
+            .unwrap_or(1);
+        let mut before = collect_index(analysis, "before_indexrepeat");
+        for round in 1..=rounds {
+            analysis.reindex_files(vec![file_id]);
+            let label = format!("after_indexrepeat[{target}]#{round}");
+            let after = collect_index(analysis, &label);
+            diff_index(
+                &format!("before_indexrepeat#{round}"),
+                &before,
+                &label,
+                &after,
+            );
+            before = after;
+        }
     }
 }
 
