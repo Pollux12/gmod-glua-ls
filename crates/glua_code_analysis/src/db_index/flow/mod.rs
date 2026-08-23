@@ -2,9 +2,8 @@ mod flow_node;
 mod flow_tree;
 mod signature_cast;
 
-use std::collections::HashMap;
-
 use rowan::TextSize;
+use rustc_hash::FxHashMap as HashMap;
 
 use crate::{FileId, LuaSignatureId, LuaType, VarRefId};
 pub use flow_node::*;
@@ -32,9 +31,9 @@ impl Default for LuaFlowIndex {
 impl LuaFlowIndex {
     pub fn new() -> Self {
         Self {
-            file_flow_tree: HashMap::new(),
-            signature_cast_cache: HashMap::new(),
-            special_call_effects: HashMap::new(),
+            file_flow_tree: HashMap::default(),
+            signature_cast_cache: HashMap::default(),
+            special_call_effects: HashMap::default(),
         }
     }
 
