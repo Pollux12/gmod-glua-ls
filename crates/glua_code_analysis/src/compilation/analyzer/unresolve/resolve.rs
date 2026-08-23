@@ -25,8 +25,8 @@ use crate::{
             snapshot_callback_table_type,
         },
         common::{
-            TypeCacheWriteMode, add_member, bind_resolved_type, holds_unbound_iter_template,
-            write_type_cache,
+            TypeCacheWriteMode, add_member, bind_resolved_type, bind_type,
+            holds_unbound_iter_template, write_type_cache,
         },
         lua::{
             analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
@@ -163,7 +163,20 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    // Narrowing an uninformative decl cache is reserved for a right-hand side
+    // that reads through a call or index: that is the boundary both routes into
+    // this pass enforce before they queue an item
+    // (`should_retry_uninformative_initializer`,
+    // `should_retry_narrowing_decl_assignment`). A write that landed here only
+    // because its right-hand side could not be inferred while its file was
+    // walked arrives without that check, so applying the narrowing policy to it
+    // let any shape overwrite an authoritative `any` — but only in the builds
+    // where the inference happened to fail.
+    if crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr) {
+        bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    } else {
+        bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+    }
     Ok(())
 }
 
