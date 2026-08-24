@@ -1279,9 +1279,8 @@ fn should_skip_nil_table_shape_assignment(
     // A prefix that has not settled yet cannot answer this, and the write is a
     // delete either way: `t[k] = nil` removes an entry, it never adds a member
     // typed `nil`. A receiver typed by a `fun(self: T)` callback slot is still
-    // `unknown` while its file is walked, so attaching one here reached back
-    // into a sibling closure and made its empty `{}` seed fail against the
-    // element type the field itself declares.
+    // `unknown` while its file is walked, so a member attached here would land
+    // on the slot every closure filling it shares.
     if matches!(prefix_type, LuaType::Unknown | LuaType::Never) {
         return true;
     }
@@ -2394,20 +2393,34 @@ fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bo
     {
         return true;
     }
-    !db.get_type_index()
-        .get_all_sub_types(&owner_id)
-        .iter()
-        .any(|sub_type| {
-            member_index
-                .get_member_item(&LuaMemberOwner::Type(sub_type.get_id()), &key)
-                .is_some_and(|item| {
-                    item.get_member_ids().iter().any(|id| {
-                        member_index
-                            .get_member(id)
-                            .is_some_and(|member| member.get_feature().is_decl())
-                    })
+    // Asked from the declaring side rather than by enumerating subtypes:
+    // collecting the subtypes of a base rescans the type index once per level
+    // of the hierarchy, while the types that declare this key at all are few and
+    // each answers with one walk up its own supers.
+    let type_index = db.get_type_index();
+    !type_index.get_all_types().into_iter().any(|type_decl| {
+        let candidate_id = type_decl.get_id();
+        if candidate_id == owner_id {
+            return false;
+        }
+        let declares_key = member_index
+            .get_member_item(&LuaMemberOwner::Type(candidate_id.clone()), &key)
+            .is_some_and(|item| {
+                item.get_member_ids().iter().any(|id| {
+                    member_index
+                        .get_member(id)
+                        .is_some_and(|member| member.get_feature().is_decl())
                 })
+            });
+        if !declares_key {
+            return false;
+        }
+        let mut super_types = Vec::new();
+        candidate_id.collect_super_types(db, &mut super_types);
+        super_types.iter().any(|super_type| {
+            matches!(super_type, LuaType::Ref(id) | LuaType::Def(id) if *id == owner_id)
         })
+    })
 }
 
 pub(super) fn is_assignment_file_define_member(
