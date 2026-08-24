@@ -648,10 +648,6 @@ pub fn is_initialized_assignment_prefix(
         return false;
     };
 
-    let Some((block_start, block_end)) = assignment_block_range(assign_stat.syntax()) else {
-        return false;
-    };
-
     let prefix_text = normalized_syntax_text(prefix.syntax());
     if prefix_text.is_empty() {
         return false;
@@ -673,7 +669,6 @@ pub fn is_initialized_assignment_prefix(
         }
     }
 
-    let _ = (block_start, block_end);
     false
 }
 

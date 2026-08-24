@@ -179,7 +179,7 @@ fn check_decl_duplicate_field(
         // 1. 检查 signature
         let signatures = member_infos.iter().filter(|info| {
             matches!(info.typ, LuaType::Signature(_))
-                && !LuaMember::is_assignment_define(info.member)
+                && !info.member.is_assignment_define()
         });
         if signatures.clone().count() > 1 {
             for signature in signatures {

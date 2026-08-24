@@ -3136,7 +3136,8 @@ fn absence_guarded_seed_initialises_the_table_for_later_writes() {
 }
 
 /// Order must not decide it either: the same two writes the other way round
-/// used to report the `false` against the part instead.
+/// have to stay clean, or the slot's type is whichever writer the walk saw last
+/// rather than the union of both.
 #[test]
 fn absence_guarded_seed_is_order_independent() {
     let mut ws = crate::VirtualWorkspace::new();
