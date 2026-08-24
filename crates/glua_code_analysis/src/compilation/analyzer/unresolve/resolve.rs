@@ -708,6 +708,26 @@ pub fn try_resolve_iter_var(
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
 ) -> ResolveResult {
+    try_resolve_iter_var_inner(db, cache, unresolve_iter_var, false)
+}
+
+/// [`try_resolve_iter_var`] for the settled re-derivation, where the answer was
+/// taken against the complete member map and so replaces whatever partial one a
+/// wave left behind rather than only widening it.
+pub fn resolve_settled_iter_var(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    unresolve_iter_var: &mut UnResolveIterVar,
+) -> ResolveResult {
+    try_resolve_iter_var_inner(db, cache, unresolve_iter_var, true)
+}
+
+fn try_resolve_iter_var_inner(
+    db: &mut DbIndex,
+    cache: &mut LuaInferCache,
+    unresolve_iter_var: &mut UnResolveIterVar,
+    settled: bool,
+) -> ResolveResult {
     let iter_var_types =
         match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs) {
             Ok(types) => types,
@@ -734,7 +754,12 @@ pub fn try_resolve_iter_var(
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
         let owner: LuaTypeOwner = decl_id.into();
-        let mode = iter_var_write_mode(db.get_type_index().get_type_cache(&owner), &ret_type);
+        let cached = db.get_type_index().get_type_cache(&owner);
+        let mode = if settled {
+            settled_iter_var_write_mode(cached, &ret_type)
+        } else {
+            iter_var_write_mode(cached, &ret_type)
+        };
         write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
     }
     Ok(())
@@ -747,6 +772,27 @@ pub fn try_resolve_iter_var(
 /// contains everything the cache holds. A documented type is an authority
 /// decision — `---@param` is legal on a `for ... in` variable — so it is never
 /// overwritten; anything else keeps insert-only precedence.
+/// Write mode for the settled re-derivation.
+///
+/// [`iter_var_write_mode`] only accepts an answer that widens the cached one,
+/// and what is cached is whatever the wave reached — a property of how far the
+/// batch had got. Here the answer was taken against the complete member map, so
+/// it replaces the cached one outright. The one thing it may not do is put a raw
+/// template ref back over a resolved type: an unbound generic is a placeholder,
+/// not an answer.
+fn settled_iter_var_write_mode(
+    cached: Option<&LuaTypeCache>,
+    settled: &LuaType,
+) -> TypeCacheWriteMode {
+    let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
+        return TypeCacheWriteMode::InsertOnly;
+    };
+    if settled.contain_tpl() && !cached.as_type().contain_tpl() {
+        return TypeCacheWriteMode::InsertOnly;
+    }
+    TypeCacheWriteMode::ForceOverwrite
+}
+
 fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> TypeCacheWriteMode {
     let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
         return TypeCacheWriteMode::InsertOnly;

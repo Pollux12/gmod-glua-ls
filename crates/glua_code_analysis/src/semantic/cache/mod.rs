@@ -279,6 +279,13 @@ impl LuaInferCache {
         self.index_ref_origin_type_cache.clear();
     }
 
+    /// Discards what a `for ... in pairs(t)` answer was built from, so it can be
+    /// taken again against a member map that has since grown.
+    pub fn clear_iter_var_results(&mut self) {
+        self.clear_deferred_inference_results();
+        self.for_range_iter_var_type_cache.clear();
+    }
+
     /// Discards the inference a wave of deferred resolution can have
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {

@@ -125,6 +125,14 @@ impl InferCacheManager {
         }
     }
 
+    pub fn clear_files_iter_var_results(&mut self, file_ids: &HashSet<FileId>) {
+        for file_id in file_ids {
+            if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
+                infer_cache.clear_iter_var_results();
+            }
+        }
+    }
+
     pub fn clear_file_flow_results(&mut self, file_id: FileId) {
         if let Some(infer_cache) = self.infer_map.get_mut(&file_id) {
             infer_cache.clear_flow_results();

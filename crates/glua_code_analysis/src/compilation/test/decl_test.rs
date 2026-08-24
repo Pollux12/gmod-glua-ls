@@ -373,4 +373,115 @@ mod test {
 
         assert_that!(references.cells.len(), ge(2));
     }
+
+    /// Binding a template parameter turns `Def(X)` into `Ref(X)`, so a generic
+    /// function cannot claim to define the class it was handed. A declared
+    /// pass-through is the exception: `assert(FindMetaTable("Panel"))` has to
+    /// keep the definition, or the methods written on the result extend nothing.
+    #[test]
+    fn declared_pass_through_keeps_the_definition_it_was_given() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@generic T
+            ---@param v T
+            ---@return T
+            function ident(v) end
+
+            ---@generic T
+            ---@param v T
+            ---@return std.NotNull<T>
+            ---@[return_alias(0)]
+            function assertlike(v) end
+            "#,
+        );
+
+        let panel = LuaType::Def(crate::LuaTypeDeclId::global("Panel"));
+        assert_that!(ws.expr_ty("FindMetaTable(\"Panel\")"), eq(&panel));
+        assert_that!(
+            ws.expr_ty("assertlike(FindMetaTable(\"Panel\"))"),
+            eq(&panel)
+        );
+        // Nothing declares `ident` to hand its argument back, so it may not.
+        assert_that!(
+            ws.expr_ty("ident(FindMetaTable(\"Panel\"))"),
+            eq(&LuaType::Ref(crate::LuaTypeDeclId::global("Panel")))
+        );
+    }
+
+    /// `local Panel = FindMetaTable("Panel")` extends the class the string
+    /// names, and naming the local after that class must not change where the
+    /// method lands. TARDIS writes exactly this in `cl_3d2dvgui.lua`, and the
+    /// method went missing while the same shape under a different local name
+    /// resolved.
+    #[test]
+    fn meta_table_local_named_after_its_class_still_extends_it() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "annotations/meta.lua",
+            r#"
+            ---@meta
+            ---@class Panel
+            ---@class DPanel : Panel
+
+            ---@generic T : table
+            ---@param metaName `T`
+            ---@return (definition) T
+            function FindMetaTable(metaName) end
+
+            ---@generic T, T1
+            ---@param expression T
+            ---@param ... T1...
+            ---@return std.NotNull<T>, T1...
+            ---@[return_alias(0)]
+            function _G.assert(expression, ...) end
+            "#,
+        );
+        ws.def_file(
+            "lua/autorun/meta-extend.lua",
+            r#"
+            local meta = FindMetaTable("Panel")
+            function meta:ViaOtherName() end
+
+            local Panel = FindMetaTable("Panel")
+            function Panel:ViaOwnName() end
+
+            local Asserted = assert(FindMetaTable("Panel"))
+            function Asserted:ViaAssert() end
+            "#,
+        );
+
+        let members = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members(&crate::LuaMemberOwner::Type(crate::LuaTypeDeclId::global(
+                "Panel",
+            )))
+            .map(|members| {
+                members
+                    .iter()
+                    .map(|member| format!("{:?}", member.get_key()))
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        assert_that!(
+            members,
+            all![
+                contains(eq(&"Name(\"ViaOtherName\")".to_string())),
+                contains(eq(&"Name(\"ViaOwnName\")".to_string())),
+                contains(eq(&"Name(\"ViaAssert\")".to_string()))
+            ]
+        );
+    }
 }

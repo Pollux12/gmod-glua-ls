@@ -35,7 +35,7 @@ use glua_parser::{
 };
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
-use unresolve::{UnResolve, UnResolveReturn};
+use unresolve::{UnResolve, UnResolveIterVar, UnResolveReturn};
 
 /// Ceiling on [`AnalyzeContext::resolve_call_site_return_consumers`] rounds.
 /// The set converges in a handful of rounds on real workspaces; the bound only
@@ -311,6 +311,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             db.get_member_index_mut().settle_alias_contributed_slots();
         }
 
+        // Only now is every member attached, so a loop that enumerates a table
+        // can be answered from the whole map rather than the part of it this
+        // batch had reached.
+        {
+            let _p = Profile::new("rederive_settled_iter_vars");
+            rederive_settled_iter_vars(db, &mut context);
+        }
+
         {
             let _p = Profile::new("resettle_guarded_table_bootstraps");
             lua::resettle_guarded_table_bootstraps(
@@ -463,6 +471,40 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
             });
     }
     changed
+}
+
+/// Re-derives `for ... in pairs(t)` variable types that were read off `t`'s
+/// member map or its declared field type.
+///
+/// The unresolve wave runs before the settled member passes, so the loop sees
+/// only what had been attached by then and can fall back to `any` where the
+/// field's own annotation says otherwise. Taking the answer again once every
+/// member has landed is both the deterministic and the more faithful one.
+fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = std::mem::take(&mut context.settled_iter_var_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|iter_var| {
+        (
+            iter_var.file_id,
+            iter_var
+                .iter_vars
+                .first()
+                .map(glua_parser::LuaAstToken::get_position),
+        )
+    });
+
+    let files = candidates
+        .iter()
+        .map(|iter_var| iter_var.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files_iter_var_results(&files);
+
+    for mut iter_var in candidates {
+        let cache = context.infer_manager.get_infer_cache(iter_var.file_id);
+        let _ = unresolve::resolve_settled_iter_var(db, cache, &mut iter_var);
+    }
 }
 
 /// Re-derives member assignment widenings that ran against an incomplete
@@ -1333,6 +1375,8 @@ pub struct AnalyzeContext {
     /// Guarded table bootstraps whose canonical writer was picked from an
     /// incomplete sibling set. See `resettle_guarded_table_bootstraps`.
     settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
+    /// See [`AnalyzeContext::record_settled_iter_var_candidate`].
+    settled_iter_var_candidates: Vec<UnResolveIterVar>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -1362,6 +1406,7 @@ impl AnalyzeContext {
             settled_member_attach_candidates: Vec::new(),
             settled_member_widening_candidates: HashMap::new(),
             settled_guarded_bootstrap_candidates: Vec::new(),
+            settled_iter_var_candidates: Vec::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1393,6 +1438,14 @@ impl AnalyzeContext {
     /// Remembers an assignment whose widening skipped a sibling that had no type
     /// yet. The assigned type is kept as written, not as widened, so the settled
     /// pass can re-derive the merge instead of growing the partial answer.
+    /// Remembers a `for ... in pairs(t)` whose variable types were read off
+    /// `t`'s member map. Which members were attached when it ran is a property
+    /// of how far the batch had got, so it is taken again once the settled
+    /// member passes have finished attaching them.
+    pub(crate) fn record_settled_iter_var_candidate(&mut self, iter_var: UnResolveIterVar) {
+        self.settled_iter_var_candidates.push(iter_var);
+    }
+
     pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {
         self.settled_guarded_bootstrap_candidates.push(member_id);
     }
