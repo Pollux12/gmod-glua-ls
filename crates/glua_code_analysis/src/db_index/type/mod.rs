@@ -596,9 +596,10 @@ pub struct LuaTypeIndex {
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
-    /// Source position of the write whose type each decl currently holds. See
-    /// [`LuaTypeIndex::bind_decl_write`].
-    decl_write_claims: HashMap<LuaDeclId, TextSize>,
+    /// For each decl whose type a write has seeded: that write's source
+    /// position, and whether its right-hand side was a call or index read. See
+    /// `bind_decl_write`.
+    decl_write_claims: HashMap<LuaDeclId, (TextSize, bool)>,
     /// Counts stored types that actually moved, so a caller can tell a no-op
     /// write from one that invalidates memoised inference.
     type_writes: u64,
@@ -950,13 +951,20 @@ impl LuaTypeIndex {
         self.type_writes
     }
 
-    /// Source position of the earliest write that has seeded `decl_id`'s type.
-    pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<TextSize> {
+    /// The write that seeded `decl_id`'s type: its source position, and whether
+    /// its right-hand side read through a call or index.
+    pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
         self.decl_write_claims.get(decl_id).copied()
     }
 
-    pub fn record_decl_write_claim(&mut self, decl_id: LuaDeclId, position: TextSize) {
-        self.decl_write_claims.insert(decl_id, position);
+    pub fn record_decl_write_claim(
+        &mut self,
+        decl_id: LuaDeclId,
+        position: TextSize,
+        reads_through_call_or_index: bool,
+    ) {
+        self.decl_write_claims
+            .insert(decl_id, (position, reads_through_call_or_index));
     }
 
     fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {

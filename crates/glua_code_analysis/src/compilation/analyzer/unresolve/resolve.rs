@@ -163,39 +163,41 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    // `bind_resolved_type` displaces an uninformative cache; the plain bind
-    // keeps it. Which one a write gets has to follow the write's shape, not the
-    // batch. An initializer is the decl's own value, so it may narrow from any
-    // right-hand side whose answer can still improve. An assignment may only
-    // narrow from a call or index read — that is the boundary the file walk
-    // enforces in `should_retry_narrowing_decl_assignment` before it queues one.
-    // An assignment that landed here only because its right-hand side could not
-    // be inferred yet arrives without that check, and whether the walk's
-    // inference failed is a property of the batch: once the callee's return
-    // resolves the same assignment infers cleanly and the walk refuses the
-    // narrowing outright.
-    if decl_expr_is_initializer(db, decl_id, &expr)
-        && crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr)
-    {
-        bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
-    } else {
-        bind_decl_write(
-            db,
-            decl_id,
-            LuaTypeCache::InferType(expr_type),
-            DeclWrite {
-                position: expr.get_position(),
-                may_improve_after_resolve:
-                    crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr),
-                reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
-                    db,
-                    decl.file_id,
-                    decl_id,
-                    &expr,
-                ),
+    // Displacing an uninformative cache is the initializer's privilege: it is
+    // the decl's own value, so it may narrow from any right-hand side whose
+    // answer can still improve. An assignment may only narrow from a call or
+    // index read — the boundary the file walk enforces in
+    // `should_retry_narrowing_decl_assignment` before it queues one. An
+    // assignment that landed here only because its right-hand side could not be
+    // inferred yet arrives without that check, and whether the walk's inference
+    // failed is a property of the batch: once the callee's return resolves, the
+    // same assignment infers cleanly and the walk refuses the narrowing.
+    //
+    // Either way the write goes through the positional claim, so a write that
+    // resolved late can still take the slot back from one that ran ahead of it.
+    let may_improve = crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr);
+    let is_initializer = decl_expr_is_initializer(db, decl_id, &expr);
+    bind_decl_write(
+        db,
+        decl_id,
+        LuaTypeCache::InferType(expr_type),
+        DeclWrite {
+            position: expr.get_position(),
+            may_improve_after_resolve: may_improve,
+            reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
+                db,
+                decl.file_id,
+                decl_id,
+                &expr,
+            ),
+            may_narrow_uninformative: if is_initializer {
+                may_improve
+            } else {
+                crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
             },
-        );
-    }
+            resolved_initializer: is_initializer && may_improve,
+        },
+    );
     Ok(())
 }
 
