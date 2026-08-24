@@ -311,6 +311,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             db.get_member_index_mut().settle_alias_contributed_slots();
         }
 
+        {
+            let _p = Profile::new("resettle_guarded_table_bootstraps");
+            lua::resettle_guarded_table_bootstraps(
+                db,
+                std::mem::take(&mut context.settled_guarded_bootstrap_candidates),
+            );
+        }
+
         // Net flows are collected last: the collector resolves wrappers through
         // signatures, receiver types and members, none of which exist yet when
         // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
@@ -1322,6 +1330,9 @@ pub struct AnalyzeContext {
     /// with the type each one actually assigned. See
     /// [`rewiden_settled_member_assignments`].
     settled_member_widening_candidates: HashMap<LuaMemberId, (LuaType, bool)>,
+    /// Guarded table bootstraps whose canonical writer was picked from an
+    /// incomplete sibling set. See `resettle_guarded_table_bootstraps`.
+    settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -1350,6 +1361,7 @@ impl AnalyzeContext {
             early_member_owner_candidates: Vec::new(),
             settled_member_attach_candidates: Vec::new(),
             settled_member_widening_candidates: HashMap::new(),
+            settled_guarded_bootstrap_candidates: Vec::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1381,6 +1393,10 @@ impl AnalyzeContext {
     /// Remembers an assignment whose widening skipped a sibling that had no type
     /// yet. The assigned type is kept as written, not as widened, so the settled
     /// pass can re-derive the merge instead of growing the partial answer.
+    pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {
+        self.settled_guarded_bootstrap_candidates.push(member_id);
+    }
+
     pub(crate) fn record_settled_member_widening_candidate(
         &mut self,
         member_id: LuaMemberId,

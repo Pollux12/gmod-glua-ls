@@ -1782,6 +1782,7 @@ fn assign_merge_type_owner_and_expr_type(
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // What this write carries on its own, before any sibling merge widens it.
     let mut source_type = None;
+    let had_canonical_guarded_bootstrap = canonical_guarded_bootstrap.is_some();
     if let Some(canonical) = canonical_guarded_bootstrap {
         expr_type = canonical;
         source_type = Some(expr_type.clone());
@@ -1863,6 +1864,15 @@ fn assign_merge_type_owner_and_expr_type(
     {
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
+        if guarded_table_assignment && !had_canonical_guarded_bootstrap {
+            // No canonical writer was found, which means fewer than two of them
+            // were indexed when this ran — a property of how far the batch has
+            // got. Re-derived once they have all landed. See
+            // `resettle_guarded_table_bootstraps`.
+            analyzer
+                .context
+                .record_settled_guarded_bootstrap_candidate(*member_id);
+        }
         let conditional_branch_assignment =
             is_member_assignment_in_conditional_branch(analyzer.db, *member_id);
         if !dynamic_expr_key_member {
@@ -2653,6 +2663,71 @@ fn guarded_table_bootstrap_range(
 /// own literal instead makes a file that re-guards the namespace read its own
 /// empty table and lose whatever another file attached, so they resolve to the
 /// earliest writer's literal — the one that would have won at runtime.
+/// Re-derives the literal each `x.y = x.y or {}` writer names, now that every
+/// writer of the slot has landed.
+///
+/// The canonical pick is the lowest-sorting writer, so a writer analysed before
+/// its siblings existed either found no canonical at all (fewer than two were
+/// indexed) or picked one that a later, lower-sorting writer displaces. Which of
+/// those happened is a property of the batch, not of the source.
+pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
+    db: &mut DbIndex,
+    candidates: Vec<LuaMemberId>,
+) {
+    // Every writer of one slot resolves to the same canonical literal, so the
+    // pick is made once per slot rather than once per writer.
+    let mut by_slot: FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>> =
+        FxHashMap::default();
+    for member_id in candidates {
+        let member_index = db.get_member_index();
+        let Some(owner) = member_index.get_member_owner(&member_id).cloned() else {
+            continue;
+        };
+        let Some(key) = member_index
+            .get_member(&member_id)
+            .map(|m| m.get_key().clone())
+        else {
+            continue;
+        };
+        by_slot.entry((owner, key)).or_default().push(member_id);
+    }
+
+    let mut slots = by_slot.into_iter().collect::<Vec<_>>();
+    slots.sort_by_key(|((_, _), members)| {
+        members
+            .iter()
+            .map(|member_id| member_id_sort_key(*member_id))
+            .min()
+    });
+
+    for (_, mut members) in slots {
+        members.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        members.dedup();
+        let Some(canonical) = members
+            .first()
+            .and_then(|member_id| canonical_guarded_table_bootstrap_type(db, *member_id))
+        else {
+            continue;
+        };
+        for member_id in members {
+            let owner = LuaTypeOwner::Member(member_id);
+            if db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .is_some_and(|cached| cached.is_doc() || cached.as_type() == &canonical)
+            {
+                continue;
+            }
+            write_type_cache(
+                db,
+                owner,
+                LuaTypeCache::InferType(canonical.clone()),
+                TypeCacheWriteMode::ForceOverwrite,
+            );
+        }
+    }
+}
+
 fn canonical_guarded_table_bootstrap_type(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
