@@ -130,7 +130,12 @@ fn check_general_type_compact(
     // Only the value the caller asked about. A `never` *member* is a declared
     // shape that contradicts itself (`integer & string`), which is worth
     // reporting on its own merits.
-    if compact_type.is_never() && check_guard.is_top_level() {
+    //
+    // And only where the answer becomes a message. Inference asks the same
+    // question to *decide* things — which way a guard narrows, which member a
+    // `t[k]` read resolves to, how a generic binds — and there "no value can
+    // fail this" would read as "`never` matches anything".
+    if context.detail && compact_type.is_never() && check_guard.is_top_level() {
         return Ok(());
     }
 
