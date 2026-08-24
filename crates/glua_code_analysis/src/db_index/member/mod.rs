@@ -628,12 +628,13 @@ impl LuaMemberIndex {
         };
         let key = member.get_key();
 
-        let is_indexed = |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
-            index
-                .get(owner)
-                .and_then(|members_by_key| members_by_key.get(key))
-                .is_some_and(|member_ids| member_ids.contains(&id))
-        };
+        let is_indexed =
+            |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
+                index
+                    .get(owner)
+                    .and_then(|members_by_key| members_by_key.get(key))
+                    .is_some_and(|member_ids| member_ids.contains(&id))
+            };
         if self.member_current_owner.get(&id) != Some(owner)
             && !(is_indexed(&self.member_owner_key_index)
                 && is_indexed(&self.member_owner_key_history_index))
