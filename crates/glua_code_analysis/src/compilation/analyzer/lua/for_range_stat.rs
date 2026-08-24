@@ -59,6 +59,9 @@ pub fn analyze_for_range_stat(
                 };
                 analyzer
                     .context
+                    .record_settled_iter_var_candidate(unresolved.clone());
+                analyzer
+                    .context
                     .add_unresolve(unresolved.into(), InferFailReason::UnResolveIterTemplate);
             }
         }
@@ -81,6 +84,9 @@ pub fn analyze_for_range_stat(
                 iter_vars: var_name_list,
             };
 
+            analyzer
+                .context
+                .record_settled_iter_var_candidate(unresolved.clone());
             analyzer
                 .context
                 .add_unresolve(unresolved.into(), reason.clone());
