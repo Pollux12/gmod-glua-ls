@@ -5,8 +5,8 @@ use crate::{
     LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
         common::{
-            TypeCacheWriteMode, add_member, bind_type, holds_unbound_iter_template,
-            reads_settling_iter_var, write_type_cache,
+            DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
+            holds_unbound_iter_template, reads_settling_iter_var, write_type_cache,
         },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -198,10 +198,20 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 }
 
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
-                bind_type(
+                bind_decl_write(
                     analyzer.db,
-                    decl_id.into(),
+                    decl_id,
                     LuaTypeCache::InferType(expr_type),
+                    DeclWrite {
+                        position: expr.get_position(),
+                        may_improve_after_resolve: may_improve_after_resolve(&expr),
+                        reads_out_of_decl: expr_reads_out_of_decl(
+                            analyzer.db,
+                            analyzer.file_id,
+                            decl_id,
+                            &expr,
+                        ),
+                    },
                 );
                 if retry_uninformative {
                     let unresolve = UnResolveDecl {
@@ -1036,7 +1046,19 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(analyzer, type_owner.clone(), &expr_type, 0, false);
+        assign_merge_type_owner_and_expr_type(
+            analyzer,
+            type_owner.clone(),
+            &expr_type,
+            0,
+            false,
+            DeclWrite {
+                position: expr.get_position(),
+                may_improve_after_resolve: may_improve_after_resolve(expr),
+                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)),
+            },
+        );
         // The member is only homed onto its owner above, so the sibling guards
         // this one shares a table with are not visible until here.
         if let LuaTypeOwner::Member(member_id) = &type_owner
@@ -1060,10 +1082,21 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &last_expr_type,
                             i - expr_count + 1,
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 } else {
@@ -1073,10 +1106,21 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &LuaType::Any,
                             0, // Any doesn't need indexing
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 }
@@ -1434,6 +1478,10 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
     crate::compilation::analyzer::initializer_reads_through_call_or_index(expr)
 }
 
+fn may_improve_after_resolve(expr: &LuaExpr) -> bool {
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+}
+
 /// Whether an initializer that inferred to a type carrying no information
 /// has to be queued for the unresolve pass as well as committed here.
 fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
@@ -1545,8 +1593,13 @@ fn should_defer_pending_local_alias(
 /// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
 /// self-contradiction — the value still cannot be the decl's lifetime type,
 /// because it was computed from a read that type would reject.
-fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
-    if index_chain_roots_at_decl(analyzer, decl_id, expr) {
+pub(crate) fn expr_reads_out_of_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
+    if index_chain_roots_at_decl(db, file_id, decl_id, expr) {
         return true;
     }
 
@@ -1558,11 +1611,16 @@ fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &Lua
                 .any(|closure| expr_range.contains_range(closure.get_range()))
         })
         .any(|index_expr| {
-            index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
+            index_chain_roots_at_decl(db, file_id, decl_id, &LuaExpr::IndexExpr(index_expr))
         })
 }
 
-fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+fn index_chain_roots_at_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
     let mut current = expr.clone();
     loop {
         match current {
@@ -1571,10 +1629,9 @@ fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &
                 None => return false,
             },
             LuaExpr::NameExpr(name_expr) => {
-                return analyzer
-                    .db
+                return db
                     .get_reference_index()
-                    .get_local_reference(&analyzer.file_id)
+                    .get_local_reference(&file_id)
                     .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
                     == Some(decl_id);
             }
@@ -1599,7 +1656,7 @@ fn seeds_empty_decl_from_own_read(
         .get_type_index()
         .get_type_cache(type_owner)
         .is_none()
-        && expr_reads_out_of_decl(analyzer, *decl_id, expr)
+        && expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)
 }
 
 fn add_unresolve_for_assignment(
@@ -1616,7 +1673,7 @@ fn add_unresolve_for_assignment(
             // slot is empty until one of the file's deferred writes
             // resolves, and `bind_type` has no acceptance rule for an empty
             // slot, so whichever lands first owns the decl's lifetime type.
-            if expr_reads_out_of_decl(analyzer, decl_id, &expr) {
+            if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, &expr) {
                 return;
             }
 
@@ -1673,6 +1730,7 @@ fn assign_merge_type_owner_and_expr_type(
     expr_type: &LuaType,
     idx: usize,
     preserve_table_literals: bool,
+    write: DeclWrite,
 ) -> Option<()> {
     let mut expr_type = expr_type.clone();
     if let LuaType::Variadic(multi) = expr_type {
@@ -1774,11 +1832,23 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = merge_open_table_types(analyzer.db, vec![expr_type]);
     }
 
-    bind_type(
-        analyzer.db,
-        type_owner.clone(),
-        LuaTypeCache::InferType(expr_type.clone()),
-    );
+    match &type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            bind_decl_write(
+                analyzer.db,
+                *decl_id,
+                LuaTypeCache::InferType(expr_type.clone()),
+                write,
+            );
+        }
+        _ => {
+            bind_type(
+                analyzer.db,
+                type_owner.clone(),
+                LuaTypeCache::InferType(expr_type.clone()),
+            );
+        }
+    }
 
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && is_assignment_file_define_member(analyzer.db, *member_id)
@@ -2842,6 +2912,11 @@ fn special_assign_pattern(
                 &expr_type,
                 0,
                 guarded_table_expr,
+                DeclWrite {
+                    position: assign_stat_range.start(),
+                    may_improve_after_resolve: false,
+                    reads_out_of_decl: false,
+                },
             );
         }
         Err(_) => return None,

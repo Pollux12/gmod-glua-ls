@@ -4,12 +4,14 @@ pub(super) use migrate_global_member::{
     migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
     reconcile_directly_attached_candidate_members, reconcile_parked_global_path_members,
 };
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 
 use crate::{
     FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
     compilation::analyzer::lua::iterates_table_member_map,
-    db_index::{DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type},
+    db_index::{
+        DbIndex, LuaMemberOwner, LuaType, LuaTypeDeclId, is_informative_type, is_undetermined_type,
+    },
 };
 
 /// Whether `typ` is a raw template placeholder inherited from a generic-for
@@ -108,31 +110,12 @@ pub fn write_type_cache(
 pub fn bind_type(
     db: &mut DbIndex,
     type_owner: LuaTypeOwner,
-    mut type_cache: LuaTypeCache,
+    type_cache: LuaTypeCache,
 ) -> Option<()> {
     let decl_type_cache = db.get_type_index().get_type_cache(&type_owner);
 
     if decl_type_cache.is_none() {
-        // type backward
-        if type_cache.is_infer()
-            && let LuaTypeOwner::Decl(decl_id) = &type_owner
-            && let Some(decl_ref) = db
-                .get_reference_index()
-                .get_decl_references(&decl_id.file_id, decl_id)
-            && decl_ref.mutable
-        {
-            match &type_cache.as_type() {
-                LuaType::IntegerConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Integer),
-                LuaType::StringConst(_) => type_cache = LuaTypeCache::InferType(LuaType::String),
-                LuaType::BooleanConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Boolean),
-                LuaType::FloatConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Number),
-                _ => {}
-            }
-        }
-
-        db.get_type_index_mut()
-            .bind_type(type_owner.clone(), type_cache);
-        migrate_global_members_when_type_resolve(db, type_owner);
+        seed_type_slot(db, type_owner, type_cache);
     } else {
         let decl_type_cache = decl_type_cache?;
         let decl_type = decl_type_cache.as_type();
@@ -145,6 +128,111 @@ pub fn bind_type(
         }
     }
 
+    Some(())
+}
+
+/// Seeds a type owner that holds nothing yet, widening a mutable declaration's
+/// literal to its base type on the way in.
+fn seed_type_slot(db: &mut DbIndex, type_owner: LuaTypeOwner, mut type_cache: LuaTypeCache) {
+    if type_cache.is_infer()
+        && let LuaTypeOwner::Decl(decl_id) = &type_owner
+        && let Some(decl_ref) = db
+            .get_reference_index()
+            .get_decl_references(&decl_id.file_id, decl_id)
+        && decl_ref.mutable
+    {
+        match &type_cache.as_type() {
+            LuaType::IntegerConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Integer),
+            LuaType::StringConst(_) => type_cache = LuaTypeCache::InferType(LuaType::String),
+            LuaType::BooleanConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Boolean),
+            LuaType::FloatConst(_) => type_cache = LuaTypeCache::InferType(LuaType::Number),
+            _ => {}
+        }
+    }
+
+    db.get_type_index_mut()
+        .force_bind_type(type_owner.clone(), type_cache);
+    migrate_global_members_when_type_resolve(db, type_owner);
+}
+
+/// Where a write to a declaration came from, for [`bind_decl_write`].
+#[derive(Clone, Copy)]
+pub struct DeclWrite {
+    /// Source position of the writing statement.
+    pub position: TextSize,
+    /// Whether the right-hand side is one whose answer can still improve — a
+    /// call or index read, or an operator over one. Only those may fill in a
+    /// declaration that nothing has determined yet.
+    pub may_improve_after_resolve: bool,
+    /// Whether the right-hand side reads out of the declaration it writes to
+    /// (`width = bit.bor(width:byte(1), ...)`). Such a write derives its type
+    /// from the slot it is about to fill, so it must not fill it.
+    pub reads_out_of_decl: bool,
+}
+
+/// Binds a decl type written by the statement at `write.position`.
+///
+/// An empty decl slot otherwise goes to whichever write reaches it first, and a
+/// write whose right-hand side could not be inferred during the file walk
+/// reaches it late — so the decl's type depended on which callees the batch had
+/// already resolved rather than on the source. Ordering the claim by source
+/// position makes both arrival orders agree on the same answer: the earliest
+/// writer owns the decl, except that a write which determined nothing never
+/// takes the slot back from a later one that did.
+pub fn bind_decl_write(
+    db: &mut DbIndex,
+    decl_id: LuaDeclId,
+    type_cache: LuaTypeCache,
+    write: DeclWrite,
+) -> Option<()> {
+    let DeclWrite {
+        position,
+        may_improve_after_resolve,
+        reads_out_of_decl,
+    } = write;
+    let type_owner = LuaTypeOwner::Decl(decl_id);
+    // A parameter's type is its declared or call-site-inferred type; the writes
+    // in the body narrow it for flow analysis, they do not own it. Only a local
+    // has a "first writer" to order.
+    if db
+        .get_decl_index()
+        .get_decl(&decl_id)
+        .is_none_or(|decl| decl.is_param())
+    {
+        return bind_type(db, type_owner, type_cache);
+    }
+    let seeds = match db.get_type_index().get_type_cache(&type_owner) {
+        None => true,
+        Some(existing) => {
+            let undetermined = is_undetermined_type(type_cache.as_type());
+            let both_inferred = existing.is_infer() && type_cache.is_infer();
+            if both_inferred
+                && may_improve_after_resolve
+                && !reads_out_of_decl
+                && !undetermined
+                && is_undetermined_type(existing.as_type())
+            {
+                // The slot holds an inferred give-up answer and this write
+                // determined something from a right-hand side the walk already
+                // treats as improvable (`should_retry_uninformative_initializer`).
+                // Applying that here too keeps the answer the same whether the
+                // write was committed during the walk or deferred to this pass.
+                true
+            } else {
+                db.get_type_index()
+                    .decl_write_claim(&decl_id)
+                    .is_some_and(|claimed| position < claimed)
+                    && !(undetermined && is_informative_type(existing.as_type()))
+                    && !existing.supersedes(&type_cache)
+            }
+        }
+    };
+    if !seeds {
+        return bind_type(db, type_owner, type_cache);
+    }
+    db.get_type_index_mut()
+        .record_decl_write_claim(decl_id, position);
+    seed_type_slot(db, type_owner, type_cache);
     Some(())
 }
 

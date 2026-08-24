@@ -109,6 +109,7 @@ impl LuaTypeCache {
 }
 
 const NIL_RANK: u8 = 1;
+const UNKNOWN_RANK: u8 = 2;
 
 /// Rank within the "carries no type information" band, ordered by how much
 /// the value could be: `never` (nothing) through `any` (anything). `None`
@@ -118,7 +119,7 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     match typ {
         LuaType::Never => Some(0),
         LuaType::Nil => Some(NIL_RANK),
-        LuaType::Unknown => Some(2),
+        LuaType::Unknown => Some(UNKNOWN_RANK),
         LuaType::Any => Some(3),
         LuaType::Union(union) => union
             .types()
@@ -163,6 +164,12 @@ fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
 /// "no value was found" rather than "any value is allowed".
 pub(crate) fn is_bottom_type(typ: &LuaType) -> bool {
     uninformative_rank(typ).is_some_and(|rank| rank <= NIL_RANK)
+}
+
+/// Whether `typ` records that no value could be determined — `never`, `nil` or
+/// `unknown` — as opposed to `any`, which states that any value is allowed.
+pub(crate) fn is_undetermined_type(typ: &LuaType) -> bool {
+    uninformative_rank(typ).is_some_and(|rank| rank <= UNKNOWN_RANK)
 }
 
 /// Whether `typ` says anything about the value. The single authoritative
