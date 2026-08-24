@@ -14621,4 +14621,46 @@ mod test {
 
         assert_that!(diagnostics.len(), eq(1_usize));
     }
+
+    /// A truthiness guard stops proving anything once the body puts a nil back,
+    /// and that is true of a `while` condition and an `elseif` exactly as it is
+    /// of an `if` — the body runs the same statements in the same order.
+    #[test]
+    fn truthiness_guard_stops_at_a_reassignment_in_every_arm() {
+        for arm in ["if h.snd then", "while h.snd do", "if flag then\nelseif h.snd then"] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let diagnostics = diagnostics_for_code(
+                &mut ws,
+                DiagnosticCode::NeedCheckNil,
+                &format!(
+                    r#"
+                    ---@class Snd
+                    ---@field Stop fun(self: Snd)
+
+                    ---@class SndHolder
+                    ---@field snd Snd?
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    ---@return Snd?
+                    local function maybe(h, flag) return h.snd end
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    local function play(h, flag)
+                        {arm}
+                            h.snd = maybe(h, flag)
+                            h.snd:Stop()
+                        end
+                    end
+                    "#
+                ),
+            );
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "reassignment before the access voids the guard in `{arm}`: {diagnostics:?}"
+            );
+        }
+    }
 }
