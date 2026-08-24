@@ -515,6 +515,8 @@ async function main() {
 
         // A pull cancelled mid-flight must never come back as an empty full
         // report — that is what clears the file's diagnostics in VS Code.
+        // Only a file that has diagnostics can answer this: on a clean file the
+        // correct report is empty too, and the two are indistinguishable.
         editDocument();
         const doomed = client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
@@ -524,7 +526,9 @@ async function main() {
         const cancelled = await doomed;
         const shape = describeReport(cancelled.message.result);
         cancelledPulls.push({
-            emptyFullReport: shape.kind === 'full' && shape.count === 0,
+            emptyFullReport: report.checks.diagnosticCount > 0
+                && shape.kind === 'full'
+                && shape.count === 0,
             errorCode: cancelled.message.error && cancelled.message.error.code,
         });
     }
