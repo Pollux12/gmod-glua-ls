@@ -10,7 +10,8 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaMemberOwner, db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner,
+    db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
 pub use humanize_type::{
@@ -18,13 +19,14 @@ pub use humanize_type::{
     humanize_type,
 };
 pub use inference_fact::*;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 // The type index is the hottest hashing site in the analyzer: `LuaTypeOwner`
 // hashing alone was 3.9% of all CPU under the default SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
+pub(crate) use type_owner::is_undetermined_type;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
@@ -594,6 +596,9 @@ pub struct LuaTypeIndex {
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
+    /// Source position of the write whose type each decl currently holds. See
+    /// [`LuaTypeIndex::bind_decl_write`].
+    decl_write_claims: HashMap<LuaDeclId, TextSize>,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
@@ -618,6 +623,7 @@ impl LuaTypeIndex {
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
             fact_metadata: HashMap::default(),
+            decl_write_claims: HashMap::default(),
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
             support_file_dependents: HashMap::default(),
@@ -931,6 +937,19 @@ impl LuaTypeIndex {
         {
             return;
         }
+        self.commit_type_cache(owner, cache);
+    }
+
+    /// Source position of the earliest write that has seeded `decl_id`'s type.
+    pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<TextSize> {
+        self.decl_write_claims.get(decl_id).copied()
+    }
+
+    pub fn record_decl_write_claim(&mut self, decl_id: LuaDeclId, position: TextSize) {
+        self.decl_write_claims.insert(decl_id, position);
+    }
+
+    fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
         let replaced = self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
@@ -1400,6 +1419,7 @@ impl LuaIndex for LuaTypeIndex {
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
+        self.decl_write_claims.clear();
         self.definition_facts.clear();
         self.inference_events_by_file.clear();
         self.support_file_dependents.clear();
@@ -1435,6 +1455,9 @@ impl LuaTypeIndex {
 
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
+                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                    self.decl_write_claims.remove(decl_id);
+                }
                 self.types.remove(&type_owner);
                 self.fact_metadata.remove(&type_owner);
             }

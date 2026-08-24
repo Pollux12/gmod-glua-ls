@@ -25,7 +25,7 @@ use crate::{
             snapshot_callback_table_type,
         },
         common::{
-            TypeCacheWriteMode, add_member, bind_resolved_type, bind_type,
+            DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
             holds_unbound_iter_template, write_type_cache,
         },
         lua::{
@@ -163,19 +163,38 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    // Narrowing an uninformative decl cache is reserved for a right-hand side
-    // whose answer can still improve — a call or index read, or an operator over
-    // one: that is the boundary both routes into this pass enforce before they
-    // queue an item (`should_retry_uninformative_initializer`,
-    // `should_retry_narrowing_decl_assignment`). A write that landed here only
-    // because its right-hand side could not be inferred while its file was
-    // walked arrives without that check, so applying the narrowing policy to it
-    // let any shape overwrite an authoritative `any` — but only in the builds
-    // where the inference happened to fail.
-    if crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr) {
+    // `bind_resolved_type` displaces an uninformative cache; the plain bind
+    // keeps it. Which one a write gets has to follow the write's shape, not the
+    // batch. An initializer is the decl's own value, so it may narrow from any
+    // right-hand side whose answer can still improve. An assignment may only
+    // narrow from a call or index read — that is the boundary the file walk
+    // enforces in `should_retry_narrowing_decl_assignment` before it queues one.
+    // An assignment that landed here only because its right-hand side could not
+    // be inferred yet arrives without that check, and whether the walk's
+    // inference failed is a property of the batch: once the callee's return
+    // resolves the same assignment infers cleanly and the walk refuses the
+    // narrowing outright.
+    if decl_expr_is_initializer(db, decl_id, &expr)
+        && crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr)
+    {
         bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
     } else {
-        bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
+        bind_decl_write(
+            db,
+            decl_id,
+            LuaTypeCache::InferType(expr_type),
+            DeclWrite {
+                position: expr.get_position(),
+                may_improve_after_resolve:
+                    crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr),
+                reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
+                    db,
+                    decl.file_id,
+                    decl_id,
+                    &expr,
+                ),
+            },
+        );
     }
     Ok(())
 }
@@ -237,6 +256,17 @@ fn create_deferred_index_expr_member(
         }
     }
     Some(())
+}
+
+/// Whether `expr` is the declaration's own initializer rather than a later
+/// assignment to it.
+fn decl_expr_is_initializer(db: &DbIndex, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .and_then(|decl| decl.get_initializer())
+        .is_some_and(|initializer| {
+            initializer.get_expr_syntax_id() == glua_parser::LuaSyntaxId::from_node(expr.syntax())
+        })
 }
 
 fn should_defer_guarded_index_alias_resolution(
