@@ -1811,10 +1811,11 @@ fn assign_merge_type_owner_and_expr_type(
                 preserve_guarded_table_assignment_members(analyzer.db, *member_id);
             }
         } else if conditional_branch_assignment {
+            let may_open_owner_slot = write_may_declare_on_owner(analyzer.db, *member_id);
             analyzer
                 .db
                 .get_member_index_mut()
-                .mark_conditional_branch_assignment_member(*member_id);
+                .mark_conditional_branch_assignment_member(*member_id, may_open_owner_slot);
         } else if !dynamic_expr_key_member
             && analyzer
                 .db
@@ -2102,8 +2103,9 @@ pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
             preserve_guarded_table_assignment_members(db, member_id);
         }
     } else if is_member_assignment_in_conditional_branch(db, member_id) {
+        let may_open_owner_slot = write_may_declare_on_owner(db, member_id);
         db.get_member_index_mut()
-            .mark_conditional_branch_assignment_member(member_id);
+            .mark_conditional_branch_assignment_member(member_id, may_open_owner_slot);
     }
 }
 
@@ -2360,6 +2362,52 @@ pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaA
     for (owner, pending_items) in pending_by_owner {
         flush_pending_dynamic_key_collection_widening_for_members(analyzer, owner, pending_items);
     }
+}
+
+/// Whether a runtime write may give the class it names a field that class never
+/// declares.
+///
+/// A write through a reference only *names* the class; the value it runs on is
+/// one instance of it. When a subclass already declares the same field, the
+/// write is evidence about that subclass, not about the class it was typed
+/// through -- and giving the base the field hands it to every subclass, which
+/// hides the declarations and stops any receiver narrowing to the subclass that
+/// really owns it.
+///
+/// The subtype walk is not cheap, so it only runs for a write that would open a
+/// key the owner does not already hold.
+fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {
+    let member_index = db.get_member_index();
+    let Some(LuaMemberOwner::Type(owner_id)) = member_index.get_member_owner(&member_id).cloned()
+    else {
+        return true;
+    };
+    let Some(key) = member_index
+        .get_member(&member_id)
+        .map(|member| member.get_key().clone())
+    else {
+        return true;
+    };
+    if member_index
+        .get_member_item(&LuaMemberOwner::Type(owner_id.clone()), &key)
+        .is_some()
+    {
+        return true;
+    }
+    !db.get_type_index()
+        .get_all_sub_types(&owner_id)
+        .iter()
+        .any(|sub_type| {
+            member_index
+                .get_member_item(&LuaMemberOwner::Type(sub_type.get_id()), &key)
+                .is_some_and(|item| {
+                    item.get_member_ids().iter().any(|id| {
+                        member_index
+                            .get_member(id)
+                            .is_some_and(|member| member.get_feature().is_decl())
+                    })
+                })
+        })
 }
 
 pub(super) fn is_assignment_file_define_member(
