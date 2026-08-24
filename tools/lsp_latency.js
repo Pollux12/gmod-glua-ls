@@ -33,8 +33,8 @@
 // pessimistic case and keeps runs comparable without naming a file per repo.
 //
 // Exits non-zero on a correctness check, not on a latency number: a cancelled
-// diagnostic pull answered with an empty full report, or a mid-edit completion
-// that disagrees with the settled one.
+// diagnostic pull answered with a report thinner than the settled one, or a
+// mid-edit completion that disagrees with the settled one.
 'use strict';
 
 const { spawn } = require('child_process');
@@ -513,10 +513,12 @@ async function main() {
         });
         editToFresh.push(fresh.ms);
 
-        // A pull cancelled mid-flight must never come back as an empty full
-        // report — that is what clears the file's diagnostics in VS Code.
-        // Only a file that has diagnostics can answer this: on a clean file the
-        // correct report is empty too, and the two are indistinguishable.
+        // A pull cancelled mid-flight must never come back thinner than the
+        // settled answer — a full report short of what the file really has is
+        // what drops diagnostics in VS Code, and an empty one clears the file.
+        // Stated against the settled count rather than against zero, so a file
+        // that legitimately has no diagnostics does not read as a failure: on a
+        // clean file the correct report is empty too.
         editDocument();
         const doomed = client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
@@ -526,9 +528,8 @@ async function main() {
         const cancelled = await doomed;
         const shape = describeReport(cancelled.message.result);
         cancelledPulls.push({
-            emptyFullReport: report.checks.diagnosticCount > 0
-                && shape.kind === 'full'
-                && shape.count === 0,
+            thinFullReport: shape.kind === 'full'
+                && shape.count < report.checks.diagnosticCount,
             errorCode: cancelled.message.error && cancelled.message.error.code,
         });
     }
@@ -541,8 +542,8 @@ async function main() {
     report.measurements.highlightAfterEdit = summarise(highlightAfterEdit);
     report.checks.highlightRetries = highlightRetries.reduce((a, b) => a + b, 0);
     report.measurements.editToFreshAnswer = summarise(editToFresh);
-    report.checks.emptyFullReportsOnCancel =
-        cancelledPulls.filter((p) => p.emptyFullReport).length;
+    report.checks.thinReportsOnCancel =
+        cancelledPulls.filter((p) => p.thinFullReport).length;
     // A mid-edit completion that differs from the settled one is a correctness
     // regression, however fast it came back.
     report.checks.completionDriftWhileTyping = {
@@ -581,8 +582,8 @@ async function main() {
     }
     console.log(`\ncompletion items          : ${report.checks.completionItemCount}`);
     console.log(`diagnostics               : ${report.checks.diagnosticCount}`);
-    console.log(`empty reports on cancel   : ${report.checks.emptyFullReportsOnCancel}`
-        + (report.checks.emptyFullReportsOnCancel === 0 ? '  (good)' : '  (BAD: clears the file)'));
+    console.log(`thin reports on cancel    : ${report.checks.thinReportsOnCancel}`
+        + (report.checks.thinReportsOnCancel === 0 ? '  (good)' : '  (BAD: drops diagnostics)'));
     const drift = report.checks.completionDriftWhileTyping;
     const driftOk = drift.worstMissing === 0 && drift.worstExtra === 0;
     console.log(`completion drift mid-edit : -${drift.worstMissing} / +${drift.worstExtra}`
@@ -595,9 +596,9 @@ async function main() {
 // comparison and never fail; these two are defects whatever the latency was.
 function failedChecks(report) {
     const failures = [];
-    if (report.checks.emptyFullReportsOnCancel > 0) {
-        failures.push(`${report.checks.emptyFullReportsOnCancel} cancelled diagnostic pull(s) `
-            + 'came back as an empty full report, which clears the file in the editor');
+    if (report.checks.thinReportsOnCancel > 0) {
+        failures.push(`${report.checks.thinReportsOnCancel} cancelled diagnostic pull(s) came `
+            + 'back thinner than the settled report, which drops diagnostics in the editor');
     }
     const drift = report.checks.completionDriftWhileTyping;
     if (drift.worstMissing > 0 || drift.worstExtra > 0) {
