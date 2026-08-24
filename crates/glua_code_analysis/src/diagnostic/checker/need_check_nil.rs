@@ -857,8 +857,18 @@ fn is_expr_guarded_by_current_type_guard_condition(
                     .get_block()
                     .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
                 && condition_is_positive_type_guard_call(semantic_model, &condition, expr)
-                && !then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr)
-                && !loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr)
+                && if_stat.get_block().is_some_and(|block| {
+                    !guarded_block_reassigns_guarded_expr_before_access(
+                        semantic_model,
+                        &block,
+                        expr,
+                    )
+                })
+                && !loop_back_edge_reassigns_guarded_expr_after_guard(
+                    semantic_model,
+                    if_stat.syntax(),
+                    expr,
+                )
             {
                 return true;
             }
@@ -910,10 +920,13 @@ fn is_expr_guarded_by_current_assigned_value_type_guard_condition(
         if !condition_is_positive_type_guard_call(semantic_model, &condition, &assigned_expr) {
             continue;
         }
-        if then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr) {
+        if if_stat.get_block().is_some_and(|block| {
+            guarded_block_reassigns_guarded_expr_before_access(semantic_model, &block, expr)
+        }) {
             continue;
         }
-        if loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr) {
+        if loop_back_edge_reassigns_guarded_expr_after_guard(semantic_model, if_stat.syntax(), expr)
+        {
             continue;
         }
         return true;
@@ -997,14 +1010,11 @@ fn prior_assignment_value_for_expr(
     Some(assigned_expr)
 }
 
-fn then_block_reassigns_guarded_expr_before_access(
+fn guarded_block_reassigns_guarded_expr_before_access(
     semantic_model: &SemanticModel,
-    if_stat: &LuaIfStat,
+    block: &LuaBlock,
     guarded_expr: &LuaExpr,
 ) -> bool {
-    let Some(block) = if_stat.get_block() else {
-        return false;
-    };
     let access_start = guarded_expr.syntax().text_range().start();
 
     for node in block.syntax().children() {
@@ -1036,12 +1046,12 @@ fn then_block_reassigns_guarded_expr_before_access(
     false
 }
 
-fn loop_back_edge_reassigns_guarded_expr_after_if(
+fn loop_back_edge_reassigns_guarded_expr_after_guard(
     semantic_model: &SemanticModel,
-    if_stat: &LuaIfStat,
+    guard_stat: &LuaSyntaxNode,
     guarded_expr: &LuaExpr,
 ) -> bool {
-    let mut current = if_stat.syntax().clone();
+    let mut current = guard_stat.clone();
 
     while let Some(parent) = current.parent() {
         if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block
@@ -1248,40 +1258,49 @@ fn is_expr_guarded_by_current_truthiness_condition(
     expr: &LuaExpr,
 ) -> bool {
     let expr_range = expr.syntax().text_range();
+    // A guard holds only if it covers the use, proves the expression truthy,
+    // and nothing between the test and the use puts a nil back. The last part
+    // is why the arms share one predicate: an `elseif` is an `if` with an extra
+    // condition, and a `while` body runs the same statements in the same order.
+    let guard_holds = |block: Option<LuaBlock>,
+                       condition: Option<LuaExpr>,
+                       guard_stat: &LuaSyntaxNode| {
+        let Some(block) = block else {
+            return false;
+        };
+        range_contains(block.syntax().text_range(), expr_range)
+            && condition.is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+            && !guarded_block_reassigns_guarded_expr_before_access(semantic_model, &block, expr)
+            && !loop_back_edge_reassigns_guarded_expr_after_guard(semantic_model, guard_stat, expr)
+    };
+
     for ancestor in expr.syntax().ancestors() {
         if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
-            if if_stat
-                .get_block()
-                .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
-                && if_stat
-                    .get_condition_expr()
-                    .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
-                && !then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr)
-                && !loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr)
-            {
+            if guard_holds(
+                if_stat.get_block(),
+                if_stat.get_condition_expr(),
+                if_stat.syntax(),
+            ) {
                 return true;
             }
 
             for elseif_clause in if_stat.get_else_if_clause_list() {
-                if elseif_clause
-                    .get_block()
-                    .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
-                    && elseif_clause
-                        .get_condition_expr()
-                        .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
-                {
+                if guard_holds(
+                    elseif_clause.get_block(),
+                    elseif_clause.get_condition_expr(),
+                    if_stat.syntax(),
+                ) {
                     return true;
                 }
             }
         }
 
         if let Some(while_stat) = glua_parser::LuaWhileStat::cast(ancestor.clone())
-            && while_stat
-                .get_block()
-                .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
-            && while_stat
-                .get_condition_expr()
-                .is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+            && guard_holds(
+                while_stat.get_block(),
+                while_stat.get_condition_expr(),
+                while_stat.syntax(),
+            )
         {
             return true;
         }
