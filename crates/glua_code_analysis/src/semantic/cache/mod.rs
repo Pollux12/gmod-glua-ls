@@ -264,6 +264,21 @@ impl LuaInferCache {
         self.call_returns_never_cache.clear();
     }
 
+    /// Drops every narrowing answer this file has memoised.
+    ///
+    /// A *successful* flow answer survives
+    /// [`Self::clear_deferred_inference_results`], and narrowing a name reads
+    /// the type of whatever it was derived from — so once a value the walk read
+    /// as "not determined yet" becomes known, every answer that read it is
+    /// void, whichever variable it happens to be keyed under. There is no way
+    /// to drop only the ones that read it: the key names what was narrowed, not
+    /// what the narrowing consulted.
+    pub fn clear_flow_results(&mut self) {
+        self.flow_node_cache.clear();
+        self.flow_query_realm = None;
+        self.index_ref_origin_type_cache.clear();
+    }
+
     /// Discards the inference a wave of deferred resolution can have
     /// invalidated.
     pub fn clear_deferred_inference_results(&mut self) {
@@ -273,11 +288,10 @@ impl LuaInferCache {
         // A resolved signature return is exactly what turns this answer from
         // `false` to `true`, so it cannot survive a wave.
         self.call_returns_never_cache.clear();
-        // A *successful* flow answer is stale too: narrowing a name reads the
-        // declaration's type, so an answer derived before that declaration
-        // settled keeps the unsettled value for the rest of the build.
-        self.flow_node_cache.clear();
-        self.flow_query_realm = None;
+        self.flow_node_cache.retain(|_, inner| {
+            inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+            !inner.is_empty()
+        });
         self.param_type_cache
             .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
         self.param_type_source_cache
