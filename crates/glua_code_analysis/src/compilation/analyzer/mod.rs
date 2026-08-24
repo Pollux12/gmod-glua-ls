@@ -316,7 +316,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         // batch had reached.
         {
             let _p = Profile::new("rederive_settled_iter_vars");
-            rederive_settled_iter_vars(db, &mut context);
+            // Everything that read a loop variable resolved while it still held
+            // the answer the partial map gave, so moving one means re-reading
+            // the initializers that could still take a better answer.
+            if rederive_settled_iter_vars(db, &mut context) {
+                refresh_settled_initializer_caches(db, &mut context);
+            }
         }
 
         {
@@ -480,10 +485,10 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
 /// only what had been attached by then and can fall back to `any` where the
 /// field's own annotation says otherwise. Taking the answer again once every
 /// member has landed is both the deterministic and the more faithful one.
-fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) {
+fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut candidates = std::mem::take(&mut context.settled_iter_var_candidates);
     if candidates.is_empty() {
-        return;
+        return false;
     }
     candidates.sort_by_key(|iter_var| {
         (
@@ -501,10 +506,12 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) {
         .collect::<HashSet<_>>();
     context.infer_manager.clear_files_iter_var_results(&files);
 
+    let writes_before = db.get_type_index().type_writes();
     for mut iter_var in candidates {
         let cache = context.infer_manager.get_infer_cache(iter_var.file_id);
         let _ = unresolve::resolve_settled_iter_var(db, cache, &mut iter_var);
     }
+    db.get_type_index().type_writes() != writes_before
 }
 
 /// Re-derives member assignment widenings that ran against an incomplete
@@ -619,11 +626,26 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
 }
 
 fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_local_decl_initializer_caches(db, context);
+    refresh_local_decl_initializer_caches(db, context, false);
     refresh_member_initializer_caches(db, context);
 }
 
-fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+/// [`refresh_initializer_caches`] for a late pass that moved a handful of types.
+///
+/// Only initializers whose cache could still take a better answer are re-read.
+/// The blind-dynamic-field probe the full pass runs is not repeated: its verdict
+/// is about whether the *first* answer was taken before the dynamic-field index
+/// existed, which a later pass cannot change, and asking it again means
+/// inferring every candidate in the workspace a second time.
+fn refresh_settled_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    refresh_member_initializer_caches(db, context);
+}
+
+fn refresh_local_decl_initializer_caches(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    settled_only: bool,
+) {
     if context.uninformative_local_decl_candidates.is_empty() {
         return;
     }
@@ -690,6 +712,13 @@ fn refresh_local_decl_initializer_caches(db: &mut DbIndex, context: &mut Analyze
                 continue;
             };
             if !initializer_reads_through_call_or_index(&expr) {
+                continue;
+            }
+            if settled_only
+                && !current_is_uninformative
+                && !can_refine_nominal_type
+                && !can_upgrade_authority
+            {
                 continue;
             }
 
