@@ -453,12 +453,27 @@ impl LuaMemberIndex {
 
     /// Re-resolves the slot `member_id` writes to, now that it is known to
     /// be a conditional-branch write.
-    fn resolve_conditional_branch_owner_key_item(&mut self, member_id: LuaMemberId) -> Option<()> {
+    ///
+    /// `may_open_slot` decides whether the write is allowed to give the owner a
+    /// key it does not already hold.
+    fn resolve_conditional_branch_owner_key_item(
+        &mut self,
+        member_id: LuaMemberId,
+        may_open_slot: bool,
+    ) -> Option<()> {
         let owner = self.member_current_owner.get(&member_id)?.clone();
         if matches!(owner, LuaMemberOwner::GlobalPath(_)) {
             return None;
         }
         let key = self.get_member(&member_id)?.get_key().clone();
+        if !may_open_slot
+            && self
+                .owner_members
+                .get(&owner)
+                .is_none_or(|members| members.get_member(&key).is_none())
+        {
+            return None;
+        }
         let candidates = self
             .get_current_owner_members_for_key(&owner, &key)
             .into_iter()
@@ -1309,10 +1324,14 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 
-    pub fn mark_conditional_branch_assignment_member(&mut self, member_id: LuaMemberId) {
+    pub fn mark_conditional_branch_assignment_member(
+        &mut self,
+        member_id: LuaMemberId,
+        may_open_owner_slot: bool,
+    ) {
         self.non_overwriting_assignment_members.insert(member_id);
         self.conditional_branch_assignment_members.insert(member_id);
-        self.resolve_conditional_branch_owner_key_item(member_id);
+        self.resolve_conditional_branch_owner_key_item(member_id, may_open_owner_slot);
     }
 
     pub fn get_current_owner_members_for_key(
