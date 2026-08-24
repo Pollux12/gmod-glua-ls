@@ -48,6 +48,12 @@ pub struct LuaMemberIndex {
     /// Per file, each `if` branch's range paired with the range of the `if` it
     /// belongs to, sorted by branch start. Recorded on the decl walk.
     conditional_branch_ranges: HashMap<FileId, Vec<(TextRange, TextRange)>>,
+    /// Members `add_member_alias_to_owner` pushed into a slot, by slot. The
+    /// alias never displaces, while the insert path collapses to the latest
+    /// writer, so which of the two ran last decides the visible set -- and that
+    /// is a property of the batch. Kept so the slot can be settled once both are
+    /// done.
+    alias_contributed_slots: HashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
     /// Per-writer evidence for the member assignment widening merge. See
     /// [`MemberAssignmentContribution`].
@@ -94,6 +100,7 @@ impl LuaMemberIndex {
             deferred_index_expr_members: HashSet::default(),
             function_scope_ranges: HashMap::default(),
             conditional_branch_ranges: HashMap::default(),
+            alias_contributed_slots: HashMap::default(),
             member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
         }
@@ -589,6 +596,10 @@ impl LuaMemberIndex {
             self.add_member_to_owner_key_history_index(owner.clone(), id);
         }
 
+        self.alias_contributed_slots
+            .entry((owner.clone(), key.clone()))
+            .or_default()
+            .push(id);
         let owner_members = self
             .owner_members
             .entry(owner.clone())
@@ -1248,6 +1259,74 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Re-derives the visible set of every slot an alias pushed into, from the
+    /// ownership those writes finally settled on.
+    ///
+    /// `add_member_alias_to_owner` never displaces what it finds, while the
+    /// insert path collapses a slot to its latest writer as each write arrives.
+    /// Which ran last is a property of how the batch was composed, so a slot
+    /// both touched has to be re-derived once they are done -- from the same
+    /// rules the insert path uses, over the same members.
+    pub fn settle_alias_contributed_slots(&mut self) {
+        let contributed = std::mem::take(&mut self.alias_contributed_slots);
+        for ((owner, key), aliased_ids) in contributed {
+            let Some(item) = self
+                .owner_members
+                .get(&owner)
+                .and_then(|owner_members| owner_members.get_member(&key))
+            else {
+                continue;
+            };
+            let mut live = member_ids_from_item(item);
+            for id in aliased_ids {
+                if !live.contains(&id) {
+                    live.push(id);
+                }
+            }
+            live.retain(|id| self.members.contains_key(id));
+            if live.len() < 2
+                || !live
+                    .iter()
+                    .all(|id| self.is_assignment_file_define_member(*id))
+            {
+                continue;
+            }
+            if live
+                .iter()
+                .all(|id| self.non_overwriting_assignment_members.contains(id))
+            {
+                continue;
+            }
+            let (aliased, owned): (Vec<_>, Vec<_>) = live
+                .iter()
+                .copied()
+                .partition(|id| self.member_current_owner.get(id) != Some(&owner));
+            let Some(&first_owned) = owned.first() else {
+                continue;
+            };
+            // A conditional-branch slot keeps one writer per branch; every other
+            // slot keeps the latest. Both read only the candidate set, which is
+            // what makes the answer independent of arrival order.
+            let mut visible = aliased;
+            match self.conditional_branch_item(&owned) {
+                Some(item) => visible.extend(member_ids_from_item(&item)),
+                None => visible.push(latest_defined_member(&owned, first_owned)),
+            }
+            visible.sort_by_key(|id| member_id_sort_key(*id));
+            visible.dedup();
+            let item = match visible.as_slice() {
+                [only] => LuaMemberIndexItem::One(*only),
+                _ => LuaMemberIndexItem::Many(visible),
+            };
+            let Some(owner_members) = self.owner_members.get_mut(&owner) else {
+                continue;
+            };
+            if owner_members.get_member(&key) != Some(&item) {
+                owner_members.add_member(key, item);
+            }
+        }
+    }
+
     pub fn add_conditional_branch_range(
         &mut self,
         file_id: FileId,
@@ -1627,6 +1706,7 @@ impl LuaIndex for LuaMemberIndex {
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
         self.conditional_branch_ranges.clear();
+        self.alias_contributed_slots.clear();
         self.member_function_scope_ranges.clear();
         self.assignment_contributions.clear();
     }

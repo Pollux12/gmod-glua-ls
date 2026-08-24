@@ -293,6 +293,13 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             common::reconcile_directly_attached_candidate_members(db);
         }
 
+        // Every write and every alias this batch performed has landed, so the
+        // slots they share can be settled from the ownership they ended on.
+        {
+            let _p = Profile::new("settle_alias_contributed_slots");
+            db.get_member_index_mut().settle_alias_contributed_slots();
+        }
+
         // Net flows are collected last: the collector resolves wrappers through
         // signatures, receiver types and members, none of which exist yet when
         // the gmod pre-pass runs. See `GmodNetworkAnalysisPipeline`.
