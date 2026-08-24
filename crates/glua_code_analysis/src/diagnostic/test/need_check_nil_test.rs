@@ -14627,7 +14627,11 @@ mod test {
     /// of an `if` — the body runs the same statements in the same order.
     #[test]
     fn truthiness_guard_stops_at_a_reassignment_in_every_arm() {
-        for arm in ["if h.snd then", "while h.snd do", "if flag then\nelseif h.snd then"] {
+        for arm in [
+            "if h.snd then",
+            "while h.snd do",
+            "if flag then\nelseif h.snd then",
+        ] {
             let mut ws = VirtualWorkspace::new_with_init_std_lib();
             let diagnostics = diagnostics_for_code(
                 &mut ws,
