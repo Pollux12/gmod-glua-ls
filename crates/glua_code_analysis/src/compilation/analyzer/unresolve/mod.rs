@@ -516,7 +516,7 @@ fn try_resolve(
                             .as_ref()
                             .is_some_and(|root| !root_type_is_undetermined(db, root))
                     {
-                        infer_manager.clear_file_flow_results(file_id);
+                        infer_manager.clear_file_undetermined_flow_results(file_id);
                     }
                 }
                 let cache = infer_manager.get_infer_cache(file_id);

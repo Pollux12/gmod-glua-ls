@@ -279,6 +279,28 @@ impl LuaInferCache {
         self.index_ref_origin_type_cache.clear();
     }
 
+    /// Drops the narrowing answers that a settling value can have invalidated.
+    ///
+    /// An answer that came back undetermined is one the walk could not pin
+    /// down, so it is exactly what a value becoming known makes wrong. An
+    /// answer that determined something did not read that value as unsettled,
+    /// and those are the expensive ones to rebuild — a fifth of a cold index if
+    /// the whole cache goes.
+    pub fn clear_undetermined_flow_results(&mut self) {
+        fn settled(entry: &CacheEntry<LuaType>) -> bool {
+            match entry {
+                CacheEntry::Cache(typ) => !crate::db_index::is_undetermined_type(typ),
+                _ => false,
+            }
+        }
+        self.flow_node_cache.retain(|_, inner| {
+            inner.retain(|_, entry| settled(entry));
+            !inner.is_empty()
+        });
+        self.index_ref_origin_type_cache
+            .retain(|_, entry| settled(entry));
+    }
+
     /// Discards what a `for ... in pairs(t)` answer was built from, so it can be
     /// taken again against a member map that has since grown.
     pub fn clear_iter_var_results(&mut self) {
