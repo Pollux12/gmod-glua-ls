@@ -273,10 +273,11 @@ impl LuaInferCache {
         // A resolved signature return is exactly what turns this answer from
         // `false` to `true`, so it cannot survive a wave.
         self.call_returns_never_cache.clear();
-        self.flow_node_cache.retain(|_, inner| {
-            inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
-            !inner.is_empty()
-        });
+        // A *successful* flow answer is stale too: narrowing a name reads the
+        // declaration's type, so an answer derived before that declaration
+        // settled keeps the unsettled value for the rest of the build.
+        self.flow_node_cache.clear();
+        self.flow_query_realm = None;
         self.param_type_cache
             .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
         self.param_type_source_cache

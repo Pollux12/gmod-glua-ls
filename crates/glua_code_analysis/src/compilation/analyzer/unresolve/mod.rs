@@ -473,7 +473,18 @@ fn try_resolve(
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
+                let writes_before = db.get_type_index().type_writes();
                 let resolve_result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                // A resolution that moved a type invalidates every inference
+                // memoised against the old one, narrowing included. The
+                // end-of-wave purge is too late for the items still to be
+                // drained here: they would read the pre-resolve value, and
+                // whether a reader shares a wave with its writer is a property
+                // of the batch rather than of the source.
+                if db.get_type_index().type_writes() != writes_before {
+                    infer_manager.clear_file_deferred_results(file_id);
+                    retry_file_ids.insert(file_id);
+                }
                 let cache = infer_manager.get_infer_cache(file_id);
                 if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
                     profile.record_attempt(
