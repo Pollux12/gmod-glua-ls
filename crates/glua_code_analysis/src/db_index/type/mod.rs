@@ -599,6 +599,9 @@ pub struct LuaTypeIndex {
     /// Source position of the write whose type each decl currently holds. See
     /// [`LuaTypeIndex::bind_decl_write`].
     decl_write_claims: HashMap<LuaDeclId, TextSize>,
+    /// Counts stored types that actually moved, so a caller can tell a no-op
+    /// write from one that invalidates memoised inference.
+    type_writes: u64,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
@@ -624,6 +627,7 @@ impl LuaTypeIndex {
             in_filed_type_owner: HashMap::default(),
             fact_metadata: HashMap::default(),
             decl_write_claims: HashMap::default(),
+            type_writes: 0,
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
             support_file_dependents: HashMap::default(),
@@ -940,6 +944,12 @@ impl LuaTypeIndex {
         self.commit_type_cache(owner, cache);
     }
 
+    /// See [`LuaTypeIndex::type_writes`]. Compare it across an operation to
+    /// learn whether that operation moved any stored type.
+    pub fn type_writes(&self) -> u64 {
+        self.type_writes
+    }
+
     /// Source position of the earliest write that has seeded `decl_id`'s type.
     pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<TextSize> {
         self.decl_write_claims.get(decl_id).copied()
@@ -1075,6 +1085,13 @@ impl LuaTypeIndex {
     /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
     /// whether a cache was replaced.
     fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
+        if self
+            .types
+            .get(&owner)
+            .is_none_or(|existing| existing.as_type() != cache.as_type())
+        {
+            self.type_writes += 1;
+        }
         let file_id = owner.get_file_id();
         self.cache_refs.add(file_id, cache.as_type());
         let Some(previous) = self.types.insert(owner, cache) else {
