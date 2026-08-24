@@ -37,6 +37,11 @@ use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
 use unresolve::{UnResolve, UnResolveReturn};
 
+/// Ceiling on [`AnalyzeContext::resolve_call_site_return_consumers`] rounds.
+/// The set converges in a handful of rounds on real workspaces; the bound only
+/// stops a mutually recursive chain from spinning.
+const CALL_SITE_RETURN_CONSUMER_ROUNDS: usize = 32;
+
 pub(crate) fn infer_closure_body_function_type(
     db: &DbIndex,
     cache: &mut crate::LuaInferCache,
@@ -242,7 +247,13 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
 
         {
             let _p = Profile::new("rederive_settled_inferred_returns");
-            rederive_settled_inferred_returns(db, &mut context);
+            // A return settled here was still `unknown` when the call-site
+            // consumers read it, so those consumers hold a value derived from
+            // it that is now stale. A warm re-index inherits the settled return
+            // and never sees the stale one, so leaving them is drift.
+            if rederive_settled_inferred_returns(db, &mut context) {
+                context.resolve_call_site_return_consumers(db);
+            }
         }
 
         {
@@ -402,7 +413,7 @@ fn attach_settled_index_expr_members(db: &mut DbIndex, context: &mut AnalyzeCont
 }
 
 /// Re-resolves inferred returns that settled on `any`/`unknown`.
-fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) {
+fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut candidates = context
         .inferred_return_candidates
         .iter()
@@ -419,7 +430,7 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
         .cloned()
         .collect::<Vec<_>>();
     if candidates.is_empty() {
-        return;
+        return false;
     }
     candidates.sort_by_key(|return_| (return_.file_id, return_.signature_id.get_position()));
 
@@ -430,10 +441,20 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
         .collect::<HashSet<_>>();
     context.infer_manager.clear_files(&candidate_files);
 
+    let mut changed = false;
     for mut return_ in candidates {
+        let signature_id = return_.signature_id.clone();
         let cache = context.infer_manager.get_infer_cache(return_.file_id);
         let _ = unresolve::try_resolve_return_point(db, cache, &mut return_);
+        changed |= db
+            .get_signature_index()
+            .get(&signature_id)
+            .is_some_and(|signature| {
+                let resolved = signature.get_return_type();
+                !resolved.is_any() && !resolved.is_unknown()
+            });
     }
+    changed
 }
 
 /// Re-derives member assignment widenings that ran against an incomplete
@@ -1281,6 +1302,10 @@ pub struct AnalyzeContext {
     inferred_return_candidates: Vec<UnResolveReturn>,
     pending_call_site_return_consumers: Vec<UnResolve>,
     pending_call_site_definition_refreshes: Vec<(LuaDefinitionId, LuaTypeOwner)>,
+    /// Consumers already resolved once, kept so a later pass that settles a
+    /// function return can have them re-resolved against it.
+    call_site_return_targets: Vec<(FileId, LuaTypeOwner, LuaExpr, usize)>,
+    call_site_return_definition_refreshes: HashMap<LuaTypeOwner, Vec<LuaDefinitionId>>,
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     member_initializer_reinfer_candidates: HashSet<LuaMemberId>,
@@ -1313,6 +1338,8 @@ impl AnalyzeContext {
             inferred_return_candidates: Vec::new(),
             pending_call_site_return_consumers: Vec::new(),
             pending_call_site_definition_refreshes: Vec::new(),
+            call_site_return_targets: Vec::new(),
+            call_site_return_definition_refreshes: HashMap::new(),
             pending_unresolve_decl_ids: HashSet::new(),
             uninformative_local_decl_candidates: HashSet::new(),
             member_initializer_reinfer_candidates: HashSet::new(),
@@ -1467,58 +1494,74 @@ impl AnalyzeContext {
     }
 
     fn resolve_call_site_return_consumers(&mut self, db: &mut DbIndex) -> usize {
-        let consumers = std::mem::take(&mut self.pending_call_site_return_consumers);
-        let count = consumers.len();
-        if count == 0 {
-            self.pending_call_site_definition_refreshes.clear();
-            return 0;
-        }
-
-        let mut definition_refreshes = HashMap::<LuaTypeOwner, Vec<LuaDefinitionId>>::new();
-        for (definition, owner) in std::mem::take(&mut self.pending_call_site_definition_refreshes)
-        {
-            definition_refreshes
-                .entry(owner)
-                .or_default()
-                .push(definition);
-        }
-        self.infer_manager.clear();
-        let mut fact_updates = Vec::with_capacity(
-            consumers.len() + definition_refreshes.values().map(Vec::len).sum::<usize>(),
-        );
-
-        for consumer in consumers {
-            let (file_id, owner, expr, ret_idx) = match consumer {
-                UnResolve::Decl(decl) => (
+        for consumer in std::mem::take(&mut self.pending_call_site_return_consumers) {
+            match consumer {
+                UnResolve::Decl(decl) => self.call_site_return_targets.push((
                     decl.file_id,
                     LuaTypeOwner::Decl(decl.decl_id),
                     decl.expr,
                     decl.ret_idx,
-                ),
+                )),
                 UnResolve::Member(member) => {
-                    let Some(expr) = member.expr else {
-                        continue;
-                    };
-                    (
-                        member.file_id,
-                        LuaTypeOwner::Member(member.member_id),
-                        expr,
-                        member.ret_idx,
-                    )
+                    if let Some(expr) = member.expr {
+                        self.call_site_return_targets.push((
+                            member.file_id,
+                            LuaTypeOwner::Member(member.member_id),
+                            expr,
+                            member.ret_idx,
+                        ));
+                    }
                 }
-                _ => continue,
-            };
-            let cache = self.infer_manager.get_infer_cache(file_id);
-            let fact = select_result_fact(infer_expr_fact_with_cache(db, cache, expr), ret_idx);
-            fact_updates.push((LuaInferenceNodeId::TypeOwner(owner.clone()), fact.clone()));
-            if let Some(definitions) = definition_refreshes.get(&owner) {
-                for definition in definitions {
-                    fact_updates.push((LuaInferenceNodeId::Definition(*definition), fact.clone()));
-                }
+                _ => {}
             }
         }
-        db.publish_inference_facts(fact_updates);
-        count
+        for (definition, owner) in std::mem::take(&mut self.pending_call_site_definition_refreshes)
+        {
+            self.call_site_return_definition_refreshes
+                .entry(owner)
+                .or_default()
+                .push(definition);
+        }
+        if self.call_site_return_targets.is_empty() {
+            return 0;
+        }
+
+        // These consumers feed each other: one's expression can read a local, or
+        // a function return, that another one settles. Inferring the whole set
+        // against the pre-publish index leaves every such reader holding its
+        // neighbour's *unresolved* value, and whether a neighbour is in this
+        // batch or was already published by an earlier build is a property of
+        // the batch rather than of the source. Iterate until publishing stops
+        // moving anything, so a partial re-index and a cold build agree.
+        for _ in 0..CALL_SITE_RETURN_CONSUMER_ROUNDS {
+            self.infer_manager.clear();
+            let mut fact_updates = Vec::with_capacity(
+                self.call_site_return_targets.len()
+                    + self
+                        .call_site_return_definition_refreshes
+                        .values()
+                        .map(Vec::len)
+                        .sum::<usize>(),
+            );
+            for (file_id, owner, expr, ret_idx) in &self.call_site_return_targets {
+                let cache = self.infer_manager.get_infer_cache(*file_id);
+                let fact = select_result_fact(
+                    infer_expr_fact_with_cache(db, cache, expr.clone()),
+                    *ret_idx,
+                );
+                fact_updates.push((LuaInferenceNodeId::TypeOwner(owner.clone()), fact.clone()));
+                if let Some(definitions) = self.call_site_return_definition_refreshes.get(owner) {
+                    for definition in definitions {
+                        fact_updates
+                            .push((LuaInferenceNodeId::Definition(*definition), fact.clone()));
+                    }
+                }
+            }
+            if db.publish_inference_facts(fact_updates).is_empty() {
+                break;
+            }
+        }
+        self.call_site_return_targets.len()
     }
 
     fn invalidate_inferred_returns_for_sources(
