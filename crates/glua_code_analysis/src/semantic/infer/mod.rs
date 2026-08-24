@@ -346,12 +346,11 @@ where
 
                 break;
             }
-            // A union that carries a multi-return still spreads. An `unknown`
-            // arm - what an unannotated recursive function leaves behind, since
-            // its own return cannot inform itself - says nothing about arity or
-            // about any slot, so the informative arms decide both. Falling
-            // through instead pushed the whole union as a single value, which
-            // mistyped the first argument and dropped every later one.
+            // A union that carries a multi-return still spreads, slot by
+            // slot. An `unknown` arm - what an unannotated recursive function
+            // leaves behind, since its own return cannot inform itself - says
+            // nothing about arity or about any slot, so the informative arms
+            // decide both.
             LuaType::Union(ref union)
                 if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) =>
             {
@@ -362,11 +361,16 @@ where
                         _ => None,
                     })
                     .collect::<Vec<_>>();
+                // A `Base` arm answers every slot, so its arity bounds nothing.
+                // That is only safe while the caller has asked for a fixed
+                // number of values; with no arity to fill it contributes one
+                // value, exactly as a bare `Variadic` does.
                 let slots = arms
                     .iter()
                     .map(|variadic| match variadic.deref() {
                         VariadicType::Multi(types) => types.len(),
-                        VariadicType::Base(_) => usize::MAX,
+                        VariadicType::Base(_) if var_count.is_some() => usize::MAX,
+                        VariadicType::Base(_) => 1,
                     })
                     .max()
                     .unwrap_or(0);

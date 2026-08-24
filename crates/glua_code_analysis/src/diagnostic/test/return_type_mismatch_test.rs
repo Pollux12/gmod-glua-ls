@@ -520,4 +520,51 @@ mod tests {
             "#
         ));
     }
+
+    /// A union arm that is an unbounded variadic answers *every* slot, so the
+    /// spread has to bound itself. Checking a `@return` asks for the value list
+    /// with no arity to fill, and taking the unbounded arm's arity literally
+    /// looped to `usize::MAX` pushing a type per iteration, which ate the
+    /// machine on a ten-line file.
+    #[test]
+    fn unbounded_variadic_union_arm_spreads_without_an_arity_to_fill() {
+        let mut ws = VirtualWorkspace::new();
+
+        let file_id = ws.def_file(
+            "lua/forward.lua",
+            r#"
+            ---@vararg integer
+            local function forward(n, ...)
+                if n > 0 then return forward(n - 1, ...) end
+                return ...
+            end
+
+            ---@return integer
+            local function outer(...)
+                return forward(3, ...)
+            end
+
+            print(outer(1))
+            "#,
+        );
+        ws.analysis
+            .diagnostic
+            .enable_only(DiagnosticCode::ReturnTypeMismatch);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, tokio_util::sync::CancellationToken::new())
+            .unwrap_or_default();
+        // The point is that this terminates at all, and the type it settles on
+        // is what proves it: an unbounded arm taken literally cannot produce a
+        // finite union, so pinning the union pins the bound.
+        let messages = diagnostics
+            .iter()
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(messages.len(), 1, "{messages:?}");
+        assert!(
+            messages[0].contains("`(1 ...|unknown ...)`"),
+            "spread should yield one slot per unbounded arm: {messages:?}"
+        );
+    }
 }
