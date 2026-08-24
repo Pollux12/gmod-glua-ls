@@ -211,6 +211,8 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                             decl_id,
                             &expr,
                         ),
+                        may_narrow_uninformative: may_improve_after_resolve(&expr),
+                        resolved_initializer: false,
                     },
                 );
                 if retry_uninformative {
@@ -1057,6 +1059,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 may_improve_after_resolve: may_improve_after_resolve(expr),
                 reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
                     if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)),
+                may_narrow_uninformative: is_call_or_index_expr(expr),
+                resolved_initializer: false,
             },
         );
         // The member is only homed onto its owner above, so the sibling guards
@@ -1096,6 +1100,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                     *decl_id,
                                     last_expr,
                                 )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
                             },
                         );
                     }
@@ -1120,6 +1126,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                     *decl_id,
                                     last_expr,
                                 )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
                             },
                         );
                     }
@@ -2916,6 +2924,8 @@ fn special_assign_pattern(
                     position: assign_stat_range.start(),
                     may_improve_after_resolve: false,
                     reads_out_of_decl: false,
+                    may_narrow_uninformative: false,
+                    resolved_initializer: false,
                 },
             );
         }
