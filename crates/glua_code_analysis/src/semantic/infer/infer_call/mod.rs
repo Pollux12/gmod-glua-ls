@@ -1102,13 +1102,86 @@ fn specialize_return_aliases_for_call(
     func_ty: &LuaFunctionType,
     call_expr: &LuaCallExpr,
 ) -> Option<Arc<LuaFunctionType>> {
-    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr).or_else(
-        || {
+    specialize_direct_param_return_alias_for_call(db, cache, signature, func_ty, call_expr)
+        .or_else(|| {
             specialize_class_name_param_return_alias_for_call(
                 db, cache, signature, func_ty, call_expr,
             )
+        })
+        .or_else(|| restore_definition_through_return_alias(db, cache, func_ty, call_expr))
+}
+
+/// Gives back the definition a declared pass-through was handed.
+///
+/// Binding a template parameter turns `Def(X)` into `Ref(X)`, so that a generic
+/// function cannot claim to define the class it was merely given. A function
+/// annotated `@[return_alias(n)]` says it returns argument `n` itself, and
+/// `assert(FindMetaTable("Panel"))` is the shape that needs it: without this the
+/// methods written on the result extend nothing, because only a `Def` does.
+///
+/// Only the exact `Ref(X)` -> `Def(X)` step is restored, so a return the
+/// annotation transformed — `std.NotNull<T>` dropping `nil`, say — keeps its
+/// transformation.
+fn restore_definition_through_return_alias(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    func_ty: &LuaFunctionType,
+    call_expr: &LuaCallExpr,
+) -> Option<Arc<LuaFunctionType>> {
+    // The alias may be the whole return or, where the function also passes the
+    // rest of its arguments back, the first of several.
+    let returned_id = match func_ty.get_ret() {
+        LuaType::Ref(returned_id) => returned_id.clone(),
+        LuaType::Variadic(variadic) => match variadic.get_type(0) {
+            Some(LuaType::Ref(returned_id)) => returned_id.clone(),
+            _ => return None,
         },
-    )
+        _ => return None,
+    };
+    let signature_id = get_prefix_expr_signature_id(db, cache, call_expr)?;
+    let attribute =
+        crate::db_index::find_signature_attribute_use(db, signature_id, "return_alias")?;
+    let param = attribute
+        .get_param_by_name("param")
+        .or_else(|| attribute.args.first().and_then(|(_, typ)| typ.as_ref()))?;
+    let (LuaType::IntegerConst(param_idx) | LuaType::DocIntegerConst(param_idx)) = param else {
+        return None;
+    };
+    let param_idx = usize::try_from(*param_idx).ok()?;
+    let args = call_expr
+        .get_args_list()
+        .map(|args| args.get_args().collect::<Vec<_>>())
+        .unwrap_or_default();
+    let arg = call_arg_for_param(call_expr, func_ty, &args, param_idx)?;
+    let LuaType::Def(arg_id) = infer_expr(db, cache, arg).ok()? else {
+        return None;
+    };
+    if arg_id != returned_id {
+        return None;
+    }
+
+    let restored = match func_ty.get_ret() {
+        LuaType::Variadic(variadic) => match std::ops::Deref::deref(variadic) {
+            VariadicType::Multi(slots) => {
+                let mut slots = slots.clone();
+                *slots.first_mut()? = LuaType::Def(arg_id);
+                LuaType::Variadic(VariadicType::Multi(slots).into())
+            }
+            VariadicType::Base(_) => return None,
+        },
+        _ => LuaType::Def(arg_id),
+    };
+
+    Some(Arc::new(
+        LuaFunctionType::new(
+            func_ty.get_async_state(),
+            func_ty.is_colon_define(),
+            func_ty.is_variadic(),
+            func_ty.get_params().to_vec(),
+            restored,
+        )
+        .with_optional_params(func_ty.get_optional_params().to_vec()),
+    ))
 }
 
 fn specialize_direct_param_return_alias_for_call(
