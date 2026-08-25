@@ -421,11 +421,14 @@ fn compact_pairs_key_type(keys: &[LuaType]) -> LuaType {
 }
 
 fn compact_pairs_value_type(db: &DbIndex, values: Vec<LuaType>) -> LuaType {
-    let values = values
+    let mut values = values
         .into_iter()
         .map(|value| remove_pairs_yield_nil(db, &value))
         .filter(|value| !value.is_unknown() && !value.is_never())
         .collect::<Vec<_>>();
+    if values.iter().any(|v| !v.is_any()) {
+        values.retain(|v| !v.is_any());
+    }
     if values.is_empty() {
         // All observed values were nil-only or otherwise uninformative; avoid collapsing to Nil.
         return LuaType::Unknown;
