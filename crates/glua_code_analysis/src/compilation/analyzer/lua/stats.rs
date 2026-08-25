@@ -229,6 +229,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                         ),
                         may_narrow_uninformative: may_improve_after_resolve(&expr),
                         resolved_initializer: false,
+                        fills_own_default: expr_fills_own_default(
+                            analyzer.db,
+                            analyzer.file_id,
+                            decl_id,
+                            &expr,
+                        ),
                     },
                 );
                 if retry_uninformative {
@@ -1077,6 +1083,8 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                     if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)),
                 may_narrow_uninformative: is_call_or_index_expr(expr),
                 resolved_initializer: false,
+                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_fills_own_default(analyzer.db, analyzer.file_id, *decl_id, expr)),
             },
         );
         // The member is only homed onto its owner above, so the sibling guards
@@ -1118,6 +1126,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 )),
                                 may_narrow_uninformative: is_call_or_index_expr(last_expr),
                                 resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
                             },
                         );
                     }
@@ -1144,6 +1159,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                                 )),
                                 may_narrow_uninformative: is_call_or_index_expr(last_expr),
                                 resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
                             },
                         );
                     }
@@ -1631,6 +1653,36 @@ fn should_defer_pending_local_alias(
 /// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
 /// self-contradiction — the value still cannot be the decl's lifetime type,
 /// because it was computed from a read that type would reject.
+/// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
+///
+/// The result always includes the declaration's own type, so unlike a plain
+/// reassignment it refines the declaration rather than replacing it, and is the
+/// one body write a parameter may take its type from.
+pub(crate) fn expr_fills_own_default(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return false;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
+        return false;
+    }
+    let Some((LuaExpr::NameExpr(left), _)) = binary_expr.get_exprs() else {
+        return false;
+    };
+    let Some(name) = left.get_name_text() else {
+        return false;
+    };
+
+    db.get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, left.get_position()))
+        .is_some_and(|decl| decl.get_id() == decl_id)
+}
+
 pub(crate) fn expr_reads_out_of_decl(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -3088,6 +3140,7 @@ fn special_assign_pattern(
                     reads_out_of_decl: false,
                     may_narrow_uninformative: false,
                     resolved_initializer: false,
+                    fills_own_default: false,
                 },
             );
         }
