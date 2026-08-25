@@ -19,9 +19,8 @@ use crate::{
 };
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
-    LuaIndexExpr,
-    LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind,
-    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
+    LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rustc_hash::FxHashMap;
 
@@ -2427,7 +2426,10 @@ fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMember
 
 /// Whether any writer of this member's slot bootstraps it with `x.y = x.y or
 /// {}`, this one included.
-pub(in crate::compilation::analyzer) fn slot_has_guarded_table_bootstrap(db: &DbIndex, member_id: LuaMemberId) -> bool {
+pub(in crate::compilation::analyzer) fn slot_has_guarded_table_bootstrap(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+) -> bool {
     let member_index = db.get_member_index();
     let Some(owner) = member_index.get_member_owner(&member_id) else {
         return false;
@@ -2890,7 +2892,10 @@ fn guarded_table_bootstrap_range(
 ) -> Option<rowan::TextRange> {
     let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
     let root = tree.get_red_root();
-    guarded_bootstrap_range_for_node(member_id.get_syntax_id().to_node_from_root(&root)?, empty_only)
+    guarded_bootstrap_range_for_node(
+        member_id.get_syntax_id().to_node_from_root(&root)?,
+        empty_only,
+    )
 }
 
 /// The one table a repeated `x.y = x.y or {}` guard names.
@@ -2950,8 +2955,8 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
         // slot holds one table, so a writer left on its own literal forks the
         // identity again, and whether it was queued depends on how far the walk
         // had got when it ran.
-        let members = guarded_table_assignment_member_ids_for_owner_key(db, first)
-            .unwrap_or(members);
+        let members =
+            guarded_table_assignment_member_ids_for_owner_key(db, first).unwrap_or(members);
         for member_id in members {
             let owner = LuaTypeOwner::Member(member_id);
             if db
@@ -3689,7 +3694,10 @@ mod tests {
                     )
                     .expect("preserved table-literal cache should stay enabled")
                     .expect("preserved table-literal cache should return a widened type");
-                    assert_eq!(cached_type, LuaType::Table, "unexpected type at member {i}");
+                    assert!(
+                        matches!(cached_type, LuaType::MergedTable(_)),
+                        "unexpected type at member {i}: {cached_type:?}"
+                    );
                     cache_hits += 1;
                 }
 
