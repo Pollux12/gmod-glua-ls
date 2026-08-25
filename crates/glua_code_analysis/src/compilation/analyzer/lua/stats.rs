@@ -613,10 +613,17 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
 /// after the batch is done.
 fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
     match prefix_type {
-        LuaType::Unknown | LuaType::Any => true,
-        LuaType::Union(union) => union
-            .types()
-            .all(|arm| matches!(arm, LuaType::Nil | LuaType::Unknown | LuaType::Any)),
+        // `table` belongs here for the same reason `any` does: it names no
+        // element, so nothing can attach through it. It is also what a slot
+        // collapses to while a writer's literal is still being widened against
+        // siblings the walk has not reached, which is a property of the batch.
+        LuaType::Unknown | LuaType::Any | LuaType::Table => true,
+        LuaType::Union(union) => union.types().all(|arm| {
+            matches!(
+                arm,
+                LuaType::Nil | LuaType::Unknown | LuaType::Any | LuaType::Table
+            )
+        }),
         _ => false,
     }
 }
@@ -1861,6 +1868,16 @@ fn assign_merge_type_owner_and_expr_type(
         || matches!(&type_owner, LuaTypeOwner::Member(member_id)
             if is_guarded_table_assignment_member(analyzer.db, *member_id));
 
+    // A plain writer that shares the slot has to preserve them too: widening
+    // `self.x = {}` against a `self.x = self.x or {}` in another file answers
+    // `table`, and the guard's literal is then gone for every reader —
+    // including the writes that attach members through it. This says nothing
+    // about *this* write being a guarded one, so it feeds the widening decision
+    // alone and not the classification below.
+    let preserve_sibling_table_literals = preserve_table_literals
+        || matches!(&type_owner, LuaTypeOwner::Member(member_id)
+            if slot_has_guarded_table_bootstrap(analyzer.db, *member_id));
+
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // What this write carries on its own, before any sibling merge widens it.
     let mut source_type = None;
@@ -1881,7 +1898,7 @@ fn assign_merge_type_owner_and_expr_type(
             analyzer,
             &type_owner,
             &expr_type,
-            preserve_table_literals,
+            preserve_sibling_table_literals,
         ) {
             Some(Some(widened_type)) => {
                 expr_type = widened_type;
@@ -1897,7 +1914,7 @@ fn assign_merge_type_owner_and_expr_type(
                     analyzer.db,
                     &type_owner,
                     &expr_type,
-                    preserve_table_literals,
+                    preserve_sibling_table_literals,
                     &mut skipped_uncached_sibling,
                 );
                 // Recorded on the skip, not on the answer: a walk that read no
@@ -1908,13 +1925,28 @@ fn assign_merge_type_owner_and_expr_type(
                     analyzer.context.record_settled_member_widening_candidate(
                         *member_id,
                         expr_type.clone(),
-                        preserve_table_literals,
+                        preserve_sibling_table_literals,
                     );
                 }
                 if let Some(widened_type) = widened {
                     expr_type = widened_type;
                 }
             }
+        }
+        // A table literal written into a slot another file bootstraps with
+        // `x.y = x.y or {}` keeps its own literal — but whether that sibling had
+        // been indexed when the walk asked is a property of the walk order. Where
+        // the literal was widened away, queue it so the settled pass can ask
+        // again against the whole writer set.
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && matches!(source_type, Some(LuaType::TableConst(_)))
+            && matches!(expr_type, LuaType::Table)
+        {
+            analyzer.context.record_settled_member_widening_candidate(
+                *member_id,
+                source_type.clone().unwrap_or_else(|| expr_type.clone()),
+                preserve_sibling_table_literals,
+            );
         }
     }
 
@@ -2391,6 +2423,22 @@ fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMember
                 | LuaSyntaxKind::ForRangeStat
         )
     })
+}
+
+/// Whether any writer of this member's slot bootstraps it with `x.y = x.y or
+/// {}`, this one included.
+pub(in crate::compilation::analyzer) fn slot_has_guarded_table_bootstrap(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_member_owner(&member_id) else {
+        return false;
+    };
+    let Some(key) = member_index.get_member(&member_id).map(LuaMember::get_key) else {
+        return false;
+    };
+    member_index
+        .get_current_owner_members_for_key(owner, key)
+        .into_iter()
+        .any(|related| is_guarded_table_assignment_member(db, related.get_id()))
 }
 
 fn guarded_table_assignment_member_ids_for_owner_key(
