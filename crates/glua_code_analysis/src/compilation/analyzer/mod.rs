@@ -854,6 +854,19 @@ fn refresh_local_decl_initializer_caches(
                         owner: type_owner,
                         fact: inferred_fact.with_runtime_type(LuaType::Unknown),
                     });
+                } else if current_cache.as_ref().is_some_and(|current| {
+                    LuaTypeCache::InferType(inferred_type.clone()).supersedes(current)
+                }) {
+                    // Both answers carry no type information, but one of them
+                    // admits more values — `any|nil` over `any`, the difference
+                    // between reporting a nil check and not. Which one is cached
+                    // otherwise comes down to how far the batch had run when the
+                    // read was taken, so the settled one is taken here on the
+                    // same rule the type index itself applies.
+                    result.updates.push(InitializerCacheUpdate::Bind {
+                        owner: type_owner,
+                        fact: inferred_fact,
+                    });
                 }
                 continue;
             }
