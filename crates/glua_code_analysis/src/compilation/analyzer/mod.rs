@@ -543,24 +543,67 @@ fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext)
     context.infer_manager.clear_files_deferred_results(&files);
 
     for (decl_id, expr) in candidates {
+        let type_owner = LuaTypeOwner::Decl(decl_id);
+        let existing = db.get_type_index().get_type_cache(&type_owner);
+        if existing.is_some_and(|cached| cached.is_doc()) {
+            continue;
+        }
+        let cached = existing.map(|cached| cached.as_type().clone());
         let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
         let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
             continue;
         };
-        let type_owner = LuaTypeOwner::Decl(decl_id);
-        let settled = common::widen_mutable_decl_literal(
-            db,
-            &type_owner,
-            LuaTypeCache::InferType(settled),
-        );
+        // Re-deriving may only add to what the walk found, never swap it. The
+        // complete writer set is what a global read needs when the walk saw
+        // none of it, and it is what puts the second writer of a two-file table
+        // back after a re-index. But a global every file reassigns --
+        // `PLUGIN_SHARED = PLUGIN` in each plugin -- settles to one arbitrary
+        // writer, and taking that over the writer the reading file's own
+        // include chain reaches would substitute an unrelated answer for a
+        // right one.
+        if let Some(cached) = &cached
+            && !crate::is_undetermined_type(cached)
+            && !settled_type_subsumes(cached, &settled)
+        {
+            continue;
+        }
+        let settled =
+            common::widen_mutable_decl_literal(db, &type_owner, LuaTypeCache::InferType(settled));
         if db
             .get_type_index()
             .get_type_cache(&type_owner)
-            .is_some_and(|cached| cached.is_doc() || cached.as_type() == settled.as_type())
+            .is_some_and(|cached| cached.as_type() == settled.as_type())
         {
             continue;
         }
         db.get_type_index_mut().force_bind_type(type_owner, settled);
+    }
+}
+
+/// Whether `settled` is `cached` with more of the writer set folded in, rather
+/// than a different answer.
+///
+/// A merge or a union the cached type is a component of says the walk saw part
+/// of what has since landed; anything else says the two reads resolved to
+/// different things, and the settled one carries no more authority for that
+/// than the walk's.
+fn settled_type_subsumes(cached: &LuaType, settled: &LuaType) -> bool {
+    if cached == settled {
+        return true;
+    }
+    match settled {
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .any(|component| settled_type_subsumes(cached, component)),
+        LuaType::Union(union) => union
+            .types()
+            .any(|component| settled_type_subsumes(cached, component)),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(component, _)| settled_type_subsumes(cached, component)),
+        _ => false,
     }
 }
 
@@ -793,7 +836,6 @@ fn refresh_local_decl_initializer_caches(
                 continue;
             }
             if !copies_settled_iter_var
-
                 && settled_only
                 && !current_is_uninformative
                 && !can_refine_nominal_type
@@ -847,7 +889,6 @@ fn refresh_local_decl_initializer_caches(
                         && blind_type != inferred_type
                 };
             if !copies_settled_iter_var
-
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
@@ -1041,8 +1082,8 @@ fn refresh_member_initializer_caches(
             // A member that copies a loop variable holds whatever that variable
             // held when the copy landed, and the settle has just moved it. What
             // it holds now is no evidence against re-reading it.
-            let copies_settled_iter_var = iter_vars_settled
-                && common::reads_settling_iter_var(db, file_id, &expr);
+            let copies_settled_iter_var =
+                iter_vars_settled && common::reads_settling_iter_var(db, file_id, &expr);
             if !copies_settled_iter_var
                 && !current_is_uninformative
                 && single_nominal_type_id(current_cache.as_type()).is_none()
