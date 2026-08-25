@@ -1,7 +1,7 @@
 use crate::{
     DbIndex, LuaTypeCache, TypeOps, db_index::LuaType, is_class_bootstrap_compatible_type,
     is_class_neutral_bootstrap_type, is_same_class_type, is_table_assignment_merge_type,
-    prefer_class_assignment_type, widen_related_assignment_type,
+    merge_table_assignment_types, prefer_class_assignment_type, widen_related_assignment_type,
 };
 
 #[derive(Debug, Clone)]
@@ -52,11 +52,22 @@ pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_st
     new_state: MemberAssignmentWideningState,
     assigned_type: &LuaType,
 ) {
-    state.no_table_literal_widen_type = TypeOps::Union.apply(
-        db,
-        &state.no_table_literal_widen_type,
-        &new_state.no_table_literal_widen_type,
-    );
+    state.all_table_assignment_merge_types &= new_state.all_table_assignment_merge_types;
+    if state.all_table_assignment_merge_types {
+        state.no_table_literal_widen_type = merge_table_assignment_types(
+            db,
+            vec![
+                state.no_table_literal_widen_type.clone(),
+                new_state.no_table_literal_widen_type,
+            ],
+        );
+    } else {
+        state.no_table_literal_widen_type = TypeOps::Union.apply(
+            db,
+            &state.no_table_literal_widen_type,
+            &new_state.no_table_literal_widen_type,
+        );
+    }
     state.table_literal_widen_type = TypeOps::Union.apply(
         db,
         &state.table_literal_widen_type,
@@ -68,7 +79,6 @@ pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_st
             None => doc_type,
         });
     }
-    state.all_table_assignment_merge_types &= new_state.all_table_assignment_merge_types;
     merge_class_bootstrap_cache_state(
         state,
         assigned_type,
@@ -80,7 +90,7 @@ pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_st
 pub(in crate::compilation::analyzer::lua) fn decide_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
-    allow_table_literal_widening: bool,
+    _allow_table_literal_widening: bool,
     previous_states: impl IntoIterator<Item = &'a MemberAssignmentWideningState>,
 ) -> MemberAssignmentWideningDecision {
     let previous_states = previous_states.into_iter().collect::<Vec<_>>();
@@ -120,23 +130,22 @@ pub(in crate::compilation::analyzer::lua) fn decide_member_assignment_widening<'
         return MemberAssignmentWideningDecision::ClassBootstrapRejected;
     }
 
-    let should_widen_table_literals = allow_table_literal_widening
-        && is_table_assignment_merge_type(incoming_type)
-        && previous_states
-            .iter()
-            .all(|state| state.all_table_assignment_merge_types);
+    if should_merge_table_literals(incoming_type, &previous_states) {
+        return MemberAssignmentWideningDecision::Widened(merged_table_assignment_type(
+            db,
+            incoming_type,
+            &previous_states,
+        ));
+    }
+
     let previous_type = merge_assignment_types(
         db,
-        previous_states.iter().map(|state| {
-            if should_widen_table_literals {
-                &state.table_literal_widen_type
-            } else {
-                &state.no_table_literal_widen_type
-            }
-        }),
+        previous_states
+            .iter()
+            .map(|state| &state.no_table_literal_widen_type),
     )
     .expect("previous states are non-empty");
-    let incoming_type = widen_related_assignment_type(incoming_type, should_widen_table_literals);
+    let incoming_type = widen_related_assignment_type(incoming_type, false);
 
     MemberAssignmentWideningDecision::Widened(TypeOps::Union.apply(
         db,
@@ -145,28 +154,59 @@ pub(in crate::compilation::analyzer::lua) fn decide_member_assignment_widening<'
     ))
 }
 
+/// Whether every writer of this slot assigns a table, so the answer is their
+/// merge rather than a union of widened forms.
+fn should_merge_table_literals(
+    incoming_type: &LuaType,
+    previous_states: &[&MemberAssignmentWideningState],
+) -> bool {
+    is_table_assignment_merge_type(incoming_type)
+        && previous_states
+            .iter()
+            .all(|state| state.all_table_assignment_merge_types)
+}
+
+/// The merge of every writer's table type.
+///
+/// Answering bare `table` here -- which is what widening each writer to
+/// `table_literal_widen_type` and unioning amounts to -- throws away the only
+/// thing the writers carry, and every field of the slot then reads as nil-able.
+/// The writers name one runtime table, so merging them is both more precise and
+/// independent of which writer the batch happened to reach first.
+fn merged_table_assignment_type(
+    db: &DbIndex,
+    incoming_type: &LuaType,
+    previous_states: &[&MemberAssignmentWideningState],
+) -> LuaType {
+    let mut components = Vec::with_capacity(previous_states.len() + 1);
+    components.push(widen_related_assignment_type(incoming_type, false));
+    for state in previous_states {
+        let component = &state.no_table_literal_widen_type;
+        if !components.contains(component) {
+            components.push(component.clone());
+        }
+    }
+
+    merge_table_assignment_types(db, components)
+}
+
 pub(in crate::compilation::analyzer::lua) fn union_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
-    allow_table_literal_widening: bool,
+    _allow_table_literal_widening: bool,
     previous_states: impl IntoIterator<Item = &'a MemberAssignmentWideningState>,
 ) -> LuaType {
     let previous_states = previous_states.into_iter().collect::<Vec<_>>();
-    let should_widen_table_literals = allow_table_literal_widening
-        && is_table_assignment_merge_type(incoming_type)
-        && previous_states
-            .iter()
-            .all(|state| state.all_table_assignment_merge_types);
-    let incoming_type = widen_related_assignment_type(incoming_type, should_widen_table_literals);
+    if !previous_states.is_empty() && should_merge_table_literals(incoming_type, &previous_states) {
+        return merged_table_assignment_type(db, incoming_type, &previous_states);
+    }
+
+    let incoming_type = widen_related_assignment_type(incoming_type, false);
     let Some(previous_type) = merge_assignment_types(
         db,
-        previous_states.iter().map(|state| {
-            if should_widen_table_literals {
-                &state.table_literal_widen_type
-            } else {
-                &state.no_table_literal_widen_type
-            }
-        }),
+        previous_states
+            .iter()
+            .map(|state| &state.no_table_literal_widen_type),
     ) else {
         return incoming_type;
     };

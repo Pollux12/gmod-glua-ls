@@ -241,14 +241,22 @@ pub(crate) fn widen_file_define_member_type(typ: &LuaType, widen_table_literals:
 }
 
 pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(
-        typ,
+    match typ {
         LuaType::Table
-            | LuaType::TableConst(_)
-            | LuaType::Object(_)
-            | LuaType::MergedTable(_)
-            | LuaType::TableOf(_)
-    )
+        | LuaType::TableConst(_)
+        | LuaType::Object(_)
+        | LuaType::MergedTable(_)
+        | LuaType::TableGeneric(_)
+        | LuaType::TableOf(_) => true,
+        LuaType::Union(union) => union
+            .types()
+            .all(|t| matches!(t, LuaType::Nil) || is_table_assignment_merge_type(t)),
+        LuaType::MultiLineUnion(multi) => multi
+            .get_unions()
+            .iter()
+            .all(|(t, _)| matches!(t, LuaType::Nil) || is_table_assignment_merge_type(t)),
+        _ => false,
+    }
 }
 
 pub(crate) fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
@@ -362,7 +370,8 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
         return collapse_guarded_table_bootstrap_branches(db, types);
     }
 
-    merge_guarded_table_bootstrap_result(
+    merge_table_assignment_types(
+        db,
         types
             .into_iter()
             .filter(|typ| !is_guarded_table_bootstrap_branch(db, typ))
@@ -397,10 +406,16 @@ fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) 
         retained.push(LuaType::Table);
     }
 
-    merge_guarded_table_bootstrap_result(retained)
+    merge_table_assignment_types(db, retained)
 }
 
-fn merge_guarded_table_bootstrap_result(types: Vec<LuaType>) -> LuaType {
+/// Folds several writers' table types into one answer.
+///
+/// Table components merge rather than union: a slot several files each assign a
+/// table literal holds one table at runtime, and every field any writer spells
+/// is a field it can have. Bare `table` drops out whenever a more precise
+/// component is present, since it names no field and would only dilute them.
+pub(crate) fn merge_table_assignment_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
     let mut table_components = Vec::new();
     let mut other_components = Vec::new();
 
@@ -409,6 +424,11 @@ fn merge_guarded_table_bootstrap_result(types: Vec<LuaType>) -> LuaType {
     }
 
     if table_components
+        .iter()
+        .any(|component| is_informative_guarded_table_branch(db, component))
+    {
+        table_components.retain(|component| is_informative_guarded_table_branch(db, component));
+    } else if table_components
         .iter()
         .any(|component| !matches!(component, LuaType::Table))
     {
@@ -447,25 +467,55 @@ fn collect_guarded_table_merge_components(
                 );
             }
         }
+        LuaType::Union(union) => {
+            for component in union.types() {
+                collect_guarded_table_merge_components(
+                    component.clone(),
+                    table_components,
+                    other_components,
+                );
+            }
+        }
+        LuaType::MultiLineUnion(multi_line) => {
+            for (component, _) in multi_line.get_unions() {
+                collect_guarded_table_merge_components(
+                    component.clone(),
+                    table_components,
+                    other_components,
+                );
+            }
+        }
         LuaType::Table
         | LuaType::TableConst(_)
         | LuaType::Object(_)
         | LuaType::TableGeneric(_)
-        | LuaType::TableOf(_) => table_components.push(typ),
-        _ => other_components.push(typ),
+        | LuaType::TableOf(_) => {
+            if !table_components.contains(&typ) {
+                table_components.push(typ);
+            }
+        }
+        _ => {
+            if !other_components.contains(&typ) {
+                other_components.push(typ);
+            }
+        }
     }
 }
 
 fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
         LuaType::TableConst(table_id) => {
-            db.get_member_index()
-                .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
-                > 0
+            let member_index = db.get_member_index();
+            let owner = LuaMemberOwner::Element(table_id.clone());
+            if let Some(members) = member_index.get_members(&owner) {
+                members
+                    .iter()
+                    .any(|m| matches!(m.get_key(), crate::LuaMemberKey::Name(_)))
+            } else {
+                false
+            }
         }
-        LuaType::Object(object) => {
-            !object.get_fields().is_empty() || !object.get_index_access().is_empty()
-        }
+        LuaType::Object(object) => !object.get_fields().is_empty(),
         LuaType::MergedTable(merged) => merged
             .get_types()
             .iter()
@@ -1104,6 +1154,20 @@ impl LuaTypeIndex {
     /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
     /// whether a cache was replaced.
     fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
+        if let Ok(want) = std::env::var("GLUALS_TRACE_WRITE") {
+            let key = format!("{:?}", owner);
+            if key.contains(&want) {
+                eprintln!(
+                    "WRITE {} <- {:?} (was {:?})",
+                    key,
+                    cache.as_type(),
+                    self.types.get(&owner).map(|c| c.as_type().clone())
+                );
+                if std::env::var("GLUALS_TRACE_BT").is_ok() {
+                    eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                }
+            }
+        }
         if self
             .types
             .get(&owner)
