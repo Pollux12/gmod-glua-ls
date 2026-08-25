@@ -676,8 +676,8 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
 }
 
 fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_local_decl_initializer_caches(db, context, false);
-    refresh_member_initializer_caches(db, context);
+    refresh_local_decl_initializer_caches(db, context, false, false);
+    refresh_member_initializer_caches(db, context, false);
 }
 
 /// [`refresh_initializer_caches`] for a late pass that moved a handful of types.
@@ -688,13 +688,17 @@ fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
 /// existed, which a later pass cannot change, and asking it again means
 /// inferring every candidate in the workspace a second time.
 fn refresh_settled_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_member_initializer_caches(db, context);
+    // Members first: a declaration that reads one of them takes its answer from
+    // whatever the member holds when the read is taken.
+    refresh_member_initializer_caches(db, context, true);
+    refresh_local_decl_initializer_caches(db, context, true, true);
 }
 
 fn refresh_local_decl_initializer_caches(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     settled_only: bool,
+    iter_vars_settled: bool,
 ) {
     if context.uninformative_local_decl_candidates.is_empty() {
         return;
@@ -761,10 +765,17 @@ fn refresh_local_decl_initializer_caches(
             let Some((ret_idx, expr)) = local_initializer_expr(db, &root, *decl_id) else {
                 continue;
             };
-            if !initializer_reads_through_call_or_index(&expr) {
+            // A copy of a loop variable holds whatever that variable held when
+            // the copy landed, and the settle has just moved it. What it holds
+            // now is no evidence against re-reading it.
+            let copies_settled_iter_var =
+                iter_vars_settled && common::reads_settling_iter_var(db, file_id, &expr);
+            if !copies_settled_iter_var && !initializer_reads_through_call_or_index(&expr) {
                 continue;
             }
-            if settled_only
+            if !copies_settled_iter_var
+
+                && settled_only
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
@@ -816,7 +827,9 @@ fn refresh_local_decl_initializer_caches(
                         .is_some_and(|current| current.as_type() == &blind_type)
                         && blind_type != inferred_type
                 };
-            if !current_is_uninformative
+            if !copies_settled_iter_var
+
+                && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
                 && !cached_a_blind_dynamic_field_read
@@ -872,13 +885,14 @@ fn refresh_local_decl_initializer_caches(
                 });
             let is_settled_widening = current_cache
                 .as_ref()
-                .is_some_and(|current| union_widens_arm(&inferred_type, current.as_type()));
+                .is_some_and(|current| union_widens_cached_type(&inferred_type, current.as_type()));
             if current_is_uninformative {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
                     fact: inferred_fact,
                 });
-            } else if has_stronger_declared_authority
+            } else if copies_settled_iter_var
+                || has_stronger_declared_authority
                 || is_nominal_refinement
                 || is_settled_widening
                 || cached_a_blind_dynamic_field_read
@@ -906,23 +920,13 @@ fn refresh_local_decl_initializer_caches(
     apply_initializer_cache_updates(db, updates);
 }
 
-/// Whether the re-derived type is a union that already contains the cached one.
+/// Whether the re-derived type is a union that already contains everything the
+/// cached one holds, plus more.
 ///
 /// The cache then holds a subset snapshot taken before the other arms were
 /// visible, so replacing it widens to the settled answer instead of guessing a
-/// different one.
-fn union_widens_arm(inferred: &LuaType, current: &LuaType) -> bool {
-    match inferred {
-        LuaType::Union(union) => union.types().any(|arm| arm == current),
-        _ => false,
-    }
-}
-
-/// Whether the re-derived union contains everything the cached type holds, plus
-/// more — the union-to-union counterpart of [`union_widens_arm`].
-///
-/// A cached union is as much a subset snapshot as a cached single arm is: both
-/// are decided by which contributors happened to be indexed first.
+/// different one. A cached union is as much a subset snapshot as a cached single
+/// arm is: both are decided by which contributors happened to be indexed first.
 pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
     let LuaType::Union(inferred_union) = inferred else {
         return false;
@@ -948,7 +952,11 @@ fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
         .collect()
 }
 
-fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+fn refresh_member_initializer_caches(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    iter_vars_settled: bool,
+) {
     if context.member_initializer_reinfer_candidates.is_empty() {
         return;
     }
@@ -992,22 +1000,32 @@ fn refresh_member_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeCont
                 continue;
             };
             let current_is_uninformative = type_is_uninformative(current_cache.as_type());
-            if current_cache.is_doc()
-                || (!current_is_uninformative
-                    && single_nominal_type_id(current_cache.as_type()).is_none())
-            {
+            if current_cache.is_doc() {
                 continue;
             }
             let Some(expr) = member_initializer_expr(&root, *member_id) else {
                 continue;
             };
+            // A member that copies a loop variable holds whatever that variable
+            // held when the copy landed, and the settle has just moved it. What
+            // it holds now is no evidence against re-reading it.
+            let copies_settled_iter_var = iter_vars_settled
+                && common::reads_settling_iter_var(db, file_id, &expr);
+            if !copies_settled_iter_var
+                && !current_is_uninformative
+                && single_nominal_type_id(current_cache.as_type()).is_none()
+            {
+                continue;
+            }
             let Ok(inferred_type) = crate::infer_expr(db, &mut infer_cache, expr) else {
                 continue;
             };
             if inferred_type == *current_cache.as_type() {
                 continue;
             }
-            let takes_inferred_type = if current_is_uninformative {
+            let takes_inferred_type = if copies_settled_iter_var {
+                true
+            } else if current_is_uninformative {
                 // A placeholder is not an answer: it only records that the
                 // member's initializer had not been inferred yet when the write
                 // landed. Re-inferring it against the settled index is the same
