@@ -18,7 +18,8 @@ use crate::{
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
+    LuaIndexExpr,
     LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind,
     LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
@@ -1806,7 +1807,6 @@ fn assign_merge_type_owner_and_expr_type(
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // What this write carries on its own, before any sibling merge widens it.
     let mut source_type = None;
-    let had_canonical_guarded_bootstrap = canonical_guarded_bootstrap.is_some();
     if let Some(canonical) = canonical_guarded_bootstrap {
         expr_type = canonical;
         source_type = Some(expr_type.clone());
@@ -1888,11 +1888,12 @@ fn assign_merge_type_owner_and_expr_type(
     {
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
-        if guarded_table_assignment && !had_canonical_guarded_bootstrap {
-            // No canonical writer was found, which means fewer than two of them
-            // were indexed when this ran — a property of how far the batch has
-            // got. Re-derived once they have all landed. See
-            // `resettle_guarded_table_bootstraps`.
+        if guarded_table_assignment {
+            // Whichever canonical writer this found — including none at all — it
+            // read the sibling set off a half-built owner index, and which
+            // writers are visible there is a property of how far the batch has
+            // got. Re-derived once they have all landed and been migrated to
+            // their final owner. See `resettle_guarded_table_bootstraps`.
             analyzer
                 .context
                 .record_settled_guarded_bootstrap_candidate(*member_id);
@@ -2558,17 +2559,58 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
     let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
         return false;
     };
-    let Some(index_expr) = LuaIndexExpr::cast(node) else {
-        return false;
-    };
-
-    is_guarded_table_assignment_index_expr(&index_expr)
+    guarded_bootstrap_range_for_node(node, false).is_some()
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
     index_expr: &LuaIndexExpr,
 ) -> bool {
     guarded_table_assignment_bootstrap_range(index_expr, false).is_some()
+}
+
+/// Range of the table a guarded bootstrap of this member names, whichever of
+/// the two shapes wrote it.
+fn guarded_bootstrap_range_for_node(
+    node: glua_parser::LuaSyntaxNode,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        return guarded_table_assignment_bootstrap_range(&index_expr, empty_only);
+    }
+
+    guarded_table_literal_field_range(&LuaTableField::cast(node)?, empty_only)
+}
+
+/// Range of the table a field of a guarded table literal names.
+///
+/// `x = x or { y = {} }` creates `x.y` on exactly the condition `x.y = x.y or
+/// {}` does — the namespace not existing yet — so the two shapes bootstrap the
+/// same slot and have to resolve to one literal between them. Treating only the
+/// second as a guarded writer leaves the first looking like a plain write, which
+/// makes the whole slot ineligible for canonicalisation.
+fn guarded_table_literal_field_range(
+    table_field: &LuaTableField,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    let LuaExpr::TableExpr(value) = table_field.get_value_expr()? else {
+        return None;
+    };
+    if empty_only && !value.is_empty() {
+        return None;
+    }
+
+    let table_expr = LuaTableExpr::cast(table_field.syntax().parent()?)?;
+    let binary_expr = LuaBinaryExpr::cast(table_expr.syntax().parent()?)?;
+    let assign_stat = binary_expr.get_parent::<LuaAssignStat>()?;
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    let access_path = var_list
+        .iter()
+        .zip(expr_list.iter())
+        .find(|(_, expr)| expr.get_syntax_id() == binary_expr.get_syntax_id())
+        .and_then(|(var, _)| var.get_access_path())?;
+    guarded_assignment_table_arm_range(&LuaExpr::BinaryExpr(binary_expr), &access_path, false)?;
+
+    Some(value.get_range())
 }
 
 /// Range of the table arm of a self-referential guarded bootstrap (`x.y =
@@ -2676,8 +2718,7 @@ fn guarded_table_bootstrap_range(
 ) -> Option<rowan::TextRange> {
     let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
     let root = tree.get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
-    guarded_table_assignment_bootstrap_range(&index_expr, empty_only)
+    guarded_bootstrap_range_for_node(member_id.get_syntax_id().to_node_from_root(&root)?, empty_only)
 }
 
 /// The one table a repeated `x.y = x.y or {}` guard names.
