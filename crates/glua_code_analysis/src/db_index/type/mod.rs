@@ -372,17 +372,28 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
 
 fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
     let mut saw_bootstrap = false;
+    let mut bootstraps = Vec::new();
     let mut retained = Vec::with_capacity(types.len());
 
     for typ in types {
         if is_guarded_table_bootstrap_branch(db, &typ) {
             saw_bootstrap = true;
+            bootstraps.push(typ);
         } else {
             retained.push(typ);
         }
     }
 
     if saw_bootstrap {
+        if retained.is_empty() {
+            // Nothing but bootstrap branches: they all name the same table, and
+            // answering bare `table` would throw away the one thing they carry —
+            // which literal that is. A slot with a single such writer keeps it
+            // (the `One` arm returns the cache verbatim), so a slot with several
+            // has to as well, or a member's owner would depend on how many
+            // writers happened to be indexed when the read was taken.
+            return LuaType::from_vec(bootstraps);
+        }
         retained.push(LuaType::Table);
     }
 

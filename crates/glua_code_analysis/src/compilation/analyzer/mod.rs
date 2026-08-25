@@ -587,6 +587,12 @@ fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeCon
         }
 
         let type_owner = LuaTypeOwner::Member(member_id);
+        // Asked again here, not taken from the walk: whether a sibling writer
+        // bootstraps the slot with `x.y = x.y or {}` decides whether this write
+        // keeps its own table literal, and which siblings were indexed when the
+        // walk asked is a property of the batch. Every writer has landed by now.
+        let preserve_table_literals =
+            preserve_table_literals || lua::slot_has_guarded_table_bootstrap(db, member_id);
         let Some(widened_type) = lua::get_widened_member_assignment_type(
             db,
             &type_owner,
@@ -594,6 +600,19 @@ fn rewiden_settled_member_assignments(db: &mut DbIndex, context: &mut AnalyzeCon
             preserve_table_literals,
             &mut false,
         ) else {
+            // No widening applies. Where the walk widened a table literal away
+            // because it could not yet see the guard that shares the slot, the
+            // literal is what the write actually carries — put it back.
+            if preserve_table_literals
+                && matches!(assigned_type, LuaType::TableConst(_))
+                && db
+                    .get_type_index()
+                    .get_type_cache(&type_owner)
+                    .is_some_and(|cache| matches!(cache.as_type(), LuaType::Table))
+            {
+                db.get_type_index_mut()
+                    .force_bind_type(type_owner, LuaTypeCache::InferType(assigned_type));
+            }
             continue;
         };
 
