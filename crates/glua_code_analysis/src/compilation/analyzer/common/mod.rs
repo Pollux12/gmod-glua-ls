@@ -182,6 +182,9 @@ pub struct DeclWrite {
     /// (`width = bit.bor(width:byte(1), ...)`). Such a write derives its type
     /// from the slot it is about to fill, so it must not fill it.
     pub reads_out_of_decl: bool,
+    /// Whether the right-hand side is `<this decl> or <default>`, the one body
+    /// write that refines a parameter instead of replacing it.
+    pub fills_own_default: bool,
     /// Whether this write is one the file walk would let replace an
     /// uninformative cache: an initializer whose answer can still improve, or
     /// an assignment that reads through a call or index — the boundary
@@ -216,6 +219,7 @@ pub fn bind_decl_write(
         reads_out_of_decl,
         may_narrow_uninformative,
         resolved_initializer,
+        fills_own_default,
     } = write;
     let type_owner = LuaTypeOwner::Decl(decl_id);
     let fallback = |db: &mut DbIndex, type_cache| {
@@ -233,6 +237,20 @@ pub fn bind_decl_write(
         .get_decl(&decl_id)
         .is_none_or(|decl| decl.is_param())
     {
+        // A default fill goes through the resolved path, so
+        // `gender = gender or GENDER_MALE` gives the same answer whether it was
+        // inferred during the walk — seeding the slot outright — or deferred
+        // until after the unresolve pass parked `unknown` there. Which of those
+        // happens depends on whether the file defining `GENDER_MALE` had been
+        // walked yet, which is a property of the batch, not of the source.
+        //
+        // Only a default fill: a reassignment to something else — splitting a
+        // string parameter into a list, say — states what the parameter becomes
+        // further down one branch, not what it was passed.
+        if fills_own_default {
+            let widened = widen_mutable_decl_literal(db, &type_owner, type_cache);
+            return bind_resolved_type(db, type_owner, widened);
+        }
         return fallback(db, type_cache);
     }
     let seeded = widen_mutable_decl_literal(db, &type_owner, type_cache.clone());

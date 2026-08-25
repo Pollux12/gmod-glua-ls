@@ -27,7 +27,7 @@ use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
 pub(in crate::compilation::analyzer) use settled_contributions::rederive_contributed_member_assignments;
 pub(crate) use stats::dominating_guarded_table_bootstrap_range;
-pub(crate) use stats::expr_reads_out_of_decl;
+pub(crate) use stats::{expr_fills_own_default, expr_reads_out_of_decl};
 pub(in crate::compilation::analyzer) use stats::resettle_guarded_table_bootstraps;
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,

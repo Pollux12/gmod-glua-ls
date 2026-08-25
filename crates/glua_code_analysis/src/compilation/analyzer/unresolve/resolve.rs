@@ -196,6 +196,12 @@ pub fn try_resolve_decl(
                 crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
             },
             resolved_initializer: is_initializer && may_improve,
+            fills_own_default: crate::compilation::analyzer::lua::expr_fills_own_default(
+                db,
+                decl.file_id,
+                decl_id,
+                &expr,
+            ),
         },
     );
     Ok(())
