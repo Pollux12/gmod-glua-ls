@@ -311,6 +311,13 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             db.get_member_index_mut().settle_alias_contributed_slots();
         }
 
+        // A loop over a global has to enumerate the table every realm's file
+        // contributed to, so the copies of that global settle first.
+        {
+            let _p = Profile::new("rederive_settled_global_reads");
+            rederive_settled_global_reads(db, &mut context);
+        }
+
         // Only now is every member attached, so a loop that enumerates a table
         // can be answered from the whole map rather than the part of it this
         // batch had reached.
@@ -322,11 +329,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             if rederive_settled_iter_vars(db, &mut context) {
                 refresh_settled_initializer_caches(db, &mut context);
             }
-        }
-
-        {
-            let _p = Profile::new("rederive_settled_global_reads");
-            rederive_settled_global_reads(db, &mut context);
         }
 
         {
