@@ -172,8 +172,17 @@ fn check_merged_table_type_compact(
     compact_type: &LuaType,
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
-    if matches!(compact_type, LuaType::Any | LuaType::Table) {
+    if matches!(
+        compact_type,
+        LuaType::Any | LuaType::Table | LuaType::TableConst(_)
+    ) {
         return Ok(());
+    }
+
+    if let LuaType::MergedTable(merged) = source {
+        if merged.get_types().iter().any(|comp| comp == compact_type) {
+            return Ok(());
+        }
     }
 
     let Some(object) = structural_object_from_members(context, source) else {
