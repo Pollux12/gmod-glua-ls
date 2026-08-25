@@ -240,10 +240,25 @@ pub fn bind_decl_write(
         None => true,
         Some(existing) => {
             let both_inferred = existing.is_infer() && type_cache.is_infer();
-            if both_inferred
+            let comparable = both_inferred && !reads_out_of_decl;
+            // `any` is the one answer neither `bind_type` nor
+            // `bind_resolved_type` will trade in either direction, so between
+            // two ordered writes it is ranked rather than positioned: whichever
+            // determined something takes the slot, and the winner is then a
+            // function of the write set instead of which one resolved first. The
+            // other bottoms are left alone — `unknown` on a declaration is what
+            // lets a use narrow it, not a give-up to be overwritten.
+            let outranks_any =
+                comparable && is_informative_type(seeded.as_type()) && existing.as_type().is_any();
+            let outranked_by_any =
+                comparable && seeded.as_type().is_any() && is_informative_type(existing.as_type());
+            if outranks_any {
+                true
+            } else if outranked_by_any {
+                false
+            } else if comparable
                 && may_improve_after_resolve
-                && !reads_out_of_decl
-                && !is_undetermined_type(seeded.as_type())
+                && is_informative_type(seeded.as_type())
                 && is_undetermined_type(existing.as_type())
             {
                 // The slot holds an inferred give-up answer and this write
