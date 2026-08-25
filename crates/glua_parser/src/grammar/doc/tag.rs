@@ -413,6 +413,16 @@ fn parse_tag_return(p: &mut LuaDocParser) -> DocParseResult {
     let m = p.mark(LuaSyntaxKind::DocTagReturn);
     p.bump();
 
+    if p.current_token() == LuaTokenKind::TkLeftBracket {
+        p.bump();
+        while p.current_token() != LuaTokenKind::TkRightBracket
+            && p.current_token() != LuaTokenKind::TkEof
+        {
+            p.bump();
+        }
+        if_token_bump(p, LuaTokenKind::TkRightBracket);
+    }
+
     if p.current_token() == LuaTokenKind::TkLeftParen && is_type_modifier_flag(p) {
         parse_doc_type_flag(p)?;
     }
