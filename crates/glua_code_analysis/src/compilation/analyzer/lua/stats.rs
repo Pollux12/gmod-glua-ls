@@ -2441,6 +2441,50 @@ pub(in crate::compilation::analyzer) fn slot_has_guarded_table_bootstrap(db: &Db
         .any(|related| is_guarded_table_assignment_member(db, related.get_id()))
 }
 
+/// Whether this member's assignment writes a bare table literal, `x.y = {...}`.
+fn assigns_bare_table_literal(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    // A table literal caches as one, so this rules out almost every writer for
+    // the price of a map lookup rather than a syntax walk.
+    if !matches!(
+        db.get_type_index()
+            .get_type_cache(&member_id.into())
+            .map(LuaTypeCache::as_type),
+        Some(LuaType::TableConst(_) | LuaType::Table)
+    ) {
+        return false;
+    }
+    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    let Some(index_expr) = member_id
+        .get_syntax_id()
+        .to_node_from_root(&root)
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let syntax_id = index_expr.get_syntax_id();
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    var_list
+        .iter()
+        .zip(expr_list.iter())
+        .find(|(candidate_var, _)| candidate_var.get_syntax_id() == syntax_id)
+        .is_some_and(|(_, expr)| matches!(expr, LuaExpr::TableExpr(_)))
+}
+
+/// Every writer of this member's slot, when at least one of them bootstraps it
+/// with `x.y = x.y or {}`.
+///
+/// The guard means "reuse it if it is there", and a plain `x.y = {}` resets that
+/// same table, so every writer names one runtime table however many literals the
+/// source spells. Returning them together is what lets the slot hold a single
+/// identity: treating a plain writer as a rival definition forks it, the merge
+/// of the forks answers bare `table`, and `table` names no element — so every
+/// member attached through the slot is lost.
 fn guarded_table_assignment_member_ids_for_owner_key(
     db: &DbIndex,
     member_id: LuaMemberId,
@@ -2449,17 +2493,23 @@ fn guarded_table_assignment_member_ids_for_owner_key(
     let owner = member_index.get_member_owner(&member_id)?.clone();
     let key = member_index.get_member(&member_id)?.get_key().clone();
     let mut member_ids = Vec::new();
+    let mut bootstrapped = false;
 
     for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
         let related_member_id = related_member.get_id();
-        if !is_guarded_table_assignment_member(db, related_member_id) {
+        if is_guarded_table_assignment_member(db, related_member_id) {
+            bootstrapped = true;
+        } else if !assigns_bare_table_literal(db, related_member_id) {
+            // This writer contributes something that is not a fresh table -- a
+            // class, a call result -- so the slot really can hold more than one
+            // thing and there is no single identity to resolve to.
             return None;
         }
 
         member_ids.push(related_member_id);
     }
 
-    (member_ids.len() >= 2).then_some(member_ids)
+    (bootstrapped && member_ids.len() >= 2).then_some(member_ids)
 }
 
 /// Widens a member assignment against its same-owner/key siblings.
@@ -2890,12 +2940,18 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
     for (_, mut members) in slots {
         members.sort_by_key(|member_id| member_id_sort_key(*member_id));
         members.dedup();
-        let Some(canonical) = members
-            .first()
-            .and_then(|member_id| canonical_guarded_table_bootstrap_type(db, *member_id))
-        else {
+        let Some(first) = members.first().copied() else {
             continue;
         };
+        let Some(canonical) = canonical_guarded_table_bootstrap_type(db, first) else {
+            continue;
+        };
+        // Every writer of the slot, not only the ones queued as candidates: the
+        // slot holds one table, so a writer left on its own literal forks the
+        // identity again, and whether it was queued depends on how far the walk
+        // had got when it ran.
+        let members = guarded_table_assignment_member_ids_for_owner_key(db, first)
+            .unwrap_or(members);
         for member_id in members {
             let owner = LuaTypeOwner::Member(member_id);
             if db
@@ -2919,8 +2975,10 @@ fn canonical_guarded_table_bootstrap_type(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
 ) -> Option<LuaType> {
+    // The guard is what names the table; a plain reset only points at it.
     let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id)?
         .into_iter()
+        .filter(|candidate| is_guarded_table_assignment_member(db, *candidate))
         .min_by_key(|candidate| member_id_sort_key(*candidate))?;
 
     guarded_table_bootstrap_member_type(db, canonical, false)
