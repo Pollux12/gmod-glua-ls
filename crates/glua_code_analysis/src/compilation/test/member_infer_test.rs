@@ -3502,8 +3502,8 @@ marauth.character = marauth.character or {}
 
         let cfg_type = local_name_type(&mut ws, consumer, "cfg");
         assert!(
-            matches!(cfg_type, LuaType::Table),
-            "cross-file member merge should widen table literals to `table`, got {cfg_type:?}"
+            matches!(cfg_type, LuaType::MergedTable(_)),
+            "cross-file member merge should merge table literals to `MergedTable`, got {cfg_type:?}"
         );
     }
 
@@ -3836,6 +3836,178 @@ mod runtime_member_write_ownership {
         assert!(
             class_member_item_exists(&ws, "door_exterior", "interior"),
             "the subclasses' own declarations are untouched"
+        );
+    }
+}
+
+#[cfg(test)]
+mod multi_site_member_and_alias_inference {
+    use googletest::assert_that;
+    use googletest::prelude::*;
+    use lsp_types::NumberOrString;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::{DiagnosticCode, VirtualWorkspace};
+
+    fn file_diagnostic_messages(
+        ws: &mut VirtualWorkspace,
+        file_id: crate::FileId,
+        diagnostic_code: DiagnosticCode,
+    ) -> Vec<String> {
+        ws.analysis.diagnostic.enable_only(diagnostic_code);
+        let diagnostics = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default();
+        let code = Some(NumberOrString::String(
+            diagnostic_code.get_name().to_string(),
+        ));
+        diagnostics
+            .iter()
+            .filter(|diagnostic| diagnostic.code == code)
+            .map(|diagnostic| diagnostic.message.clone())
+            .collect()
+    }
+
+    /// Guarded bootstrap globals across multiple files must merge their table
+    /// fields rather than widening to bare `table`, so fields like `.stored`
+    /// remain defined and non-nil.
+    #[test]
+    fn test_guarded_bootstrap_multi_file_table_fields_not_nil() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/cityrp/sh_item.lua",
+            r#"
+cityrp = cityrp or {}
+if not cityrp.item then
+    cityrp.item = {
+        stored = {},
+        count = 0,
+    }
+end
+"#,
+        );
+        ws.def_file(
+            "lua/cityrp/sv_item.lua",
+            r#"
+cityrp = cityrp or {}
+if not cityrp.item then
+    cityrp.item = {
+        stored = {},
+        count = 0,
+    }
+end
+"#,
+        );
+        let consumer = ws.def_file(
+            "lua/cityrp/consumer.lua",
+            r#"
+local stored = cityrp.item.stored
+local count = cityrp.item.count
+"#,
+        );
+
+        assert_that!(
+            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::NeedCheckNil),
+            is_empty()
+        );
+        assert_that!(
+            file_diagnostic_messages(&mut ws, consumer, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    /// Nested table literals inside table fields looped over with `pairs`
+    /// must retain their populated fields on the loop variable.
+    #[test]
+    fn test_pairs_loop_over_table_with_nested_table_literals_preserves_field_types() {
+        let mut ws = VirtualWorkspace::new();
+        let weapon_file = ws.def_file(
+            "lua/weapons/weapon_test.lua",
+            r#"
+SWEP = {}
+SWEP.VElements = {
+    ["element1"] = {
+        pos = {},
+        angle = {},
+        size = {},
+        scale = 1,
+    },
+    ["element2"] = {
+        pos = {},
+        angle = {},
+        size = {},
+        scale = 2,
+    },
+}
+
+for k, v in pairs(SWEP.VElements) do
+    local pos = v.pos
+    local angle = v.angle
+    local size = v.size
+    local scale = v.scale
+end
+"#,
+        );
+
+        assert_that!(
+            file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::NeedCheckNil),
+            is_empty()
+        );
+        assert_that!(
+            file_diagnostic_messages(&mut ws, weapon_file, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+    }
+
+    /// Locals aliasing a shared global table across plugins, extended via
+    /// methods and included files, must not have their local read replaced by an
+    /// arbitrary settled global from a different plugin.
+    #[test]
+    fn test_plugin_shared_local_alias_preserves_included_fields_and_methods() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "lua/plugins/plugin_a/config.lua",
+            r#"
+local PLUGIN = PLUGIN_SHARED
+PLUGIN.config = { enabled = true }
+"#,
+        );
+        let plugin_a = ws.def_file(
+            "lua/plugins/plugin_a/sh_init.lua",
+            r#"
+PLUGIN_SHARED = PLUGIN_SHARED or {}
+local PLUGIN = PLUGIN_SHARED
+include("config.lua")
+
+function PLUGIN:IsColor(val)
+    return true
+end
+
+function PLUGIN:Test()
+    local cfg = self.config
+    local c = self:IsColor(1)
+    local cfg2 = PLUGIN.config
+    local c2 = PLUGIN:IsColor(1)
+end
+"#,
+        );
+        ws.def_file(
+            "lua/plugins/plugin_b/sh_init.lua",
+            r#"
+PLUGIN_SHARED = PLUGIN_SHARED or {}
+local PLUGIN = PLUGIN_SHARED
+PLUGIN.other_field = 123
+"#,
+        );
+
+        assert_that!(
+            file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedField),
+            is_empty()
+        );
+        assert_that!(
+            file_diagnostic_messages(&mut ws, plugin_a, DiagnosticCode::UndefinedMethod),
+            is_empty()
         );
     }
 }
