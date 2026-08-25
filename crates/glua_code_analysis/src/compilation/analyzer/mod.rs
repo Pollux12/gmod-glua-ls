@@ -325,6 +325,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         {
+            let _p = Profile::new("rederive_settled_global_reads");
+            rederive_settled_global_reads(db, &mut context);
+        }
+
+        {
             let _p = Profile::new("resettle_guarded_table_bootstraps");
             lua::resettle_guarded_table_bootstraps(
                 db,
@@ -512,6 +517,49 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
         let _ = unresolve::resolve_settled_iter_var(db, cache, &mut iter_var);
     }
     db.get_type_index().type_writes() != writes_before
+}
+
+/// Re-derives `local x = SomeGlobal` reads.
+///
+/// A global's type is the merge of every file that writes it. A batch keeps the
+/// values of the files it is not re-indexing while its own are empty until the
+/// walk reaches them, so a read taken during the walk can see fewer writers than
+/// a cold build does — the cold build defers the read instead, and by the time
+/// it resolves every writer has landed. Taking the read again here gives both
+/// the complete set.
+fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut candidates = std::mem::take(&mut context.settled_global_read_candidates);
+    if candidates.is_empty() {
+        return;
+    }
+    candidates.sort_by_key(|(decl_id, _)| (decl_id.file_id, decl_id.position));
+
+    let files = candidates
+        .iter()
+        .map(|(decl_id, _)| decl_id.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files_deferred_results(&files);
+
+    for (decl_id, expr) in candidates {
+        let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
+        let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
+            continue;
+        };
+        let type_owner = LuaTypeOwner::Decl(decl_id);
+        let settled = common::widen_mutable_decl_literal(
+            db,
+            &type_owner,
+            LuaTypeCache::InferType(settled),
+        );
+        if db
+            .get_type_index()
+            .get_type_cache(&type_owner)
+            .is_some_and(|cached| cached.is_doc() || cached.as_type() == settled.as_type())
+        {
+            continue;
+        }
+        db.get_type_index_mut().force_bind_type(type_owner, settled);
+    }
 }
 
 /// Re-derives member assignment widenings that ran against an incomplete
@@ -1406,6 +1454,8 @@ pub struct AnalyzeContext {
     settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
     /// See [`AnalyzeContext::record_settled_iter_var_candidate`].
     settled_iter_var_candidates: Vec<UnResolveIterVar>,
+    /// See [`AnalyzeContext::record_settled_global_read_candidate`].
+    settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -1436,6 +1486,7 @@ impl AnalyzeContext {
             settled_member_widening_candidates: HashMap::new(),
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
+            settled_global_read_candidates: Vec::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1473,6 +1524,18 @@ impl AnalyzeContext {
     /// member passes have finished attaching them.
     pub(crate) fn record_settled_iter_var_candidate(&mut self, iter_var: UnResolveIterVar) {
         self.settled_iter_var_candidates.push(iter_var);
+    }
+
+    /// Remembers `local x = SomeGlobal`. A global's type is the merge of every
+    /// file that writes it, and a batch that retains some writers while its own
+    /// are still empty answers the read from a smaller set than a cold build
+    /// sees. See `rederive_settled_global_reads`.
+    pub(crate) fn record_settled_global_read_candidate(
+        &mut self,
+        decl_id: LuaDeclId,
+        expr: LuaExpr,
+    ) {
+        self.settled_global_read_candidates.push((decl_id, expr));
     }
 
     pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {

@@ -197,6 +197,16 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
 
+                // A global's type is the merge of every file that writes it, and
+                // a batch that retains some of those writers while its own are
+                // still empty answers this read from a smaller set than a cold
+                // build sees. Re-derived once they have all landed.
+                if reads_global_name(analyzer, &expr) {
+                    analyzer
+                        .context
+                        .record_settled_global_read_candidate(decl_id, expr.clone());
+                }
+
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
                 bind_decl_write(
                     analyzer.db,
@@ -1488,6 +1498,20 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
 
 fn may_improve_after_resolve(expr: &LuaExpr) -> bool {
     crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+}
+
+/// Whether `expr` is a bare read of a global name, whose type is the merge of
+/// every file that writes it.
+fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_none()
 }
 
 /// Whether an initializer that inferred to a type carrying no information

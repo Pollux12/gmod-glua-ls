@@ -142,7 +142,7 @@ fn seed_type_slot(db: &mut DbIndex, type_owner: LuaTypeOwner, type_cache: LuaTyp
 
 /// A declaration written more than once holds a primitive over its lifetime,
 /// not whichever literal one write happened to carry.
-fn widen_mutable_decl_literal(
+pub(crate) fn widen_mutable_decl_literal(
     db: &DbIndex,
     type_owner: &LuaTypeOwner,
     type_cache: LuaTypeCache,
