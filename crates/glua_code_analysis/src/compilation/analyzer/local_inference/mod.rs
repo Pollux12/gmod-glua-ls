@@ -16,7 +16,7 @@ use crate::{
     InFiled, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
     LuaInferenceProvenanceKind, LuaInferenceStep, LuaInferredGuardOwner, LuaInferredPositiveGuard,
     LuaMemberKey, LuaMemberOwner, LuaSignatureId, LuaType, LuaTypeDeclId, LuaTypeFact,
-    SignatureReturnStatus,
+    SignatureReturnStatus, TypeOps,
     compilation::analyzer::AnalyzeContext,
     semantic::{
         infer_bind_value_type, infer_expr, infer_true_condition_narrowing,
@@ -80,6 +80,20 @@ pub(super) fn stabilize_unknown_locals(
         let flow_tree = db.get_flow_index().get_flow_tree(&file_id);
         let mut cells = references.cells;
         cells.sort_by_key(|cell| cell.range.start());
+        // One read the value could not survive as nil settles it for the whole
+        // declaration: reaching that read at all means no assignment left a nil
+        // behind. Without this the local keeps a `nil` it only ever picked up
+        // from the slots its other reads feed -- `draw.SimpleText`'s `number?`
+        // parameter -- and every use then wants a guard against it.
+        let proven_non_nil = cells.iter().any(|cell| {
+            !cell.is_write
+                && root
+                    .covering_element(cell.range)
+                    .ancestors()
+                    .find_map(LuaNameExpr::cast)
+                    .filter(|name| name.get_range() == cell.range)
+                    .is_some_and(|name| read_would_error_on_nil(&name))
+        });
         for cell in cells {
             let Some(name_expr) = root
                 .covering_element(cell.range)
@@ -106,6 +120,11 @@ pub(super) fn stabilize_unknown_locals(
                 infer_bind_value_type(db, context.infer_manager.get_infer_cache(file_id), expr)
             else {
                 continue;
+            };
+            let candidate = if proven_non_nil {
+                TypeOps::Remove.apply(db, &candidate, &LuaType::Nil)
+            } else {
+                candidate
             };
             if super::type_is_uninformative(&candidate) {
                 continue;
@@ -161,6 +180,51 @@ pub(super) fn stabilize_unknown_locals(
         context.infer_manager.clear();
     }
     changed_any
+}
+
+/// Whether reaching this read with a nil value would be a runtime error.
+///
+/// Arithmetic, concatenation and length take a value apart; indexing and calling
+/// dereference it. Each errors on nil, so the read stands as proof the value is
+/// not nil. Every other position -- an argument, a return, the right side of an
+/// assignment -- passes the value along and proves nothing.
+fn read_would_error_on_nil(name_expr: &LuaNameExpr) -> bool {
+    let Some(parent) = name_expr.syntax().parent() else {
+        return false;
+    };
+    if let Some(binary) = LuaBinaryExpr::cast(parent.clone()) {
+        return binary.get_op_token().is_some_and(|token| {
+            matches!(
+                token.get_op(),
+                BinaryOperator::OpAdd
+                    | BinaryOperator::OpSub
+                    | BinaryOperator::OpMul
+                    | BinaryOperator::OpDiv
+                    | BinaryOperator::OpIDiv
+                    | BinaryOperator::OpMod
+                    | BinaryOperator::OpPow
+                    | BinaryOperator::OpConcat
+            )
+        });
+    }
+    if let Some(unary) = glua_parser::LuaUnaryExpr::cast(parent.clone()) {
+        return unary.get_op_token().is_some_and(|token| {
+            matches!(
+                token.get_op(),
+                glua_parser::UnaryOperator::OpUnm | glua_parser::UnaryOperator::OpLen
+            )
+        });
+    }
+    // The prefix of an index or a call is dereferenced; an argument is not.
+    if let Some(index) = LuaIndexExpr::cast(parent.clone()) {
+        return index
+            .get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax());
+    }
+    LuaCallExpr::cast(parent).is_some_and(|call| {
+        call.get_prefix_expr()
+            .is_some_and(|prefix| prefix.syntax() == name_expr.syntax())
+    })
 }
 
 /// Re-derives what each candidate's own initializer says before anything is
