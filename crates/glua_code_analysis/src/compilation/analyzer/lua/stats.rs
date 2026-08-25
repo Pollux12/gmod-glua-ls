@@ -89,7 +89,12 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
-        if is_call_or_index_expr(&expr) {
+        // A copy of a loop variable holds whatever the variable held when the
+        // copy landed, and the settled re-derivation moves those, so it needs
+        // re-reading for the same reason a call or index read does.
+        if is_call_or_index_expr(&expr)
+            || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
+        {
             analyzer
                 .context
                 .request_uninformative_local_decl_reinfer(decl_id);
