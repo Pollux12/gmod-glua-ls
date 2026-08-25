@@ -304,10 +304,21 @@ impl LuaMemberIndex {
                 // one win this slot -- or evicting one -- would make the outcome
                 // depend on whether the owner's own write or the alias arrived
                 // first, which is a property of the batch, not of the source.
-                let (aliased, owned): (Vec<_>, Vec<_>) = old_member_ids
-                    .iter()
-                    .copied()
-                    .partition(|old_id| self.member_current_owner.get(old_id) != Some(owner));
+                //
+                // An assignment file-define keeps its place for the same
+                // reason: `should_preserve_assignment_file_define_member`
+                // accumulated it deliberately, and the removal list below
+                // already refuses to evict one. Collapsing the slot to a single
+                // "latest defined" writer here would undo that — and only when
+                // the other kind of member happens to arrive second, which is
+                // how far the batch has run rather than anything about the
+                // source. A re-index of one file dropped 35 writers of
+                // `ply._Food.amount` this way.
+                let (aliased, owned): (Vec<_>, Vec<_>) =
+                    old_member_ids.iter().copied().partition(|old_id| {
+                        self.member_current_owner.get(old_id) != Some(owner)
+                            || self.is_assignment_file_define_member(*old_id)
+                    });
                 let winner = latest_defined_member(&owned, id);
                 let mut visible = aliased;
                 visible.push(winner);
