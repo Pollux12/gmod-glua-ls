@@ -2058,7 +2058,7 @@ fn get_cached_widened_member_assignment_type(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
     incoming_type: &LuaType,
-    _preserve_table_literals: bool,
+    preserve_table_literals: bool,
 ) -> Option<Option<LuaType>> {
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return None;
@@ -2078,7 +2078,24 @@ fn get_cached_widened_member_assignment_type(
         &cache_key,
         visible_count,
     ) {
-        WideningCacheLookup::FirstSighting => return Some(None),
+        WideningCacheLookup::FirstSighting => {
+            // Being the only writer the owner can currently see is a statement
+            // about how far the batch has run: until the global this member
+            // hangs off resolves, its siblings sit on the global path instead
+            // and are invisible here. Re-derived once they have all been
+            // migrated to their owner.
+            //
+            // Only a named slot: a key the source writes as an expression names
+            // one entry of a collection, and those never migrate as a group.
+            if matches!(cache_key.key, LuaMemberKey::Name(_)) {
+                analyzer.context.record_settled_member_widening_candidate(
+                    *member_id,
+                    incoming_type.clone(),
+                    preserve_table_literals,
+                );
+            }
+            return Some(None);
+        }
         WideningCacheLookup::Fallback => return None,
         WideningCacheLookup::Hit(cache) => cache,
     };
