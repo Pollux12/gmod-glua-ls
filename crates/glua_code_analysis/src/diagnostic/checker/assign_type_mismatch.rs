@@ -189,7 +189,20 @@ fn check_index_expr(
 
     let source_is_inferred = inferred_member_flags(semantic_model, index_expr)
         .map(|(is_inferred, _)| is_inferred)
-        .unwrap_or(false);
+        .unwrap_or_else(|| {
+            index_expr
+                .get_prefix_expr()
+                .and_then(|prefix| semantic_model.infer_expr(prefix).ok())
+                .is_some_and(|t| {
+                    matches!(
+                        t,
+                        LuaType::TableConst(_)
+                            | LuaType::Table
+                            | LuaType::Object(_)
+                            | LuaType::MergedTable(_)
+                    )
+                })
+        });
 
     // Prefer the pre-write member type to avoid the current assignment
     // widening the target field type before comparison.
