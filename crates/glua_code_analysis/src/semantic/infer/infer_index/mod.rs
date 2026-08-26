@@ -679,7 +679,15 @@ fn infer_table_member_owner(
         }
 
         if table_has_cross_file_matching_expr_key_member(db, &owner, &key, cache.get_file_id()) {
-            return Ok(nullable_any_type());
+            // Another file fills this table under a computed key, so the value
+            // behind a named key is not something the source states -- but that
+            // another file writes it is weak evidence the key IS there, never
+            // evidence it is absent. Answering `any?` would put a nil on every
+            // named read of a registry (`cityrp.item.stored.pot`) that a bare
+            // `table` answers as `any` with no nil at all, which is strictly
+            // less that we know. Whether a computed key may be missing is
+            // decided per access by `table_index_result_may_be_nil`.
+            return Ok(LuaType::Any);
         }
     }
 
