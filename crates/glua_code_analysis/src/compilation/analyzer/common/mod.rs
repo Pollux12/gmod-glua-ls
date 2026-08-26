@@ -291,7 +291,17 @@ pub fn bind_decl_write(
                     // whatever is in it was not put there by an ordered write.
                     None => false,
                     Some((claimed, claim_may_narrow)) => {
+                        // Source position arbitrates between two answers, not
+                        // between an answer and none. An earlier write that came
+                        // back undetermined -- an unresolve retry that still
+                        // cannot see through its initializer -- must not take the
+                        // slot from a later one that resolved, or the
+                        // declaration is left needing its type guessed from how
+                        // it is used.
+                        let displaces_an_answer = is_undetermined_type(seeded.as_type())
+                            && is_informative_type(existing.as_type());
                         position < claimed
+                            && !displaces_an_answer
                             && !claiming_write_would_have_won(
                                 &type_owner,
                                 &seeded,
