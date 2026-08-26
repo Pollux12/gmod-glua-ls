@@ -1519,8 +1519,8 @@ fn global_expr_access_path(
     }
 
     match expr {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path(),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path(),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_owner_access_path(),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_owner_access_path(),
         _ => None,
     }
 }
