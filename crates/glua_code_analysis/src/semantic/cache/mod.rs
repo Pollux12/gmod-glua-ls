@@ -123,6 +123,12 @@ pub struct LuaInferCache {
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    /// Cache for the in-place `ipairs` transform recogniser, keyed by the array
+    /// local's declaration. `None` means the block holds no such transform loop;
+    /// `Some((loop_end, element_type))` records where the transform completes and
+    /// the element type it leaves, so a read is answered without re-scanning the
+    /// declaration's block each time.
+    pub in_place_ipairs_transform_cache: FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>,
     pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
     pub local_reassignments_indexed: bool,
     pub dynamic_field_scope_metatable_cache:
@@ -171,6 +177,7 @@ impl LuaInferCache {
             self_base_seed: None,
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
+            in_place_ipairs_transform_cache: FxHashMap::default(),
             local_reassignment_positions_cache: FxHashMap::default(),
             local_reassignments_indexed: false,
             dynamic_field_scope_metatable_cache: FxHashMap::default(),

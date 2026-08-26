@@ -130,4 +130,57 @@ mod test {
         assert_eq!(leading_ty, expected);
         assert_eq!(trailing_ty, expected);
     }
+
+    #[test]
+    fn test_in_place_ipairs_transform_rewrites_array_element_type() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                arr[i] = tonum(v)
+            end
+            local after = arr
+        "#,
+        );
+
+        // `ipairs` walks exactly the sequential part and the body rewrites every
+        // element it visits, so a read past the loop sees `number?`, not the
+        // `string` the array started as.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("(number?)[]"));
+    }
+
+    #[test]
+    fn test_guarded_element_write_leaves_array_element_type_unchanged() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            ---@return string[]
+            local function explode() end
+            ---@param v string
+            ---@return number?
+            local function tonum(v) end
+
+            local arr = explode()
+            for i, v in ipairs(arr) do
+                if v ~= "" then
+                    arr[i] = tonum(v)
+                end
+            end
+            local after = arr
+        "#,
+        );
+
+        // The write is conditional, so not every element is provably rewritten;
+        // the element type stays `string`.
+        let after = local_name_type(&mut ws, file_id, "after");
+        assert_eq!(after, ws.ty("string[]"));
+    }
 }
