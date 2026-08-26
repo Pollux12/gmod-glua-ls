@@ -2595,8 +2595,8 @@ fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Opt
     }
 
     match expr {
-        LuaExpr::NameExpr(name_expr) => name_expr.get_access_path().map(Into::into),
-        LuaExpr::IndexExpr(index_expr) => index_expr.get_access_path().map(Into::into),
+        LuaExpr::NameExpr(name_expr) => name_expr.get_owner_access_path().map(Into::into),
+        LuaExpr::IndexExpr(index_expr) => index_expr.get_owner_access_path().map(Into::into),
         _ => None,
     }
 }

@@ -13,13 +13,13 @@ pub fn find_index_owner(
         if let Some(prefix_expr) = index_expr.get_prefix_expr() {
             match prefix_expr {
                 LuaExpr::IndexExpr(parent_index_expr) => {
-                    if let Some(parent_access_path) = parent_index_expr.get_access_path() {
+                    if let Some(parent_access_path) = parent_index_expr.get_owner_access_path() {
                         if let Some(module_path) = rewrite_legacy_module_member_path(
                             analyzer,
                             &parent_access_path,
                             index_expr.get_position(),
                         ) {
-                            if let Some(access_path) = index_expr.get_access_path()
+                            if let Some(access_path) = index_expr.get_owner_access_path()
                                 && let Some(global_path) = rewrite_legacy_module_member_path(
                                     analyzer,
                                     &access_path,
@@ -42,7 +42,7 @@ pub fn find_index_owner(
                             );
                         }
 
-                        if let Some(access_path) = index_expr.get_access_path() {
+                        if let Some(access_path) = index_expr.get_owner_access_path() {
                             return (
                                 LuaMemberOwner::GlobalPath(GlobalId(
                                     SmolStr::new(parent_access_path).into(),
@@ -70,7 +70,7 @@ pub fn find_index_owner(
                             parent_path.as_str(),
                             index_expr.get_position(),
                         ) {
-                            if let Some(access_path) = index_expr.get_access_path()
+                            if let Some(access_path) = index_expr.get_owner_access_path()
                                 && let Some(global_path) = rewrite_legacy_module_member_path(
                                     analyzer,
                                     &access_path,
@@ -93,7 +93,7 @@ pub fn find_index_owner(
                             );
                         }
 
-                        if let Some(access_path) = index_expr.get_access_path() {
+                        if let Some(access_path) = index_expr.get_owner_access_path() {
                             return (
                                 LuaMemberOwner::GlobalPath(GlobalId(
                                     SmolStr::new(parent_path).into(),
@@ -110,7 +110,7 @@ pub fn find_index_owner(
                 }
                 _ => {}
             }
-        } else if let Some(access_path) = index_expr.get_access_path() {
+        } else if let Some(access_path) = index_expr.get_owner_access_path() {
             return (
                 LuaMemberOwner::LocalUnresolve,
                 Some(GlobalId(SmolStr::new(access_path).into())),
