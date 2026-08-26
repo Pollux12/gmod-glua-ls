@@ -716,7 +716,36 @@ fn narrow_valid_guard_true_branch(
     }
 
     let truthy_type = remove_false_or_nil(antecedent_type);
-    TypeOps::Remove.apply(db, &truthy_type, &gmod_null_type())
+    let non_null = TypeOps::Remove.apply(db, &truthy_type, &gmod_null_type());
+    // `IsValid` answers true only for a live engine handle, never for a
+    // boolean/number/string. Plain truthiness keeps a `boolean` as `true`, but
+    // that surviving `true` cannot be the thing `IsValid` accepted, so any
+    // primitive left in a union has to drop out -- otherwise a value typed
+    // `Entity|boolean` narrows to `Entity|true` and every later field read on it
+    // reports a phantom nil.
+    remove_non_validatable_primitives(non_null)
+}
+
+/// Strips the primitive value types `IsValid` can never accept from a union.
+/// A lone primitive is left untouched: `IsValid` being true over a purely
+/// primitive type is unreachable rather than informative, and answering `never`
+/// there would only trade a phantom nil for a phantom empty type.
+fn remove_non_validatable_primitives(typ: LuaType) -> LuaType {
+    let LuaType::Union(union) = &typ else {
+        return typ;
+    };
+    let kept: Vec<LuaType> = union
+        .types()
+        .filter(|component| {
+            !(component.is_boolean() || component.is_number() || component.is_string())
+        })
+        .cloned()
+        .collect();
+    if kept.is_empty() {
+        typ
+    } else {
+        LuaType::from_vec(kept)
+    }
 }
 
 fn apply_positive_signature_cast(

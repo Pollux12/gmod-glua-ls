@@ -3052,6 +3052,63 @@ _2 = a[1]
     }
 
     #[gtest]
+    fn test_isvalid_guard_drops_boolean_from_union() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        // `getEntOrBool` widens to `Entity|boolean` the way a `local rp = false`
+        // that later takes an entity does; `IsValid` answers true only for a live
+        // handle, so the true branch must be `Entity`, never `Entity|true`.
+        let file_id = ws.def(
+            r#"
+            ---@return Entity|boolean
+            local function getEntOrBool() end
+
+            local function use()
+                local x = getEntOrBool()
+                if IsValid(x) then
+                    local narrowed = x
+                    print(narrowed)
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "Entity");
+    }
+
+    #[gtest]
+    fn test_plain_truthiness_keeps_boolean_true_unlike_isvalid() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+        def_isvalid_guard(&mut ws);
+
+        // The `IsValid` narrowing above is stronger than truthiness on purpose:
+        // a bare `if x` cannot rule out `x` being the boolean `true`, so the
+        // truthy component stays. This pins that the fix did not collapse the
+        // two into one behaviour.
+        let file_id = ws.def(
+            r#"
+            ---@return Entity|boolean
+            local function getEntOrBool() end
+
+            local function use()
+                local x = getEntOrBool()
+                if x then
+                    local narrowed = x
+                    print(narrowed)
+                end
+            end
+            "#,
+        );
+
+        let narrowed = nth_name_expr_type_from_end(&mut ws, file_id, "narrowed", 0);
+        assert_eq!(ws.humanize_type(narrowed), "(Entity|true)");
+    }
+
+    #[gtest]
     fn test_unannotated_predicate_wrapper_narrows_member_expression_on_true_branch() {
         let mut ws = VirtualWorkspace::new();
         set_gmod_enabled(&mut ws);
