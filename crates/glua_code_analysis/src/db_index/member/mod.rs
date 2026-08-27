@@ -1637,7 +1637,7 @@ fn stable_member_sort_key(member: &LuaMember) -> (u32, u32, u32, u16) {
 
 // The owner-level sorted member-id cache depends on these file id, position,
 // range end, and kind components remaining immutable for a member's lifetime.
-pub(crate) fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16) {
+pub fn member_id_sort_key(member_id: LuaMemberId) -> (u32, u32, u32, u16) {
     let syntax_id = member_id.get_syntax_id();
     (
         member_id.file_id.id,

@@ -396,7 +396,10 @@ impl DebouncedAnalysis {
     /// This takes the write lock and gives it back, which is the whole point: a
     /// freshness flag published while the lock is still held buys a waiting
     /// request nothing, since it cannot read the index until the lock is free.
-    async fn self_index_without_queuing(&self, file_ids: Vec<FileId>) -> Option<Vec<FileId>> {
+    async fn self_index_without_queuing(
+        &self,
+        file_ids: Vec<FileId>,
+    ) -> Option<(Vec<FileId>, Vec<FileId>)> {
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
@@ -404,12 +407,15 @@ impl DebouncedAnalysis {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
-                let expansion = guard.expand_reindex_file_ids(file_ids.clone());
-                guard.self_index_files(file_ids);
+                // Change-aware: only expand to dependents when the file's
+                // exported interface actually changed. Most keystrokes (typing
+                // inside a function, trailing comment, local rename) keep the
+                // same fingerprint and collapse the ripple to empty.
+                let (changed, expansion) = guard.self_index_files_and_get_ripple_with_changed(file_ids);
                 cache.invalidate();
-                expansion
+                (changed, expansion)
             }) => match result {
-                Ok(expansion) => Some(expansion),
+                Ok(result) => Some(result),
                 Err(err) => {
                     log::error!("self-index task failed: {}", err);
                     None
@@ -531,7 +537,8 @@ impl DebouncedAnalysis {
                 // instead of waiting out the whole dependency ripple. The
                 // ripple is by far the larger half — measured on a gamemode
                 // workspace, 106ms against 5.1s.
-                let Some(expansion) = self.self_index_without_queuing(file_ids.clone()).await
+                let Some((changed_files, expansion)) =
+                    self.self_index_without_queuing(file_ids.clone()).await
                 else {
                     if self.shutdown.is_cancelled() {
                         return;
@@ -565,9 +572,39 @@ impl DebouncedAnalysis {
                 // would put them behind the whole ripple.
                 self.await_reader_handoff().await;
 
-                owed_files.extend(file_ids.iter().copied());
-                owed_expansion.extend(expansion);
-                burst_started_at.get_or_insert_with(Instant::now);
+                if expansion.is_empty() {
+                    // No exports changed - the self-index already makes these
+                    // files answerable, and no dependent needs re-indexing.
+                    // Clear them from reindexing immediately so dirty state
+                    // can settle without waiting for a ripple that will never
+                    // come.
+                    {
+                        let mut reindexing = self.reindexing_files.lock().await;
+                        for id in &file_ids {
+                            reindexing.remove(id);
+                        }
+                    }
+                    self.refresh_dirty_state().await;
+                    self.reindex_notify.notify_waiters();
+                    if owed_files.is_empty() {
+                        continue;
+                    }
+                } else {
+                    // Only the files whose exports actually changed need a
+                    // ripple; the rest are already settled by the self-index.
+                    let changed_set: HashSet<FileId> = changed_files.iter().copied().collect();
+                    {
+                        let mut reindexing = self.reindexing_files.lock().await;
+                        for id in &file_ids {
+                            if !changed_set.contains(id) {
+                                reindexing.remove(id);
+                            }
+                        }
+                    }
+                    owed_files.extend(changed_files.iter().copied());
+                    owed_expansion.extend(expansion);
+                    burst_started_at.get_or_insert_with(Instant::now);
+                }
             }
 
             if owed_files.is_empty() {
