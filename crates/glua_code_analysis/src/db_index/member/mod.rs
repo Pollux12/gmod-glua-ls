@@ -512,6 +512,26 @@ impl LuaMemberIndex {
         Some(())
     }
 
+    /// Re-resolves every conditional-branch slot once the batch has finished, so
+    /// each is settled against the full writer set rather than the part of it
+    /// that had landed when the slot was first classified. A write that homes
+    /// its owner forward-only (a `set_owner_only` prefix onto a concrete class)
+    /// joins the slot's history after the walk that classified it, so the first
+    /// resolution cannot see it; re-running here folds it in, and the resolution
+    /// is a pure function of the writer set, so a slot with nothing new to add
+    /// settles to the item it already held.
+    pub fn settle_conditional_branch_slots(&mut self) {
+        let mut members = self
+            .conditional_branch_assignment_members
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        members.sort_by_key(|id| member_id_sort_key(*id));
+        for member_id in members {
+            self.resolve_conditional_branch_owner_key_item(member_id, false);
+        }
+    }
+
     fn apply_member_insert_action(
         &mut self,
         owner: LuaMemberOwner,
