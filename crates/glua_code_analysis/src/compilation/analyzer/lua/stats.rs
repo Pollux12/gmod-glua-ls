@@ -1582,13 +1582,13 @@ fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
 /// file walk, so a later statement is enough to flag the file for re-derivation.
 fn note_vgui_parent_fallback_file(analyzer: &mut LuaAnalyzer) {
     let file_id = analyzer.file_id;
-    let has_fallback = !analyzer
-        .context
-        .infer_manager
-        .get_infer_cache(file_id)
-        .vgui_parent_fallback_calls
-        .is_empty();
-    if has_fallback {
+    let cache = analyzer.context.infer_manager.get_infer_cache(file_id);
+    // Chain-derived successes are as batch-sensitive as fallbacks: the chain a
+    // read went through can be one the final chain state contradicts, so both
+    // kinds flag the file for the settled re-derivation.
+    let has_chain_read =
+        !cache.vgui_parent_fallback_calls.is_empty() || !cache.vgui_parent_chain_calls.is_empty();
+    if has_chain_read {
         analyzer.context.record_vgui_parent_fallback_file(file_id);
     }
 }

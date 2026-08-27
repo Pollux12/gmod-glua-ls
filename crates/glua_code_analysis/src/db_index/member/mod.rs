@@ -1188,6 +1188,24 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Whether `id` is still present in `owner`'s visible owner-key index.
+    ///
+    /// An in-batch sibling's re-walk can prune a settled out-of-batch member
+    /// from the slot (`retain_only_member_for_owner_key` collapses to the
+    /// latest writer it can see); ownership survives that, reachability does
+    /// not, and the reconcile passes use this to tell the two apart.
+    pub fn member_reachable_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+        id: LuaMemberId,
+    ) -> bool {
+        self.member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+            .is_some_and(|member_ids| member_ids.contains(&id))
+    }
+
     pub fn get_members_for_owner_key(
         &self,
         owner: &LuaMemberOwner,
@@ -3108,5 +3126,42 @@ mod tests {
 
         index.remove(file_id);
         assert!(!index.has_live_member(&owner));
+    }
+
+    #[test]
+    fn pruned_cross_file_member_is_unreachable_until_reattached() {
+        let owner_file = FileId::new(1);
+        let sibling_file = FileId::new(2);
+        let owner = LuaMemberOwner::Element(crate::InFiled::new(
+            owner_file,
+            TextRange::new(TextSize::new(0), TextSize::new(2)),
+        ));
+        let key = LuaMemberKey::Name("field".into());
+        let own_write = make_index_member_id(owner_file, 10);
+        let sibling_write = make_index_member_id(sibling_file, 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(sibling_write, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_write, "field", LuaMemberFeature::FileDefine),
+        );
+        assert!(index.member_reachable_for_owner_key(&owner, &key, sibling_write));
+
+        // The owning file's own write collapsing the slot to itself is how a
+        // re-walk that cannot see the settled sibling prunes it: ownership
+        // survives, reachability does not.
+        index.retain_only_member_for_owner_key(own_write);
+        assert!(!index.member_reachable_for_owner_key(&owner, &key, sibling_write));
+        assert_eq!(index.get_member_owner(&sibling_write), Some(&owner));
+
+        // The reconcile repair path: re-homing onto the owner it already has
+        // restores the visible entry.
+        index.set_member_owner(owner.clone(), sibling_file, sibling_write);
+        index.add_member_to_owner(owner.clone(), sibling_write);
+        assert!(index.member_reachable_for_owner_key(&owner, &key, sibling_write));
     }
 }
