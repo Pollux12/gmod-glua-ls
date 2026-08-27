@@ -256,11 +256,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             }
         }
 
-        {
-            let _p = Profile::new("rewiden_settled_member_assignments");
-            rewiden_settled_member_assignments(db, &mut context);
-        }
-
         // Members that landed on a global path before the global's owner was
         // known are attached now that it is. See
         // `reconcile_parked_global_path_members`.
@@ -277,6 +272,18 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         {
             let _p = Profile::new("reconcile_directly_attached_candidate_members");
             common::reconcile_directly_attached_candidate_members(db);
+        }
+
+        // Runs after both reconcile passes: the sibling set it widens against
+        // is read through owner visibility, and before the reconciles that
+        // visibility still reflects whichever owners the walk had reached —
+        // a property of the batch, not of the source. A partial re-index
+        // inherits the settled homes while a cold build is still mid-migration,
+        // and the same candidate then widens against two different sibling
+        // sets.
+        {
+            let _p = Profile::new("rewiden_settled_member_assignments");
+            rewiden_settled_member_assignments(db, &mut context);
         }
 
         // Runs last of the settled passes: it needs every member to have reached
@@ -602,14 +609,17 @@ fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext)
     }
 }
 
-/// Re-derives decls whose `panel:GetParent()` read fell back to the broad
-/// `Panel` type during the walk because the vgui parent chain was not complete.
+/// Re-derives decls whose `panel:GetParent()` read was answered against a vgui
+/// parent chain state that has since settled differently.
 ///
-/// The chains are finished by the gmod-post pass, so the same read now resolves
-/// the actual parent panel. A warm re-index gets the specific type on the walk
-/// because the chains were already built; this closes the same gap for a cold
-/// build. Only an exact `Panel` cache is replaced, and only by a more specific
-/// vgui panel, so a genuinely-`Panel` decl is left alone.
+/// Both directions are batch artifacts. A read taken before the chains were
+/// complete falls back to broad `Panel` where the finished chain names the
+/// actual parent. A read taken while a chain was *transiently* complete — the
+/// conflicting creation site's relations not yet re-resolved — binds a specific
+/// panel the finished chain contradicts, and has to widen back. Only decls
+/// whose cache holds a vgui panel type are touched, and only when the settled
+/// read still answers a vgui panel type, so a decl typed by other means is
+/// left alone.
 pub(crate) fn rederive_vgui_parent_fallbacks(db: &mut DbIndex, context: &mut AnalyzeContext) {
     let files = std::mem::take(&mut context.vgui_parent_fallback_files);
     if files.is_empty() {
@@ -651,7 +661,12 @@ pub(crate) fn rederive_vgui_parent_fallbacks(db: &mut DbIndex, context: &mut Ana
             let Some(cached) = db.get_type_index().get_type_cache(&type_owner) else {
                 continue;
             };
-            if cached.is_doc() || !is_exact_panel_type(cached.as_type()) {
+            if cached.is_doc() {
+                continue;
+            }
+            let cached_type = cached.as_type().clone();
+            let cached_exact_panel = is_exact_panel_type(&cached_type);
+            if !cached_exact_panel && !is_more_specific_vgui_panel_type(db, &cached_type) {
                 continue;
             }
             let Some((ret_idx, expr)) = local_initializer_expr(db, &root, decl_id) else {
@@ -662,13 +677,19 @@ pub(crate) fn rederive_vgui_parent_fallbacks(db: &mut DbIndex, context: &mut Ana
                 continue;
             };
             let settled = match &settled {
-                LuaType::Variadic(multi) => multi
-                    .get_type(ret_idx)
-                    .cloned()
-                    .unwrap_or(LuaType::Unknown),
+                LuaType::Variadic(multi) => {
+                    multi.get_type(ret_idx).cloned().unwrap_or(LuaType::Unknown)
+                }
                 _ => settled,
             };
-            if is_more_specific_vgui_panel_type(db, &settled) {
+            let takes_settled = if cached_exact_panel {
+                is_more_specific_vgui_panel_type(db, &settled)
+            } else {
+                settled != cached_type
+                    && (is_exact_panel_type(&settled)
+                        || is_more_specific_vgui_panel_type(db, &settled))
+            };
+            if takes_settled {
                 db.get_type_index_mut()
                     .force_bind_type(type_owner, LuaTypeCache::InferType(settled));
             }

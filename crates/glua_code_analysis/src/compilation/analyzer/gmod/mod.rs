@@ -4004,8 +4004,22 @@ enum ForwardingParentCandidate {
 fn resolve_vgui_parent_relations(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
-    _file_ids: &[FileId],
+    batch_file_ids: &[FileId],
 ) {
+    // This group's files have had their calls re-collected by the passes
+    // before this one, so their removal marks come off: whatever relations
+    // they still contribute are resolved below. A marked file with no syntax
+    // tree left was deleted outright, and its relations are legitimately gone.
+    let mut settled_pending = db
+        .get_gmod_class_metadata_index()
+        .pending_vgui_parent_relation_file_ids()
+        .into_iter()
+        .filter(|file_id| db.get_vfs().get_syntax_tree(file_id).is_none())
+        .collect::<Vec<_>>();
+    settled_pending.extend_from_slice(batch_file_ids);
+    db.get_gmod_class_metadata_index_mut()
+        .clear_pending_vgui_parent_relation_files(&settled_pending);
+
     let mut file_ids = db
         .get_gmod_class_metadata_index()
         .iter_file_metadata()

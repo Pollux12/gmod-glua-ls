@@ -142,6 +142,13 @@ pub struct LuaInferCache {
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
+    /// `GetParent` reads answered *through* a resolved vgui parent chain.
+    ///
+    /// The mirror of [`Self::vgui_parent_fallback_calls`]: a chain answer taken
+    /// before every group's relations landed can be one the final chain state
+    /// contradicts, so the files holding these reads are re-derived alongside
+    /// the fallback files once the chains settle.
+    pub vgui_parent_chain_calls: FxHashSet<LuaSyntaxId>,
     /// Call sites of a local function, keyed by its declaration. Syntax ids,
     /// not nodes: red nodes are `!Send`.
     pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
@@ -186,6 +193,7 @@ impl LuaInferCache {
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
             vgui_parent_fallback_calls: FxHashSet::default(),
+            vgui_parent_chain_calls: FxHashSet::default(),
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
             inferred_guard_dependencies: HashSet::new(),
@@ -268,6 +276,7 @@ impl LuaInferCache {
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
+        self.vgui_parent_chain_calls.clear();
         self.call_returns_never_cache.clear();
     }
 
@@ -368,6 +377,7 @@ impl LuaInferCache {
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
+        self.vgui_parent_chain_calls.clear();
     }
 
     pub fn get_flow_cache(

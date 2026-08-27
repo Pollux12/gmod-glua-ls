@@ -350,14 +350,24 @@ fn refine_known_vgui_parent_return(
             None => parent_id = Some(candidate.clone()),
         }
     }
-    parent_id.map(LuaType::Ref).unwrap_or_else(|| {
-        if is_broad_panel_type(&return_type) {
+    match parent_id {
+        Some(parent_id) => {
+            // A chain answer taken mid-analysis can be one the final chain
+            // state contradicts; the settled pass re-derives these reads.
             cache
-                .vgui_parent_fallback_calls
+                .vgui_parent_chain_calls
                 .insert(call_expr.get_syntax_id());
+            LuaType::Ref(parent_id)
         }
-        return_type
-    })
+        None => {
+            if is_broad_panel_type(&return_type) {
+                cache
+                    .vgui_parent_fallback_calls
+                    .insert(call_expr.get_syntax_id());
+            }
+            return_type
+        }
+    }
 }
 
 fn is_broad_panel_type(typ: &LuaType) -> bool {

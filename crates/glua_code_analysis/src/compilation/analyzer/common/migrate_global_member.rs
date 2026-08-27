@@ -191,6 +191,19 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
                 None => Some(canonical_owner.clone()),
             };
 
+            // A member already homed on the right table can still have been
+            // pruned out of that table's visible slot by an in-batch sibling's
+            // re-walk; put it back where it already belongs, whatever owner
+            // this pass would otherwise elect for it.
+            if let Some(current) = db.get_member_index().get_member_owner(&member_id).cloned()
+                && member_needs_reattach_to_owner(db, member_id, &current)
+            {
+                restore_non_overwriting_mark(db, member_id);
+                let member_index = db.get_member_index_mut();
+                member_index.set_member_owner(current.clone(), member_id.file_id, member_id);
+                member_index.add_member_to_owner(current, member_id);
+            }
+
             let rehome_target = target_owner.clone().filter(|target_owner| {
                 needs_rehome
                     && db
@@ -230,6 +243,39 @@ pub fn reconcile_parked_global_path_members(db: &mut DbIndex) {
             }
         }
     }
+}
+
+/// Whether a member that already sits on its correct owner has been pruned out
+/// of that owner's visible slot and needs re-attaching.
+///
+/// A batch that re-walks the owner's file collapses the slot to the latest
+/// writer it can see (`retain_only_member_for_owner_key`), and an out-of-batch
+/// sibling homed there in an earlier build is exactly what it cannot see. Its
+/// ownership survives, so the move path skips it, and the sibling evidence the
+/// settled merges read stays smaller than a cold build's. A cold build never
+/// reaches this state — its cross-file members are still parked when the prune
+/// fires and the move path re-attaches them — so the repair only ever fires on
+/// a partial re-index. Same-file members are excluded: pruning those is the
+/// slot's latest-write-wins design, not damage.
+fn member_needs_reattach_to_owner(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+    owner: &LuaMemberOwner,
+) -> bool {
+    let LuaMemberOwner::Element(in_filed) = owner else {
+        return false;
+    };
+    if in_filed.file_id == member_id.file_id {
+        return false;
+    }
+    let member_index = db.get_member_index();
+    let Some(key) = member_index
+        .get_member(&member_id)
+        .map(|member| member.get_key().clone())
+    else {
+        return false;
+    };
+    !member_index.member_reachable_for_owner_key(owner, &key, member_id)
 }
 
 /// Whether this member is a write through *this* global's path.
@@ -357,7 +403,9 @@ fn rehome_directly_attached_candidate_members(
             None if declaring_files.contains(&member_id.file_id) => continue,
             None => canonical_owner.clone(),
         };
-        let needs_move = *current != target && candidates.iter().any(|(_, owner)| owner == current);
+        let needs_move = (*current != target
+            && candidates.iter().any(|(_, owner)| owner == current))
+            || (*current == target && member_needs_reattach_to_owner(db, member_id, &target));
         let contribution_group_owner = db
             .get_member_index()
             .member_assignment_contributions()
