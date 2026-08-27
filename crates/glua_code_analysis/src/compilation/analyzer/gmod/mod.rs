@@ -661,6 +661,9 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         crate::profile::phase("gmodpost/vgui_parent_relations", || {
             resolve_vgui_parent_relations(db, context, &file_ids)
         });
+        crate::profile::phase("gmodpost/vgui_parent_fallback_rederive", || {
+            crate::compilation::analyzer::rederive_vgui_parent_fallbacks(db, context)
+        });
         if let Some(t_parent) = t_parent {
             let elapsed = t_parent.elapsed();
             if log::log_enabled!(log::Level::Info) {

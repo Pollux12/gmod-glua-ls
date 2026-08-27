@@ -98,6 +98,16 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 .context
                 .request_uninformative_local_decl_reinfer(decl_id);
         }
+        // A read through a multi-declaration global answers from whichever backing
+        // tables the walk had reached; a decl deferred to the unresolve wave never
+        // reaches the settled-global-read recording below, so record it here
+        // before it can branch off. Re-derived once every backing table has landed.
+        if initializer_reads_through_multi_decl_global(analyzer, &expr) {
+            analyzer
+                .context
+                .record_settled_multi_decl_global_read_candidate(decl_id, expr.clone());
+        }
+        note_vgui_parent_fallback_file(analyzer);
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
             let unresolve = UnResolveDecl {
@@ -916,6 +926,19 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         let type_owner = get_var_owner(analyzer, var.clone());
 
+        // A local reassigned from a multi-declaration global field read has the
+        // same batch-order exposure as a local *initialized* from one: the walk
+        // answers it from whichever backing tables it had reached. Record it so
+        // the settled pass re-derives it against the complete set.
+        if let LuaTypeOwner::Decl(decl_id) = &type_owner
+            && initializer_reads_through_multi_decl_global(analyzer, expr)
+        {
+            analyzer
+                .context
+                .record_settled_multi_decl_global_read_candidate(*decl_id, expr.clone());
+        }
+        note_vgui_parent_fallback_file(analyzer);
+
         let assign_stat_range = assign_stat.get_range();
         if special_assign_pattern(
             analyzer,
@@ -1546,6 +1569,67 @@ fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
         .get_local_reference(&analyzer.file_id)
         .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
         .is_none()
+}
+
+/// Whether the initializer reads through a global whose root name has more than
+/// one declaration — the `X = X or {}` per-realm bootstrap whose backing tables
+/// the walk merges incrementally. Recurses index/call prefixes and operator
+/// operands so a member path (`cityrp.presidential.Taxes`) or an arithmetic read
+/// (`... / 100`) is caught, not only a bare `local x = cityrp`.
+/// Record the current file if any `panel:GetParent()` read in it fell back to
+/// the broad `Panel` type because the vgui parent chain was not complete. The
+/// chains finish in the gmod-post pass; the fallback set accumulates over the
+/// file walk, so a later statement is enough to flag the file for re-derivation.
+fn note_vgui_parent_fallback_file(analyzer: &mut LuaAnalyzer) {
+    let file_id = analyzer.file_id;
+    let has_fallback = !analyzer
+        .context
+        .infer_manager
+        .get_infer_cache(file_id)
+        .vgui_parent_fallback_calls
+        .is_empty();
+    if has_fallback {
+        analyzer.context.record_vgui_parent_fallback_file(file_id);
+    }
+}
+
+fn initializer_reads_through_multi_decl_global(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let Some(root_name) = global_read_root_name(analyzer, expr) else {
+        return false;
+    };
+    analyzer
+        .db
+        .get_global_index()
+        .get_global_decl_ids(&root_name)
+        .is_some_and(|decl_ids| decl_ids.len() > 1)
+}
+
+/// The root global name a *field read* is rooted at (`cityrp` for
+/// `cityrp.presidential.Taxes`), or `None` if it is not a field read rooted at a
+/// global. A call is deliberately not followed: `cityrp.player.get(x)` returns
+/// whatever the callee returns, not a field off the merged backing tables, so
+/// re-deriving it against the complete set is neither needed nor sound.
+fn global_read_root_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => reads_global_name(analyzer, expr)
+            .then(|| name_expr.get_name_token())
+            .flatten()
+            .map(|token| token.get_name_text().to_string()),
+        LuaExpr::IndexExpr(index) => index
+            .get_prefix_expr()
+            .and_then(|prefix| global_read_root_name(analyzer, &prefix)),
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .and_then(|inner| global_read_root_name(analyzer, &inner)),
+        LuaExpr::BinaryExpr(binary) => binary.get_exprs().and_then(|(left, right)| {
+            global_read_root_name(analyzer, &left)
+                .or_else(|| global_read_root_name(analyzer, &right))
+        }),
+        LuaExpr::UnaryExpr(unary) => unary
+            .get_expr()
+            .and_then(|inner| global_read_root_name(analyzer, &inner)),
+        _ => None,
+    }
 }
 
 /// Whether an initializer that inferred to a type carrying no information
