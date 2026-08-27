@@ -33,7 +33,7 @@
 
 ## Change Requirements
 
-- Always load rust-best-practice skill, and if working on core language server API functionality, the language server spec skill.
+- Always start by loading the rust-best-practices skill, and if working on core language server API functionality, the language server spec skill.
 - Fix incorrect inference, realm, load, or member evidence at its root source. Suppressing a diagnostic or adding a special case usually hides the real bug.
 - Incremental edits may invalidate dependent files and cross-file caches. Test edit, deletion, and reopen behavior when changing indexes or cached inference.
 - Dynamic fields and flow narrowing are sensitive to ownership, source range, scope, realm visibility, and edit stability; preserve all of those dimensions.
@@ -41,7 +41,7 @@
 - Network diagnostics compare send/receive flows and operation order. Treat dynamic message names, payload branches, and read/write loops conservatively to avoid false positives.
 - Annotation metadata changes need both ingestion coverage and a downstream behavior test. Use the existing Garry's Mod builtins and fixtures rather than recreating behavior in the test.
 - Output derived from hash maps or parallel collection must be sorted before it reaches diagnostics, completions, code lenses, or snapshots.
-- Do not address performance problems with arbitrary budgets, caps, fragile pre-filters or broad work-skipping flags. Profile first, then prefilter, index, cache, or parallelize safe read-only work.
+- Do not address performance problems with arbitrary budgets, caps, fragile pre-filters or broad work-skipping flags. Profile first, then index, cache, optimize, or parallelize.
 - Configuration changes must update the config structs, `crates/glua_code_analysis/resources/schema.json`, generated schema output, and user documentation together. Run `cargo run --bin schema_json_gen` and inspect the resulting diff.
 - `.gluarc.json` is exclusive when present; otherwise configs are considered in order: `.luarc.json`, `.emmyrc.json`, `.emmyrc.lua`. Gamemode-base detection scans workspace roots, not the config-file directory.
 - Annotations are external library workspaces, not server-bundled files. Loading may come from `glua_check --gmod-annotations`, `glua_ls --gmod-annotations-path`, or the `gmod.annotationsPath` / `gmod.autoLoadAnnotations` settings.

@@ -1047,6 +1047,10 @@ impl LuaTypeIndex {
         self.in_filed_type_owner.get(&file_id)
     }
 
+    pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
+        self.file_types.get(&file_id)
+    }
+
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);

@@ -394,6 +394,10 @@ impl LuaSignatureIndex {
             .keys()
             .map(String::as_str)
     }
+
+    pub fn get_file_signature_ids(&self, file_id: FileId) -> Option<&HashSet<LuaSignatureId>> {
+        self.in_file_signatures.get(&file_id)
+    }
 }
 
 impl LuaIndex for LuaSignatureIndex {

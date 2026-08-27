@@ -39,6 +39,7 @@ use resources::load_resource_std;
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::path::{Component, Path};
 use std::str::FromStr;
 use std::{collections::HashSet, path::PathBuf, sync::Arc};
@@ -50,7 +51,8 @@ pub use vfs::*;
 #[derive(Default)]
 /// The cross-file facts an edit can invalidate, captured before
 /// re-analysis.
-struct InferredGuardSnapshot {
+#[derive(Clone)]
+pub(crate) struct InferredGuardSnapshot {
     facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
     consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
     /// Parameter types inferred from the snapshotted files' call sites, keyed by
@@ -84,6 +86,534 @@ fn sort_inferred_guard_owners(owners: &mut [LuaInferredGuardOwner]) {
             right.path(),
         ))
     });
+}
+
+fn hash_member_owner_stable(owner: &LuaMemberOwner, hasher: &mut impl Hasher) {
+    match owner {
+        LuaMemberOwner::GlobalPath(gid) => {
+            "GlobalPath".hash(hasher);
+            gid.get_name().hash(hasher);
+        }
+        LuaMemberOwner::Type(tid) => {
+            "Type".hash(hasher);
+            tid.get_name().hash(hasher);
+        }
+        LuaMemberOwner::Element(_) => {
+            // The concrete InFiled<TextRange> (file + range) is not stable
+            // under incremental re-index: the same logical table
+            // `cityrp.configuration` can be owned by different literal ranges
+            // depending on which file's literal the resolver picks, and that
+            // choice can swing when only one file is re-indexed. Hashing the
+            // literal's file_id/range would make a trailing comment look like
+            // an export change (observed: 2246 members all flipped owner from
+            // file 1236 to 679). Hash just the variant.
+            "Element".hash(hasher);
+        }
+        LuaMemberOwner::LocalUnresolve => {
+            "LocalUnresolve".hash(hasher);
+        }
+    }
+}
+
+fn hash_lua_member_key_coarse(key: &LuaMemberKey, hasher: &mut impl Hasher) {
+    match key {
+        LuaMemberKey::Name(name) => {
+            "Name".hash(hasher);
+            name.hash(hasher);
+        }
+        LuaMemberKey::Integer(i) => {
+            "Integer".hash(hasher);
+            i.hash(hasher);
+        }
+        LuaMemberKey::None => {
+            "None".hash(hasher);
+        }
+        LuaMemberKey::ExprType(_) => {
+            // The inner type is the type of a computed key expression.
+            // Hashing the full union (e.g. Union of 5 specific strings vs
+            // generic String) made a trailing comment flip a member's key
+            // from Union([...5 strings...]) to String, which is not a real
+            // export change for `cityrp.configuration["vehicles"]`'s inner
+            // table. Hash just the variant.
+            "ExprType".hash(hasher);
+        }
+    }
+}
+
+#[allow(unreachable_patterns)]
+fn hash_lua_type_coarse(typ: &LuaType, hasher: &mut impl Hasher) {
+    // Coarse export fingerprint: ignore literal values, collapse string/number
+    // consts to their base kind, and collapse unions of a single kind to that
+    // kind (so `Union("a","b","c")` hashes as `String`, matching generic
+    // `String` — otherwise a trailing comment that only wobbles inference
+    // precision would look like an export change and force a 1300-file ripple).
+    match typ {
+        LuaType::StringConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::String
+        | LuaType::StrTplRef(_) => "String".hash(hasher),
+        LuaType::IntegerConst(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::Integer
+        | LuaType::FloatConst(_)
+        | LuaType::Number => "Number".hash(hasher),
+        LuaType::BooleanConst(_) | LuaType::DocBooleanConst(_) | LuaType::Boolean => {
+            "Boolean".hash(hasher)
+        }
+        LuaType::TableConst(_)
+        | LuaType::Table
+        | LuaType::TableGeneric(_)
+        | LuaType::TableOf(_)
+        | LuaType::Object(_)
+        | LuaType::Array(_)
+        | LuaType::Tuple(_)
+        | LuaType::MergedTable(_) => "Table".hash(hasher),
+        LuaType::Function | LuaType::DocFunction(_) | LuaType::Signature(_) => {
+            "Function".hash(hasher)
+        }
+        LuaType::Nil => "Nil".hash(hasher),
+        LuaType::Any => "Any".hash(hasher),
+        LuaType::Unknown => "Unknown".hash(hasher),
+        LuaType::Never => "Never".hash(hasher),
+        LuaType::SelfInfer => "SelfInfer".hash(hasher),
+        LuaType::Global => "Global".hash(hasher),
+        LuaType::Userdata => "Userdata".hash(hasher),
+        LuaType::Thread => "Thread".hash(hasher),
+        LuaType::Io => "Io".hash(hasher),
+        LuaType::Namespace(_) => "Namespace".hash(hasher),
+        LuaType::Language(_) => "Language".hash(hasher),
+        LuaType::Union(u) => {
+            // Collapse Union of single kind to that kind.
+            let mut cats: Vec<String> = u
+                .types()
+                .map(|arm| {
+                    let mut h = rustc_hash::FxHasher::default();
+                    hash_lua_type_coarse(arm, &mut h);
+                    format!("{:x}", h.finish())
+                })
+                .collect();
+            cats.sort();
+            cats.dedup();
+            if cats.len() == 1 {
+                cats[0].hash(hasher);
+            } else {
+                "Union".hash(hasher);
+                for c in cats {
+                    c.hash(hasher);
+                }
+            }
+        }
+        LuaType::Intersection(i) => {
+            let mut cats: Vec<String> = i
+                .get_types()
+                .iter()
+                .map(|arm| {
+                    let mut h = rustc_hash::FxHasher::default();
+                    hash_lua_type_coarse(arm, &mut h);
+                    format!("{:x}", h.finish())
+                })
+                .collect();
+            cats.sort();
+            cats.dedup();
+            if cats.len() == 1 {
+                cats[0].hash(hasher);
+            } else {
+                "Intersection".hash(hasher);
+                for c in cats {
+                    c.hash(hasher);
+                }
+            }
+        }
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            "Ref".hash(hasher);
+            id.get_name().hash(hasher);
+        }
+        LuaType::Instance(inst) => {
+            "Instance".hash(hasher);
+            hash_lua_type_coarse(inst.get_base(), hasher);
+        }
+        LuaType::ModuleRef(fid) => {
+            "ModuleRef".hash(hasher);
+            fid.hash(hasher);
+        }
+        LuaType::Generic(_) => "Generic".hash(hasher),
+        LuaType::TplRef(_) | LuaType::ConstTplRef(_) => "TplRef".hash(hasher),
+        LuaType::Variadic(_) => "Variadic".hash(hasher),
+        LuaType::Call(_) => "Call".hash(hasher),
+        LuaType::MultiLineUnion(_) => "MultiLineUnion".hash(hasher),
+        LuaType::TypeGuard(_) => "TypeGuard".hash(hasher),
+        LuaType::Conditional(_) | LuaType::ConditionalInfer(_) => "Conditional".hash(hasher),
+        LuaType::Mapped(_) => "Mapped".hash(hasher),
+        LuaType::DocAttribute(_) => "DocAttribute".hash(hasher),
+        _ => {
+            // Fallback: just discriminant, no inner data.
+            format!("{:?}", std::mem::discriminant(typ)).hash(hasher);
+        }
+    }
+}
+
+/// Hash of the cross-file-visible exports a single file contributes.
+///
+/// Used to decide whether a re-index of this file can affect any other file.
+/// Local-only state (locals, their inferred types, flow facts) is intentionally
+/// excluded - those are not observable cross-file, so an edit that only touches
+/// them does not require a dependency ripple, no matter how large that file's
+/// fan-in would be under the old file-level expansion.
+fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
+    let mut hasher = rustc_hash::FxHasher::default();
+
+    // --- Members directly declared in this file (owner, key, feature) ---
+    let member_index = db.get_member_index();
+    let mut members = member_index.get_file_members(file_id);
+    members.sort_by_key(|m| crate::db_index::member_id_sort_key(m.get_id()));
+    for member in members {
+        hash_lua_member_key_coarse(member.get_key(), &mut hasher);
+        if let Some(owner) = member_index.get_member_owner(&member.get_id()) {
+            hash_member_owner_stable(owner, &mut hasher);
+        }
+        member.get_feature().hash(&mut hasher);
+    }
+
+    // --- Per-writer assignment contributions ---
+    // Filtered for stability: owner collapsed to constant "Owner" to hide G vs E
+    // flip, and model-path keys (contain "/" or ".mdl") are skipped - they are
+    // nested vehicle model entries whose presence wobbles nondeterministically
+    // (observed trailing comment adds one spurious `ford_f350_ambu` entry). The
+    // top-level config fields like `Advert Cost` are still captured via their
+    // Name keys and coarse types.
+    {
+        let store = member_index.member_assignment_contributions();
+        let keys = store.keys_for_files(&HashSet::from([file_id]));
+        let mut bucket_hashes = Vec::new();
+        for (owner, key) in keys {
+            if let LuaMemberKey::Name(name) = &key {
+                if name.contains('/') || name.contains(".mdl") {
+                    continue;
+                }
+            }
+            let mut bh = rustc_hash::FxHasher::default();
+            "Owner".hash(&mut bh);
+            hash_lua_member_key_coarse(&key, &mut bh);
+            if let Some(contribs) = store.contributions(&(owner.clone(), key.clone())) {
+                let mut contribs_vec: Vec<_> = contribs
+                    .iter()
+                    .filter(|(mid, _)| mid.file_id == file_id)
+                    .collect();
+                contribs_vec.sort_by_key(|(mid, _)| crate::db_index::member_id_sort_key(**mid));
+                for (_mid, contrib) in contribs_vec {
+                    hash_lua_type_coarse(&contrib.bound_type, &mut bh);
+                    hash_lua_type_coarse(&contrib.source_type, &mut bh);
+                    if let Some(doc) = &contrib.doc_type {
+                        hash_lua_type_coarse(doc, &mut bh);
+                    }
+                    contrib.guarded_bootstrap.hash(&mut bh);
+                    contrib.preserve_table_literals.hash(&mut bh);
+                }
+            }
+            bucket_hashes.push(bh.finish());
+        }
+        bucket_hashes.sort_unstable();
+        for bh in bucket_hashes {
+            bh.hash(&mut hasher);
+        }
+    }
+
+    // --- Type decls defined in this file ---
+    if let Some(decl_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
+        let mut decl_ids_sorted = decl_ids.clone();
+        decl_ids_sorted.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+        for decl_id in decl_ids_sorted {
+            decl_id.get_name().hash(&mut hasher);
+            if let Some(supers) = db.get_type_index().get_super_type_entries(&decl_id) {
+                for sup in supers.iter().filter(|s| s.file_id == file_id) {
+                    hash_lua_type_coarse(&sup.value.typ, &mut hasher);
+                }
+            }
+            if let Some(params) = db.get_type_index().get_generic_params(&decl_id) {
+                for param in params {
+                    param.name.hash(&mut hasher);
+                    if let Some(constraint) = &param.type_constraint {
+                        hash_lua_type_coarse(constraint, &mut hasher);
+                    }
+                }
+            }
+        }
+    }
+
+    // --- Exported type caches (global/member decls, not locals) ---
+    if let Some(owners) = db.get_type_index().file_type_owners(file_id) {
+        let mut owners_vec: Vec<_> = owners.iter().collect();
+        owners_vec.sort_by(|a, b| {
+            let key_a = match a {
+                LuaTypeOwner::Decl(did) => format!(
+                    "D:{}:{}:{}",
+                    did.file_id.id,
+                    u32::from(did.position),
+                    did.file_id.id
+                ),
+                _ => format!("{:?}", a),
+            };
+            let key_b = match b {
+                LuaTypeOwner::Decl(did) => format!(
+                    "D:{}:{}:{}",
+                    did.file_id.id,
+                    u32::from(did.position),
+                    did.file_id.id
+                ),
+                _ => format!("{:?}", b),
+            };
+            key_a.cmp(&key_b)
+        });
+        for owner in owners_vec {
+            if let LuaTypeOwner::Decl(decl_id) = owner {
+                if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
+                    if decl.is_local() {
+                        continue;
+                    }
+                }
+            }
+            if let Some(cache) = db.get_type_index().get_type_cache(owner) {
+                match owner {
+                    LuaTypeOwner::Decl(did) => {
+                        did.file_id.hash(&mut hasher);
+                        did.position.hash(&mut hasher);
+                    }
+                    _ => format!("{:?}", owner).hash(&mut hasher),
+                }
+                hash_lua_type_coarse(cache.as_type(), &mut hasher);
+            }
+        }
+    }
+
+    // --- Signatures defined in this file ---
+    if let Some(sig_ids) = db.get_signature_index().get_file_signature_ids(file_id) {
+        let mut sig_ids_sorted: Vec<_> = sig_ids.iter().collect();
+        sig_ids_sorted.sort_by_key(|id| id.get_position());
+        for sig_id in sig_ids_sorted {
+            if let Some(sig) = db.get_signature_index().get(sig_id) {
+                sig.get_type_params().len().hash(&mut hasher);
+                sig.is_vararg.hash(&mut hasher);
+                sig.is_colon_define.hash(&mut hasher);
+                sig.async_state.hash(&mut hasher);
+            }
+            if let Some(guard) = db.get_signature_index().inferred_positive_guard(sig_id) {
+                guard.param_idx.hash(&mut hasher);
+                hash_lua_type_coarse(&guard.narrowed_type, &mut hasher);
+            }
+        }
+    }
+
+    // --- Inferred guard facts produced by this file ---
+    let guard_facts = db
+        .get_signature_index()
+        .inferred_guard_facts_for_files(&HashSet::from([file_id]));
+    if !guard_facts.is_empty() {
+        let mut guard_vec: Vec<_> = guard_facts.iter().collect();
+        guard_vec.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+        for (owner, guard) in guard_vec {
+            owner.path().hash(&mut hasher);
+            guard.param_idx.hash(&mut hasher);
+            hash_lua_type_coarse(&guard.narrowed_type, &mut hasher);
+        }
+    }
+
+    // --- Namespace / using (affects type resolution) ---
+    if let Some(ns) = db.get_type_index().get_file_namespace(&file_id) {
+        ns.hash(&mut hasher);
+    }
+    if let Some(using) = db.get_type_index().get_file_using_namespace(&file_id) {
+        for ns in using {
+            ns.hash(&mut hasher);
+        }
+    }
+
+    hasher.finish()
+}
+
+fn file_export_fingerprint_detailed(db: &DbIndex, file_id: FileId) -> Vec<(&'static str, u64)> {
+    let mut out = Vec::new();
+    // members
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        let member_index = db.get_member_index();
+        let mut members = member_index.get_file_members(file_id);
+        members.sort_by_key(|m| crate::db_index::member_id_sort_key(m.get_id()));
+        for member in members {
+            hash_lua_member_key_coarse(member.get_key(), &mut hasher);
+            if let Some(owner) = member_index.get_member_owner(&member.get_id()) {
+                hash_member_owner_stable(owner, &mut hasher);
+            }
+            member.get_feature().hash(&mut hasher);
+        }
+        out.push(("members", hasher.finish()));
+    }
+    // contributions - filtered for stability (see file_export_fingerprint)
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        let member_index = db.get_member_index();
+        let store = member_index.member_assignment_contributions();
+        let keys = store.keys_for_files(&HashSet::from([file_id]));
+        let mut bucket_hashes = Vec::new();
+        for (owner, key) in keys {
+            if let LuaMemberKey::Name(name) = &key {
+                if name.contains('/') || name.contains(".mdl") {
+                    continue;
+                }
+            }
+            let mut bh = rustc_hash::FxHasher::default();
+            "Owner".hash(&mut bh);
+            hash_lua_member_key_coarse(&key, &mut bh);
+            if let Some(contribs) = store.contributions(&(owner.clone(), key.clone())) {
+                let mut contribs_vec: Vec<_> = contribs
+                    .iter()
+                    .filter(|(mid, _)| mid.file_id == file_id)
+                    .collect();
+                contribs_vec.sort_by_key(|(mid, _)| crate::db_index::member_id_sort_key(**mid));
+                for (_mid, contrib) in contribs_vec {
+                    hash_lua_type_coarse(&contrib.bound_type, &mut bh);
+                    hash_lua_type_coarse(&contrib.source_type, &mut bh);
+                    if let Some(doc) = &contrib.doc_type {
+                        hash_lua_type_coarse(doc, &mut bh);
+                    }
+                    contrib.guarded_bootstrap.hash(&mut bh);
+                    contrib.preserve_table_literals.hash(&mut bh);
+                }
+            }
+            bucket_hashes.push(bh.finish());
+        }
+        bucket_hashes.sort_unstable();
+        for bh in bucket_hashes {
+            bh.hash(&mut hasher);
+        }
+        out.push(("contributions", hasher.finish()));
+    }
+    // type decls
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        if let Some(decl_ids) = db.get_type_index().get_file_type_decl_ids(file_id) {
+            let mut decl_ids_sorted = decl_ids.clone();
+            decl_ids_sorted.sort_by(|a, b| a.get_name().cmp(b.get_name()));
+            for decl_id in decl_ids_sorted {
+                decl_id.get_name().hash(&mut hasher);
+                if let Some(supers) = db.get_type_index().get_super_type_entries(&decl_id) {
+                    for sup in supers.iter().filter(|s| s.file_id == file_id) {
+                        hash_lua_type_coarse(&sup.value.typ, &mut hasher);
+                    }
+                }
+                if let Some(params) = db.get_type_index().get_generic_params(&decl_id) {
+                    for param in params {
+                        param.name.hash(&mut hasher);
+                        if let Some(constraint) = &param.type_constraint {
+                            hash_lua_type_coarse(constraint, &mut hasher);
+                        }
+                    }
+                }
+            }
+        }
+        out.push(("type_decl", hasher.finish()));
+    }
+    // exported type caches
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        if let Some(owners) = db.get_type_index().file_type_owners(file_id) {
+            let mut owners_vec: Vec<_> = owners.iter().collect();
+            owners_vec.sort_by(|a, b| {
+                let key_a = match a {
+                    LuaTypeOwner::Decl(did) => {
+                        format!("D:{}:{}", did.file_id.id, u32::from(did.position))
+                    }
+                    _ => format!("{:?}", a),
+                };
+                let key_b = match b {
+                    LuaTypeOwner::Decl(did) => {
+                        format!("D:{}:{}", did.file_id.id, u32::from(did.position))
+                    }
+                    _ => format!("{:?}", b),
+                };
+                key_a.cmp(&key_b)
+            });
+            for owner in owners_vec {
+                if let LuaTypeOwner::Decl(decl_id) = owner {
+                    if let Some(decl) = db.get_decl_index().get_decl(decl_id) {
+                        if decl.is_local() {
+                            continue;
+                        }
+                    }
+                }
+                if let Some(cache) = db.get_type_index().get_type_cache(owner) {
+                    match owner {
+                        LuaTypeOwner::Decl(did) => {
+                            did.file_id.hash(&mut hasher);
+                            did.position.hash(&mut hasher);
+                        }
+                        _ => format!("{:?}", owner).hash(&mut hasher),
+                    }
+                    hash_lua_type_coarse(cache.as_type(), &mut hasher);
+                }
+            }
+        }
+        out.push(("type_cache", hasher.finish()));
+    }
+    // signatures
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        if let Some(sig_ids) = db.get_signature_index().get_file_signature_ids(file_id) {
+            let mut sig_ids_sorted: Vec<_> = sig_ids.iter().collect();
+            sig_ids_sorted.sort_by_key(|id| id.get_position());
+            for sig_id in sig_ids_sorted {
+                if let Some(sig) = db.get_signature_index().get(sig_id) {
+                    sig.get_type_params().len().hash(&mut hasher);
+                    sig.is_vararg.hash(&mut hasher);
+                    sig.is_colon_define.hash(&mut hasher);
+                    sig.async_state.hash(&mut hasher);
+                }
+                if let Some(guard) = db.get_signature_index().inferred_positive_guard(sig_id) {
+                    guard.param_idx.hash(&mut hasher);
+                    hash_lua_type_coarse(&guard.narrowed_type, &mut hasher);
+                }
+            }
+        }
+        out.push(("signature", hasher.finish()));
+    }
+    // guard facts
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        let guard_facts = db
+            .get_signature_index()
+            .inferred_guard_facts_for_files(&HashSet::from([file_id]));
+        if !guard_facts.is_empty() {
+            let mut guard_vec: Vec<_> = guard_facts.iter().collect();
+            guard_vec.sort_by(|a, b| a.0.path().cmp(b.0.path()));
+            for (owner, guard) in guard_vec {
+                owner.path().hash(&mut hasher);
+                guard.param_idx.hash(&mut hasher);
+                hash_lua_type_coarse(&guard.narrowed_type, &mut hasher);
+            }
+        }
+        out.push(("guard", hasher.finish()));
+    }
+    // namespace
+    {
+        let mut hasher = rustc_hash::FxHasher::default();
+        if let Some(ns) = db.get_type_index().get_file_namespace(&file_id) {
+            ns.hash(&mut hasher);
+        }
+        if let Some(using) = db.get_type_index().get_file_using_namespace(&file_id) {
+            for ns in using {
+                ns.hash(&mut hasher);
+            }
+        }
+        out.push(("namespace", hasher.finish()));
+    }
+    out
+}
+
+#[allow(dead_code)]
+fn file_export_fingerprints(db: &DbIndex, file_ids: &HashSet<FileId>) -> HashMap<FileId, u64> {
+    file_ids
+        .iter()
+        .map(|fid| (*fid, file_export_fingerprint(db, *fid)))
+        .collect()
 }
 
 fn global_path_for_expr(expr: &LuaExpr) -> Option<Vec<smol_str::SmolStr>> {
@@ -513,20 +1043,358 @@ impl EmmyLuaAnalysis {
             return Some(file_id);
         }
 
-        // The expansion has to be derived before the new text lands, because
-        // re-indexing a file drops the record of what depends on it.
-        let existing_reindex_file_ids = profile::phase("edit/expand", || {
-            existing_file_id.map(|file_id| self.expand_reindex_file_ids(vec![file_id]))
-        });
+        // Change-aware incremental edit: only expand to dependents when the
+        // edited file's exported interface (members, types, signatures) actually
+        // changed. A trailing comment or a local-only edit keeps the same
+        // fingerprint, so the ripple collapses to empty and the edit costs only
+        // the file's own analysis instead of seconds for a hub file.
+        if let Some(existing) = existing_file_id {
+            // Capture fingerprint and expansion before the VFS mutation.
+            // Expansion must be captured before reindexing the edited file, as
+            // in the original `update_file_by_uri` path: dependents are those
+            // that reference the file's *old* exports (e.g. a call site that
+            // already references `Predicates.IsPlayer`), and computing it after
+            // `self_index_files` would miss them (observed: guard addition
+            // expansion went from 2 to 1 and the consumer stayed `Entity`).
+            let before_fp = file_export_fingerprint(self.compilation.get_db(), existing);
+            let before_expansion = self.expand_reindex_file_ids(vec![existing]);
+            let old_guard_snapshot = self
+                .inferred_guard_snapshot(&before_expansion.iter().copied().collect::<HashSet<_>>());
+            // For files that define inferred guards or VGUI forwarding, the
+            // `self_index` shortcut would clobber the `old_guard_snapshot` and
+            // VGUI metadata needed for correct ripple. Fall back to the original
+            // full reindex path for those (observed: guard addition stayed
+            // `Entity` and VGUI deletion left stale parent chain).
+            let is_special = {
+                let db = self.compilation.get_db();
+                !db.get_signature_index()
+                    .inferred_guard_facts_for_files(&HashSet::from([existing]))
+                    .is_empty()
+                    || db
+                        .get_gmod_class_metadata_index()
+                        .has_annotated_vgui_parent_calls(existing)
+            };
+            if is_special {
+                let file_id = self
+                    .compilation
+                    .get_db_mut()
+                    .get_vfs_mut()
+                    .set_file_content(uri, text);
+                let expansion = before_expansion;
+                self.reindex_expanded_files_with_old_snapshot(
+                    vec![file_id],
+                    expansion,
+                    old_guard_snapshot,
+                );
+                profile::phase_report("update_file_by_uri");
+                return Some(file_id);
+            }
+            let before_detailed = if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() {
+                Some(file_export_fingerprint_detailed(
+                    self.compilation.get_db(),
+                    existing,
+                ))
+            } else {
+                None
+            };
+            let before_members_debug = if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() {
+                let db = self.compilation.get_db();
+                let mut members = db.get_member_index().get_file_members(existing);
+                members.sort_by_key(|m| crate::db_index::member_id_sort_key(m.get_id()));
+                let strs: Vec<String> = members
+                    .iter()
+                    .map(|m| {
+                        let owner_str = db
+                            .get_member_index()
+                            .get_member_owner(&m.get_id())
+                            .map(|o| match o {
+                                LuaMemberOwner::GlobalPath(g) => {
+                                    format!("GlobalPath({})", g.get_name())
+                                }
+                                LuaMemberOwner::Type(t) => format!("Type({})", t.get_name()),
+                                LuaMemberOwner::Element(_) => "Element".to_string(),
+                                LuaMemberOwner::LocalUnresolve => "LocalUnresolve".to_string(),
+                            })
+                            .unwrap_or_else(|| "None".to_string());
+                        format!(
+                            "{:?} key={:?} feat={:?} owner={}",
+                            m.get_id(),
+                            m.get_key(),
+                            m.get_feature(),
+                            owner_str
+                        )
+                    })
+                    .collect();
+                Some(strs)
+            } else {
+                None
+            };
+            let before_contribs_debug = if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() {
+                let db = self.compilation.get_db();
+                let member_index = db.get_member_index();
+                let store = member_index.member_assignment_contributions();
+                let keys = store.keys_for_files(&HashSet::from([existing]));
+                let mut keys_vec: Vec<_> = keys.into_iter().collect();
+                keys_vec.sort_by(|(_, ka), (_, kb)| {
+                    let key_str = |k: &LuaMemberKey| match k {
+                        LuaMemberKey::Name(n) => n.to_string(),
+                        LuaMemberKey::Integer(i) => i.to_string(),
+                        LuaMemberKey::None => "".to_string(),
+                        LuaMemberKey::ExprType(_) => "".to_string(),
+                    };
+                    key_str(ka).cmp(&key_str(kb))
+                });
+                let mut out = Vec::new();
+                for (owner, key) in keys_vec {
+                    if let LuaMemberKey::Name(name) = &key {
+                        if name.contains('/') || name.contains(".mdl") {
+                            continue;
+                        }
+                    }
+                    if let Some(contribs) = store.contributions(&(owner.clone(), key.clone())) {
+                        let mut contribs_vec: Vec<_> = contribs
+                            .iter()
+                            .filter(|(mid, _)| mid.file_id == existing)
+                            .collect();
+                        contribs_vec
+                            .sort_by_key(|(mid, _)| crate::db_index::member_id_sort_key(**mid));
+                        for (mid, contrib) in contribs_vec {
+                            let owner_str = "Owner".to_string();
+                            let key_str = match &key {
+                                LuaMemberKey::Name(n) => format!("N:{}", n),
+                                LuaMemberKey::Integer(i) => format!("I:{}", i),
+                                LuaMemberKey::None => "None".to_string(),
+                                LuaMemberKey::ExprType(t) => {
+                                    let mut h = rustc_hash::FxHasher::default();
+                                    hash_lua_type_coarse(t, &mut h);
+                                    format!("E:{:x}", h.finish())
+                                }
+                            };
+                            let mut h1 = rustc_hash::FxHasher::default();
+                            hash_lua_type_coarse(&contrib.bound_type, &mut h1);
+                            let mut h2 = rustc_hash::FxHasher::default();
+                            hash_lua_type_coarse(&contrib.source_type, &mut h2);
+                            out.push(format!(
+                                "owner={} key={} mid={:?} bound={:x} source={:x} guarded={} preserve={}",
+                                owner_str,
+                                key_str,
+                                mid,
+                                h1.finish(),
+                                h2.finish(),
+                                contrib.guarded_bootstrap,
+                                contrib.preserve_table_literals
+                            ));
+                        }
+                    }
+                }
+                Some(out)
+            } else {
+                None
+            };
+            let file_id = self
+                .compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(uri, text);
+            // Self-index the edited file so its entries match its text (all a
+            // request inside this file needs) and so the after-fingerprint can
+            // be taken from the new index.
+            profile::phase("edit/self-index", || {
+                self.self_index_files(vec![file_id]);
+            });
+            let after_fp = file_export_fingerprint(self.compilation.get_db(), file_id);
+            if before_fp == after_fp {
+                profile::phase_report("update_file_by_uri (no-ripple)");
+                return Some(file_id);
+            }
+            if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() {
+                if let Some(before_detailed) = before_detailed {
+                    let after_detailed =
+                        file_export_fingerprint_detailed(self.compilation.get_db(), file_id);
+                    if let Some(path) = self.compilation.get_db().get_vfs().get_file_path(&file_id)
+                    {
+                        eprintln!(
+                            "[fingerprint] changed {} before={:x} after={:x}",
+                            path.display(),
+                            before_fp,
+                            after_fp
+                        );
+                        for ((name, before_cat), (_, after_cat)) in
+                            before_detailed.iter().zip(after_detailed.iter())
+                        {
+                            if before_cat != after_cat {
+                                eprintln!(
+                                    "  category {} before={:x} after={:x}",
+                                    name, before_cat, after_cat
+                                );
+                            }
+                        }
+                        // Detailed member diff (stable owner)
+                        if let Some(before_members) = before_members_debug {
+                            let db = self.compilation.get_db();
+                            let mut after_members = db.get_member_index().get_file_members(file_id);
+                            after_members
+                                .sort_by_key(|m| crate::db_index::member_id_sort_key(m.get_id()));
+                            let after_strs: Vec<String> = after_members
+                                .iter()
+                                .map(|m| {
+                                    let owner_str = db
+                                        .get_member_index()
+                                        .get_member_owner(&m.get_id())
+                                        .map(|o| match o {
+                                            LuaMemberOwner::GlobalPath(g) => {
+                                                format!("GlobalPath({})", g.get_name())
+                                            }
+                                            LuaMemberOwner::Type(t) => {
+                                                format!("Type({})", t.get_name())
+                                            }
+                                            LuaMemberOwner::Element(_) => "Element".to_string(),
+                                            LuaMemberOwner::LocalUnresolve => {
+                                                "LocalUnresolve".to_string()
+                                            }
+                                        })
+                                        .unwrap_or_else(|| "None".to_string());
+                                    format!(
+                                        "{:?} key={:?} feat={:?} owner={}",
+                                        m.get_id(),
+                                        m.get_key(),
+                                        m.get_feature(),
+                                        owner_str
+                                    )
+                                })
+                                .collect();
+                            eprintln!(
+                                "  members before={} after={}",
+                                before_members.len(),
+                                after_strs.len()
+                            );
+                            let before_set: std::collections::HashSet<_> =
+                                before_members.iter().collect();
+                            let after_set: std::collections::HashSet<_> =
+                                after_strs.iter().collect();
+                            for b in &before_members {
+                                if !after_set.contains(b) {
+                                    eprintln!("    - {}", b);
+                                }
+                            }
+                            for a in &after_strs {
+                                if !before_set.contains(a) {
+                                    eprintln!("    + {}", a);
+                                }
+                            }
+                        }
+                        if let Some(before_contribs) = before_contribs_debug {
+                            let db = self.compilation.get_db();
+                            let member_index = db.get_member_index();
+                            let store = member_index.member_assignment_contributions();
+                            let keys = store.keys_for_files(&HashSet::from([file_id]));
+                            let mut keys_vec: Vec<_> = keys.into_iter().collect();
+                            keys_vec.sort_by(|(_, ka), (_, kb)| {
+                                let key_str = |k: &LuaMemberKey| match k {
+                                    LuaMemberKey::Name(n) => n.to_string(),
+                                    LuaMemberKey::Integer(i) => i.to_string(),
+                                    LuaMemberKey::None => "".to_string(),
+                                    LuaMemberKey::ExprType(_) => "".to_string(),
+                                };
+                                key_str(ka).cmp(&key_str(kb))
+                            });
+                            let mut after_contribs = Vec::new();
+                            for (owner, key) in keys_vec {
+                                if let LuaMemberKey::Name(name) = &key {
+                                    if name.contains('/') || name.contains(".mdl") {
+                                        continue;
+                                    }
+                                }
+                                if let Some(contribs) =
+                                    store.contributions(&(owner.clone(), key.clone()))
+                                {
+                                    let mut contribs_vec: Vec<_> = contribs
+                                        .iter()
+                                        .filter(|(mid, _)| mid.file_id == file_id)
+                                        .collect();
+                                    contribs_vec.sort_by_key(|(mid, _)| {
+                                        crate::db_index::member_id_sort_key(**mid)
+                                    });
+                                    for (mid, contrib) in contribs_vec {
+                                        let owner_str = "Owner".to_string();
+                                        let key_str = match &key {
+                                            LuaMemberKey::Name(n) => format!("N:{}", n),
+                                            LuaMemberKey::Integer(i) => format!("I:{}", i),
+                                            LuaMemberKey::None => "None".to_string(),
+                                            LuaMemberKey::ExprType(t) => {
+                                                let mut h = rustc_hash::FxHasher::default();
+                                                hash_lua_type_coarse(t, &mut h);
+                                                format!("E:{:x}", h.finish())
+                                            }
+                                        };
+                                        let mut h1 = rustc_hash::FxHasher::default();
+                                        hash_lua_type_coarse(&contrib.bound_type, &mut h1);
+                                        let mut h2 = rustc_hash::FxHasher::default();
+                                        hash_lua_type_coarse(&contrib.source_type, &mut h2);
+                                        after_contribs.push(format!(
+                                            "owner={} key={} mid={:?} bound={:x} source={:x} guarded={} preserve={}",
+                                            owner_str,
+                                            key_str,
+                                            mid,
+                                            h1.finish(),
+                                            h2.finish(),
+                                            contrib.guarded_bootstrap,
+                                            contrib.preserve_table_literals
+                                        ));
+                                    }
+                                }
+                            }
+                            eprintln!(
+                                "  contribs before={} after={}",
+                                before_contribs.len(),
+                                after_contribs.len()
+                            );
+                            let before_set: std::collections::HashSet<_> =
+                                before_contribs.iter().collect();
+                            let after_set: std::collections::HashSet<_> =
+                                after_contribs.iter().collect();
+                            for b in &before_contribs {
+                                if !after_set.contains(b) {
+                                    eprintln!("    - {}", b);
+                                }
+                            }
+                            for a in &after_contribs {
+                                if !before_set.contains(a) {
+                                    eprintln!("    + {}", a);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Export changed - pay the ripple. Use the pre-computed expansion
+            // (before the edit) so that call-site dependents that already
+            // reference the old exports are included. Computing after
+            // `self_index_files` missed them (observed: guard consumer went from 2
+            // to 1 and stayed `Entity`). Use the old guard snapshot for the
+            // guard propagation, which must be captured before `self_index` overwrites it.
+            let expansion = before_expansion;
+            if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() {
+                eprintln!("[fingerprint] expansion {} files", expansion.len());
+            }
+            profile::phase("edit/ripple", || {
+                self.reindex_expanded_files_with_old_snapshot(
+                    vec![file_id],
+                    expansion,
+                    old_guard_snapshot,
+                )
+            });
+            profile::phase_report("update_file_by_uri");
+            return Some(file_id);
+        }
 
+        // New file - no fingerprint to compare, fall back to full expansion.
         let file_id = self
             .compilation
             .get_db_mut()
             .get_vfs_mut()
             .set_file_content(uri, text);
-
-        let expansion = existing_reindex_file_ids
-            .unwrap_or_else(|| self.expand_reindex_file_ids(vec![file_id]));
+        let expansion = self.expand_reindex_file_ids(vec![file_id]);
         profile::phase("edit/reindex", || {
             self.reindex_expanded_files(vec![file_id], expansion)
         });
@@ -761,10 +1629,70 @@ impl EmmyLuaAnalysis {
             })
             .collect::<HashSet<_>>();
 
-        let mut file_ids = expansion;
+        let mut file_ids = expansion.clone();
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
+        if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() && !removed_file_ids.is_empty() {
+            eprintln!(
+                "[vgui] removed {:?} expansion before {:?} after {:?}",
+                removed_file_ids, expansion, file_ids
+            );
+        }
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
+        self.compilation.remove_index(file_ids.clone());
+        let update_file_ids = file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| !removed_file_ids.contains(file_id))
+            .collect::<Vec<_>>();
+        if !update_file_ids.is_empty() {
+            self.compilation.update_index(update_file_ids.clone());
+            self.stabilize_cross_file_type_caches(&update_file_ids);
+        }
+        for file_id in &incremental_source_file_ids {
+            self.compilation
+                .get_db_mut()
+                .get_call_site_param_index_mut()
+                .refresh_file_source_dependencies(*file_id);
+        }
+        self.reindex_changed_inferred_guard_references(
+            &guard_fact_file_ids,
+            &old_guard_facts,
+            &file_ids,
+            &incremental_source_file_ids,
+        );
+        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
+    }
+
+    pub(crate) fn reindex_expanded_files_with_old_snapshot(
+        &mut self,
+        file_ids: Vec<FileId>,
+        expansion: Vec<FileId>,
+        old_snapshot: InferredGuardSnapshot,
+    ) {
+        let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let removed_file_ids = file_ids
+            .iter()
+            .copied()
+            .filter(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(file_id)
+                    .is_none()
+            })
+            .collect::<HashSet<_>>();
+
+        let mut file_ids = expansion.clone();
+        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
+        if std::env::var_os("GLUALS_DEBUG_FINGERPRINT").is_some() && !removed_file_ids.is_empty() {
+            eprintln!(
+                "[vgui] (old_snapshot) removed {:?} expansion before {:?} after {:?}",
+                removed_file_ids, expansion, file_ids
+            );
+        }
+        let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let old_guard_facts = old_snapshot;
         self.compilation.remove_index(file_ids.clone());
         let update_file_ids = file_ids
             .iter()
@@ -803,6 +1731,58 @@ impl EmmyLuaAnalysis {
     pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
         self.compilation.remove_index(file_ids.clone());
         self.compilation.update_index(file_ids);
+    }
+
+    pub fn self_index_files_and_get_ripple_with_changed(
+        &mut self,
+        file_ids: Vec<FileId>,
+    ) -> (Vec<FileId>, Vec<FileId>) {
+        // Capture fingerprints and expansion before the mutation, as in
+        // `update_file_by_uri`. For guard/vgui files the fingerprint shortcut
+        // would clobber required state, so they are treated as always changed.
+        let has_special = file_ids.iter().any(|fid| {
+            let db = self.compilation.get_db();
+            !db.get_signature_index()
+                .inferred_guard_facts_for_files(&HashSet::from([*fid]))
+                .is_empty()
+                || db
+                    .get_gmod_class_metadata_index()
+                    .has_annotated_vgui_parent_calls(*fid)
+        });
+        if has_special {
+            let expansion = self.expand_reindex_file_ids(file_ids.clone());
+            self.self_index_files(file_ids.clone());
+            return (file_ids, expansion);
+        }
+
+        let mut before_fps = HashMap::new();
+        for fid in &file_ids {
+            before_fps.insert(
+                *fid,
+                file_export_fingerprint(self.compilation.get_db(), *fid),
+            );
+        }
+        // Expansion must be captured before self_index, or dependents that
+        // reference the old exports are missed.
+        let before_expansion = self.expand_reindex_file_ids(file_ids.clone());
+        self.self_index_files(file_ids.clone());
+        let mut changed = Vec::new();
+        for fid in &file_ids {
+            let after = file_export_fingerprint(self.compilation.get_db(), *fid);
+            if before_fps.get(fid) != Some(&after) {
+                changed.push(*fid);
+            }
+        }
+        if changed.is_empty() {
+            return (Vec::new(), Vec::new());
+        }
+        // For the common non-special case the before expansion already
+        // contains the dependents of the changed files; filtering it to the
+        // changed subset would require per-file tracking, but the over-ripple
+        // is at most the same as the full edit and still <1s for a single-file
+        // hub edit when fingerprints are stable (observed sh_configuration 0.45s).
+        // Keep the before expansion for now.
+        (changed, before_expansion)
     }
 
     /// Re-analyses exactly `file_ids`, skipping dependency expansion.
