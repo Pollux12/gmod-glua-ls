@@ -1040,6 +1040,13 @@ impl LuaTypeIndex {
         }
     }
 
+    /// The type-cache owners recorded for a file, used to re-derive a file's
+    /// decls after a late index (e.g. vgui parent chains) makes a broad fallback
+    /// resolvable.
+    pub fn file_type_owners(&self, file_id: FileId) -> Option<&HashSet<LuaTypeOwner>> {
+        self.in_filed_type_owner.get(&file_id)
+    }
+
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
         self.insert_type_cache(owner.clone(), cache);

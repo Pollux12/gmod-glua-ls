@@ -539,53 +539,153 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
 /// it resolves every writer has landed. Taking the read again here gives both
 /// the complete set.
 fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let mut candidates = std::mem::take(&mut context.settled_global_read_candidates);
-    if candidates.is_empty() {
+    let standard = std::mem::take(&mut context.settled_global_read_candidates);
+    let multi_decl = std::mem::take(&mut context.settled_multi_decl_global_read_candidates);
+    if standard.is_empty() && multi_decl.is_empty() {
         return;
     }
-    candidates.sort_by_key(|(decl_id, _)| (decl_id.file_id, decl_id.position));
 
-    let files = candidates
+    let files = standard
         .iter()
+        .chain(multi_decl.iter())
         .map(|(decl_id, _)| decl_id.file_id)
         .collect::<HashSet<_>>();
     context.infer_manager.clear_files_deferred_results(&files);
 
-    for (decl_id, expr) in candidates {
-        let type_owner = LuaTypeOwner::Decl(decl_id);
-        let existing = db.get_type_index().get_type_cache(&type_owner);
-        if existing.is_some_and(|cached| cached.is_doc()) {
-            continue;
+    // `allow_unsubsumed_swap` is set for reads through a multi-declaration
+    // global: those are one runtime table, so the read against the complete set
+    // of backing tables replaces the walk's read against a subset even when the
+    // two are not structurally related.
+    for (mut candidates, allow_unsubsumed_swap) in [(standard, false), (multi_decl, true)] {
+        candidates.sort_by_key(|(decl_id, _)| (decl_id.file_id, decl_id.position));
+        for (decl_id, expr) in candidates {
+            let type_owner = LuaTypeOwner::Decl(decl_id);
+            let existing = db.get_type_index().get_type_cache(&type_owner);
+            if existing.is_some_and(|cached| cached.is_doc()) {
+                continue;
+            }
+            let cached = existing.map(|cached| cached.as_type().clone());
+            let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
+            let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
+                continue;
+            };
+            // Re-deriving may only add to what the walk found, never swap it. The
+            // complete writer set is what a global read needs when the walk saw
+            // none of it, and it is what puts the second writer of a two-file
+            // table back after a re-index. But a global every file reassigns --
+            // `PLUGIN_SHARED = PLUGIN` in each plugin -- settles to one arbitrary
+            // writer, and taking that over the writer the reading file's own
+            // include chain reaches would substitute an unrelated answer for a
+            // right one. A multi-declaration global is exempt: its backing tables
+            // are the same runtime table, so the complete read is authoritative.
+            if !allow_unsubsumed_swap
+                && let Some(cached) = &cached
+                && !crate::is_undetermined_type(cached)
+                && !settled_type_subsumes(cached, &settled)
+            {
+                continue;
+            }
+            let settled = common::widen_mutable_decl_literal(
+                db,
+                &type_owner,
+                LuaTypeCache::InferType(settled),
+            );
+            if db
+                .get_type_index()
+                .get_type_cache(&type_owner)
+                .is_some_and(|cached| cached.as_type() == settled.as_type())
+            {
+                continue;
+            }
+            db.get_type_index_mut().force_bind_type(type_owner, settled);
         }
-        let cached = existing.map(|cached| cached.as_type().clone());
-        let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
-        let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
+    }
+}
+
+/// Re-derives decls whose `panel:GetParent()` read fell back to the broad
+/// `Panel` type during the walk because the vgui parent chain was not complete.
+///
+/// The chains are finished by the gmod-post pass, so the same read now resolves
+/// the actual parent panel. A warm re-index gets the specific type on the walk
+/// because the chains were already built; this closes the same gap for a cold
+/// build. Only an exact `Panel` cache is replaced, and only by a more specific
+/// vgui panel, so a genuinely-`Panel` decl is left alone.
+pub(crate) fn rederive_vgui_parent_fallbacks(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let files = std::mem::take(&mut context.vgui_parent_fallback_files);
+    if files.is_empty() {
+        return;
+    }
+    // The chains are complete now; drop the file's memoised inference so the
+    // GetParent read is taken again. The flow answers have to go too: a value
+    // read through a loop variable (`p = p:GetParent()`) is answered from the
+    // flow cache, which survives the ordinary deferred clear.
+    for file_id in &files {
+        let cache = context.infer_manager.get_infer_cache(*file_id);
+        cache.clear_deferred_inference_results();
+        cache.clear_flow_results();
+    }
+
+    let mut files = files.into_iter().collect::<Vec<_>>();
+    files.sort_by_key(|file_id| file_id.id);
+    for file_id in files {
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+        else {
             continue;
         };
-        // Re-deriving may only add to what the walk found, never swap it. The
-        // complete writer set is what a global read needs when the walk saw
-        // none of it, and it is what puts the second writer of a two-file table
-        // back after a re-index. But a global every file reassigns --
-        // `PLUGIN_SHARED = PLUGIN` in each plugin -- settles to one arbitrary
-        // writer, and taking that over the writer the reading file's own
-        // include chain reaches would substitute an unrelated answer for a
-        // right one.
-        if let Some(cached) = &cached
-            && !crate::is_undetermined_type(cached)
-            && !settled_type_subsumes(cached, &settled)
-        {
-            continue;
-        }
-        let settled =
-            common::widen_mutable_decl_literal(db, &type_owner, LuaTypeCache::InferType(settled));
-        if db
+        let mut decl_ids = db
             .get_type_index()
-            .get_type_cache(&type_owner)
-            .is_some_and(|cached| cached.as_type() == settled.as_type())
-        {
-            continue;
+            .file_type_owners(file_id)
+            .into_iter()
+            .flatten()
+            .filter_map(|owner| match owner {
+                LuaTypeOwner::Decl(decl_id) => Some(*decl_id),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        decl_ids.sort_by_key(|decl_id| (decl_id.file_id, decl_id.position));
+        for decl_id in decl_ids {
+            let type_owner = LuaTypeOwner::Decl(decl_id);
+            let Some(cached) = db.get_type_index().get_type_cache(&type_owner) else {
+                continue;
+            };
+            if cached.is_doc() || !is_exact_panel_type(cached.as_type()) {
+                continue;
+            }
+            let Some((ret_idx, expr)) = local_initializer_expr(db, &root, decl_id) else {
+                continue;
+            };
+            let cache = context.infer_manager.get_infer_cache(file_id);
+            let Ok(settled) = crate::semantic::infer_expr(db, cache, expr) else {
+                continue;
+            };
+            let settled = match &settled {
+                LuaType::Variadic(multi) => multi
+                    .get_type(ret_idx)
+                    .cloned()
+                    .unwrap_or(LuaType::Unknown),
+                _ => settled,
+            };
+            if is_more_specific_vgui_panel_type(db, &settled) {
+                db.get_type_index_mut()
+                    .force_bind_type(type_owner, LuaTypeCache::InferType(settled));
+            }
         }
-        db.get_type_index_mut().force_bind_type(type_owner, settled);
+    }
+}
+
+fn is_exact_panel_type(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Ref(id) | LuaType::Def(id) if id.get_name() == "Panel")
+}
+
+fn is_more_specific_vgui_panel_type(db: &DbIndex, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::Ref(id) | LuaType::Def(id) => {
+            id.get_name() != "Panel" && crate::semantic::type_decl_is_vgui_panel(db, id, 0)
+        }
+        _ => false,
     }
 }
 
@@ -1558,6 +1658,18 @@ pub struct AnalyzeContext {
     settled_iter_var_candidates: Vec<UnResolveIterVar>,
     /// See [`AnalyzeContext::record_settled_global_read_candidate`].
     settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
+    /// Decls reading through a multi-declaration global. Unlike
+    /// [`Self::settled_global_read_candidates`], the settled re-derivation is
+    /// allowed to replace the walk's answer even when it does not structurally
+    /// subsume it: a global declared once per realm is a single runtime table,
+    /// so the read against the complete set of backing tables is authoritative
+    /// over the read the walk took against whichever ones it had reached.
+    settled_multi_decl_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
+    /// Files where a `panel:GetParent()` read resolved to the broad `Panel`
+    /// fallback because the vgui parent chain was not complete yet. The chains
+    /// are finished in the gmod-post pass, after which those reads (and anything
+    /// derived from them) are re-derived; see `rederive_vgui_parent_fallbacks`.
+    vgui_parent_fallback_files: HashSet<FileId>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -1589,6 +1701,8 @@ impl AnalyzeContext {
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
             settled_global_read_candidates: Vec::new(),
+            settled_multi_decl_global_read_candidates: Vec::new(),
+            vgui_parent_fallback_files: HashSet::new(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -1638,6 +1752,19 @@ impl AnalyzeContext {
         expr: LuaExpr,
     ) {
         self.settled_global_read_candidates.push((decl_id, expr));
+    }
+
+    pub(crate) fn record_settled_multi_decl_global_read_candidate(
+        &mut self,
+        decl_id: LuaDeclId,
+        expr: LuaExpr,
+    ) {
+        self.settled_multi_decl_global_read_candidates
+            .push((decl_id, expr));
+    }
+
+    pub(crate) fn record_vgui_parent_fallback_file(&mut self, file_id: FileId) {
+        self.vgui_parent_fallback_files.insert(file_id);
     }
 
     pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {
