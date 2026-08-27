@@ -311,6 +311,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             db.get_member_index_mut().settle_alias_contributed_slots();
         }
 
+        // A conditional-branch slot is first resolved during the walk, before a
+        // write that homes its owner forward-only can have landed. Now that every
+        // owner stands, re-resolve each such slot against its full writer set so
+        // the visible members do not depend on how far the walk had reached.
+        {
+            let _p = Profile::new("settle_conditional_branch_slots");
+            db.get_member_index_mut().settle_conditional_branch_slots();
+        }
+
         // A loop over a global has to enumerate the table every realm's file
         // contributed to, so the copies of that global settle first.
         {
