@@ -63,8 +63,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 return Some(());
             }
             // Skip Nil binding for mutable locals (those with subsequent write-assignments).
-            // This prevents false "cannot assign X to never" diagnostics when a local is used
-            // as an upvalue inside a closure and assigned before the closure is first called.
             if is_local_mutable(analyzer, decl_id) {
                 continue;
             }
@@ -88,9 +86,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
-        // A copy of a loop variable holds whatever the variable held when the
-        // copy landed, and the settled re-derivation moves those, so it needs
-        // re-reading for the same reason a call or index read does.
         if is_call_or_index_expr(&expr)
             || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
         {
@@ -98,10 +93,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                 .context
                 .request_uninformative_local_decl_reinfer(decl_id);
         }
-        // A read through a multi-declaration global answers from whichever backing
-        // tables the walk had reached; a decl deferred to the unresolve wave never
-        // reaches the settled-global-read recording below, so record it here
-        // before it can branch off. Re-derived once every backing table has landed.
         if initializer_reads_through_multi_decl_global(analyzer, &expr) {
             analyzer
                 .context
@@ -212,10 +203,6 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
 
-                // A global's type is the merge of every file that writes it, and
-                // a batch that retains some of those writers while its own are
-                // still empty answers this read from a smaller set than a cold
-                // build sees. Re-derived once they have all landed.
                 if reads_global_name(analyzer, &expr) {
                     analyzer
                         .context
@@ -569,10 +556,6 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
             let Some((member_owner, set_owner_only)) =
                 resolve_index_expr_member_owner_for_file(&prefix_type, Some(analyzer.file_id))
             else {
-                // The prefix inferred, but to nothing that names an owner. That
-                // is not a property of the source: the prefix may simply not
-                // have settled yet, and nothing revisits this attach. Record it
-                // so the settled pass can retry it once the batch is done.
                 if prefix_carries_no_owner_information(&prefix_type) {
                     analyzer
                         .context
@@ -594,11 +577,7 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
                 ));
         }
         Err(reason) => {
-            // Every other branch above reaches
-            // `apply_index_expr_member_owner`, which *creates* the
-            // `LuaMember` and then attaches it. This branch cannot: the
-            // prefix is not inferable yet, so there is no owner to attach
-            // to.
+            // Defer member with unresolvable prefix via unresolve.
             let unresolve_member = UnResolveMember {
                 file_id: analyzer.file_id,
                 member_id: LuaMemberId::new(var_expr.get_syntax_id(), analyzer.file_id),
@@ -615,17 +594,9 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     Some(())
 }
 
-/// Whether a prefix type says nothing about which table a member write lands on.
-///
-/// Distinguishes "this prefix has no owner" (a number, a string — a real answer)
-/// from "this prefix has not settled yet", which is the only case worth retrying
-/// after the batch is done.
+/// Whether prefix type carries no owner information.
 fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
     match prefix_type {
-        // `table` belongs here for the same reason `any` does: it names no
-        // element, so nothing can attach through it. It is also what a slot
-        // collapses to while a writer's literal is still being widened against
-        // siblings the walk has not reached, which is a property of the batch.
         LuaType::Unknown | LuaType::Any | LuaType::Table => true,
         LuaType::Union(union) => union.types().all(|arm| {
             matches!(
@@ -837,10 +808,7 @@ fn apply_index_expr_member_owner_with_guarded(
         }
         let member_index = analyzer.db.get_member_index_mut();
         member_index.add_member(member_owner, member);
-        // `add_member` already records the enclosing function scope for
-        // `FileDefine` index-expr members (via
-        // `assignment_file_define_scope_for_member`). For other features
-        // (e.g. `MetaDefine`) it stores `None`, so set the real scope here.
+        // Set scope for non-FileDefine members.
         if !matches!(decl_feature, LuaMemberFeature::FileDefine) {
             let function_scope = member_index
                 .enclosing_function_scope_range(analyzer.file_id, member_id.get_position());
@@ -926,10 +894,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         let type_owner = get_var_owner(analyzer, var.clone());
 
-        // A local reassigned from a multi-declaration global field read has the
-        // same batch-order exposure as a local *initialized* from one: the walk
-        // answers it from whichever backing tables it had reached. Record it so
-        // the settled pass re-derives it against the complete set.
         if let LuaTypeOwner::Decl(decl_id) = &type_owner
             && initializer_reads_through_multi_decl_global(analyzer, expr)
         {
@@ -1046,8 +1010,6 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 }
             }
             // Reading an undefined global yields `nil` at runtime, so the
-            // assignment target's value is `nil` (not unknown). This mirrors
-            // the local-stat path above so hover/inference stays consistent.
             Err(InferFailReason::None) => {
                 if should_defer_none_infer_expr(expr) {
                     add_unresolve_for_assignment(
@@ -1395,11 +1357,6 @@ fn should_skip_nil_table_shape_assignment(
         return false;
     };
 
-    // A prefix that has not settled yet cannot answer this, and the write is a
-    // delete either way: `t[k] = nil` removes an entry, it never adds a member
-    // typed `nil`. A receiver typed by a `fun(self: T)` callback slot is still
-    // `unknown` while its file is walked, so a member attached here would land
-    // on the slot every closure filling it shares.
     if matches!(prefix_type, LuaType::Unknown | LuaType::Never) {
         return true;
     }
@@ -1571,21 +1528,9 @@ fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
         .is_none()
 }
 
-/// Whether the initializer reads through a global whose root name has more than
-/// one declaration — the `X = X or {}` per-realm bootstrap whose backing tables
-/// the walk merges incrementally. Recurses index/call prefixes and operator
-/// operands so a member path (`cityrp.presidential.Taxes`) or an arithmetic read
-/// (`... / 100`) is caught, not only a bare `local x = cityrp`.
-/// Record the current file if any `panel:GetParent()` read in it fell back to
-/// the broad `Panel` type because the vgui parent chain was not complete. The
-/// chains finish in the gmod-post pass; the fallback set accumulates over the
-/// file walk, so a later statement is enough to flag the file for re-derivation.
 fn note_vgui_parent_fallback_file(analyzer: &mut LuaAnalyzer) {
     let file_id = analyzer.file_id;
     let cache = analyzer.context.infer_manager.get_infer_cache(file_id);
-    // Chain-derived successes are as batch-sensitive as fallbacks: the chain a
-    // read went through can be one the final chain state contradicts, so both
-    // kinds flag the file for the settled re-derivation.
     let has_chain_read =
         !cache.vgui_parent_fallback_calls.is_empty() || !cache.vgui_parent_chain_calls.is_empty();
     if has_chain_read {
@@ -1604,11 +1549,6 @@ fn initializer_reads_through_multi_decl_global(analyzer: &LuaAnalyzer, expr: &Lu
         .is_some_and(|decl_ids| decl_ids.len() > 1)
 }
 
-/// The root global name a *field read* is rooted at (`cityrp` for
-/// `cityrp.presidential.Taxes`), or `None` if it is not a field read rooted at a
-/// global. A call is deliberately not followed: `cityrp.player.get(x)` returns
-/// whatever the callee returns, not a field off the merged backing tables, so
-/// re-deriving it against the complete set is neither needed nor sound.
 fn global_read_root_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> Option<String> {
     match expr {
         LuaExpr::NameExpr(name_expr) => reads_global_name(analyzer, expr)
@@ -1739,15 +1679,6 @@ fn should_defer_pending_local_alias(
 }
 
 /// Whether `expr` reads out of `decl_id` itself: the `x = x.field` shape,
-/// and the same read buried in an operand or call argument (`width =
-/// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
-/// self-contradiction — the value still cannot be the decl's lifetime type,
-/// because it was computed from a read that type would reject.
-/// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
-///
-/// The result always includes the declaration's own type, so unlike a plain
-/// reassignment it refines the declaration rather than replacing it, and is the
-/// one body write a parameter may take its type from.
 pub(crate) fn expr_fills_own_default(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -1849,10 +1780,6 @@ fn add_unresolve_for_assignment(
     match type_owner {
         LuaTypeOwner::Decl(decl_id) => {
             // A read out of the decl being assigned (`limit =
-            // limit.maximum`) must not queue a deferred write. The decl
-            // slot is empty until one of the file's deferred writes
-            // resolves, and `bind_type` has no acceptance rule for an empty
-            // slot, so whichever lands first owns the decl's lifetime type.
             if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, &expr) {
                 return;
             }
@@ -1886,13 +1813,6 @@ fn add_unresolve_for_assignment(
                 prefix,
                 ret_idx: 0,
             };
-            // The deferred write resolves against whatever the index held
-            // when its retry ran, and an attempt that reaches `unknown`
-            // succeeds: the item retires and the placeholder becomes the
-            // member's final type. Whether the retry was early or late is a
-            // property of batch order, not of the source, so record the
-            // member for the settled re-infer in
-            // `refresh_member_initializer_caches`.
             analyzer
                 .context
                 .request_member_initializer_reinfer(member_id);
@@ -1917,12 +1837,6 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = multi.get_type(idx).unwrap_or(&LuaType::Nil).clone();
     }
 
-    // A self-referential guarded bootstrap (`x.y = x.y or {}`) assigns its
-    // own `{}` whatever the self-read resolves to, which is what
-    // `special_or_rule` folds it to. The inferred expression type can still
-    // carry that self-read when it was memoised before the fold ran, and
-    // what the read resolved to is whichever sibling file the batch
-    // analysed first.
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && let Some(bootstrap_type) =
             guarded_table_bootstrap_member_type(analyzer.db, *member_id, true)
@@ -1930,11 +1844,7 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = bootstrap_type;
     }
 
-    // Where every writer of this member is a `x.y = x.y or {}` guard they all
-    // name one table, so there are no competing writes to merge — each writer
-    // resolves to the earliest one's literal and the sibling widening is
-    // skipped. Widening them against each other unions two literals into a bare
-    // `table`, which drops the members another file attached to the namespace.
+    // Skip widening when all writers are guarded bootstraps.
     let canonical_guarded_bootstrap = match &type_owner {
         LuaTypeOwner::Member(member_id) => {
             canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
@@ -1942,21 +1852,12 @@ fn assign_merge_type_owner_and_expr_type(
         _ => None,
     };
 
-    // A repeated `x.y = x.y or {}` guard names one table, however many files
-    // open with it: each writer means "reuse it if it is there". Widening those
-    // literals against each other answers `table`, which drops whatever another
-    // file attached to it — so the guard has to preserve them here too, the same
-    // way the contribution record below already reads it.
+    // Preserve table literals for guarded bootstrap members.
     let preserve_table_literals = preserve_table_literals
         || matches!(&type_owner, LuaTypeOwner::Member(member_id)
             if is_guarded_table_assignment_member(analyzer.db, *member_id));
 
-    // A plain writer that shares the slot has to preserve them too: widening
-    // `self.x = {}` against a `self.x = self.x or {}` in another file answers
-    // `table`, and the guard's literal is then gone for every reader —
-    // including the writes that attach members through it. This says nothing
-    // about *this* write being a guarded one, so it feeds the widening decision
-    // alone and not the classification below.
+    // Preserve literals for plain writers sharing guarded slot.
     let preserve_sibling_table_literals = preserve_table_literals
         || matches!(&type_owner, LuaTypeOwner::Member(member_id)
             if slot_has_guarded_table_bootstrap(analyzer.db, *member_id));
@@ -1988,10 +1889,6 @@ fn assign_merge_type_owner_and_expr_type(
             }
             Some(None) => {}
             None => {
-                // Whether every sibling writer already carried a type is a
-                // property of how far the batch has run, not of the source.
-                // Where one did not, the merge below is provisional and the
-                // settled pass re-derives it against the complete writer set.
                 let mut skipped_uncached_sibling = false;
                 let widened = get_widened_member_assignment_type(
                     analyzer.db,
@@ -2000,10 +1897,6 @@ fn assign_merge_type_owner_and_expr_type(
                     preserve_sibling_table_literals,
                     &mut skipped_uncached_sibling,
                 );
-                // Recorded on the skip, not on the answer: a walk that read no
-                // sibling type declines to widen at all, and that write needs
-                // the settled re-derivation just as much as one that widened
-                // from a partial set.
                 if skipped_uncached_sibling && let LuaTypeOwner::Member(member_id) = &type_owner {
                     analyzer.context.record_settled_member_widening_candidate(
                         *member_id,
@@ -2016,11 +1909,6 @@ fn assign_merge_type_owner_and_expr_type(
                 }
             }
         }
-        // A table literal written into a slot another file bootstraps with
-        // `x.y = x.y or {}` keeps its own literal — but whether that sibling had
-        // been indexed when the walk asked is a property of the walk order. Where
-        // the literal was widened away, queue it so the settled pass can ask
-        // again against the whole writer set.
         if let LuaTypeOwner::Member(member_id) = &type_owner
             && matches!(source_type, Some(LuaType::TableConst(_)))
             && matches!(expr_type, LuaType::Table)
@@ -2061,11 +1949,6 @@ fn assign_merge_type_owner_and_expr_type(
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
         if guarded_table_assignment {
-            // Whichever canonical writer this found — including none at all — it
-            // read the sibling set off a half-built owner index, and which
-            // writers are visible there is a property of how far the batch has
-            // got. Re-derived once they have all landed and been migrated to
-            // their final owner. See `resettle_guarded_table_bootstraps`.
             analyzer
                 .context
                 .record_settled_guarded_bootstrap_candidate(*member_id);
@@ -2251,14 +2134,6 @@ fn get_cached_widened_member_assignment_type(
         visible_count,
     ) {
         WideningCacheLookup::FirstSighting => {
-            // Being the only writer the owner can currently see is a statement
-            // about how far the batch has run: until the global this member
-            // hangs off resolves, its siblings sit on the global path instead
-            // and are invisible here. Re-derived once they have all been
-            // migrated to their owner.
-            //
-            // Only a named slot: a key the source writes as an expression names
-            // one entry of a collection, and those never migrate as a group.
             if matches!(cache_key.key, LuaMemberKey::Name(_)) {
                 analyzer.context.record_settled_member_widening_candidate(
                     *member_id,
@@ -2297,8 +2172,7 @@ fn get_cached_widened_member_assignment_type(
     }
 }
 
-/// Stores this write's own evidence so the settled re-derivation can merge the
-/// complete writer set. See [`MemberAssignmentContribution`].
+/// Record member assignment contribution.
 fn record_member_assignment_contribution(
     analyzer: &mut LuaAnalyzer,
     member_id: LuaMemberId,
@@ -2341,15 +2215,7 @@ fn record_member_assignment_contribution_in(
         .record_member_assignment_contribution(member_id, contribution);
 }
 
-/// Records the evidence of an assignment whose value only resolved after the
-/// walk had moved on.
-///
-/// The walk records a contribution as it binds each write, so a write whose
-/// right-hand side deferred contributes nothing and the settled merge never
-/// sees it. Whether a write deferred is a fact about how far the batch had
-/// run - a re-index keeps out-of-batch types standing and resolves inline what
-/// a cold build had to defer - so the writer set the merge reads would
-/// otherwise differ between the two.
+/// Record contribution for resolved member assignment.
 pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contribution(
     db: &mut DbIndex,
     member_id: LuaMemberId,
@@ -2377,16 +2243,7 @@ pub(in crate::compilation::analyzer) fn record_resolved_member_assignment_contri
     );
 }
 
-/// Applies the visibility marks a write earns from its own syntax, for a write
-/// the walk did not get to classify.
-///
-/// The walk marks each assignment as it binds it — guarded bootstrap, or
-/// conditional branch — and those marks decide which writers stay visible for
-/// the slot. A write whose right-hand side could not be inferred in time is
-/// finished by the unresolve pass instead, which binds the type and stops, so
-/// the marks are never applied. Both tests read syntax alone, so the answer is
-/// the same either way; only whether anything asks was in question, and that is
-/// a fact about how far the batch had run.
+/// Apply visibility marks for resolved member assignment.
 pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
     db: &mut DbIndex,
     member_id: LuaMemberId,
@@ -2469,22 +2326,6 @@ pub(in crate::compilation::analyzer) fn preserve_guarded_table_assignment_member
 }
 
 /// Returns true when the assignment that introduced this member sits inside a
-/// branching construct (if / while / repeat / for). In those cases we must not
-/// collapse to a single "latest write" member, because the assignments in
-/// sibling branches (or earlier loop iterations) are not dominated by this one
-/// and their types must remain available so reads can union them.
-///
-/// Without this guard, a pattern like
-///
-/// ```lua
-/// if cond then
-///     obj.field = Vector(...)
-/// else
-///     obj.field = nil
-/// end
-/// ```
-///
-/// would silently drop the `Vector` branch and hover `obj.field` as just `nil`.
 fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMemberId) -> bool {
     let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
         return false;
@@ -2563,14 +2404,6 @@ fn assigns_bare_table_literal(db: &DbIndex, member_id: LuaMemberId) -> bool {
 }
 
 /// Every writer of this member's slot, when at least one of them bootstraps it
-/// with `x.y = x.y or {}`.
-///
-/// The guard means "reuse it if it is there", and a plain `x.y = {}` resets that
-/// same table, so every writer names one runtime table however many literals the
-/// source spells. Returning them together is what lets the slot hold a single
-/// identity: treating a plain writer as a rival definition forks it, the merge
-/// of the forks answers bare `table`, and `table` names no element — so every
-/// member attached through the slot is lost.
 fn guarded_table_assignment_member_ids_for_owner_key(
     db: &DbIndex,
     member_id: LuaMemberId,
@@ -2587,8 +2420,6 @@ fn guarded_table_assignment_member_ids_for_owner_key(
             bootstrapped = true;
         } else if !assigns_bare_table_literal(db, related_member_id) {
             // This writer contributes something that is not a fresh table -- a
-            // class, a call result -- so the slot really can hold more than one
-            // thing and there is no single identity to resolve to.
             return None;
         }
 
@@ -2637,14 +2468,6 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
         if related_member_id == *member_id {
             continue;
         }
-        // Only writers that come before this one are evidence for it. The walk
-        // otherwise settles that with "the sibling already has a type cache",
-        // which reports how far the batch has run rather than anything about
-        // the source: a re-index clears the batch's caches and leaves the rest
-        // standing, so the same sibling counts on one run and not on another.
-        // Reading the order off the source makes the set identical on both,
-        // and it is the rule the settled re-derivation already applies - a
-        // later write must not widen the type it is itself checked against.
         if !preserve_table_literals
             && member_id_sort_key(related_member_id) >= member_id_sort_key(*member_id)
         {
@@ -2698,12 +2521,6 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
                 previous_states.iter(),
             )
         }
-        // Only reachable once a preceding writer has been seen but every one of
-        // them was skipped for having no type yet: siblings exist, and not one
-        // of them is evidence. Widening the literal here guesses at writers this
-        // pass has not read, and how many it has read is how far the batch has
-        // run, not anything about the source. Leave the write as it stands and
-        // let the settled re-derivation decide against the complete set.
         MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
     };
 
@@ -2735,17 +2552,6 @@ pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaA
 }
 
 /// Whether a runtime write may give the class it names a field that class never
-/// declares.
-///
-/// A write through a reference only *names* the class; the value it runs on is
-/// one instance of it. When a subclass already declares the same field, the
-/// write is evidence about that subclass, not about the class it was typed
-/// through -- and giving the base the field hands it to every subclass, which
-/// hides the declarations and stops any receiver narrowing to the subclass that
-/// really owns it.
-///
-/// The subtype walk is not cheap, so it only runs for a write that would open a
-/// key the owner does not already hold.
 fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {
     let member_index = db.get_member_index();
     let Some(LuaMemberOwner::Type(owner_id)) = member_index.get_member_owner(&member_id).cloned()
@@ -2765,9 +2571,6 @@ fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bo
         return true;
     }
     // Asked from the declaring side rather than by enumerating subtypes:
-    // collecting the subtypes of a base rescans the type index once per level
-    // of the hierarchy, while the types that declare this key at all are few and
-    // each answers with one walk up its own supers.
     let type_index = db.get_type_index();
     !type_index.get_all_types().into_iter().any(|type_decl| {
         let candidate_id = type_decl.get_id();
@@ -2840,12 +2643,6 @@ fn guarded_bootstrap_range_for_node(
 }
 
 /// Range of the table a field of a guarded table literal names.
-///
-/// `x = x or { y = {} }` creates `x.y` on exactly the condition `x.y = x.y or
-/// {}` does — the namespace not existing yet — so the two shapes bootstrap the
-/// same slot and have to resolve to one literal between them. Treating only the
-/// second as a guarded writer leaves the first looking like a plain write, which
-/// makes the whole slot ineligible for canonicalisation.
 fn guarded_table_literal_field_range(
     table_field: &LuaTableField,
     empty_only: bool,
@@ -2872,8 +2669,6 @@ fn guarded_table_literal_field_range(
 }
 
 /// Range of the table arm of a self-referential guarded bootstrap (`x.y =
-/// x.y or {}`), which is what the assignment's type is when the guard falls
-/// through.
 fn guarded_table_assignment_bootstrap_range(
     index_expr: &LuaIndexExpr,
     empty_only: bool,
@@ -2982,20 +2777,6 @@ fn guarded_table_bootstrap_range(
     )
 }
 
-/// The one table a repeated `x.y = x.y or {}` guard names.
-///
-/// Every such writer means "reuse it if it is there", so at runtime they are all
-/// the same table and only the first to run creates it. Giving each writer its
-/// own literal instead makes a file that re-guards the namespace read its own
-/// empty table and lose whatever another file attached, so they resolve to the
-/// earliest writer's literal — the one that would have won at runtime.
-/// Re-derives the literal each `x.y = x.y or {}` writer names, now that every
-/// writer of the slot has landed.
-///
-/// The canonical pick is the lowest-sorting writer, so a writer analysed before
-/// its siblings existed either found no canonical at all (fewer than two were
-/// indexed) or picked one that a later, lower-sorting writer displaces. Which of
-/// those happened is a property of the batch, not of the source.
 pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
     db: &mut DbIndex,
     candidates: Vec<LuaMemberId>,
@@ -3036,9 +2817,6 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
             continue;
         };
         // Every writer of the slot, not only the ones queued as candidates: the
-        // slot holds one table, so a writer left on its own literal forks the
-        // identity again, and whether it was queued depends on how far the walk
-        // had got when it ran.
         let members =
             guarded_table_assignment_member_ids_for_owner_key(db, first).unwrap_or(members);
         for member_id in members {
@@ -3194,10 +2972,6 @@ fn register_expr_key_member(analyzer: &mut LuaAnalyzer, field: &LuaTableField) {
 }
 
 /// Whether this value-field (positional `{ expr }`) belongs to a shaped
-/// sequential table literal whose integer members were registered in the
-/// declaration pass (see `analyze_table_expr`). Such members need their value
-/// types inferred and bound here, exactly like keyed/assign fields, otherwise
-/// the registered `[n]` member has no type cache and dynamic indexing degrades.
 fn is_shaped_array_value_field(field: &LuaTableField) -> bool {
     field.is_value_field()
         && field
@@ -3303,10 +3077,6 @@ fn special_assign_pattern(
             }
 
             // Register inferred string default for `x = x or "literal"`.
-            // This is a SIBLING branch to the table-guard path: only fires
-            // when the RHS is NOT a TableExpr and IS a string literal,
-            // and the type_owner is a plain Decl. Completely disjoint from
-            // the table-guard path.
             if !guarded_table_expr {
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     if let Some(string_value) = extract_string_literal_from_expr(&right) {
@@ -3515,12 +3285,6 @@ fn get_delayed_definition_decl_id(
 }
 
 /// Returns `true` when `expr` is a bare `NameExpr` that resolves to neither a
-/// local declaration nor a registered global. Such reads evaluate to `nil` at
-/// runtime, but `infer_expr` reports them as `Unknown` (see
-/// `semantic/infer/mod.rs` where `InferFailReason::None` is collapsed to
-/// `Ok(LuaType::Unknown)`). Callers use this to substitute `Nil` when binding
-/// the LHS of a local/assign/table-field declaration so hover and downstream
-/// inference reflect the runtime value.
 fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
     let LuaExpr::NameExpr(name_expr) = expr else {
         return false;
@@ -3542,9 +3306,6 @@ fn is_undefined_global_name_expr(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool
         return false;
     }
     // Workspace-scoped lookup matches the diagnostic's own visibility check
-    // (see `diagnostic/checker/undefined_global.rs`). With multi-workspace
-    // isolation enabled, a global declared in another root must not "rescue"
-    // an undefined read in the current root.
     let module_index = analyzer.db.get_module_index();
     let global_index = analyzer.db.get_global_index();
     let has_global = if let Some(ws_id) = module_index.get_workspace_id(analyzer.file_id) {
@@ -3572,8 +3333,6 @@ mod tests {
     }
 
     /// A sibling assignment that has not been analysed carries no type cache, so
-    /// the cross-file merge can only keep it by deriving its type from syntax.
-    /// Only the self-referential bootstrap has a syntax-determined type.
     #[test]
     fn guarded_table_bootstrap_range_names_only_the_self_referential_arm() {
         let source = "lib.store = lib.store or {}\nlib.other = fetch() or {}\n";

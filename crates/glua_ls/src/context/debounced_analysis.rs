@@ -11,18 +11,10 @@ use super::{ClientProxy, file_diagnostic::SharedDiagnosticDataCache};
 
 const FRESHNESS_STUCK_WARN_AFTER: Duration = Duration::from_secs(5);
 
-/// How long the user must stay idle after a reindex before the whole workspace
-/// is re-diagnosed.
+/// See implementation.
 const IDLE_WORKSPACE_DIAGNOSTIC_DELAY: Duration = Duration::from_millis(2000);
 
 /// How long the user must stay idle before the dependency ripple runs.
-///
-/// The edited file's own re-index runs on the much shorter debounce, which is
-/// all a request positioned inside that file needs. This timer governs only the
-/// cross-file settle, which holds the write lock for seconds on a large
-/// gamemode — and while it does, no keystroke can even be applied. Starting it
-/// after every brief pause is what put a ripple in flight for nearly every
-/// completion.
 const RIPPLE_QUIET: Duration = Duration::from_millis(1000);
 
 /// Cap on how long one typing burst can hold the ripple off, so diagnostics
@@ -30,41 +22,17 @@ const RIPPLE_QUIET: Duration = Duration::from_millis(1000);
 const MAX_RIPPLE_DEFERRAL: Duration = Duration::from_secs(5);
 
 /// How long the ripple gives requests released by the self-index to take their
-/// read lock before it takes the write lock back.
-///
-/// Bounded so a stream of requests cannot starve the ripple: past this, the
-/// ripple proceeds and the stragglers wait it out as they did before.
 const READER_HANDOFF_GRACE: Duration = Duration::from_millis(250);
 
-/// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
     reindexing_files: Mutex<HashSet<FileId>>,
     /// Documents whose own index entries do not match their text yet, either
-    /// because their edit is still queued or because the batch re-indexing them
-    /// has not reached them.
-    ///
-    /// Holds the URI the *client* used, so a request can be tested against its
-    /// own params without taking the analysis lock — which the re-index holds
-    /// for its whole duration, so resolving a file id first would wait out
-    /// exactly what this exists to avoid. Keyed by file id so entries are
-    /// cleared by identity rather than by matching that URI against the one the
-    /// VFS derived from a path, which need not be spelled the same way.
     blocked_documents: Mutex<HashMap<FileId, Uri>>,
-    /// True when document changes have arrived but reindex has not yet completed.
-    /// Set synchronously by `begin_in_flight_change()` (called inline in the
-    /// notification handler, before the didChange task is spawned) so that any
-    /// request handler dispatched afterwards sees the flag immediately.
+    /// See implementation.
     has_pending_changes: AtomicBool,
     in_flight_changes: AtomicUsize,
     /// Requests aimed at one document that are waiting for, or reading against,
-    /// that document's own index entries.
-    ///
-    /// The self-index releases them and then immediately queues the ripple's
-    /// write lock. A woken request still has to be polled before it can queue
-    /// its read, and the lock is fair-FIFO, so without this the ripple wins the
-    /// race every time and the request waits out the whole ripple it was just
-    /// released from.
     pending_readers: AtomicUsize,
     readers_idle_notify: Notify,
     notify: Notify,
@@ -114,7 +82,6 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Add a file to the pending reindex set and reset the debounce timer.
     pub async fn schedule(&self, file_id: FileId, uri: Uri) {
         {
             let mut pending = self.pending_files.lock().await;
@@ -129,11 +96,6 @@ impl DebouncedAnalysis {
     }
 
     /// Signal that document changes are in-flight but not yet scheduled.
-    ///
-    /// Called **synchronously** from the notification handler (inline, before
-    /// spawning the didChange task) so that request handlers dispatched
-    /// immediately afterward see the dirty flag and wait for reindex instead
-    /// of computing on stale analysis data.
     pub fn begin_in_flight_change(self: &Arc<Self>) -> InFlightChangeGuard {
         self.in_flight_changes.fetch_add(1, Ordering::AcqRel);
         self.has_pending_changes.store(true, Ordering::Release);
@@ -173,11 +135,7 @@ impl DebouncedAnalysis {
         self.reindex_notify.notify_waiters();
     }
 
-    /// Check whether document changes are pending reindex.
-    ///
-    /// Handlers that need consistent tree + index data (e.g. semantic tokens)
-    /// can use this to decide whether to serve stale results or return `None`
-    /// so the client keeps its previous state.
+    /// See implementation.
     pub fn is_dirty(&self) -> bool {
         self.has_pending_changes.load(Ordering::Acquire)
     }
@@ -193,12 +151,6 @@ impl DebouncedAnalysis {
     }
 
     /// Register that a request is waiting on, or reading against, one
-    /// document's own index entries.
-    ///
-    /// Hold the guard until the request has finished reading. The ripple yields
-    /// to outstanding guards — up to [`READER_HANDOFF_GRACE`] — before it takes
-    /// the write lock back, so a request the self-index just released is not
-    /// made to wait out the ripple anyway.
     pub fn begin_reader_handoff(self: &Arc<Self>) -> ReaderHandoff {
         self.pending_readers.fetch_add(1, Ordering::AcqRel);
         ReaderHandoff {
@@ -207,11 +159,6 @@ impl DebouncedAnalysis {
     }
 
     /// Let outstanding [`ReaderHandoff`]s take their read lock before the
-    /// caller takes the write lock.
-    ///
-    /// Returns as soon as none are outstanding, or after
-    /// [`READER_HANDOFF_GRACE`] so a stream of requests cannot starve the
-    /// ripple.
     async fn await_reader_handoff(&self) {
         let deadline = Instant::now() + READER_HANDOFF_GRACE;
 
@@ -238,11 +185,7 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Wait until all pending document changes have been reindexed.
-    ///
-    /// Returns `true` when the analysis is fresh, `false` if the cancel token
-    /// fired first.  Uses `enable()` so that `notify_waiters()` wakeups are
-    /// not lost between creating the `Notified` future and polling it.
+    /// See implementation.
     pub async fn wait_until_fresh_for(
         &self,
         cancel_token: &CancellationToken,
@@ -279,18 +222,6 @@ impl DebouncedAnalysis {
     }
 
     /// Wait until the document at `uri` has index entries matching its text.
-    ///
-    /// A request positioned inside a file needs that file's entries to line up
-    /// with the tree it is resolving against — they are keyed by position, so an
-    /// edit that shifts offsets is what makes them stop matching, and answering
-    /// from the old ones is what silently returns a thinner list. It does *not*
-    /// need the edit's dependency ripple to have finished; that settles other
-    /// files' inferences, and waiting for it costs seconds on a large gamemode
-    /// for an answer that is already correct.
-    ///
-    /// Callers with no URI to aim at want [`wait_until_fresh_for`] instead.
-    ///
-    /// [`wait_until_fresh_for`]: Self::wait_until_fresh_for
     pub async fn wait_until_file_fresh_for(
         &self,
         cancel_token: &CancellationToken,
@@ -326,12 +257,6 @@ impl DebouncedAnalysis {
     }
 
     /// Whether a request aimed at `uri` can be answered against entries that
-    /// match its text.
-    ///
-    /// Workspace-wide dirtiness is the wrong question for a request positioned
-    /// inside one document: an edit to some other file leaves this one's entries
-    /// matching its own text, so refusing it buys nothing and blanks the answer
-    /// for every open document whenever anything is typed anywhere.
     pub async fn file_is_answerable(&self, uri: &Uri) -> bool {
         // An edit whose text has not been applied yet would have the request
         // resolve a position against the previous tree.
@@ -364,7 +289,6 @@ impl DebouncedAnalysis {
         );
     }
 
-    /// Wait until the given file is no longer pending reindex.
     pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) {
         loop {
             let notified = self.reindex_notify.notified();
@@ -386,16 +310,7 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Re-index the edited files' own entries, and report the dependency
-    /// expansion the ripple still owes them.
-    ///
-    /// The expansion is captured *before* the self-index, because deriving it
-    /// from a partly-updated index under-expands and leaves dependents holding
-    /// inferences a cold build would not produce.
-    ///
-    /// This takes the write lock and gives it back, which is the whole point: a
-    /// freshness flag published while the lock is still held buys a waiting
-    /// request nothing, since it cannot read the index until the lock is free.
+    /// See implementation.
     async fn self_index_without_queuing(
         &self,
         file_ids: Vec<FileId>,
@@ -408,9 +323,6 @@ impl DebouncedAnalysis {
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
                 // Change-aware: only expand to dependents when the file's
-                // exported interface actually changed. Most keystrokes (typing
-                // inside a function, trailing comment, local rename) keep the
-                // same fingerprint and collapse the ripple to empty.
                 let (changed, expansion) = guard.self_index_files_and_get_ripple_with_changed(file_ids);
                 cache.invalidate();
                 (changed, expansion)
@@ -432,15 +344,12 @@ impl DebouncedAnalysis {
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
-        // Re-index under a blocking write lock on a blocking thread: the wait
-        // for the lock and the CPU work both stay off the Tokio workers.
         tokio::select! {
             _ = self.shutdown.cancelled() => false,
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
                 guard.reindex_expanded_files(file_ids, expansion);
                 // Invalidate under the write lock so no reader can observe the
-                // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
             }) => {
                 if let Err(err) = result {
@@ -453,10 +362,6 @@ impl DebouncedAnalysis {
     }
 
     /// Hold the owed ripple until typing has stopped for [`RIPPLE_QUIET`].
-    ///
-    /// Returns `true` when the caller should run the ripple now, `false` when
-    /// another edit arrived and the loop should self-index that first — the
-    /// ripple it owes then joins the one already outstanding.
     async fn ripple_quiet_elapsed(&self, burst_started_at: Instant) -> bool {
         let extra = RIPPLE_QUIET.saturating_sub(self.debounce_duration);
         let deferral_left = MAX_RIPPLE_DEFERRAL.saturating_sub(burst_started_at.elapsed());
@@ -476,8 +381,7 @@ impl DebouncedAnalysis {
         self.pending_files.lock().await.is_empty()
     }
 
-    /// Background loop: waits for events, debounces, then runs reindex.
-    /// Spawn this once at server startup.
+    /// See implementation.
     pub async fn run(&self) {
         let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
         // The ripple owed by the self-indexes run so far in this typing burst,
@@ -512,7 +416,6 @@ impl DebouncedAnalysis {
                 }
             }
 
-            // Timer expired — drain pending files and reindex
             let file_ids: Vec<FileId> = {
                 let mut pending = self.pending_files.lock().await;
                 let mut reindexing = self.reindexing_files.lock().await;
@@ -531,21 +434,12 @@ impl DebouncedAnalysis {
                     self.debounce_duration.as_millis()
                 );
 
-                // Re-index the edited files themselves first and release the
-                // write lock, so a completion or hover positioned inside one of
-                // them can be answered against entries that match its text
-                // instead of waiting out the whole dependency ripple. The
-                // ripple is by far the larger half — measured on a gamemode
-                // workspace, 106ms against 5.1s.
                 let Some((changed_files, expansion)) =
                     self.self_index_without_queuing(file_ids.clone()).await
                 else {
                     if self.shutdown.is_cancelled() {
                         return;
                     }
-                    // Release the batch, or every request aimed at these
-                    // documents parks until some later edit happens to cover
-                    // them.
                     let mut reindexing = self.reindexing_files.lock().await;
                     let mut blocked = self.blocked_documents.lock().await;
                     for id in &file_ids {
@@ -568,16 +462,10 @@ impl DebouncedAnalysis {
                 self.reindex_notify.notify_waiters();
 
                 // The requests just released still have to be polled before
-                // they can queue their read. Taking the write lock back now
-                // would put them behind the whole ripple.
                 self.await_reader_handoff().await;
 
                 if expansion.is_empty() {
                     // No exports changed - the self-index already makes these
-                    // files answerable, and no dependent needs re-indexing.
-                    // Clear them from reindexing immediately so dirty state
-                    // can settle without waiting for a ripple that will never
-                    // come.
                     {
                         let mut reindexing = self.reindexing_files.lock().await;
                         for id in &file_ids {
@@ -591,7 +479,6 @@ impl DebouncedAnalysis {
                     }
                 } else {
                     // Only the files whose exports actually changed need a
-                    // ripple; the rest are already settled by the self-index.
                     let changed_set: HashSet<FileId> = changed_files.iter().copied().collect();
                     {
                         let mut reindexing = self.reindexing_files.lock().await;
@@ -614,8 +501,6 @@ impl DebouncedAnalysis {
             }
 
             // Hold the ripple until typing has genuinely stopped. Another edit
-            // sends us back for its own self-index, and the ripple it owes
-            // joins this one.
             let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
             if !self.ripple_quiet_elapsed(burst_started_at_instant).await {
                 continue;
@@ -655,8 +540,6 @@ impl DebouncedAnalysis {
 
                 self.reindex_notify.notify_waiters();
                 if !reindex_completed {
-                    // Only shutdown stops the loop; a panicked reindex must
-                    // fall through so `refresh_dirty_state()` releases waiters.
                     if self.shutdown.is_cancelled() {
                         return;
                     }
@@ -708,15 +591,12 @@ impl DebouncedAnalysis {
             self.refresh_dirty_state().await;
 
             // Always notify waiters so they can re-check the condition.
-            // Even if we didn't reindex (pending was empty), clearing the
-            // dirty flag means waiters should proceed with available data.
             self.reindex_notify.notify_waiters();
         }
     }
 
     async fn refresh_dirty_state(&self) {
         // Publish while holding both locks, or concurrent callers can
-        // interleave and store a stale reading.
         let pending = self.pending_files.lock().await;
         let reindexing = self.reindexing_files.lock().await;
 
@@ -729,12 +609,6 @@ impl DebouncedAnalysis {
         );
 
         // `in_flight_changes` is not covered by the locks above, so a
-        // concurrent `begin_in_flight_change()` can land between the load and
-        // the store and have its `true` overwritten. Re-reading narrows that
-        // window rather than closing it; what is guaranteed is only that the
-        // flag ends up `true` for any change whose `fetch_add` is visible by
-        // the time this second load runs. A change that arrives later still
-        // sets the flag itself, and `finish_in_flight_changes` calls back here.
         if self.in_flight_changes.load(Ordering::Acquire) > 0 {
             self.has_pending_changes.store(true, Ordering::Release);
         }
@@ -742,8 +616,6 @@ impl DebouncedAnalysis {
 }
 
 /// Keeps the ripple off the write lock while one request takes its read lock.
-///
-/// See [`DebouncedAnalysis::begin_reader_handoff`].
 pub struct ReaderHandoff {
     analysis: Arc<DebouncedAnalysis>,
 }
@@ -999,8 +871,6 @@ mod tests {
     }
 
     /// The point of the per-file gate: an edit to one document must not park
-    /// requests aimed at a different one, and must park requests aimed at
-    /// itself until its own entries have been rebuilt.
     #[gtest]
     fn a_pending_edit_blocks_only_its_own_document() -> Result<()> {
         let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
