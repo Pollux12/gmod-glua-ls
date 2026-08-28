@@ -40,11 +40,16 @@ impl LuaMetatableIndex {
     pub fn add(&mut self, table: InFiled<TextRange>, metatable: InFiled<TextRange>) {
         self.metatables.insert(table, metatable);
     }
+    /// Number of recorded `setmetatable` bindings, so a test can show its
+    /// fixture actually produced one.
+    #[cfg(test)]
+    pub fn metatable_count(&self) -> usize {
+        self.metatables.len()
+    }
 
     pub fn get(&self, table: &InFiled<TextRange>) -> Option<&InFiled<TextRange>> {
         self.metatables.get(table)
     }
-
     pub fn add_factory_binding(&mut self, binding: SetmetatableFactoryBinding) {
         self.factory_bindings
             .entry(binding.file_id)

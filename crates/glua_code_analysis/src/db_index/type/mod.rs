@@ -187,7 +187,22 @@ fn replace_table_consts_in_type<S: std::hash::BuildHasher>(
     }
 }
 
-fn remap_table_ranges_in_type(
+/// Every table-literal range a type names, directly or nested.
+///
+/// The mirror of [`remap_table_ranges_in_type`]: a test can use it to assert
+/// that no store was left holding a range the remap should have moved.
+#[cfg(test)]
+pub(crate) fn table_ranges_in_type(typ: &LuaType) -> Vec<InFiled<TextRange>> {
+    let mut ranges = Vec::new();
+    TypeVisitTrait::visit_type(typ, &mut |inner| match inner {
+        LuaType::TableConst(range) => ranges.push(range.clone()),
+        LuaType::Instance(instance) => ranges.push(instance.get_range().clone()),
+        _ => {}
+    });
+    ranges
+}
+
+pub(crate) fn remap_table_ranges_in_type(
     typ: &LuaType,
     map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
 ) -> Option<LuaType> {
@@ -470,6 +485,8 @@ fn remap_table_ranges_in_type(
                 None
             }
         }
+        // The remaining variants nest no type that can carry a table literal's
+        // range, so there is nothing under them to move.
         _ => None,
     }
 }
@@ -1605,6 +1622,28 @@ impl LuaTypeIndex {
         self.rebuild_inference_derived_state(&changed_files);
     }
 
+    /// Drops the cached types of members that were removed on their own,
+    /// rather than as part of a file sweep.
+    ///
+    /// A member whose owning table literal is gone leaves a cache entry no
+    /// re-index will reach, because the file it belongs to is not being
+    /// re-analysed.
+    pub fn remove_member_type_caches(&mut self, member_ids: &[crate::LuaMemberId]) {
+        for member_id in member_ids {
+            let owner = LuaTypeOwner::Member(*member_id);
+            if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
+                set.remove(&owner);
+            }
+            // `cache_refs` has to come off with the cache, the way
+            // `insert_type_cache` and the file sweep both keep them in step.
+            if let Some(previous) = self.types.remove(&owner) {
+                self.cache_refs
+                    .remove(member_id.file_id, previous.as_type());
+            }
+            self.fact_metadata.remove(&owner);
+        }
+    }
+
     pub fn remap_table_const(
         &mut self,
         map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
@@ -1638,6 +1677,9 @@ impl LuaTypeIndex {
                 updates.push((owner.clone(), new_cache));
             }
         }
+        // `candidate_owners` comes out of a hash set, so the writes are ordered
+        // before they are applied.
+        updates.sort_unstable_by_key(|(owner, _)| format!("{:?}", owner));
         let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());

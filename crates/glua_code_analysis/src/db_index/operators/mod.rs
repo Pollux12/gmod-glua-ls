@@ -59,6 +59,14 @@ impl LuaOperatorIndex {
             .and_then(|map| map.get(&meta_method))
     }
 
+    /// Every metamethod this file declares. Another file's inference reads
+    /// them whenever it applies an operator to the owning type.
+    pub fn operators_in_file(&self, file_id: FileId) -> Vec<&LuaOperator> {
+        self.in_filed_operator_map
+            .get(&file_id)
+            .map(|ids| ids.iter().filter_map(|id| self.get_operator(id)).collect())
+            .unwrap_or_default()
+    }
     pub fn get_operator(&self, id: &LuaOperatorId) -> Option<&LuaOperator> {
         self.operators.get(id)
     }

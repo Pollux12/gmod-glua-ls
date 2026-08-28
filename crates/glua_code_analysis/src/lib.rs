@@ -30,8 +30,7 @@ pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{
     LineIndex, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexKey,
-    LuaLocalStat, LuaNameExpr, LuaParenExpr, LuaParser, LuaSyntaxKind, LuaSyntaxTree, LuaTableExpr,
-    LuaTableField,
+    LuaLocalStat, LuaNameExpr, LuaParenExpr, LuaParser, LuaSyntaxTree, LuaTableExpr, LuaTableField,
 };
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
@@ -49,10 +48,9 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
 
-#[derive(Default)]
 /// The cross-file facts an edit can invalidate, captured before
 /// re-analysis.
-#[derive(Clone)]
+#[derive(Clone, Debug, Default)]
 pub(crate) struct InferredGuardSnapshot {
     facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
     consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
@@ -89,7 +87,11 @@ fn sort_inferred_guard_owners(owners: &mut [LuaInferredGuardOwner]) {
     });
 }
 
-fn hash_member_owner_stable(owner: &LuaMemberOwner, hasher: &mut impl Hasher) {
+fn hash_member_owner_stable(
+    ids: &ExportIdentities,
+    owner: &LuaMemberOwner,
+    hasher: &mut impl Hasher,
+) {
     match owner {
         LuaMemberOwner::GlobalPath(gid) => {
             "GlobalPath".hash(hasher);
@@ -100,12 +102,15 @@ fn hash_member_owner_stable(owner: &LuaMemberOwner, hasher: &mut impl Hasher) {
             tid.get_name().hash(hasher);
         }
         LuaMemberOwner::Element(range) => {
-            // The range moves whenever an edit shifts offsets and is re-homed
-            // by the remap pass, so only the file it lives in is hashed. That
-            // still distinguishes one file's literal from another's, which is
-            // what a dependent resolving the owner can observe.
+            // Named by its anchor where it has one, and by its file plus
+            // ordinal otherwise - see `ExportIdentities::table_identity`.
+            //
+            // Deliberately *not* the identity `TableConst` uses. A member's
+            // owner is the one place where the resolver's choice between two
+            // files' literals for a single logical table would otherwise read
+            // as an export change on every edit.
             "Element".hash(hasher);
-            range.file_id.hash(hasher);
+            ids.table_identity(range).hash(hasher);
         }
         LuaMemberOwner::LocalUnresolve => {
             "LocalUnresolve".hash(hasher);
@@ -113,7 +118,11 @@ fn hash_member_owner_stable(owner: &LuaMemberOwner, hasher: &mut impl Hasher) {
     }
 }
 
-fn hash_lua_member_key_export(key: &LuaMemberKey, hasher: &mut impl Hasher) {
+fn hash_lua_member_key_export(
+    ids: &ExportIdentities,
+    key: &LuaMemberKey,
+    hasher: &mut impl Hasher,
+) {
     match key {
         LuaMemberKey::Name(name) => {
             "Name".hash(hasher);
@@ -128,8 +137,127 @@ fn hash_lua_member_key_export(key: &LuaMemberKey, hasher: &mut impl Hasher) {
         }
         LuaMemberKey::ExprType(typ) => {
             "ExprType".hash(hasher);
-            hash_lua_type_export(typ, hasher);
+            hash_lua_type_export(ids, typ, hasher);
         }
+    }
+}
+
+/// Offset-free identities for the things a type can point at.
+///
+/// A signature id and a table literal's range are both a file plus a position,
+/// and the position moves whenever an edit shifts the file. Hashing the
+/// position reports an export change for every edit; hashing only the file
+/// makes *repointing* an export at a different function or literal in the same
+/// file invisible. The index among the file's signatures, or among its table
+/// literals, is stable under a shift and still tells the two apart.
+///
+/// Built per file on first use, because a fingerprint usually reaches only a
+/// handful of files.
+struct ExportIdentities<'a> {
+    db: &'a DbIndex,
+    signature_ordinals: std::cell::RefCell<rustc_hash::FxHashMap<FileId, Vec<rowan::TextSize>>>,
+    table_ordinals: std::cell::RefCell<rustc_hash::FxHashMap<FileId, Vec<rowan::TextRange>>>,
+    table_anchors: std::cell::RefCell<
+        rustc_hash::FxHashMap<FileId, rustc_hash::FxHashMap<rowan::TextRange, String>>,
+    >,
+}
+
+impl<'a> ExportIdentities<'a> {
+    fn new(db: &'a DbIndex) -> Self {
+        Self {
+            db,
+            signature_ordinals: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            table_ordinals: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+            table_anchors: std::cell::RefCell::new(rustc_hash::FxHashMap::default()),
+        }
+    }
+
+    fn signature_ordinal(&self, id: &LuaSignatureId) -> Option<usize> {
+        let file_id = id.get_file_id();
+        let mut cache = self.signature_ordinals.borrow_mut();
+        let positions = cache.entry(file_id).or_insert_with(|| {
+            let mut positions: Vec<rowan::TextSize> = self
+                .db
+                .get_signature_index()
+                .get_file_signature_ids(file_id)
+                .map(|ids| ids.iter().map(|id| id.get_position()).collect())
+                .unwrap_or_default();
+            positions.sort_unstable();
+            positions
+        });
+        positions.binary_search(&id.get_position()).ok()
+    }
+
+    /// What a table literal is called, for the purpose of deciding whether an
+    /// export changed.
+    ///
+    /// The anchor, when the literal has one: a name like `cityrp.configuration`
+    /// identifies the *logical* table, and several files can declare a literal
+    /// for it. Which of those the resolver picks as a member's owner is not
+    /// stable across a partial re-index, so keying on the literal's file and
+    /// position makes an unrelated edit look like an export change. The anchor
+    /// is the same whichever literal wins.
+    ///
+    /// Falls back to file plus ordinal for a literal no name reaches - still
+    /// enough to tell two literals in one file apart, which is what a member
+    /// moving between them needs.
+    fn table_identity(&self, range: &InFiled<rowan::TextRange>) -> String {
+        let file_id = range.file_id;
+        let mut cache = self.table_anchors.borrow_mut();
+        let anchors = cache.entry(file_id).or_insert_with(|| {
+            collect_anchored_map(self.db, file_id)
+                .into_iter()
+                .filter_map(|(anchor, anchored)| match anchor {
+                    // Only a name identifies the logical table across files.
+                    TableAnchor::Global(path) => Some((anchored.value, format!("G:{path}"))),
+                    _ => None,
+                })
+                .collect()
+        });
+        match anchors.get(&range.value) {
+            Some(anchor) => anchor.clone(),
+            None => {
+                drop(cache);
+                format!("{}:{:?}", file_id.id, self.table_ordinal(range))
+            }
+        }
+    }
+
+    fn table_ordinal(&self, range: &InFiled<rowan::TextRange>) -> Option<usize> {
+        let file_id = range.file_id;
+        let mut cache = self.table_ordinals.borrow_mut();
+        let ranges = cache.entry(file_id).or_insert_with(|| {
+            let Some(tree) = self.db.get_vfs().get_syntax_tree(&file_id) else {
+                return Vec::new();
+            };
+            let mut ranges: Vec<rowan::TextRange> = tree
+                .get_chunk_node()
+                .descendants::<LuaTableExpr>()
+                .map(|table| table.get_range())
+                .collect();
+            ranges.sort_unstable_by_key(|range| (range.start(), range.end()));
+            ranges
+        });
+        ranges
+            .binary_search_by_key(&(range.value.start(), range.value.end()), |range| {
+                (range.start(), range.end())
+            })
+            .ok()
+    }
+}
+
+/// Hashes a generic parameter, recursing into its constraint so a table
+/// literal's range inside one is normalised the same way it is elsewhere.
+fn hash_generic_param_export(
+    ids: &ExportIdentities,
+    param: &GenericParam,
+    hasher: &mut impl Hasher,
+) {
+    param.name.hash(hasher);
+    format!("{:?}", param.attributes).hash(hasher);
+    match &param.type_constraint {
+        Some(constraint) => hash_lua_type_export(ids, constraint, hasher),
+        None => "NoConstraint".hash(hasher),
     }
 }
 
@@ -140,16 +268,21 @@ fn hash_lua_member_key_export(key: &LuaMemberKey, hasher: &mut impl Hasher) {
 /// whenever an edit shifts offsets, and are re-homed by the remap pass rather
 /// than by a re-index, so hashing them would report an export change for every
 /// edit. Values, shapes and names are kept: they are what a dependent reads.
-fn hash_lua_type_export(typ: &LuaType, hasher: &mut impl Hasher) {
+fn hash_lua_type_export(ids: &ExportIdentities, typ: &LuaType, hasher: &mut impl Hasher) {
     // Arm order is not guaranteed for the set-like composites, so their arm
     // hashes are sorted before they are folded in.
-    fn hash_unordered(tag: &str, arms: &[LuaType], hasher: &mut impl Hasher) {
+    fn hash_unordered(
+        ids: &ExportIdentities,
+        tag: &str,
+        arms: &[LuaType],
+        hasher: &mut impl Hasher,
+    ) {
         tag.hash(hasher);
         let mut arm_hashes: Vec<u64> = arms
             .iter()
             .map(|arm| {
                 let mut h = rustc_hash::FxHasher::default();
-                hash_lua_type_export(arm, &mut h);
+                hash_lua_type_export(ids, arm, &mut h);
                 h.finish()
             })
             .collect();
@@ -180,17 +313,20 @@ fn hash_lua_type_export(typ: &LuaType, hasher: &mut impl Hasher) {
         LuaType::TableConst(range) => {
             "TableConst".hash(hasher);
             range.file_id.hash(hasher);
+            ids.table_ordinal(range).hash(hasher);
         }
         LuaType::Instance(inst) => {
             "Instance".hash(hasher);
             inst.get_range().file_id.hash(hasher);
-            hash_lua_type_export(inst.get_base(), hasher);
+            ids.table_ordinal(inst.get_range()).hash(hasher);
+            hash_lua_type_export(ids, inst.get_base(), hasher);
         }
         // The id is a file plus a position. The signature's own shape is
         // hashed by the signature section of the file fingerprint.
         LuaType::Signature(id) => {
             "Signature".hash(hasher);
             id.get_file_id().hash(hasher);
+            ids.signature_ordinal(id).hash(hasher);
         }
         LuaType::Ref(id) => {
             "Ref".hash(hasher);
@@ -200,51 +336,55 @@ fn hash_lua_type_export(typ: &LuaType, hasher: &mut impl Hasher) {
             "Def".hash(hasher);
             id.get_name().hash(hasher);
         }
-        LuaType::Union(union) => hash_unordered("Union", &union.into_vec(), hasher),
-        LuaType::Intersection(inter) => hash_unordered("Intersection", inter.get_types(), hasher),
-        LuaType::MergedTable(merged) => hash_unordered("MergedTable", merged.get_types(), hasher),
+        LuaType::Union(union) => hash_unordered(ids, "Union", &union.into_vec(), hasher),
+        LuaType::Intersection(inter) => {
+            hash_unordered(ids, "Intersection", inter.get_types(), hasher)
+        }
+        LuaType::MergedTable(merged) => {
+            hash_unordered(ids, "MergedTable", merged.get_types(), hasher)
+        }
         LuaType::Tuple(tuple) => {
             "Tuple".hash(hasher);
             tuple.status.hash(hasher);
             for sub in tuple.get_types() {
-                hash_lua_type_export(sub, hasher);
+                hash_lua_type_export(ids, sub, hasher);
             }
         }
         LuaType::Array(arr) => {
             "Array".hash(hasher);
             format!("{:?}", arr.get_len()).hash(hasher);
-            hash_lua_type_export(arr.get_base(), hasher);
+            hash_lua_type_export(ids, arr.get_base(), hasher);
         }
         LuaType::Object(obj) => {
             "Object".hash(hasher);
             for (key, value) in obj.get_fields() {
-                format!("{:?}", key).hash(hasher);
-                hash_lua_type_export(value, hasher);
+                hash_lua_member_key_export(ids, key, hasher);
+                hash_lua_type_export(ids, value, hasher);
             }
             for (key, value) in obj.get_index_access() {
-                hash_lua_type_export(key, hasher);
-                hash_lua_type_export(value, hasher);
+                hash_lua_type_export(ids, key, hasher);
+                hash_lua_type_export(ids, value, hasher);
             }
         }
         LuaType::TableGeneric(params) => {
             "TableGeneric".hash(hasher);
             for param in params.iter() {
-                hash_lua_type_export(param, hasher);
+                hash_lua_type_export(ids, param, hasher);
             }
         }
         LuaType::TableOf(inner) => {
             "TableOf".hash(hasher);
-            hash_lua_type_export(inner, hasher);
+            hash_lua_type_export(ids, inner, hasher);
         }
         LuaType::TypeGuard(inner) => {
             "TypeGuard".hash(hasher);
-            hash_lua_type_export(inner, hasher);
+            hash_lua_type_export(ids, inner, hasher);
         }
         LuaType::Generic(generic) => {
             "Generic".hash(hasher);
             generic.get_base_type_id().get_name().hash(hasher);
             for param in generic.get_params() {
-                hash_lua_type_export(param, hasher);
+                hash_lua_type_export(ids, param, hasher);
             }
         }
         LuaType::DocFunction(func) => {
@@ -256,19 +396,141 @@ fn hash_lua_type_export(typ: &LuaType, hasher: &mut impl Hasher) {
             for (name, param_type) in func.get_params() {
                 name.hash(hasher);
                 match param_type {
-                    Some(param_type) => hash_lua_type_export(param_type, hasher),
+                    Some(param_type) => hash_lua_type_export(ids, param_type, hasher),
                     None => "NoParamType".hash(hasher),
                 }
             }
-            hash_lua_type_export(func.get_ret(), hasher);
+            hash_lua_type_export(ids, func.get_ret(), hasher);
         }
         LuaType::ModuleRef(file_id) => {
             "ModuleRef".hash(hasher);
             file_id.hash(hasher);
         }
-        // The remaining variants carry no source position, so their `Debug`
-        // form is a precise and stable description of them.
+        LuaType::Variadic(variadic) => {
+            "Variadic".hash(hasher);
+            match variadic.as_ref() {
+                VariadicType::Base(base) => {
+                    "Base".hash(hasher);
+                    hash_lua_type_export(ids, base, hasher);
+                }
+                VariadicType::Multi(types) => {
+                    "Multi".hash(hasher);
+                    for sub in types {
+                        hash_lua_type_export(ids, sub, hasher);
+                    }
+                }
+            }
+        }
+        LuaType::Call(call) => {
+            "Call".hash(hasher);
+            format!("{:?}", call.get_call_kind()).hash(hasher);
+            for operand in call.get_operands() {
+                hash_lua_type_export(ids, operand, hasher);
+            }
+        }
+        LuaType::MultiLineUnion(union) => {
+            "MultiLineUnion".hash(hasher);
+            for (arm, description) in union.get_unions() {
+                description.hash(hasher);
+                hash_lua_type_export(ids, arm, hasher);
+            }
+        }
+        LuaType::Conditional(cond) => {
+            "Conditional".hash(hasher);
+            cond.has_new.hash(hasher);
+            for param in cond.get_infer_params() {
+                hash_generic_param_export(ids, param, hasher);
+            }
+            hash_lua_type_export(ids, cond.get_condition(), hasher);
+            hash_lua_type_export(ids, cond.get_true_type(), hasher);
+            hash_lua_type_export(ids, cond.get_false_type(), hasher);
+        }
+        LuaType::Mapped(mapped) => {
+            "Mapped".hash(hasher);
+            format!("{:?}", mapped.param.0).hash(hasher);
+            hash_generic_param_export(ids, &mapped.param.1, hasher);
+            mapped.is_readonly.hash(hasher);
+            mapped.is_optional.hash(hasher);
+            hash_lua_type_export(ids, &mapped.value, hasher);
+        }
+        LuaType::DocAttribute(attribute) => {
+            "DocAttribute".hash(hasher);
+            for (name, param_type) in attribute.get_params() {
+                name.hash(hasher);
+                match param_type {
+                    Some(param_type) => hash_lua_type_export(ids, param_type, hasher),
+                    None => "NoParamType".hash(hasher),
+                }
+            }
+        }
+        LuaType::StrTplRef(tpl) => {
+            "StrTplRef".hash(hasher);
+            tpl.get_prefix().hash(hasher);
+            tpl.get_name().hash(hasher);
+            tpl.get_suffix().hash(hasher);
+            format!("{:?}", tpl.get_tpl_id()).hash(hasher);
+            if let Some(constraint) = tpl.get_constraint() {
+                hash_lua_type_export(ids, constraint, hasher);
+            }
+        }
+        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
+            match typ {
+                LuaType::ConstTplRef(_) => "ConstTplRef".hash(hasher),
+                _ => "TplRef".hash(hasher),
+            }
+            format!("{:?}", tpl.get_tpl_id()).hash(hasher);
+            tpl.get_name().hash(hasher);
+            match tpl.get_constraint() {
+                Some(constraint) => hash_lua_type_export(ids, constraint, hasher),
+                None => "NoConstraint".hash(hasher),
+            }
+        }
+        // The remaining variants hold no nested type and no source position,
+        // so their `Debug` form describes them precisely and stably.
         other => format!("{:?}", other).hash(hasher),
+    }
+}
+
+/// A name another file can resolve for a documented symbol, or `None` when
+/// nothing outside this file can name it.
+///
+/// Every `LuaSemanticDeclId` variant is a file plus a position, and the
+/// position moves on any edit above it, so the name is what gets hashed.
+fn semantic_decl_export_key(ids: &ExportIdentities, id: &LuaSemanticDeclId) -> Option<String> {
+    let db = ids.db;
+    match id {
+        LuaSemanticDeclId::TypeDecl(type_decl_id) => Some(format!("T:{}", type_decl_id.get_name())),
+        LuaSemanticDeclId::LuaDecl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            (!decl.is_local()).then(|| format!("D:{}", decl.get_name()))
+        }
+        LuaSemanticDeclId::Member(member_id) => {
+            let member_index = db.get_member_index();
+            let member = member_index.get_member(member_id)?;
+            let mut hasher = rustc_hash::FxHasher::default();
+            hash_lua_member_key_export(ids, member.get_key(), &mut hasher);
+            if let Some(owner) = member_index.get_member_owner(member_id) {
+                hash_member_owner_stable(ids, owner, &mut hasher);
+            }
+            Some(format!("M:{:x}", hasher.finish()))
+        }
+        // A signature has no name of its own; it is reached through the decl
+        // or member that holds it, and its own shape is hashed by the
+        // signature section. Its index among the file's signatures identifies
+        // it without a byte position, which would move on any edit above it.
+        LuaSemanticDeclId::Signature(signature_id) => {
+            let mut file_signatures: Vec<_> = db
+                .get_signature_index()
+                .get_file_signature_ids(signature_id.get_file_id())?
+                .iter()
+                .map(|id| id.get_position())
+                .collect();
+            file_signatures.sort_unstable();
+            let ordinal = file_signatures
+                .binary_search(&signature_id.get_position())
+                .ok()?;
+            Some(format!("S:{ordinal}"))
+        }
     }
 }
 
@@ -281,15 +543,16 @@ fn hash_lua_type_export(typ: &LuaType, hasher: &mut impl Hasher) {
 /// fan-in would be under the old file-level expansion.
 pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
     let mut hasher = rustc_hash::FxHasher::default();
+    let ids = &ExportIdentities::new(db);
 
     // --- Members directly declared in this file (owner, key, feature) ---
     let member_index = db.get_member_index();
     let mut members = member_index.get_file_members(file_id);
     members.sort_by_key(|m| crate::db_index::member_id_sort_key(m.get_id()));
     for member in members {
-        hash_lua_member_key_export(member.get_key(), &mut hasher);
+        hash_lua_member_key_export(ids, member.get_key(), &mut hasher);
         if let Some(owner) = member_index.get_member_owner(&member.get_id()) {
-            hash_member_owner_stable(owner, &mut hasher);
+            hash_member_owner_stable(ids, owner, &mut hasher);
         }
         member.get_feature().hash(&mut hasher);
     }
@@ -301,8 +564,8 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
         let mut bucket_hashes = Vec::new();
         for (owner, key) in keys {
             let mut bh = rustc_hash::FxHasher::default();
-            hash_member_owner_stable(&owner, &mut bh);
-            hash_lua_member_key_export(&key, &mut bh);
+            hash_member_owner_stable(ids, &owner, &mut bh);
+            hash_lua_member_key_export(ids, &key, &mut bh);
             if let Some(contribs) = store.contributions(&(owner.clone(), key.clone())) {
                 let mut contribs_vec: Vec<_> = contribs
                     .iter()
@@ -310,10 +573,11 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
                     .collect();
                 contribs_vec.sort_by_key(|(mid, _)| crate::db_index::member_id_sort_key(**mid));
                 for (_mid, contrib) in contribs_vec {
-                    hash_lua_type_export(&contrib.bound_type, &mut bh);
-                    hash_lua_type_export(&contrib.source_type, &mut bh);
-                    if let Some(doc) = &contrib.doc_type {
-                        hash_lua_type_export(doc, &mut bh);
+                    hash_lua_type_export(ids, &contrib.bound_type, &mut bh);
+                    hash_lua_type_export(ids, &contrib.source_type, &mut bh);
+                    match &contrib.doc_type {
+                        Some(doc) => hash_lua_type_export(ids, doc, &mut bh),
+                        None => "NoDocType".hash(&mut bh),
                     }
                     contrib.guarded_bootstrap.hash(&mut bh);
                     contrib.preserve_table_literals.hash(&mut bh);
@@ -333,16 +597,40 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
         decl_ids_sorted.sort_by(|a, b| a.get_name().cmp(b.get_name()));
         for decl_id in decl_ids_sorted {
             decl_id.get_name().hash(&mut hasher);
+            if let Some(type_decl) = db.get_type_index().get_type_decl(&decl_id) {
+                // An alias is read by name and resolved to its target, so
+                // changing the target changes what every file that names it
+                // infers.
+                match type_decl.get_alias_ref() {
+                    Some(alias_ref) => hash_lua_type_export(ids, alias_ref, &mut hasher),
+                    None => "NoAlias".hash(&mut hasher),
+                }
+                // Kind and flags live only on the declaration, so nothing else
+                // in this file moves when one changes - yet `(exact)` decides
+                // whether another file's write creates a member on this type,
+                // and `(partial)`/`(private)` gate diagnostics other files
+                // report.
+                let (kind, flags) = type_decl.kind_and_flags();
+                format!("{kind:?}").hash(&mut hasher);
+                flags.hash(&mut hasher);
+                let (extra_type, flat) = type_decl.extra_type();
+                flat.hash(&mut hasher);
+                match extra_type {
+                    Some(extra_type) => hash_lua_type_export(ids, extra_type, &mut hasher),
+                    None => "NoExtra".hash(&mut hasher),
+                }
+            }
             if let Some(supers) = db.get_type_index().get_super_type_entries(&decl_id) {
                 for sup in supers.iter().filter(|s| s.file_id == file_id) {
-                    hash_lua_type_export(&sup.value.typ, &mut hasher);
+                    hash_lua_type_export(ids, &sup.value.typ, &mut hasher);
                 }
             }
             if let Some(params) = db.get_type_index().get_generic_params(&decl_id) {
                 for param in params {
                     param.name.hash(&mut hasher);
-                    if let Some(constraint) = &param.type_constraint {
-                        hash_lua_type_export(constraint, &mut hasher);
+                    match &param.type_constraint {
+                        Some(constraint) => hash_lua_type_export(ids, constraint, &mut hasher),
+                        None => "NoConstraint".hash(&mut hasher),
                     }
                 }
             }
@@ -355,7 +643,11 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
     // edit anywhere above one shifts it, so hashing the position reports an
     // export change for every edit that is not at the very end of the file.
     if let Some(owners) = db.get_type_index().file_type_owners(file_id) {
-        let mut entries: Vec<(String, u64)> = Vec::new();
+        // Sorted by name then source order. The position orders the entries but
+        // is never hashed: two declarations of the same name in one file are
+        // distinguished by which type each holds, and swapping them has to be
+        // visible, but the offsets themselves move on any edit above.
+        let mut entries: Vec<(String, u32, u64)> = Vec::new();
         for owner in owners.iter() {
             let key = match owner {
                 LuaTypeOwner::Decl(decl_id) => {
@@ -373,9 +665,9 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
                         continue;
                     };
                     let mut h = rustc_hash::FxHasher::default();
-                    hash_lua_member_key_export(member.get_key(), &mut h);
+                    hash_lua_member_key_export(ids, member.get_key(), &mut h);
                     if let Some(owner) = member_index.get_member_owner(member_id) {
-                        hash_member_owner_stable(owner, &mut h);
+                        hash_member_owner_stable(ids, owner, &mut h);
                     }
                     format!("M:{:x}", h.finish())
                 }
@@ -383,15 +675,23 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
                 // one, so it is local memoisation rather than an export.
                 LuaTypeOwner::SyntaxId(_) => continue,
             };
+            let owner_position = match owner {
+                LuaTypeOwner::Decl(decl_id) => u32::from(decl_id.position),
+                LuaTypeOwner::Member(member_id) => u32::from(member_id.get_position()),
+                LuaTypeOwner::SyntaxId(_) => continue,
+            };
             let Some(cache) = db.get_type_index().get_type_cache(owner) else {
                 continue;
             };
             let mut h = rustc_hash::FxHasher::default();
-            hash_lua_type_export(cache.as_type(), &mut h);
-            entries.push((key, h.finish()));
+            hash_lua_type_export(ids, cache.as_type(), &mut h);
+            entries.push((key, owner_position, h.finish()));
         }
         entries.sort_unstable();
-        entries.hash(&mut hasher);
+        for (key, _, type_hash) in entries {
+            key.hash(&mut hasher);
+            type_hash.hash(&mut hasher);
+        }
     }
 
     // --- Signatures defined in this file ---
@@ -408,8 +708,9 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
                 sig.params.hash(&mut hasher);
                 for param in &sig.generic_params {
                     param.name.hash(&mut hasher);
-                    if let Some(constraint) = &param.constraint {
-                        hash_lua_type_export(constraint, &mut hasher);
+                    match &param.constraint {
+                        Some(constraint) => hash_lua_type_export(ids, constraint, &mut hasher),
+                        None => "NoConstraint".hash(&mut hasher),
                     }
                 }
                 // A caller reads the declared parameter and return types, so a
@@ -423,25 +724,67 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
                     doc.name.hash(&mut hasher);
                     doc.nullable.hash(&mut hasher);
                     doc.description.hash(&mut hasher);
-                    hash_lua_type_export(&doc.type_ref, &mut hasher);
+                    format!("{:?}", doc.default_value).hash(&mut hasher);
+                    format!("{:?}", doc.attributes).hash(&mut hasher);
+                    hash_lua_type_export(ids, &doc.type_ref, &mut hasher);
                 }
                 for ret in &sig.return_docs {
                     ret.name.hash(&mut hasher);
                     ret.description.hash(&mut hasher);
-                    hash_lua_type_export(&ret.type_ref, &mut hasher);
+                    format!("{:?}", ret.default_value).hash(&mut hasher);
+                    format!("{:?}", ret.attributes).hash(&mut hasher);
+                    format!("{:?}", ret.return_kind).hash(&mut hasher);
+                    hash_lua_type_export(ids, &ret.type_ref, &mut hasher);
                 }
                 for overload in &sig.overloads {
-                    hash_lua_type_export(&LuaType::DocFunction(overload.clone()), &mut hasher);
+                    hash_lua_type_export(ids, &LuaType::DocFunction(overload.clone()), &mut hasher);
                 }
+                // Caller-side narrowing facts derived from the body. A caller
+                // in another file reads them, and an edit can change one while
+                // leaving the declared parameters and returns alone.
+                format!("{:?}", sig.require_guard_param()).hash(&mut hasher);
+                sig.nil_return_guard_params().hash(&mut hasher);
+                format!("{:?}", sig.return_correlations()).hash(&mut hasher);
+                format!("{:?}", sig.direct_param_return_alias()).hash(&mut hasher);
+                format!("{:?}", sig.class_name_param_return_alias()).hash(&mut hasher);
+                format!("{:?}", sig.falsy_param_nil_free_return_slots()).hash(&mut hasher);
+                format!("{:?}", sig.falsy_param_return_aliases()).hash(&mut hasher);
                 for out_param in &sig.out_params {
-                    format!("{:?}", out_param).hash(&mut hasher);
+                    format!("{:?}", out_param.root).hash(&mut hasher);
+                    out_param.field_path.hash(&mut hasher);
+                    hash_lua_type_export(ids, &out_param.type_ref, &mut hasher);
                 }
             }
             if let Some(guard) = db.get_signature_index().inferred_positive_guard(sig_id) {
                 guard.param_idx.hash(&mut hasher);
-                hash_lua_type_export(&guard.narrowed_type, &mut hasher);
+                hash_lua_type_export(ids, &guard.narrowed_type, &mut hasher);
             }
         }
+    }
+
+    // --- Parameter types this file's call sites are evidence for ---
+    // A call argument here is the only evidence an unannotated parameter in
+    // another file has, and `expand_reindex_file_ids` already treats call
+    // sites as producing dependents. Without this the fingerprint would call
+    // an argument change local and never ripple it to the callee.
+    {
+        let contributed = db
+            .get_call_site_param_index()
+            .inferred_params_for_contributor_files(&HashSet::from([file_id]));
+        let mut param_hashes: Vec<u64> = contributed
+            .iter()
+            .map(|((signature_id, param_idx), typ)| {
+                let mut h = rustc_hash::FxHasher::default();
+                // The signature's position moves on any edit to its own file;
+                // the file it lives in and the parameter index do not.
+                signature_id.get_file_id().hash(&mut h);
+                param_idx.hash(&mut h);
+                hash_lua_type_export(ids, typ, &mut h);
+                h.finish()
+            })
+            .collect();
+        param_hashes.sort_unstable();
+        param_hashes.hash(&mut hasher);
     }
 
     // --- Inferred guard facts produced by this file ---
@@ -449,13 +792,291 @@ pub(crate) fn file_export_fingerprint(db: &DbIndex, file_id: FileId) -> u64 {
         .get_signature_index()
         .inferred_guard_facts_for_files(&HashSet::from([file_id]));
     if !guard_facts.is_empty() {
-        let mut guard_vec: Vec<_> = guard_facts.iter().collect();
-        guard_vec.sort_by(|a, b| a.0.path().cmp(b.0.path()));
-        for (owner, guard) in guard_vec {
+        // Sorted on the same total key the rest of the analyzer uses. A path
+        // alone is not total: the standard `if SERVER` pattern gives one path
+        // two owners that differ only by realm, and ordering them by path
+        // leaves the fold order to hash-map iteration.
+        let mut guard_owners: Vec<_> = guard_facts.keys().cloned().collect();
+        sort_inferred_guard_owners(&mut guard_owners);
+        for owner in guard_owners {
             owner.path().hash(&mut hasher);
-            guard.param_idx.hash(&mut hasher);
-            hash_lua_type_export(&guard.narrowed_type, &mut hasher);
+            // The realm the guard applies in is part of what a caller reads,
+            // and the same path can hold a different guard per realm.
+            format!("{:?}", owner.state_mask()).hash(&mut hasher);
+            owner.source_file_id().hash(&mut hasher);
+            if let Some(guard) = guard_facts.get(&owner) {
+                guard.param_idx.hash(&mut hasher);
+                hash_lua_type_export(ids, &guard.narrowed_type, &mut hasher);
+            }
         }
+    }
+
+    // --- Annotations on this file's symbols that other files act on ---
+    // A `@deprecated`, `@private` or `@export` on an exported symbol changes
+    // the diagnostics every call site in every other file reports.
+    //
+    // The free-text description and source are deliberately excluded: a hover
+    // in another file reads them from this index when the request arrives, so
+    // no dependent holds a copy that could go stale, and a doc-comment edit on
+    // a hub file would otherwise pay a full ripple for text nothing caches.
+    {
+        let default = LuaCommonProperty::new();
+        let default_property = format!(
+            "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+            default.visibility,
+            default.deprecated,
+            default.export,
+            default.decl_features,
+            default.version_conds,
+            default.attribute_uses,
+            default.default_value,
+            default.tag_content,
+        );
+        let mut properties: Vec<(String, String)> = db
+            .get_property_index()
+            .properties_in_file(file_id)
+            .into_iter()
+            .filter_map(|(owner, property)| {
+                let key = semantic_decl_export_key(ids, owner)?;
+                // None of these hold a source position, so their `Debug` form
+                // describes them precisely and stably.
+                let acted_on = format!(
+                    "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                    property.visibility,
+                    property.deprecated,
+                    property.export,
+                    property.decl_features,
+                    property.version_conds,
+                    property.attribute_uses,
+                    // Gates whether a field counts as required, and the
+                    // missing-field diagnostic is reported by the file that
+                    // builds the table, not the one that declares the class.
+                    property.default_value,
+                    // Carries the GMod tag payloads (`@accessorfunc` and
+                    // friends) that other files' call analysis reads.
+                    property.tag_content,
+                );
+                // Writing a doc comment creates a property whose acted-on
+                // fields are all still default. Registering it would make
+                // documenting a symbol an export change, which is the case
+                // excluding the description is meant to avoid.
+                (acted_on != default_property).then_some((key, acted_on))
+            })
+            .collect();
+        properties.sort_unstable();
+        properties.hash(&mut hasher);
+    }
+
+    // --- Metamethods this file declares ---
+    // Another file's inference reads these whenever it applies an operator to
+    // the owning type.
+    {
+        let mut operators: Vec<u64> = db
+            .get_operator_index()
+            .operators_in_file(file_id)
+            .into_iter()
+            .map(|operator| {
+                let mut h = rustc_hash::FxHasher::default();
+                // A table owner is a literal's range, which moves on any edit
+                // above it, so it is identified the same way a `TableConst` is.
+                match operator.get_owner() {
+                    LuaOperatorOwner::Table(range) => {
+                        "Table".hash(&mut h);
+                        range.file_id.hash(&mut h);
+                        ids.table_ordinal(&range).hash(&mut h);
+                    }
+                    LuaOperatorOwner::Type(type_decl_id) => {
+                        "Type".hash(&mut h);
+                        type_decl_id.get_name().hash(&mut h);
+                    }
+                }
+                format!("{:?}", operator.get_op()).hash(&mut h);
+                // The operator's own range moves on any edit above it; what a
+                // dependent reads is the function it resolves to.
+                hash_lua_type_export(ids, &operator.get_operator_func(db), &mut h);
+                h.finish()
+            })
+            .collect();
+        operators.sort_unstable();
+        operators.hash(&mut hasher);
+    }
+
+    // --- Network flows this file declares ---
+    // Network diagnostics compare a message's writes against its reads across
+    // files, so changing either half is an export change.
+    //
+    // Field by field: `NetSendFlow`, `NetReceiveFlow` and `NetOpEntry` all
+    // carry the source range of the call they came from, and those move on
+    // every edit above them. What the peer file's diagnostic reads is the
+    // message name and the ordered sequence of operations.
+    if let Some(network) = db.get_gmod_network_index().get_file_data(file_id) {
+        fn hash_ops(ops: &[NetOpEntry], hasher: &mut impl Hasher) {
+            for entry in ops {
+                format!("{:?}", entry.op).hash(hasher);
+                entry.display_name.hash(hasher);
+                entry.dynamic.hash(hasher);
+                format!("{:?}", entry.bits).hash(hasher);
+            }
+        }
+        let mut flows: Vec<u64> = Vec::new();
+        for flow in &network.send_flows {
+            let mut h = rustc_hash::FxHasher::default();
+            "Send".hash(&mut h);
+            flow.message_name.hash(&mut h);
+            format!("{:?}", flow.send_kind).hash(&mut h);
+            flow.send_display_name.hash(&mut h);
+            flow.send_target.hash(&mut h);
+            flow.is_wrapped.hash(&mut h);
+            hash_ops(&flow.writes, &mut h);
+            flows.push(h.finish());
+        }
+        for flow in &network.receive_flows {
+            let mut h = rustc_hash::FxHasher::default();
+            "Receive".hash(&mut h);
+            flow.message_name.hash(&mut h);
+            flow.reads_opaque.hash(&mut h);
+            hash_ops(&flow.reads, &mut h);
+            flows.push(h.finish());
+        }
+        flows.sort_unstable();
+        flows.hash(&mut hasher);
+    }
+
+    // --- Metatable bindings this file declares ---
+    // `setmetatable(t, mt)` is read by every file that resolves a member
+    // through `t`. Both halves are table literals, and repointing one at a
+    // different literal in the same file moves no member, type or signature.
+    {
+        let metatable_index = db.get_metatable_index();
+        let mut bindings: Vec<(usize, u32, usize)> = Vec::new();
+        if let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) {
+            for table in tree.get_chunk_node().descendants::<LuaTableExpr>() {
+                let range = InFiled::new(file_id, table.get_range());
+                let Some(metatable) = metatable_index.get(&range) else {
+                    continue;
+                };
+                let Some(table_ordinal) = ids.table_ordinal(&range) else {
+                    continue;
+                };
+                bindings.push((
+                    table_ordinal,
+                    metatable.file_id.id,
+                    ids.table_ordinal(metatable).unwrap_or(usize::MAX),
+                ));
+            }
+        }
+        bindings.sort_unstable();
+        bindings.hash(&mut hasher);
+    }
+
+    // --- The realm each exported symbol is declared in ---
+    // Realm is first-class: wrapping an existing definition in `if SERVER`
+    // changes which callers may reach it and which realm-mismatch diagnostics
+    // other files report, while leaving its name, type and signature alone.
+    // The offset is used only to look the realm up, never hashed.
+    {
+        let gmod_infer = db.get_gmod_infer_index();
+        let mut realms: Vec<(String, String)> = Vec::new();
+        if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&file_id) {
+            for (decl_id, decl) in decl_tree.get_decls() {
+                if decl.is_local() {
+                    continue;
+                }
+                let realm = gmod_infer.get_realm_at_offset(&file_id, decl_id.position);
+                realms.push((format!("D:{}", decl.get_name()), format!("{realm:?}")));
+            }
+        }
+        for member in db.get_member_index().get_file_members(file_id) {
+            let mut h = rustc_hash::FxHasher::default();
+            hash_lua_member_key_export(ids, member.get_key(), &mut h);
+            if let Some(owner) = db.get_member_index().get_member_owner(&member.get_id()) {
+                hash_member_owner_stable(ids, owner, &mut h);
+            }
+            let realm = gmod_infer.get_realm_at_offset(&file_id, member.get_id().get_position());
+            realms.push((format!("M:{:x}", h.finish()), format!("{realm:?}")));
+        }
+        realms.sort_unstable();
+        realms.dedup();
+        realms.hash(&mut hasher);
+
+        if let Some(metadata) = gmod_infer.get_realm_file_metadata(&file_id) {
+            // Field by field, because `branch_realm_ranges` carries the source
+            // ranges of the `if CLIENT`/`if SERVER` blocks, and those move on
+            // every edit above them. Which realms the file narrows to is the
+            // part another file can observe; where the braces sit is not.
+            format!(
+                "{:?}|{:?}|{:?}|{:?}|{:?}|{:?}|{:?}",
+                metadata.inferred_realm,
+                metadata.load_realm,
+                metadata.load_status,
+                metadata.load_state_mask,
+                metadata.filename_hint,
+                metadata.dependency_hints,
+                metadata.annotation_realm,
+            )
+            .hash(&mut hasher);
+            let branch_realms: Vec<String> = metadata
+                .branch_realm_ranges
+                .iter()
+                .map(|range| format!("{:?}", range.realm))
+                .collect();
+            branch_realms.hash(&mut hasher);
+        }
+    }
+
+    // --- What this file exports as a module ---
+    // `local M = {} ... return M` makes the returned table the module's export
+    // type, which every `require`/`include` consumer reads. The local itself is
+    // skipped by the type-cache section, so returning a different table moves
+    // nothing else.
+    if let Some(module) = db.get_module_index().get_module(file_id) {
+        module.full_module_name.hash(&mut hasher);
+        module.visible.hash(&mut hasher);
+        module.is_meta.hash(&mut hasher);
+        format!("{:?}", module.workspace_id).hash(&mut hasher);
+        format!("{:?}", module.version_conds).hash(&mut hasher);
+        match &module.export_type {
+            Some(export_type) => hash_lua_type_export(ids, export_type, &mut hasher),
+            None => "NoExport".hash(&mut hasher),
+        }
+        match module
+            .semantic_id
+            .as_ref()
+            .and_then(|id| semantic_decl_export_key(ids, id))
+        {
+            Some(key) => key.hash(&mut hasher),
+            None => "NoSemanticId".hash(&mut hasher),
+        }
+    }
+
+    // --- Load edges this file declares ---
+    // Adding or removing an `include`/`require` changes which files load this
+    // one and in what order, which realm and load-order analysis both read.
+    // No member, type or signature moves when it happens.
+    {
+        let dependency_index = db.get_file_dependencies_index();
+        let mut sites: Vec<String> = dependency_index
+            .get_dependency_sites(&file_id)
+            .unwrap_or_default()
+            .iter()
+            .map(|site| {
+                // The call's range is left out: it moves on any edit above it,
+                // and the edge is identified by its target and kind.
+                format!(
+                    "{:?}|{:?}|{:?}|{}",
+                    site.kind, site.target_file_id, site.path, site.original_expr
+                )
+            })
+            .collect();
+        sites.sort_unstable();
+        sites.hash(&mut hasher);
+
+        let mut required: Vec<u32> = dependency_index
+            .get_required_files(&file_id)
+            .map(|files| files.iter().map(|file| file.id).collect())
+            .unwrap_or_default();
+        required.sort_unstable();
+        required.hash(&mut hasher);
     }
 
     // --- Namespace / using (affects type resolution) ---
@@ -756,23 +1377,38 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
 }
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum TableAnchor {
+pub(crate) enum TableAnchor {
     Global(String),
     Local {
         decl_name: String,
-        decl_pos: u32,
         path: String,
+        /// The field names the literal declares.
+        ///
+        /// The declaration's byte position cannot identify it - that is the
+        /// case the anchor has to survive - and neither can its index among
+        /// the file's same-named locals, because inserting another `local cfg`
+        /// above renumbers it and the old anchor would then resolve to the new
+        /// literal. Duplicate names are routine in Lua, so the field names are
+        /// the tie-break, and two that still collide are left unanchored.
+        fields: Vec<String>,
     },
-    /// Path of `(node kind, index among same-kind siblings)` from the chunk
-    /// root down to the table, for literals that no name reaches.
+    /// A literal passed to a call that also takes string literals, keyed by
+    /// the call's path and those strings.
     ///
-    /// The whole path is needed, not just the parent's kind: two table
-    /// literals passed to two different calls both sit at index 0 of a
-    /// `CallArgList`, and a shared anchor makes both ambiguous, so neither is
-    /// remapped nor reported deleted and both keep a stale range.
-    Tree {
-        path: Vec<(LuaSyntaxKind, usize)>,
+    /// `registry.Add("first", { ... })` is the dominant shape for a literal no
+    /// name reaches, and the call's own string arguments identify it without a
+    /// sibling ordinal - inserting another registration above does not
+    /// renumber it.
+    CallArgument {
+        path: String,
+        labels: Vec<String>,
+        arg_index: usize,
     },
+    /// A literal no name and no call reaches, keyed by the field names it
+    /// declares. Those survive an edit to a field's *value*, which a sibling
+    /// ordinal would not: inserting another literal above renumbers ordinals,
+    /// and the old anchor would then resolve to a different literal.
+    Fields(Vec<String>),
 }
 
 fn expr_path_strings(expr: &LuaExpr) -> Option<Vec<String>> {
@@ -806,12 +1442,7 @@ fn var_path_strings(var: &glua_parser::LuaVarExpr) -> Option<Vec<String>> {
     }
 }
 
-#[allow(clippy::only_used_in_recursion)]
-fn table_global_path_recursive(
-    db: &DbIndex,
-    file_id: FileId,
-    table: LuaTableExpr,
-) -> Option<String> {
+fn table_global_path_recursive(table: LuaTableExpr) -> Option<String> {
     if let Some(field) = table.get_parent::<LuaTableField>() {
         let key = field.get_field_key()?;
         let key_str = match key {
@@ -820,7 +1451,7 @@ fn table_global_path_recursive(
             _ => return None,
         };
         let parent_table = field.get_parent::<LuaTableExpr>()?;
-        let parent_path = table_global_path_recursive(db, file_id, parent_table)?;
+        let parent_path = table_global_path_recursive(parent_table)?;
         return Some(format!("{}.{}", parent_path, key_str));
     }
     let mut current = table.syntax().clone();
@@ -830,7 +1461,6 @@ fn table_global_path_recursive(
             for (var, expr) in vars.iter().zip(exprs.iter()) {
                 if expr.get_range() == table.get_range() {
                     if let Some(mut path) = var_path_strings(var) {
-                        // Canonicalize _G / _ENV prefix like global_path_for_expr
                         if path.len() > 1 && matches!(path[0].as_str(), "_G" | "_ENV") {
                             path.remove(0);
                         }
@@ -848,7 +1478,26 @@ fn table_global_path_recursive(
     None
 }
 
+/// The field names a table literal declares, sorted.
+///
+/// They survive an edit to a field's *value*, which is what makes them usable
+/// as identity, and they distinguish literals that no name singles out.
+fn table_field_names(table: &LuaTableExpr) -> Vec<String> {
+    let mut fields: Vec<String> = table
+        .get_fields()
+        .filter_map(|field| match field.get_field_key()? {
+            glua_parser::LuaIndexKey::Name(name) => Some(name.get_name_text().to_string()),
+            glua_parser::LuaIndexKey::String(text) => Some(text.get_value().to_string()),
+            glua_parser::LuaIndexKey::Integer(number) => Some(format!("{number:?}")),
+            _ => None,
+        })
+        .collect();
+    fields.sort_unstable();
+    fields
+}
+
 fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Option<TableAnchor> {
+    let fields = table_field_names(&table);
     let mut parts: Vec<String> = Vec::new();
     let mut cur = table;
     loop {
@@ -880,7 +1529,7 @@ fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Opt
             let name_text = name.get_name_token()?.get_name_text().to_string();
             return Some(TableAnchor::Local {
                 decl_name: name_text,
-                decl_pos: u32::from(name.get_position()),
+                fields,
                 path,
             });
         }
@@ -900,15 +1549,13 @@ fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Opt
                     let path = parts.join(".");
                     return Some(TableAnchor::Local {
                         decl_name: decl.get_name().to_string(),
-                        decl_pos: u32::from(decl.get_id().position),
+                        fields,
                         path,
                     });
                 }
                 glua_parser::LuaVarExpr::IndexExpr(_) => {
-                    // Handle `t.inner = {}` where `t` is a local
                     let var_path = var_path_strings(var)?;
                     let root_name = var_path.first()?.clone();
-                    // Find the leftmost NameExpr for the root to get its position
                     let root_name_expr = var
                         .syntax()
                         .descendants()
@@ -916,7 +1563,6 @@ fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Opt
                     let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
                     let decl =
                         decl_tree.find_local_decl(&root_name, root_name_expr.get_position())?;
-                    // var_path is e.g. ["t","inner"] or ["t","a","b"]
                     let suffix = if var_path.len() > 1 {
                         var_path[1..].join(".")
                     } else {
@@ -934,7 +1580,7 @@ fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Opt
                     let final_path = combined.join(".");
                     return Some(TableAnchor::Local {
                         decl_name: decl.get_name().to_string(),
-                        decl_pos: u32::from(decl.get_id().position),
+                        fields,
                         path: final_path,
                     });
                 }
@@ -944,56 +1590,101 @@ fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Opt
     }
 }
 
-fn table_tree_anchor(table: LuaTableExpr) -> TableAnchor {
-    let mut path = Vec::new();
-    let mut node = table.syntax().clone();
-    while let Some(parent) = node.parent() {
-        let kind = node.kind();
-        let nth = parent
-            .children()
-            .filter(|sibling| sibling.kind() == kind)
-            .position(|sibling| sibling == node)
-            .unwrap_or(0);
-        path.push((kind.into(), nth));
-        node = parent;
+/// The call a table literal is an argument to, described by the call's path
+/// and its literal string arguments.
+///
+/// `registry.Add("first", { ... })` is the dominant shape for a table literal
+/// no name reaches, and this identifies it without a sibling ordinal, so
+/// inserting another registration above does not renumber it.
+fn table_call_argument_anchor(table: &LuaTableExpr) -> Option<TableAnchor> {
+    let arg_list = table.syntax().parent()?;
+    let call = LuaCallExpr::cast(arg_list.parent()?)?;
+    let path = var_path_strings(&glua_parser::LuaVarExpr::cast(
+        call.get_prefix_expr()?.syntax().clone(),
+    )?)?
+    .join(".");
+
+    let mut arg_index = 0;
+    let mut labels = Vec::new();
+    for (index, arg) in call.get_args_list()?.get_args().enumerate() {
+        match &arg {
+            LuaExpr::LiteralExpr(literal) => {
+                if let Some(glua_parser::LuaLiteralToken::String(text)) = literal.get_literal() {
+                    labels.push(format!("{index}:{}", text.get_value()));
+                }
+            }
+            _ => {
+                if arg.get_range() == table.get_range() {
+                    arg_index = index;
+                }
+            }
+        }
     }
-    path.reverse();
-    TableAnchor::Tree { path }
+    (!labels.is_empty()).then_some(TableAnchor::CallArgument {
+        path,
+        labels,
+        arg_index,
+    })
 }
 
 type AnchorMaps =
     rustc_hash::FxHashMap<FileId, rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>>>;
 
-fn collect_anchored_map(
+pub(crate) fn collect_anchored_map(
     db: &DbIndex,
     file_id: FileId,
 ) -> rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>> {
-    use rustc_hash::{FxHashMap, FxHashSet};
+    use rustc_hash::FxHashMap;
     let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
         return FxHashMap::default();
     };
     let chunk = tree.get_chunk_node();
+
+    // Two passes, because an anchor is only usable if it singles its literal
+    // out. Both the name a literal is reached by and the field names it
+    // declares survive an edit elsewhere in the file; the sibling ordinals in
+    // a tree path do not. So the most durable unique key wins, and the
+    // ordinals are added only to break a tie between literals that are
+    // otherwise indistinguishable.
+    let candidates: Vec<(Option<TableAnchor>, LuaTableExpr)> = chunk
+        .descendants::<LuaTableExpr>()
+        .map(|table| {
+            let named = table_global_path_recursive(table.clone())
+                .map(TableAnchor::Global)
+                .or_else(|| table_local_anchor(db, file_id, table.clone()))
+                .or_else(|| table_call_argument_anchor(&table))
+                .or_else(|| {
+                    let fields = table_field_names(&table);
+                    (!fields.is_empty()).then_some(TableAnchor::Fields(fields))
+                });
+            (named, table)
+        })
+        .collect();
+
+    let mut counts: FxHashMap<&TableAnchor, usize> = FxHashMap::default();
+    for (anchor, _) in &candidates {
+        if let Some(anchor) = anchor {
+            *counts.entry(anchor).or_default() += 1;
+        }
+    }
+    let ambiguous: rustc_hash::FxHashSet<TableAnchor> = counts
+        .into_iter()
+        .filter(|(_, count)| *count > 1)
+        .map(|(anchor, _)| anchor.clone())
+        .collect();
+
+    // A literal with no unique durable key is left out entirely. The only key
+    // left for it is the sibling ordinals, and those renumber when anything is
+    // inserted above, so an old anchor would resolve to a *different* literal
+    // and the remap would re-home its members onto the wrong table. Leaving it
+    // out costs a stale range, which a later re-index corrects; re-homing it
+    // writes a wrong one that nothing does.
     let mut map: FxHashMap<TableAnchor, InFiled<rowan::TextRange>> = FxHashMap::default();
-    let mut ambiguous: FxHashSet<TableAnchor> = FxHashSet::default();
-    for table in chunk.descendants::<LuaTableExpr>() {
-        let range = InFiled::new(file_id, table.get_range());
-        let anchor = if let Some(global) = table_global_path_recursive(db, file_id, table.clone()) {
-            TableAnchor::Global(global)
-        } else if let Some(local) = table_local_anchor(db, file_id, table.clone()) {
-            local
-        } else {
-            table_tree_anchor(table)
-        };
-        if ambiguous.contains(&anchor) {
+    for (anchor, table) in candidates {
+        let Some(anchor) = anchor.filter(|anchor| !ambiguous.contains(anchor)) else {
             continue;
-        }
-        #[allow(clippy::map_entry)]
-        if map.contains_key(&anchor) {
-            map.remove(&anchor);
-            ambiguous.insert(anchor);
-        } else {
-            map.insert(anchor, range);
-        }
+        };
+        map.insert(anchor, InFiled::new(file_id, table.get_range()));
     }
     map
 }
@@ -1007,6 +1698,16 @@ pub struct EmmyLuaAnalysis {
     pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
     #[cfg(test)]
     cross_file_stabilization_invocations: usize,
+    /// Guard facts as they stood before a self-index overwrote them.
+    ///
+    /// The LSP splits one edit across two calls: it self-indexes the edited
+    /// files to answer requests inside them, then pays the ripple later.
+    /// Guard propagation has to diff against the facts from before the
+    /// self-index, so they are carried across the gap.
+    pending_guard_snapshot: Option<InferredGuardSnapshot>,
+    /// Export fingerprints taken before a VFS mutation, for the paths that
+    /// write the text and re-index later. See [`Self::stash_pre_edit_state`].
+    pending_export_fingerprints: rustc_hash::FxHashMap<FileId, u64>,
     pending_table_ranges: rustc_hash::FxHashMap<
         FileId,
         rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>>,
@@ -1024,6 +1725,8 @@ impl EmmyLuaAnalysis {
             inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
             #[cfg(test)]
             cross_file_stabilization_invocations: 0,
+            pending_guard_snapshot: None,
+            pending_export_fingerprints: rustc_hash::FxHashMap::default(),
             pending_table_ranges: rustc_hash::FxHashMap::default(),
         }
     }
@@ -1158,22 +1861,24 @@ impl EmmyLuaAnalysis {
         // a file that is gone. It takes the full path below, which filters
         // removed files out of `update_index` and seeds VGUI forwarding removal.
         if let Some(existing) = existing_file_id.filter(|_| text.is_some()) {
-            // Capture fingerprint and expansion before the VFS mutation.
-            // Expansion must be captured before reindexing the edited file, as
-            // in the original `update_file_by_uri` path: dependents are those
-            // that reference the file's *old* exports (e.g. a call site that
-            // already references `Predicates.IsPlayer`), and computing it after
-            // `self_index_files` would miss them (observed: guard addition
-            // expansion went from 2 to 1 and the consumer stayed `Entity`).
-            let before_fp = file_export_fingerprint(self.compilation.get_db(), existing);
+            // Both are taken before the VFS mutation. A dependent is a file
+            // that references this file's *old* exports, so an expansion
+            // computed after the re-index would not contain it.
+            let before_fp = self.take_pre_edit_fingerprint(existing);
             let before_expansion = self.expand_reindex_file_ids(vec![existing]);
             let old_guard_snapshot = self
                 .inferred_guard_snapshot(&before_expansion.iter().copied().collect::<HashSet<_>>());
-            // For files that define inferred guards or VGUI forwarding, the
-            // `self_index` shortcut would clobber the `old_guard_snapshot` and
-            // VGUI metadata needed for correct ripple. Fall back to the original
-            // full reindex path for those (observed: guard addition stayed
-            // `Entity` and VGUI deletion left stale parent chain).
+            // Inferred guards and VGUI forwarding are derived from state the
+            // self-index clears and the ripple then rebuilds from, so for a
+            // file that carries either, "did the exports change" is not a
+            // question the fingerprint can answer: the facts it would compare
+            // are gone by the time it looks. Those files take the full path.
+            //
+            // This is a correctness requirement rather than a performance
+            // prefilter - removing it makes
+            // `test_fact_preserving_guard_reindex_keeps_full_incremental_consumer_chain`
+            // fail, because the consumer chain is rebuilt from facts the
+            // self-index has already dropped.
             let is_special = {
                 let db = self.compilation.get_db();
                 !db.get_signature_index()
@@ -1185,6 +1890,7 @@ impl EmmyLuaAnalysis {
             };
             if is_special {
                 let old_maps = self.take_old_anchor_maps(&[existing]);
+                self.pending_export_fingerprints.remove(&existing);
                 let file_id = self
                     .compilation
                     .get_db_mut()
@@ -1195,16 +1901,11 @@ impl EmmyLuaAnalysis {
                     before_expansion,
                     old_guard_snapshot,
                 );
-                self.apply_table_remap(old_maps);
+                self.apply_table_remap(old_maps, &[file_id]);
                 profile::phase_report("update_file_by_uri");
                 return Some(file_id);
             }
-            let anchored = collect_anchored_map(self.compilation.get_db(), existing);
-            if !anchored.is_empty() {
-                self.pending_table_ranges
-                    .entry(existing)
-                    .or_insert(anchored);
-            }
+            self.stash_pre_edit_anchors(existing);
             let file_id = self
                 .compilation
                 .get_db_mut()
@@ -1232,17 +1933,13 @@ impl EmmyLuaAnalysis {
             // derived in the same batch as its dependents' for the pass to
             // converge, and it is one file out of an expansion in the thousands.
             //
-            // Use the pre-computed expansion
-            // (before the edit) so that call-site dependents that already
-            // reference the old exports are included. Computing after
-            // `self_index_files` missed them (observed: guard consumer went from 2
-            // to 1 and stayed `Entity`). Use the old guard snapshot for the
-            // guard propagation, which must be captured before `self_index` overwrites it.
-            let expansion = before_expansion;
+            // The expansion and the guard snapshot are the ones taken before
+            // the edit, so guard propagation diffs against the facts the
+            // self-index has already overwritten.
             profile::phase("edit/ripple", || {
                 self.reindex_expanded_files_with_old_snapshot(
                     vec![file_id],
-                    expansion,
+                    before_expansion,
                     old_guard_snapshot,
                 )
             });
@@ -1250,7 +1947,11 @@ impl EmmyLuaAnalysis {
             return Some(file_id);
         }
 
-        // New file - no fingerprint to compare, fall back to full expansion.
+        // A new file, or a deletion. Neither has a useful before-fingerprint,
+        // so both take the full expansion.
+        let old_maps = existing_file_id
+            .map(|file_id| self.take_old_anchor_maps(&[file_id]))
+            .unwrap_or_default();
         let file_id = self
             .compilation
             .get_db_mut()
@@ -1260,6 +1961,11 @@ impl EmmyLuaAnalysis {
         profile::phase("edit/reindex", || {
             self.reindex_expanded_files(vec![file_id], expansion)
         });
+        // A deleted file has no tree, so every one of its literals is gone and
+        // its Element owners are purged. That is what has to happen: the
+        // members other files own on them are not reachable from any file the
+        // re-index visited.
+        self.apply_table_remap(old_maps, &[file_id]);
         profile::phase_report("update_file_by_uri");
 
         Some(file_id)
@@ -1311,8 +2017,13 @@ impl EmmyLuaAnalysis {
                 }
 
                 if trigger_reindex {
-                    self.compilation.remove_index(vec![file_id]);
-                    self.compilation.update_index(vec![file_id]);
+                    // Through `self_index_files`, so the anchor stash an
+                    // earlier text-only write left is consumed and applied.
+                    // Re-indexing without it leaves the stash describing a tree
+                    // two edits back, and the next edit would then remap from
+                    // ranges the index no longer holds.
+                    self.self_index_files(vec![file_id]);
+                    self.pending_export_fingerprints.remove(&file_id);
                 }
 
                 self.compilation
@@ -1356,10 +2067,7 @@ impl EmmyLuaAnalysis {
         let old_maps = match existing_file_id {
             Some(fid) if trigger_reindex => self.take_old_anchor_maps(&[fid]),
             Some(fid) => {
-                let anchored = collect_anchored_map(self.compilation.get_db(), fid);
-                if !anchored.is_empty() {
-                    self.pending_table_ranges.entry(fid).or_insert(anchored);
-                }
+                self.stash_pre_edit_state(fid);
                 AnchorMaps::default()
             }
             None => AnchorMaps::default(),
@@ -1396,7 +2104,12 @@ impl EmmyLuaAnalysis {
                 &incremental_source_file_ids,
             );
             self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
-            self.apply_table_remap(old_maps);
+            self.apply_table_remap(old_maps, &[file_id]);
+            // Settled against the current text now, so any stashed fingerprint
+            // describes a state that no longer exists.
+            for reindexed in &reindex_file_ids {
+                self.pending_export_fingerprints.remove(reindexed);
+            }
         }
 
         Some(file_id)
@@ -1443,10 +2156,7 @@ impl EmmyLuaAnalysis {
         }
 
         if let Some(fid) = existing_file_id {
-            let anchored = collect_anchored_map(self.compilation.get_db(), fid);
-            if !anchored.is_empty() {
-                self.pending_table_ranges.entry(fid).or_insert(anchored);
-            }
+            self.stash_pre_edit_state(fid);
         }
 
         self.compilation
@@ -1472,12 +2182,7 @@ impl EmmyLuaAnalysis {
                     return Some(file_id);
                 }
             }
-            // Stash old table anchors before VFS mutation so self_index can remap
-            // Element owners and TableConst that shifted due to earlier edits.
-            let anchored = collect_anchored_map(self.compilation.get_db(), file_id);
-            if !anchored.is_empty() {
-                self.pending_table_ranges.entry(file_id).or_insert(anchored);
-            }
+            self.stash_pre_edit_state(file_id);
         }
 
         let file_id = self
@@ -1508,46 +2213,7 @@ impl EmmyLuaAnalysis {
     /// 8 and the workspace ended up with 18 diagnostics that a cold build does
     /// not produce.
     pub fn reindex_expanded_files(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
-        let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let removed_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| {
-                self.compilation
-                    .get_db()
-                    .get_vfs()
-                    .get_syntax_tree(file_id)
-                    .is_none()
-            })
-            .collect::<HashSet<_>>();
-
-        let mut file_ids = expansion.clone();
-        self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
-        let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
-        self.compilation.remove_index(file_ids.clone());
-        let update_file_ids = file_ids
-            .iter()
-            .copied()
-            .filter(|file_id| !removed_file_ids.contains(file_id))
-            .collect::<Vec<_>>();
-        if !update_file_ids.is_empty() {
-            self.compilation.update_index(update_file_ids.clone());
-            self.stabilize_cross_file_type_caches(&update_file_ids);
-        }
-        for file_id in &incremental_source_file_ids {
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(*file_id);
-        }
-        self.reindex_changed_inferred_guard_references(
-            &guard_fact_file_ids,
-            &old_guard_facts,
-            &file_ids,
-            &incremental_source_file_ids,
-        );
-        self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
+        self.reindex_expanded_files_inner(file_ids, expansion, None);
     }
 
     pub(crate) fn reindex_expanded_files_with_old_snapshot(
@@ -1555,6 +2221,20 @@ impl EmmyLuaAnalysis {
         file_ids: Vec<FileId>,
         expansion: Vec<FileId>,
         old_snapshot: InferredGuardSnapshot,
+    ) {
+        self.reindex_expanded_files_inner(file_ids, expansion, Some(old_snapshot));
+    }
+
+    /// Re-analyses `expansion` with `file_ids` as the files that changed.
+    ///
+    /// `old_snapshot` is the guard facts to diff propagation against. Pass the
+    /// snapshot taken before a self-index overwrote them; `None` takes one now,
+    /// which is only correct when nothing has re-indexed since.
+    fn reindex_expanded_files_inner(
+        &mut self,
+        file_ids: Vec<FileId>,
+        expansion: Vec<FileId>,
+        old_snapshot: Option<InferredGuardSnapshot>,
     ) {
         let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         let removed_file_ids = file_ids
@@ -1569,10 +2249,15 @@ impl EmmyLuaAnalysis {
             })
             .collect::<HashSet<_>>();
 
-        let mut file_ids = expansion.clone();
+        let mut file_ids = expansion;
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
-        let old_guard_facts = old_snapshot;
+        // A self-index may already have overwritten the guard facts this
+        // ripple has to diff against, in which case the snapshot from before
+        // it was stashed for us.
+        let old_guard_facts = old_snapshot
+            .or_else(|| self.pending_guard_snapshot.take())
+            .unwrap_or_else(|| self.inferred_guard_snapshot(&guard_fact_file_ids));
         self.compilation.remove_index(file_ids.clone());
         let update_file_ids = file_ids
             .iter()
@@ -1582,6 +2267,11 @@ impl EmmyLuaAnalysis {
         if !update_file_ids.is_empty() {
             self.compilation.update_index(update_file_ids.clone());
             self.stabilize_cross_file_type_caches(&update_file_ids);
+        }
+        // These files are settled against their current text now, so a
+        // fingerprint stashed for one describes a state that no longer exists.
+        for file_id in &file_ids {
+            self.pending_export_fingerprints.remove(file_id);
         }
         for file_id in &incremental_source_file_ids {
             self.compilation
@@ -1598,16 +2288,47 @@ impl EmmyLuaAnalysis {
         self.reindex_changed_inferred_param_consumers(&old_guard_facts, &file_ids);
     }
 
-    /// Rebuilds only these files' own index entries.
+    /// Records the anchors the index's stored `Element` ranges correspond to,
+    /// unless an earlier edit already recorded some.
     ///
-    /// Nothing cross-file is settled: dependents keep whatever they inferred
-    /// before, and the caller still owes them a
-    /// [`reindex_expanded_files`](Self::reindex_expanded_files) against an
-    /// expansion captured beforehand. What this does buy is that the edited
-    /// file's declarations, members and signatures line up with its text again,
-    /// which is all a request positioned *inside that file* needs — the index
-    /// entries are keyed by position, so an edit that shifts offsets is exactly
-    /// what makes them stop matching the tree.
+    /// The oldest stash is the one that matches the index: a write that does
+    /// not re-index leaves the index describing the text from before it, so
+    /// that is the state the stored ranges belong to.
+    fn stash_pre_edit_anchors(&mut self, file_id: FileId) {
+        if self.pending_table_ranges.contains_key(&file_id) {
+            return;
+        }
+        let anchored = collect_anchored_map(self.compilation.get_db(), file_id);
+        if !anchored.is_empty() {
+            self.pending_table_ranges.insert(file_id, anchored);
+        }
+    }
+
+    /// The same, plus the export fingerprint, for the paths that write the text
+    /// now and re-index later.
+    ///
+    /// The fingerprint has to be taken here for the same reason the anchors do:
+    /// once the new text is parsed it would read the old index against the new
+    /// tree, and report a change for every edit that shifts a table literal.
+    fn stash_pre_edit_state(&mut self, file_id: FileId) {
+        self.stash_pre_edit_anchors(file_id);
+        // Independent of the anchors: a file with no table literals stashes no
+        // anchors, and one stash must not suppress the other.
+        if !self.pending_export_fingerprints.contains_key(&file_id) {
+            let fingerprint = file_export_fingerprint(self.compilation.get_db(), file_id);
+            self.pending_export_fingerprints
+                .insert(file_id, fingerprint);
+        }
+    }
+
+    /// The file's export fingerprint as it stood before the edit: the stashed
+    /// one when a write has already landed, otherwise one taken now.
+    fn take_pre_edit_fingerprint(&mut self, file_id: FileId) -> u64 {
+        self.pending_export_fingerprints
+            .remove(&file_id)
+            .unwrap_or_else(|| file_export_fingerprint(self.compilation.get_db(), file_id))
+    }
+
     /// The anchor map the index's stored `Element` ranges correspond to.
     ///
     /// An edit stashes this before mutating the VFS, because the tree those
@@ -1637,20 +2358,48 @@ impl EmmyLuaAnalysis {
     /// other file's reference to one of its `Element` owners keeps the old
     /// offset, so without this they point into the wrong table after any edit
     /// that shifts offsets.
-    fn apply_table_remap(&mut self, mut old_maps: AnchorMaps) {
-        if old_maps.is_empty() {
-            return;
-        }
+    fn apply_table_remap(&mut self, mut old_maps: AnchorMaps, file_ids: &[FileId]) {
         let mut global_remap: rustc_hash::FxHashMap<
             InFiled<rowan::TextRange>,
             InFiled<rowan::TextRange>,
         > = rustc_hash::FxHashMap::default();
         let mut deleted: Vec<InFiled<rowan::TextRange>> = Vec::new();
-        let file_ids: Vec<FileId> = old_maps.keys().copied().collect();
-        for fid in file_ids {
-            let Some(old_map) = old_maps.remove(&fid) else {
+        // Driven off the files being re-indexed, not off the stashed anchors: a
+        // removed file whose literals were all unnameable stashes nothing, and
+        // its owners still have to go.
+        for fid in file_ids.iter().copied() {
+            let old_map = old_maps.remove(&fid).unwrap_or_default();
+            // A file with no tree has been removed. Only then does an anchor
+            // that no longer resolves mean the literal is gone: while the file
+            // is still there, a mismatch can equally be a heuristic the anchor
+            // did not survive, and purging on that basis destroys members other
+            // files own with nothing left to rebuild them. Leaving the entry
+            // stale is recoverable; deleting it is not.
+            let file_removed = self
+                .compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(&fid)
+                .is_none();
+            if old_map.is_empty() && !file_removed {
+                // Nothing stashed and the file is still there, so there is no
+                // range to move and none to purge. Skipping here avoids a
+                // `collect_anchored_map` tree walk per file, which the batch
+                // path would otherwise pay for every file it touches.
                 continue;
-            };
+            }
+            if file_removed {
+                // Every literal in it is gone, not just the ones an anchor
+                // reached: `collect_anchored_map` leaves out literals it cannot
+                // name uniquely, and members other files own on those are not
+                // reachable from any file the removal sweeps.
+                deleted.extend(
+                    self.compilation
+                        .get_db()
+                        .get_member_index()
+                        .element_owner_ranges_in_file(fid),
+                );
+            }
             let new_map = collect_anchored_map(self.compilation.get_db(), fid);
             for (anchor, old_range) in old_map {
                 match new_map.get(&anchor) {
@@ -1658,7 +2407,8 @@ impl EmmyLuaAnalysis {
                         global_remap.insert(old_range, new_range.clone());
                     }
                     Some(_) => {}
-                    None => deleted.push(old_range),
+                    None if file_removed => deleted.push(old_range),
+                    None => {}
                 }
             }
         }
@@ -1667,20 +2417,39 @@ impl EmmyLuaAnalysis {
             let db = self.compilation.get_db_mut();
             db.get_member_index_mut().remap_elements(&global_remap);
             db.get_type_index_mut().remap_table_const(&global_remap);
+            // Beyond the type cache and the member owner, the one store that
+            // can hold *another* file's literal range: a write registers a
+            // dynamic field on a table it does not declare.
+            db.get_dynamic_field_index_mut()
+                .remap_table_ranges(&global_remap);
         }
         if !deleted.is_empty() {
-            self.compilation
-                .get_db_mut()
+            let db = self.compilation.get_db_mut();
+            let forgotten = db
                 .get_member_index_mut()
                 .remove_deleted_element_owners(&deleted);
+            // Their cached types would otherwise outlive them: the files those
+            // members belong to are not the ones being re-analysed.
+            db.get_type_index_mut()
+                .remove_member_type_caches(&forgotten);
         }
     }
 
+    /// Rebuilds only these files' own index entries.
+    ///
+    /// Nothing cross-file is settled: dependents keep whatever they inferred
+    /// before, and the caller still owes them a
+    /// [`reindex_expanded_files`](Self::reindex_expanded_files) against an
+    /// expansion captured beforehand. What this does buy is that the edited
+    /// file's declarations, members and signatures line up with its text again,
+    /// which is all a request positioned *inside that file* needs — the index
+    /// entries are keyed by position, so an edit that shifts offsets is exactly
+    /// what makes them stop matching the tree.
     pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
         let old_maps = self.take_old_anchor_maps(&file_ids);
         self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids);
-        self.apply_table_remap(old_maps);
+        self.compilation.update_index(file_ids.clone());
+        self.apply_table_remap(old_maps, &file_ids);
     }
 
     pub fn self_index_files_and_get_ripple_with_changed(
@@ -1701,20 +2470,29 @@ impl EmmyLuaAnalysis {
         });
         if has_special {
             let expansion = self.expand_reindex_file_ids(file_ids.clone());
+            let snapshot =
+                self.inferred_guard_snapshot(&expansion.iter().copied().collect::<HashSet<_>>());
+            self.pending_guard_snapshot.get_or_insert(snapshot);
             self.self_index_files(file_ids.clone());
             return (file_ids, expansion);
         }
 
+        // The text is already written by the time the editor path reaches
+        // here, so a fingerprint taken now would read the old index against the
+        // new tree. Whoever wrote the text stashed one taken before it.
         let mut before_fps = HashMap::new();
         for fid in &file_ids {
-            before_fps.insert(
-                *fid,
-                file_export_fingerprint(self.compilation.get_db(), *fid),
-            );
+            before_fps.insert(*fid, self.take_pre_edit_fingerprint(*fid));
         }
         // Expansion must be captured before self_index, or dependents that
         // reference the old exports are missed.
         let before_expansion = self.expand_reindex_file_ids(file_ids.clone());
+        // The oldest snapshot in a burst is the one the ripple has to diff
+        // against: later batches see facts the earlier self-indexes already
+        // overwrote.
+        let snapshot =
+            self.inferred_guard_snapshot(&before_expansion.iter().copied().collect::<HashSet<_>>());
+        self.pending_guard_snapshot.get_or_insert(snapshot);
         self.self_index_files(file_ids.clone());
         self.stabilize_cross_file_type_caches(&file_ids);
         let mut changed = Vec::new();
@@ -1725,14 +2503,14 @@ impl EmmyLuaAnalysis {
             }
         }
         if changed.is_empty() {
+            // The guard snapshot is left alone: an earlier batch in this burst
+            // may still owe a ripple that has to diff against it.
             return (Vec::new(), Vec::new());
         }
-        // For the common non-special case the before expansion already
-        // contains the dependents of the changed files; filtering it to the
-        // changed subset would require per-file tracking, but the over-ripple
-        // is at most the same as the full edit and still <1s for a single-file
-        // hub edit when fingerprints are stable (observed sh_configuration 0.45s).
-        // Keep the before expansion for now.
+        // The before expansion already contains the dependents of the changed
+        // files. Narrowing it to just those would need per-file dependent
+        // tracking, and over-rippling here costs at most what the edit would
+        // have cost without the fingerprint at all.
         (changed, before_expansion)
     }
 
@@ -2371,6 +3149,13 @@ impl EmmyLuaAnalysis {
             .filter(|(_, text)| text.is_none())
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
             .collect::<HashSet<_>>();
+        // Taken before the writes below, as on every other edit path: the
+        // expansion re-derives each dependent's *type caches*, but a member
+        // another file owns on a literal here is not reached by that, so the
+        // ranges still have to be re-homed.
+        let mut remap_source_file_ids: Vec<FileId> = old_source_file_ids.iter().copied().collect();
+        remap_source_file_ids.sort_unstable();
+        let old_anchor_maps = self.take_old_anchor_maps(&remap_source_file_ids);
         let mut old_guard_fact_file_ids =
             self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
         self.add_vgui_forwarding_removal_seed(
@@ -2517,6 +3302,7 @@ impl EmmyLuaAnalysis {
             let _p = Profile::new("post: stabilize_cross_file_type_caches");
             self.stabilize_cross_file_type_caches(&updated_files);
         }
+        self.apply_table_remap(old_anchor_maps, &remap_source_file_ids);
         {
             let _p = Profile::new("post: refresh_file_source_dependencies");
             for file_id in &old_source_file_ids {
@@ -2656,6 +3442,9 @@ impl EmmyLuaAnalysis {
             self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
             let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
             let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
+            // Members other files own on this file's table literals are filed
+            // under *their* file, so `remove_index` never reaches them.
+            let old_maps = self.take_old_anchor_maps(&[file_id]);
             self.compilation
                 .get_db_mut()
                 .get_vfs_mut()
@@ -2684,6 +3473,8 @@ impl EmmyLuaAnalysis {
                 &reindex_file_ids,
                 &HashSet::new(),
             );
+            self.apply_table_remap(old_maps, &[file_id]);
+            self.pending_export_fingerprints.remove(&file_id);
             return Some(file_id);
         }
 
