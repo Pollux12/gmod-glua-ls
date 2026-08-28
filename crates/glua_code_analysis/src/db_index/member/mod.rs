@@ -1731,22 +1731,53 @@ impl LuaMemberIndex {
         if map.is_empty() {
             return;
         }
-        let to_move: Vec<(LuaMemberId, LuaMemberOwner, LuaMemberOwner)> = self
-            .member_current_owner
+        // Driven off the map rather than a scan of every member in the
+        // workspace: `owner_members` already indexes members by owner, and the
+        // map holds only the literals one edited file shifted.
+        let to_move: Vec<(LuaMemberId, LuaMemberOwner, LuaMemberOwner)> = map
             .iter()
-            .filter_map(|(mid, owner)| {
-                if let LuaMemberOwner::Element(old) = owner {
-                    if let Some(new) = map.get(old) {
-                        return Some((
-                            *mid,
-                            LuaMemberOwner::Element(old.clone()),
-                            LuaMemberOwner::Element(new.clone()),
-                        ));
-                    }
-                }
-                None
+            .flat_map(|(old, new)| {
+                let old_owner = LuaMemberOwner::Element(old.clone());
+                let new_owner = LuaMemberOwner::Element(new.clone());
+                self.owner_members
+                    .get(&old_owner)
+                    .into_iter()
+                    .flat_map(|items| items.get_member_items())
+                    .flat_map(|item| match item {
+                        LuaMemberIndexItem::One(id) => vec![*id],
+                        LuaMemberIndexItem::Many(ids) => ids.clone(),
+                    })
+                    .map(move |id| (id, old_owner.clone(), new_owner.clone()))
+                    .collect::<Vec<_>>()
             })
             .collect();
+        self.assignment_contributions.remap_element_owners(map);
+        let moved_slots: Vec<(
+            (LuaMemberOwner, LuaMemberKey),
+            (LuaMemberOwner, LuaMemberKey),
+        )> = self
+            .alias_contributed_slots
+            .keys()
+            .filter_map(|slot| {
+                let LuaMemberOwner::Element(old) = &slot.0 else {
+                    return None;
+                };
+                let new = map.get(old)?;
+                Some((
+                    slot.clone(),
+                    (LuaMemberOwner::Element(new.clone()), slot.1.clone()),
+                ))
+            })
+            .collect();
+        for (old_slot, new_slot) in moved_slots {
+            if let Some(ids) = self.alias_contributed_slots.remove(&old_slot) {
+                self.alias_contributed_slots
+                    .entry(new_slot)
+                    .or_default()
+                    .extend(ids);
+            }
+        }
+
         for (member_id, old_owner, new_owner) in to_move {
             // Remove from old owner's structures
             self.detach_member_from_owner(&old_owner, member_id);
@@ -1777,21 +1808,29 @@ impl LuaMemberIndex {
         for range in deleted {
             let owner = LuaMemberOwner::Element(range.clone());
             if let Some(member_items) = self.owner_members.remove(&owner) {
-                for item in member_items.get_member_items() {
-                    match item {
-                        LuaMemberIndexItem::One(id) => {
-                            self.member_current_owner.remove(id);
-                            self.remove_member_from_all_owner_key_indexes(&owner, *id);
-                            self.remove_current_owner_member(&owner, *id);
-                        }
-                        LuaMemberIndexItem::Many(ids) => {
-                            for id in ids {
-                                self.member_current_owner.remove(id);
-                                self.remove_member_from_all_owner_key_indexes(&owner, *id);
-                                self.remove_current_owner_member(&owner, *id);
-                            }
+                let member_ids: Vec<LuaMemberId> = member_items
+                    .get_member_items()
+                    .flat_map(|item| match item {
+                        LuaMemberIndexItem::One(id) => vec![*id],
+                        LuaMemberIndexItem::Many(ids) => ids.clone(),
+                    })
+                    .collect();
+                for id in member_ids {
+                    self.member_current_owner.remove(&id);
+                    self.remove_member_from_all_owner_key_indexes(&owner, id);
+                    self.remove_current_owner_member(&owner, id);
+                    // The member itself has to go too. Leaving it in
+                    // `members`/`in_filed` makes it reachable by id and by
+                    // file while `get_member_owner` answers `None`, from a
+                    // file no later re-index will visit.
+                    self.members.remove(&id);
+                    if let Some(set) = self.in_filed.get_mut(&id.file_id) {
+                        set.remove(&MemberOrOwner::Member(id));
+                        if set.is_empty() {
+                            self.in_filed.remove(&id.file_id);
                         }
                     }
+                    self.assignment_contributions.remove_member(id);
                 }
             }
             if let Some(set) = self.in_filed.get_mut(&range.file_id) {

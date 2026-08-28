@@ -1612,8 +1612,24 @@ impl LuaTypeIndex {
         if map.is_empty() {
             return;
         }
+        // Only caches that actually name a table literal in one of the edited
+        // files can contain a range the map moves, and `cache_refs` already
+        // records which files those are. Scanning every cache in the workspace
+        // here would put a full-index walk on the per-keystroke path.
+        let source_files: HashSet<FileId> = map.keys().map(|range| range.file_id).collect();
+        let candidate_owners: HashSet<&LuaTypeOwner> = source_files
+            .iter()
+            .filter_map(|file_id| self.cache_refs.owners(&TypeCacheRef::File(*file_id)))
+            .flatten()
+            .filter_map(|owner_file_id| self.in_filed_type_owner.get(owner_file_id))
+            .flatten()
+            .collect();
+
         let mut updates = Vec::new();
-        for (owner, cache) in self.types.iter() {
+        for owner in candidate_owners {
+            let Some(cache) = self.types.get(owner) else {
+                continue;
+            };
             if let Some(new_type) = remap_table_ranges_in_type(cache.as_type(), map) {
                 let new_cache = match cache {
                     LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
