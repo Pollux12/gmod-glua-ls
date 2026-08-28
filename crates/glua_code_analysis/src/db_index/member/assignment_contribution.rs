@@ -2,7 +2,8 @@ use rustc_hash::FxHashMap;
 use std::collections::HashSet;
 
 use super::{LuaMemberId, LuaMemberKey, LuaMemberOwner};
-use crate::{FileId, LuaType};
+use crate::{FileId, InFiled, LuaType};
+use rowan::TextRange;
 
 /// The group a member assignment contributes its evidence to.
 pub type MemberAssignmentContributionKey = (LuaMemberOwner, LuaMemberKey);
@@ -110,6 +111,62 @@ impl MemberAssignmentContributionStore {
             keys.extend(entries.values().cloned());
         }
         keys
+    }
+
+    /// Moves writer groups whose owner is a table literal that shifted offset
+    /// onto the literal's new range.
+    ///
+    /// Without this a group stays filed under the pre-edit range while the
+    /// member index has already re-homed the owner, so the widening merge for
+    /// the new range cannot see the writers other files contributed.
+    pub fn remap_element_owners(
+        &mut self,
+        map: &FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+    ) {
+        let moved: Vec<(
+            MemberAssignmentContributionKey,
+            MemberAssignmentContributionKey,
+        )> = self
+            .by_owner_key
+            .keys()
+            .filter_map(|store_key| {
+                let LuaMemberOwner::Element(old) = &store_key.0 else {
+                    return None;
+                };
+                let new = map.get(old)?;
+                Some((
+                    store_key.clone(),
+                    (LuaMemberOwner::Element(new.clone()), store_key.1.clone()),
+                ))
+            })
+            .collect();
+
+        for (old_key, new_key) in moved {
+            let Some(group) = self.by_owner_key.remove(&old_key) else {
+                continue;
+            };
+            for member_id in group.keys() {
+                if let Some(entries) = self.by_file.get_mut(&member_id.file_id) {
+                    entries.insert(*member_id, new_key.clone());
+                }
+            }
+            self.by_owner_key.entry(new_key).or_default().extend(group);
+        }
+    }
+
+    /// Drops one member's writer entry, for a member removed on its own
+    /// rather than as part of a file sweep.
+    pub fn remove_member(&mut self, member_id: LuaMemberId) {
+        let Some(entries) = self.by_file.get_mut(&member_id.file_id) else {
+            return;
+        };
+        let Some(store_key) = entries.remove(&member_id) else {
+            return;
+        };
+        if entries.is_empty() {
+            self.by_file.remove(&member_id.file_id);
+        }
+        self.detach(&store_key, member_id);
     }
 
     /// Number of stored writer entries, for the profile report.
