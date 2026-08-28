@@ -47,11 +47,7 @@ pub fn analyze_for_range_stat(
             }
 
             if iter_var_types.contain_tpl() || enumerates_member_map {
-                // Either nothing bound the generic, so the vars hold raw
-                // template refs, or the types came from enumerating a
-                // table's member map. Either way the answer only covers the
-                // members indexed when this ran, and which those are
-                // depends on the order files were analysed in.
+                // Defer when iter type depends on incomplete enumeration.
                 let unresolved = UnResolveIterVar {
                     file_id: analyzer.file_id,
                     iter_exprs: iter_exprs.clone(),
@@ -96,9 +92,7 @@ pub fn analyze_for_range_stat(
     Some(())
 }
 
-/// Whether this loop's variable types come from enumerating a table's
-/// member map, the union [`try_infer_pairs_iter_types_from_table_members`]
-/// builds.
+/// Whether loop iter types come from table member enumeration.
 pub fn iterates_table_member_map(
     db: &DbIndex,
     file_id: FileId,
@@ -254,10 +248,7 @@ fn try_infer_pairs_iter_types_from_table_members(
 
     let table_type = infer_expr(db, cache, table_arg)?;
     if matches!(table_type, LuaType::Global) {
-        // The global table has no enumerable answer: its member types are the very
-        // thing analysis is computing, and a loop over it can declare further
-        // globals whose types are then part of the same union. Any snapshot is a
-        // record of how far inference had progressed, not a fact about the program.
+        // Global table has no stable enumerable answer.
         return Ok(Some(VariadicType::Multi(vec![
             LuaType::String,
             LuaType::Any,
@@ -290,11 +281,7 @@ fn try_infer_pairs_iter_types_from_table_members(
         .collect::<Vec<_>>();
     member_entries.sort_by_key(|(key, _)| member_key_stable_key(key));
 
-    // A dynamic key aliases every access whose key infers to the same type
-    // rather than naming a member, so once one is present the literal keys
-    // beside it are a sample of the indices some file happened to write, not
-    // the table's key domain. Which samples are in the map depends on how far
-    // inference had progressed, so the keys are reported by kind.
+    // Dynamic keys alias by type; literal keys are incomplete samples.
     let keys_are_sampled = member_entries
         .iter()
         .any(|(key, _)| matches!(key, LuaMemberKey::ExprType(_)));

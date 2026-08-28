@@ -22,8 +22,6 @@ macro_rules! alloc_report {
 static GLOBAL: MiMalloc = MiMalloc;
 
 /// Counting wrapper over mimalloc. dhat is unusable here — its per-allocation
-/// backtrace capture costs ~150x on Windows — so `--features alloc-stats`
-/// buys allocation counts, bytes and live-peak for a couple of atomics.
 #[cfg(all(feature = "alloc-stats", not(feature = "dhat-heap")))]
 mod alloc_stats {
     use std::alloc::{GlobalAlloc, Layout};
@@ -125,14 +123,9 @@ struct BenchmarkResult {
 }
 
 /// Process start, so incremental edits can be located on a sampling profiler's
-/// timeline. Set `BENCH_EDIT_LANDMARKS=1` to print a `t+Ns` landmark per edit
-/// and window the samples to just the edit.
 static PROCESS_START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
 /// Edit each sampled file (append a comment, so the token-identity no-op gate
-/// does not skip the work), timing the full production keystroke cost: reindex
-/// of the file plus its dependency expansion, then the post-edit diagnostics
-/// pass. Restores the original text after each edit. Returns the worst edit.
 fn run_incremental_edits(
     analysis: &mut EmmyLuaAnalysis,
     sample: Vec<(FileId, usize)>,
@@ -141,8 +134,6 @@ fn run_incremental_edits(
     let mut worst = std::time::Duration::ZERO;
     let mut edited = 0usize;
     // `BENCH_EDIT_REPEAT=N` edits each file N times, which both fills a
-    // sampling profiler's edit window and separates first-edit cache warming
-    // from the steady-state cost of typing.
     let repeats: usize = std::env::var("BENCH_EDIT_REPEAT")
         .ok()
         .and_then(|value| value.parse().ok())
@@ -189,25 +180,15 @@ fn run_incremental_edits(
             );
         }
         // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
-        // position-based request actually depends on: re-indexing the edited
-        // file alone, then the dependency ripple. It reports what a handler
-        // gated on the edited file's own freshness would wait for.
         let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
             // The expansion has to be captured before the edit lands, exactly as
-            // the production edit path does; recomputing it after the edited
-            // file has been re-indexed under-expands.
             let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
             analysis.update_file_text_only(&uri, edited_text);
             // Just the edited file's own entries — no cross-file stabilization
-            // and no expansion. This is the floor a position-based request has
-            // to wait for if it is gated on its own file rather than on the
-            // whole ripple.
             let t = Instant::now();
             analysis.self_index_files(vec![file_id]);
             let self_only = t.elapsed();
             // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
-            // entries, so a profile of the run contains nothing but the cost a
-            // per-file freshness gate would pay.
             let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
                 std::time::Duration::ZERO
             } else {
@@ -242,10 +223,6 @@ fn run_incremental_edits(
             diagnostics.as_secs_f64()
         );
         // Reverting through the full path costs a whole ripple per iteration —
-        // several times the self-index being measured, and untimed, so it
-        // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
-        // exists to leave nothing but the self-index in the profile, so the
-        // revert has to match it.
         if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
             analysis.update_file_text_only(&uri, text);
             analysis.self_index_files(vec![file_id]);
@@ -287,13 +264,7 @@ fn contribution_entries(analysis: &EmmyLuaAnalysis, file_id: FileId) -> Vec<Stri
     entries
 }
 
-/// `BENCH_IDEMPOTENCY=1` re-indexes the target with its text untouched and
-/// reports what the workspace disagrees with itself about afterwards.
-///
-/// Re-analysing a file whose text and inputs are unchanged ought to reproduce
-/// exactly what was already there. Where it does not, every "has this actually
-/// changed?" optimisation downstream is dead on arrival, because every file
-/// reports itself as changed.
+/// See implementation.
 fn report_reindex_idempotency(analysis: &mut EmmyLuaAnalysis, file_id: FileId) {
     let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
     let before = expansion
@@ -373,8 +344,6 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
 }
 
 /// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread does
-/// on Windows, so the tools have to ask for one explicitly.
 fn main() {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -454,10 +423,6 @@ async fn run() {
     analysis.add_library_workspace(annotations_path.clone());
 
     // The server resolves the gamemode base and loads it as a library, so a
-    // benchmark without those roots re-indexes a much smaller dependency
-    // expansion than a keystroke really pays for. `BENCH_LIBS` lists the extra
-    // library roots (e.g. the `sandbox` and `base` gamemodes) so the harness
-    // measures the workspace the editor actually has open.
     let extra_libraries = std::env::var("BENCH_LIBS")
         .ok()
         .into_iter()
@@ -552,11 +517,6 @@ async fn run() {
     });
 
     // Phase 4b: Incremental edit latency — the full cost a keystroke pays
-    // once it lands: reindex of the edited file plus its whole dependency
-    // expansion, then the post-edit diagnostics pass (shared-data recompute
-    // + the edited file), matching the production LS flow. Worst-case
-    // biased: files are ranked by reindex-expansion size and the top hubs
-    // are edited.
     let mut incremental_worst: Option<std::time::Duration> = None;
     if std::env::var("BENCH_INCREMENTAL").is_ok() {
         let main_ids = analysis
@@ -607,8 +567,6 @@ async fn run() {
             ranked.sort_by_key(|(_, n)| std::cmp::Reverse(*n));
             {
                 // What an edit costs depends almost entirely on how many files
-                // it drags in, so the shape of that distribution matters more
-                // than the worst case the sample below reports.
                 let sizes: Vec<usize> = ranked.iter().map(|(_, n)| *n).collect();
                 let total = sizes.len();
                 let pct = |p: usize| sizes[(total.saturating_sub(1)) * (100 - p) / 100];
@@ -830,9 +788,6 @@ async fn run() {
     eprintln!("Target: ≤10s");
 
     // A single-file edit is the interactive hot path: the user is typing, and
-    // every keystroke that lands pays reindex + diagnostics. Budget it
-    // separately from the cold index — a workspace that indexes in 10s is
-    // useless if each edit costs a second.
     if let Some(worst) = incremental_worst {
         let incremental_target = std::time::Duration::from_secs(1);
         let status = if worst <= incremental_target {

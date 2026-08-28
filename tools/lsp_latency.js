@@ -1,40 +1,4 @@
-// Interactive latency harness for the language server.
-//
-// Drives a real `glua_ls` binary over stdio with the capabilities and the
-// cancellation behaviour vscode-languageclient actually uses, then reports how
-// long the requests a user waits on take. Unit tests cannot catch what this
-// measures: the cost of a request is dominated by whether a reindex is pending,
-// which only shows up against a real workspace.
-//
-// Usage:
-//   LSP_CODEBASE=/path/to/workspace \
-//   LSP_ANNOTATIONS=/path/to/annotations/output \
-//   node tools/lsp_latency.js [--json] [--runs N] [--file relative/path.lua]
-//                             [--edit code|comment]
-//                             [--edit-find TEXT --edit-replace TEXT]
-//                             [--completion-find TEXT]
-//
-// --edit-find/--edit-replace swap one snippet back and forth on every edit, so
-// a specific real change to real code can be reproduced. --completion-find puts
-// the cursor immediately after a given snippet instead of at the first member
-// access in the file. Together they reproduce one user's exact complaint.
-//
-// --edit code (default) inserts a global function declaration, so each edit
-// really changes what the file exports and the full dependency ripple runs.
-// --edit comment inserts a comment line instead: cheaper, and useful for
-// isolating offset-shift cost, but an optimisation that only helps this case
-// has not made real typing any faster.
-//
-// LSP_SERVER overrides the binary (default: target/dist/glua_ls[.exe] if built,
-// else target/release/glua_ls[.exe] — see defaultServerPath, and prefer `dist`).
-// LSP_SERVER_ARGS passes extra space-separated arguments to the server, e.g.
-//   LSP_SERVER_ARGS='--log-level debug' to profile a slow path.
-// --file defaults to the largest .lua file in the workspace, which is the
-// pessimistic case and keeps runs comparable without naming a file per repo.
-//
-// Exits non-zero on a correctness check, not on a latency number: a cancelled
-// diagnostic pull answered with a report thinner than the settled one, or a
-// mid-edit completion that disagrees with the settled one.
+// Interactive latency harness for glua_ls.
 'use strict';
 
 const { spawn } = require('child_process');
@@ -75,11 +39,7 @@ function parseArgs(argv) {
     return opts;
 }
 
-/**
- * Prefers the `dist` profile, which is what ships. `release` lacks its thin LTO
- * and single codegen unit, so measuring it reports numbers no user experiences —
- * an easy mistake to make for a whole session before noticing.
- */
+/** Prefers dist profile. */
 function defaultServerPath() {
     const exe = process.platform === 'win32' ? 'glua_ls.exe' : 'glua_ls';
     const dist = path.resolve(__dirname, '..', 'target', 'dist', exe);
@@ -158,11 +118,7 @@ class LspClient {
 
     _dispatch(message) {
         if (message.id !== undefined && message.method) {
-            // Server-initiated request. Record it and answer so the server is
-            // never left waiting on us. `workspace/configuration` has to come
-            // back as one entry per requested item; null is not a valid result
-            // and would have the server fall back to something a real client
-            // never makes it use.
+            // Answer server requests.
             this.serverRequests.add(message.method);
             const result = message.method === 'workspace/configuration'
                 ? ((message.params && message.params.items) || []).map(() => ({}))
@@ -207,11 +163,7 @@ class LspClient {
 
 const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
 
-/**
- * The subset of VS Code's capabilities that changes server behaviour on the
- * paths this tool measures. Keep in step with vscode-languageclient: the point
- * is to exercise what the real client exercises.
- */
+/** VS Code capabilities for server. */
 function clientCapabilities() {
     return {
         general: {
@@ -266,14 +218,7 @@ function describeReport(result) {
 
 // ------------------------------------------------------------- scenarios ---
 
-/**
- * Finds a position just after a `.` on a member access, which is the case that
- * matters most: it forces the server to resolve a receiver type through the
- * index rather than listing globals.
- *
- * `self.` is preferred because resolving it exercises the class/type indexes
- * rather than a module table, which is where a stale index shows up first.
- */
+/** Finds position after '.' for completion. */
 function memberAccessPosition(text) {
     const lines = text.split('\n');
     const find = (pattern) => {
@@ -354,9 +299,7 @@ async function main() {
     });
     await sleep(1500);
 
-    // `--completion-find` puts the cursor immediately after a given snippet, so
-    // a specific completion can be reproduced instead of whatever member access
-    // happens to come first in the file.
+    // Completion position via --completion-find.
     const completionPosition = (currentText) => {
         if (opts.completionFind === null) return memberAccessPosition(currentText);
         const index = currentText.indexOf(opts.completionFind);
@@ -383,8 +326,7 @@ async function main() {
     const labelsOf = (items) =>
         (Array.isArray(items) ? items : []).map((item) => item.label);
 
-    // Recomputed per call: every edit inserts a line, so a position captured
-    // once would drift and silently start measuring an empty completion.
+    // Completion position recomputed per call.
     const completionAt = async () => client.request('textDocument/completion', {
         textDocument: { uri },
         position: completionPosition(text),
@@ -396,9 +338,7 @@ async function main() {
         version += 1;
         editSerial += 1;
 
-        // `--edit-find`/`--edit-replace` reproduce one specific edit, swapping
-        // back and forth so every keystroke is a real change to real code. Use
-        // it to measure the edit a user actually complained about.
+        // Specific edit via --edit-find.
         if (opts.editFind !== null) {
             const [from, to] = editSerial % 2 === 1
                 ? [opts.editFind, opts.editReplace]
@@ -414,11 +354,7 @@ async function main() {
             return;
         }
 
-        // `--edit comment` keeps the edit syntactically inert, which makes runs
-        // comparable but is also the case an early-cutoff optimisation can make
-        // fast without helping anyone. `--edit code` (the default) declares a
-        // global function instead, so the edit really does change what the file
-        // exports and the whole dependency ripple has to run.
+        // Insert edit per --edit mode.
         const inserted = opts.edit === 'comment'
             ? '-- perf\n'
             : `function _PerfProbe${editSerial}(a) return a end\n`;
@@ -429,9 +365,7 @@ async function main() {
         });
     };
 
-    // A settled measurement is only meaningful once nothing is pending. An
-    // uncancelled diagnostic pull returns exactly when the analysis is fresh,
-    // so it is the cheapest way to wait for quiescence without guessing.
+    // Wait for analysis to settle.
     const waitUntilQuiet = async () => {
         await client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
@@ -441,7 +375,7 @@ async function main() {
     for (let run = 0; run < opts.runs; run++) {
         await waitUntilQuiet();
 
-        // Settled: no pending edit, so this is the pure compute cost.
+        // Measure without pending edits.
         const settled = await completionAt();
         settledCompletion.push(settled.ms);
         const items = settled.message.result
@@ -457,10 +391,7 @@ async function main() {
         if (described.resultId) previousResultId = described.resultId;
         report.checks.diagnosticCount = described.count ?? report.checks.diagnosticCount;
 
-        // While typing: the request the user actually waits on. Its result is
-        // compared against the settled one, because the whole risk of answering
-        // before a reindex finishes is answering *differently* — a thinner or
-        // wrong list is the failure mode, not a slow one.
+        // Measure while typing.
         editDocument();
         const typing = await completionAt();
         typingCompletion.push(typing.ms);
@@ -474,10 +405,7 @@ async function main() {
         completionDrift.push({ missing: missing.length, extra: extra.length,
             sampleMissing: missing.slice(0, 5) });
 
-        // Completion is not the only thing gated on freshness. Hover is issued
-        // from the same keystroke and measured separately, so a fix that makes
-        // completion answer early but leaves every other position-based feature
-        // parked shows up here instead of looking like a win.
+        // Measure hover separately.
         editDocument();
         const [hovered, completed] = await Promise.all([
             client.request('textDocument/hover', {
@@ -488,9 +416,7 @@ async function main() {
         typingHover.push(hovered.ms);
         typingCompletionConcurrent.push(completed.ms);
 
-        // Syntax highlighting. The client retries on ContentModified rather than
-        // waiting, so the number the user feels is the time until a real token
-        // set arrives, not the latency of any single request.
+        // Measure semantic tokens.
         editDocument();
         const highlightStarted = Date.now();
         let highlightRetried = 0;
@@ -513,12 +439,7 @@ async function main() {
         });
         editToFresh.push(fresh.ms);
 
-        // A pull cancelled mid-flight must never come back thinner than the
-        // settled answer — a full report short of what the file really has is
-        // what drops diagnostics in VS Code, and an empty one clears the file.
-        // Stated against the settled count rather than against zero, so a file
-        // that legitimately has no diagnostics does not read as a failure: on a
-        // clean file the correct report is empty too.
+        // Verify cancelled pull does not drop diagnostics.
         editDocument();
         const doomed = client.request('textDocument/diagnostic', {
             textDocument: { uri }, previousResultId,
@@ -544,8 +465,7 @@ async function main() {
     report.measurements.editToFreshAnswer = summarise(editToFresh);
     report.checks.thinReportsOnCancel =
         cancelledPulls.filter((p) => p.thinFullReport).length;
-    // A mid-edit completion that differs from the settled one is a correctness
-    // regression, however fast it came back.
+    // Check mid-edit completion matches baseline.
     report.checks.completionDriftWhileTyping = {
         worstMissing: Math.max(0, ...completionDrift.map((d) => d.missing)),
         worstExtra: Math.max(0, ...completionDrift.map((d) => d.extra)),
