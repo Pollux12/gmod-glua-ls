@@ -189,6 +189,96 @@ impl DynamicFieldIndex {
         }
     }
 
+    /// Re-keys owners whose table literal shifted offset.
+    ///
+    /// A dynamic field is filed under the literal's range, and a write from
+    /// another file is not re-collected when this one is re-indexed, so a
+    /// stale key makes the field unreachable from the type the literal has.
+    pub fn remap_table_ranges(
+        &mut self,
+        map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+    ) {
+        fn remap_owner(
+            owner: &DynamicFieldOwner,
+            map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+        ) -> Option<DynamicFieldOwner> {
+            match owner {
+                DynamicFieldOwner::Table(range) => map
+                    .get(range)
+                    .map(|new| DynamicFieldOwner::Table(new.clone())),
+                DynamicFieldOwner::Type(_) => None,
+            }
+        }
+
+        macro_rules! remap_owner_keyed {
+            ($field:expr) => {{
+                let moved: Vec<(DynamicFieldOwner, DynamicFieldOwner)> = $field
+                    .keys()
+                    .filter_map(|owner| Some((owner.clone(), remap_owner(owner, map)?)))
+                    .collect();
+                // Detached before any is re-filed: one literal's new range can
+                // be another's old one.
+                let detached: Vec<_> = moved
+                    .into_iter()
+                    .filter_map(|(old, new)| Some((new, $field.remove(&old)?)))
+                    .collect();
+                for (new, value) in detached {
+                    $field.entry(new).or_default().extend(value);
+                }
+            }};
+        }
+
+        remap_owner_keyed!(self.field_definitions);
+        remap_owner_keyed!(self.direct_field_definitions);
+        remap_owner_keyed!(self.finite_named_members);
+        remap_owner_keyed!(self.wildcard_definitions);
+
+        for entries in self.file_contributions.values_mut() {
+            for (owner, _, _) in entries.iter_mut() {
+                if let Some(new) = remap_owner(owner, map) {
+                    *owner = new;
+                }
+            }
+        }
+        for entries in self.wildcard_file_contributions.values_mut() {
+            for (owner, _) in entries.iter_mut() {
+                if let Some(new) = remap_owner(owner, map) {
+                    *owner = new;
+                }
+            }
+        }
+    }
+
+    /// Every table-literal range this index is keyed by.
+    #[cfg(test)]
+    pub(crate) fn table_ranges(&self) -> Vec<InFiled<TextRange>> {
+        fn owner_range(owner: &DynamicFieldOwner) -> Option<InFiled<TextRange>> {
+            match owner {
+                DynamicFieldOwner::Table(range) => Some(range.clone()),
+                DynamicFieldOwner::Type(_) => None,
+            }
+        }
+        self.field_definitions
+            .keys()
+            .chain(self.direct_field_definitions.keys())
+            .chain(self.finite_named_members.keys())
+            .chain(self.wildcard_definitions.keys())
+            .filter_map(owner_range)
+            .chain(
+                self.file_contributions
+                    .values()
+                    .flatten()
+                    .filter_map(|(owner, _, _)| owner_range(owner)),
+            )
+            .chain(
+                self.wildcard_file_contributions
+                    .values()
+                    .flatten()
+                    .filter_map(|(owner, _)| owner_range(owner)),
+            )
+            .collect()
+    }
+
     /// Whether the index has finished being built for the current analysis
     /// round. A read taken before that answers from however far the batch walk
     /// happened to get, so an absent field is not yet known to be absent.

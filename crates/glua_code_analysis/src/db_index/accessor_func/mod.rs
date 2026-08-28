@@ -32,6 +32,30 @@ impl AccessorFuncAnnotationIndex {
         self.by_file.entry(file_id).or_default().push(name);
     }
 
+    /// The `@accessorfunc` annotations this file declares, as
+    /// `(function name, name parameter index)`.
+    ///
+    /// The index is consulted by name while analysing calls in *any* file, and
+    /// decides which argument names the accessor - so which `Get*`/`Set*`
+    /// members get synthesized on the owner.
+    #[cfg(test)]
+    pub fn annotations_in_file(&self, file_id: FileId) -> Vec<(&SmolStr, usize)> {
+        let Some(names) = self.by_file.get(&file_id) else {
+            return Vec::new();
+        };
+        names
+            .iter()
+            .filter_map(|name| {
+                let annotation = self
+                    .by_name
+                    .get(name)?
+                    .iter()
+                    .find(|annotation| annotation.file_id == file_id)?;
+                Some((name, annotation.name_param_index))
+            })
+            .collect()
+    }
+
     pub fn contains_name(&self, name: &str) -> bool {
         self.by_name.contains_key(name)
     }

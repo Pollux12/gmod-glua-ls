@@ -38,7 +38,7 @@
 - Network diagnostics compare send/receive flows and order; be conservative with dynamic names, branches, and loops.
 - Annotation metadata changes need ingestion coverage plus a downstream behavior test via real builtins/fixtures.
 - Sort any output derived from hash maps or parallel collection before diagnostics/completions/snapshots.
-- No budgets, caps, or fragile prefilters for performance. Profile first, then index/cache/optimize/parallelize.
+- No budgets, caps, or fragile prefilters for performance: they regress functionality on exactly the large or complex workspaces the server exists for. Profile first, then index/cache/optimize/parallelize. Fix performance at the root cause.
 - Config changes must update structs, `crates/glua_code_analysis/resources/schema.json`, and docs together. Run `cargo run --bin schema_json_gen` and commit the diff.
 - `.gluarc.json` is exclusive when present; otherwise consider `.luarc.json`, `.emmyrc.json`, `.emmyrc.lua` in order. Gamemode-base detection scans workspace roots.
 - Annotations are external library workspaces: `glua_check --gmod-annotations`, `glua_ls --gmod-annotations-path` (or `gmod.annotationsPath` / `gmod.autoLoadAnnotations` in config).
@@ -48,17 +48,17 @@
 - Use `VirtualWorkspace` with realistic addon/gamemode paths; prefer existing GMod fixtures. Call-role tests must load relevant builtins.
 - Tests: `cargo test -p glua_code_analysis <filter>` | `cargo test -p glua_code_analysis` | `cargo test`.
 - Corpus diffs: `glua_check` JSON. Benchmark is for performance only.
-- Determinism (required for index/cache/unresolve changes): `cargo run --release -p determinism`. Requires `DET_CODEBASE` and `DET_ANNOTATIONS`; set `DET_EDIT_FIND`/`DET_EDIT_REPLACE` for edit gates or they skip. Every gate must be `+0` diagnostics and `+0` index.
+- Determinism (required for index/cache/unresolve changes): `cargo run --release -p determinism`. The harness module docs say what each gate proves and which stages are expected to diverge; read them before interpreting a result. Requires `DET_CODEBASE` and `DET_ANNOTATIONS`; set `DET_EDIT_FIND`/`DET_EDIT_REPLACE` for edit gates or they skip. Every gate must be `+0` diagnostics and `+0` index.
   Gates: `repeat`, `fresh`, `order`, `reindex`, `allreindex`, `mainexpand`, `noopedit`, `realedit`, `editrevert`, `indexrepeat`, `burst`.
   Bisect/debug only (expected to diverge): `mainreindex`, `exact`, `split:N`, `editmid`, `restabilize`, `perfile`, `expandwhy`, `faithful`.
   Use `DET_TARGETS=gamemode/core/sh_data.lua` by default for edit target, `sh_configuration` is good for performance related tests (many related files).
-- Perf: `GLUALS_PROFILE=1` for phase timings; `cargo run --release -p benchmark` for large-workspace. For `samply` (ETW on Windows, needs elevation and therefore user permission first): build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark`, run from `target/release`, do not use `--main-thread-only` (analysis runs on spawned thread). Example: `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o out.json.gz ./benchmark.exe`.
+- Perf: `GLUALS_PROFILE=1` for phase timings; `cargo run --release -p benchmark` for large-workspace. For `samply` (ETW on Windows, needs elevation and therefore user permission first) three things have to be right or the profile is useless: build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark` so the PDB exists; run from `target/release`, because samply resolves the PDB by the relative path recorded in the exe; and do not pass `--main-thread-only`, because analysis runs on a spawned big-stack thread and the main thread only shows a join. Example: `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o out.json.gz ./benchmark.exe`. That writes `out.json.gz` plus an `out.json.syms.json` sidecar; the profile holds only addresses, so symbol names come from joining the two by `libs[].debugName` and the frame address against each module's `symbol_table` rva ranges.
 
 ## Commands
 
 - `cargo fmt --all`
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`
-- `pre-commit run --all-files` (mixed-line-ending hook is `manual` stage)
+- `pre-commit run --all-files`, and `pre-commit run --all --hook-stage manual` to include the manual-stage hooks (mixed-line-ending)
 - `cargo build --release` [`-p glua_ls|glua_check|glua_doc_cli`]
 - `cargo build --profile dist` (shipped/CI optimized, thin LTO)
 - `docs/mintlify`: `mint dev` | `mint broken-links`

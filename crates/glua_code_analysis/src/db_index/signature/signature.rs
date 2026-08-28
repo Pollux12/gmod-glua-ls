@@ -112,6 +112,10 @@ impl LuaSignature {
         }
     }
 
+    pub fn return_correlations(&self) -> &[LuaReturnCorrelation] {
+        &self.return_correlations
+    }
+
     pub fn set_return_correlations(&mut self, correlations: Vec<LuaReturnCorrelation>) {
         self.return_correlations = correlations;
     }

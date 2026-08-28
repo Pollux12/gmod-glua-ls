@@ -304,6 +304,20 @@ impl LuaPropertyIndex {
         Some(())
     }
 
+    /// Every documented symbol this file declares, with its property.
+    pub fn properties_in_file(
+        &self,
+        file_id: FileId,
+    ) -> Vec<(&LuaSemanticDeclId, &LuaCommonProperty)> {
+        let Some(owners) = self.in_filed_owner.get(&file_id) else {
+            return Vec::new();
+        };
+        owners
+            .iter()
+            .filter_map(|owner| Some((owner, self.get_property(owner)?)))
+            .collect()
+    }
+
     pub fn get_property(&self, owner_id: &LuaSemanticDeclId) -> Option<&LuaCommonProperty> {
         self.property_owners_map
             .get(owner_id)

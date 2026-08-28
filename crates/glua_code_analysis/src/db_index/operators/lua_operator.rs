@@ -46,7 +46,6 @@ impl LuaOperator {
             func,
         }
     }
-
     pub fn get_owner(&self) -> &LuaOperatorOwner {
         &self.owner
     }
