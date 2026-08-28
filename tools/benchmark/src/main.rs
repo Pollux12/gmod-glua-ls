@@ -203,8 +203,7 @@ fn run_incremental_edits(
             // to wait for if it is gated on its own file rather than on the
             // whole ripple.
             let t = Instant::now();
-            analysis.compilation.remove_index(vec![file_id]);
-            analysis.compilation.update_index(vec![file_id]);
+            analysis.self_index_files(vec![file_id]);
             let self_only = t.elapsed();
             // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
             // entries, so a profile of the run contains nothing but the cost a
@@ -249,8 +248,7 @@ fn run_incremental_edits(
         // revert has to match it.
         if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
             analysis.update_file_text_only(&uri, text);
-            analysis.compilation.remove_index(vec![file_id]);
-            analysis.compilation.update_index(vec![file_id]);
+            analysis.self_index_files(vec![file_id]);
         } else {
             analysis.update_file_by_uri(&uri, Some(text));
         }

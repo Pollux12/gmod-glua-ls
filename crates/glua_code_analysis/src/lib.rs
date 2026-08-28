@@ -29,8 +29,8 @@ pub use diagnostic::*;
 pub use gamemode_base::detect_gamemode_base_libraries;
 pub use glua_codestyle::*;
 use glua_parser::{
-    LineIndex, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexKey, LuaLocalStat, LuaNameExpr,
-    LuaParenExpr, LuaParser, LuaSyntaxTree,
+    LineIndex, LuaAssignStat, LuaAstNode, LuaAstToken, LuaCallExpr, LuaExpr, LuaIndexKey,
+    LuaLocalStat, LuaNameExpr, LuaParenExpr, LuaParser, LuaSyntaxTree, LuaTableExpr, LuaTableField,
 };
 pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
@@ -900,6 +900,352 @@ fn lexically_normalize_path(path: &Path) -> PathBuf {
     normalized
 }
 
+#[derive(Debug, Clone, Hash, PartialEq, Eq)]
+enum TableAnchor {
+    Global(String),
+    Local {
+        decl_name: String,
+        decl_pos: u32,
+        path: String,
+    },
+    Tree {
+        parent_kind: String,
+        nth: usize,
+    },
+}
+
+#[allow(dead_code)]
+fn collect_table_ranges(db: &DbIndex, file_id: FileId) -> Vec<InFiled<rowan::TextRange>> {
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return Vec::new();
+    };
+    let chunk = tree.get_chunk_node();
+    let mut ranges = Vec::new();
+    for table_expr in chunk.descendants::<LuaTableExpr>() {
+        ranges.push(InFiled::new(file_id, table_expr.get_range()));
+    }
+    ranges.sort_by_key(|r| r.value.start());
+    ranges
+}
+
+fn expr_path_strings(expr: &LuaExpr) -> Option<Vec<String>> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => Some(vec![name_expr.get_name_text()?.to_string()]),
+        LuaExpr::IndexExpr(index_expr) => {
+            if index_expr.get_index_token()?.is_colon() {
+                return None;
+            }
+            let mut path = expr_path_strings(&index_expr.get_prefix_expr()?)?;
+            let name = match index_expr.get_index_key()? {
+                LuaIndexKey::Name(n) => n.get_name_text().to_string(),
+                LuaIndexKey::String(s) => s.get_value().to_string(),
+                LuaIndexKey::Integer(i) => i.syntax().text().to_string(),
+                LuaIndexKey::Expr(_) | LuaIndexKey::Idx(_) => return None,
+            };
+            path.push(name);
+            Some(path)
+        }
+        _ => None,
+    }
+}
+
+fn var_path_strings(var: &glua_parser::LuaVarExpr) -> Option<Vec<String>> {
+    match var {
+        glua_parser::LuaVarExpr::NameExpr(n) => Some(vec![n.get_name_text()?.to_string()]),
+        glua_parser::LuaVarExpr::IndexExpr(idx) => {
+            let expr: LuaExpr = LuaExpr::IndexExpr(idx.clone());
+            expr_path_strings(&expr)
+        }
+    }
+}
+
+#[allow(clippy::only_used_in_recursion)]
+fn table_global_path_recursive(
+    db: &DbIndex,
+    file_id: FileId,
+    table: LuaTableExpr,
+) -> Option<String> {
+    if let Some(field) = table.get_parent::<LuaTableField>() {
+        let key = field.get_field_key()?;
+        let key_str = match key {
+            glua_parser::LuaIndexKey::Name(n) => n.get_name_text().to_string(),
+            glua_parser::LuaIndexKey::String(s) => s.get_value().to_string(),
+            _ => return None,
+        };
+        let parent_table = field.get_parent::<LuaTableExpr>()?;
+        let parent_path = table_global_path_recursive(db, file_id, parent_table)?;
+        return Some(format!("{}.{}", parent_path, key_str));
+    }
+    let mut current = table.syntax().clone();
+    while let Some(parent) = current.parent() {
+        if let Some(assign) = LuaAssignStat::cast(parent.clone()) {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            for (var, expr) in vars.iter().zip(exprs.iter()) {
+                if expr.get_range() == table.get_range() {
+                    if let Some(mut path) = var_path_strings(var) {
+                        // Canonicalize _G / _ENV prefix like global_path_for_expr
+                        if path.len() > 1 && matches!(path[0].as_str(), "_G" | "_ENV") {
+                            path.remove(0);
+                        }
+                        return Some(path.join("."));
+                    }
+                }
+            }
+            break;
+        }
+        if glua_parser::LuaLocalStat::can_cast(parent.kind().into()) {
+            break;
+        }
+        current = parent;
+    }
+    None
+}
+
+fn table_local_anchor(db: &DbIndex, file_id: FileId, table: LuaTableExpr) -> Option<TableAnchor> {
+    let mut parts: Vec<String> = Vec::new();
+    let mut cur = table;
+    loop {
+        if let Some(field) = cur.get_parent::<LuaTableField>() {
+            let key = field.get_field_key()?;
+            let key_str = match key {
+                glua_parser::LuaIndexKey::Name(n) => n.get_name_text().to_string(),
+                glua_parser::LuaIndexKey::String(s) => s.get_value().to_string(),
+                _ => return None,
+            };
+            parts.push(key_str);
+            if let Some(parent_table) = field.get_parent::<LuaTableExpr>() {
+                cur = parent_table;
+                continue;
+            } else {
+                return None;
+            }
+        }
+        let parent = cur.syntax().parent()?;
+        if let Some(local) = glua_parser::LuaLocalStat::cast(parent.clone()) {
+            let values = local.get_value_exprs().collect::<Vec<_>>();
+            let idx = values
+                .iter()
+                .position(|v| v.get_range() == cur.get_range())?;
+            let names = local.get_local_name_list().collect::<Vec<_>>();
+            let name = names.get(idx)?;
+            parts.reverse();
+            let path = parts.join(".");
+            let name_text = name.get_name_token()?.get_name_text().to_string();
+            return Some(TableAnchor::Local {
+                decl_name: name_text,
+                decl_pos: u32::from(name.get_position()),
+                path,
+            });
+        }
+        if let Some(assign) = LuaAssignStat::cast(parent.clone()) {
+            let (vars, exprs) = assign.get_var_and_expr_list();
+            let idx = exprs
+                .iter()
+                .position(|e| e.get_range() == cur.get_range())?;
+            let var = vars.get(idx)?;
+            match var {
+                glua_parser::LuaVarExpr::NameExpr(name_expr) => {
+                    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+                    let name_text = name_expr.get_name_text()?;
+                    let decl =
+                        decl_tree.find_local_decl(name_text.as_str(), name_expr.get_position())?;
+                    parts.reverse();
+                    let path = parts.join(".");
+                    return Some(TableAnchor::Local {
+                        decl_name: decl.get_name().to_string(),
+                        decl_pos: u32::from(decl.get_id().position),
+                        path,
+                    });
+                }
+                glua_parser::LuaVarExpr::IndexExpr(_) => {
+                    // Handle `t.inner = {}` where `t` is a local
+                    let var_path = var_path_strings(var)?;
+                    let root_name = var_path.first()?.clone();
+                    // Find the leftmost NameExpr for the root to get its position
+                    let root_name_expr = var
+                        .syntax()
+                        .descendants()
+                        .find_map(glua_parser::LuaNameExpr::cast)?;
+                    let decl_tree = db.get_decl_index().get_decl_tree(&file_id)?;
+                    let decl =
+                        decl_tree.find_local_decl(&root_name, root_name_expr.get_position())?;
+                    // var_path is e.g. ["t","inner"] or ["t","a","b"]
+                    let suffix = if var_path.len() > 1 {
+                        var_path[1..].join(".")
+                    } else {
+                        String::new()
+                    };
+                    parts.reverse();
+                    let inner = parts.join(".");
+                    let mut combined = Vec::new();
+                    if !suffix.is_empty() {
+                        combined.push(suffix);
+                    }
+                    if !inner.is_empty() {
+                        combined.push(inner);
+                    }
+                    let final_path = combined.join(".");
+                    return Some(TableAnchor::Local {
+                        decl_name: decl.get_name().to_string(),
+                        decl_pos: u32::from(decl.get_id().position),
+                        path: final_path,
+                    });
+                }
+            }
+        }
+        return None;
+    }
+}
+
+fn table_tree_anchor(table: LuaTableExpr) -> TableAnchor {
+    let parent = table
+        .syntax()
+        .parent()
+        .map(|n| format!("{:?}", n.kind()))
+        .unwrap_or_else(|| "root".to_string());
+    let parent_node = table
+        .syntax()
+        .parent()
+        .unwrap_or_else(|| table.syntax().clone());
+    let mut idx = 0usize;
+    let mut found = 0usize;
+    for child in parent_node.children() {
+        if LuaTableExpr::can_cast(child.kind().into()) {
+            if child.text_range() == table.get_range() {
+                found = idx;
+            }
+            idx += 1;
+        }
+    }
+    TableAnchor::Tree {
+        parent_kind: parent,
+        nth: found,
+    }
+}
+
+fn table_anchor(db: &DbIndex, range: &InFiled<rowan::TextRange>) -> TableAnchor {
+    let file_id = range.file_id;
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return TableAnchor::Tree {
+            parent_kind: "missing".to_string(),
+            nth: 0,
+        };
+    };
+    let chunk = tree.get_chunk_node();
+    for table in chunk.descendants::<LuaTableExpr>() {
+        if table.get_range() == range.value {
+            if let Some(global) = table_global_path_recursive(db, file_id, table.clone()) {
+                return TableAnchor::Global(global);
+            }
+            if let Some(local) = table_local_anchor(db, file_id, table.clone()) {
+                return local;
+            }
+            return table_tree_anchor(table);
+        }
+    }
+    TableAnchor::Tree {
+        parent_kind: "fallback".to_string(),
+        nth: 0,
+    }
+}
+
+#[allow(dead_code)]
+fn build_anchor_map(
+    old: Vec<InFiled<rowan::TextRange>>,
+    new: Vec<InFiled<rowan::TextRange>>,
+    db: &DbIndex,
+) -> std::collections::HashMap<
+    InFiled<rowan::TextRange>,
+    InFiled<rowan::TextRange>,
+    rustc_hash::FxBuildHasher,
+> {
+    use rustc_hash::FxHashMap;
+    if old.is_empty() || new.is_empty() {
+        return FxHashMap::default();
+    }
+    let old_anchored: Vec<(InFiled<rowan::TextRange>, TableAnchor)> = old
+        .iter()
+        .map(|r| (r.clone(), table_anchor(db, r)))
+        .collect();
+    // For new, we need db after reindex; table_anchor uses new db's tree
+    let new_anchored: Vec<(InFiled<rowan::TextRange>, TableAnchor)> = new
+        .iter()
+        .map(|r| (r.clone(), table_anchor(db, r)))
+        .collect();
+
+    if old.len() != new.len() {
+        let old_set: std::collections::HashSet<TableAnchor> =
+            old_anchored.iter().map(|(_, a)| a.clone()).collect();
+        let new_set: std::collections::HashSet<TableAnchor> =
+            new_anchored.iter().map(|(_, a)| a.clone()).collect();
+        if old_set != new_set {
+            eprintln!(
+                "[anchor] len mismatch old={} new={} anchor mismatch, skipping migration (old_set {} new_set {})",
+                old.len(),
+                new.len(),
+                old_set.len(),
+                new_set.len()
+            );
+            return FxHashMap::default();
+        }
+    }
+
+    let mut new_by_anchor: FxHashMap<TableAnchor, InFiled<rowan::TextRange>> = FxHashMap::default();
+    for (range, anchor) in new_anchored {
+        // Keep first occurrence if duplicate (should be unique)
+        new_by_anchor.entry(anchor).or_insert(range);
+    }
+    let mut map: FxHashMap<InFiled<rowan::TextRange>, InFiled<rowan::TextRange>> =
+        FxHashMap::default();
+    for (old_range, anchor) in old_anchored {
+        if let Some(new_range) = new_by_anchor.get(&anchor) {
+            map.insert(old_range, new_range.clone());
+        }
+    }
+    if old.len() == new.len() && map.len() != old.len() {
+        eprintln!(
+            "[anchor] len equal but map incomplete {}/{} (likely TreePath collision)",
+            map.len(),
+            old.len()
+        );
+    }
+    map
+}
+
+fn collect_anchored_map(
+    db: &DbIndex,
+    file_id: FileId,
+) -> rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>> {
+    use rustc_hash::{FxHashMap, FxHashSet};
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return FxHashMap::default();
+    };
+    let chunk = tree.get_chunk_node();
+    let mut map: FxHashMap<TableAnchor, InFiled<rowan::TextRange>> = FxHashMap::default();
+    let mut ambiguous: FxHashSet<TableAnchor> = FxHashSet::default();
+    for table in chunk.descendants::<LuaTableExpr>() {
+        let range = InFiled::new(file_id, table.get_range());
+        let anchor = if let Some(global) = table_global_path_recursive(db, file_id, table.clone()) {
+            TableAnchor::Global(global)
+        } else if let Some(local) = table_local_anchor(db, file_id, table.clone()) {
+            local
+        } else {
+            table_tree_anchor(table)
+        };
+        if ambiguous.contains(&anchor) {
+            continue;
+        }
+        #[allow(clippy::map_entry)]
+        if map.contains_key(&anchor) {
+            map.remove(&anchor);
+            ambiguous.insert(anchor);
+        } else {
+            map.insert(anchor, range);
+        }
+    }
+    map
+}
+
 #[derive(Debug)]
 pub struct EmmyLuaAnalysis {
     pub compilation: LuaCompilation,
@@ -909,6 +1255,10 @@ pub struct EmmyLuaAnalysis {
     pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
     #[cfg(test)]
     cross_file_stabilization_invocations: usize,
+    pending_table_ranges: rustc_hash::FxHashMap<
+        FileId,
+        rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>>,
+    >,
 }
 
 impl EmmyLuaAnalysis {
@@ -922,6 +1272,7 @@ impl EmmyLuaAnalysis {
             inferred_guard_propagation_stats: InferredGuardPropagationStats::default(),
             #[cfg(test)]
             cross_file_stabilization_invocations: 0,
+            pending_table_ranges: rustc_hash::FxHashMap::default(),
         }
     }
 
@@ -1075,6 +1426,12 @@ impl EmmyLuaAnalysis {
                         .has_annotated_vgui_parent_calls(existing)
             };
             if is_special {
+                let anchored = collect_anchored_map(self.compilation.get_db(), existing);
+                if !anchored.is_empty() {
+                    self.pending_table_ranges
+                        .entry(existing)
+                        .or_insert(anchored);
+                }
                 let file_id = self
                     .compilation
                     .get_db_mut()
@@ -1086,6 +1443,40 @@ impl EmmyLuaAnalysis {
                     expansion,
                     old_guard_snapshot,
                 );
+                // Apply element/table remap if stashed, then clear
+                if let Some(old_map) = self.pending_table_ranges.remove(&existing) {
+                    let new_map = collect_anchored_map(self.compilation.get_db(), file_id);
+                    let mut global_remap: rustc_hash::FxHashMap<
+                        InFiled<rowan::TextRange>,
+                        InFiled<rowan::TextRange>,
+                    > = rustc_hash::FxHashMap::default();
+                    let mut deleted: Vec<InFiled<rowan::TextRange>> = Vec::new();
+                    for (anchor, old_range) in old_map {
+                        if let Some(new_range) = new_map.get(&anchor) {
+                            if &old_range != new_range {
+                                global_remap.insert(old_range.clone(), new_range.clone());
+                            }
+                        } else {
+                            deleted.push(old_range);
+                        }
+                    }
+                    if !global_remap.is_empty() {
+                        self.compilation
+                            .get_db_mut()
+                            .get_member_index_mut()
+                            .remap_elements(&global_remap);
+                        self.compilation
+                            .get_db_mut()
+                            .get_type_index_mut()
+                            .remap_table_const(&global_remap);
+                    }
+                    if !deleted.is_empty() {
+                        self.compilation
+                            .get_db_mut()
+                            .get_member_index_mut()
+                            .remove_deleted_element_owners(&deleted);
+                    }
+                }
                 profile::phase_report("update_file_by_uri");
                 return Some(file_id);
             }
@@ -1191,6 +1582,12 @@ impl EmmyLuaAnalysis {
             } else {
                 None
             };
+            let anchored = collect_anchored_map(self.compilation.get_db(), existing);
+            if !anchored.is_empty() {
+                self.pending_table_ranges
+                    .entry(existing)
+                    .or_insert(anchored);
+            }
             let file_id = self
                 .compilation
                 .get_db_mut()
@@ -1487,6 +1884,13 @@ impl EmmyLuaAnalysis {
             (None, InferredGuardSnapshot::default())
         };
 
+        if let Some(fid) = existing_file_id {
+            let anchored = collect_anchored_map(self.compilation.get_db(), fid);
+            if !anchored.is_empty() {
+                self.pending_table_ranges.entry(fid).or_insert(anchored);
+            }
+        }
+
         let file_id = self
             .compilation
             .get_db_mut()
@@ -1518,6 +1922,42 @@ impl EmmyLuaAnalysis {
                 &incremental_source_file_ids,
             );
             self.reindex_changed_inferred_param_consumers(&old_guard_facts, &reindex_file_ids);
+            // Remap Element/TableConst that shifted due to offset changes in the edited file.
+            if let Some(fid) = existing_file_id {
+                if let Some(old_map) = self.pending_table_ranges.remove(&fid) {
+                    let new_map = collect_anchored_map(self.compilation.get_db(), file_id);
+                    let mut global_remap: rustc_hash::FxHashMap<
+                        InFiled<rowan::TextRange>,
+                        InFiled<rowan::TextRange>,
+                    > = rustc_hash::FxHashMap::default();
+                    let mut deleted: Vec<InFiled<rowan::TextRange>> = Vec::new();
+                    for (anchor, old_range) in old_map {
+                        if let Some(new_range) = new_map.get(&anchor) {
+                            if &old_range != new_range {
+                                global_remap.insert(old_range.clone(), new_range.clone());
+                            }
+                        } else {
+                            deleted.push(old_range);
+                        }
+                    }
+                    if !global_remap.is_empty() {
+                        self.compilation
+                            .get_db_mut()
+                            .get_member_index_mut()
+                            .remap_elements(&global_remap);
+                        self.compilation
+                            .get_db_mut()
+                            .get_type_index_mut()
+                            .remap_table_const(&global_remap);
+                    }
+                    if !deleted.is_empty() {
+                        self.compilation
+                            .get_db_mut()
+                            .get_member_index_mut()
+                            .remove_deleted_element_owners(&deleted);
+                    }
+                }
+            }
         }
 
         Some(file_id)
@@ -1563,6 +2003,13 @@ impl EmmyLuaAnalysis {
             return None;
         }
 
+        if let Some(fid) = existing_file_id {
+            let anchored = collect_anchored_map(self.compilation.get_db(), fid);
+            if !anchored.is_empty() {
+                self.pending_table_ranges.entry(fid).or_insert(anchored);
+            }
+        }
+
         self.compilation
             .get_db_mut()
             .get_vfs_mut()
@@ -1585,6 +2032,12 @@ impl EmmyLuaAnalysis {
                 if old_text == text.as_str() {
                     return Some(file_id);
                 }
+            }
+            // Stash old table anchors before VFS mutation so self_index can remap
+            // Element owners and TableConst that shifted due to earlier edits.
+            let anchored = collect_anchored_map(self.compilation.get_db(), file_id);
+            if !anchored.is_empty() {
+                self.pending_table_ranges.entry(file_id).or_insert(anchored);
             }
         }
 
@@ -1729,8 +2182,66 @@ impl EmmyLuaAnalysis {
     /// entries are keyed by position, so an edit that shifts offsets is exactly
     /// what makes them stop matching the tree.
     pub fn self_index_files(&mut self, file_ids: Vec<FileId>) {
+        // Capture old anchored tables. If the edit came through update_file_text_only
+        // or update_file_by_uri, the old anchors are already stashed in
+        // pending_table_ranges before the VFS mutation; otherwise collect from the
+        // current tree before we drop it.
+        let mut old_maps: rustc_hash::FxHashMap<
+            FileId,
+            rustc_hash::FxHashMap<TableAnchor, InFiled<rowan::TextRange>>,
+        > = rustc_hash::FxHashMap::default();
+        for fid in &file_ids {
+            if let Some(pending) = self.pending_table_ranges.remove(fid) {
+                old_maps.insert(*fid, pending);
+            } else {
+                let m = collect_anchored_map(self.compilation.get_db(), *fid);
+                if !m.is_empty() {
+                    old_maps.insert(*fid, m);
+                }
+            }
+        }
+
         self.compilation.remove_index(file_ids.clone());
-        self.compilation.update_index(file_ids);
+        self.compilation.update_index(file_ids.clone());
+
+        // Build global remap oldRange -> newRange by matching anchors.
+        let mut global_remap: rustc_hash::FxHashMap<
+            InFiled<rowan::TextRange>,
+            InFiled<rowan::TextRange>,
+        > = rustc_hash::FxHashMap::default();
+        let mut deleted: Vec<InFiled<rowan::TextRange>> = Vec::new();
+        for fid in &file_ids {
+            let old_map = old_maps.remove(fid);
+            let new_map = collect_anchored_map(self.compilation.get_db(), *fid);
+            if let Some(old_map) = old_map {
+                for (anchor, old_range) in old_map {
+                    if let Some(new_range) = new_map.get(&anchor) {
+                        if &old_range != new_range {
+                            global_remap.insert(old_range.clone(), new_range.clone());
+                        }
+                    } else {
+                        deleted.push(old_range);
+                    }
+                }
+            }
+        }
+
+        if !global_remap.is_empty() {
+            self.compilation
+                .get_db_mut()
+                .get_member_index_mut()
+                .remap_elements(&global_remap);
+            self.compilation
+                .get_db_mut()
+                .get_type_index_mut()
+                .remap_table_const(&global_remap);
+        }
+        if !deleted.is_empty() {
+            self.compilation
+                .get_db_mut()
+                .get_member_index_mut()
+                .remove_deleted_element_owners(&deleted);
+        }
     }
 
     pub fn self_index_files_and_get_ripple_with_changed(
