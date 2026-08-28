@@ -1723,6 +1723,85 @@ impl LuaMemberIndex {
         self.function_scope_ranges.remove(&file_id);
         self.conditional_branch_ranges.remove(&file_id);
     }
+
+    pub fn remap_elements(
+        &mut self,
+        map: &rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>>,
+    ) {
+        if map.is_empty() {
+            return;
+        }
+        let to_move: Vec<(LuaMemberId, LuaMemberOwner, LuaMemberOwner)> = self
+            .member_current_owner
+            .iter()
+            .filter_map(|(mid, owner)| {
+                if let LuaMemberOwner::Element(old) = owner {
+                    if let Some(new) = map.get(old) {
+                        return Some((
+                            *mid,
+                            LuaMemberOwner::Element(old.clone()),
+                            LuaMemberOwner::Element(new.clone()),
+                        ));
+                    }
+                }
+                None
+            })
+            .collect();
+        for (member_id, old_owner, new_owner) in to_move {
+            // Remove from old owner's structures
+            self.detach_member_from_owner(&old_owner, member_id);
+            // The detach already removed from owner_members and key indexes.
+            // Now attach to new owner using the established rehome pattern.
+            self.set_member_owner(new_owner.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(new_owner, member_id);
+            // Clean up old tombstone if now empty
+            if let LuaMemberOwner::Element(old_range) = &old_owner {
+                if self
+                    .owner_members
+                    .get(&old_owner)
+                    .is_none_or(|m| m.is_empty())
+                {
+                    self.owner_members.remove(&old_owner);
+                    if let Some(set) = self.in_filed.get_mut(&old_range.file_id) {
+                        set.remove(&MemberOrOwner::Owner(old_owner.clone()));
+                        if set.is_empty() {
+                            self.in_filed.remove(&old_range.file_id);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn remove_deleted_element_owners(&mut self, deleted: &[crate::InFiled<TextRange>]) {
+        for range in deleted {
+            let owner = LuaMemberOwner::Element(range.clone());
+            if let Some(member_items) = self.owner_members.remove(&owner) {
+                for item in member_items.get_member_items() {
+                    match item {
+                        LuaMemberIndexItem::One(id) => {
+                            self.member_current_owner.remove(id);
+                            self.remove_member_from_all_owner_key_indexes(&owner, *id);
+                            self.remove_current_owner_member(&owner, *id);
+                        }
+                        LuaMemberIndexItem::Many(ids) => {
+                            for id in ids {
+                                self.member_current_owner.remove(id);
+                                self.remove_member_from_all_owner_key_indexes(&owner, *id);
+                                self.remove_current_owner_member(&owner, *id);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(set) = self.in_filed.get_mut(&range.file_id) {
+                set.remove(&MemberOrOwner::Owner(owner));
+                if set.is_empty() {
+                    self.in_filed.remove(&range.file_id);
+                }
+            }
+        }
+    }
 }
 
 impl LuaIndex for LuaMemberIndex {
