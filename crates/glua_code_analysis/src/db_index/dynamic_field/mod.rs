@@ -82,6 +82,35 @@ fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
     )
 }
 
+/// Merges one owner's named definitions into another's, per field name, so a
+/// name both hold keeps the definitions of each.
+fn merge_field_definitions(
+    into: &mut HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+    from: HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+) {
+    for (field_name, definitions) in from {
+        // The canonical order and the no-duplicates rule `add_field_inner`
+        // maintains on insert have to survive the merge.
+        let slot = into.entry(field_name).or_default();
+        slot.extend(definitions);
+        slot.sort_unstable_by_key(definition_sort_key);
+        slot.dedup();
+    }
+}
+
+/// Appends the wildcard definitions the target does not already hold.
+///
+/// Order is left alone: `add_wildcard_definition` files these in walk order
+/// rather than a canonical one, so sorting here would make a re-indexed
+/// workspace disagree with a cold build.
+fn merge_wildcard_definitions(into: &mut Vec<InFiled<TextRange>>, from: Vec<InFiled<TextRange>>) {
+    for definition in from {
+        if !into.contains(&definition) {
+            into.push(definition);
+        }
+    }
+}
+
 impl DynamicFieldIndex {
     pub fn new() -> Self {
         Self::default()
@@ -210,8 +239,13 @@ impl DynamicFieldIndex {
             }
         }
 
+        // The moved group is merged into whatever the target key already
+        // holds rather than replacing it. Only literals with a stable anchor
+        // are in `map`, so an unanchored literal's cross-file entry can already
+        // sit on the range an anchored one moves onto; `extend` on the nested
+        // maps would drop that entry instead of merging it.
         macro_rules! remap_owner_keyed {
-            ($field:expr) => {{
+            ($field:expr, |$slot:ident, $group:ident| $merge:block) => {{
                 let moved: Vec<(DynamicFieldOwner, DynamicFieldOwner)> = $field
                     .keys()
                     .filter_map(|owner| Some((owner.clone(), remap_owner(owner, map)?)))
@@ -222,16 +256,31 @@ impl DynamicFieldIndex {
                     .into_iter()
                     .filter_map(|(old, new)| Some((new, $field.remove(&old)?)))
                     .collect();
-                for (new, value) in detached {
-                    $field.entry(new).or_default().extend(value);
+                for (new, group) in detached {
+                    let $slot = $field.entry(new).or_default();
+                    let $group = group;
+                    $merge
                 }
             }};
         }
 
-        remap_owner_keyed!(self.field_definitions);
-        remap_owner_keyed!(self.direct_field_definitions);
-        remap_owner_keyed!(self.finite_named_members);
-        remap_owner_keyed!(self.wildcard_definitions);
+        remap_owner_keyed!(self.owner_fields, |slot, group| {
+            for (field_name, files) in group {
+                slot.entry(field_name).or_default().extend(files);
+            }
+        });
+        remap_owner_keyed!(self.field_definitions, |slot, group| {
+            merge_field_definitions(slot, group)
+        });
+        remap_owner_keyed!(self.direct_field_definitions, |slot, group| {
+            merge_field_definitions(slot, group)
+        });
+        remap_owner_keyed!(self.finite_named_members, |slot, group| {
+            slot.extend(group)
+        });
+        remap_owner_keyed!(self.wildcard_definitions, |slot, group| {
+            merge_wildcard_definitions(slot, group)
+        });
 
         for entries in self.file_contributions.values_mut() {
             for (owner, _, _) in entries.iter_mut() {
@@ -258,8 +307,9 @@ impl DynamicFieldIndex {
                 DynamicFieldOwner::Type(_) => None,
             }
         }
-        self.field_definitions
+        self.owner_fields
             .keys()
+            .chain(self.field_definitions.keys())
             .chain(self.direct_field_definitions.keys())
             .chain(self.finite_named_members.keys())
             .chain(self.wildcard_definitions.keys())
@@ -648,6 +698,69 @@ mod tests {
 
     fn range(start: u32, end: u32) -> TextRange {
         TextRange::new(TextSize::from(start), TextSize::from(end))
+    }
+
+    fn shift(
+        file_id: FileId,
+        from: TextRange,
+        to: TextRange,
+    ) -> rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>> {
+        let mut map = rustc_hash::FxHashMap::default();
+        map.insert(InFiled::new(file_id, from), InFiled::new(file_id, to));
+        map
+    }
+
+    /// Every owner-keyed store has to move together. `owner_fields` backs
+    /// `has_field`, so leaving it behind strands the field on a range no type
+    /// resolves to any more.
+    #[test]
+    fn remapping_a_literal_moves_the_field_lookup_with_it() {
+        let edited = FileId::new(1);
+        let contributor = FileId::new(2);
+        let old = DynamicFieldOwner::Table(InFiled::new(edited, range(0, 10)));
+        let new = DynamicFieldOwner::Table(InFiled::new(edited, range(20, 30)));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(old.clone(), SmolStr::new("f"), contributor, range(1, 2));
+        index.remap_table_ranges(&shift(edited, range(0, 10), range(20, 30)));
+
+        assert!(index.has_field(&new, "f"));
+        assert!(!index.has_field(&old, "f"));
+        assert_eq!(index.field_definitions(&new, "f").len(), 1);
+    }
+
+    /// Only anchored literals are remapped, so an unanchored one's cross-file
+    /// entry can already sit on the range an anchored one moves onto. Merging
+    /// has to keep both, per field name.
+    #[test]
+    fn remapping_onto_an_occupied_range_keeps_both_owners_definitions() {
+        let edited = FileId::new(1);
+        let contributor = FileId::new(2);
+        let moved_from = DynamicFieldOwner::Table(InFiled::new(edited, range(0, 10)));
+        let occupied = DynamicFieldOwner::Table(InFiled::new(edited, range(20, 30)));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(
+            moved_from.clone(),
+            SmolStr::new("shared"),
+            contributor,
+            range(1, 2),
+        );
+        index.add_field(
+            occupied.clone(),
+            SmolStr::new("shared"),
+            contributor,
+            range(3, 4),
+        );
+        index.remap_table_ranges(&shift(edited, range(0, 10), range(20, 30)));
+
+        assert_eq!(
+            index.field_definitions(&occupied, "shared"),
+            [
+                InFiled::new(contributor, range(1, 2)),
+                InFiled::new(contributor, range(3, 4)),
+            ]
+        );
     }
 
     #[test]
