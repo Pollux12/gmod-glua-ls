@@ -501,6 +501,58 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
     changed
 }
 
+/// The parallel re-derivation's per-file output: candidate type writes for the
+/// settled iterator variables, plus the cache side effects inference produced.
+struct IterVarRefreshResult {
+    file_id: FileId,
+    pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
+    guard_dependencies: HashSet<crate::LuaInferredGuardOwner>,
+    updates: Vec<unresolve::IterVarTypeUpdate>,
+}
+
+impl IterVarRefreshResult {
+    fn new(file_id: FileId) -> Self {
+        Self {
+            file_id,
+            pending_type_decls: Vec::new(),
+            guard_dependencies: HashSet::new(),
+            updates: Vec::new(),
+        }
+    }
+}
+
+/// A settled iterator-variable candidate carried across the parallel boundary:
+/// rowan-backed AST handles are not `Send`, so the closure re-reads the
+/// expressions from the file's syntax tree by syntax id.
+struct SettledIterVarCandidate {
+    iter_expr_ids: Vec<LuaSyntaxId>,
+    var_positions: Vec<rowan::TextSize>,
+}
+
+impl SettledIterVarCandidate {
+    fn new(iter_var: &UnResolveIterVar) -> Self {
+        Self {
+            iter_expr_ids: iter_var
+                .iter_exprs
+                .iter()
+                .map(LuaAstNode::get_syntax_id)
+                .collect(),
+            var_positions: iter_var
+                .iter_vars
+                .iter()
+                .map(glua_parser::LuaAstToken::get_position)
+                .collect(),
+        }
+    }
+
+    fn iter_exprs(&self, root: &LuaSyntaxNode) -> Option<Vec<LuaExpr>> {
+        self.iter_expr_ids
+            .iter()
+            .map(|id| LuaExpr::cast(id.to_node_from_root(root)?))
+            .collect()
+    }
+}
+
 /// Re-derives `for ... in pairs(t)` variable types that were read off `t`'s
 /// member map or its declared field type.
 ///
@@ -523,16 +575,82 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
         )
     });
 
-    let files = candidates
-        .iter()
-        .map(|iter_var| iter_var.file_id)
-        .collect::<HashSet<_>>();
-    context.infer_manager.clear_files_iter_var_results(&files);
+    let mut candidates_by_file = HashMap::<FileId, Vec<SettledIterVarCandidate>>::new();
+    for iter_var in candidates {
+        let candidate = SettledIterVarCandidate::new(&iter_var);
+        candidates_by_file
+            .entry(iter_var.file_id)
+            .or_default()
+            .push(candidate);
+    }
+
+    let file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    context
+        .infer_manager
+        .clear_files_iter_var_results(&file_ids.iter().copied().collect());
+
+    let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+
+    // Inference reads the settled indexes and records candidate type writes
+    // without mutating the database. Apply the writes in stable file and source
+    // order on the caller thread, so the result does not depend on the schedule.
+    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+                building_dynamic_field_index: false,
+            },
+        );
+        let mut result = IterVarRefreshResult::new(file_id);
+        let root = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root());
+        if let Some(root) = &root {
+            for candidate in &candidates_by_file[&file_id] {
+                let Some(iter_exprs) = candidate.iter_exprs(root) else {
+                    continue;
+                };
+                if let Ok(updates) = unresolve::resolve_settled_iter_var_readonly(
+                    db,
+                    &mut infer_cache,
+                    file_id,
+                    &iter_exprs,
+                    &candidate.var_positions,
+                ) {
+                    result.updates.extend(updates);
+                }
+            }
+        }
+        result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
+        result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
+        result
+    });
 
     let writes_before = db.get_type_index().type_writes();
-    for mut iter_var in candidates {
-        let cache = context.infer_manager.get_infer_cache(iter_var.file_id);
-        let _ = unresolve::resolve_settled_iter_var(db, cache, &mut iter_var);
+    for result in results {
+        context.infer_manager.merge_inference_side_effects(
+            result.file_id,
+            result.pending_type_decls,
+            result.guard_dependencies,
+        );
+        for update in result.updates {
+            common::write_type_cache(db, update.owner.clone(), update.cache.clone(), update.mode);
+            // The same answer serves the iter-var reads: mirror it into the
+            // per-file iter-var cache the way the sequential re-derivation's
+            // inference did.
+            if let LuaTypeOwner::Decl(decl_id) = update.owner {
+                let typ = update.cache.as_type().clone();
+                context
+                    .infer_manager
+                    .get_infer_cache(decl_id.file_id)
+                    .for_range_iter_var_type_cache
+                    .insert(decl_id, crate::CacheEntry::Cache(typ));
+            }
+        }
     }
     db.get_type_index().type_writes() != writes_before
 }
