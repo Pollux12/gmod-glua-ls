@@ -1,7 +1,7 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberInfo, LuaMemberKey,
-    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, MemberAssignmentContributionStore,
-    SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param,
+    get_tpl_ref_extend_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
@@ -187,112 +187,77 @@ fn extend_gmod_hook_fallback_members(
     }
 }
 
-/// Writers of one key, resolved the way the settled slot resolves them.
-///
-/// Writers within one file are sequential — the file's latest write of the
-/// key, whatever its class, is what a load of the file leaves in the slot, so
-/// earlier same-file writers collapse to it. Across files, a plain load-time
-/// write supersedes conditional-branch writers (`if ... then t.k = x end`
-/// fires only at runtime events, after the slot's load-time value exists),
-/// while guarded bootstrap siblings (`x = x or {}`) and other cross-file
-/// writers coexist — realm and load order at the caller decide which of those
-/// a caller sees (the item resolution's job).
+/// Collapses each key's candidates to one entry per distinct definition the
+/// caller can be looking at: branch-only writes drop out where an unconditional
+/// one exists, and what remains is deduplicated by identity.
 fn dedupe_member_infos(
     builder: &CompletionBuilder,
     members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) {
     let db = builder.semantic_model.get_db();
-    let contributions = db.get_member_index().member_assignment_contributions();
     for infos in members.values_mut() {
-        resolve_slot_writers(db, contributions, infos);
+        resolve_slot_writes(db, infos);
         let mut seen = HashSet::new();
         infos.retain(|info| seen.insert(MemberInfoIdentity::from(info)));
     }
 }
 
-fn resolve_slot_writers(
-    db: &DbIndex,
-    contributions: &MemberAssignmentContributionStore,
-    infos: &mut Vec<LuaMemberInfo>,
-) {
-    let member_index = db.get_member_index();
-    // Class declaration fields (`---@field`) are contracts, not sequential
-    // writes — they never take part in the per-file supersession below.
-    let is_declaration = |member_id: &LuaMemberId| {
-        matches!(
-            member_index.get_member_owner(member_id),
-            Some(LuaMemberOwner::Type(_))
-        )
-    };
-    let is_plain_writer = |member_id: &LuaMemberId| {
-        !member_index.is_conditional_branch_assignment_member(*member_id)
-            && contributions
-                .contribution_of(member_id)
-                .is_some_and(|contribution| {
-                    !contribution.guarded_bootstrap && !contribution.preserve_table_literals
-                })
-    };
+/// What a candidate for one key is, as far as the rule below is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotWrite {
+    /// Not a write: a class declaration field (`---@field`) is a contract, and
+    /// a dynamic field carries no member at all. Never collapsed.
+    NotAWrite,
+    /// Runs whenever the statement around it is reached. A write in a function
+    /// body counts: reaching the body is the caller's business, not a condition
+    /// on the write.
+    Unconditional,
+    /// Runs only when its branch is taken, so the slot may never hold it.
+    Branch,
+}
 
-    // Writers of a key within one file are sequential: the file's latest write
-    // — whatever its class — is what a load of the file leaves in the slot.
+/// Drops the writes of a key that only happen in a branch, where one outside
+/// any branch exists.
+///
+/// This is the only separation available here. Load order across files is
+/// decided by member resolution, which also picks the write the caller's realm
+/// selects, both before these infos are built; what is left is whether a write
+/// is conditional at all. Writes that are all unconditional — guarded bootstrap
+/// siblings (`x = x or {}`) among them — say nothing about each other and all
+/// survive.
+fn resolve_slot_writes(db: &DbIndex, infos: &mut Vec<LuaMemberInfo>) {
     if infos.len() <= 1 {
         return;
     }
-    let mut latest_per_file: HashMap<FileId, rowan::TextSize> = HashMap::new();
-    for info in infos.iter() {
-        let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
-            continue;
-        };
-        if is_declaration(member_id) {
-            continue;
-        }
-        let position = member_id.get_position();
-        latest_per_file
-            .entry(member_id.file_id)
-            .and_modify(|latest| {
-                if position > *latest {
-                    *latest = position;
-                }
-            })
-            .or_insert(position);
-    }
-    if latest_per_file.is_empty() {
+
+    let writes = infos
+        .iter()
+        .map(|info| classify_slot_write(db, info))
+        .collect::<Vec<_>>();
+    if !writes.contains(&SlotWrite::Unconditional) {
         return;
     }
 
-    let mut plain_files: HashSet<FileId> = HashSet::new();
-    let mut has_plain_writer = false;
-    for info in infos.iter() {
-        let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
-            continue;
-        };
-        if !is_declaration(member_id) && is_plain_writer(member_id) {
-            has_plain_writer = true;
-            plain_files.insert(member_id.file_id);
-        }
-    }
+    let mut writes = writes.into_iter();
+    infos.retain(|_| writes.next() != Some(SlotWrite::Branch));
+}
 
-    infos.retain(|info| match &info.property_owner_id {
-        Some(LuaSemanticDeclId::Member(member_id)) => {
-            if is_declaration(member_id) {
-                return true;
-            }
-            if latest_per_file.get(&member_id.file_id) != Some(&member_id.get_position()) {
-                return false;
-            }
-            // A plain load-time write supersedes conditional-branch writers
-            // from files with no plain writer of the key: those only fire at
-            // runtime events, after the slot's load-time value exists.
-            if has_plain_writer
-                && !plain_files.contains(&member_id.file_id)
-                && member_index.is_conditional_branch_assignment_member(*member_id)
-            {
-                return false;
-            }
-            true
-        }
-        _ => true,
-    });
+fn classify_slot_write(db: &DbIndex, info: &LuaMemberInfo) -> SlotWrite {
+    let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+        return SlotWrite::NotAWrite;
+    };
+    let member_index = db.get_member_index();
+    if matches!(
+        member_index.get_member_owner(member_id),
+        Some(LuaMemberOwner::Type(_))
+    ) {
+        return SlotWrite::NotAWrite;
+    }
+    if member_index.is_conditional_branch_assignment_member(*member_id) {
+        SlotWrite::Branch
+    } else {
+        SlotWrite::Unconditional
+    }
 }
 
 type MemberIdentityMap = HashMap<LuaMemberKey, HashSet<MemberInfoIdentity>>;

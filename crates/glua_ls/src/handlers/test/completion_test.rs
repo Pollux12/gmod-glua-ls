@@ -1513,6 +1513,79 @@ mod tests {
         Ok(())
     }
 
+    /// A function that runs more than once — every GMod hook — has already
+    /// executed the assignments below the cursor on its later calls, so the
+    /// fields they define stay listed inside it. Only a file's top-level
+    /// statements are a strict sequence. The name is offered even though a read
+    /// at that position is not yet given its type.
+    #[gtest]
+    fn test_completion_offers_dynamic_field_defined_later_in_the_same_function() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+
+        check!(ws.check_completion(
+            r#"
+                ---@class DynLater.Entity
+
+                ---@type DynLater.Entity
+                local ent
+
+                function ENT:Think()
+                    ent.<??>
+                    local now = 1
+                    ent.cooldown = now
+                end
+            "#,
+            vec![VirtualCompletionItem {
+                label: "cooldown".to_string(),
+                kind: CompletionItemKind::VARIABLE,
+                label_detail: None,
+            }],
+        ));
+        Ok(())
+    }
+
+    /// A branch write is dropped beside an unconditional one whatever form the
+    /// unconditional one takes — a guarded bootstrap included, since it runs on
+    /// every load of its file.
+    #[gtest]
+    fn test_completion_branch_write_drops_beside_guarded_bootstrap_sibling() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.alpha = cfg.alpha or {}
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                if cfg.alpha then
+                    cfg.alpha = 2
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "alpha".to_string(),
+                kind: CompletionItemKind::FIELD,
+                label_detail: None,
+            }],
+        ));
+        Ok(())
+    }
+
     /// Guarded bootstrap writers of a slot coexist: the completion must not
     /// collapse them the way it collapses superseded writers.
     #[gtest]
