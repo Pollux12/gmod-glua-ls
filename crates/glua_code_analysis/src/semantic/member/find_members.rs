@@ -1129,12 +1129,25 @@ fn append_dynamic_fields_for_type(
     field_names.sort_unstable();
 
     for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name);
+        let member_key = LuaMemberKey::Name(field_name.clone());
         if !should_include_member(&member_key, filter) {
             continue;
         }
 
         if members.iter().any(|member| member.key == member_key) {
+            continue;
+        }
+
+        if let Some(caller_position) = ctx.caller_position()
+            && let Some(caller_file_id) = ctx.file_id()
+            && !dynamic_field_visible_at_offset(
+                db,
+                &owner,
+                &field_name,
+                caller_file_id,
+                caller_position,
+            )
+        {
             continue;
         }
 
@@ -1208,12 +1221,25 @@ fn append_dynamic_fields_for_table(
     field_names.sort_unstable();
 
     for field_name in field_names {
-        let member_key = LuaMemberKey::Name(field_name);
+        let member_key = LuaMemberKey::Name(field_name.clone());
         if !should_include_member(&member_key, filter) {
             continue;
         }
 
         if members.iter().any(|member| member.key == member_key) {
+            continue;
+        }
+
+        if let Some(caller_position) = ctx.caller_position()
+            && let Some(caller_file_id) = ctx.file_id()
+            && !dynamic_field_visible_at_offset(
+                db,
+                &owner,
+                &field_name,
+                caller_file_id,
+                caller_position,
+            )
+        {
             continue;
         }
 
@@ -1237,6 +1263,31 @@ fn append_dynamic_fields_for_table(
     }
 
     false
+}
+
+/// A dynamic field is only as visible as its assignments: a definition in the
+/// caller file that starts after the caller position has not executed yet, so
+/// the field must not be offered there — a simplified form of the rule
+/// `member_visible_at_offset` applies to regular members (it has no
+/// same-function execution-region exception). Definitions in other files stay
+/// visible; their load-order and realm rules are the member item's to decide.
+fn dynamic_field_visible_at_offset(
+    db: &DbIndex,
+    owner: &crate::DynamicFieldOwner,
+    field_name: &str,
+    caller_file_id: FileId,
+    caller_position: TextSize,
+) -> bool {
+    let definitions = db
+        .get_dynamic_field_index()
+        .get_field_definitions(owner, field_name);
+    if definitions.is_empty() {
+        return true;
+    }
+
+    definitions.iter().any(|definition| {
+        definition.file_id != caller_file_id || definition.value.start() <= caller_position
+    })
 }
 
 fn append_keyed_dynamic_field(
@@ -1268,6 +1319,12 @@ fn append_keyed_dynamic_field(
         index.has_field(owner, field_name)
     };
     if !is_visible {
+        return Some(false);
+    }
+    if let Some(caller_position) = ctx.caller_position()
+        && let Some(caller_file_id) = ctx.file_id()
+        && !dynamic_field_visible_at_offset(db, owner, field_name, caller_file_id, caller_position)
+    {
         return Some(false);
     }
 
