@@ -302,8 +302,9 @@ fn infer_index_expr_semantic_decl(
     Ok(None)
 }
 
-/// Prefix types that carry no member shape of their own, so a miss against
-/// them says nothing about whether the member exists.
+/// Prefix types whose miss is not evidence of absence: they either carry no
+/// member shape at all, or (a table literal) carry one that a bootstrap link
+/// left empty while the accumulated members live under the global path owner.
 fn is_shapeless_prefix_type(prefix_type: &LuaType) -> bool {
     matches!(
         prefix_type,
