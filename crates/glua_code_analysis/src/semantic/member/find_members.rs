@@ -1265,12 +1265,14 @@ fn append_dynamic_fields_for_table(
     false
 }
 
-/// A dynamic field is only as visible as its assignments: a definition in the
-/// caller file that starts after the caller position has not executed yet, so
-/// the field must not be offered there — a simplified form of the rule
-/// `member_visible_at_offset` applies to regular members (it has no
-/// same-function execution-region exception). Definitions in other files stay
-/// visible; their load-order and realm rules are the member item's to decide.
+/// A dynamic field is only as visible as its assignments. GLua load order only
+/// constrains *top-level* statements: a same-file, top-level definition that
+/// starts after the caller position has not executed yet, so the field must not
+/// be offered there. A definition inside a function body runs when that
+/// function is called, which load order does not pin down, and a caller inside
+/// a function body runs after the whole file has loaded — both stay visible.
+/// Definitions in other files are always visible; their load-order and realm
+/// rules are the member item's to decide.
 fn dynamic_field_visible_at_offset(
     db: &DbIndex,
     owner: &crate::DynamicFieldOwner,
@@ -1285,8 +1287,24 @@ fn dynamic_field_visible_at_offset(
         return true;
     }
 
+    let member_index = db.get_member_index();
+    // A caller inside a function body runs after the whole file has loaded, so
+    // every same-file definition is visible to it.
+    let caller_in_function = member_index
+        .enclosing_function_scope_range(caller_file_id, caller_position)
+        .is_some();
     definitions.iter().any(|definition| {
-        definition.file_id != caller_file_id || definition.value.start() <= caller_position
+        if definition.file_id != caller_file_id || definition.value.start() <= caller_position {
+            return true;
+        }
+        if caller_in_function {
+            return true;
+        }
+        // A definition inside a function body runs when that function is
+        // called, which load order does not pin down, so it stays visible.
+        member_index
+            .enclosing_function_scope_range(definition.file_id, definition.value.start())
+            .is_some()
     })
 }
 
