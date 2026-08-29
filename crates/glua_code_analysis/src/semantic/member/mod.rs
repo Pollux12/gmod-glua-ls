@@ -526,20 +526,20 @@ fn dynamic_field_definitions_for_owner(
             .enclosing_function_scope_range(caller_file_id, position)
     });
     db.get_dynamic_field_index()
-        .get_field_definitions(owner, field_name)
-        .into_iter()
+        .field_definitions(owner, field_name)
+        .iter()
         .filter(|definition| dynamic_fields_global || definition.file_id == caller_file_id)
         .filter(|definition| is_dynamic_field_realm_compatible(db, caller_mask, definition))
         .filter_map(|definition| {
             dynamic_field_definition_visibility_at(
                 db,
                 caller_file_id,
-                &definition,
+                definition,
                 access_position,
                 access_function,
             )
             .map(|visibility| VisibleDynamicFieldDefinition {
-                location: definition,
+                location: definition.clone(),
                 visibility,
             })
         })

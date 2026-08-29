@@ -138,7 +138,7 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let definition = InFiled::new(file_id, range);
-        // Kept in canonical order: `get_field_definitions` feeds a union of
+        // Kept in canonical order: `field_definitions` feeds a union of
         // overloads, so insertion order would make the elected arm depend on the
         // batch walk order rather than on the workspace.
         let insert_at = field_definitions.partition_point(|existing| {
@@ -375,16 +375,16 @@ impl DynamicFieldIndex {
             .unwrap_or_default()
     }
 
-    pub fn get_field_definitions(
+    /// Every recorded definition of one field, in canonical order.
+    pub fn field_definitions(
         &self,
         owner: &DynamicFieldOwner,
         field_name: &str,
-    ) -> Vec<InFiled<TextRange>> {
+    ) -> &[InFiled<TextRange>] {
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
@@ -679,9 +679,9 @@ mod tests {
 
         index.remove(file_to_remove);
 
-        assert_eq!(index.get_field_definitions(&owner, &field).len(), 1);
+        assert_eq!(index.field_definitions(&owner, &field).len(), 1);
         assert_eq!(
-            index.get_field_definitions(&owner, &field)[0].file_id,
+            index.field_definitions(&owner, &field)[0].file_id,
             remaining_file
         );
         assert_eq!(index.get_wildcard_definitions(&owner).len(), 1);
@@ -735,7 +735,7 @@ mod tests {
 
         assert!(!index.has_field(&owner, &field));
         assert!(index.get_fields(&owner).is_none());
-        assert!(index.get_field_definitions(&owner, &field).is_empty());
+        assert!(index.field_definitions(&owner, &field).is_empty());
     }
 
     #[test]
@@ -758,7 +758,7 @@ mod tests {
         }
 
         assert_eq!(
-            forward.get_field_definitions(&owner, &field),
+            forward.field_definitions(&owner, &field),
             vec![
                 InFiled::new(FileId::new(1), range(3, 4)),
                 InFiled::new(FileId::new(1), range(9, 10)),
@@ -766,8 +766,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            forward.get_field_definitions(&owner, &field),
-            reverse.get_field_definitions(&owner, &field)
+            forward.field_definitions(&owner, &field),
+            reverse.field_definitions(&owner, &field)
         );
     }
 
