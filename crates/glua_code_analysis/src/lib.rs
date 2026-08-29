@@ -2492,6 +2492,7 @@ impl EmmyLuaAnalysis {
         // overwrote.
         let snapshot =
             self.inferred_guard_snapshot(&before_expansion.iter().copied().collect::<HashSet<_>>());
+        let opened_the_burst = self.pending_guard_snapshot.is_none();
         self.pending_guard_snapshot.get_or_insert(snapshot);
         self.self_index_files(file_ids.clone());
         self.stabilize_cross_file_type_caches(&file_ids);
@@ -2503,8 +2504,14 @@ impl EmmyLuaAnalysis {
             }
         }
         if changed.is_empty() {
-            // The guard snapshot is left alone: an earlier batch in this burst
-            // may still owe a ripple that has to diff against it.
+            // An earlier batch in this burst may still owe a ripple that has to
+            // diff against its snapshot, so that one is left alone. The one
+            // this call took is not: no ripple is owed for it, and nothing else
+            // clears it, so it would be handed to the next unrelated edit's
+            // ripple as if it were that edit's own before-state.
+            if opened_the_burst {
+                self.pending_guard_snapshot = None;
+            }
             return (Vec::new(), Vec::new());
         }
         // The before expansion already contains the dependents of the changed
