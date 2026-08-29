@@ -63,12 +63,17 @@ impl From<rowan::SyntaxKind> for LuaTokenKind {
 }
 
 /// Per-thread memo for [`LuaSyntaxId::to_node_from_root`], keyed by root
+/// (MRU, a few roots kept). Holding each root alive keeps its green tree
+/// alive, which is what makes identity comparison sound.
 mod node_memo {
     use super::{LuaSyntaxId, LuaSyntaxNode};
     use rustc_hash::FxHashMap;
 
     const MAX_ROOTS: usize = 4;
     /// Each entry pins a red node, which holds an rc on its whole ancestor
+    /// chain, so a long-lived thread would otherwise retain most of a large
+    /// tree. Clearing beats evicting: the memo only pays off within one
+    /// traversal, so a fresh map costs a re-walk, not a lasting miss.
     const MAX_ENTRIES_PER_ROOT: usize = 8192;
 
     #[derive(Default)]

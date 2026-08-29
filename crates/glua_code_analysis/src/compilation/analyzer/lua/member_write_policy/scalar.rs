@@ -166,6 +166,13 @@ fn should_merge_table_literals(
             .all(|state| state.all_table_assignment_merge_types)
 }
 
+/// The merge of every writer's table type.
+///
+/// Answering bare `table` here -- which is what widening each writer to
+/// `table_literal_widen_type` and unioning amounts to -- throws away the only
+/// thing the writers carry, and every field of the slot then reads as nil-able.
+/// The writers name one runtime table, so merging them is both more precise and
+/// independent of which writer the batch happened to reach first.
 fn merged_table_assignment_type(
     db: &DbIndex,
     incoming_type: &LuaType,

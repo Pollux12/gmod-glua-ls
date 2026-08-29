@@ -239,6 +239,11 @@ impl LuaNameExpr {
     }
 
     /// The identifier's text.
+    ///
+    /// Returns `SmolStr` rather than `String`: the token's text is already
+    /// `&str`, so building a `String` allocated for every name read. `SmolStr`
+    /// stores up to 22 bytes inline, which covers essentially every Lua
+    /// identifier, so the common case allocates nothing.
     pub fn get_name_text(&self) -> Option<SmolStr> {
         self.get_name_token()
             .map(|it| SmolStr::new(it.get_name_text()))
@@ -466,6 +471,15 @@ impl From<LuaCallExpr> for LuaExpr {
 }
 
 /// In Lua, tables are a fundamental data structure that can be used to represent arrays, objects,
+/// and more. To facilitate parsing and handling of different table structures, we categorize tables
+/// into three types: `TableArrayExpr`, `TableObjectExpr`, and `TableEmptyExpr`.
+///
+/// - `TableArrayExpr`: Represents a table used as an array, where elements are indexed by integers.
+/// - `TableObjectExpr`: Represents a table used as an object, where elements are indexed by strings or other keys.
+/// - `TableEmptyExpr`: Represents an empty table with no elements.
+///
+/// This categorization helps in accurately parsing and processing Lua code by distinguishing between
+/// different uses of tables, thereby enabling more precise syntax analysis and manipulation.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct LuaTableExpr {
     syntax: LuaSyntaxNode,
@@ -517,6 +531,18 @@ impl LuaTableExpr {
     }
 
     /// Whether this is a sequential ("array-style") table literal whose entries
+    /// are themselves table literals — e.g.
+    /// `{ { offset = .. }, { offset = .. } }`.
+    ///
+    /// Such literals carry meaningful per-row shape, so they are materialized as
+    /// a dynamic [`crate::LuaSyntaxKind::TableArrayExpr`]-backed table (with
+    /// integer-keyed members `[1]`, `[2]`, ...) rather than collapsed to a bare
+    /// `table`. Simple scalar arrays (`{ 1, 2, 3 }`) intentionally do NOT match,
+    /// so they stay summarized as `T[]`.
+    ///
+    /// This is a purely syntactic check so the declaration analyzer (which
+    /// registers members) and the inference pass (which assigns the type) make
+    /// the same decision without needing inferred element types.
     pub fn is_shaped_array_literal(&self) -> bool {
         if !self.is_array() {
             return false;

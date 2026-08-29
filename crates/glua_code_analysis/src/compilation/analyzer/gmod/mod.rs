@@ -140,6 +140,11 @@ fn scan_gmod_keywords(
 }
 
 /// Pre-analysis phase: runs BEFORE lua_analyze.
+/// Collects purely syntactic metadata (hooks, network, realm, scripted class
+/// type declarations) so that lua_analyze has correct realm keys and scripted
+/// class types available from the start. Without them lua_analyze would see
+/// `GmodRealm::Unknown` and the unresolve phase would have to recompute every
+/// flow once the realm became known.
 pub struct GmodPreAnalysisPipeline;
 
 impl AnalysisPipeline for GmodPreAnalysisPipeline {
@@ -166,8 +171,19 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         let mut t_scoped = std::time::Duration::ZERO;
         let mut profile = do_profile.then(GmodPreProfile::default);
 
-        // Cache key covers signature index size.
+        // The registry is derived by scanning the entire signature index, so the
+        // cache key has to cover how much of that index existed when it was
+        // built — not just VFS content. Keying on content alone let a registry
+        // built during an earlier workspace group (with fewer files indexed) be
+        // served to a later group that could see more.
         let helper_revision = helper_registry_revision(db);
+        // `collect_gmod_call_sites` already built this pair for every group
+        // before any group entered resolution, so reuse it whenever the
+        // signature index has not grown since — deriving it again means
+        // another fold over the whole signature index.
+        //
+        // On a miss the rebuild is served from the per-file scan cache, so it
+        // only re-derives the files that changed.
         let reusable_roles = context
             .gmod_global_call_roles
             .as_ref()
@@ -204,6 +220,11 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         }
 
         // Per-file metadata collection is read-only against `&DbIndex` (it only
+        // reads the reference/decl indexes built by earlier passes plus each
+        // file's own AST), so it runs in parallel across files. The collected
+        // results are merged into the db sequentially afterward in file order to
+        // preserve identical behavior. The scoped-class (`is_in_scope`) work
+        // mutates the db and stays in the sequential merge loop.
         let s_collect = do_profile.then(std::time::Instant::now);
         let collect_file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let collected = crate::profile::phase("gmodpre/collect_file_metadata", || {
@@ -440,6 +461,22 @@ impl GmodPreProfile {
     }
 }
 
+/// Post-analysis phase: runs AFTER lua_analyze.
+/// Synthesizes members that depend on metadata collected during lua_analyze
+/// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
+/// Collects GMod `net` message flows.
+///
+/// This runs at the very end of the batch, after declaration, doc, lua and
+/// unresolve analysis, because flow collection *reads* what those produce:
+/// resolving `net.Start`/`net.Send` reached through a wrapper needs the
+/// wrapper's signature, its receiver's type, and the members those depend on.
+///
+/// Collecting any earlier would let the collector see a poorer index on a cold
+/// build than on a re-index, which makes `gmod-net-*` diagnostics change across
+/// the workspace after the first edit. Nothing in the analysis pipeline reads
+/// the network index (only diagnostics do), so collecting it last costs nothing
+/// and is the only point at which the input state is the same for a cold build
+/// and a partial re-index.
 pub struct GmodNetworkAnalysisPipeline;
 
 impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
@@ -454,6 +491,10 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         }
         let _p = Profile::cond_new("gmod net-analyze", tree_list.len() > 1);
 
+        // The gmod pre-pass already built these for this batch; reuse them
+        // unless the signature index has grown since (the revision covers that).
+        // On a miss the rebuild is served from the per-file scan cache, so it
+        // only re-derives the files that changed.
         let helper_revision = helper_registry_revision(db);
         let reusable_roles = context
             .gmod_global_call_roles
@@ -521,6 +562,8 @@ fn collect_file_network_flows(
     let mut local_fns = LocalFnCache::default();
     let mut net = NetCallResolver::default();
     // One memo for both walks: the receive walk and the three send walks start
+    // from the same call expressions and reach the same helpers, so a shared
+    // memo resolves each of them once.
     let mut resolve_memo = ResolveMemo::default();
 
     let (_, _, _, receive_flows) = crate::profile::phase("gmodnet/receive_walk", || {
@@ -573,6 +616,8 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         });
 
         // Resolve scripted_ents.GetMember delegations BEFORE synthesizing
+        // members so that NetworkVar calls copied from target entities are
+        // picked up by synthesize_scripted_class_members.
         let t_deleg = do_profile.then(std::time::Instant::now);
         crate::profile::phase("gmodpost/getmember_delegations", || {
             resolve_getmember_network_var_delegations(db, &scripted_scope_files, context)
@@ -586,6 +631,8 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
 
         let t_class = do_profile.then(std::time::Instant::now);
         // Same per-file cached scan the net pass uses. Folding the signature
+        // index directly here took its `HashMap` iteration order, so a call path
+        // defined by two files resolved differently between processes.
         let (_, annotated_global_call_roles) =
             crate::profile::phase("gmodpost/call_roles_and_registry", || {
                 build_call_roles_and_registry(db)
@@ -694,6 +741,10 @@ fn collect_annotated_scripted_class_calls(
 }
 
 /// A db write produced by the per-file annotated call-site scan.
+///
+/// The scan itself reads only the file's own AST plus immutable db state; the
+/// writes are buffered so the scan can run off the caller's thread and be
+/// applied afterwards in the original file-then-call order.
 enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
     ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
@@ -781,6 +832,12 @@ fn collect_annotated_call_sites_with(
     }
 }
 
+/// Scripted-class registration and `load`-style call sites for one
+/// workspace group, collected before *any* group resolves.
+///
+/// The role map is stashed on the context because `GmodPreAnalysisPipeline`
+/// needs the same one; rebuilding it there would repeat a full signature-index
+/// fold per group.
 pub(crate) fn collect_gmod_call_sites(db: &mut DbIndex, context: &mut AnalyzeContext) {
     if !db.get_emmyrc().gmod.enabled {
         return;
@@ -832,11 +889,19 @@ fn collect_annotated_load_dependency_site(
 }
 
 /// Workspace-global registry of helper function definitions, stored as
+/// `(FileId, LuaSyntaxId)` rather than live red-tree nodes so the registry is
+/// `Send + Sync` and can be shared across the parallel per-file collection
+/// workers. Each entry is resolved back to a `(LuaBlock, LuaChunk)` on demand by
+/// rebuilding the owning file's red tree from the (Send) green tree in the VFS.
 #[derive(Default)]
 pub(crate) struct HelperRegistry {
     /// Function bodies keyed by the language server's canonical global symbol
+    /// identity. This is a call-graph lookup, not a net-op recognizer: the body
+    /// is still inspected through annotated signatures only.
     globals: HashMap<GlobalId, (FileId, LuaSyntaxId)>,
     /// Unique method names provide a conservative fallback for dynamic Lua
+    /// receivers whose class cannot be inferred. Ambiguous method names are
+    /// deliberately removed during construction.
     methods: HashMap<SmolStr, (FileId, LuaSyntaxId)>,
     signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)>,
 }
@@ -844,6 +909,10 @@ pub(crate) struct HelperRegistry {
 type IndexedHelperDefinition = (LuaSignatureId, FileId, LuaSyntaxId, Option<GlobalId>);
 
 /// Cache key for the net-helper registry.
+///
+/// The registry is a pure function of the syntax trees reachable through the
+/// signature index, so both the VFS content revision and the size of that index
+/// have to take part in the key. Both reads are `O(1)`.
 fn helper_registry_revision(db: &DbIndex) -> u64 {
     let content_revision = db.get_vfs().content_revision();
     let signature_count = db.get_signature_index().indexed_signature_count() as u64;
@@ -878,6 +947,10 @@ fn build_call_roles_and_registry(
             map
         });
     // Merge order decides which file wins a call path both define, so it has to
+    // be a property of the source, not of the session. `FileId`s are handed out
+    // in workspace-collection order and shift when a file is removed and
+    // re-added, so order by normalized path — the same policy
+    // `HelperRegistryBuilder::build` already uses for its definitions.
     let scan_files = crate::profile::phase("ccs/sort_scan_files", || {
         let vfs = db.get_vfs();
         let mut scan_files = signatures_by_file.keys().copied().collect::<Vec<_>>();
@@ -895,6 +968,11 @@ fn build_call_roles_and_registry(
         scan_files
     });
 
+    // A file's scan reads only its own signatures plus immutable db state, so
+    // the uncached ones are derived concurrently. On a cold index that is every
+    // file in the workspace, and the per-file syntax-tree walk behind
+    // `has_calls` dominates. Results are stored and merged below in exactly the
+    // previous fixed file order, so the fold is unchanged.
     let uncached = scan_files
         .iter()
         .copied()
@@ -970,6 +1048,8 @@ fn build_call_roles_and_registry(
 struct HelperRegistryBuilder {
     definitions: Vec<IndexedHelperDefinition>,
     /// Whether the scanned file contains any call expression at all. Computed
+    /// once per file so annotation libraries full of empty stubs are rejected
+    /// before resolving every signature back to a red-tree closure.
     file_has_calls: bool,
 }
 
@@ -987,6 +1067,9 @@ impl HelperRegistryBuilder {
             return;
         };
         // Annotation libraries contain thousands of empty function stubs.
+        // They can carry net metadata, but they cannot be wrapper bodies.
+        // Checking for a first statement is constant-time and avoids walking
+        // every empty stub's red subtree during the signature scan.
         if block.get_stats().next().is_none() {
             return;
         }
@@ -1069,6 +1152,14 @@ fn expr_written_name(expr: &LuaExpr) -> Option<SmolStr> {
 }
 
 /// The names the shipped net operations are declared under (`Start`,
+/// `Receive`, and any annotated wrapper of them).
+///
+/// Read straight out of the annotated call-role map the pre-analysis pass
+/// already built, which is keyed by access path and already tags these calls
+/// `NetStart`/`NetReceive`. The pre-pass records op *call sites* by path and so
+/// cannot see `local recv = net.Receive`; carrying the op names lets the same
+/// reference lookup and per-file binding closure that finds helper calls follow
+/// that alias to its call sites.
 fn net_operation_names(annotated_roles: &AnnotatedGmodGlobalCallRoleMap) -> HashSet<SmolStr> {
     annotated_roles
         .roles_by_path
@@ -1145,10 +1236,26 @@ fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
 }
 
 /// The names a call has to be written with for it to expand into a helper that
+/// can reach a `net.Start`.
+///
+/// The helpers that can answer yes are a small fixed set, and resolution
+/// matches declarations by written name, so a call written with a name no such
+/// helper carries cannot expand into one.
+///
+/// Seeded from the net operations' own references, then grown outward: each
+/// site is walked *up* to the function containing it, and that function's own
+/// call sites come from the reference index, whose enclosing functions are the
+/// next level. The set settles when a round adds no new site.
+///
+/// Nothing is scanned. The cost is proportional to how much net code the
+/// workspace actually has, not to its size.
 fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> HashSet<SmolStr> {
     let mut names: HashSet<SmolStr> = HashSet::new();
     let mut visited_decls: HashSet<LuaDeclId> = HashSet::new();
     // Seeded from the net operations' own references rather than from the
+    // pre-pass's recorded call sites: that record is only written for files
+    // that also need hook metadata, so it is not a complete list of net ops.
+    // The reference index records every reference unconditionally.
     let mut frontier: Vec<InFiled<LuaSyntaxId>> = op_names
         .iter()
         .flat_map(|name| name_reference_sites(db, name))
@@ -1183,6 +1290,8 @@ fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> Ha
                     continue;
                 };
                 // A local enters neither name-keyed reference table, so a chain
+                // through local wrappers only continues if the next level comes
+                // from the declaration's own references.
                 if let Some(decl_id) = closure_local_decl_id(file_id, &closure)
                     && visited_decls.insert(decl_id)
                 {
@@ -1244,6 +1353,9 @@ fn decl_reference_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<InFiled<LuaSynt
 }
 
 /// The declaration a closure is bound to, when that binding is a local.
+///
+/// A declaration is identified by the position of its declared name, so the two
+/// local binding forms yield it without a lookup.
 fn closure_local_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<LuaDeclId> {
     if let Some(local_func_stat) = closure.get_parent::<LuaLocalFuncStat>() {
         return Some(LuaDeclId::new(
@@ -1262,11 +1374,17 @@ fn closure_local_decl_id(file_id: FileId, closure: &LuaClosureExpr) -> Option<Lu
 }
 
 /// The call sites that can expand into a helper able to reach a `net.Start`.
+///
+/// Every reference to a name is recorded in the reference index while the
+/// workspace is indexed, so these call sites are a direct lookup rather than a
+/// walk that resolves every call expression in every file.
 #[derive(Default)]
 struct NetHelperCallSites {
     /// Syntax id of the callee reference node, per file.
     by_file: FxHashMap<FileId, Vec<LuaSyntaxId>>,
     /// The helper names themselves, needed per file to pick up locals: a
+    /// `local function send()` never enters the global reference table, so its
+    /// call sites are only reachable through its declaration's own references.
     names: HashSet<SmolStr>,
 }
 
@@ -1293,6 +1411,9 @@ fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCall
         }
     }
     // Source order, so a file's flows are collected in the same order the walk
+    // produced them. The key is the whole identity rather than just the start
+    // offset: sites arrive in hash order, and sorting on a partial key leaves
+    // equal ids non-adjacent, which silently defeats the dedup.
     for sites in by_file.values_mut() {
         sites.sort_by_key(|syntax_id| {
             let range = syntax_id.get_range();
@@ -1310,6 +1431,8 @@ struct FileFunctionMap {
     /// `local f = function() end`, `f = function() end`.
     bare: HashMap<String, LuaBlock>,
     /// All top-level function-defining blocks in source order, including
+    /// duplicates and unnamed closures. Lets callers that need to scan every
+    /// function body in the file skip running 4 separate `descendants` walks.
     all_blocks: Vec<LuaBlock>,
 }
 
@@ -1414,6 +1537,8 @@ impl FileFunctionMap {
 }
 
 /// Lazy cache of per-file function maps, keyed by file identity and chunk
+/// range. Used so cross-file helper recursion doesn't rebuild the same map
+/// repeatedly or alias equal-sized chunks from different files.
 #[derive(Default)]
 struct LocalFnCache {
     cache: HashMap<(FileId, TextRange), FileFunctionMap>,
@@ -1429,9 +1554,13 @@ impl LocalFnCache {
 }
 
 /// All per-file gmod pre-analysis metadata collected off-thread for one file.
+/// Produced by [`collect_file_gmod_metadata`] (read-only against `&DbIndex`) and
+/// merged into the db sequentially by the pipeline in file order.
 struct GmodFileMetadataResult {
     keywords: GmodKeywords,
     /// `Some` when hook metadata was collected (file had hook-relevant
+    /// keywords): (hook sites, system metadata, gm-method realm annotations).
+    /// `None` means the hook walk was skipped for this file.
     hook_metadata: Option<(
         Vec<GmodHookSiteMetadata>,
         GmodSystemFileMetadata,
@@ -1448,6 +1577,10 @@ struct GmodFileMetadataResult {
 }
 
 /// Collect all per-file gmod pre-analysis metadata for `file_id`. Read-only
+/// against `&DbIndex`: reads the file's own AST (rebuilt locally from the Send
+/// green tree) plus pre-existing immutable index state, so this is safe to run
+/// concurrently across files. The returned [`GmodFileMetadataResult`] is merged
+/// into the db sequentially by the caller.
 fn collect_file_gmod_metadata(
     db: &DbIndex,
     file_id: FileId,
@@ -1485,6 +1618,8 @@ fn collect_file_gmod_metadata(
 
     let mut local_fns = LocalFnCache::default();
     // One resolver per file: it memoizes signature resolution per call site and
+    // holds an infer cache per file touched, including helper bodies expanded
+    // from other files.
     let mut net = NetCallResolver::default();
 
     // Hook metadata collection never expands wrapper chains for send flows, so
@@ -1493,6 +1628,8 @@ fn collect_file_gmod_metadata(
 
     let collect_non_net_metadata = keywords.needs_hook_metadata();
     // Network flows are collected later, by `GmodNetworkAnalysisPipeline`; see
+    // that pipeline for why. Receive-flow collection therefore no longer rides
+    // along here, so a file that needs no hook metadata skips the walk whole.
     let hook_metadata = collect_non_net_metadata.then(|| {
         let (hook_sites, system_metadata, gm_method_realms, _receive_flows) =
             collect_hook_and_receive_metadata(
@@ -1577,6 +1714,9 @@ fn collect_hook_and_receive_metadata(
         file_id,
     };
     // Built once for the whole walk rather than per call expression, so the
+    // memo carries across the walk instead of being reallocated empty each
+    // time. `resolve_memo` is a pure function of `(file_id, call range)` for a
+    // fixed registry and index — see the field's own doc.
     let mut net_ctx = NetCollectCtx {
         db,
         helper_registry,
@@ -1588,6 +1728,8 @@ fn collect_hook_and_receive_metadata(
     };
 
     // Collecting receive flows alone needs no walk: the `net.Receive` sites are
+    // already recorded by annotation, and the calls that can expand into a
+    // wrapper that reaches one come from the reference index.
     if !collect_non_net_metadata {
         if collect_receive_flows {
             for call_expr in net_candidate_call_exprs(db, &net_site, helper_call_sites) {
@@ -2043,6 +2185,9 @@ fn collect_wrapped_net_send_flows_in_function_block(
             }
 
             // Wrapped helper flows can start a net message in one function and send at call-site.
+            // Keep a conservative stub so counterpart diagnostics can still resolve by message name.
+            // The realm is a placeholder: `is_wrapped` flows are used for counterpart
+            // presence only and are skipped by every realm-sensitive check.
             flows.push(NetSendFlow {
                 message_name,
                 start_range: call_expr.get_range(),
@@ -2062,6 +2207,14 @@ fn collect_wrapped_net_send_flows_in_function_block(
 }
 
 /// Collect complete send flows performed by ordinary, unannotated helpers.
+///
+/// The helper itself is found through the metadata-derived helper registry, and
+/// every operation inside it is still classified by [`NetCallResolver`] from
+/// the shipped signature annotations. The only extra work here is propagating
+/// literal string arguments from the call site into the helper's parameters so
+/// `net.Start(messageName)` can become concrete at
+/// `MyLib.SendString("Message", value)`. Static message names take this same
+/// path, which lets a no-argument helper produce a complete call-site flow.
 fn collect_unannotated_net_wrapper_send_flows(
     ctx: &mut NetCollectCtx<'_>,
     site: &NetWalkSite,
@@ -2090,6 +2243,10 @@ fn collect_unannotated_net_wrapper_send_flows(
 }
 
 /// The calls in a file that can take part in net-flow collection.
+///
+/// A lookup rather than a walk: the call sites that can expand into a
+/// net-producing helper come from the reference index, which already records
+/// every reference to those helpers' names.
 fn net_candidate_call_exprs(
     db: &DbIndex,
     site: &NetWalkSite,
@@ -2097,10 +2254,16 @@ fn net_candidate_call_exprs(
 ) -> Vec<LuaCallExpr> {
     let root_syntax = site.root.syntax().clone();
     // Locals never enter the global reference table, so a helper declared
+    // `local function send()` is reached through its own declaration's
+    // references instead.
     let mut local_sites: Vec<LuaSyntaxId> = Vec::new();
     if let Some(decl_tree) = db.get_decl_index().get_decl_tree(&site.file_id) {
         let names = &helper_call_sites.names;
         // `local sendString = MyLib.SendString` calls the helper under a name
+        // the reference index files under the local binding rather than under
+        // the helper, so this file's own bindings of a helper name count as
+        // call sites too. Chains settle by iterating, bounded by the number of
+        // bindings in the file.
         let mut aliases: HashSet<SmolStr> = HashSet::new();
         let bindings = decl_tree
             .get_decls()
@@ -2170,6 +2333,8 @@ fn net_candidate_call_exprs(
         .collect::<Vec<_>>();
 
     // Source order. The key is the whole range so that equal calls reached
+    // through both the name and the local-declaration lookup end up adjacent
+    // and the dedup can see them.
     calls.sort_by_key(|call_expr| {
         let range = call_expr.get_range();
         (range.start(), range.end())
@@ -2203,6 +2368,9 @@ fn collect_send_flows_from_helper_call(
     };
 
     // A send flow always starts at a `net.Start` somewhere in the expansion, so
+    // a helper that cannot reach one contributes nothing however it is called.
+    // The answer depends only on the helper, so it is cached per helper rather
+    // than recomputed for each calling file.
     let helper_id = (helper_file_id, helper_key.clone());
     let (reaches_start, _) = helper_reaches_net_role(
         ctx,
@@ -2361,6 +2529,8 @@ fn collect_net_receive_flow(
     call_expr: &LuaCallExpr,
 ) -> Option<NetReceiveFlow> {
     // Same ordering as the send collector: this runs for every call expression
+    // in the file, so the cheap literal-string check gates the far more
+    // expensive signature resolution.
     if !call_has_literal_string_arg(call_expr) {
         return None;
     }
@@ -2397,6 +2567,8 @@ fn build_net_receive_flow(
 
     let mut reads = Vec::new();
     // No annotated `callback` role means we cannot know which argument holds the
+    // receiver, so treat the reads as unknown rather than as none — asserting an
+    // empty read list here would invent count mismatches against every send.
     let mut reads_opaque = callback_idx.is_none();
     if let Some(callback_expr) = callback_idx.and_then(|idx| {
         call_expr
@@ -2409,6 +2581,10 @@ fn build_net_receive_flow(
             }
             None => {
                 // Inline closure that can't yield a block is malformed — but a
+                // bare name reference we couldn't resolve in the file is the
+                // common case (callback defined elsewhere). Mark opaque so the
+                // mismatch checker skips this flow without losing the
+                // counterpart record.
                 if !matches!(callback_expr, LuaExpr::ClosureExpr(_)) {
                     reads_opaque = true;
                 }
@@ -2467,6 +2643,10 @@ fn collect_receive_flows_from_helper_call(
     };
 
     // Mirror of the send walk's prune: a receive flow always originates at a
+    // `net.Receive` somewhere in the expansion, so a helper that cannot reach
+    // one contributes nothing however it is called. Without this, every call
+    // with a literal string argument re-walked the full body of whatever it
+    // resolved to, once per calling site.
     let helper_id = (helper_file_id, helper_key.clone());
     let (reaches_receive, _) = helper_reaches_net_role(
         ctx,
@@ -2496,6 +2676,8 @@ fn collect_receive_flows_from_helper_call(
                 callback_idx,
             }) => {
                 // Literal registrations are already indexed in the helper's
+                // defining file. Only materialize a call-site flow when the
+                // wrapper call makes a dynamic message parameter concrete.
                 if extract_static_string_arg_value(&nested_call, message_idx).is_some() {
                     continue;
                 }
@@ -2528,6 +2710,11 @@ fn collect_receive_flows_from_helper_call(
 }
 
 /// Resolve the callback block for a `net.Receive` second argument. Handles
+/// inline closures (`function() ... end`) and same-file local/global function
+/// references (`net.Receive("Msg", doRetrieve)` paired with
+/// `local function doRetrieve() ... end` or `local doRetrieve = function() ... end`).
+/// Cross-file references are out of scope — those resolve at semantic-model
+/// time and are not part of the per-file collection pass.
 fn resolve_callback_block(
     file_id: FileId,
     root: &LuaChunk,
@@ -2551,6 +2738,14 @@ fn resolve_callback_block(
 }
 
 /// Resolve a call expression to a function definition, returning a
+/// stable string key (used for cycle detection), the function body block,
+/// and the chunk that owns the body (which becomes the new `root` for
+/// further nested helper resolution within that body).
+///
+/// Resolve a `(FileId, LuaSyntaxId)` helper-registry entry back to its
+/// `(LuaBlock, LuaChunk)` by rebuilding the owning file's red tree on demand.
+/// Returns an owned `LuaChunk` (cheap clone of a red node) which becomes the new
+/// `root` for further nested helper resolution within that body.
 fn resolve_registry_entry(
     db: &DbIndex,
     file_id: &FileId,
@@ -2573,6 +2768,9 @@ fn resolve_call_to_function_block(
     db: &DbIndex,
 ) -> Option<(String, LuaBlock, LuaChunk, FileId)> {
     // Direct global member calls have a stable symbol identity even when
+    // duplicate declarations make the inferred signature winner dependent on
+    // index order. Resolve that identity through the deterministic registry.
+    // Aliases and locals take the signature-identity path below.
     if !call_expr_has_shadowing_local_root(db, root_file_id, call_expr)
         && let Some(call_path) = call_expr.get_access_path()
     {
@@ -2603,6 +2801,8 @@ fn resolve_call_to_function_block(
     }
 
     // Pre-analysis can run before every local/global callable type cache is
+    // available. Preserve lexical same-file wrapper expansion only when the
+    // written bare name identifies exactly one function body in that file.
     if let Some(LuaExpr::NameExpr(name_expr)) = call_expr.get_prefix_expr()
         && let Some(name) = name_expr.get_name_text()
         && let Some(block) = local_fns
@@ -2620,6 +2820,8 @@ fn resolve_call_to_function_block(
     }
 
     // Dynamic receivers sometimes have no inferable class in Lua source. Keep
+    // existing wrapper support only when the method name maps to exactly one
+    // indexed function body workspace-wide; ambiguity is a hard stop.
     if call_expr.is_colon_call()
         && let Some(LuaExpr::IndexExpr(index_expr)) = call_expr.get_prefix_expr()
         && let Some(LuaIndexKey::Name(method_token)) = index_expr.get_index_key()
@@ -2641,6 +2843,14 @@ fn resolve_call_to_function_block(
 }
 
 /// Shared state for a file's net collection walk. Bundled so the recursive
+/// helpers stay readable: they already carried 11 positional arguments before
+/// `file_id` and the call resolver had to be threaded for annotation lookup.
+///
+/// The three `&mut` fields are pure memo state: `local_fns`, `net` and
+/// `resolve_memo` are all keyed by syntax position and each entry is a function
+/// of the file's own text and the index, so a walk can only ever fill them in a
+/// different order — never with a different answer, and never with one that
+/// makes a later lookup depend on the walk that preceded it.
 struct NetCollectCtx<'a> {
     db: &'a DbIndex,
     helper_registry: &'a HelperRegistry,
@@ -2658,6 +2868,8 @@ struct NetCollectCtx<'a> {
 type ResolvedHelperFn = (String, LuaBlock, LuaChunk, FileId);
 
 /// See [`NetCollectCtx::resolve_memo`]. Owned per file by the collector that
+/// drives both the receive walk and the send walks, so one file's helper
+/// resolutions are computed once instead of once per walk.
 type ResolveMemo = FxHashMap<(FileId, TextRange), Option<ResolvedHelperFn>>;
 
 type HelperId = (FileId, String);
@@ -2803,6 +3015,8 @@ fn resolve_call_to_function_block_cached(
 }
 
 /// Position of the walk within a file, which changes when helper expansion
+/// crosses into a function body defined elsewhere. `file_id` must travel with
+/// `root` so signature resolution runs against the owning file.
 #[derive(Clone)]
 struct NetWalkSite {
     root: LuaChunk,
@@ -2851,6 +3065,10 @@ fn collect_net_write_ops_from_stat(
 }
 
 /// Walk `subtree` for net payload call expressions, treating non-net
+/// calls that resolve to a same-file function as helper expansions: we recurse
+/// into the helper body so writes/reads it performs participate in the
+/// outer flow. Cycles are guarded via `visited`, and dynamic-context propagates
+/// from the call site into the helper body.
 #[allow(clippy::too_many_arguments)]
 fn collect_net_ops_recursive(
     ctx: &mut NetCollectCtx<'_>,
@@ -2864,6 +3082,8 @@ fn collect_net_ops_recursive(
     flow_prefix: &[NetFlowFrame],
 ) {
     // Keep the public helper name used by read/write collection call sites,
+    // while the implementation below documents the call-argument evaluation
+    // ordering needed for nested reads such as `net.ReadData(net.ReadUInt(16))`.
     collect_net_ops_eval_order(
         ctx,
         site,
@@ -2989,6 +3209,8 @@ fn collect_net_ops_from_call_expr(
     let helper_force_dynamic =
         force_dynamic || is_call_expr_in_dynamic_control_flow(enclosing_block, call_expr);
     // Carry the call-site's flow context into the helper so reads/writes
+    // performed inside the helper appear under the correct outer
+    // `for`/`if`/`while` frames in hover.
     let local_path = extract_flow_path(enclosing_block, call_expr);
     let mut nested_prefix = Vec::with_capacity(flow_prefix.len() + local_path.len());
     nested_prefix.extend_from_slice(flow_prefix);
@@ -3058,9 +3280,24 @@ fn is_call_expr_in_dynamic_control_flow(block: &LuaBlock, call_expr: &LuaCallExp
 }
 
 /// Walks ancestors from `call_expr` up to (but not including) `block`,
+/// collecting one `NetFlowFrame` per enclosing if/while/for/repeat. Frames
+/// are returned outer-to-inner so the renderer can nest them naturally.
+///
+/// `if`/`elseif`/`else` are folded into a single frame per if-chain branch:
+/// when the op lives inside an `elseif cond then ... end` clause, that frame
+/// records `elseif cond then` (instead of the outer `if cond then`) so the
+/// developer sees the actual branch the op is gated by. Same for `else`. The
+/// frame's id is the clause's source range so two ops in different branches
+/// of the same if are distinct frames (different patterns can result).
+///
+/// The header text is a single-line trimmed summary of the statement opener
+/// (e.g. `if cond then`, `for i = 1, #items do`). Multi-line headers and
+/// excessively long ones are stored as `None` to keep hover popups compact.
 fn extract_flow_path(block: &LuaBlock, call_expr: &LuaCallExpr) -> Vec<NetFlowFrame> {
     let mut frames: Vec<NetFlowFrame> = Vec::new();
     // When set, the next ancestor (which we know is the parent LuaIfStat of
+    // an elseif/else clause we just captured) should be skipped so we don't
+    // double-count the if-chain.
     let mut skip_parent_if = false;
     for node in call_expr
         .syntax()
@@ -3126,6 +3363,13 @@ enum BranchKind {
 }
 
 /// The node's text up to its first newline.
+///
+/// `node.text().to_string()` walks and concatenates every token underneath, so
+/// asking an `if` statement for its header used to materialise the statement's
+/// whole body — thousands of lines for a large branch — to read one line of it.
+/// Network flow analysis does that for every branch around every `net` call in
+/// every re-analysed file, which made it one of the more expensive things a
+/// keystroke paid for.
 fn first_line_text(node: &LuaSyntaxNode) -> String {
     let mut line = String::new();
     for token in node
@@ -3177,6 +3421,9 @@ fn extract_branch_header(node: &LuaSyntaxNode, kind: BranchKind) -> Option<Strin
 }
 
 /// Pulls a compact single-line summary of a control-flow statement's opener
+/// straight from the source — e.g. `if foo > 0 then`, `for i = 1, n do`.
+/// Returns `None` for multi-line or oversized headers; the renderer falls
+/// back to a generic label in that case.
 fn extract_flow_header(stat_node: &LuaSyntaxNode, kind: NetFlowKind) -> Option<String> {
     const MAX_HEADER_LEN: usize = 80;
     // Only the opener is ever read, and it bails on a multi-line one, so there
@@ -3196,9 +3443,13 @@ fn extract_flow_header(stat_node: &LuaSyntaxNode, kind: NetFlowKind) -> Option<S
             };
             let trimmed = full.trim_start();
             // Find terminator on the first line containing it. If the opener
+            // breaks across lines (e.g. condition split over multiple lines)
+            // we bail to keep the hover compact.
             let nl_idx = trimmed.find('\n').unwrap_or(trimmed.len());
             let first_line_slice = &trimmed[..nl_idx];
             // Terminator must be a standalone keyword: preceded by whitespace
+            // (not mid-identifier) or appear at start of line, and bounded by
+            // a non-alphanumeric char on the right (or be at end-of-line).
             let bytes = first_line_slice.as_bytes();
             let mut search_from = 0usize;
             let term_end = loop {
@@ -3239,9 +3490,15 @@ fn call_expr_from_stat(stat: &LuaStat) -> Option<LuaCallExpr> {
 }
 
 /// What a call does in the net subsystem, resolved purely from the callee's
+/// signature metadata. Because resolution goes through the type layer, aliases
+/// (`local netStart = net.Start`), cross-file globals, and annotated replacement
+/// APIs are all recognized identically to the builtins. Ordinary wrappers are
+/// expanded through their bodies and need no annotations of their own.
 #[derive(Debug, Clone)]
 enum NetCallRole {
     /// Begins a message: `call_arg("gmod.net_message", "start")`. Carries the
+    /// index of the parameter holding the message name, so a wrapper that takes
+    /// it somewhere other than first is read correctly.
     Start { message_idx: usize },
     /// Registers a receiver: `call_arg("gmod.net_message", "receive")`, with the
     /// message-name index and the `callback` role's index when annotated.
@@ -3256,11 +3513,22 @@ enum NetCallRole {
 }
 
 /// Resolves [`NetCallRole`] for call expressions, memoizing per call site.
+///
+/// Signature resolution runs type inference, which is far more expensive than
+/// the syntax match it replaces, so results are cached by syntax id — the send
+/// and wrapped-send passes both scan the same statements, and helper expansion
+/// can revisit a body. One [`LuaInferCache`] is kept per file so expansion into
+/// a helper defined in another file still resolves against that file.
 #[derive(Default)]
 struct NetCallResolver {
     caches: HashMap<FileId, LuaInferCache>,
     memo: HashMap<(FileId, LuaSyntaxId), Option<NetCallRole>>,
     /// `role` memoises the *role*, but the signature behind it is asked for
+    /// twice per call site: once here and once by
+    /// [`resolve_call_to_function_block`]'s signature path. Resolving a call's
+    /// signature means resolving its prefix to a semantic decl, which is the
+    /// single most expensive operation in this pipeline, so the answer is
+    /// memoised on the same key the role is.
     signature_memo: HashMap<(FileId, LuaSyntaxId), Option<LuaSignatureId>>,
 }
 
@@ -3378,6 +3646,10 @@ impl NetCallResolver {
         }
 
         // Some same-file member declarations do not yet have a semantic owner
+        // edge at this pre-analysis phase, while their inferred callable type
+        // is already available. Read that type instead of falling back to the
+        // source spelling of the member. Ambiguous callable unions are left
+        // unresolved rather than choosing an arbitrary body.
         let prefix = call_expr.get_prefix_expr()?;
         let typ = crate::semantic::infer_expr(db, cache, prefix).ok()?;
         unique_signature_id_from_type(&typ)
@@ -3407,6 +3679,8 @@ fn unique_signature_id_from_type(typ: &LuaType) -> Option<LuaSignatureId> {
 }
 
 /// Source text of the called function, used for display in diagnostics, hover
+/// and code lens. Prefers what the developer actually wrote so an aliased or
+/// wrapped call reports its own name.
 fn call_display_name(call_expr: &LuaCallExpr) -> SmolStr {
     call_expr
         .get_prefix_expr()
@@ -3425,6 +3699,11 @@ fn call_display_name(call_expr: &LuaCallExpr) -> SmolStr {
 }
 
 /// Captures a short snippet of the value-arg source text for a write op so
+/// hover can display *what* is being written (e.g. `net.WriteString("hi")`
+/// instead of just `net.WriteString`). Returns `None` for read ops, when the
+/// arg is missing, when it spans multiple lines, or when it's too long to
+/// render inline — robustness over completeness; we'd rather show the bare
+/// op name than blow up the hover popup with a 200-char expression.
 fn extract_write_value_text(call_expr: &LuaCallExpr, op: &NetOpDescriptor) -> Option<String> {
     if !op.is_write() {
         return None;
@@ -3448,6 +3727,10 @@ fn extract_write_value_text(call_expr: &LuaCallExpr, op: &NetOpDescriptor) -> Op
 }
 
 /// Extracts the static bit-width literal from a payload op that declares a
+/// `gmod.net_payload`/`bits` parameter. Returns `None` for ops with no such
+/// parameter, or when the argument is not an integer literal (variable,
+/// expression, runtime computation) — anything else is unknowable at index time
+/// and would produce false-positive mismatches if compared.
 fn extract_bit_width_arg(call_expr: &LuaCallExpr, bits_arg_idx: usize) -> Option<u32> {
     let arg_expr = call_expr.get_args_list()?.get_args().nth(bits_arg_idx)?;
     let LuaExpr::LiteralExpr(literal_expr) = arg_expr else {
@@ -3474,6 +3757,14 @@ fn extract_static_string_arg_value(call_expr: &LuaCallExpr, arg_idx: usize) -> O
 }
 
 /// Cheap syntactic gate for the flow collectors, which run over every
+/// statement-level call in a candidate file. A tracked flow always names its
+/// message with a literal string, so a call carrying none can never start or
+/// receive one, and is rejected here before the far more expensive signature
+/// resolution runs.
+///
+/// Deliberately index-agnostic: the message parameter's position comes from the
+/// annotation and is not fixed at zero. Ordering only — every call that would
+/// have produced a flow still reaches the resolver.
 fn call_has_literal_string_arg(call_expr: &LuaCallExpr) -> bool {
     let Some(args_list) = call_expr.get_args_list() else {
         return false;
@@ -3487,6 +3778,10 @@ fn call_has_literal_string_arg(call_expr: &LuaCallExpr) -> bool {
 }
 
 /// Captures the recipient argument of a send terminator as a single-line snippet
+/// for display in code lens. The argument position comes from the
+/// `gmod.net_payload`/`target` call-arg role, so terminators with no recipient
+/// (`net.Broadcast`, `net.SendToServer`) yield `None` without a name check.
+/// Returns `None` when the source is multi-line or too long to render inline.
 fn extract_send_target_text(call_expr: &LuaCallExpr, send_kind: NetSendKind) -> Option<String> {
     const MAX_INLINE_LEN: usize = 40;
 
@@ -3511,6 +3806,8 @@ pub(crate) struct GmodScopedClassMatch {
     pub aliases: Vec<String>,
     pub super_types: Vec<String>,
     /// The scope's `classNamePrefix` (if any). Used to derive the stripped
+    /// short name for parent-alias synthesis (e.g. `gamemode_sandbox` →
+    /// `sandbox` → `Sandbox`).
     pub class_name_prefix: Option<String>,
 }
 
@@ -3710,6 +4007,9 @@ fn resolve_vgui_parent_relations(
     batch_file_ids: &[FileId],
 ) {
     // This group's files have had their calls re-collected by the passes
+    // before this one, so their removal marks come off: whatever relations
+    // they still contribute are resolved below. A marked file with no syntax
+    // tree left was deleted outright, and its relations are legitimately gone.
     let mut settled_pending = db
         .get_gmod_class_metadata_index()
         .pending_vgui_parent_relation_file_ids()
@@ -3790,6 +4090,9 @@ fn resolve_vgui_parent_relations(
             continue;
         }
         // Every call already resolved means this file was not rebuilt, so
+        // walking its syntax tree would reproduce what is cached. Skipping it is
+        // the whole point: only a handful of the workspace's vgui files are
+        // touched by any one edit.
         if let Some(cached) = calls
             .iter()
             .map(|call| {
@@ -4687,6 +4990,9 @@ fn scoped_class_uses_global_namespace(global_name: &str) -> bool {
 }
 
 /// Scopes whose authoring table is conventionally declared as a `local`
+/// (e.g. `local PLUGIN = {}`, `local PLAYER = {}`) rather than a bare global.
+/// For these, an explicit local declaration with the scope's global name is
+/// treated as the scoped class table even without the synthetic seed.
 pub(crate) fn scoped_class_authored_as_local(global_name: &str) -> bool {
     matches!(global_name, "PLUGIN" | "PLAYER")
 }
@@ -4697,6 +5003,11 @@ fn scoped_class_super_types(
     configured: &[String],
 ) -> Vec<LuaType> {
     // PLAYER is special: the runtime authoring table is named `PLAYER`, but that
+    // identifier is already a GMod enum alias (`PLAYER_IDLE`, ... in enums.lua),
+    // so the authoring-class annotation cannot use it. The shared player-class
+    // fields live on the `PlayerClass` annotation class instead. The player-class
+    // table is NOT itself a Player entity (methods use `self.Player:...`), so it
+    // inherits only `PlayerClass`.
     if global_name == "PLAYER" {
         return vec![LuaType::Ref(LuaTypeDeclId::global("PlayerClass"))];
     }
@@ -4755,12 +5066,26 @@ pub(crate) fn ensure_scoped_class_type_decl_for_file(
 }
 
 /// Resolve scripted_ents.GetMember("class", "method") delegation patterns.
+///
+/// Detects patterns like:
+/// ```lua
+/// function ENT:SetupDataTables()
+///     local f = scripted_ents.GetMember("target_class", "SetupDataTables")
+///     f(self)
+/// end
+/// ```
+///
+/// When such a delegation is found, NetworkVar calls from the target entity's
+/// metadata are copied into the current entity's metadata so that
+/// `synthesize_scripted_class_members` will produce Get/Set members for them.
 fn resolve_getmember_network_var_delegations(
     db: &mut DbIndex,
     scripted_scope_files: &HashSet<FileId>,
     context: &AnalyzeContext,
 ) {
     // Collect files to process: only scripted scope files whose source
+    // contains "scripted_ents.GetMember".  Collect into owned structures
+    // so we can drop the immutable VFS borrow before mutable db access.
     let candidate_files: Vec<(FileId, LuaChunk, LuaTypeDeclId)> = {
         let vfs = db.get_vfs();
         context
@@ -4824,6 +5149,8 @@ fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
 }
 
 /// Walk a scripted class file's AST looking for `scripted_ents.GetMember` delegation
+/// patterns. When found, copy NetworkVar calls from the target class into this file's
+/// metadata.
 fn find_and_resolve_getmember_delegations(
     db: &mut DbIndex,
     current_file_id: FileId,
@@ -4894,6 +5221,9 @@ fn find_and_resolve_getmember_delegations(
             };
 
             // Also check as a statement: f(self) as a statement
+            // Actually the descendant walk will hit both LuaCallExpr and
+            // LuaCallExprStat, and the LuaCallExpr inside a LuaCallExprStat
+            // will match either way.
 
             // Look up the target class
             if let Some(target_file_ids) = class_file_map.get(target_class) {
@@ -5180,10 +5510,14 @@ fn synthesize_vgui_registrations(
     let mut vgui_registration_regions: Vec<VguiRegistrationRegion> = Vec::new();
     let mut synthesis_cache = VguiSynthesisCache::default();
     // Tracks local table regions that have already been registered via
+    // `vgui.RegisterTable` so that subsequent `vgui.CreateFromTable` calls
+    // referencing the same region do not trigger a second class synthesis.
     let mut registered_table_regions: HashSet<(LuaDeclId, TextSize)> = HashSet::new();
 
     for file_id in file_ids.iter().copied() {
         // Borrow first and skip files with no VGUI-relevant calls before paying
+        // for the (multi-Vec) metadata clone. The vast majority of files have
+        // class metadata but no VGUI register/derma calls.
         let has_vgui_work = match db
             .get_gmod_class_metadata_index()
             .get_file_metadata(&file_id)
@@ -5277,6 +5611,21 @@ fn synthesize_vgui_registrations(
                     resolve_local_registration_region(db, file_id, table_var, register_position)
             {
                 // Skip synthesis when this table is already registered via a
+                // prior `vgui.RegisterTable` call. `vgui.CreateFromTable` uses
+                // the same `register_table` call_arg kind, which means it also
+                // lands in `vgui_register_table_calls`. Without this guard, the
+                // `CreateFromTable` call synthesizes a SECOND class at its own
+                // position, overwriting the first registration's binding and
+                // producing false-positive `undefined-field` /
+                // `unchecked-nil-access` on the original panel's `self.Field`
+                // accesses.
+                //
+                // Only actual `vgui.RegisterTable` calls populate the dedup
+                // set. A `CreateFromTable` call that appears before the real
+                // `RegisterTable` must not insert a key, otherwise the later
+                // `RegisterTable` can lose its base/type synthesis. The key is
+                // region-specific so reused locals can register later table
+                // regions without being blocked by earlier registrations.
                 let registration_key = (decl_id, region_start);
                 if registered_table_regions.contains(&registration_key) {
                     continue;
@@ -5371,6 +5720,8 @@ fn synthesize_vgui_registrations(
     flush_vgui_table_const_replacements(db, &mut synthesis_cache);
 
     // Synthesize AccessorFunc members for VGUI-registered classes. Group by
+    // file so each accessor target is resolved once instead of once per
+    // registration in that file.
     let mut registrations_by_file: HashMap<FileId, Vec<&VguiRegistrationRegion>> = HashMap::new();
     for registration in &vgui_registration_regions {
         registrations_by_file
@@ -5619,6 +5970,11 @@ fn synthesize_scripted_ent_registration(
     }
 
     // Inject extra super-types based on `ENT.Type`. The `Type` field selects
+    // the engine-side entity framework (e.g. `"nextbot"` provides `NextBot`
+    // methods like `StartActivity`, `loco`, `MoveToPos` via C++ metatable
+    // injection). Without this, `self:StartActivity()` on a `base_nextbot`
+    // entity produces false-positive `undefined-field` diagnostics because
+    // the synthesized `base_nextbot` class doesn't inherit from `NextBot`.
     if let Some((type_name, source_range)) = resolve_registered_scripted_ent_type(&table_expr)
         && let Some(super_name) = super_type_for_entity_type(&type_name)
     {
@@ -5679,6 +6035,8 @@ fn resolve_registered_scripted_ent_type(table_expr: &LuaTableExpr) -> Option<(St
 }
 
 /// Maps `ENT.Type` values to the annotation class that provides the
+/// engine-side framework methods. C++ metatable injection makes these
+/// methods available at runtime; we model them via super-types.
 fn super_type_for_entity_type(type_name: &str) -> Option<&'static str> {
     match type_name {
         "nextbot" => Some("NextBot"),
@@ -5805,6 +6163,8 @@ fn synthesize_scoped_base_assignments_with(
     let expected_base_path = format!("{}.Base", scope_match.global_name);
 
     // ENT.Type selects the engine-side entity framework (e.g. "nextbot"
+    // provides NextBot methods). Only entities use this field — SWEP, TOOL,
+    // PLAYER, etc. have their own Type field with different semantics.
     let expected_type_path = if scope_match.global_name == "ENT" {
         Some(format!("{}.Type", scope_match.global_name))
     } else {
@@ -5844,6 +6204,8 @@ fn synthesize_scoped_base_assignments_with(
                 && access_path.eq_ignore_ascii_case(type_path)
             {
                 // ENT.Type = "nextbot" → inject NextBot as a super-type so
+                // engine-side framework methods (StartActivity, loco, etc.)
+                // are visible on the synthesized class.
                 let Some(type_name) = extract_scoped_base_name(value_expr) else {
                     continue;
                 };
@@ -5905,6 +6267,12 @@ fn extract_scoped_base_name(expr: &LuaExpr) -> Option<String> {
 }
 
 /// A wrapper function that internally calls NetworkVar or NetworkVarElement.
+/// For example:
+/// ```lua
+/// function ENT:SetupNW(type, name)
+///     self:NetworkVar(type, 0, name)
+/// end
+/// ```
 #[derive(Debug, Clone)]
 struct NetworkVarWrapper {
     /// The method name of the wrapper (e.g. "SetupNW")
@@ -6121,6 +6489,10 @@ fn find_networkvar_in_closure(
             resolve_wrapper_arg_mapping(&inner_args, 0, param_names);
 
         // Determine the name argument — find the last string-like argument
+        // For 3-arg NetworkVar: name is at index 2
+        // For 2-arg NetworkVar: name is at index 1
+        // For 4-arg NetworkVarElement: name is at index 3
+        // Try from the end to find the name position
         let name_indices: &[usize] = if is_element { &[3, 2, 1] } else { &[2, 1] };
 
         let mut fixed_name = None;
@@ -6158,6 +6530,8 @@ fn find_networkvar_in_closure(
 }
 
 /// Given a call argument expression and the wrapper's parameter names,
+/// determine if the argument is a fixed string literal or a reference to
+/// one of the wrapper's parameters.
 fn resolve_wrapper_arg_mapping(
     inner_args: &[LuaExpr],
     arg_index: usize,
@@ -6190,6 +6564,8 @@ fn resolve_wrapper_arg_mapping(
 }
 
 /// Given a call to a known wrapper method and the wrapper's parameter mapping,
+/// resolve the concrete type and name from the call arguments and synthesize
+/// Get/Set members.
 fn synthesize_from_wrapper_call(
     db: &mut DbIndex,
     file_id: FileId,
@@ -6420,6 +6796,22 @@ fn resolve_effective_inheritance_base(
 }
 
 /// Synthesize a parent-name alias member on a derived scripted class.
+///
+/// In Garry's Mod, derived gamemodes can access their inherited base via a
+/// field named after the parent's short (prefix-stripped) folder name. For
+/// example, a DarkRP gamemode inheriting from Sandbox uses `self.Sandbox` to
+/// reach the base gamemode table. The runtime exposes this field, but the
+/// analyzer would otherwise have no type for it, which breaks hover, goto,
+/// and completion on `self.<ShortParentName>.<member>`.
+///
+/// Rules (mirroring the oracle-approved design):
+/// - Only applies when the scope declares a non-empty `classNamePrefix`.
+/// - The parent class name must start with that prefix, and the remainder
+///   must be non-empty (otherwise we skip silently to avoid bogus aliases
+///   on malformed or cross-scope base names).
+/// - If the derived class already has a member with the alias name (for
+///   example, because the user wrote `GM.Sandbox = BaseClass` themselves),
+///   the explicit field wins and we do not synthesize a duplicate.
 fn synthesize_define_baseclass_parent_alias(
     db: &mut DbIndex,
     file_id: FileId,
@@ -6484,6 +6876,8 @@ fn synthesize_define_baseclass_parent_alias(
 }
 
 /// Uppercase the first ASCII letter of `s`, leaving the rest untouched.
+/// Non-ASCII leading bytes are preserved as-is (GMod class names are ASCII
+/// in practice, so this keeps the implementation simple and allocation-light).
 fn capitalize_ascii_first(s: &str) -> String {
     let mut chars = s.chars();
     match chars.next() {
@@ -6506,6 +6900,10 @@ fn synthesize_accessor_func(
     call: &GmodScriptedClassCallMetadata,
 ) {
     // AccessorFunc(target, "m_VarKey", "Name", forceType)
+    // args[0] = target (ENT etc) - non-literal name ref
+    // args[1] = backing field name (string)
+    // args[2] = accessor name (string)
+    // args[3] = force type (FORCE_STRING, number, bool, etc)
 
     let accessor_name = match call.literal_args.get(2) {
         Some(Some(GmodClassCallLiteral::String(name))) => name.clone(),
@@ -6600,6 +6998,10 @@ fn synthesize_network_var(
     call: &GmodScriptedClassCallMetadata,
 ) {
     // ENT:NetworkVar("Type", slot, "Name") — 3-arg form
+    // ENT:NetworkVar("Type", "Name")       — 2-arg form (slot omitted)
+    // args[0] = type name (string)
+    // args[1] = slot (integer) OR name (string, if 2-arg form)
+    // args[2] = name (string, if 3-arg form)
 
     let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
     let type_name = match call.literal_args.get(type_arg_idx) {
@@ -6687,6 +7089,13 @@ fn synthesize_network_var_element(
     call: &GmodScriptedClassCallMetadata,
 ) {
     // ENT:NetworkVarElement("Type", slot, element, "Name") — 4-arg form
+    // ENT:NetworkVarElement("Type", slot, "Name")          — 3-arg form
+    // ENT:NetworkVarElement("Type", "Name")                — 2-arg form
+    // The value type is always `number` for element access.
+    // args[0] = type name (string) — used only for validation, not for type
+    // args[1] = slot or name
+    // args[2] = element or name
+    // args[3] = name (if 4-arg form)
 
     let type_arg_idx = call.network_var_type_arg_idx().unwrap_or(0);
     if call
@@ -6786,6 +7195,9 @@ fn synthesize_vgui_register(
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // vgui.Register("PanelName", TABLE, "BasePanel")
+    // args[0] = panel name (string)
+    // args[1] = table variable (name ref)
+    // args[2] = base panel name (string)
     let table_source = call.vgui_panel_table_arg_source(1);
     let base_source = call.vgui_panel_base_arg_source(Some(2));
 
@@ -6824,6 +7236,10 @@ fn synthesize_derma_define_control(
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // derma.DefineControl("ControlName", "description", TABLE, "BasePanel")
+    // args[0] = control name (string)
+    // args[1] = description (string, ignored)
+    // args[2] = table variable (name ref)
+    // args[3] = base panel name (string)
     let table_source = call.vgui_panel_table_arg_source(2);
     let base_source = call.vgui_panel_base_arg_source(Some(3));
 
@@ -6864,6 +7280,8 @@ fn synthesize_vgui_register_table(
     resolved_registration: Option<ResolvedVguiRegistrationRegion>,
 ) {
     // vgui.RegisterTable(TABLE, "BasePanel")
+    // args[0] = table variable (name ref)
+    // args[1] = base panel name (string)
     let table_source = call.vgui_panel_table_arg_source(0);
     let base_source = call.vgui_panel_base_arg_source(Some(1));
 
@@ -6902,6 +7320,8 @@ fn synthesize_vgui_register_file_target(
     call: &GmodScriptedClassCallMetadata,
 ) -> Option<(FileId, LuaDeclId, LuaTypeDeclId, String, TextSize, TextSize)> {
     // vgui.RegisterFile("path/to/panel.lua") includes a file with a temporary
+    // global PANEL table. The file itself is not a named VGUI class, but its
+    // methods should still see PANEL.Base inheritance while it is being loaded.
     let panel_source = call.vgui_panel_define_arg_source();
     let GmodClassCallLiteral::String(path) = call.value_for_arg_source(&panel_source)? else {
         return None;
@@ -6928,6 +7348,8 @@ fn synthesize_vgui_register_file_target(
     let class_type = LuaType::Def(class_decl_id.clone());
 
     // `vgui.RegisterFile` returns the temporary PANEL table it loaded. Bind
+    // that call expression to the synthesized class so a subsequent
+    // `vgui.CreateFromTable(result)` preserves the file's PANEL members.
     write_type_cache(
         db,
         LuaTypeOwner::SyntaxId(InFiled::new(source_file_id, call.syntax_id)),
@@ -7181,8 +7603,25 @@ fn register_global_panel(
 }
 
 // REMOVED: find_table_type_for_register — it fell back to the shared decl-level
+// type cache, which is exactly the position-insensitive slot that caused
+// reassigned-PANEL collapse. Resolution now goes through the concrete table
+// expression (find_registered_table_expr) instead.
 
 /// Locate the concrete table-constructor (`{}`) expression that backs the
+/// variable being registered, by scanning to the variable's latest write
+/// before the register call and taking the matching RHS expression.
+///
+/// VGUI files commonly reuse a single `local PANEL` decl with repeated plain
+/// reassignments (`PANEL = {}`), one per registered class. The class identity
+/// belongs to each individual table value, not to the shared decl slot — so we
+/// resolve the exact `{}` literal at the latest write position and return its
+/// table range plus syntax id. Callers bind the synthesized class to that
+/// `SyntaxId`, which the public `infer_expr` override consults, giving correct
+/// per-region resolution for hover/diagnostics/CodeLens alike.
+///
+/// Returns `None` (caller skips SyntaxId binding) when the RHS is not a table
+/// literal (e.g. `PANEL = make()`, `PANEL = SomeOther`), keeping behavior
+/// conservative for non-literal table values.
 fn find_registered_table_expr(
     db: &DbIndex,
     file_id: FileId,
@@ -7190,11 +7629,27 @@ fn find_registered_table_expr(
     register_position: TextSize,
 ) -> Option<LuaTableExpr> {
     // The latest write position is the start of the assigned name range for the
+    // most recent plain reassignment (`PANEL = {}`) before the register call.
+    //
+    // The original `local PANEL = {}` declaration is NOT recorded as a write
+    // reference cell (only later assignments are), so for the FIRST region
+    // there is no prior write — fall back to the decl's own position, where the
+    // enclosing `LuaLocalStat` yields the initializer table RHS.
     let write_position =
         find_latest_decl_write_before_position(db, file_id, decl_id, register_position)
             .unwrap_or(decl_id.position);
 
     find_registered_table_expr_at_write_position(db, file_id, write_position).or_else(|| {
+        // When the latest write is a reassignment whose RHS is not a table
+        // literal (e.g. `PANEL = vgui.RegisterTable(PANEL, "DPanel")`),
+        // the table constructor still lives at the original `local PANEL =
+        // {...}` declaration.
+        //
+        // Only fall back when the registration call is the reassignment RHS
+        // itself — i.e. `register_position` is within the write statement's
+        // range. This avoids mis-modeling unrelated reassignments such as
+        // `PANEL = MakePanel()` followed by a separate `vgui.RegisterTable`
+        // call, where the stale initializer should NOT be used.
         if write_position == decl_id.position {
             return None;
         }
@@ -7209,6 +7664,10 @@ fn find_registered_table_expr(
 }
 
 /// Checks whether `register_position` falls within the RHS expression
+/// corresponding to the LHS at `write_position`. This identifies the
+/// self-assignment registration pattern `PANEL = vgui.RegisterTable(PANEL, ...)`
+/// while rejecting multi-assignments where the registration call is on a
+/// different LHS (e.g. `PANEL, OTHER = MakePanel(), vgui.RegisterTable(...)`).
 fn write_position_contains_register(
     db: &DbIndex,
     file_id: FileId,
@@ -7230,6 +7689,9 @@ fn write_position_contains_register(
         return false;
     };
     // Find the specific RHS expression for the LHS at write_position.
+    // In a simple assignment `PANEL = expr`, there is one RHS at index 0.
+    // In a multi-assignment `A, B = expr1, expr2`, each LHS maps to its
+    // corresponding RHS by position index.
     let (lhs_list, rhs_list) = assign_stat.get_var_and_expr_list();
     let Some(lhs_idx) = lhs_list
         .iter()
@@ -7245,6 +7707,10 @@ fn write_position_contains_register(
 }
 
 /// Checks whether the call at the given metadata is `vgui.RegisterTable`
+/// (not `vgui.CreateFromTable`). Both use the `register_table` call_arg
+/// kind and land in `vgui_register_table_calls`, but only `RegisterTable`
+/// actually registers a panel class. `CreateFromTable` instantiates from
+/// an already-registered table and should not populate the dedup set.
 pub(crate) fn is_vgui_register_table_call(
     db: &DbIndex,
     file_id: FileId,
@@ -7446,6 +7912,16 @@ fn synthesize_panel_class_with_id(
     }
 
     // Bind the table variable to the panel class.
+    //
+    // VGUI files reuse a single `local PANEL` decl with repeated plain
+    // reassignments (`PANEL = {}`), one per registered class. The class
+    // identity belongs to each concrete table value (the `{}` literal), NOT to
+    // the shared decl slot. Binding the decl slot collapses every region onto a
+    // single class (last-write-wins), which is the root cause of the
+    // reassigned-PANEL mis-binding. Instead we bind the class to the exact
+    // table-constructor expression via `LuaTypeOwner::SyntaxId`, which the
+    // public `infer_expr` override consults — yielding correct per-region
+    // resolution for hover, diagnostics, completion and CodeLens uniformly.
     if let Some(var_name) = table_var_name {
         let register_position = call.syntax_id.get_range().start();
         let Some(resolved_registration) = resolved_registration.or_else(|| {
@@ -7495,6 +7971,10 @@ fn synthesize_panel_class_with_id(
 
         if !cached_decl_has_reassignment(cache, db, file_id, decl_id) {
             // For single-panel files the `PANEL` local has one stable identity.
+            // Bind the decl slot too so method-self collection during the Lua
+            // pass sees the synthesized class before it caches member values.
+            // Reassigned locals remain table-literal-only to avoid collapsing
+            // distinct registration regions onto one class.
             write_type_cache(
                 db,
                 decl_id.into(),
@@ -7504,11 +7984,27 @@ fn synthesize_panel_class_with_id(
         }
 
         // Transfer the members defined in this registration's table region to
+        // the class, then rewrite that exact table-const range so persistent
+        // type caches (cross-file accesses, exports) resolve to the class.
         if let Some(table_expr) = &registered_table {
             let table_range = InFiled::new(file_id, table_expr.get_range());
             let class_member_owner = LuaMemberOwner::Type(class_decl_id.clone());
 
             // Members defined via `function PANEL:Method()` / `PANEL.Field =`
+            // are collected during the `lua` analysis pass — which runs BEFORE
+            // this gmod post-analysis SyntaxId binding exists. At that point the
+            // flow inference of the reused `PANEL` local resolves to its
+            // *initializer* table literal, so EVERY region's members accumulate
+            // under that single `Element` owner, differentiated only by source
+            // position. The per-region table literal's own `Element` owner is
+            // therefore usually empty.
+            //
+            // To bridge synthesis (which knows the per-region boundary) with
+            // collection (which keyed everything on the initializer table), we
+            // gather all candidate member-source `Element` owners and slice them
+            // by source position `[latest_write_position, register_position)`.
+            // This stays correct if a future flow-aware collector starts keying
+            // members under the per-region literal instead.
             let member_source_ranges =
                 collect_panel_member_source_ranges(cache, db, file_id, decl_id, &table_range);
 
@@ -7528,6 +8024,10 @@ fn synthesize_panel_class_with_id(
                                 .unwrap_or(true)
                         {
                             // For the initializer table fallback, verify the member
+                            // was defined using the registered variable name. Members
+                            // defined through aliases (e.g. `local OLD = PANEL;
+                            // function OLD:Method()`) must not be transferred to the
+                            // new panel class.
                             if is_initializer_fallback
                                 && !member_defined_via_variable(
                                     db,
@@ -7545,6 +8045,12 @@ fn synthesize_panel_class_with_id(
             }
 
             // A derma file conventionally uses the *global* `PANEL` scratch
+            // table (`PANEL = {}` … `function PANEL:Paint()` …
+            // `vgui.Register("X", PANEL, "DButton")`). At runtime that
+            // table is consumed by the register call and the next file
+            // overwrites the global, so each file's `PANEL` is a separate
+            // class — exactly like `ENT`/`SWEP`, which are modelled as
+            // scoped class globals.
             for global_owner in global_panel_member_owners(db, var_name) {
                 let members = db
                     .get_member_index()
@@ -7579,6 +8085,8 @@ fn synthesize_panel_class_with_id(
             }
 
             // Backfill persistent type caches that still hold this exact
+            // table-const identity (scoped to the current range only — never
+            // carried forward across registrations).
             cache
                 .table_const_replacements
                 .insert(table_range, class_type.clone());
@@ -7672,6 +8180,26 @@ fn bind_inline_vgui_panel_table(
 }
 
 /// Collect the candidate `Element` owner ranges that may hold this
+/// registration region's members, deduped and most-specific first.
+///
+/// `function PANEL:Method()` member collection happens in the `lua` pass before
+/// the gmod-post SyntaxId binding exists, so members of reused locals end up
+/// under the local's *initializer* table `Element` owner rather than each
+/// region's own table literal. We therefore consider:
+///
+/// 1. the exact per-region table literal range (precise / future-proof), and
+/// 2. the original local declaration's initializer `TableConst` range (where
+///    the lua pass actually accumulated the members today).
+///
+/// Callers slice the resulting members by source position to attribute them to
+/// the correct region.
+/// Owners a *global* panel-table variable's members can be sitting on.
+///
+/// Decl analysis parks `PANEL.Field` / `function PANEL:Method()` under
+/// `GlobalPath("PANEL")`; the global-member migration then re-homes them onto
+/// whatever the `PANEL` declaration resolved to, which for GMod workspaces is
+/// the annotation `@class PANEL`. Both are checked so the transfer works
+/// whichever stage the member reached.
 fn global_panel_member_owners(db: &DbIndex, var_name: &str) -> Vec<LuaMemberOwner> {
     let mut owners = vec![LuaMemberOwner::GlobalPath(GlobalId::new(var_name))];
     let type_decl_id = LuaTypeDeclId::global(var_name);
@@ -7692,6 +8220,11 @@ fn collect_panel_member_source_ranges(
     ranges.push(region_table_range.clone());
 
     // The original local decl's initializer table literal (`local PANEL = {}`)
+    // is the `Element` owner the lua pass keyed all reused-local members under.
+    //
+    // We derive this range from the AST rather than the decl type cache: VGUI
+    // synthesis rewrites table-const caches after collecting region members, so
+    // cache state is intentionally not the source of truth here.
     if let Some(initializer_range) =
         cached_decl_initializer_table_range(cache, db, file_id, decl_id)
         && !ranges.iter().any(|existing| existing == &initializer_range)
@@ -7721,6 +8254,8 @@ fn cached_decl_initializer_table_range(
 }
 
 /// Find the range of the table literal in a local declaration's initializer
+/// (`local PANEL = {}` -> range of `{}`), derived purely from the AST so it is
+/// stable against type-cache mutation during synthesis.
 fn find_decl_initializer_table_range(
     db: &DbIndex,
     file_id: FileId,
@@ -7750,6 +8285,9 @@ fn find_decl_initializer_table_range(
 }
 
 /// Returns true when the local decl has at least one write that is not its
+/// initial declaration position — i.e. it is reassigned (`PANEL = {}`) after
+/// the original `local PANEL`. Used to keep the single-panel decl-binding
+/// compatibility path from contaminating reused locals.
 fn decl_has_reassignment(db: &DbIndex, file_id: FileId, decl_id: LuaDeclId) -> bool {
     let decl_position = decl_id.position;
     db.get_reference_index()
@@ -7764,6 +8302,12 @@ fn decl_has_reassignment(db: &DbIndex, file_id: FileId, decl_id: LuaDeclId) -> b
 }
 
 /// Check if a member at the given position was defined using a specific
+/// variable name. Walks up from the member's syntax position to find the
+/// enclosing `function VAR:Method()` / `VAR.Field = value` and checks the
+/// prefix variable name.
+///
+/// Returns `true` (conservative include) when the variable name cannot be
+/// determined, so callers don't accidentally drop members they can't trace.
 fn member_defined_via_variable(
     db: &DbIndex,
     file_id: FileId,
@@ -7968,11 +8512,16 @@ fn detect_scoped_class_from_path(db: &DbIndex, file_id: FileId) -> Option<GmodSc
 }
 
 /// Returns the scripted class info `(class_name, global_name)` for a file, if it belongs to a
+/// GMod scripted class scope.  `global_name` is the well-known table name used in the file
+/// (e.g. `"ENT"`, `"SWEP"`, `"TOOL"`, `"EFFECT"`, `"PLUGIN"`).
+/// Uses cached scoped class info when available, falling back to path detection.
 pub fn get_scripted_class_info_for_file(db: &DbIndex, file_id: FileId) -> Option<(String, String)> {
     get_scripted_class_info_with_prefix(db, file_id).map(|(c, g, _)| (c, g))
 }
 
 /// Like [`get_scripted_class_info_for_file`] but also returns the scope's
+/// `class_name_prefix`, so callers can correctly strip it to recover the
+/// folder short-name (used for parent-alias synthesis on inherited classes).
 pub(crate) fn get_scripted_class_info_with_prefix(
     db: &DbIndex,
     file_id: FileId,
@@ -8024,6 +8573,9 @@ pub(crate) struct AnnotatedGmodGlobalCallRoleMap {
     candidate_call_path_kinds: Vec<AnnotatedGmodCandidatePresence>,
     environment_role_source_files: HashSet<FileId>,
     /// Canonical function metadata per `(wire_format, direction)`, published to
+    /// the network index for features that must emit a net call. Values keep
+    /// their precedence rank so the winner does not depend on the signature
+    /// index's iteration order.
     canonical_net_ops:
         HashMap<(SmolStr, NetOpDirection), (CanonicalNetOpRank, crate::db_index::CanonicalNetOp)>,
 }
@@ -8765,6 +9317,8 @@ fn match_bool(matches: bool) -> StaticArgTypeMatch {
 }
 
 /// Total precedence of canonical net metadata, lowest wins. Workspace class is
+/// the meaningful preference; path and position make equal-name duplicates
+/// deterministic even when their metadata conflicts.
 #[derive(Clone, PartialEq, Eq, PartialOrd, Ord)]
 struct CanonicalNetOpRank {
     workspace: u8,
@@ -8799,6 +9353,9 @@ fn canonical_net_op_rank(db: &DbIndex, signature_id: LuaSignatureId) -> Canonica
 }
 
 impl AnnotatedGmodGlobalCallRoleMap {
+    /// One file's contribution to the role map, plus the helper definitions its
+    /// signatures produced. Cached on the db and re-derived only when the file
+    /// is re-analysed — see `DbIndex::get_cached_file_helper_scan`.
     fn build_for_file(
         db: &DbIndex,
         signature_ids: &[LuaSignatureId],
@@ -8832,6 +9389,9 @@ impl AnnotatedGmodGlobalCallRoleMap {
     }
 
     /// Folds another file's fragment in. Files are merged in a fixed order and
+    /// the first file to define a call path wins, so a path that two files both
+    /// define resolves the same way every run — the previous whole-index fold
+    /// took the signature index's `HashMap` order, which varies per process.
     fn merge_from(&mut self, other: &Self) {
         for (path, roles) in &other.roles_by_path {
             self.roles_by_path
@@ -8875,6 +9435,9 @@ impl AnnotatedGmodGlobalCallRoleMap {
 
         if let Some(descriptor) = descriptor {
             // Wrappers are expected to share a wire format with the builtin they
+            // wrap, so collisions here are normal rather than exceptional. The
+            // signature index is a `HashMap`, so its iteration order varies per
+            // process; ranking the candidates keeps the published name stable.
             let candidate = (
                 canonical_net_op_rank(db, signature_id),
                 crate::db_index::CanonicalNetOp {
@@ -9363,6 +9926,8 @@ fn roles_from_inferred_receiver_method(
     call_path: &str,
 ) -> Option<AnnotatedGmodCallRoles> {
     // A local access path such as self.tabContainer:AddPanel cannot match the
+    // annotated DHorizontalScroller.AddPanel path, but its member signature can.
+    // Most calls have no VGUI parent role, so avoid semantic inference for them.
     if !matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
         || !matches!(
             call_path.rsplit('.').next(),
@@ -10788,6 +11353,8 @@ fn collect_member_realm_ranges(root: &LuaChunk) -> Vec<GmodRealmRange> {
 }
 
 /// Extract realm narrowing from a single if-statement, handling if/elseif/else clauses.
+/// Also handles early-return guards like `if not CLIENT then return end` which narrows
+/// the realm of code after the if-statement to the complementary realm.
 fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>) {
     let condition_realm = if_stat
         .get_condition_expr()
@@ -10800,6 +11367,8 @@ fn collect_if_realm_ranges(if_stat: &LuaIfStat, ranges: &mut Vec<GmodRealmRange>
             ranges.push(GmodRealmRange { range, realm });
         } else {
             // Empty block (e.g., comment-only if-body): still record the realm
+            // so that realm-awareness checks (like AddCSLuaFile CLIENT detection) work.
+            // Use a zero-width range at the start of the if-statement as a marker.
             let pos = if_stat.syntax().text_range().start();
             ranges.push(GmodRealmRange {
                 range: TextRange::new(pos, pos),
@@ -11908,6 +12477,10 @@ fn collect_dynamic_loaders(
     }
 
     // Every file is content-scanned for a `file_find` candidate before almost
+    // all of them bail out, and the whole walk is read-only against `&DbIndex`,
+    // so it runs across files in parallel. Results stay index-aligned and are
+    // flattened in file order, so the pattern list is identical to the previous
+    // sequential build.
     let per_file = super::parallel::map_files_collect(db, file_ids, |db, source_file_id| {
         let mut patterns = Vec::new();
         let Some(tree) = db.get_vfs().get_syntax_tree(&source_file_id) else {
@@ -13085,6 +13658,10 @@ fn dynamic_file_find_targets(
     relative_paths_by_parent: &HashMap<String, Vec<(FileId, String)>>,
 ) -> Vec<(FileId, String)> {
     // `targets` is consumed in order by `apply_dynamic_loaders`, which feeds the
+    // load-graph fixpoint, so the order has to be a property of the source. The
+    // directory branch walks a `HashSet` of suffixes and a `HashMap` keyed by
+    // parent path — doubly hash-random per process. Same policy as
+    // `build_call_roles_and_registry`: order by normalized path, then file id.
     let mut targets =
         dynamic_file_find_targets_unordered(glob, result_kind, usage, relative_paths_by_parent);
     targets.sort_by_cached_key(|(file_id, target_path)| {
@@ -14094,6 +14671,10 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
     }
 
     // 2. Check parent directory names for realm hints SECOND
+    // Prefer the path segment after the last `/lua/` anchor to avoid false realm hints
+    // from unrelated parent directory names (e.g. a user home directory named "server").
+    // If there is no `/lua/` anchor, still allow inference for known GMod workspace layouts
+    // such as addon-root (`lua/...`) and gamemode-root (`gamemode/...`, `entities/...`).
     let path_str = file_path.to_string_lossy().to_ascii_lowercase();
     let path_str = path_str.replace('\\', "/");
     let components = file_path
@@ -14141,6 +14722,8 @@ fn infer_realm_from_filename(db: &DbIndex, file_id: FileId) -> Option<GmodRealm>
     }
 
     // 3. Check GMod special directory patterns (engine-defined realm behavior per GMod loading order)
+    // These MUST come before the init.lua/shared.lua filename checks because e.g.
+    // effects/init.lua should be Shared (effects load on both realms), not Server.
     if search_str.contains("/effects/") {
         return Some(GmodRealm::Shared);
     }

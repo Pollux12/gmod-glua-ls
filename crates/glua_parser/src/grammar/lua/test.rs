@@ -1185,6 +1185,8 @@ Syntax(Chunk)@0..94
         assert_ast_eq!(code, result);
     }
     /// A missing `end` is only detected at EOF, but reporting it there puts the
+    /// error at the bottom of the file instead of on the definition that is
+    /// unclosed. Every `function` form routes through `parse_closure_expr`.
     #[test]
     fn missing_end_reports_at_the_function_not_at_eof() {
         for src in [

@@ -3007,6 +3007,8 @@ local EscapeStringMap: {
     }
 
     /// Hovering the `function` keyword in a hook.Add callback should show the anonymous callback
+    /// signature (e.g. `function(ply: Player, seat: Vehicle) -> boolean`) and NOT the generic
+    /// "The function keyword is used to define a function..." keyword docs.
     #[gtest]
     fn test_hover_hook_add_callback_function_keyword_shows_hook_signature() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
@@ -3370,6 +3372,9 @@ local EscapeStringMap: {
     }
 
     /// A hook declared with only `@return` and no `@param` annotations must still show
+    /// the return type in the anonymous callback signature (e.g. `function() -> boolean`).
+    /// Previously `filter_signature_type` would skip the signature when `param_docs` is empty,
+    /// silently degrading return-only hooks to keyword docs.
     #[gtest]
     fn test_hover_hook_add_callback_function_keyword_return_only_hook_shows_return_type()
     -> Result<()> {
@@ -3882,6 +3887,9 @@ local EscapeStringMap: {
         let value = extract_hover_markdown(&ws, file_id, position);
 
         // Reads inside readPair() should appear inside a Lua code fence that
+        // follows a styled scope-open row for the outer for-loop — the
+        // helper-recursion flow_path-prefix fix carries the call site's loop
+        // into the helper body's reads.
         assert!(
             value.contains("net.ReadString") && value.contains("for i = 1, n, 1 do"),
             "expected ReadString and outer for-loop header both rendered, got: {value}"
@@ -3949,6 +3957,14 @@ local EscapeStringMap: {
     #[gtest]
     fn test_hover_branched_dynamic_field_unions_vector_real_shape() -> Result<()> {
         // Repro of cityrp-vehicle-base/init.lua bug:
+        //   if exitPos then
+        //       seat.GlideExitPos = Vector(...)
+        //   else
+        //       seat.GlideExitPos = nil
+        //   end
+        // Reading `seat.GlideExitPos` later must hover as `Vector?` (i.e. Vector|nil),
+        // NOT bare `nil`. Pre-fix, `retain_only_member_for_owner_key` dropped the
+        // Vector-branch member because the `= nil` branch ran later.
         let mut ws = enable_gmod_workspace();
         let mut emmyrc = ws.get_emmyrc();
         emmyrc.gmod.infer_dynamic_fields = true;
@@ -4016,6 +4032,8 @@ local EscapeStringMap: {
     }
 
     /// Hover at the LHS of `seat.GlideExitPos = nil`. Assignment-target hovers
+    /// describe the value written at that site; the adjacent read-site
+    /// regression above continues to require the accumulated `Vector?` type.
     #[gtest]
     fn test_hover_branched_dynamic_field_lhs_assign_shows_assigned_nil() -> Result<()> {
         let mut ws = enable_gmod_workspace();
@@ -4077,6 +4095,11 @@ local EscapeStringMap: {
     }
 
     /// Read-site hover where the entity local comes from `self.seats[index]`
+    /// in a different method than the branched assignment. Mirrors
+    /// `cityrp-vehicle-base/init.lua:559` (`local seat = self.seats[index]`
+    /// then `seat.GlideExitPos[1]`). Failing red test pre-fix produced bare
+    /// `nil` or `never` because the branched dynamic-field assignment
+    /// collapsed to the last `= nil` branch.
     #[gtest]
     fn test_hover_branched_dynamic_field_read_via_self_seats_array() -> Result<()> {
         let mut ws = enable_gmod_workspace();
@@ -4234,6 +4257,13 @@ local EscapeStringMap: {
     }
 
     /// `self` inside a scripted-class method is an instance of the class the
+    /// authoring table stands for, so hover must name that class.
+    ///
+    /// `ENT` is virtual inside a scripted scope, so it has no decl and the
+    /// receiver lookup used to fall back to the enclosing method's member. That
+    /// is the shared semantic decl id, so goto-definition, references,
+    /// implementation and rename all pointed at the method too; hover is just
+    /// the cheapest place to observe it.
     #[gtest]
     fn test_hover_self_in_scripted_entity_method_shows_class() -> Result<()> {
         let mut ws = enable_gmod_workspace();
@@ -4297,6 +4327,9 @@ local EscapeStringMap: {
     }
 
     /// `PLAYER` and `PLUGIN` author their class through a real local, unlike the
+    /// virtual `ENT` / `SWEP` / `GM` tables. `self` must still be typed as that
+    /// file's scripted class in both styles — the local is the authoring
+    /// mechanism, not a different entity.
     #[gtest]
     fn test_self_in_player_class_resolves_to_class_like_the_token() -> Result<()> {
         let source = r#"
@@ -4334,6 +4367,12 @@ local EscapeStringMap: {
     }
 
     /// A scripted class inherits both the GMod `ENT` annotation chain and its
+    /// own scripted base, so the super graph is a diamond: `ENT : ENTITY :
+    /// Entity` sits alongside a direct `Entity` super, and the real base comes
+    /// last. Walking the siblings with one shared infer guard marked `Entity`
+    /// visited in the `ENT` branch, so the direct `Entity` sibling failed with
+    /// `RecursiveInfer` and aborted the rest of the walk — the real base was
+    /// never searched and the inherited method lost its signature.
     #[gtest]
     fn test_inherited_scripted_method_survives_super_diamond() -> Result<()> {
         let mut ws = enable_gmod_workspace();
