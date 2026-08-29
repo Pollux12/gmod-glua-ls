@@ -584,7 +584,8 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
             .push(candidate);
     }
 
-    let file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.sort_unstable();
     context
         .infer_manager
         .clear_files_iter_var_results(&file_ids.iter().copied().collect());
@@ -593,8 +594,10 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
     // Inference reads the settled indexes and records candidate type writes
-    // without mutating the database. Apply the writes in stable file and source
-    // order on the caller thread, so the result does not depend on the schedule.
+    // without mutating the database. The results come back in `file_ids` order,
+    // which is why it is sorted above: the writes are applied on the caller
+    // thread in file and source order, never in the order the workers finished
+    // or a hash map happened to yield.
     let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
         let mut infer_cache = crate::LuaInferCache::new(
             file_id,
