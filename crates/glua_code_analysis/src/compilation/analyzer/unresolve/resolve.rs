@@ -709,21 +709,13 @@ fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
     }
 }
 
-pub fn try_resolve_iter_var(
-    db: &mut DbIndex,
-    cache: &mut LuaInferCache,
-    unresolve_iter_var: &mut UnResolveIterVar,
-) -> ResolveResult {
-    try_resolve_iter_var_inner(db, cache, unresolve_iter_var, false)
-}
-
-/// [`try_resolve_iter_var`] for the settled re-derivation, where the answer was
-/// taken against the complete member map and so replaces whatever partial one a
-/// wave left behind rather than only widening it.
-/// The inference of the settled iterator-variable re-derivation without the
-/// writes, for the parallel pass: updates are applied later in stable file
-/// order. Each update pairs a variable's resolved type with the write-mode
-/// decision it earned.
+/// [`try_resolve_iter_var`] for the settled re-derivation, minus the writes.
+///
+/// The answer is taken against the complete member map, so it replaces whatever
+/// partial one a wave left behind rather than only widening it. The pass runs on
+/// parallel workers against an immutable index and applies the updates it
+/// returns in file order afterwards, so each one pairs a variable's resolved
+/// type with the write-mode decision it earned.
 pub fn resolve_settled_iter_var_readonly(
     db: &DbIndex,
     cache: &mut LuaInferCache,
@@ -734,11 +726,10 @@ pub fn resolve_settled_iter_var_readonly(
     compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, true)
 }
 
-fn try_resolve_iter_var_inner(
+pub fn try_resolve_iter_var(
     db: &mut DbIndex,
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
-    settled: bool,
 ) -> ResolveResult {
     let var_positions = unresolve_iter_var
         .iter_vars
@@ -751,7 +742,7 @@ fn try_resolve_iter_var_inner(
         unresolve_iter_var.file_id,
         &unresolve_iter_var.iter_exprs,
         &var_positions,
-        settled,
+        false,
     ) {
         Ok(updates) => updates,
         // Placeholder items have nothing to add on a failed retry: the template
