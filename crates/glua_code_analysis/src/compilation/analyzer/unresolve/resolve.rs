@@ -720,12 +720,18 @@ pub fn try_resolve_iter_var(
 /// [`try_resolve_iter_var`] for the settled re-derivation, where the answer was
 /// taken against the complete member map and so replaces whatever partial one a
 /// wave left behind rather than only widening it.
-pub fn resolve_settled_iter_var(
-    db: &mut DbIndex,
+/// The inference of the settled iterator-variable re-derivation without the
+/// writes, for the parallel pass: updates are applied later in stable file
+/// order. Each update pairs a variable's resolved type with the write-mode
+/// decision it earned.
+pub fn resolve_settled_iter_var_readonly(
+    db: &DbIndex,
     cache: &mut LuaInferCache,
-    unresolve_iter_var: &mut UnResolveIterVar,
-) -> ResolveResult {
-    try_resolve_iter_var_inner(db, cache, unresolve_iter_var, true)
+    file_id: FileId,
+    iter_exprs: &[LuaExpr],
+    var_positions: &[TextSize],
+) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
+    compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, true)
 }
 
 fn try_resolve_iter_var_inner(
@@ -734,25 +740,60 @@ fn try_resolve_iter_var_inner(
     unresolve_iter_var: &mut UnResolveIterVar,
     settled: bool,
 ) -> ResolveResult {
-    let iter_var_types =
-        match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs) {
-            Ok(types) => types,
-            // Placeholder items have nothing to add on a failed retry: the template
-            // ref is already cached. Keep the failure in this reason's own group
-            // rather than injecting the item into another group's fixpoint.
-            Err(reason) => {
-                return Err(
-                    if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
-                        InferFailReason::UnResolveIterTemplate
-                    } else {
-                        reason
-                    },
-                );
-            }
-        };
-    for (idx, var_name) in unresolve_iter_var.iter_vars.iter().enumerate() {
-        let position = var_name.get_position();
-        let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, position);
+    let var_positions = unresolve_iter_var
+        .iter_vars
+        .iter()
+        .map(LuaAstToken::get_position)
+        .collect::<Vec<_>>();
+    let updates = match compute_iter_var_updates(
+        db,
+        cache,
+        unresolve_iter_var.file_id,
+        &unresolve_iter_var.iter_exprs,
+        &var_positions,
+        settled,
+    ) {
+        Ok(updates) => updates,
+        // Placeholder items have nothing to add on a failed retry: the template
+        // ref is already cached. Keep the failure in this reason's own group
+        // rather than injecting the item into another group's fixpoint.
+        Err(reason) => {
+            return Err(
+                if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
+                    InferFailReason::UnResolveIterTemplate
+                } else {
+                    reason
+                },
+            );
+        }
+    };
+    for update in updates {
+        write_type_cache(db, update.owner, update.cache, update.mode);
+    }
+    Ok(())
+}
+
+/// A resolved iterator-variable type plus the write-mode decision it earned, so
+/// the settled re-derivation can run the inference read-only on parallel workers
+/// and apply the updates in stable file order.
+pub struct IterVarTypeUpdate {
+    pub(crate) owner: LuaTypeOwner,
+    pub(crate) cache: LuaTypeCache,
+    pub(crate) mode: TypeCacheWriteMode,
+}
+
+fn compute_iter_var_updates(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    iter_exprs: &[LuaExpr],
+    var_positions: &[TextSize],
+    settled: bool,
+) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
+    let iter_var_types = infer_for_range_iter_expr_func(db, cache, iter_exprs)?;
+    let mut updates = Vec::with_capacity(var_positions.len());
+    for (idx, &position) in var_positions.iter().enumerate() {
+        let decl_id = LuaDeclId::new(file_id, position);
         let ret_type = iter_var_types
             .get_type(idx)
             .cloned()
@@ -766,9 +807,13 @@ fn try_resolve_iter_var_inner(
         } else {
             iter_var_write_mode(cached, &ret_type)
         };
-        write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
+        updates.push(IterVarTypeUpdate {
+            owner,
+            cache: LuaTypeCache::InferType(ret_type),
+            mode,
+        });
     }
-    Ok(())
+    Ok(updates)
 }
 
 /// The write mode for a settled iterator-variable type.

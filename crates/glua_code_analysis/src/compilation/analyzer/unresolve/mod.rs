@@ -32,7 +32,10 @@ use resolve_closure::{
 };
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
-pub(crate) use resolve::{resolve_settled_iter_var, try_resolve_member, try_resolve_return_point};
+pub(crate) use resolve::{
+    IterVarTypeUpdate, resolve_settled_iter_var_readonly, try_resolve_member,
+    try_resolve_return_point,
+};
 pub use resolve_closure::extract_hook_name;
 pub use resolve_closure::{
     resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
