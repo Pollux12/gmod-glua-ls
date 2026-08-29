@@ -241,6 +241,31 @@ impl FindMembersContext {
     fn caller_position(&self) -> Option<TextSize> {
         self.caller_position
     }
+
+    /// The position dynamic-field visibility is judged from. `None` when the
+    /// request carries no position, where every definition is visible.
+    fn dynamic_field_access_site(&self, db: &DbIndex) -> Option<DynamicFieldAccessSite> {
+        let file_id = self.file_id?;
+        let position = self.caller_position?;
+        Some(DynamicFieldAccessSite {
+            file_id,
+            position,
+            // A listing asks about many fields from one position, and this is a
+            // binary search plus a backward scan over every function range in
+            // the file, so it is resolved per listing rather than per field.
+            in_function: db
+                .get_member_index()
+                .enclosing_function_scope_range(file_id, position)
+                .is_some(),
+        })
+    }
+}
+
+/// The position a dynamic-field listing is taken from.
+struct DynamicFieldAccessSite {
+    file_id: FileId,
+    position: TextSize,
+    in_function: bool,
 }
 
 fn find_members_guard(
@@ -1127,6 +1152,7 @@ fn append_dynamic_fields_for_type(
     };
 
     field_names.sort_unstable();
+    let access_site = ctx.dynamic_field_access_site(db);
 
     for field_name in field_names {
         let member_key = LuaMemberKey::Name(field_name.clone());
@@ -1138,15 +1164,8 @@ fn append_dynamic_fields_for_type(
             continue;
         }
 
-        if let Some(caller_position) = ctx.caller_position()
-            && let Some(caller_file_id) = ctx.file_id()
-            && !dynamic_field_visible_at_offset(
-                db,
-                &owner,
-                &field_name,
-                caller_file_id,
-                caller_position,
-            )
+        if let Some(site) = &access_site
+            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
         {
             continue;
         }
@@ -1219,6 +1238,7 @@ fn append_dynamic_fields_for_table(
     };
 
     field_names.sort_unstable();
+    let access_site = ctx.dynamic_field_access_site(db);
 
     for field_name in field_names {
         let member_key = LuaMemberKey::Name(field_name.clone());
@@ -1230,15 +1250,8 @@ fn append_dynamic_fields_for_table(
             continue;
         }
 
-        if let Some(caller_position) = ctx.caller_position()
-            && let Some(caller_file_id) = ctx.file_id()
-            && !dynamic_field_visible_at_offset(
-                db,
-                &owner,
-                &field_name,
-                caller_file_id,
-                caller_position,
-            )
+        if let Some(site) = &access_site
+            && !dynamic_field_visible_at_offset(db, &owner, &field_name, site)
         {
             continue;
         }
@@ -1273,31 +1286,32 @@ fn append_dynamic_fields_for_table(
 /// a function body runs after the whole file has loaded — both stay visible.
 /// Definitions in other files are always visible; their load-order and realm
 /// rules are the member item's to decide.
+///
+/// This is deliberately broader than [`super::resolve_dynamic_field_member`]'s
+/// execution-region rule, which answers what a read *yields* at a position: a
+/// field a hook assigns further down its own body is a name the table has, even
+/// on the call that has not reached the assignment yet.
 fn dynamic_field_visible_at_offset(
     db: &DbIndex,
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
-    caller_file_id: FileId,
-    caller_position: TextSize,
+    site: &DynamicFieldAccessSite,
 ) -> bool {
     let definitions = db
         .get_dynamic_field_index()
-        .get_field_definitions(owner, field_name);
+        .field_definitions(owner, field_name);
     if definitions.is_empty() {
         return true;
     }
 
     let member_index = db.get_member_index();
-    // A caller inside a function body runs after the whole file has loaded, so
-    // every same-file definition is visible to it.
-    let caller_in_function = member_index
-        .enclosing_function_scope_range(caller_file_id, caller_position)
-        .is_some();
     definitions.iter().any(|definition| {
-        if definition.file_id != caller_file_id || definition.value.start() <= caller_position {
+        if definition.file_id != site.file_id || definition.value.start() <= site.position {
             return true;
         }
-        if caller_in_function {
+        // A caller inside a function body runs after the whole file has loaded,
+        // so every same-file definition is visible to it.
+        if site.in_function {
             return true;
         }
         // A definition inside a function body runs when that function is
@@ -1339,9 +1353,8 @@ fn append_keyed_dynamic_field(
     if !is_visible {
         return Some(false);
     }
-    if let Some(caller_position) = ctx.caller_position()
-        && let Some(caller_file_id) = ctx.file_id()
-        && !dynamic_field_visible_at_offset(db, owner, field_name, caller_file_id, caller_position)
+    if let Some(site) = ctx.dynamic_field_access_site(db)
+        && !dynamic_field_visible_at_offset(db, owner, field_name, &site)
     {
         return Some(false);
     }

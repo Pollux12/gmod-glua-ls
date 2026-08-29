@@ -301,7 +301,7 @@ fn collect_dynamic_field_locations(
             let definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(&owner, field_name);
+                .field_definitions(&owner, field_name);
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
@@ -321,7 +321,7 @@ fn collect_dynamic_field_locations(
             let definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()
-                .get_field_definitions(&owner, field_name);
+                .field_definitions(&owner, field_name);
             for definition in definitions {
                 if respect_file_scope
                     && !dynamic_fields_global
