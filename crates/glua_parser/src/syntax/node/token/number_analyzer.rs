@@ -10,6 +10,9 @@ pub fn float_token_value(token: &LuaSyntaxToken) -> Result<f64, LuaParseError> {
     let hex = text.starts_with("0x") || text.starts_with("0X");
 
     // This section handles the parsing of hexadecimal floating-point numbers.
+    // Hexadecimal floating-point literals are of the form 0x1.8p3, where:
+    // - "0x1.8" is the significand (integer and fractional parts in hexadecimal)
+    // - "p3" is the exponent (in decimal, base 2 exponent)
     let value = if hex {
         let hex_float_text = &text[2..];
         let exponent_position = hex_float_text

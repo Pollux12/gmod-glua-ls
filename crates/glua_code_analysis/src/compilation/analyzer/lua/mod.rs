@@ -146,6 +146,8 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
                         }
 
                         // Detailed per-file logging is intentionally reserved for explicit profiling.
+                        // Info logging can be enabled in normal server sessions, and logging every
+                        // >1ms file turns large workspace analysis into a log-I/O hotspot.
                         let should_log_file = if stderr_profile_enabled {
                             file_elapsed.as_millis() > 1
                         } else {
@@ -211,6 +213,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
 }
 
 /// Measures how much of `lua analyze` could overlap if each dependency level ran
+/// concurrently: the critical path is the sum of each level's slowest file.
 /// Profiling only (`GLUALS_PROFILE=1`).
 #[derive(Default)]
 struct LevelShape {

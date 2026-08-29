@@ -4,6 +4,38 @@ use std::str::Chars;
 pub const EOF: char = '\0';
 
 /// Reader with look-ahead and look-behind methods.
+///
+/// As you read text, the part that you've read is accumulated
+/// in `current_range`. The part that you haven't seen yet is available
+/// in `tail_range`:
+///
+/// ```text
+/// valid range: a b c d e f g
+///                ^^^          - current range
+///                    ^^^^^^^  - tail range
+///                  ^          - prev char
+///                    ^        - current char
+///                      ^      - next char
+/// ```
+///
+/// Once you call `reset_buff`, current range is advanced to start
+/// at the current char, and shrunk to zero length:
+///
+/// ```text
+/// valid range: a b c d e f g
+///                    .       - current range (empty, starts at `d`)
+///                    ^^^^^^  - tail range
+///                  ^         - prev char
+///                    ^       - current char
+///                      ^     - next char
+/// ```
+///
+/// The workflow in roughly this:
+///
+/// - you read characters, they're put into `saved_range`;
+/// - once you're at a token boundary, you emit a token with `saved_range`,
+///   then call `reset_buff`,
+/// - you continue onto the next token.
 #[derive(Debug, Clone)]
 pub struct Reader<'a> {
     text: &'a str,

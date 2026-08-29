@@ -18,6 +18,9 @@ fn is_name_continue(ch: char) -> bool {
 }
 
 /// This enum allows preserving lexer state between reader resets. This is used
+/// when lexer doesn't see the whole input source, and only sees a reader
+/// for each individual line. It happens when we're lexing
+/// code blocks in comments.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LexerState {
     Normal,
