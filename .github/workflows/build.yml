@@ -304,7 +304,7 @@ jobs:
       contents: write
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v7
+        uses: actions/download-artifact@v8
       - name: Add execute permission and compress (Linux)
         run: |
           chmod +x glua_ls-linux-x64/glua_ls
