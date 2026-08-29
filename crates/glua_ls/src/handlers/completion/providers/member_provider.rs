@@ -1,6 +1,7 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId,
-    LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberId, LuaMemberInfo, LuaMemberKey,
+    LuaMemberOwner, LuaSemanticDeclId, LuaType, LuaTypeDeclId, MemberAssignmentContributionStore,
+    SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
@@ -73,6 +74,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         None
     };
     extend_gmod_hook_fallback_members(builder, gmod_fallback_owner, &mut member_info_map);
+    dedupe_member_infos(builder, &mut member_info_map);
 
     add_completions_for_members_with_gmod_owner(
         builder,
@@ -99,6 +101,11 @@ fn extend_global_path_members(
         return;
     };
 
+    // The namespace route is a fallback for keys the prefix type cannot
+    // answer — e.g. a guarded bootstrap slot that resolves to an empty
+    // literal while the accumulated members live under the global path
+    // owner. Its members join the prefix type's own, and superseded
+    // same-file writers are collapsed afterwards.
     let mut existing = collect_member_identities(members);
 
     for (key, infos) in global_path_members {
@@ -178,6 +185,114 @@ fn extend_gmod_hook_fallback_members(
             }
         }
     }
+}
+
+/// Writers of one key, resolved the way the settled slot resolves them.
+///
+/// Writers within one file are sequential — the file's latest write of the
+/// key, whatever its class, is what a load of the file leaves in the slot, so
+/// earlier same-file writers collapse to it. Across files, a plain load-time
+/// write supersedes conditional-branch writers (`if ... then t.k = x end`
+/// fires only at runtime events, after the slot's load-time value exists),
+/// while guarded bootstrap siblings (`x = x or {}`) and other cross-file
+/// writers coexist — realm and load order at the caller decide which of those
+/// a caller sees (the item resolution's job).
+fn dedupe_member_infos(
+    builder: &CompletionBuilder,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    let db = builder.semantic_model.get_db();
+    let contributions = db.get_member_index().member_assignment_contributions();
+    for infos in members.values_mut() {
+        resolve_slot_writers(db, contributions, infos);
+        let mut seen = HashSet::new();
+        infos.retain(|info| seen.insert(MemberInfoIdentity::from(info)));
+    }
+}
+
+fn resolve_slot_writers(
+    db: &DbIndex,
+    contributions: &MemberAssignmentContributionStore,
+    infos: &mut Vec<LuaMemberInfo>,
+) {
+    let member_index = db.get_member_index();
+    // Class declaration fields (`---@field`) are contracts, not sequential
+    // writes — they never take part in the per-file supersession below.
+    let is_declaration = |member_id: &LuaMemberId| {
+        matches!(
+            member_index.get_member_owner(member_id),
+            Some(LuaMemberOwner::Type(_))
+        )
+    };
+    let is_plain_writer = |member_id: &LuaMemberId| {
+        !member_index.is_conditional_branch_assignment_member(*member_id)
+            && contributions
+                .contribution_of(member_id)
+                .is_some_and(|contribution| {
+                    !contribution.guarded_bootstrap && !contribution.preserve_table_literals
+                })
+    };
+
+    // Writers of a key within one file are sequential: the file's latest write
+    // — whatever its class — is what a load of the file leaves in the slot.
+    if infos.len() <= 1 {
+        return;
+    }
+    let mut latest_per_file: HashMap<FileId, rowan::TextSize> = HashMap::new();
+    for info in infos.iter() {
+        let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+            continue;
+        };
+        if is_declaration(member_id) {
+            continue;
+        }
+        let position = member_id.get_position();
+        latest_per_file
+            .entry(member_id.file_id)
+            .and_modify(|latest| {
+                if position > *latest {
+                    *latest = position;
+                }
+            })
+            .or_insert(position);
+    }
+    if latest_per_file.is_empty() {
+        return;
+    }
+
+    let mut plain_files: HashSet<FileId> = HashSet::new();
+    let mut has_plain_writer = false;
+    for info in infos.iter() {
+        let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+            continue;
+        };
+        if !is_declaration(member_id) && is_plain_writer(member_id) {
+            has_plain_writer = true;
+            plain_files.insert(member_id.file_id);
+        }
+    }
+
+    infos.retain(|info| match &info.property_owner_id {
+        Some(LuaSemanticDeclId::Member(member_id)) => {
+            if is_declaration(member_id) {
+                return true;
+            }
+            if latest_per_file.get(&member_id.file_id) != Some(&member_id.get_position()) {
+                return false;
+            }
+            // A plain load-time write supersedes conditional-branch writers
+            // from files with no plain writer of the key: those only fire at
+            // runtime events, after the slot's load-time value exists.
+            if has_plain_writer
+                && !plain_files.contains(&member_id.file_id)
+                && member_index.is_conditional_branch_assignment_member(*member_id)
+            {
+                return false;
+            }
+            true
+        }
+        _ => true,
+    });
 }
 
 type MemberIdentityMap = HashMap<LuaMemberKey, HashSet<MemberInfoIdentity>>;

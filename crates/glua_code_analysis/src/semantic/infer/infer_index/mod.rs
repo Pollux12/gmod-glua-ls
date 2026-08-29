@@ -2597,7 +2597,11 @@ fn infer_global_path_member(
     resolved
 }
 
-fn global_expr_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
+pub(crate) fn global_expr_access_path(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> Option<String> {
     if !expr_root_is_global(db, file_id, expr) {
         return None;
     }

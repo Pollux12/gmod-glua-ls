@@ -710,9 +710,18 @@ fn infer_define_baseclass_type(db: &DbIndex, file_id: FileId, name: &str) -> Opt
 }
 
 fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -> InferResult {
-    let self_ref_id = match get_name_expr_var_ref_id(db, cache, &name_expr) {
-        Some(VarRefId::SelfRef(self_ref_id)) => self_ref_id,
-        _ => return Err(InferFailReason::None),
+    let var_ref_id = get_name_expr_var_ref_id(db, cache, &name_expr);
+    let self_ref_id = match var_ref_id {
+        Some(VarRefId::SelfRef(self_ref_id)) => Some(self_ref_id),
+        // Receiver-id resolution can fail even when the receiver's type is
+        // still derivable: `find_self_receiver_id` resolves the colon-method
+        // prefix through semantic-decl lookup, which has no route for a
+        // shapeless (bare `table`) intermediate link — e.g. after the settled
+        // widening of a guarded `x.y = x.y or {}` bootstrap. The seed below
+        // re-derives the receiver type through prefix inference, which does
+        // resolve such chains, so fall back to it instead of erroring: an
+        // error here silently empties `self.` member completions and hover.
+        _ => None,
     };
 
     // Compute a region-aware base for the implicit `self` (the colon-method
@@ -726,6 +735,12 @@ fn infer_self(db: &DbIndex, cache: &mut LuaInferCache, name_expr: LuaNameExpr) -
     // so generic `SelfInfer`/declared-parameter `self` still falls through to
     // the canonical `get_var_ref_type` resolution.
     let base_seed = infer_implicit_method_self_type(db, cache, &name_expr);
+
+    let Some(self_ref_id) = self_ref_id else {
+        // No receiver id, but the seed may still know the receiver's type.
+        // Narrowing needs the id, so the seed is the final answer here.
+        return base_seed.ok_or(InferFailReason::None);
+    };
 
     infer_expr_narrow_type_with_self_base(
         db,
@@ -2978,11 +2993,11 @@ fn infer_method_prefix_type(
 mod test {
     use super::{
         direct_table_field_from_member_id, find_param_type_from_contextual_member,
-        get_name_expr_var_ref_id, infer_name_expr,
+        find_self_ref_id, get_name_expr_var_ref_id, infer_name_expr,
     };
     use crate::{
-        Emmyrc, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache, VarRefId,
-        VirtualWorkspace,
+        Emmyrc, FileId, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache,
+        VarRefId, VirtualWorkspace,
     };
     use glua_parser::{
         LuaAstNode, LuaAstToken, LuaClosureExpr, LuaIndexKey, LuaLocalName, LuaNameExpr,
@@ -3100,6 +3115,103 @@ mod test {
         expect_that!(infer_name_expr(db, &mut cache, self_expr).is_ok(), eq(true));
         expect_that!(
             cache.expr_var_ref_id_cache.contains_key(&syntax_id),
+            eq(true)
+        );
+
+        Ok(())
+    }
+
+    /// The bootstrap fixture both `self` tests use: `cityrp.configuration`
+    /// comes from a shapeless bootstrap link, and `self` is used inside a
+    /// function on its `ranks` member.
+    fn def_bootstrap_fixture(ws: &mut VirtualWorkspace) -> FileId {
+        ws.def_file(
+            "gamemode/shared.lua",
+            r#"
+cityrp = cityrp or {}
+
+---@return table
+function cityrp.bootstrap() end
+
+cityrp.configuration = cityrp.bootstrap()
+"#,
+        );
+        ws.def_file(
+            "gamemode/core/sh_configuration.lua",
+            r#"
+cityrp.configuration.ranks = {
+    owner = { level = 5 },
+    remap = { admin = "mod" },
+}
+
+function cityrp.configuration.ranks:Get(rank)
+    return self.remap
+end
+"#,
+        )
+    }
+
+    #[gtest]
+    fn test_infer_self_falls_back_to_seed_when_receiver_id_resolution_is_shapeless() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let config_id = def_bootstrap_fixture(&mut ws);
+
+        // The intermediate link `cityrp.configuration` is shapeless (bare
+        // `table`), so semantic-decl receiver resolution cannot see through it
+        // and no receiver id is derived. Prefix inference through the member
+        // index still resolves the chain, so `self` must fall back to the seed
+        // instead of degrading to `Unknown` (which empties `self.` completion).
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(config_id)
+            .expect("semantic model must exist");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .expect("expected self name expr");
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = LuaInferCache::new(config_id, Default::default());
+        let self_type =
+            infer_name_expr(db, &mut cache, self_expr).expect("self inference should succeed");
+
+        let LuaType::TableConst(in_file) = self_type else {
+            panic!("expected self to resolve to the ranks table literal, got {self_type:?}");
+        };
+        expect_that!(in_file.file_id, eq(config_id));
+
+        Ok(())
+    }
+
+    #[gtest]
+    fn test_self_receiver_id_resolves_through_shapeless_bootstrap_link() -> Result<()> {
+        let mut ws = VirtualWorkspace::new();
+        let config_id = def_bootstrap_fixture(&mut ws);
+
+        // The bootstrap link `cityrp.configuration` resolves to an empty
+        // literal, so the prefix-type member lookup misses. The global-path
+        // fallback must still resolve the chain's declaration, so `self`'s
+        // receiver id resolves to the `ranks` member instead of failing.
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(config_id)
+            .expect("semantic model must exist");
+        let self_expr = semantic_model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("self"))
+            .expect("expected self name expr");
+        let db = ws.analysis.compilation.get_db();
+        let mut cache = LuaInferCache::new(config_id, Default::default());
+        let self_ref_id =
+            find_self_ref_id(db, &mut cache, &self_expr).expect("receiver id should resolve");
+        expect_that!(
+            matches!(
+                self_ref_id.receiver,
+                crate::db_index::LuaDeclOrMemberId::Member(_)
+            ),
             eq(true)
         );
 

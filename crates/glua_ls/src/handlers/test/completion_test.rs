@@ -1474,6 +1474,86 @@ mod tests {
         Ok(())
     }
 
+    /// A global slot written by a plain top-level assignment in one file and
+    /// a conditional-branch writer in another resolves like the settled slot:
+    /// the plain write supersedes the conditional writer, so the key is
+    /// offered once.
+    #[gtest]
+    fn test_completion_plain_write_supersedes_cross_file_conditional_writer() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.mode = "plain"
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                if cfg.mode then
+                    cfg.mode = "conditional"
+                end
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![VirtualCompletionItem {
+                label: "mode".to_string(),
+                kind: CompletionItemKind::FIELD,
+                ..Default::default()
+            }],
+        ));
+        Ok(())
+    }
+
+    /// Guarded bootstrap writers of a slot coexist: the completion must not
+    /// collapse them the way it collapses superseded writers.
+    #[gtest]
+    fn test_completion_keeps_guarded_bootstrap_sibling_writers() -> Result<()> {
+        let mut ws = ProviderVirtualWorkspace::new();
+        let mut emmyrc = ws.get_emmyrc();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_file(
+            "a.lua",
+            r#"
+                cfg = cfg or { alpha = {} }
+            "#,
+        );
+        ws.def_file(
+            "b.lua",
+            r#"
+                cfg = cfg or {}
+                cfg.alpha = cfg.alpha or {}
+            "#,
+        );
+        check!(ws.check_completion(
+            r#"
+                cfg.<??>
+            "#,
+            vec![
+                VirtualCompletionItem {
+                    label: "alpha".to_string(),
+                    kind: CompletionItemKind::STRUCT,
+                    ..Default::default()
+                },
+                VirtualCompletionItem {
+                    label: "alpha".to_string(),
+                    kind: CompletionItemKind::INTERFACE,
+                    ..Default::default()
+                },
+            ],
+        ));
+        Ok(())
+    }
+
     #[gtest]
     fn test_issue_572() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();

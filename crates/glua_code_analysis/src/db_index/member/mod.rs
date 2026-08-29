@@ -1488,6 +1488,11 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 
+    pub fn is_conditional_branch_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        self.conditional_branch_assignment_members
+            .contains(&member_id)
+    }
+
     pub fn mark_conditional_branch_assignment_member(
         &mut self,
         member_id: LuaMemberId,
