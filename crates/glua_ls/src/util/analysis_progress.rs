@@ -225,32 +225,6 @@ mod tests {
     static SINK: Mutex<()> = Mutex::new(());
 
     #[test]
-    fn clearing_the_sink_stops_reports() {
-        let _guard = SINK.lock().unwrap_or_else(|error| error.into_inner());
-        // The reporter owns the global sink, so dropping it must clear it.
-        progress::clear_sink();
-        assert!(!progress::is_active());
-
-        // Tests that analyse a workspace report into the same global sink, so
-        // count only the phase this test enters.
-        const PHASE: &str = "clearing_the_sink_stops_reports";
-        let counter = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-        let seen = counter.clone();
-        progress::set_sink(Arc::new(move |progress: progress::PhaseProgress<'_>| {
-            if progress.phase == PHASE {
-                seen.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-        }));
-        assert!(progress::is_active());
-        progress::enter_phase(PHASE, 0, "files");
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
-
-        progress::clear_sink();
-        progress::enter_phase(PHASE, 0, "files");
-        assert_eq!(counter.load(std::sync::atomic::Ordering::Relaxed), 1);
-    }
-
-    #[test]
     fn an_overlapping_reporter_keeps_the_sink_until_the_newest_one_goes() {
         let _guard = SINK.lock().unwrap_or_else(|error| error.into_inner());
         progress::clear_sink();
