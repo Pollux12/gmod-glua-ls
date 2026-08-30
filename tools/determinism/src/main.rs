@@ -148,14 +148,33 @@
 //!                               and report how often it reproduces the cached
 //!                               type, split by single- vs multi-writer members
 //!                     fresh     build a second analysis in-process
-//!   DET_INDEX_DIFF  also diff type caches, members, signatures, class members,
-//!                   super types, net flows and inferred params
+//!   DET_INDEX_DIFF  also diff every index reachable from `DbIndex`: type
+//!                   caches, members, signatures, class members, super types,
+//!                   net flows, inferred params, decls, decl references,
+//!                   modules, globals, diagnostics (and their disable
+//!                   actions), operators, dependency sites, gmod load/hook/
+//!                   system/realm/scoped-class/network/class metadata,
+//!                   dynamic-field wildcards, accessor-func calls,
+//!                   properties, and metatables. Not covered: flow index
+//!                   (signature casts, special-call effects), the
+//!                   name-keyed accessor-func annotation table, dynamic-field
+//!                   owner/field maps beyond wildcards, and numeric-range
+//!                   population -- none expose a public whole-index
+//!                   iterator
 //!   DET_DUMP_INDEX  directory to write each index snapshot to as `<label>.idx`.
 //!                   The stage diffs only compare snapshots *within* one process;
 //!                   this writes them out so two runs of the same binary on the
 //!                   same input can be diffed against each other, which is the
 //!                   only way to see a per-process divergence (hash seeds,
-//!                   allocation addresses) rather than an ordering one.
+//!                   allocation addresses) rather than an ordering one. The
+//!                   bulkier indexes (every decl, diagnostic, dependency site,
+//!                   ...) are hashed rather than rendered to keep the harness's
+//!                   own memory bounded; those write as `<TAG>_HASH <hex>`
+//!                   lines unless DET_DUMP_INDEX_DETAIL names them.
+//!   DET_DUMP_INDEX_DETAIL  name of one bulky index (the `name` string used in
+//!                   its diff, e.g. `decls` or `dependency_sites`) to keep full
+//!                   text for, so it can still be inspected entry-by-entry
+//!                   while every other bulky index stays hash-only.
 //!   DET_SHOW_EXPANSION  print the reindex expansion set for each edit
 //!   DET_DUMP        write the cold diagnostic set to this path
 //!   DET_DUMP_FILE_IDS   print the main-workspace file id table
@@ -676,6 +695,137 @@ struct IndexSnapshot {
     super_types: BTreeMap<String, String>,
     class_members: BTreeMap<String, String>,
     signatures: BTreeMap<String, String>,
+    decls: HashDumpResult,
+    decl_references: HashDumpResult,
+    modules: HashDumpResult,
+    globals: HashDumpResult,
+    diagnostics: HashDumpResult,
+    diagnostic_actions: HashDumpResult,
+    operators: HashDumpResult,
+    dependency_sites: HashDumpResult,
+    gmod_load_files: HashDumpResult,
+    gmod_load_unresolved_edges: HashDumpResult,
+    gmod_hook_files: HashDumpResult,
+    gmod_system_files: HashDumpResult,
+    gmod_gm_method_realm_annotations: HashDumpResult,
+    gmod_realm_files: HashDumpResult,
+    gmod_scoped_class_info: HashDumpResult,
+    gmod_network_wire_coverage: HashDumpResult,
+    gmod_class_file_metadata: HashDumpResult,
+    dynamic_field_wildcards: HashDumpResult,
+    accessor_func_calls: HashDumpResult,
+    properties: HashDumpResult,
+    metatables: HashDumpResult,
+    metatable_factory_bindings: HashDumpResult,
+}
+
+/// Accumulates one index's entries as sorted hashes rather than owned
+/// strings, so a bulky index (every decl, every diagnostic, every dependency
+/// site) costs 8 bytes per entry during the in-process diff instead of two
+/// full rendered strings. `+N/-N` then comes from a sorted-merge of the two
+/// hash vectors: a changed entry is a drop of its old hash plus a gain of its
+/// new one, same as the existing members/net_flows set-diffs.
+///
+/// `DET_DUMP_INDEX_DETAIL=<name>` (matching the `name` passed to `diff_map`
+/// in `diff_index`) additionally retains the full text for that one index, so
+/// it can still be inspected entry-by-entry while every other index stays
+/// hash-only.
+struct HashDump {
+    hashes: Vec<u64>,
+    detail: Option<BTreeMap<String, String>>,
+}
+
+struct HashDumpResult {
+    hashes: Vec<u64>,
+    detail: Option<BTreeMap<String, String>>,
+}
+
+impl HashDump {
+    fn new(name: &str) -> Self {
+        let want_detail = std::env::var("DET_DUMP_INDEX_DETAIL").is_ok_and(|want| want == name);
+        Self {
+            hashes: Vec::new(),
+            detail: want_detail.then(BTreeMap::new),
+        }
+    }
+
+    fn insert(&mut self, key: String, value: String) {
+        use std::hash::{Hash, Hasher};
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        key.hash(&mut hasher);
+        value.hash(&mut hasher);
+        self.hashes.push(hasher.finish());
+        if let Some(detail) = &mut self.detail {
+            detail.insert(key, value);
+        }
+    }
+
+    fn finish(mut self) -> HashDumpResult {
+        self.hashes.sort_unstable();
+        HashDumpResult {
+            hashes: self.hashes,
+            detail: self.detail,
+        }
+    }
+}
+
+/// Sorted-merge diff of two hash vectors: counts only, since a hash carries
+/// no text to print a dropped/gained line from.
+fn diff_sorted_hashes(base: &[u64], other: &[u64]) -> (usize, usize) {
+    let mut dropped = 0;
+    let mut gained = 0;
+    let mut i = 0;
+    let mut j = 0;
+    while i < base.len() && j < other.len() {
+        match base[i].cmp(&other[j]) {
+            std::cmp::Ordering::Less => {
+                dropped += 1;
+                i += 1;
+            }
+            std::cmp::Ordering::Greater => {
+                gained += 1;
+                j += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                i += 1;
+                j += 1;
+            }
+        }
+    }
+    dropped += base.len() - i;
+    gained += other.len() - j;
+    (dropped, gained)
+}
+
+/// One hash-based bucket: full per-entry diff when `DET_DUMP_INDEX_DETAIL`
+/// retained text for this index, otherwise a dropped/gained count from the
+/// hash vectors alone.
+#[allow(clippy::too_many_arguments)]
+fn diff_hash_dump(
+    base_label: &str,
+    label: &str,
+    name: &str,
+    prefix: &str,
+    base: &HashDumpResult,
+    other: &HashDumpResult,
+    limit: usize,
+    emit: &impl Fn(String),
+) {
+    if let (Some(base_detail), Some(other_detail)) = (&base.detail, &other.detail) {
+        diff_map(
+            base_label,
+            label,
+            name,
+            prefix,
+            base_detail,
+            other_detail,
+            limit,
+            emit,
+        );
+        return;
+    }
+    let (dropped, gained) = diff_sorted_hashes(&base.hashes, &other.hashes);
+    println!("INDEX {base_label} -> {label}: {name} dropped={dropped} gained={gained}");
 }
 
 fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
@@ -888,6 +1038,155 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
+    // Every index not already covered above, dumped through whatever public
+    // iteration each one exposes. Per-file maps key on `file_label`; indexes
+    // with no per-file getter but a global iterator key on their own item.
+    let all_files = db.get_vfs().get_all_file_ids();
+
+    let decl_index = db.get_decl_index();
+    let mut decls = HashDump::new("decls");
+    let mut decl_references = HashDump::new("decl_references");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(tree) = decl_index.get_decl_tree(&file_id) {
+            for (decl_id, decl) in tree.get_decls() {
+                decls.insert(format!("{file}|{decl_id:?}"), format!("{decl:?}"));
+            }
+        }
+        if let Some(reference) = db.get_reference_index().get_local_reference(&file_id) {
+            for (decl_id, decl_reference) in reference.get_decl_references_map() {
+                decl_references
+                    .insert(format!("{file}|{decl_id:?}"), format!("{decl_reference:?}"));
+            }
+        }
+    }
+
+    // `module_id` is an arena index assigned in tree-build order, not a
+    // function of content -- it legitimately differs between a full walk and
+    // a partial re-index of the same files, so it is left out here.
+    let mut modules = HashDump::new("modules");
+    for info in db.get_module_index().get_module_infos() {
+        modules.insert(
+            file_label(analysis, info.file_id),
+            format!(
+                "full_module_name={:?} name={:?} visible={:?} export_type={:?} version_conds={:?} workspace_id={:?} semantic_id={:?} is_meta={:?}",
+                info.full_module_name,
+                info.name,
+                info.visible,
+                info.export_type,
+                info.version_conds,
+                info.workspace_id,
+                info.semantic_id,
+                info.is_meta
+            ),
+        );
+    }
+
+    let mut globals = HashDump::new("globals");
+    for decl_id in db.get_global_index().get_all_global_decl_ids() {
+        globals.insert(format!("{decl_id:?}"), format!("{decl_id:?}"));
+    }
+
+    let mut diagnostics = HashDump::new("diagnostics_index");
+    let mut diagnostic_actions = HashDump::new("diagnostic_actions");
+    let mut operators = HashDump::new("operators");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(errors) = db.get_diagnostic_index().get_diagnostics(&file_id) {
+            diagnostics.insert(file.clone(), format!("{errors:?}"));
+        }
+        if let Some(actions) = db.get_diagnostic_index().get_diagnostics_actions(file_id) {
+            diagnostic_actions.insert(file.clone(), format!("{actions:?}"));
+        }
+        let ops = db.get_operator_index().operators_in_file(file_id);
+        if !ops.is_empty() {
+            operators.insert(file, format!("{ops:?}"));
+        }
+    }
+
+    let mut dependency_sites = HashDump::new("dependency_sites");
+    for (file_id, sites) in db.get_file_dependencies_index().iter_dependency_sites() {
+        dependency_sites.insert(file_label(analysis, *file_id), format!("{sites:?}"));
+    }
+
+    let mut gmod_load_files = HashDump::new("gmod_load_files");
+    for (file_id, info) in db.get_gmod_load_index().iter_file_infos() {
+        gmod_load_files.insert(file_label(analysis, *file_id), format!("{info:?}"));
+    }
+    // Self-keyed rather than positional: an edge has no stable id, and a
+    // positional key would turn one inserted/removed entry into a cascade of
+    // false "changed" hits for every entry after it.
+    let mut gmod_load_unresolved_edges = HashDump::new("gmod_load_unresolved_edges");
+    for edge in db.get_gmod_load_index().unresolved_edges() {
+        let text = format!("{edge:?}");
+        gmod_load_unresolved_edges.insert(text.clone(), text);
+    }
+
+    let gmod_infer_index = db.get_gmod_infer_index();
+    let mut gmod_hook_files = HashDump::new("gmod_hook_files");
+    for (file_id, metadata) in gmod_infer_index.iter_hook_file_metadata() {
+        gmod_hook_files.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+    let mut gmod_system_files = HashDump::new("gmod_system_files");
+    for (file_id, metadata) in gmod_infer_index.iter_system_file_metadata() {
+        gmod_system_files.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+    let mut gmod_gm_method_realm_annotations = HashDump::new("gmod_gm_method_realm_annotations");
+    for (file_id, annotations) in gmod_infer_index.iter_gm_method_realm_annotations() {
+        gmod_gm_method_realm_annotations
+            .insert(file_label(analysis, *file_id), format!("{annotations:?}"));
+    }
+    let mut gmod_realm_files = HashDump::new("gmod_realm_files");
+    let mut gmod_scoped_class_info = HashDump::new("gmod_scoped_class_info");
+    for &file_id in &all_files {
+        let file = file_label(analysis, file_id);
+        if let Some(metadata) = gmod_infer_index.get_realm_file_metadata(&file_id) {
+            gmod_realm_files.insert(file.clone(), format!("{metadata:?}"));
+        }
+        if let Some(info) = gmod_infer_index.get_scoped_class_info(&file_id) {
+            gmod_scoped_class_info.insert(file, format!("{info:?}"));
+        }
+    }
+
+    let mut gmod_network_wire_coverage = HashDump::new("gmod_network_wire_coverage");
+    for (wire_format, coverage) in network.wire_format_coverage() {
+        gmod_network_wire_coverage.insert(format!("{wire_format:?}"), format!("{coverage:?}"));
+    }
+
+    let mut gmod_class_file_metadata = HashDump::new("gmod_class_file_metadata");
+    for (file_id, metadata) in db.get_gmod_class_metadata_index().iter_file_metadata() {
+        gmod_class_file_metadata.insert(file_label(analysis, *file_id), format!("{metadata:?}"));
+    }
+
+    let mut dynamic_field_wildcards = HashDump::new("dynamic_field_wildcards");
+    for entry in db.get_dynamic_field_index().get_all_wildcard_definitions() {
+        dynamic_field_wildcards.insert(format!("{entry:?}"), format!("{entry:?}"));
+    }
+
+    let mut accessor_func_calls = HashDump::new("accessor_func_calls");
+    for (file_id, calls) in db.get_accessor_func_call_index().iter() {
+        accessor_func_calls.insert(file_label(analysis, *file_id), format!("{calls:?}"));
+    }
+
+    let mut properties = HashDump::new("properties");
+    for (owner_id, property) in db.get_property_index().iter_owner_properties() {
+        properties.insert(format!("{owner_id:?}"), format!("{property:?}"));
+    }
+
+    let mut metatables = HashDump::new("metatables");
+    for (table, metatable) in &db.get_metatable_index().metatables {
+        metatables.insert(format!("{table:?}"), format!("{metatable:?}"));
+    }
+    let mut metatable_factory_bindings = HashDump::new("metatable_factory_bindings");
+    for &file_id in &all_files {
+        if let Some(bindings) = db.get_metatable_index().factory_bindings_for_file(file_id)
+            && !bindings.is_empty()
+        {
+            metatable_factory_bindings
+                .insert(file_label(analysis, file_id), format!("{bindings:?}"));
+        }
+    }
+
     let snapshot = IndexSnapshot {
         type_caches,
         type_facts,
@@ -899,6 +1198,28 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         super_types,
         class_members,
         signatures,
+        decls: decls.finish(),
+        decl_references: decl_references.finish(),
+        modules: modules.finish(),
+        globals: globals.finish(),
+        diagnostics: diagnostics.finish(),
+        diagnostic_actions: diagnostic_actions.finish(),
+        operators: operators.finish(),
+        dependency_sites: dependency_sites.finish(),
+        gmod_load_files: gmod_load_files.finish(),
+        gmod_load_unresolved_edges: gmod_load_unresolved_edges.finish(),
+        gmod_hook_files: gmod_hook_files.finish(),
+        gmod_system_files: gmod_system_files.finish(),
+        gmod_gm_method_realm_annotations: gmod_gm_method_realm_annotations.finish(),
+        gmod_realm_files: gmod_realm_files.finish(),
+        gmod_scoped_class_info: gmod_scoped_class_info.finish(),
+        gmod_network_wire_coverage: gmod_network_wire_coverage.finish(),
+        gmod_class_file_metadata: gmod_class_file_metadata.finish(),
+        dynamic_field_wildcards: dynamic_field_wildcards.finish(),
+        accessor_func_calls: accessor_func_calls.finish(),
+        properties: properties.finish(),
+        metatables: metatables.finish(),
+        metatable_factory_bindings: metatable_factory_bindings.finish(),
     };
 
     // Cross-process comparison: write the whole snapshot so two runs of the same
@@ -921,6 +1242,43 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
         for entry in &snapshot.net_flows {
             out.push_str(&format!("NET {entry}\n"));
+        }
+        // Hash-only unless `DET_DUMP_INDEX_DETAIL` named this index: write its
+        // retained text, otherwise write just the sorted hashes so a
+        // cross-process compare still has *something* to diff.
+        for (tag, dump) in [
+            ("DECL", &snapshot.decls),
+            ("DREF", &snapshot.decl_references),
+            ("MOD", &snapshot.modules),
+            ("GLOBAL", &snapshot.globals),
+            ("DIAG", &snapshot.diagnostics),
+            ("DIAGACT", &snapshot.diagnostic_actions),
+            ("OP", &snapshot.operators),
+            ("DEP", &snapshot.dependency_sites),
+            ("GLOAD", &snapshot.gmod_load_files),
+            ("GLOADEDGE", &snapshot.gmod_load_unresolved_edges),
+            ("GHOOK", &snapshot.gmod_hook_files),
+            ("GSYS", &snapshot.gmod_system_files),
+            ("GMETHREALM", &snapshot.gmod_gm_method_realm_annotations),
+            ("GREALM", &snapshot.gmod_realm_files),
+            ("GSCOPED", &snapshot.gmod_scoped_class_info),
+            ("GWIRE", &snapshot.gmod_network_wire_coverage),
+            ("GCLASS", &snapshot.gmod_class_file_metadata),
+            ("DYNWILD", &snapshot.dynamic_field_wildcards),
+            ("ACCCALL", &snapshot.accessor_func_calls),
+            ("PROP", &snapshot.properties),
+            ("METATBL", &snapshot.metatables),
+            ("METAFACT", &snapshot.metatable_factory_bindings),
+        ] {
+            if let Some(detail) = &dump.detail {
+                for (key, value) in detail {
+                    out.push_str(&format!("{tag} {key} = {value}\n"));
+                }
+            } else {
+                for hash in &dump.hashes {
+                    out.push_str(&format!("{tag}_HASH {hash:016x}\n"));
+                }
+            }
         }
         let file_name = label
             .chars()
@@ -1035,6 +1393,118 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     ] {
         diff_map(
             base_label, label, name, prefix, base_map, other_map, limit, &emit,
+        );
+    }
+
+    // Bulky per-file/per-decl indexes: diffed as sorted hash vectors (see
+    // `HashDump`) instead of owned-string maps, so a whole-workspace snapshot
+    // does not multiply the harness's peak memory.
+    for (name, prefix, base_hash, other_hash) in [
+        ("decls", "DECL", &base.decls, &other.decls),
+        (
+            "decl_references",
+            "DREF",
+            &base.decl_references,
+            &other.decl_references,
+        ),
+        ("modules", "MOD", &base.modules, &other.modules),
+        ("globals", "GLOBAL", &base.globals, &other.globals),
+        (
+            "diagnostics_index",
+            "DIAG",
+            &base.diagnostics,
+            &other.diagnostics,
+        ),
+        (
+            "diagnostic_actions",
+            "DIAGACT",
+            &base.diagnostic_actions,
+            &other.diagnostic_actions,
+        ),
+        ("operators", "OP", &base.operators, &other.operators),
+        (
+            "dependency_sites",
+            "DEP",
+            &base.dependency_sites,
+            &other.dependency_sites,
+        ),
+        (
+            "gmod_load_files",
+            "GLOAD",
+            &base.gmod_load_files,
+            &other.gmod_load_files,
+        ),
+        (
+            "gmod_load_unresolved_edges",
+            "GLOADEDGE",
+            &base.gmod_load_unresolved_edges,
+            &other.gmod_load_unresolved_edges,
+        ),
+        (
+            "gmod_hook_files",
+            "GHOOK",
+            &base.gmod_hook_files,
+            &other.gmod_hook_files,
+        ),
+        (
+            "gmod_system_files",
+            "GSYS",
+            &base.gmod_system_files,
+            &other.gmod_system_files,
+        ),
+        (
+            "gmod_gm_method_realm_annotations",
+            "GMETHREALM",
+            &base.gmod_gm_method_realm_annotations,
+            &other.gmod_gm_method_realm_annotations,
+        ),
+        (
+            "gmod_realm_files",
+            "GREALM",
+            &base.gmod_realm_files,
+            &other.gmod_realm_files,
+        ),
+        (
+            "gmod_scoped_class_info",
+            "GSCOPED",
+            &base.gmod_scoped_class_info,
+            &other.gmod_scoped_class_info,
+        ),
+        (
+            "gmod_network_wire_coverage",
+            "GWIRE",
+            &base.gmod_network_wire_coverage,
+            &other.gmod_network_wire_coverage,
+        ),
+        (
+            "gmod_class_file_metadata",
+            "GCLASS",
+            &base.gmod_class_file_metadata,
+            &other.gmod_class_file_metadata,
+        ),
+        (
+            "dynamic_field_wildcards",
+            "DYNWILD",
+            &base.dynamic_field_wildcards,
+            &other.dynamic_field_wildcards,
+        ),
+        (
+            "accessor_func_calls",
+            "ACCCALL",
+            &base.accessor_func_calls,
+            &other.accessor_func_calls,
+        ),
+        ("properties", "PROP", &base.properties, &other.properties),
+        ("metatables", "METATBL", &base.metatables, &other.metatables),
+        (
+            "metatable_factory_bindings",
+            "METAFACT",
+            &base.metatable_factory_bindings,
+            &other.metatable_factory_bindings,
+        ),
+    ] {
+        diff_hash_dump(
+            base_label, label, name, prefix, base_hash, other_hash, limit, &emit,
         );
     }
 
