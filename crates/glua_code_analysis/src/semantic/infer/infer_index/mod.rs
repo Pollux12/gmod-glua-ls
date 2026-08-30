@@ -587,7 +587,24 @@ fn infer_table_member_owner(
         return Ok(member_type);
     }
 
-    if let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) {
+    // A computed-key write from another file is evidence that the table is a
+    // registry, not an answer for this access: the cross-file expression-key
+    // handler below is what reads it, and it applies the realm and
+    // finite-domain filters that evidence needs. Short-circuiting here would
+    // bypass them. Only a same-file write states the value at this branch --
+    // which is all this lookup could ever find before one owner per global
+    // path brought every file's writes into one bucket.
+    let same_file_expr_key_item =
+        db.get_member_index()
+            .get_member_item(&owner, &key)
+            .filter(|item| {
+                !matches!(key, LuaMemberKey::ExprType(_))
+                    || item
+                        .get_member_ids()
+                        .iter()
+                        .any(|member_id| member_id.file_id == cache.get_file_id())
+            });
+    if let Some(member_item) = same_file_expr_key_item {
         let member_type = member_item.resolve_type_with_realm_at_offset(
             db,
             &cache.get_file_id(),
@@ -651,16 +668,6 @@ fn infer_table_member_owner(
         return Ok(member_type);
     }
 
-    if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
-        db,
-        &owner,
-        &key,
-        cache.get_file_id(),
-        index_expr.get_position(),
-    ) {
-        return Ok(member_type);
-    }
-
     if db.get_emmyrc().gmod.enabled
         && db.get_emmyrc().gmod.infer_dynamic_fields
         && is_literal_table_field_access(&index_key)
@@ -711,6 +718,22 @@ fn infer_table_member_owner(
                 && !type_is_uninformative(&dynamic_member_type)
             {
                 return Ok(dynamic_member_type);
+            }
+
+            // An uninformative answer is not an answer. Fall back to the same
+            // last-resort value evidence the not-found tail uses, so a read of
+            // a registry does not lose its nil just because the key-specific
+            // lookup resolved to `unknown`.
+            if type_is_uninformative(&typ)
+                && let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+                    db,
+                    &owner,
+                    &key,
+                    cache.get_file_id(),
+                    index_expr.get_position(),
+                )
+            {
+                return Ok(nullable_if_needed(db, member_type));
             }
 
             Ok(typ)
@@ -764,6 +787,20 @@ fn infer_table_member_owner(
                 table_member_lookup_guard,
             ) {
                 return Ok(metatable_type);
+            }
+
+            // Consulted last, after every key-specific source above: a
+            // computed write in another file is evidence about the *values* a
+            // table holds, never about this key being one of them. So it only
+            // answers when nothing better did, and it answers `V?`.
+            if let Some(member_type) = infer_cross_file_matching_expr_key_member_type(
+                db,
+                &owner,
+                &key,
+                cache.get_file_id(),
+                index_expr.get_position(),
+            ) {
+                return Ok(nullable_if_needed(db, member_type));
             }
 
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
@@ -1284,14 +1321,6 @@ fn is_literal_member_key(key: &LuaMemberKey) -> bool {
     matches!(key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_))
 }
 
-fn dynamic_field_owner(owner: &LuaMemberOwner) -> Option<crate::DynamicFieldOwner> {
-    match owner {
-        LuaMemberOwner::Type(type_id) => Some(crate::DynamicFieldOwner::Type(type_id.clone())),
-        LuaMemberOwner::Element(range) => Some(crate::DynamicFieldOwner::Table(range.clone())),
-        _ => None,
-    }
-}
-
 fn member_is_finite_named_dynamic_assignment(
     db: &DbIndex,
     owner: &LuaMemberOwner,
@@ -1301,7 +1330,7 @@ fn member_is_finite_named_dynamic_assignment(
         return false;
     }
 
-    dynamic_field_owner(owner).is_some_and(|dynamic_owner| {
+    crate::dynamic_field_owner_of(db, owner).is_some_and(|dynamic_owner| {
         db.get_dynamic_field_index()
             .member_has_finite_named_definition(&dynamic_owner, member.get_id())
     })
@@ -1312,7 +1341,7 @@ fn owner_has_finite_named_dynamic_assignment(db: &DbIndex, owner: &LuaMemberOwne
         return false;
     }
 
-    dynamic_field_owner(owner).is_some_and(|dynamic_owner| {
+    crate::dynamic_field_owner_of(db, owner).is_some_and(|dynamic_owner| {
         db.get_dynamic_field_index()
             .owner_has_finite_named_members(&dynamic_owner)
     })
@@ -1327,7 +1356,7 @@ fn member_key_is_unknown_expr(key: &LuaMemberKey) -> bool {
 }
 
 fn owner_wildcard_covers_literal_key(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
-    let Some(dynamic_owner) = dynamic_field_owner(owner) else {
+    let Some(dynamic_owner) = crate::dynamic_field_owner_of(db, owner) else {
         return false;
     };
 
@@ -1429,12 +1458,29 @@ fn is_dynamic_index_proven_in_range(
         && check_index_in_range(db, cache, index_expr)
 }
 
+/// Whether nothing is known about this table beyond that it is one.
+///
+/// An expression-keyed member does not count: it says the table is filled
+/// under computed keys, which is the opposite of knowing a key. Only a member
+/// under a name or an integer states something specific about what the table
+/// holds. The distinction used to be free -- a registry's computed write and
+/// its `X.k = X.k or {}` bootstrap were two different literals, so the
+/// bootstrap's bucket really was empty -- and it has to be made explicitly now
+/// that both belong to the one owner the path has.
 fn table_const_has_no_specific_data(
     db: &DbIndex,
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
 ) -> bool {
-    !db.get_member_index().has_live_member(owner) && db.get_metatable_index().get(inst).is_none()
+    let has_specific_member = db
+        .get_member_index()
+        .get_members(owner)
+        .is_some_and(|members| {
+            members
+                .iter()
+                .any(|member| is_literal_member_key(member.get_key()))
+        });
+    !has_specific_member && db.get_metatable_index().get(inst).is_none()
 }
 
 fn infer_plain_table_member(
