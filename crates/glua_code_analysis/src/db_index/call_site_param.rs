@@ -5,10 +5,29 @@ use rowan::TextSize;
 
 use super::traits::LuaIndex;
 use crate::{
-    FileId, LuaDeclId, LuaDefinitionId, LuaInferenceConfidence, LuaInferenceDiagnosticEvent,
-    LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId, LuaSignatureId, LuaType,
-    LuaTypeFact,
+    FileId, InFiled, LuaDeclId, LuaDefinitionId, LuaInferenceConfidence,
+    LuaInferenceDiagnosticEvent, LuaInferenceProvenanceKind, LuaInferenceStep, LuaMemberId,
+    LuaSignatureId, LuaType, LuaTypeFact,
 };
+
+/// A single thing outside a file that the file's call-site inference read.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub enum CallSiteSourceId {
+    /// The syntax node a contribution's provenance step came from.
+    Node(InFiled<glua_parser::LuaSyntaxId>),
+    /// The signature whose return a consumer in this file reads.
+    Signature(LuaSignatureId),
+}
+
+impl CallSiteSourceId {
+    /// The file the source lives in.
+    pub fn file_id(&self) -> FileId {
+        match self {
+            Self::Node(node) => node.file_id,
+            Self::Signature(signature_id) => signature_id.get_file_id(),
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct CallSiteReturnConsumer {
@@ -90,6 +109,12 @@ fn sorted_file_ids<V>(map: &HashMap<FileId, V>) -> Vec<FileId> {
 pub struct CallSiteParamIndex {
     /// file → source function access paths and their mutated parameter indexes declared by that file.
     file_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId, Vec<usize>)>>,
+    /// The source signatures a re-indexed file had before its removal, kept so
+    /// the update can tell which of its signatures merely moved. A signature is
+    /// identified by position, so an edit that shifts offsets leaves every
+    /// contribution made by a file outside the re-index expansion pointing at a
+    /// position no signature occupies any more.
+    previous_source_signatures: HashMap<FileId, Vec<(String, LuaSignatureId)>>,
     /// access path → current source function signature candidates.
     source_signatures_by_path: HashMap<String, Vec<LuaSignatureId>>,
     /// Flat map for fast check: signature_id -> list of mutated parameter indices.
@@ -103,6 +128,17 @@ pub struct CallSiteParamIndex {
     deferred_contributions: Vec<(FileId, CallSiteParamContribution)>,
     /// signature → param index → union of all observed types from current file contributions.
     inferred_params: HashMap<LuaSignatureId, HashMap<usize, LuaTypeFact>>,
+    /// file declaring a signature → files whose calls have supplied evidence for
+    /// it.
+    ///
+    /// Accumulated rather than rebuilt, like `file_source_dependencies`: an
+    /// edit that stops a call from resolving drops the contribution, and an
+    /// edge rebuilt from the current contributions would go with it - leaving
+    /// nothing to re-analyse the caller with when the edit is taken back out.
+    contributor_files_by_signature: HashMap<LuaSignatureId, HashSet<FileId>>,
+    /// File declaring a signature -> the signatures of that file that have
+    /// contributors, so the file-level view is a lookup rather than a scan.
+    contributor_signatures_by_file: HashMap<FileId, HashSet<LuaSignatureId>>,
     pending_previous_params: HashMap<(LuaSignatureId, usize), LuaTypeFact>,
     file_return_consumers: HashMap<FileId, Vec<CallSiteReturnConsumer>>,
     return_consumers: HashMap<LuaSignatureId, Vec<CallSiteReturnConsumer>>,
@@ -114,8 +150,9 @@ pub struct CallSiteParamIndex {
     ///
     /// These survive dependent reindexing while a producer is absent so reopening the producer
     /// can invalidate its consumers. Direct consumer edits refresh their entry exactly.
-    file_source_dependencies: HashMap<FileId, HashSet<FileId>>,
-    source_dependents: HashMap<FileId, HashSet<FileId>>,
+    file_source_dependencies: HashMap<FileId, HashSet<CallSiteSourceId>>,
+    source_dependents: HashMap<CallSiteSourceId, HashSet<FileId>>,
+    source_file_dependents: HashMap<FileId, HashSet<FileId>>,
     source_paths: HashMap<FileId, PathBuf>,
     source_path_dependents: HashMap<PathBuf, HashSet<FileId>>,
 }
@@ -129,10 +166,142 @@ impl CallSiteParamIndex {
         &mut self,
         updates: Vec<(FileId, Vec<(String, LuaSignatureId, Vec<usize>)>)>,
     ) {
+        let moved = self.moved_signatures(&updates);
         for (file_id, signatures) in updates {
+            // Drained per file rather than wholesale: `analyze` runs this pass
+            // once per workspace group, so a batch spanning a library and the
+            // main workspace reaches here more than once and the later group's
+            // parks have to survive the earlier one.
+            self.previous_source_signatures.remove(&file_id);
             self.file_source_signatures.insert(file_id, signatures);
         }
         self.rebuild_source_signatures();
+        if !moved.is_empty() {
+            self.remap_signatures(&moved);
+        }
+    }
+
+    /// Old → new signature id for every source function this batch re-indexed
+    /// that kept its access path but changed position.
+    ///
+    /// Paths repeat when a file defines the same function twice, so a path is
+    /// matched positionally within its group, and a group whose size changed is
+    /// skipped outright: a definition added or removed makes the pairing a
+    /// guess, and a wrong pairing merges one function's call sites into
+    /// another's. A group that lost one definition and gained another in the
+    /// same edit keeps its size and is still paired positionally, which is as
+    /// close as the access path can get without a second key to match on.
+    fn moved_signatures(
+        &self,
+        updates: &[(FileId, Vec<(String, LuaSignatureId, Vec<usize>)>)],
+    ) -> HashMap<LuaSignatureId, LuaSignatureId> {
+        let mut moved = HashMap::new();
+        for (file_id, signatures) in updates {
+            let Some(previous) = self.previous_source_signatures.get(file_id) else {
+                continue;
+            };
+            let mut by_path: HashMap<&str, Vec<LuaSignatureId>> = HashMap::new();
+            for (path, signature_id) in previous {
+                by_path
+                    .entry(path.as_str())
+                    .or_default()
+                    .push(*signature_id);
+            }
+            let mut current: HashMap<&str, Vec<LuaSignatureId>> = HashMap::new();
+            for (path, signature_id, _) in signatures {
+                current
+                    .entry(path.as_str())
+                    .or_default()
+                    .push(*signature_id);
+            }
+            for (path, old_ids) in by_path {
+                let Some(new_ids) = current.get(path) else {
+                    continue;
+                };
+                if new_ids.len() != old_ids.len() {
+                    continue;
+                }
+                for (old_id, new_id) in old_ids.into_iter().zip(new_ids) {
+                    if old_id != *new_id {
+                        moved.insert(old_id, *new_id);
+                    }
+                }
+            }
+        }
+        moved
+    }
+
+    /// Re-keys every stored reference to a signature that moved.
+    ///
+    /// Only the files the re-index visited rebuild their own contributions; a
+    /// contributor outside the expansion keeps the id it recorded, so without
+    /// this its evidence is stranded on a position the callee no longer has.
+    fn remap_signatures(&mut self, moved: &HashMap<LuaSignatureId, LuaSignatureId>) {
+        for contributions in self.file_contributions.values_mut() {
+            for contribution in contributions {
+                if let Some(new_id) = moved.get(&contribution.signature_id) {
+                    contribution.signature_id = *new_id;
+                }
+            }
+        }
+        for (_, contribution) in &mut self.deferred_contributions {
+            if let Some(new_id) = moved.get(&contribution.signature_id) {
+                contribution.signature_id = *new_id;
+            }
+        }
+        for consumers in self.file_return_consumers.values_mut() {
+            for consumer in consumers {
+                if let Some(new_id) = moved.get(&consumer.signature_id) {
+                    consumer.signature_id = *new_id;
+                }
+            }
+        }
+        let contributors = std::mem::take(&mut self.contributor_files_by_signature);
+        self.contributor_signatures_by_file.clear();
+        for (signature_id, files) in contributors {
+            let signature_id = moved.get(&signature_id).copied().unwrap_or(signature_id);
+            self.contributor_signatures_by_file
+                .entry(signature_id.get_file_id())
+                .or_default()
+                .insert(signature_id);
+            self.contributor_files_by_signature
+                .entry(signature_id)
+                .or_default()
+                .extend(files);
+        }
+        for sources in self.file_source_dependencies.values_mut() {
+            *sources = sources
+                .iter()
+                .map(|source| match source {
+                    CallSiteSourceId::Signature(signature_id) => match moved.get(signature_id) {
+                        Some(new_id) => CallSiteSourceId::Signature(*new_id),
+                        None => source.clone(),
+                    },
+                    CallSiteSourceId::Node(_) => source.clone(),
+                })
+                .collect();
+        }
+        let parked = std::mem::take(&mut self.pending_previous_params);
+        self.pending_previous_params = HashMap::with_capacity(parked.len());
+        for ((signature_id, param_idx), fact) in parked {
+            match moved.get(&signature_id) {
+                // A remapped entry describes the signature now at that
+                // position, so it wins over one parked there before the edit
+                // moved its owner away. Without the split the winner would be
+                // whichever the map happened to yield last.
+                Some(new_id) => {
+                    self.pending_previous_params
+                        .insert((*new_id, param_idx), fact);
+                }
+                None => {
+                    self.pending_previous_params
+                        .entry((signature_id, param_idx))
+                        .or_insert(fact);
+                }
+            }
+        }
+        self.rebuild_derived_state();
+        self.rebuild_return_consumers();
     }
 
     pub fn get_source_signature_for_file_at(
@@ -405,6 +574,42 @@ impl CallSiteParamIndex {
         consumers
     }
 
+    /// The files whose calls supply the call-site param evidence for signatures
+    /// declared in `signature_files`.
+    ///
+    /// A re-index rebuilds only the files it visits, so a contributor left out
+    /// keeps evidence derived from - and keyed by - the callee's previous text.
+    pub fn collect_contributor_files(&self, signature_files: &HashSet<FileId>) -> Vec<FileId> {
+        let mut files = signature_files
+            .iter()
+            .filter_map(|file_id| self.contributor_signatures_by_file.get(file_id))
+            .flatten()
+            .filter_map(|signature_id| self.contributor_files_by_signature.get(signature_id))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
+    /// The files whose calls supply the call-site param evidence for
+    /// `signatures`.
+    pub fn collect_signature_contributor_files(
+        &self,
+        signatures: &[LuaSignatureId],
+    ) -> Vec<FileId> {
+        let mut files = signatures
+            .iter()
+            .filter_map(|signature_id| self.contributor_files_by_signature.get(signature_id))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
+        files.sort_unstable();
+        files.dedup();
+        files
+    }
+
     pub fn collect_contribution_signature_files(
         &self,
         source_files: &HashSet<FileId>,
@@ -443,7 +648,7 @@ impl CallSiteParamIndex {
     pub fn collect_source_dependents(&self, source_files: &HashSet<FileId>) -> Vec<FileId> {
         let mut dependents = source_files
             .iter()
-            .filter_map(|file_id| self.source_dependents.get(file_id))
+            .filter_map(|file_id| self.source_file_dependents.get(file_id))
             .flatten()
             .copied()
             .collect::<Vec<_>>();
@@ -455,6 +660,19 @@ impl CallSiteParamIndex {
                 .flatten()
                 .copied(),
         );
+        dependents.sort_unstable();
+        dependents.dedup();
+        dependents
+    }
+
+    /// The files whose call-site inference read one of `sources`.
+    pub fn collect_source_node_dependents(&self, sources: &[CallSiteSourceId]) -> Vec<FileId> {
+        let mut dependents = sources
+            .iter()
+            .filter_map(|source| self.source_dependents.get(source))
+            .flatten()
+            .copied()
+            .collect::<Vec<_>>();
         dependents.sort_unstable();
         dependents.dedup();
         dependents
@@ -478,6 +696,38 @@ impl CallSiteParamIndex {
     pub fn record_source_paths(&mut self, paths: impl IntoIterator<Item = (FileId, PathBuf)>) {
         self.source_paths.extend(paths);
         self.rebuild_source_dependents();
+    }
+
+    /// Drops the state kept for files that are gone rather than re-indexed.
+    ///
+    /// Both stores here deliberately outlive a removal - one so an edit's
+    /// signature moves can still be matched, the other so a caller stays a
+    /// dependent while its contribution is absent. Neither is worth keeping
+    /// once the file itself is gone.
+    pub fn forget_removed_files(&mut self, file_ids: &HashSet<FileId>) {
+        for file_id in file_ids {
+            self.previous_source_signatures.remove(file_id);
+            if let Some(signatures) = self.contributor_signatures_by_file.remove(file_id) {
+                for signature_id in signatures {
+                    self.contributor_files_by_signature.remove(&signature_id);
+                }
+            }
+        }
+        let contributor_signatures_by_file = &mut self.contributor_signatures_by_file;
+        self.contributor_files_by_signature
+            .retain(|signature_id, contributors| {
+                contributors.retain(|file_id| !file_ids.contains(file_id));
+                if contributors.is_empty() {
+                    if let Some(signatures) =
+                        contributor_signatures_by_file.get_mut(&signature_id.get_file_id())
+                    {
+                        signatures.remove(signature_id);
+                    }
+                    return false;
+                }
+                true
+            });
+        contributor_signatures_by_file.retain(|_, signatures| !signatures.is_empty());
     }
 
     pub fn refresh_file_source_dependencies(&mut self, file_id: FileId) {
@@ -509,9 +759,17 @@ impl CallSiteParamIndex {
                         self.file_source_dependencies
                             .entry(file_id)
                             .or_default()
-                            .insert(step.event.source.file_id);
+                            .insert(CallSiteSourceId::Node(step.event.source.clone()));
                     }
                 }
+                self.contributor_files_by_signature
+                    .entry(contribution.signature_id)
+                    .or_default()
+                    .insert(file_id);
+                self.contributor_signatures_by_file
+                    .entry(contribution.signature_id.get_file_id())
+                    .or_default()
+                    .insert(contribution.signature_id);
                 accumulators
                     .entry(contribution.signature_id)
                     .or_default()
@@ -558,36 +816,42 @@ impl CallSiteParamIndex {
         self.rebuild_source_dependents();
     }
 
-    fn current_file_source_dependencies(&self, file_id: FileId) -> HashSet<FileId> {
+    fn current_file_source_dependencies(&self, file_id: FileId) -> HashSet<CallSiteSourceId> {
         let contribution_sources = self
             .file_contributions
             .get(&file_id)
             .into_iter()
             .flatten()
             .flat_map(|contribution| contribution.param_fact.provenance())
-            .map(|step| step.event.source.file_id);
+            .map(|step| CallSiteSourceId::Node(step.event.source.clone()));
         let return_sources = self
             .file_return_consumers
             .get(&file_id)
             .into_iter()
             .flatten()
-            .map(|consumer| consumer.signature_id.get_file_id());
+            .map(|consumer| CallSiteSourceId::Signature(consumer.signature_id));
         contribution_sources
             .chain(return_sources)
-            .filter(|source_file_id| *source_file_id != file_id)
+            .filter(|source| source.file_id() != file_id)
             .collect()
     }
 
     fn rebuild_source_dependents(&mut self) {
         self.source_dependents.clear();
+        self.source_file_dependents.clear();
         self.source_path_dependents.clear();
-        for (consumer_file_id, source_file_ids) in &self.file_source_dependencies {
-            for source_file_id in source_file_ids {
+        for (consumer_file_id, sources) in &self.file_source_dependencies {
+            for source in sources {
                 self.source_dependents
-                    .entry(*source_file_id)
+                    .entry(source.clone())
                     .or_default()
                     .insert(*consumer_file_id);
-                if let Some(path) = self.source_paths.get(source_file_id) {
+                let source_file_id = source.file_id();
+                self.source_file_dependents
+                    .entry(source_file_id)
+                    .or_default()
+                    .insert(*consumer_file_id);
+                if let Some(path) = self.source_paths.get(&source_file_id) {
                     self.source_path_dependents
                         .entry(path.clone())
                         .or_default()
@@ -636,7 +900,7 @@ impl CallSiteParamIndex {
                         self.file_source_dependencies
                             .entry(consumer.file_id)
                             .or_default()
-                            .insert(signature_file_id);
+                            .insert(CallSiteSourceId::Signature(consumer.signature_id));
                     }
                 }
             }
@@ -670,7 +934,19 @@ impl LuaIndex for CallSiteParamIndex {
         self.deferred_contributions
             .retain(|(file_id, _)| !file_ids.contains(file_id));
         for &file_id in file_ids {
-            self.file_source_signatures.remove(&file_id);
+            if let Some(signatures) = self.file_source_signatures.remove(&file_id) {
+                // The oldest surviving entry is the one the stored ids belong
+                // to: a second removal before any update would otherwise record
+                // positions the contributions never referred to.
+                self.previous_source_signatures
+                    .entry(file_id)
+                    .or_insert_with(|| {
+                        signatures
+                            .into_iter()
+                            .map(|(path, signature_id, _)| (path, signature_id))
+                            .collect()
+                    });
+            }
             self.file_return_consumers.remove(&file_id);
             self.file_contributions.remove(&file_id);
         }
@@ -682,6 +958,9 @@ impl LuaIndex for CallSiteParamIndex {
 
     fn clear(&mut self) {
         self.file_source_signatures.clear();
+        self.previous_source_signatures.clear();
+        self.contributor_files_by_signature.clear();
+        self.contributor_signatures_by_file.clear();
         self.source_signatures_by_path.clear();
         self.file_contributions.clear();
         self.deferred_contributions.clear();
@@ -694,6 +973,7 @@ impl LuaIndex for CallSiteParamIndex {
         self.inference_events_by_file.clear();
         self.file_source_dependencies.clear();
         self.source_dependents.clear();
+        self.source_file_dependents.clear();
         self.source_paths.clear();
         self.source_path_dependents.clear();
         self.mutated_params.clear();
@@ -894,5 +1174,190 @@ mod tests {
         )]);
 
         assert!(changed.is_empty());
+    }
+
+    #[test]
+    fn a_contribution_follows_the_signature_an_edit_moved() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let before = signature_id(callee, 100);
+        let after = signature_id(callee, 101);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_source_signatures(vec![(
+            callee,
+            vec![("m.f".to_string(), before, Vec::new())],
+        )]);
+        index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
+
+        // The callee is re-indexed on its own, as an edit outside the caller's
+        // expansion re-indexes it: the caller keeps the contribution it made
+        // against the pre-edit text.
+        index.remove(callee);
+        index.set_files_source_signatures(vec![(
+            callee,
+            vec![("m.f".to_string(), after, Vec::new())],
+        )]);
+
+        assert_eq!(index.get_inferred_param(&after, 0), Some(&LuaType::String));
+        assert_eq!(index.get_inferred_param(&before, 0), None);
+    }
+
+    #[test]
+    fn a_path_that_gained_a_definition_is_left_alone() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let before = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_source_signatures(vec![(
+            callee,
+            vec![("m.f".to_string(), before, Vec::new())],
+        )]);
+        index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
+
+        // Two definitions now share the path, so which one the old id meant is
+        // a guess, and guessing wrong merges one function's call sites into
+        // another's.
+        index.remove(callee);
+        index.set_files_source_signatures(vec![(
+            callee,
+            vec![
+                ("m.f".to_string(), signature_id(callee, 101), Vec::new()),
+                ("m.f".to_string(), signature_id(callee, 220), Vec::new()),
+            ],
+        )]);
+
+        assert_eq!(index.get_inferred_param(&before, 0), Some(&LuaType::String));
+        assert_eq!(
+            index.get_inferred_param(&signature_id(callee, 101), 0),
+            None
+        );
+    }
+
+    #[test]
+    fn a_park_survives_the_group_analysed_before_it() {
+        let library = FileId::new(1);
+        let main = FileId::new(2);
+        let caller = FileId::new(3);
+        let before = signature_id(main, 100);
+        let after = signature_id(main, 101);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_source_signatures(vec![
+            (
+                library,
+                vec![("lib.f".to_string(), signature_id(library, 10), Vec::new())],
+            ),
+            (main, vec![("m.f".to_string(), before, Vec::new())]),
+        ]);
+        index.set_files_contributions(vec![(caller, vec![(before, 0, LuaType::String)])]);
+
+        // `analyze` runs this pass once per workspace group, so one batch
+        // spanning both files installs the library's signatures before the main
+        // workspace's. The main file's park has to still be there when its own
+        // group arrives.
+        index.remove_files(&[library, main]);
+        index.set_files_source_signatures(vec![(
+            library,
+            vec![("lib.f".to_string(), signature_id(library, 10), Vec::new())],
+        )]);
+        index.set_files_source_signatures(vec![(
+            main,
+            vec![("m.f".to_string(), after, Vec::new())],
+        )]);
+
+        assert_eq!(index.get_inferred_param(&after, 0), Some(&LuaType::String));
+        assert_eq!(index.get_inferred_param(&before, 0), None);
+    }
+
+    #[test]
+    fn a_contributor_stays_a_dependent_after_its_contribution_goes() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+        let callee_files = HashSet::from([callee]);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+        assert_eq!(index.collect_contributor_files(&callee_files), vec![caller]);
+
+        // An edit that stops the call from resolving drops the contribution.
+        // The caller still has to be re-analysed when that edit is taken back
+        // out, so the edge cannot be derived from the contributions alone.
+        index.remove(caller);
+        index.set_files_contributions(vec![(caller, Vec::new())]);
+
+        assert_eq!(index.get_inferred_param(&signature_id, 0), None);
+        assert_eq!(index.collect_contributor_files(&callee_files), vec![caller]);
+    }
+
+    #[test]
+    fn a_contributor_is_reachable_from_the_signature_and_from_its_file() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let other_id = signature_id(callee, 200);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+
+        assert_eq!(
+            index.collect_signature_contributor_files(&[signature_id]),
+            vec![caller]
+        );
+        assert!(
+            index
+                .collect_signature_contributor_files(&[other_id])
+                .is_empty()
+        );
+        assert_eq!(
+            index.collect_contributor_files(&HashSet::from([callee])),
+            vec![caller]
+        );
+    }
+
+    #[test]
+    fn forgetting_a_removed_callee_clears_both_contributor_views() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+        index.forget_removed_files(&HashSet::from([callee]));
+
+        assert!(
+            index
+                .collect_signature_contributor_files(&[signature_id])
+                .is_empty()
+        );
+        assert!(
+            index
+                .collect_contributor_files(&HashSet::from([callee]))
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn forgetting_a_removed_caller_clears_both_contributor_views() {
+        let callee = FileId::new(1);
+        let caller = FileId::new(2);
+        let signature_id = signature_id(callee, 100);
+
+        let mut index = CallSiteParamIndex::new();
+        index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
+        index.forget_removed_files(&HashSet::from([caller]));
+
+        assert!(
+            index
+                .collect_signature_contributor_files(&[signature_id])
+                .is_empty()
+        );
+        assert!(
+            index
+                .collect_contributor_files(&HashSet::from([callee]))
+                .is_empty()
+        );
     }
 }

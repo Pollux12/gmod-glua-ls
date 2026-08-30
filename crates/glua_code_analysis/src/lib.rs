@@ -2249,6 +2249,11 @@ impl EmmyLuaAnalysis {
             })
             .collect::<HashSet<_>>();
 
+        self.compilation
+            .get_db_mut()
+            .get_call_site_param_index_mut()
+            .forget_removed_files(&removed_file_ids);
+
         let mut file_ids = expansion;
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
@@ -2556,6 +2561,11 @@ impl EmmyLuaAnalysis {
                 .get_db()
                 .get_call_site_param_index()
                 .collect_source_dependents(&expanded);
+            let contributor_dependents = self
+                .compilation
+                .get_db()
+                .get_call_site_param_index()
+                .collect_contributor_files(&expanded);
             let callback_source_paths = expanded
                 .iter()
                 .filter_map(|file_id| self.compilation.get_db().get_vfs().get_file_path(file_id))
@@ -2572,6 +2582,7 @@ impl EmmyLuaAnalysis {
                 .chain(dependent_files)
                 .chain(inference_dependents)
                 .chain(callback_dependents)
+                .chain(contributor_dependents)
                 .chain(callback_path_dependents)
             {
                 added |= expanded.insert(file_id);
