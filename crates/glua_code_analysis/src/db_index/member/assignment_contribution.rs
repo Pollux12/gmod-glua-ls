@@ -188,6 +188,24 @@ impl MemberAssignmentContributionStore {
     /// the evidence the widening merge reads is here, and a stale range in it
     /// resolves to a literal that no longer exists.
     pub fn remap_table_ranges(&mut self, map: &FxHashMap<InFiled<TextRange>, InFiled<TextRange>>) {
+        let signatures = FxHashMap::default();
+        self.remap_identities(crate::db_index::TypeIdentityRemap {
+            tables: map,
+            signatures: &signatures,
+        });
+    }
+
+    /// Rewrites table-literal ranges and signature ids inside stored writer
+    /// evidence.
+    ///
+    /// A contribution's `bound_type`/`source_type`/`doc_type` can name a table
+    /// literal or a function in the edited file. The member index re-homes the
+    /// *owner*, but the evidence the widening merge reads is here, and a stale
+    /// identity in it resolves to something that no longer exists.
+    pub fn remap_identities(&mut self, map: crate::db_index::TypeIdentityRemap<'_>) {
+        if map.is_empty() {
+            return;
+        }
         let keys: Vec<MemberAssignmentContributionKey> =
             self.by_owner_key.keys().cloned().collect();
         for key in keys {
@@ -196,19 +214,19 @@ impl MemberAssignmentContributionStore {
             };
             for contribution in group.values_mut() {
                 if let Some(bound) =
-                    crate::db_index::remap_table_ranges_in_type(&contribution.bound_type, map)
+                    crate::db_index::remap_identities_in_type(&contribution.bound_type, map)
                 {
                     contribution.bound_type = bound;
                 }
                 if let Some(source) =
-                    crate::db_index::remap_table_ranges_in_type(&contribution.source_type, map)
+                    crate::db_index::remap_identities_in_type(&contribution.source_type, map)
                 {
                     contribution.source_type = source;
                 }
                 if let Some(doc) = contribution
                     .doc_type
                     .as_ref()
-                    .and_then(|doc| crate::db_index::remap_table_ranges_in_type(doc, map))
+                    .and_then(|doc| crate::db_index::remap_identities_in_type(doc, map))
                 {
                     contribution.doc_type = Some(doc);
                 }

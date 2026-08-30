@@ -87,6 +87,28 @@ impl LuaFlowIndex {
             .push(LuaSpecialCallEffect { target, type_ref });
     }
 
+    /// Rewrites the types stored on special-call effects.
+    ///
+    /// `type_ref` is the callee's declared out-param type, so it can name a
+    /// table literal or signature in a file other than the caller this effect
+    /// is filed under.
+    pub fn remap_special_call_effect_types(&mut self, map: crate::db_index::TypeIdentityRemap<'_>) {
+        if map.is_empty() {
+            return;
+        }
+        for effects in self.special_call_effects.values_mut() {
+            for effects in effects.values_mut() {
+                for effect in effects {
+                    if let Some(typ) =
+                        crate::db_index::remap_identities_in_type(&effect.type_ref, map)
+                    {
+                        effect.type_ref = typ;
+                    }
+                }
+            }
+        }
+    }
+
     pub fn get_special_call_effects(
         &self,
         file_id: &FileId,

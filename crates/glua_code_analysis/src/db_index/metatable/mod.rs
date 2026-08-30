@@ -7,6 +7,15 @@ use crate::{FileId, InFiled};
 
 use super::LuaIndex;
 
+/// `None` when the edit destroyed the literal this range named.
+fn map_range(remap: &crate::FileRemap, range: &InFiled<TextRange>) -> Option<InFiled<TextRange>> {
+    match remap.table_range(range) {
+        crate::Remap::Moved(new) => Some(new),
+        crate::Remap::Unrelated => Some(range.clone()),
+        crate::Remap::Lost => None,
+    }
+}
+
 #[derive(Debug)]
 pub struct LuaMetatableIndex {
     pub metatables: HashMap<InFiled<TextRange>, InFiled<TextRange>>,
@@ -55,6 +64,53 @@ impl LuaMetatableIndex {
             .entry(binding.file_id)
             .or_default()
             .push(binding);
+    }
+
+    /// Rewrites every `setmetatable` binding that names a table literal in the
+    /// edited file.
+    ///
+    /// Both halves of a binding are table literals and either can live in a
+    /// file other than the one that wrote the call, so both sides are mapped.
+    /// Returns the files whose binding named a literal the edit destroyed.
+    pub fn remap_file_ranges(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let mut dirty = HashSet::new();
+        let mut rebuilt = HashMap::with_capacity(self.metatables.len());
+        for (table, metatable) in std::mem::take(&mut self.metatables) {
+            match (map_range(remap, &table), map_range(remap, &metatable)) {
+                (Some(new_table), Some(new_metatable)) => {
+                    rebuilt.insert(new_table, new_metatable);
+                }
+                // The writer of `setmetatable(t, mt)` is not recorded, so the
+                // table's own file stands in for it: it is the file whose
+                // members resolve through the binding.
+                _ => {
+                    dirty.insert(table.file_id);
+                }
+            }
+        }
+        self.metatables = rebuilt;
+
+        for (file_id, bindings) in &mut self.factory_bindings {
+            let before = bindings.len();
+            bindings.retain_mut(|binding| {
+                let (Some(table_range), Some(metatable_range)) = (
+                    map_range(remap, &binding.table_range),
+                    map_range(remap, &binding.metatable_range),
+                ) else {
+                    return false;
+                };
+                binding.table_range = table_range;
+                binding.metatable_range = metatable_range;
+                true
+            });
+            if bindings.len() != before {
+                dirty.insert(*file_id);
+            }
+        }
+        self.factory_bindings
+            .retain(|_, bindings| !bindings.is_empty());
+        dirty.remove(&remap.file_id);
+        dirty
     }
 
     pub fn factory_bindings_for_file(
