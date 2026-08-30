@@ -31,6 +31,11 @@ pub struct LuaMemberIndex {
     member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
     member_owner_key_history_index:
         HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+    /// The owners under which a file's members were filed in the two
+    /// owner-key indexes. A file sweep only has to visit these owners, rather
+    /// than every owner in the workspace. Entries may outlive the members that
+    /// caused them; a sweep of an owner that holds none is a no-op.
+    owner_key_index_owners_by_file: HashMap<FileId, HashSet<LuaMemberOwner>>,
     current_owner_member_history:
         HashMap<LuaMemberOwner, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
     current_members_by_key: HashMap<LuaMemberKey, BTreeMap<(u32, u32, u32, u16), LuaMemberId>>,
@@ -92,6 +97,7 @@ impl LuaMemberIndex {
             member_current_owner: HashMap::default(),
             member_owner_key_index: HashMap::default(),
             member_owner_key_history_index: HashMap::default(),
+            owner_key_index_owners_by_file: HashMap::default(),
             current_owner_member_history: HashMap::default(),
             current_members_by_key: HashMap::default(),
             non_overwriting_assignment_members: HashSet::default(),
@@ -801,6 +807,7 @@ impl LuaMemberIndex {
             return;
         };
 
+        self.record_owner_key_index_owner(id.file_id, &owner);
         {
             let target_index = if history {
                 &mut self.member_owner_key_history_index
@@ -818,6 +825,16 @@ impl LuaMemberIndex {
         }
     }
 
+    fn record_owner_key_index_owner(&mut self, file_id: FileId, owner: &LuaMemberOwner) {
+        let owners = self
+            .owner_key_index_owners_by_file
+            .entry(file_id)
+            .or_default();
+        if !owners.contains(owner) {
+            owners.insert(owner.clone());
+        }
+    }
+
     fn add_new_member_id_to_owner_key_map(
         &mut self,
         owner: LuaMemberOwner,
@@ -828,6 +845,7 @@ impl LuaMemberIndex {
             return;
         };
 
+        self.record_owner_key_index_owner(id.file_id, &owner);
         let target_index = if history {
             &mut self.member_owner_key_history_index
         } else {
@@ -890,24 +908,40 @@ impl LuaMemberIndex {
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
-        Self::remove_files_members_from_owner_key_map(&mut self.member_owner_key_index, removed);
+        let owners = removed
+            .iter()
+            .filter_map(|file_id| self.owner_key_index_owners_by_file.remove(file_id))
+            .flatten()
+            .collect::<HashSet<_>>();
+        Self::remove_files_members_from_owner_key_map(
+            &mut self.member_owner_key_index,
+            removed,
+            &owners,
+        );
         Self::remove_files_members_from_owner_key_map(
             &mut self.member_owner_key_history_index,
             removed,
+            &owners,
         );
     }
 
     fn remove_files_members_from_owner_key_map(
         owner_key_index: &mut HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
         removed: &HashSet<FileId>,
+        owners: &HashSet<LuaMemberOwner>,
     ) {
-        owner_key_index.retain(|_, key_members| {
+        for owner in owners {
+            let Some(key_members) = owner_key_index.get_mut(owner) else {
+                continue;
+            };
             key_members.retain(|_, member_ids| {
                 member_ids.retain(|member_id| !removed.contains(&member_id.file_id));
                 !member_ids.is_empty()
             });
-            !key_members.is_empty()
-        });
+            if key_members.is_empty() {
+                owner_key_index.remove(owner);
+            }
+        }
     }
 
     fn is_item_only_meta(&self, item: &LuaMemberIndexItem) -> bool {
@@ -1657,6 +1691,9 @@ impl LuaMemberIndex {
             _ => LuaMemberIndexItem::Many(preserved_member_ids.clone()),
         };
 
+        for id in &preserved_member_ids {
+            self.record_owner_key_index_owner(id.file_id, &owner);
+        }
         self.member_owner_key_index
             .entry(owner.clone())
             .or_default()
@@ -1938,6 +1975,7 @@ impl LuaIndex for LuaMemberIndex {
         self.member_current_owner.clear();
         self.member_owner_key_index.clear();
         self.member_owner_key_history_index.clear();
+        self.owner_key_index_owners_by_file.clear();
         self.current_owner_member_history.clear();
         self.current_members_by_key.clear();
         self.non_overwriting_assignment_members.clear();

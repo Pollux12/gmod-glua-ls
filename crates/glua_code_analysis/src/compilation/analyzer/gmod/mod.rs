@@ -49,7 +49,7 @@ use crate::{
     profile::Profile,
 };
 use rowan::{TextRange, TextSize};
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use smol_str::SmolStr;
 
 mod numeric_range_population;
@@ -514,12 +514,15 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         };
 
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
+        let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
         let reach = HelperStartReachCache::default();
         let helper_call_sites = crate::profile::phase("gmodnet/helper_call_sites", || {
             let op_names = net_operation_names(&annotated_global_call_roles);
-            let mut names = net_producing_function_names(db, &op_names);
+            let mut names = crate::profile::phase("gmodnet/helper_names", || {
+                net_producing_function_names(db, &op_names)
+            });
             names.extend(op_names);
-            net_helper_call_sites(db, names)
+            net_helper_call_sites(db, names, &collected_files)
         });
         let collected = crate::profile::phase("gmodnet/collect_flows", || {
             super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
@@ -1388,7 +1391,14 @@ struct NetHelperCallSites {
     names: HashSet<SmolStr>,
 }
 
-fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCallSites {
+/// `by_file` is filled for `collected_files` only: it is read through
+/// [`net_candidate_call_exprs`], and every site that reaches it belongs to the
+/// file currently being collected. `names` stays workspace-wide.
+fn net_helper_call_sites(
+    db: &DbIndex,
+    names: HashSet<SmolStr>,
+    collected_files: &FxHashSet<FileId>,
+) -> NetHelperCallSites {
     let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
     let reference_index = db.get_reference_index();
     for name in &names {
@@ -1404,6 +1414,9 @@ fn net_helper_call_sites(db: &DbIndex, names: HashSet<SmolStr>) -> NetHelperCall
                     .flatten(),
             )
         {
+            if !collected_files.contains(&reference.file_id) {
+                continue;
+            }
             by_file
                 .entry(reference.file_id)
                 .or_default()
@@ -12084,16 +12097,6 @@ fn rebuild_gmod_load_index(
     let _p_prep = crate::profile::PhaseGuard::new("gmodload/prep");
     let file_ids = db.get_vfs().get_all_local_file_ids();
     let analyzed_file_ids: HashSet<FileId> = analyzed_file_ids.iter().copied().collect();
-    let previous_realm_metadata: HashMap<FileId, GmodRealmFileMetadata> = file_ids
-        .iter()
-        .filter_map(|file_id| {
-            db.get_gmod_infer_index()
-                .get_realm_file_metadata(file_id)
-                .cloned()
-                .map(|metadata| (*file_id, metadata))
-        })
-        .collect();
-
     let resolved_branch_ranges = file_ids
         .iter()
         .map(|file_id| {
@@ -12102,8 +12105,8 @@ fn rebuild_gmod_load_index(
             } else if analyzed_file_ids.contains(file_id) {
                 Vec::new()
             } else {
-                previous_realm_metadata
-                    .get(file_id)
+                db.get_gmod_infer_index()
+                    .get_realm_file_metadata(file_id)
                     .map(|metadata| metadata.branch_realm_ranges.clone())
                     .unwrap_or_default()
             };

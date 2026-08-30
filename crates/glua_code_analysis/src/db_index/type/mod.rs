@@ -1022,6 +1022,7 @@ pub struct LuaTypeIndex {
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
+    derived_state_dirty: bool,
 }
 
 impl Default for LuaTypeIndex {
@@ -1049,6 +1050,7 @@ impl LuaTypeIndex {
             inference_events_by_file: HashMap::default(),
             support_dependents: HashMap::default(),
             support_file_dependents: HashMap::default(),
+            derived_state_dirty: false,
         }
     }
 
@@ -1575,6 +1577,13 @@ impl LuaTypeIndex {
         file_id
     }
 
+    /// Marks the inference-derived state stale.
+    ///
+    /// The rebuild reads every fact in the index, so it is deferred to
+    /// [`flush_inference_derived_state`](Self::flush_inference_derived_state)
+    /// rather than run once per binding. No reader runs inside an analysis
+    /// batch: the events are read by the inference-trust diagnostic and the
+    /// support dependents by reindex expansion, both after `analyze` returns.
     pub(crate) fn rebuild_inference_derived_state<S: std::hash::BuildHasher>(
         &mut self,
         changed_files: &std::collections::HashSet<FileId, S>,
@@ -1582,6 +1591,15 @@ impl LuaTypeIndex {
         if changed_files.is_empty() {
             return;
         }
+        self.derived_state_dirty = true;
+    }
+
+    /// Rebuilds the inference-derived state if any binding marked it stale.
+    pub(crate) fn flush_inference_derived_state(&mut self) {
+        if !self.derived_state_dirty {
+            return;
+        }
+        self.derived_state_dirty = false;
 
         let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> =
             HashMap::default();
@@ -1985,6 +2003,7 @@ impl LuaIndex for LuaTypeIndex {
             .retain(|definition, _| !changed_files.contains(&definition.file_id()));
 
         self.rebuild_inference_derived_state(&changed_files);
+        self.flush_inference_derived_state();
     }
 
     fn clear(&mut self) {
@@ -2003,6 +2022,7 @@ impl LuaIndex for LuaTypeIndex {
         self.inference_events_by_file.clear();
         self.support_dependents.clear();
         self.support_file_dependents.clear();
+        self.derived_state_dirty = false;
     }
 }
 

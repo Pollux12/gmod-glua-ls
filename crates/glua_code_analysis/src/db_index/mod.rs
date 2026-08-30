@@ -249,6 +249,12 @@ impl DbIndex {
         &mut self.references_index
     }
 
+    /// Rebuilds the inference-derived state left stale by a batch of fact
+    /// bindings. See [`LuaTypeIndex::flush_inference_derived_state`].
+    pub fn flush_inference_derived_state(&mut self) {
+        self.types_index.flush_inference_derived_state();
+    }
+
     pub fn get_type_index_mut(&mut self) -> &mut LuaTypeIndex {
         self.type_structure_revision = next_type_structure_revision();
         &mut self.types_index
@@ -338,6 +344,7 @@ impl DbIndex {
 
         self.types_index
             .rebuild_inference_derived_state(&changed_files);
+        self.types_index.flush_inference_derived_state();
         changed_files
     }
 

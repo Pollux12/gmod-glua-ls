@@ -390,6 +390,8 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             );
         }
     }
+
+    db.flush_inference_derived_state();
 }
 
 /// Retries the index-expression member attaches `set_index_expr_owner`

@@ -136,6 +136,7 @@ mod test {
         );
         index.force_bind_type(owner(), LuaTypeCache::InferType(LuaType::Number));
 
+        index.flush_inference_derived_state();
         let fact = index.get_type_fact(&owner()).unwrap();
         assert_eq!(fact.typ(), &LuaType::Number);
         assert_eq!(fact.confidence(), LuaInferenceConfidence::Certain);
@@ -633,13 +634,16 @@ mod test {
             LuaTypeCache::InferType(LuaType::String),
             metadata.clone(),
         );
+        index.flush_inference_derived_state();
         assert!(index.get_inference_events_for_file(owner_file).is_empty());
         assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
 
         index.force_bind_type(owner.clone(), LuaTypeCache::InferType(LuaType::Number));
+        index.flush_inference_derived_state();
         assert!(index.get_inference_events_for_file(source_file).is_empty());
 
         index.force_bind_type_fact(owner, LuaTypeCache::InferType(LuaType::String), metadata);
+        index.flush_inference_derived_state();
         assert_eq!(index.get_inference_events_for_file(source_file).len(), 1);
         index.remove(owner_file);
         assert!(index.get_inference_events_for_file(source_file).is_empty());
@@ -678,6 +682,7 @@ mod test {
 
         index.force_bind_type(first_owner, LuaTypeCache::InferType(LuaType::Boolean));
 
+        index.flush_inference_derived_state();
         let remaining = index.get_inference_events_for_file(source_file);
         assert_eq!(remaining.len(), 1);
         assert_eq!(
@@ -754,6 +759,7 @@ mod test {
         );
 
         index.bind_definition_fact(definition, fact.clone());
+        index.flush_inference_derived_state();
 
         assert_eq!(index.get_definition_fact(&definition), Some(&fact));
         assert_eq!(
@@ -794,6 +800,7 @@ mod test {
 
         index.replace_table_const_type(&table_range, &LuaType::Table);
 
+        index.flush_inference_derived_state();
         assert_eq!(
             index.get_type_fact(&owner()).unwrap().typ(),
             &LuaType::Table
@@ -837,6 +844,7 @@ mod test {
             metadata,
         );
 
+        index.flush_inference_derived_state();
         let events = index.get_inference_events_for_file(file_id());
         assert_eq!(events.len(), 1, "{events:?}");
         let step = events[0]
