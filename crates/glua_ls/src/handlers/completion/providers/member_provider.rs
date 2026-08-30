@@ -1,6 +1,7 @@
 use glua_code_analysis::{
-    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaSemanticDeclId,
-    LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param, get_tpl_ref_extend_type,
+    DbIndex, FileId, GmodRealm, GmodStateMask, LuaMemberInfo, LuaMemberKey, LuaMemberOwner,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticModel, enum_variable_is_param,
+    get_tpl_ref_extend_type,
 };
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaComment, LuaCommentOwner, LuaDocTag, LuaDocTagRealm, LuaExpr,
@@ -73,6 +74,7 @@ pub fn add_completion(builder: &mut CompletionBuilder) -> Option<()> {
         None
     };
     extend_gmod_hook_fallback_members(builder, gmod_fallback_owner, &mut member_info_map);
+    dedupe_member_infos(builder, &mut member_info_map);
 
     add_completions_for_members_with_gmod_owner(
         builder,
@@ -99,6 +101,11 @@ fn extend_global_path_members(
         return;
     };
 
+    // The namespace route is a fallback for keys the prefix type cannot
+    // answer — e.g. a guarded bootstrap slot that resolves to an empty
+    // literal while the accumulated members live under the global path
+    // owner. Its members join the prefix type's own, and superseded
+    // same-file writers are collapsed afterwards.
     let mut existing = collect_member_identities(members);
 
     for (key, infos) in global_path_members {
@@ -177,6 +184,79 @@ fn extend_gmod_hook_fallback_members(
                 push_unique_member_info(members, &mut existing, key.clone(), info);
             }
         }
+    }
+}
+
+/// Collapses each key's candidates to one entry per distinct definition the
+/// caller can be looking at: branch-only writes drop out where an unconditional
+/// one exists, and what remains is deduplicated by identity.
+fn dedupe_member_infos(
+    builder: &CompletionBuilder,
+    members: &mut HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+) {
+    let db = builder.semantic_model.get_db();
+    for infos in members.values_mut() {
+        resolve_slot_writes(db, infos);
+        let mut seen = HashSet::new();
+        infos.retain(|info| seen.insert(MemberInfoIdentity::from(info)));
+    }
+}
+
+/// What a candidate for one key is, as far as the rule below is concerned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SlotWrite {
+    /// Not a write: a class declaration field (`---@field`) is a contract, and
+    /// a dynamic field carries no member at all. Never collapsed.
+    NotAWrite,
+    /// Runs whenever the statement around it is reached. A write in a function
+    /// body counts: reaching the body is the caller's business, not a condition
+    /// on the write.
+    Unconditional,
+    /// Runs only when its branch is taken, so the slot may never hold it.
+    Branch,
+}
+
+/// Drops the writes of a key that only happen in a branch, where one outside
+/// any branch exists.
+///
+/// This is the only separation available here. Load order across files is
+/// decided by member resolution, which also picks the write the caller's realm
+/// selects, both before these infos are built; what is left is whether a write
+/// is conditional at all. Writes that are all unconditional — guarded bootstrap
+/// siblings (`x = x or {}`) among them — say nothing about each other and all
+/// survive.
+fn resolve_slot_writes(db: &DbIndex, infos: &mut Vec<LuaMemberInfo>) {
+    if infos.len() <= 1 {
+        return;
+    }
+
+    let writes = infos
+        .iter()
+        .map(|info| classify_slot_write(db, info))
+        .collect::<Vec<_>>();
+    if !writes.contains(&SlotWrite::Unconditional) {
+        return;
+    }
+
+    let mut writes = writes.into_iter();
+    infos.retain(|_| writes.next() != Some(SlotWrite::Branch));
+}
+
+fn classify_slot_write(db: &DbIndex, info: &LuaMemberInfo) -> SlotWrite {
+    let Some(LuaSemanticDeclId::Member(member_id)) = &info.property_owner_id else {
+        return SlotWrite::NotAWrite;
+    };
+    let member_index = db.get_member_index();
+    if matches!(
+        member_index.get_member_owner(member_id),
+        Some(LuaMemberOwner::Type(_))
+    ) {
+        return SlotWrite::NotAWrite;
+    }
+    if member_index.is_conditional_branch_assignment_member(*member_id) {
+        SlotWrite::Branch
+    } else {
+        SlotWrite::Unconditional
     }
 }
 

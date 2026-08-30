@@ -82,6 +82,11 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
                     return remove_type(db, alias_ref.clone(), removed_type);
                 }
 
+                // In Garry's Mod, engine/userdata classes have distinct type() names ("Vector", "Player", etc.) and are not table
+                if is_gmod_non_table_class(db, type_decl_id) {
+                    return Some(source.clone());
+                }
+
                 // 需要对`userdata`进行特殊处理
                 if let Some(super_types) = db.get_type_index().get_super_types_iter(type_decl_id) {
                     for super_type in super_types {
@@ -164,4 +169,29 @@ pub fn remove_type(db: &DbIndex, source: LuaType, removed_type: LuaType) -> Opti
     }
 
     Some(source.clone())
+}
+
+fn is_gmod_non_table_class(db: &crate::DbIndex, type_decl_id: &crate::LuaTypeDeclId) -> bool {
+    if !db.get_emmyrc().gmod.enabled {
+        return false;
+    }
+    let name = type_decl_id.get_name();
+    match name {
+        "Vector" | "Angle" | "VMatrix" | "Entity" | "Player" | "NPC" | "Weapon" | "Vehicle"
+        | "NextBot" | "Panel" | "PhysObj" | "File" | "IMaterial" | "ITexture" | "ISave"
+        | "IRestore" | "IGModAudioChannel" | "PathFollower" | "CLuaEmitter" | "CLuaParticle"
+        | "CNavArea" | "CNavLadder" | "CNewParticleEffect" | "CSoundPatch" | "CTakeDamageInfo"
+        | "CUserCmd" | "bf_read" => true,
+        _ => {
+            let mut supers = Vec::new();
+            type_decl_id.collect_super_types(db, &mut supers);
+            supers.iter().any(|st| {
+                if let LuaType::Ref(sid) | LuaType::Def(sid) = st {
+                    matches!(sid.get_name(), "Entity" | "Panel")
+                } else {
+                    false
+                }
+            })
+        }
+    }
 }

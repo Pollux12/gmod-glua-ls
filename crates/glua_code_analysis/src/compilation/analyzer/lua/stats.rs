@@ -5,8 +5,8 @@ use crate::{
     LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
         common::{
-            TypeCacheWriteMode, add_member, bind_type, holds_unbound_iter_template,
-            reads_settling_iter_var, write_type_cache,
+            DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
+            holds_unbound_iter_template, reads_settling_iter_var, write_type_cache,
         },
         gmod::name_expr_resolves_to_scoped_authoring_table,
         unresolve::{UnResolveDecl, UnResolveMember},
@@ -18,9 +18,9 @@ use crate::{
     semantic::{merge_open_table_types, remove_false_or_nil},
 };
 use glua_parser::{
-    BinaryOperator, LuaAssignStat, LuaAstNode, LuaClosureExpr, LuaExpr, LuaFuncStat, LuaIndexExpr,
-    LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr, LuaSyntaxKind,
-    LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
+    LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
+    LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rustc_hash::FxHashMap;
 
@@ -88,11 +88,26 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             break;
         };
         let decl_id = LuaDeclId::new(analyzer.file_id, position);
-        if is_call_or_index_expr(&expr) {
+        // A copy of a loop variable holds whatever the variable held when the
+        // copy landed, and the settled re-derivation moves those, so it needs
+        // re-reading for the same reason a call or index read does.
+        if is_call_or_index_expr(&expr)
+            || reads_settling_iter_var(analyzer.db, analyzer.file_id, &expr)
+        {
             analyzer
                 .context
                 .request_uninformative_local_decl_reinfer(decl_id);
         }
+        // A read through a multi-declaration global answers from whichever backing
+        // tables the walk had reached; a decl deferred to the unresolve wave never
+        // reaches the settled-global-read recording below, so record it here
+        // before it can branch off. Re-derived once every backing table has landed.
+        if initializer_reads_through_multi_decl_global(analyzer, &expr) {
+            analyzer
+                .context
+                .record_settled_multi_decl_global_read_candidate(decl_id, expr.clone());
+        }
+        note_vgui_parent_fallback_file(analyzer);
 
         if let Some(reason) = should_defer_guarded_index_alias(analyzer, &expr) {
             let unresolve = UnResolveDecl {
@@ -197,11 +212,39 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
                     continue;
                 }
 
+                // A global's type is the merge of every file that writes it, and
+                // a batch that retains some of those writers while its own are
+                // still empty answers this read from a smaller set than a cold
+                // build sees. Re-derived once they have all landed.
+                if reads_global_name(analyzer, &expr) {
+                    analyzer
+                        .context
+                        .record_settled_global_read_candidate(decl_id, expr.clone());
+                }
+
                 let retry_uninformative = should_retry_uninformative_initializer(&expr, &expr_type);
-                bind_type(
+                bind_decl_write(
                     analyzer.db,
-                    decl_id.into(),
+                    decl_id,
                     LuaTypeCache::InferType(expr_type),
+                    DeclWrite {
+                        position: expr.get_position(),
+                        may_improve_after_resolve: may_improve_after_resolve(&expr),
+                        reads_out_of_decl: expr_reads_out_of_decl(
+                            analyzer.db,
+                            analyzer.file_id,
+                            decl_id,
+                            &expr,
+                        ),
+                        may_narrow_uninformative: may_improve_after_resolve(&expr),
+                        resolved_initializer: false,
+                        fills_own_default: expr_fills_own_default(
+                            analyzer.db,
+                            analyzer.file_id,
+                            decl_id,
+                            &expr,
+                        ),
+                    },
                 );
                 if retry_uninformative {
                     let unresolve = UnResolveDecl {
@@ -579,10 +622,17 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
 /// after the batch is done.
 fn prefix_carries_no_owner_information(prefix_type: &LuaType) -> bool {
     match prefix_type {
-        LuaType::Unknown | LuaType::Any => true,
-        LuaType::Union(union) => union
-            .types()
-            .all(|arm| matches!(arm, LuaType::Nil | LuaType::Unknown | LuaType::Any)),
+        // `table` belongs here for the same reason `any` does: it names no
+        // element, so nothing can attach through it. It is also what a slot
+        // collapses to while a writer's literal is still being widened against
+        // siblings the walk has not reached, which is a property of the batch.
+        LuaType::Unknown | LuaType::Any | LuaType::Table => true,
+        LuaType::Union(union) => union.types().all(|arm| {
+            matches!(
+                arm,
+                LuaType::Nil | LuaType::Unknown | LuaType::Any | LuaType::Table
+            )
+        }),
         _ => false,
     }
 }
@@ -876,6 +926,19 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
 
         let type_owner = get_var_owner(analyzer, var.clone());
 
+        // A local reassigned from a multi-declaration global field read has the
+        // same batch-order exposure as a local *initialized* from one: the walk
+        // answers it from whichever backing tables it had reached. Record it so
+        // the settled pass re-derives it against the complete set.
+        if let LuaTypeOwner::Decl(decl_id) = &type_owner
+            && initializer_reads_through_multi_decl_global(analyzer, expr)
+        {
+            analyzer
+                .context
+                .record_settled_multi_decl_global_read_candidate(*decl_id, expr.clone());
+        }
+        note_vgui_parent_fallback_file(analyzer);
+
         let assign_stat_range = assign_stat.get_range();
         if special_assign_pattern(
             analyzer,
@@ -1032,10 +1095,34 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 .request_member_initializer_reinfer(*member_id);
         }
 
-        let expr_type = member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
+        let mut expr_type =
+            member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
         widen_existing_member_collection_type(analyzer, &var, &expr_type);
-        assign_merge_type_owner_and_expr_type(analyzer, type_owner, &expr_type, 0, false);
+        assign_merge_type_owner_and_expr_type(
+            analyzer,
+            type_owner.clone(),
+            &expr_type,
+            0,
+            false,
+            DeclWrite {
+                position: expr.get_position(),
+                may_improve_after_resolve: may_improve_after_resolve(expr),
+                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)),
+                may_narrow_uninformative: is_call_or_index_expr(expr),
+                resolved_initializer: false,
+                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                    if expr_fills_own_default(analyzer.db, analyzer.file_id, *decl_id, expr)),
+            },
+        );
+        // The member is only homed onto its owner above, so the sibling guards
+        // this one shares a table with are not visible until here.
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && let Some(canonical) = canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+        {
+            expr_type = canonical;
+        }
         update_literal_index_member_owner_cache(analyzer, &var, &expr_type);
     }
 
@@ -1052,10 +1139,30 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &last_expr_type,
                             i - expr_count + 1,
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 } else {
@@ -1065,10 +1172,30 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                         set_index_expr_owner(analyzer, var.clone());
                         assign_merge_type_owner_and_expr_type(
                             analyzer,
-                            type_owner,
+                            type_owner.clone(),
                             &LuaType::Any,
                             0, // Any doesn't need indexing
                             false,
+                            DeclWrite {
+                                position: last_expr.get_position(),
+                                may_improve_after_resolve: may_improve_after_resolve(last_expr),
+                                reads_out_of_decl: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_reads_out_of_decl(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                                may_narrow_uninformative: is_call_or_index_expr(last_expr),
+                                resolved_initializer: false,
+                                fills_own_default: matches!(&type_owner, LuaTypeOwner::Decl(decl_id)
+                                if expr_fills_own_default(
+                                    analyzer.db,
+                                    analyzer.file_id,
+                                    *decl_id,
+                                    last_expr,
+                                )),
+                            },
                         );
                     }
                 }
@@ -1268,6 +1395,15 @@ fn should_skip_nil_table_shape_assignment(
         return false;
     };
 
+    // A prefix that has not settled yet cannot answer this, and the write is a
+    // delete either way: `t[k] = nil` removes an entry, it never adds a member
+    // typed `nil`. A receiver typed by a `fun(self: T)` callback slot is still
+    // `unknown` while its file is walked, so a member attached here would land
+    // on the slot every closure filling it shares.
+    if matches!(prefix_type, LuaType::Unknown | LuaType::Never) {
+        return true;
+    }
+
     if !is_table_shape_cleanup_type(&prefix_type) {
         return false;
     }
@@ -1417,10 +1553,90 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
     crate::compilation::analyzer::initializer_reads_through_call_or_index(expr)
 }
 
+fn may_improve_after_resolve(expr: &LuaExpr) -> bool {
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+}
+
+/// Whether `expr` is a bare read of a global name, whose type is the merge of
+/// every file that writes it.
+fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return false;
+    };
+    analyzer
+        .db
+        .get_reference_index()
+        .get_local_reference(&analyzer.file_id)
+        .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
+        .is_none()
+}
+
+/// Whether the initializer reads through a global whose root name has more than
+/// one declaration — the `X = X or {}` per-realm bootstrap whose backing tables
+/// the walk merges incrementally. Recurses index/call prefixes and operator
+/// operands so a member path (`cityrp.presidential.Taxes`) or an arithmetic read
+/// (`... / 100`) is caught, not only a bare `local x = cityrp`.
+/// Record the current file if any `panel:GetParent()` read in it fell back to
+/// the broad `Panel` type because the vgui parent chain was not complete. The
+/// chains finish in the gmod-post pass; the fallback set accumulates over the
+/// file walk, so a later statement is enough to flag the file for re-derivation.
+fn note_vgui_parent_fallback_file(analyzer: &mut LuaAnalyzer) {
+    let file_id = analyzer.file_id;
+    let cache = analyzer.context.infer_manager.get_infer_cache(file_id);
+    // Chain-derived successes are as batch-sensitive as fallbacks: the chain a
+    // read went through can be one the final chain state contradicts, so both
+    // kinds flag the file for the settled re-derivation.
+    let has_chain_read =
+        !cache.vgui_parent_fallback_calls.is_empty() || !cache.vgui_parent_chain_calls.is_empty();
+    if has_chain_read {
+        analyzer.context.record_vgui_parent_fallback_file(file_id);
+    }
+}
+
+fn initializer_reads_through_multi_decl_global(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
+    let Some(root_name) = global_read_root_name(analyzer, expr) else {
+        return false;
+    };
+    analyzer
+        .db
+        .get_global_index()
+        .get_global_decl_ids(&root_name)
+        .is_some_and(|decl_ids| decl_ids.len() > 1)
+}
+
+/// The root global name a *field read* is rooted at (`cityrp` for
+/// `cityrp.presidential.Taxes`), or `None` if it is not a field read rooted at a
+/// global. A call is deliberately not followed: `cityrp.player.get(x)` returns
+/// whatever the callee returns, not a field off the merged backing tables, so
+/// re-deriving it against the complete set is neither needed nor sound.
+fn global_read_root_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> Option<String> {
+    match expr {
+        LuaExpr::NameExpr(name_expr) => reads_global_name(analyzer, expr)
+            .then(|| name_expr.get_name_token())
+            .flatten()
+            .map(|token| token.get_name_text().to_string()),
+        LuaExpr::IndexExpr(index) => index
+            .get_prefix_expr()
+            .and_then(|prefix| global_read_root_name(analyzer, &prefix)),
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .and_then(|inner| global_read_root_name(analyzer, &inner)),
+        LuaExpr::BinaryExpr(binary) => binary.get_exprs().and_then(|(left, right)| {
+            global_read_root_name(analyzer, &left)
+                .or_else(|| global_read_root_name(analyzer, &right))
+        }),
+        LuaExpr::UnaryExpr(unary) => unary
+            .get_expr()
+            .and_then(|inner| global_read_root_name(analyzer, &inner)),
+        _ => None,
+    }
+}
+
 /// Whether an initializer that inferred to a type carrying no information
 /// has to be queued for the unresolve pass as well as committed here.
 fn should_retry_uninformative_initializer(expr: &LuaExpr, expr_type: &LuaType) -> bool {
-    is_call_or_index_expr(expr) && !crate::db_index::is_informative_type(expr_type)
+    crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+        && !crate::db_index::is_informative_type(expr_type)
 }
 
 /// Whether an assignment that *would* narrow an uninformative decl cache
@@ -1527,8 +1743,43 @@ fn should_defer_pending_local_alias(
 /// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
 /// self-contradiction — the value still cannot be the decl's lifetime type,
 /// because it was computed from a read that type would reject.
-fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
-    if index_chain_roots_at_decl(analyzer, decl_id, expr) {
+/// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
+///
+/// The result always includes the declaration's own type, so unlike a plain
+/// reassignment it refines the declaration rather than replacing it, and is the
+/// one body write a parameter may take its type from.
+pub(crate) fn expr_fills_own_default(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
+    let LuaExpr::BinaryExpr(binary_expr) = expr else {
+        return false;
+    };
+    if binary_expr.get_op_token().map(|op| op.get_op()) != Some(BinaryOperator::OpOr) {
+        return false;
+    }
+    let Some((LuaExpr::NameExpr(left), _)) = binary_expr.get_exprs() else {
+        return false;
+    };
+    let Some(name) = left.get_name_text() else {
+        return false;
+    };
+
+    db.get_decl_index()
+        .get_decl_tree(&file_id)
+        .and_then(|decl_tree| decl_tree.find_local_decl(&name, left.get_position()))
+        .is_some_and(|decl| decl.get_id() == decl_id)
+}
+
+pub(crate) fn expr_reads_out_of_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
+    if index_chain_roots_at_decl(db, file_id, decl_id, expr) {
         return true;
     }
 
@@ -1540,11 +1791,16 @@ fn expr_reads_out_of_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &Lua
                 .any(|closure| expr_range.contains_range(closure.get_range()))
         })
         .any(|index_expr| {
-            index_chain_roots_at_decl(analyzer, decl_id, &LuaExpr::IndexExpr(index_expr))
+            index_chain_roots_at_decl(db, file_id, decl_id, &LuaExpr::IndexExpr(index_expr))
         })
 }
 
-fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+fn index_chain_roots_at_decl(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    decl_id: LuaDeclId,
+    expr: &LuaExpr,
+) -> bool {
     let mut current = expr.clone();
     loop {
         match current {
@@ -1553,10 +1809,9 @@ fn index_chain_roots_at_decl(analyzer: &LuaAnalyzer, decl_id: LuaDeclId, expr: &
                 None => return false,
             },
             LuaExpr::NameExpr(name_expr) => {
-                return analyzer
-                    .db
+                return db
                     .get_reference_index()
-                    .get_local_reference(&analyzer.file_id)
+                    .get_local_reference(&file_id)
                     .and_then(|file_ref| file_ref.get_decl_id(&name_expr.get_range()))
                     == Some(decl_id);
             }
@@ -1581,7 +1836,7 @@ fn seeds_empty_decl_from_own_read(
         .get_type_index()
         .get_type_cache(type_owner)
         .is_none()
-        && expr_reads_out_of_decl(analyzer, *decl_id, expr)
+        && expr_reads_out_of_decl(analyzer.db, analyzer.file_id, *decl_id, expr)
 }
 
 fn add_unresolve_for_assignment(
@@ -1598,7 +1853,7 @@ fn add_unresolve_for_assignment(
             // slot is empty until one of the file's deferred writes
             // resolves, and `bind_type` has no acceptance rule for an empty
             // slot, so whichever lands first owns the decl's lifetime type.
-            if expr_reads_out_of_decl(analyzer, decl_id, &expr) {
+            if expr_reads_out_of_decl(analyzer.db, analyzer.file_id, decl_id, &expr) {
                 return;
             }
 
@@ -1655,6 +1910,7 @@ fn assign_merge_type_owner_and_expr_type(
     expr_type: &LuaType,
     idx: usize,
     preserve_table_literals: bool,
+    write: DeclWrite,
 ) -> Option<()> {
     let mut expr_type = expr_type.clone();
     if let LuaType::Variadic(multi) = expr_type {
@@ -1674,10 +1930,44 @@ fn assign_merge_type_owner_and_expr_type(
         expr_type = bootstrap_type;
     }
 
+    // Where every writer of this member is a `x.y = x.y or {}` guard they all
+    // name one table, so there are no competing writes to merge — each writer
+    // resolves to the earliest one's literal and the sibling widening is
+    // skipped. Widening them against each other unions two literals into a bare
+    // `table`, which drops the members another file attached to the namespace.
+    let canonical_guarded_bootstrap = match &type_owner {
+        LuaTypeOwner::Member(member_id) => {
+            canonical_guarded_table_bootstrap_type(analyzer.db, *member_id)
+        }
+        _ => None,
+    };
+
+    // A repeated `x.y = x.y or {}` guard names one table, however many files
+    // open with it: each writer means "reuse it if it is there". Widening those
+    // literals against each other answers `table`, which drops whatever another
+    // file attached to it — so the guard has to preserve them here too, the same
+    // way the contribution record below already reads it.
+    let preserve_table_literals = preserve_table_literals
+        || matches!(&type_owner, LuaTypeOwner::Member(member_id)
+            if is_guarded_table_assignment_member(analyzer.db, *member_id));
+
+    // A plain writer that shares the slot has to preserve them too: widening
+    // `self.x = {}` against a `self.x = self.x or {}` in another file answers
+    // `table`, and the guard's literal is then gone for every reader —
+    // including the writes that attach members through it. This says nothing
+    // about *this* write being a guarded one, so it feeds the widening decision
+    // alone and not the classification below.
+    let preserve_sibling_table_literals = preserve_table_literals
+        || matches!(&type_owner, LuaTypeOwner::Member(member_id)
+            if slot_has_guarded_table_bootstrap(analyzer.db, *member_id));
+
     let dynamic_expr_key_member = is_dynamic_expr_key_member_assignment(analyzer, &type_owner);
     // What this write carries on its own, before any sibling merge widens it.
     let mut source_type = None;
-    if !dynamic_expr_key_member {
+    if let Some(canonical) = canonical_guarded_bootstrap {
+        expr_type = canonical;
+        source_type = Some(expr_type.clone());
+    } else if !dynamic_expr_key_member {
         if let Some(widened_type) =
             get_widened_member_assignment_collection_type(analyzer, &type_owner, &expr_type)
         {
@@ -1691,7 +1981,7 @@ fn assign_merge_type_owner_and_expr_type(
             analyzer,
             &type_owner,
             &expr_type,
-            preserve_table_literals,
+            preserve_sibling_table_literals,
         ) {
             Some(Some(widened_type)) => {
                 expr_type = widened_type;
@@ -1707,7 +1997,7 @@ fn assign_merge_type_owner_and_expr_type(
                     analyzer.db,
                     &type_owner,
                     &expr_type,
-                    preserve_table_literals,
+                    preserve_sibling_table_literals,
                     &mut skipped_uncached_sibling,
                 );
                 // Recorded on the skip, not on the answer: a walk that read no
@@ -1718,7 +2008,7 @@ fn assign_merge_type_owner_and_expr_type(
                     analyzer.context.record_settled_member_widening_candidate(
                         *member_id,
                         expr_type.clone(),
-                        preserve_table_literals,
+                        preserve_sibling_table_literals,
                     );
                 }
                 if let Some(widened_type) = widened {
@@ -1726,23 +2016,60 @@ fn assign_merge_type_owner_and_expr_type(
                 }
             }
         }
+        // A table literal written into a slot another file bootstraps with
+        // `x.y = x.y or {}` keeps its own literal — but whether that sibling had
+        // been indexed when the walk asked is a property of the walk order. Where
+        // the literal was widened away, queue it so the settled pass can ask
+        // again against the whole writer set.
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && matches!(source_type, Some(LuaType::TableConst(_)))
+            && matches!(expr_type, LuaType::Table)
+        {
+            analyzer.context.record_settled_member_widening_candidate(
+                *member_id,
+                source_type.clone().unwrap_or_else(|| expr_type.clone()),
+                preserve_sibling_table_literals,
+            );
+        }
     }
 
     if is_global_decl_owner(analyzer, &type_owner) {
         expr_type = merge_open_table_types(analyzer.db, vec![expr_type]);
     }
 
-    bind_type(
-        analyzer.db,
-        type_owner.clone(),
-        LuaTypeCache::InferType(expr_type.clone()),
-    );
+    match &type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            bind_decl_write(
+                analyzer.db,
+                *decl_id,
+                LuaTypeCache::InferType(expr_type.clone()),
+                write,
+            );
+        }
+        _ => {
+            bind_type(
+                analyzer.db,
+                type_owner.clone(),
+                LuaTypeCache::InferType(expr_type.clone()),
+            );
+        }
+    }
 
     if let LuaTypeOwner::Member(member_id) = &type_owner
         && is_assignment_file_define_member(analyzer.db, *member_id)
     {
         let guarded_table_assignment =
             preserve_table_literals || is_guarded_table_assignment_member(analyzer.db, *member_id);
+        if guarded_table_assignment {
+            // Whichever canonical writer this found — including none at all — it
+            // read the sibling set off a half-built owner index, and which
+            // writers are visible there is a property of how far the batch has
+            // got. Re-derived once they have all landed and been migrated to
+            // their final owner. See `resettle_guarded_table_bootstraps`.
+            analyzer
+                .context
+                .record_settled_guarded_bootstrap_candidate(*member_id);
+        }
         let conditional_branch_assignment =
             is_member_assignment_in_conditional_branch(analyzer.db, *member_id);
         if !dynamic_expr_key_member {
@@ -1768,10 +2095,11 @@ fn assign_merge_type_owner_and_expr_type(
                 preserve_guarded_table_assignment_members(analyzer.db, *member_id);
             }
         } else if conditional_branch_assignment {
+            let may_open_owner_slot = write_may_declare_on_owner(analyzer.db, *member_id);
             analyzer
                 .db
                 .get_member_index_mut()
-                .mark_conditional_branch_assignment_member(*member_id);
+                .mark_conditional_branch_assignment_member(*member_id, may_open_owner_slot);
         } else if !dynamic_expr_key_member
             && analyzer
                 .db
@@ -1902,7 +2230,7 @@ fn get_cached_widened_member_assignment_type(
     analyzer: &mut LuaAnalyzer,
     type_owner: &LuaTypeOwner,
     incoming_type: &LuaType,
-    _preserve_table_literals: bool,
+    preserve_table_literals: bool,
 ) -> Option<Option<LuaType>> {
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return None;
@@ -1922,7 +2250,24 @@ fn get_cached_widened_member_assignment_type(
         &cache_key,
         visible_count,
     ) {
-        WideningCacheLookup::FirstSighting => return Some(None),
+        WideningCacheLookup::FirstSighting => {
+            // Being the only writer the owner can currently see is a statement
+            // about how far the batch has run: until the global this member
+            // hangs off resolves, its siblings sit on the global path instead
+            // and are invisible here. Re-derived once they have all been
+            // migrated to their owner.
+            //
+            // Only a named slot: a key the source writes as an expression names
+            // one entry of a collection, and those never migrate as a group.
+            if matches!(cache_key.key, LuaMemberKey::Name(_)) {
+                analyzer.context.record_settled_member_widening_candidate(
+                    *member_id,
+                    incoming_type.clone(),
+                    preserve_table_literals,
+                );
+            }
+            return Some(None);
+        }
         WideningCacheLookup::Fallback => return None,
         WideningCacheLookup::Hit(cache) => cache,
     };
@@ -2059,8 +2404,9 @@ pub(in crate::compilation::analyzer) fn mark_resolved_member_assignment(
             preserve_guarded_table_assignment_members(db, member_id);
         }
     } else if is_member_assignment_in_conditional_branch(db, member_id) {
+        let may_open_owner_slot = write_may_declare_on_owner(db, member_id);
         db.get_member_index_mut()
-            .mark_conditional_branch_assignment_member(member_id);
+            .mark_conditional_branch_assignment_member(member_id, may_open_owner_slot);
     }
 }
 
@@ -2162,6 +2508,69 @@ fn is_member_assignment_in_conditional_branch(db: &DbIndex, member_id: LuaMember
     })
 }
 
+/// Whether any writer of this member's slot bootstraps it with `x.y = x.y or
+/// {}`, this one included.
+pub(in crate::compilation::analyzer) fn slot_has_guarded_table_bootstrap(
+    db: &DbIndex,
+    member_id: LuaMemberId,
+) -> bool {
+    let member_index = db.get_member_index();
+    let Some(owner) = member_index.get_member_owner(&member_id) else {
+        return false;
+    };
+    let Some(key) = member_index.get_member(&member_id).map(LuaMember::get_key) else {
+        return false;
+    };
+    member_index
+        .get_current_owner_members_for_key(owner, key)
+        .into_iter()
+        .any(|related| is_guarded_table_assignment_member(db, related.get_id()))
+}
+
+/// Whether this member's assignment writes a bare table literal, `x.y = {...}`.
+fn assigns_bare_table_literal(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    // A table literal caches as one, so this rules out almost every writer for
+    // the price of a map lookup rather than a syntax walk.
+    if !matches!(
+        db.get_type_index()
+            .get_type_cache(&member_id.into())
+            .map(LuaTypeCache::as_type),
+        Some(LuaType::TableConst(_) | LuaType::Table)
+    ) {
+        return false;
+    }
+    let Some(tree) = db.get_vfs().get_syntax_tree(&member_id.file_id) else {
+        return false;
+    };
+    let root = tree.get_red_root();
+    let Some(index_expr) = member_id
+        .get_syntax_id()
+        .to_node_from_root(&root)
+        .and_then(LuaIndexExpr::cast)
+    else {
+        return false;
+    };
+    let Some(assign_stat) = index_expr.get_parent::<LuaAssignStat>() else {
+        return false;
+    };
+    let syntax_id = index_expr.get_syntax_id();
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    var_list
+        .iter()
+        .zip(expr_list.iter())
+        .find(|(candidate_var, _)| candidate_var.get_syntax_id() == syntax_id)
+        .is_some_and(|(_, expr)| matches!(expr, LuaExpr::TableExpr(_)))
+}
+
+/// Every writer of this member's slot, when at least one of them bootstraps it
+/// with `x.y = x.y or {}`.
+///
+/// The guard means "reuse it if it is there", and a plain `x.y = {}` resets that
+/// same table, so every writer names one runtime table however many literals the
+/// source spells. Returning them together is what lets the slot hold a single
+/// identity: treating a plain writer as a rival definition forks it, the merge
+/// of the forks answers bare `table`, and `table` names no element — so every
+/// member attached through the slot is lost.
 fn guarded_table_assignment_member_ids_for_owner_key(
     db: &DbIndex,
     member_id: LuaMemberId,
@@ -2170,17 +2579,23 @@ fn guarded_table_assignment_member_ids_for_owner_key(
     let owner = member_index.get_member_owner(&member_id)?.clone();
     let key = member_index.get_member(&member_id)?.get_key().clone();
     let mut member_ids = Vec::new();
+    let mut bootstrapped = false;
 
     for related_member in member_index.get_current_owner_members_for_key(&owner, &key) {
         let related_member_id = related_member.get_id();
-        if !is_guarded_table_assignment_member(db, related_member_id) {
+        if is_guarded_table_assignment_member(db, related_member_id) {
+            bootstrapped = true;
+        } else if !assigns_bare_table_literal(db, related_member_id) {
+            // This writer contributes something that is not a fresh table -- a
+            // class, a call result -- so the slot really can hold more than one
+            // thing and there is no single identity to resolve to.
             return None;
         }
 
         member_ids.push(related_member_id);
     }
 
-    (member_ids.len() >= 2).then_some(member_ids)
+    (bootstrapped && member_ids.len() >= 2).then_some(member_ids)
 }
 
 /// Widens a member assignment against its same-owner/key siblings.
@@ -2319,6 +2734,66 @@ pub(super) fn flush_pending_dynamic_key_collection_widenings(analyzer: &mut LuaA
     }
 }
 
+/// Whether a runtime write may give the class it names a field that class never
+/// declares.
+///
+/// A write through a reference only *names* the class; the value it runs on is
+/// one instance of it. When a subclass already declares the same field, the
+/// write is evidence about that subclass, not about the class it was typed
+/// through -- and giving the base the field hands it to every subclass, which
+/// hides the declarations and stops any receiver narrowing to the subclass that
+/// really owns it.
+///
+/// The subtype walk is not cheap, so it only runs for a write that would open a
+/// key the owner does not already hold.
+fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bool {
+    let member_index = db.get_member_index();
+    let Some(LuaMemberOwner::Type(owner_id)) = member_index.get_member_owner(&member_id).cloned()
+    else {
+        return true;
+    };
+    let Some(key) = member_index
+        .get_member(&member_id)
+        .map(|member| member.get_key().clone())
+    else {
+        return true;
+    };
+    if member_index
+        .get_member_item(&LuaMemberOwner::Type(owner_id.clone()), &key)
+        .is_some()
+    {
+        return true;
+    }
+    // Asked from the declaring side rather than by enumerating subtypes:
+    // collecting the subtypes of a base rescans the type index once per level
+    // of the hierarchy, while the types that declare this key at all are few and
+    // each answers with one walk up its own supers.
+    let type_index = db.get_type_index();
+    !type_index.get_all_types().into_iter().any(|type_decl| {
+        let candidate_id = type_decl.get_id();
+        if candidate_id == owner_id {
+            return false;
+        }
+        let declares_key = member_index
+            .get_member_item(&LuaMemberOwner::Type(candidate_id.clone()), &key)
+            .is_some_and(|item| {
+                item.get_member_ids().iter().any(|id| {
+                    member_index
+                        .get_member(id)
+                        .is_some_and(|member| member.get_feature().is_decl())
+                })
+            });
+        if !declares_key {
+            return false;
+        }
+        let mut super_types = Vec::new();
+        candidate_id.collect_super_types(db, &mut super_types);
+        super_types.iter().any(|super_type| {
+            matches!(super_type, LuaType::Ref(id) | LuaType::Def(id) if *id == owner_id)
+        })
+    })
+}
+
 pub(super) fn is_assignment_file_define_member(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
@@ -2342,17 +2817,58 @@ pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(
     let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
         return false;
     };
-    let Some(index_expr) = LuaIndexExpr::cast(node) else {
-        return false;
-    };
-
-    is_guarded_table_assignment_index_expr(&index_expr)
+    guarded_bootstrap_range_for_node(node, false).is_some()
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_index_expr(
     index_expr: &LuaIndexExpr,
 ) -> bool {
     guarded_table_assignment_bootstrap_range(index_expr, false).is_some()
+}
+
+/// Range of the table a guarded bootstrap of this member names, whichever of
+/// the two shapes wrote it.
+fn guarded_bootstrap_range_for_node(
+    node: glua_parser::LuaSyntaxNode,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+        return guarded_table_assignment_bootstrap_range(&index_expr, empty_only);
+    }
+
+    guarded_table_literal_field_range(&LuaTableField::cast(node)?, empty_only)
+}
+
+/// Range of the table a field of a guarded table literal names.
+///
+/// `x = x or { y = {} }` creates `x.y` on exactly the condition `x.y = x.y or
+/// {}` does — the namespace not existing yet — so the two shapes bootstrap the
+/// same slot and have to resolve to one literal between them. Treating only the
+/// second as a guarded writer leaves the first looking like a plain write, which
+/// makes the whole slot ineligible for canonicalisation.
+fn guarded_table_literal_field_range(
+    table_field: &LuaTableField,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    let LuaExpr::TableExpr(value) = table_field.get_value_expr()? else {
+        return None;
+    };
+    if empty_only && !value.is_empty() {
+        return None;
+    }
+
+    let table_expr = LuaTableExpr::cast(table_field.syntax().parent()?)?;
+    let binary_expr = LuaBinaryExpr::cast(table_expr.syntax().parent()?)?;
+    let assign_stat = binary_expr.get_parent::<LuaAssignStat>()?;
+    let (var_list, expr_list) = assign_stat.get_var_and_expr_list();
+    let access_path = var_list
+        .iter()
+        .zip(expr_list.iter())
+        .find(|(_, expr)| expr.get_syntax_id() == binary_expr.get_syntax_id())
+        .and_then(|(var, _)| var.get_access_path())?;
+    guarded_assignment_table_arm_range(&LuaExpr::BinaryExpr(binary_expr), &access_path, false)?;
+
+    Some(value.get_range())
 }
 
 /// Range of the table arm of a self-referential guarded bootstrap (`x.y =
@@ -2448,12 +2964,113 @@ fn guarded_table_bootstrap_member_type(
     member_id: LuaMemberId,
     empty_only: bool,
 ) -> Option<LuaType> {
-    let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
-    let root = tree.get_red_root();
-    let index_expr = LuaIndexExpr::cast(member_id.get_syntax_id().to_node_from_root(&root)?)?;
-    let range = guarded_table_assignment_bootstrap_range(&index_expr, empty_only)?;
+    let range = guarded_table_bootstrap_range(db, member_id, empty_only)?;
 
     Some(LuaType::TableConst(InFiled::new(member_id.file_id, range)))
+}
+
+fn guarded_table_bootstrap_range(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+    empty_only: bool,
+) -> Option<rowan::TextRange> {
+    let tree = db.get_vfs().get_syntax_tree(&member_id.file_id)?;
+    let root = tree.get_red_root();
+    guarded_bootstrap_range_for_node(
+        member_id.get_syntax_id().to_node_from_root(&root)?,
+        empty_only,
+    )
+}
+
+/// The one table a repeated `x.y = x.y or {}` guard names.
+///
+/// Every such writer means "reuse it if it is there", so at runtime they are all
+/// the same table and only the first to run creates it. Giving each writer its
+/// own literal instead makes a file that re-guards the namespace read its own
+/// empty table and lose whatever another file attached, so they resolve to the
+/// earliest writer's literal — the one that would have won at runtime.
+/// Re-derives the literal each `x.y = x.y or {}` writer names, now that every
+/// writer of the slot has landed.
+///
+/// The canonical pick is the lowest-sorting writer, so a writer analysed before
+/// its siblings existed either found no canonical at all (fewer than two were
+/// indexed) or picked one that a later, lower-sorting writer displaces. Which of
+/// those happened is a property of the batch, not of the source.
+pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
+    db: &mut DbIndex,
+    candidates: Vec<LuaMemberId>,
+) {
+    // Every writer of one slot resolves to the same canonical literal, so the
+    // pick is made once per slot rather than once per writer.
+    let mut by_slot: FxHashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>> =
+        FxHashMap::default();
+    for member_id in candidates {
+        let member_index = db.get_member_index();
+        let Some(owner) = member_index.get_member_owner(&member_id).cloned() else {
+            continue;
+        };
+        let Some(key) = member_index
+            .get_member(&member_id)
+            .map(|m| m.get_key().clone())
+        else {
+            continue;
+        };
+        by_slot.entry((owner, key)).or_default().push(member_id);
+    }
+
+    let mut slots = by_slot.into_iter().collect::<Vec<_>>();
+    slots.sort_by_key(|((_, _), members)| {
+        members
+            .iter()
+            .map(|member_id| member_id_sort_key(*member_id))
+            .min()
+    });
+
+    for (_, mut members) in slots {
+        members.sort_by_key(|member_id| member_id_sort_key(*member_id));
+        members.dedup();
+        let Some(first) = members.first().copied() else {
+            continue;
+        };
+        let Some(canonical) = canonical_guarded_table_bootstrap_type(db, first) else {
+            continue;
+        };
+        // Every writer of the slot, not only the ones queued as candidates: the
+        // slot holds one table, so a writer left on its own literal forks the
+        // identity again, and whether it was queued depends on how far the walk
+        // had got when it ran.
+        let members =
+            guarded_table_assignment_member_ids_for_owner_key(db, first).unwrap_or(members);
+        for member_id in members {
+            let owner = LuaTypeOwner::Member(member_id);
+            if db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .is_some_and(|cached| cached.is_doc() || cached.as_type() == &canonical)
+            {
+                continue;
+            }
+            write_type_cache(
+                db,
+                owner,
+                LuaTypeCache::InferType(canonical.clone()),
+                TypeCacheWriteMode::ForceOverwrite,
+            );
+        }
+    }
+}
+
+fn canonical_guarded_table_bootstrap_type(
+    db: &crate::DbIndex,
+    member_id: LuaMemberId,
+) -> Option<LuaType> {
+    // The guard is what names the table; a plain reset only points at it.
+    let canonical = guarded_table_assignment_member_ids_for_owner_key(db, member_id)?
+        .into_iter()
+        .filter(|candidate| is_guarded_table_assignment_member(db, *candidate))
+        .min_by_key(|candidate| member_id_sort_key(*candidate))?;
+
+    guarded_table_bootstrap_member_type(db, canonical, false)
 }
 
 fn merge_type_owner_and_unresolve_expr(
@@ -2712,6 +3329,14 @@ fn special_assign_pattern(
                 &expr_type,
                 0,
                 guarded_table_expr,
+                DeclWrite {
+                    position: assign_stat_range.start(),
+                    may_improve_after_resolve: false,
+                    reads_out_of_decl: false,
+                    may_narrow_uninformative: false,
+                    resolved_initializer: false,
+                    fills_own_default: false,
+                },
             );
         }
         Err(_) => return None,
@@ -3153,7 +3778,10 @@ mod tests {
                     )
                     .expect("preserved table-literal cache should stay enabled")
                     .expect("preserved table-literal cache should return a widened type");
-                    assert_eq!(cached_type, LuaType::Table, "unexpected type at member {i}");
+                    assert!(
+                        matches!(cached_type, LuaType::MergedTable(_)),
+                        "unexpected type at member {i}: {cached_type:?}"
+                    );
                     cache_hits += 1;
                 }
 

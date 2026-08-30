@@ -25,7 +25,7 @@ use crate::{
             snapshot_callback_table_type,
         },
         common::{
-            TypeCacheWriteMode, add_member, bind_resolved_type, bind_type,
+            DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_resolved_type,
             holds_unbound_iter_template, write_type_cache,
         },
         lua::{
@@ -163,20 +163,47 @@ pub fn try_resolve_decl(
         return Err(InferFailReason::UnResolveIterTemplate);
     }
 
-    // Narrowing an uninformative decl cache is reserved for a right-hand side
-    // that reads through a call or index: that is the boundary both routes into
-    // this pass enforce before they queue an item
-    // (`should_retry_uninformative_initializer`,
-    // `should_retry_narrowing_decl_assignment`). A write that landed here only
-    // because its right-hand side could not be inferred while its file was
-    // walked arrives without that check, so applying the narrowing policy to it
-    // let any shape overwrite an authoritative `any` — but only in the builds
-    // where the inference happened to fail.
-    if crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr) {
-        bind_resolved_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
-    } else {
-        bind_type(db, decl_id.into(), LuaTypeCache::InferType(expr_type));
-    }
+    // Displacing an uninformative cache is the initializer's privilege: it is
+    // the decl's own value, so it may narrow from any right-hand side whose
+    // answer can still improve. An assignment may only narrow from a call or
+    // index read — the boundary the file walk enforces in
+    // `should_retry_narrowing_decl_assignment` before it queues one. An
+    // assignment that landed here only because its right-hand side could not be
+    // inferred yet arrives without that check, and whether the walk's inference
+    // failed is a property of the batch: once the callee's return resolves, the
+    // same assignment infers cleanly and the walk refuses the narrowing.
+    //
+    // Either way the write goes through the positional claim, so a write that
+    // resolved late can still take the slot back from one that ran ahead of it.
+    let may_improve = crate::compilation::analyzer::initializer_may_improve_after_resolve(&expr);
+    let is_initializer = decl_expr_is_initializer(db, decl_id, &expr);
+    bind_decl_write(
+        db,
+        decl_id,
+        LuaTypeCache::InferType(expr_type),
+        DeclWrite {
+            position: expr.get_position(),
+            may_improve_after_resolve: may_improve,
+            reads_out_of_decl: crate::compilation::analyzer::lua::expr_reads_out_of_decl(
+                db,
+                decl.file_id,
+                decl_id,
+                &expr,
+            ),
+            may_narrow_uninformative: if is_initializer {
+                may_improve
+            } else {
+                crate::compilation::analyzer::initializer_reads_through_call_or_index(&expr)
+            },
+            resolved_initializer: is_initializer && may_improve,
+            fills_own_default: crate::compilation::analyzer::lua::expr_fills_own_default(
+                db,
+                decl.file_id,
+                decl_id,
+                &expr,
+            ),
+        },
+    );
     Ok(())
 }
 
@@ -237,6 +264,17 @@ fn create_deferred_index_expr_member(
         }
     }
     Some(())
+}
+
+/// Whether `expr` is the declaration's own initializer rather than a later
+/// assignment to it.
+fn decl_expr_is_initializer(db: &DbIndex, decl_id: LuaDeclId, expr: &LuaExpr) -> bool {
+    db.get_decl_index()
+        .get_decl(&decl_id)
+        .and_then(|decl| decl.get_initializer())
+        .is_some_and(|initializer| {
+            initializer.get_expr_syntax_id() == glua_parser::LuaSyntaxId::from_node(expr.syntax())
+        })
 }
 
 fn should_defer_guarded_index_alias_resolution(
@@ -671,30 +709,82 @@ fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
     }
 }
 
+/// [`try_resolve_iter_var`] for the settled re-derivation, minus the writes.
+///
+/// The answer is taken against the complete member map, so it replaces whatever
+/// partial one a wave left behind rather than only widening it. The pass runs on
+/// parallel workers against an immutable index and applies the updates it
+/// returns in file order afterwards, so each one pairs a variable's resolved
+/// type with the write-mode decision it earned.
+pub fn resolve_settled_iter_var_readonly(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    iter_exprs: &[LuaExpr],
+    var_positions: &[TextSize],
+) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
+    compute_iter_var_updates(db, cache, file_id, iter_exprs, var_positions, true)
+}
+
 pub fn try_resolve_iter_var(
     db: &mut DbIndex,
     cache: &mut LuaInferCache,
     unresolve_iter_var: &mut UnResolveIterVar,
 ) -> ResolveResult {
-    let iter_var_types =
-        match infer_for_range_iter_expr_func(db, cache, &unresolve_iter_var.iter_exprs) {
-            Ok(types) => types,
-            // Placeholder items have nothing to add on a failed retry: the template
-            // ref is already cached. Keep the failure in this reason's own group
-            // rather than injecting the item into another group's fixpoint.
-            Err(reason) => {
-                return Err(
-                    if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
-                        InferFailReason::UnResolveIterTemplate
-                    } else {
-                        reason
-                    },
-                );
-            }
-        };
-    for (idx, var_name) in unresolve_iter_var.iter_vars.iter().enumerate() {
-        let position = var_name.get_position();
-        let decl_id = LuaDeclId::new(unresolve_iter_var.file_id, position);
+    let var_positions = unresolve_iter_var
+        .iter_vars
+        .iter()
+        .map(LuaAstToken::get_position)
+        .collect::<Vec<_>>();
+    let updates = match compute_iter_var_updates(
+        db,
+        cache,
+        unresolve_iter_var.file_id,
+        &unresolve_iter_var.iter_exprs,
+        &var_positions,
+        false,
+    ) {
+        Ok(updates) => updates,
+        // Placeholder items have nothing to add on a failed retry: the template
+        // ref is already cached. Keep the failure in this reason's own group
+        // rather than injecting the item into another group's fixpoint.
+        Err(reason) => {
+            return Err(
+                if iter_var_holds_tpl_placeholder(db, unresolve_iter_var, 0) {
+                    InferFailReason::UnResolveIterTemplate
+                } else {
+                    reason
+                },
+            );
+        }
+    };
+    for update in updates {
+        write_type_cache(db, update.owner, update.cache, update.mode);
+    }
+    Ok(())
+}
+
+/// A resolved iterator-variable type plus the write-mode decision it earned, so
+/// the settled re-derivation can run the inference read-only on parallel workers
+/// and apply the updates in stable file order.
+pub struct IterVarTypeUpdate {
+    pub(crate) owner: LuaTypeOwner,
+    pub(crate) cache: LuaTypeCache,
+    pub(crate) mode: TypeCacheWriteMode,
+}
+
+fn compute_iter_var_updates(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    file_id: FileId,
+    iter_exprs: &[LuaExpr],
+    var_positions: &[TextSize],
+    settled: bool,
+) -> Result<Vec<IterVarTypeUpdate>, InferFailReason> {
+    let iter_var_types = infer_for_range_iter_expr_func(db, cache, iter_exprs)?;
+    let mut updates = Vec::with_capacity(var_positions.len());
+    for (idx, &position) in var_positions.iter().enumerate() {
+        let decl_id = LuaDeclId::new(file_id, position);
         let ret_type = iter_var_types
             .get_type(idx)
             .cloned()
@@ -702,10 +792,19 @@ pub fn try_resolve_iter_var(
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
 
         let owner: LuaTypeOwner = decl_id.into();
-        let mode = iter_var_write_mode(db.get_type_index().get_type_cache(&owner), &ret_type);
-        write_type_cache(db, owner, LuaTypeCache::InferType(ret_type), mode);
+        let cached = db.get_type_index().get_type_cache(&owner);
+        let mode = if settled {
+            settled_iter_var_write_mode(cached, &ret_type)
+        } else {
+            iter_var_write_mode(cached, &ret_type)
+        };
+        updates.push(IterVarTypeUpdate {
+            owner,
+            cache: LuaTypeCache::InferType(ret_type),
+            mode,
+        });
     }
-    Ok(())
+    Ok(updates)
 }
 
 /// The write mode for a settled iterator-variable type.
@@ -715,6 +814,27 @@ pub fn try_resolve_iter_var(
 /// contains everything the cache holds. A documented type is an authority
 /// decision — `---@param` is legal on a `for ... in` variable — so it is never
 /// overwritten; anything else keeps insert-only precedence.
+/// Write mode for the settled re-derivation.
+///
+/// [`iter_var_write_mode`] only accepts an answer that widens the cached one,
+/// and what is cached is whatever the wave reached — a property of how far the
+/// batch had got. Here the answer was taken against the complete member map, so
+/// it replaces the cached one outright. The one thing it may not do is put a raw
+/// template ref back over a resolved type: an unbound generic is a placeholder,
+/// not an answer.
+fn settled_iter_var_write_mode(
+    cached: Option<&LuaTypeCache>,
+    settled: &LuaType,
+) -> TypeCacheWriteMode {
+    let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
+        return TypeCacheWriteMode::InsertOnly;
+    };
+    if settled.contain_tpl() && !cached.as_type().contain_tpl() {
+        return TypeCacheWriteMode::InsertOnly;
+    }
+    TypeCacheWriteMode::ForceOverwrite
+}
+
 fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> TypeCacheWriteMode {
     let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
         return TypeCacheWriteMode::InsertOnly;

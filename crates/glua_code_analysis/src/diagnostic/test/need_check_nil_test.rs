@@ -14533,4 +14533,138 @@ mod test {
         assert_that!(diagnostics.len(), eq(1_usize));
         assert_that!(diagnostics[0].range.start.line, eq(19_u32));
     }
+
+    /// A truthiness test excludes `nil` *and* `false`, so it can never narrow
+    /// less than `~= nil` does. An undeclared field resolves to `unknown?`, and
+    /// that was the one shape where it did.
+    #[test]
+    fn truthiness_guard_narrows_an_unknown_typed_field() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hFire
+            ---@param h hFire
+            local function fires(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    /// The report's own controls: `~= nil`, a cached local, and a declared
+    /// nilable field all narrow the same field, and none of them may start
+    /// reporting when the bare truthiness form stops.
+    #[test]
+    fn nil_guard_controls_on_an_unknown_typed_field_stay_clean() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hC1
+            ---@param h hC1
+            local function c1(h)
+                if h.snd ~= nil then h.snd:Stop() end
+            end
+
+            ---@class hC2
+            ---@param h hC2
+            local function c2(h)
+                local s = h.snd
+                if s then s:Stop() end
+            end
+
+            ---@class hC3
+            ---@field snd snd_obj?
+            ---@param h hC3
+            local function c3(h)
+                if h.snd then h.snd:Stop() end
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics, is_empty());
+    }
+
+    /// An unguarded access still reports, so the guard above is doing the work
+    /// rather than the check having been switched off for unknown fields.
+    #[test]
+    fn unguarded_unknown_typed_field_access_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::UncheckedNilAccess,
+            r#"
+            ---@class snd_obj
+            ---@field Stop fun(self: snd_obj)
+
+            ---@class hBare
+            ---@param h hBare
+            local function bare(h)
+                h.snd:Stop()
+            end
+            "#,
+        );
+
+        assert_that!(diagnostics.len(), eq(1_usize));
+    }
+
+    /// A truthiness guard stops proving anything once the body puts a nil back,
+    /// and that is true of a `while` condition and an `elseif` exactly as it is
+    /// of an `if` — the body runs the same statements in the same order.
+    #[test]
+    fn truthiness_guard_stops_at_a_reassignment_in_every_arm() {
+        for arm in [
+            "if h.snd then",
+            "while h.snd do",
+            "if flag then\nelseif h.snd then",
+        ] {
+            let mut ws = VirtualWorkspace::new_with_init_std_lib();
+            let diagnostics = diagnostics_for_code(
+                &mut ws,
+                DiagnosticCode::NeedCheckNil,
+                &format!(
+                    r#"
+                    ---@class Snd
+                    ---@field Stop fun(self: Snd)
+
+                    ---@class SndHolder
+                    ---@field snd Snd?
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    ---@return Snd?
+                    local function maybe(h, flag) return h.snd end
+
+                    ---@param h SndHolder
+                    ---@param flag boolean
+                    local function play(h, flag)
+                        {arm}
+                            h.snd = maybe(h, flag)
+                            h.snd:Stop()
+                        end
+                    end
+                    "#
+                ),
+            );
+            assert_eq!(
+                diagnostics.len(),
+                1,
+                "reassignment before the access voids the guard in `{arm}`: {diagnostics:?}"
+            );
+        }
+    }
 }

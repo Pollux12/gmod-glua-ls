@@ -13,8 +13,8 @@ mod test {
         DbIndex, FileId, InFiled, LuaDeclId, LuaDeclLocation, LuaDefinitionId,
         LuaInferenceConfidence, LuaInferenceEventId, LuaInferenceNodeId,
         LuaInferenceProvenanceKind, LuaInferenceStep, LuaSignatureId, LuaType, LuaTypeCache,
-        LuaTypeDecl,
-        LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner, resolve_alias_type,
+        LuaTypeDecl, LuaTypeDeclId, LuaTypeFact, LuaTypeFactMetadata, LuaTypeOwner,
+        resolve_alias_type,
     };
 
     fn create_type_index() -> LuaTypeIndex {
@@ -359,7 +359,10 @@ mod test {
         let provider_id = LuaTypeDeclId::global("ProviderType");
 
         let mut index = LuaTypeIndex::new();
-        index.add_type_decl(provider, class_decl(provider, "SharedType", shared_id.clone()));
+        index.add_type_decl(
+            provider,
+            class_decl(provider, "SharedType", shared_id.clone()),
+        );
         index.add_type_decl_location(contributor, &shared_id, decl_location(contributor));
         index.add_type_decl(
             provider,

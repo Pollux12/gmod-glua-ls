@@ -13,6 +13,7 @@ use crate::{
     },
 };
 
+use super::super::infer::global_expr_access_path;
 use super::{
     SemanticDeclLevel, infer_expr, infer_token_semantic_decl, semantic_guard::SemanticDeclGuard,
 };
@@ -252,7 +253,7 @@ fn infer_index_expr_semantic_decl(
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return Ok(None);
     };
-    let prefix_type = match infer_expr(db, cache, prefix_expr) {
+    let prefix_type = match infer_expr(db, cache, prefix_expr.clone()) {
         Ok(typ) => typ,
         Err(reason) => return terminal(reason),
     };
@@ -266,13 +267,53 @@ fn infer_index_expr_semantic_decl(
     let Some(next_guard) = semantic_guard.next_level() else {
         return Ok(None);
     };
-    infer_member_semantic_decl_by_member_key(
+    let resolved = infer_member_semantic_decl_by_member_key(
         db,
         cache,
         &prefix_type,
         &member_key,
         Some(index_expr.get_position()),
         next_guard,
+    )?;
+    if resolved.is_some() {
+        return Ok(resolved);
+    }
+
+    // A global-rooted chain whose link carries no members of its own — e.g. a
+    // guarded `x.y = x.y or {}` bootstrap whose slot resolves to the empty
+    // bootstrap literal — keeps its accumulated members in the member index
+    // under the global path owner. The type-level route falls back to that
+    // owner (`infer_global_path_member`); the semantic-decl route must too, or
+    // receiver and declaration resolution through such chains silently miss.
+    if is_shapeless_prefix_type(&prefix_type)
+        && let Some(owner_path) = global_expr_access_path(db, cache.get_file_id(), &prefix_expr)
+    {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&owner_path));
+        if let Some(member_item) = db.get_member_index().get_member_item(&owner, &member_key)
+            && let Some(decl) = member_item.resolve_semantic_decl_with_realm_at_offset(
+                db,
+                &cache.get_file_id(),
+                index_expr.get_position(),
+            )
+        {
+            return Ok(Some(decl));
+        }
+    }
+    Ok(None)
+}
+
+/// Prefix types whose miss is not evidence of absence: they either carry no
+/// member shape at all, or (a table literal) carry one that a bootstrap link
+/// left empty while the accumulated members live under the global path owner.
+fn is_shapeless_prefix_type(prefix_type: &LuaType) -> bool {
+    matches!(
+        prefix_type,
+        LuaType::Table
+            | LuaType::TableConst(_)
+            | LuaType::Unknown
+            | LuaType::Any
+            | LuaType::Nil
+            | LuaType::Global
     )
 }
 

@@ -4527,4 +4527,96 @@ mod test {
             "inferred dynamic key field values should respect inferred mismatch diagnostics policy: {diagnostics:?}"
         );
     }
+
+    /// The same runtime write also reached table compatibility, which reported
+    /// the literal as missing a member the class never declared.
+    #[test]
+    fn undeclared_field_written_to_a_container_element_is_not_expected_of_a_literal() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@class Fires
+            ---@field ID string
+
+            ---@type table<string, Fires>
+            local storeF = {}
+
+            ---@param t Fires
+            local function makeF(t) return t.ID end
+
+            makeF({ ID = "a" })
+            for _, v in pairs(storeF) do v.X = 5 end
+            "#,
+        ));
+    }
+    /// An unannotated recursive function reaches its return type through its
+    /// base case, so `((1,2)|unknown)` must not leave the first value typed as
+    /// the whole union when it spreads into an argument list.
+    #[test]
+    fn recursive_multi_return_spreads_into_an_argument_list() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            ---@param x number
+            ---@param y number
+            local function takesTwo(x, y) end
+
+            local function r2(n)
+                if n and n > 0 then return r2(n - 1) end
+                return 1, 2
+            end
+
+            takesTwo(r2(5))
+            "#,
+        ));
+    }
+
+    /// `if a.x ~= nil` on an untyped container narrows the field to `never`,
+    /// because the flow antecedent for a field it cannot resolve is `nil`. The
+    /// branch is not actually unreachable, so nothing may be reported against a
+    /// value inside it - and a runtime `TypeGuard` cannot recover one either,
+    /// since `never & T` is `never`.
+    #[test]
+    fn neq_nil_on_an_untyped_container_field_reports_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::ParamTypeMismatch,
+            r#"
+            local function base(a)
+                if a.x ~= nil then math.max(0, a.x) end
+            end
+            "#,
+        ));
+    }
+
+    /// A `never` *member* is a declared shape contradicting itself
+    /// (`integer & string`), which is a real defect and keeps reporting.
+    #[test]
+    fn contradictory_intersection_member_still_reports() {
+        let mut ws = VirtualWorkspace::new();
+
+        assert!(!ws.check_code_for_namespace(
+            DiagnosticCode::AssignTypeMismatch,
+            r#"
+            ---@class NevA
+            ---@field y integer
+
+            ---@class NevB
+            ---@field y string
+
+            local c ---@type NevA & NevB
+
+            ---@class NevC
+            ---@field y integer
+
+            ---@type NevC
+            _ = c
+            "#
+        ));
+    }
 }

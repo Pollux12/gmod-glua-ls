@@ -321,7 +321,6 @@ impl CallSiteParamIndex {
         }
         out
     }
-
     /// Every call-site-inferred parameter type currently indexed.
     pub fn iter_inferred_params(
         &self,

@@ -35,6 +35,17 @@ fn is_structural_method_member(feature: Option<LuaMemberFeature>) -> bool {
     feature.is_some_and(|feature| feature.is_method_decl())
 }
 
+/// A member that exists only because something assigned to it is an addition to
+/// a value, not part of what the type requires a literal to supply.
+fn is_assignment_added_member(db: &DbIndex, property_owner_id: Option<&LuaSemanticDeclId>) -> bool {
+    let Some(LuaSemanticDeclId::Member(member_id)) = property_owner_id else {
+        return false;
+    };
+    db.get_member_index()
+        .get_member(member_id)
+        .is_some_and(crate::LuaMember::is_assignment_define)
+}
+
 // A documented default makes a member optional for presence only.
 fn member_has_documented_default(
     db: &DbIndex,
@@ -106,6 +117,25 @@ fn check_general_type_compact(
     check_guard: TypeCheckGuard,
 ) -> TypeCheckResult {
     if is_like_any(compact_type) {
+        return Ok(());
+    }
+
+    // `never` is the bottom of the lattice: it holds no values, so there is no
+    // value it could fail to be. It is what narrowing produces where the
+    // analyzer's own picture is contradictory — `if a.x ~= nil` on a field it
+    // could only see as `nil` — and reporting a type error against code we
+    // believe unreachable says nothing about the source. Nor can a runtime
+    // guard recover it, since `never & T` is `never`.
+    //
+    // Only the value the caller asked about. A `never` *member* is a declared
+    // shape that contradicts itself (`integer & string`), which is worth
+    // reporting on its own merits.
+    //
+    // And only where the answer becomes a message. Inference asks the same
+    // question to *decide* things — which way a guard narrows, which member a
+    // `t[k]` read resolves to, how a generic binds — and there "no value can
+    // fail this" would read as "`never` matches anything".
+    if context.detail && compact_type.is_never() && check_guard.is_top_level() {
         return Ok(());
     }
 

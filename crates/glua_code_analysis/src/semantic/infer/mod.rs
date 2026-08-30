@@ -23,6 +23,7 @@ pub(crate) use infer_call::signature_call_selects_declared_overload;
 pub use infer_doc_type::{DocTypeInferContext, infer_doc_type};
 pub use infer_fail_reason::InferFailReason;
 pub(crate) use infer_index::check_iter_var_range;
+pub(crate) use infer_index::global_expr_access_path;
 pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
 pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
@@ -342,6 +343,51 @@ where
                             }
                         }
                     }
+                }
+
+                break;
+            }
+            // A union that carries a multi-return still spreads, slot by
+            // slot. An `unknown` arm - what an unannotated recursive function
+            // leaves behind, since its own return cannot inform itself - says
+            // nothing about arity or about any slot, so the informative arms
+            // decide both.
+            LuaType::Union(ref union)
+                if union.types().any(|typ| matches!(typ, LuaType::Variadic(_))) =>
+            {
+                let arms = union
+                    .types()
+                    .filter_map(|typ| match typ {
+                        LuaType::Variadic(variadic) => Some(variadic.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>();
+                // A `Base` arm answers every slot, so its arity bounds nothing.
+                // That is only safe while the caller has asked for a fixed
+                // number of values; with no arity to fill it contributes one
+                // value, exactly as a bare `Variadic` does.
+                let slots = arms
+                    .iter()
+                    .map(|variadic| match variadic.deref() {
+                        VariadicType::Multi(types) => types.len(),
+                        VariadicType::Base(_) if var_count.is_some() => usize::MAX,
+                        VariadicType::Base(_) => 1,
+                    })
+                    .max()
+                    .unwrap_or(0);
+                let wanted = match var_count {
+                    Some(var_count) => var_count.saturating_sub(value_types.len()),
+                    None => slots,
+                };
+                for slot in 0..wanted.min(slots) {
+                    let slot_type = arms
+                        .iter()
+                        .filter_map(|variadic| variadic.get_type(slot).cloned())
+                        .reduce(|left, right| crate::TypeOps::Union.apply(db, &left, &right));
+                    let Some(slot_type) = slot_type else {
+                        break;
+                    };
+                    value_types.push((slot_type, expr.get_range()));
                 }
 
                 break;

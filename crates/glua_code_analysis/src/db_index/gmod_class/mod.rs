@@ -327,6 +327,16 @@ pub struct GmodClassMetadataIndex {
     vgui_forwarding_parents: HashMap<(LuaTypeDeclId, String), Vec<LuaTypeDeclId>>,
     vgui_panel_parent_chains: HashMap<LuaTypeDeclId, Vec<LuaTypeDeclId>>,
     incomplete_vgui_panel_parent_chains: HashSet<LuaTypeDeclId>,
+    /// Children whose parent relations came from a file that has been removed
+    /// from the index but not yet re-analysed.
+    ///
+    /// A batch removes every file up front and re-analyses them group by group,
+    /// so between those two points the relation set is missing evidence it will
+    /// get back. A chain must stay incomplete while any of its contributing
+    /// files is in that window: deriving completeness from the partial set let
+    /// a conflicting creation site vanish transiently, and inference that ran
+    /// in the gap kept the answer the full relation set contradicts.
+    pending_vgui_parent_relation_files: HashMap<FileId, Vec<LuaTypeDeclId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -351,6 +361,7 @@ impl GmodClassMetadataIndex {
             vgui_forwarding_parents: HashMap::new(),
             vgui_panel_parent_chains: HashMap::new(),
             incomplete_vgui_panel_parent_chains: HashSet::new(),
+            pending_vgui_parent_relation_files: HashMap::new(),
         }
     }
 
@@ -742,11 +753,40 @@ impl GmodClassMetadataIndex {
                 }
             }
         }
+        // A removed-but-not-reanalysed file's relations are evidence in
+        // transit, not evidence gone: its children stay incomplete until the
+        // file's re-analysis puts its relations back (or its deletion is
+        // confirmed and the mark is cleared).
+        for children in self.pending_vgui_parent_relation_files.values() {
+            incomplete.extend(children.iter().cloned());
+        }
         for type_id in &incomplete {
             parent_chains.remove(type_id);
         }
         self.vgui_panel_parent_chains = parent_chains;
         self.incomplete_vgui_panel_parent_chains = incomplete;
+    }
+
+    /// Clears the removed-file marks for files whose parent relations have been
+    /// re-derived (or that no longer exist), so their children's chains can
+    /// settle again. Callers must recompute the chains afterwards; both call
+    /// sites do so via [`Self::set_vgui_parent_relations`].
+    pub fn clear_pending_vgui_parent_relation_files(&mut self, file_ids: &[FileId]) {
+        for file_id in file_ids {
+            self.pending_vgui_parent_relation_files.remove(file_id);
+        }
+    }
+
+    /// The files whose removal is still holding their children's chains
+    /// incomplete.
+    pub fn pending_vgui_parent_relation_file_ids(&self) -> Vec<FileId> {
+        let mut file_ids = self
+            .pending_vgui_parent_relation_files
+            .keys()
+            .copied()
+            .collect::<Vec<_>>();
+        file_ids.sort_by_key(|file_id| file_id.id);
+        file_ids
     }
 
     pub fn get_file_metadata(&self, file_id: &FileId) -> Option<&GmodScriptedClassFileMetadata> {
@@ -840,7 +880,21 @@ impl LuaIndex for GmodClassMetadataIndex {
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
         for &file_id in file_ids {
-            self.file_metadata.remove(&file_id);
+            let Some(metadata) = self.file_metadata.remove(&file_id) else {
+                continue;
+            };
+            let mut children = metadata
+                .vgui_parent_calls
+                .iter()
+                .flat_map(|call| &call.relations)
+                .map(|relation| relation.child_type_id.clone())
+                .collect::<Vec<_>>();
+            children.sort_by(|left, right| left.get_name().cmp(right.get_name()));
+            children.dedup();
+            if !children.is_empty() {
+                self.pending_vgui_parent_relation_files
+                    .insert(file_id, children);
+            }
         }
         self.recompute_derived_caches();
     }
@@ -852,6 +906,7 @@ impl LuaIndex for GmodClassMetadataIndex {
         self.vgui_forwarding_parents.clear();
         self.vgui_panel_parent_chains.clear();
         self.incomplete_vgui_panel_parent_chains.clear();
+        self.pending_vgui_parent_relation_files.clear();
     }
 }
 
@@ -1030,5 +1085,69 @@ mod tests {
         assert_eq!(index.file_metadata, expected.file_metadata);
         assert_eq!(index.vgui_panels, expected.vgui_panels);
         assert_eq!(index.derma_skins, expected.derma_skins);
+    }
+
+    fn parent_call(
+        start: u32,
+        child: &str,
+        parent: &str,
+        complete: bool,
+    ) -> super::GmodVguiParentCallMetadata {
+        super::GmodVguiParentCallMetadata {
+            syntax_id: LuaSyntaxId::new(LuaSyntaxKind::CallExpr.into(), range(start)),
+            child: super::GmodVguiParentSource::LiteralName(child.to_string()),
+            parent: super::GmodVguiParentSource::LiteralName(parent.to_string()),
+            relations: vec![super::GmodVguiParentRelation {
+                child_type_id: crate::LuaTypeDeclId::global(child),
+                parent_chain: if complete {
+                    vec![crate::LuaTypeDeclId::global(parent)]
+                } else {
+                    Vec::new()
+                },
+                parent_chain_complete: complete,
+            }],
+            origin: super::GmodVguiParentCallOrigin::Annotated,
+            resolved_source: None,
+        }
+    }
+
+    #[test]
+    fn removed_relation_file_keeps_child_chain_incomplete_until_cleared() {
+        let mut index = GmodClassMetadataIndex::new();
+        let agreeing_file = FileId::new(1);
+        let conflicting_file = FileId::new(2);
+        let child = crate::LuaTypeDeclId::global("ChildPanel");
+
+        index.add_vgui_parent_call(
+            agreeing_file,
+            parent_call(10, "ChildPanel", "ParentA", true),
+        );
+        index.add_vgui_parent_call(
+            conflicting_file,
+            parent_call(20, "ChildPanel", "ParentB", true),
+        );
+        index.set_vgui_parent_relations(Vec::new());
+        assert!(!index.vgui_panel_parent_chain_is_complete(&child));
+
+        // Removing the conflicting creation site for a re-index must not let
+        // the surviving relation settle the chain: the removed file's evidence
+        // is in transit, not gone.
+        index.remove(conflicting_file);
+        assert!(!index.vgui_panel_parent_chain_is_complete(&child));
+        assert!(index.get_vgui_panel_parent_chain(&child).is_none());
+        assert_eq!(
+            index.pending_vgui_parent_relation_file_ids(),
+            vec![conflicting_file]
+        );
+
+        // Once the file's relations are re-derived (here: it genuinely lost its
+        // call), the surviving relation may settle the chain again.
+        index.clear_pending_vgui_parent_relation_files(&[conflicting_file]);
+        index.set_vgui_parent_relations(Vec::new());
+        assert!(index.vgui_panel_parent_chain_is_complete(&child));
+        assert_eq!(
+            index.get_vgui_panel_parent_chain(&child),
+            Some(&[crate::LuaTypeDeclId::global("ParentA")][..])
+        );
     }
 }

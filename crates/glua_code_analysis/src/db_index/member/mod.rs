@@ -48,6 +48,12 @@ pub struct LuaMemberIndex {
     /// Per file, each `if` branch's range paired with the range of the `if` it
     /// belongs to, sorted by branch start. Recorded on the decl walk.
     conditional_branch_ranges: HashMap<FileId, Vec<(TextRange, TextRange)>>,
+    /// Members `add_member_alias_to_owner` pushed into a slot, by slot. The
+    /// alias never displaces, while the insert path collapses to the latest
+    /// writer, so which of the two ran last decides the visible set -- and that
+    /// is a property of the batch. Kept so the slot can be settled once both are
+    /// done.
+    alias_contributed_slots: HashMap<(LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>>,
     member_function_scope_ranges: HashMap<LuaMemberId, TextRange>,
     /// Per-writer evidence for the member assignment widening merge. See
     /// [`MemberAssignmentContribution`].
@@ -94,6 +100,7 @@ impl LuaMemberIndex {
             deferred_index_expr_members: HashSet::default(),
             function_scope_ranges: HashMap::default(),
             conditional_branch_ranges: HashMap::default(),
+            alias_contributed_slots: HashMap::default(),
             member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
         }
@@ -297,10 +304,21 @@ impl LuaMemberIndex {
                 // one win this slot -- or evicting one -- would make the outcome
                 // depend on whether the owner's own write or the alias arrived
                 // first, which is a property of the batch, not of the source.
-                let (aliased, owned): (Vec<_>, Vec<_>) = old_member_ids
-                    .iter()
-                    .copied()
-                    .partition(|old_id| self.member_current_owner.get(old_id) != Some(owner));
+                //
+                // An assignment file-define keeps its place for the same
+                // reason: `should_preserve_assignment_file_define_member`
+                // accumulated it deliberately, and the removal list below
+                // already refuses to evict one. Collapsing the slot to a single
+                // "latest defined" writer here would undo that — and only when
+                // the other kind of member happens to arrive second, which is
+                // how far the batch has run rather than anything about the
+                // source. A re-index of one file dropped 35 writers of
+                // `ply._Food.amount` this way.
+                let (aliased, owned): (Vec<_>, Vec<_>) =
+                    old_member_ids.iter().copied().partition(|old_id| {
+                        self.member_current_owner.get(old_id) != Some(owner)
+                            || self.is_assignment_file_define_member(*old_id)
+                    });
                 let winner = latest_defined_member(&owned, id);
                 let mut visible = aliased;
                 visible.push(winner);
@@ -453,12 +471,27 @@ impl LuaMemberIndex {
 
     /// Re-resolves the slot `member_id` writes to, now that it is known to
     /// be a conditional-branch write.
-    fn resolve_conditional_branch_owner_key_item(&mut self, member_id: LuaMemberId) -> Option<()> {
+    ///
+    /// `may_open_slot` decides whether the write is allowed to give the owner a
+    /// key it does not already hold.
+    fn resolve_conditional_branch_owner_key_item(
+        &mut self,
+        member_id: LuaMemberId,
+        may_open_slot: bool,
+    ) -> Option<()> {
         let owner = self.member_current_owner.get(&member_id)?.clone();
         if matches!(owner, LuaMemberOwner::GlobalPath(_)) {
             return None;
         }
         let key = self.get_member(&member_id)?.get_key().clone();
+        if !may_open_slot
+            && self
+                .owner_members
+                .get(&owner)
+                .is_none_or(|members| members.get_member(&key).is_none())
+        {
+            return None;
+        }
         let candidates = self
             .get_current_owner_members_for_key(&owner, &key)
             .into_iter()
@@ -477,6 +510,26 @@ impl LuaMemberIndex {
             owner_members.add_member(key, item);
         }
         Some(())
+    }
+
+    /// Re-resolves every conditional-branch slot once the batch has finished, so
+    /// each is settled against the full writer set rather than the part of it
+    /// that had landed when the slot was first classified. A write that homes
+    /// its owner forward-only (a `set_owner_only` prefix onto a concrete class)
+    /// joins the slot's history after the walk that classified it, so the first
+    /// resolution cannot see it; re-running here folds it in, and the resolution
+    /// is a pure function of the writer set, so a slot with nothing new to add
+    /// settles to the item it already held.
+    pub fn settle_conditional_branch_slots(&mut self) {
+        let mut members = self
+            .conditional_branch_assignment_members
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        members.sort_by_key(|id| member_id_sort_key(*id));
+        for member_id in members {
+            self.resolve_conditional_branch_owner_key_item(member_id, false);
+        }
     }
 
     fn apply_member_insert_action(
@@ -574,6 +627,10 @@ impl LuaMemberIndex {
             self.add_member_to_owner_key_history_index(owner.clone(), id);
         }
 
+        self.alias_contributed_slots
+            .entry((owner.clone(), key.clone()))
+            .or_default()
+            .push(id);
         let owner_members = self
             .owner_members
             .entry(owner.clone())
@@ -602,12 +659,13 @@ impl LuaMemberIndex {
         };
         let key = member.get_key();
 
-        let is_indexed = |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
-            index
-                .get(owner)
-                .and_then(|members_by_key| members_by_key.get(key))
-                .is_some_and(|member_ids| member_ids.contains(&id))
-        };
+        let is_indexed =
+            |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
+                index
+                    .get(owner)
+                    .and_then(|members_by_key| members_by_key.get(key))
+                    .is_some_and(|member_ids| member_ids.contains(&id))
+            };
         if self.member_current_owner.get(&id) != Some(owner)
             && !(is_indexed(&self.member_owner_key_index)
                 && is_indexed(&self.member_owner_key_history_index))
@@ -962,6 +1020,41 @@ impl LuaMemberIndex {
         global_ids
     }
 
+    /// Every table-literal range in `file_id` that currently owns a member.
+    ///
+    /// Used when the file is removed: its literals are all gone, and members
+    /// other files own on them are not reachable from any file the removal
+    /// sweep visits.
+    pub fn element_owner_ranges_in_file(&self, file_id: FileId) -> Vec<crate::InFiled<TextRange>> {
+        let mut ranges: Vec<crate::InFiled<TextRange>> = self
+            .owner_members
+            .keys()
+            .filter_map(|owner| match owner {
+                LuaMemberOwner::Element(range) if range.file_id == file_id => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        ranges.sort_unstable_by_key(|range| (range.value.start(), range.value.end()));
+        ranges
+    }
+
+    /// Every table-literal range that currently owns at least one member.
+    #[cfg(test)]
+    pub(crate) fn element_owner_ranges(&self) -> Vec<crate::InFiled<TextRange>> {
+        let mut ranges: Vec<crate::InFiled<TextRange>> = self
+            .owner_members
+            .iter()
+            .filter(|(_, members)| !members.is_empty())
+            .filter_map(|(owner, _)| match owner {
+                LuaMemberOwner::Element(range) => Some(range.clone()),
+                _ => None,
+            })
+            .collect();
+        ranges
+            .sort_unstable_by_key(|range| (range.file_id, range.value.start(), range.value.end()));
+        ranges
+    }
+
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
         let owner_members = self.owner_members.get(owner)?;
         if owner_members.get_member_len() == 0 {
@@ -1130,6 +1223,24 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Whether `id` is still present in `owner`'s visible owner-key index.
+    ///
+    /// An in-batch sibling's re-walk can prune a settled out-of-batch member
+    /// from the slot (`retain_only_member_for_owner_key` collapses to the
+    /// latest writer it can see); ownership survives that, reachability does
+    /// not, and the reconcile passes use this to tell the two apart.
+    pub fn member_reachable_for_owner_key(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+        id: LuaMemberId,
+    ) -> bool {
+        self.member_owner_key_index
+            .get(owner)
+            .and_then(|owner_items| owner_items.get(key))
+            .is_some_and(|member_ids| member_ids.contains(&id))
+    }
+
     pub fn get_members_for_owner_key(
         &self,
         owner: &LuaMemberOwner,
@@ -1233,6 +1344,74 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Re-derives the visible set of every slot an alias pushed into, from the
+    /// ownership those writes finally settled on.
+    ///
+    /// `add_member_alias_to_owner` never displaces what it finds, while the
+    /// insert path collapses a slot to its latest writer as each write arrives.
+    /// Which ran last is a property of how the batch was composed, so a slot
+    /// both touched has to be re-derived once they are done -- from the same
+    /// rules the insert path uses, over the same members.
+    pub fn settle_alias_contributed_slots(&mut self) {
+        let contributed = std::mem::take(&mut self.alias_contributed_slots);
+        for ((owner, key), aliased_ids) in contributed {
+            let Some(item) = self
+                .owner_members
+                .get(&owner)
+                .and_then(|owner_members| owner_members.get_member(&key))
+            else {
+                continue;
+            };
+            let mut live = member_ids_from_item(item);
+            for id in aliased_ids {
+                if !live.contains(&id) {
+                    live.push(id);
+                }
+            }
+            live.retain(|id| self.members.contains_key(id));
+            if live.len() < 2
+                || !live
+                    .iter()
+                    .all(|id| self.is_assignment_file_define_member(*id))
+            {
+                continue;
+            }
+            if live
+                .iter()
+                .all(|id| self.non_overwriting_assignment_members.contains(id))
+            {
+                continue;
+            }
+            let (aliased, owned): (Vec<_>, Vec<_>) = live
+                .iter()
+                .copied()
+                .partition(|id| self.member_current_owner.get(id) != Some(&owner));
+            let Some(&first_owned) = owned.first() else {
+                continue;
+            };
+            // A conditional-branch slot keeps one writer per branch; every other
+            // slot keeps the latest. Both read only the candidate set, which is
+            // what makes the answer independent of arrival order.
+            let mut visible = aliased;
+            match self.conditional_branch_item(&owned) {
+                Some(item) => visible.extend(member_ids_from_item(&item)),
+                None => visible.push(latest_defined_member(&owned, first_owned)),
+            }
+            visible.sort_by_key(|id| member_id_sort_key(*id));
+            visible.dedup();
+            let item = match visible.as_slice() {
+                [only] => LuaMemberIndexItem::One(*only),
+                _ => LuaMemberIndexItem::Many(visible),
+            };
+            let Some(owner_members) = self.owner_members.get_mut(&owner) else {
+                continue;
+            };
+            if owner_members.get_member(&key) != Some(&item) {
+                owner_members.add_member(key, item);
+            }
+        }
+    }
+
     pub fn add_conditional_branch_range(
         &mut self,
         file_id: FileId,
@@ -1309,10 +1488,19 @@ impl LuaMemberIndex {
         self.non_overwriting_assignment_members.contains(&member_id)
     }
 
-    pub fn mark_conditional_branch_assignment_member(&mut self, member_id: LuaMemberId) {
+    pub fn is_conditional_branch_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        self.conditional_branch_assignment_members
+            .contains(&member_id)
+    }
+
+    pub fn mark_conditional_branch_assignment_member(
+        &mut self,
+        member_id: LuaMemberId,
+        may_open_owner_slot: bool,
+    ) {
         self.non_overwriting_assignment_members.insert(member_id);
         self.conditional_branch_assignment_members.insert(member_id);
-        self.resolve_conditional_branch_owner_key_item(member_id);
+        self.resolve_conditional_branch_owner_key_item(member_id, may_open_owner_slot);
     }
 
     pub fn get_current_owner_members_for_key(
@@ -1508,6 +1696,35 @@ fn sorted_member_pair(first: LuaMemberId, second: LuaMemberId) -> Vec<LuaMemberI
 }
 
 impl LuaMemberIndex {
+    /// Drops every trace of one member.
+    ///
+    /// The single place that knows the full set of side tables a member
+    /// appears in. Removal paths call this rather than listing the tables
+    /// themselves, so a new table cannot be added to the index and forgotten
+    /// by one path but not the other.
+    fn forget_member(&mut self, member_id: LuaMemberId) {
+        if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
+            self.remove_member_from_all_owner_key_indexes(&owner, member_id);
+            self.remove_current_owner_member(&owner, member_id);
+            self.remove_current_member_key(member_id);
+        }
+        self.members.remove(&member_id);
+        self.member_current_owner.remove(&member_id);
+        self.non_overwriting_assignment_members.remove(&member_id);
+        self.conditional_branch_assignment_members
+            .remove(&member_id);
+        self.synthesized_owner_members.remove(&member_id);
+        self.deferred_index_expr_members.remove(&member_id);
+        self.member_function_scope_ranges.remove(&member_id);
+        self.assignment_contributions.remove_member(member_id);
+        if let Some(set) = self.in_filed.get_mut(&member_id.file_id) {
+            set.remove(&MemberOrOwner::Member(member_id));
+            if set.is_empty() {
+                self.in_filed.remove(&member_id.file_id);
+            }
+        }
+    }
+
     /// The per-file half of removal: erase every entry keyed or owned by
     /// `file_id`. The whole-index owner-key sweeps are done once per batch in
     /// `remove_files`, not here — running them per file made removal cost
@@ -1517,21 +1734,7 @@ impl LuaMemberIndex {
             let mut owners = HashSet::default();
             for member_id_or_owner in member_ids {
                 match member_id_or_owner {
-                    MemberOrOwner::Member(member_id) => {
-                        if let Some(owner) = self.member_current_owner.get(&member_id).cloned() {
-                            self.remove_member_from_all_owner_key_indexes(&owner, member_id);
-                            self.remove_current_owner_member(&owner, member_id);
-                            self.remove_current_member_key(member_id);
-                        }
-                        self.members.remove(&member_id);
-                        self.member_current_owner.remove(&member_id);
-                        self.non_overwriting_assignment_members.remove(&member_id);
-                        self.conditional_branch_assignment_members
-                            .remove(&member_id);
-                        self.synthesized_owner_members.remove(&member_id);
-                        self.deferred_index_expr_members.remove(&member_id);
-                        self.member_function_scope_ranges.remove(&member_id);
-                    }
+                    MemberOrOwner::Member(member_id) => self.forget_member(member_id),
                     MemberOrOwner::Owner(owner) => {
                         owners.insert(owner);
                     }
@@ -1575,6 +1778,141 @@ impl LuaMemberIndex {
         self.function_scope_ranges.remove(&file_id);
         self.conditional_branch_ranges.remove(&file_id);
     }
+
+    /// Drops an owner entry from every file that registered it.
+    ///
+    /// `set_member_owner` files it under the contributing member's file, so a
+    /// single Element owner can be registered by several files at once.
+    fn remove_owner_from_all_files(&mut self, owner: &LuaMemberOwner) {
+        let entry = MemberOrOwner::Owner(owner.clone());
+        self.in_filed.retain(|_, set| {
+            set.remove(&entry);
+            !set.is_empty()
+        });
+    }
+
+    pub fn remap_elements(
+        &mut self,
+        map: &rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>>,
+    ) {
+        if map.is_empty() {
+            return;
+        }
+        // Driven off the map rather than a scan of every member in the
+        // workspace: `owner_members` already indexes members by owner, and the
+        // map holds only the literals one edited file shifted.
+        // Applied in a fixed order. Where one literal moves onto the range
+        // another is vacating, the resulting state depends on which move ran
+        // first, and hash-map iteration order is not stable.
+        let mut moves: Vec<(&crate::InFiled<TextRange>, &crate::InFiled<TextRange>)> =
+            map.iter().collect();
+        moves.sort_unstable_by_key(|(old, _)| (old.file_id, old.value.start(), old.value.end()));
+        let to_move: Vec<(LuaMemberId, LuaMemberOwner, LuaMemberOwner)> = moves
+            .into_iter()
+            .flat_map(|(old, new)| {
+                let old_owner = LuaMemberOwner::Element(old.clone());
+                let new_owner = LuaMemberOwner::Element(new.clone());
+                self.owner_members
+                    .get(&old_owner)
+                    .into_iter()
+                    .flat_map(|items| items.get_member_items())
+                    .flat_map(|item| match item {
+                        LuaMemberIndexItem::One(id) => vec![*id],
+                        LuaMemberIndexItem::Many(ids) => ids.clone(),
+                    })
+                    .map(move |id| (id, old_owner.clone(), new_owner.clone()))
+                    .collect::<Vec<_>>()
+            })
+            .collect();
+        self.assignment_contributions.remap_element_owners(map);
+        self.assignment_contributions.remap_table_ranges(map);
+        let moved_slots: Vec<(
+            (LuaMemberOwner, LuaMemberKey),
+            (LuaMemberOwner, LuaMemberKey),
+        )> = self
+            .alias_contributed_slots
+            .keys()
+            .filter_map(|slot| {
+                let LuaMemberOwner::Element(old) = &slot.0 else {
+                    return None;
+                };
+                let new = map.get(old)?;
+                Some((
+                    slot.clone(),
+                    (LuaMemberOwner::Element(new.clone()), slot.1.clone()),
+                ))
+            })
+            .collect();
+        // Detached before any is re-filed, for the same reason the
+        // contribution store is: one literal's new range can be another's old.
+        let detached_slots: Vec<((LuaMemberOwner, LuaMemberKey), Vec<LuaMemberId>)> = moved_slots
+            .into_iter()
+            .filter_map(|(old_slot, new_slot)| {
+                Some((new_slot, self.alias_contributed_slots.remove(&old_slot)?))
+            })
+            .collect();
+        for (new_slot, ids) in detached_slots {
+            self.alias_contributed_slots
+                .entry(new_slot)
+                .or_default()
+                .extend(ids);
+        }
+
+        for (member_id, old_owner, new_owner) in to_move {
+            self.detach_member_from_owner(&old_owner, member_id);
+            self.set_member_owner(new_owner.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(new_owner, member_id);
+            if matches!(old_owner, LuaMemberOwner::Element(_))
+                && self
+                    .owner_members
+                    .get(&old_owner)
+                    .is_none_or(|m| m.is_empty())
+            {
+                self.owner_members.remove(&old_owner);
+                // `set_member_owner` files the owner entry under the *member's*
+                // file, not the range's. For the cross-file case this pass
+                // exists for they are different files, and clearing the wrong
+                // one leaves a dead owner in the member file's set for the next
+                // sweep to act on.
+                self.remove_owner_from_all_files(&old_owner);
+            }
+        }
+    }
+
+    /// Drops the owners for table literals an edit removed, and every member
+    /// filed under them.
+    ///
+    /// Those members can belong to files the edit does not re-index, so
+    /// nothing else will clean them up.
+    pub fn remove_deleted_element_owners(
+        &mut self,
+        deleted: &[crate::InFiled<TextRange>],
+    ) -> Vec<LuaMemberId> {
+        let mut forgotten = Vec::new();
+        for range in deleted {
+            let owner = LuaMemberOwner::Element(range.clone());
+            if let Some(member_items) = self.owner_members.remove(&owner) {
+                let member_ids: Vec<LuaMemberId> = member_items
+                    .get_member_items()
+                    .flat_map(|item| match item {
+                        LuaMemberIndexItem::One(id) => vec![*id],
+                        LuaMemberIndexItem::Many(ids) => ids.clone(),
+                    })
+                    .collect();
+                for id in member_ids {
+                    self.forget_member(id);
+                    forgotten.push(id);
+                }
+            }
+            self.member_owner_key_index.remove(&owner);
+            self.member_owner_key_history_index.remove(&owner);
+            self.current_owner_member_history.remove(&owner);
+            self.alias_contributed_slots
+                .retain(|(slot_owner, _), _| slot_owner != &owner);
+            self.remove_owner_from_all_files(&owner);
+        }
+        forgotten
+    }
 }
 
 impl LuaIndex for LuaMemberIndex {
@@ -1608,6 +1946,7 @@ impl LuaIndex for LuaMemberIndex {
         self.deferred_index_expr_members.clear();
         self.function_scope_ranges.clear();
         self.conditional_branch_ranges.clear();
+        self.alias_contributed_slots.clear();
         self.member_function_scope_ranges.clear();
         self.assignment_contributions.clear();
     }
@@ -2977,5 +3316,42 @@ mod tests {
 
         index.remove(file_id);
         assert!(!index.has_live_member(&owner));
+    }
+
+    #[test]
+    fn pruned_cross_file_member_is_unreachable_until_reattached() {
+        let owner_file = FileId::new(1);
+        let sibling_file = FileId::new(2);
+        let owner = LuaMemberOwner::Element(crate::InFiled::new(
+            owner_file,
+            TextRange::new(TextSize::new(0), TextSize::new(2)),
+        ));
+        let key = LuaMemberKey::Name("field".into());
+        let own_write = make_index_member_id(owner_file, 10);
+        let sibling_write = make_index_member_id(sibling_file, 10);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(sibling_write, "field", LuaMemberFeature::FileDefine),
+        );
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(own_write, "field", LuaMemberFeature::FileDefine),
+        );
+        assert!(index.member_reachable_for_owner_key(&owner, &key, sibling_write));
+
+        // The owning file's own write collapsing the slot to itself is how a
+        // re-walk that cannot see the settled sibling prunes it: ownership
+        // survives, reachability does not.
+        index.retain_only_member_for_owner_key(own_write);
+        assert!(!index.member_reachable_for_owner_key(&owner, &key, sibling_write));
+        assert_eq!(index.get_member_owner(&sibling_write), Some(&owner));
+
+        // The reconcile repair path: re-homing onto the owner it already has
+        // restores the visible entry.
+        index.set_member_owner(owner.clone(), sibling_file, sibling_write);
+        index.add_member_to_owner(owner.clone(), sibling_write);
+        assert!(index.member_reachable_for_owner_key(&owner, &key, sibling_write));
     }
 }

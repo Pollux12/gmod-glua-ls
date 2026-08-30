@@ -499,7 +499,8 @@ fn resolve_member_type(
 
             match resolve_state {
                 MemberTypeResolveState::All => {
-                    let mut typ = LuaType::Never;
+                    let mut collected_types = Vec::new();
+                    let mut all_are_table_merges = true;
                     for member in &members {
                         let member_type_cache = db
                             .get_type_index()
@@ -510,13 +511,32 @@ fn resolve_member_type(
                         }
 
                         let member_type = member_type_cache.as_type();
+                        if !is_table_assignment_merge_type(member_type) {
+                            all_are_table_merges = false;
+                        }
                         let member_type = if should_widen_file_defines {
                             widen_file_define_member_type(member_type, should_widen_table_literals)
                         } else {
                             member_type.clone()
                         };
-                        typ = TypeOps::Union.apply(db, &typ, &member_type);
+                        collected_types.push(member_type);
                     }
+
+                    // Whether a writer is worth keeping is not decided here: a
+                    // sibling still sitting at `unknown` is one the analysis has
+                    // not reached yet, not one that carries nothing, and reading
+                    // this slot before and after it lands would then answer
+                    // differently for the same source.
+                    let mut typ = if all_are_table_merges && !collected_types.is_empty() {
+                        crate::merge_table_assignment_types(db, collected_types)
+                    } else {
+                        let mut t = LuaType::Never;
+                        for member_type in collected_types {
+                            t = TypeOps::Union.apply(db, &t, &member_type);
+                        }
+                        t
+                    };
+
                     if let Some(adapters) =
                         build_generic_arity_adapters_for_overrides(db, &typ, &members)
                     {

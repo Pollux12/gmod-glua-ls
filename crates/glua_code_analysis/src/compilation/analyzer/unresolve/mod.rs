@@ -32,7 +32,10 @@ use resolve_closure::{
 };
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
-pub(crate) use resolve::{try_resolve_member, try_resolve_return_point};
+pub(crate) use resolve::{
+    IterVarTypeUpdate, resolve_settled_iter_var_readonly, try_resolve_member,
+    try_resolve_return_point,
+};
 pub use resolve_closure::extract_hook_name;
 pub use resolve_closure::{
     resolve_gmod_hook_add_callback_doc_function, resolve_gmod_hook_callback_doc_function,
@@ -403,6 +406,22 @@ fn attempt_resolve(
     }
 }
 
+/// Whether the owner currently holds a type recording that no value was found.
+fn root_type_is_undetermined(db: &DbIndex, root: &crate::semantic::VarRefCacheRootKey) -> bool {
+    let owner = match root {
+        crate::semantic::VarRefCacheRootKey::Decl(decl_id)
+        | crate::semantic::VarRefCacheRootKey::SelfRef(decl_id) => {
+            crate::LuaTypeOwner::Decl(*decl_id)
+        }
+        crate::semantic::VarRefCacheRootKey::Member(member_id) => {
+            crate::LuaTypeOwner::Member(*member_id)
+        }
+    };
+    db.get_type_index()
+        .get_type_cache(&owner)
+        .is_none_or(|cache| crate::db_index::is_undetermined_type(cache.as_type()))
+}
+
 fn try_resolve(
     db: &mut DbIndex,
     infer_manager: &mut InferCacheManager,
@@ -473,7 +492,36 @@ fn try_resolve(
             for mut unresolve in unresolves.drain(..) {
                 let file_id = unresolve.get_file_id().unwrap_or(FileId { id: 0 });
                 let attempt_start = profile_enabled.then(std::time::Instant::now);
+                let writes_before = db.get_type_index().type_writes();
+                let narrowing_root = unresolve.narrowing_root();
+                let was_undetermined = narrowing_root
+                    .as_ref()
+                    .is_none_or(|root| root_type_is_undetermined(db, root));
                 let resolve_result = attempt_resolve(db, infer_manager, file_id, &mut unresolve);
+                // A resolution that moved a type invalidates every inference
+                // memoised against the old one. The end-of-wave purge is too
+                // late for the items still to be drained here: they would read
+                // the pre-resolve value, and whether a reader shares a wave
+                // with its writer is a property of the batch rather than of the
+                // source.
+                if db.get_type_index().type_writes() != writes_before {
+                    infer_manager.clear_file_deferred_results(file_id);
+                    retry_file_ids.insert(file_id);
+                    // Narrowing answers are the expensive half of that cache and
+                    // are keyed by the variable they narrow, not by what the
+                    // walk consulted, so there is no way to drop only the ones
+                    // that read this owner. They go when the resolution turned a
+                    // value the walk could have read as "not determined yet"
+                    // into a known one — the transition that makes an answer
+                    // derived from it wrong rather than merely older.
+                    if was_undetermined
+                        && narrowing_root
+                            .as_ref()
+                            .is_some_and(|root| !root_type_is_undetermined(db, root))
+                    {
+                        infer_manager.clear_file_undetermined_flow_results(file_id);
+                    }
+                }
                 let cache = infer_manager.get_infer_cache(file_id);
                 if let (Some(profile), Some(attempt_start)) = (profile.as_mut(), attempt_start) {
                     profile.record_attempt(
@@ -883,6 +931,19 @@ impl UnResolve {
         }
     }
 
+    /// The declaration or member this item writes to, when narrowing can read
+    /// it. Used to tell whether a resolution settled a value the flow walk
+    /// could still have been reading as undetermined.
+    pub fn narrowing_root(&self) -> Option<crate::semantic::VarRefCacheRootKey> {
+        match self {
+            UnResolve::Decl(decl) => Some(crate::semantic::VarRefCacheRootKey::Decl(decl.decl_id)),
+            UnResolve::Member(member) => Some(crate::semantic::VarRefCacheRootKey::Member(
+                member.member_id,
+            )),
+            _ => None,
+        }
+    }
+
     /// Returns a deterministic sort key (file_id, text_position) for stable ordering.
     /// This ensures unresolves are processed in a consistent order regardless of
     /// HashMap iteration order or other non-deterministic sources during collection.
@@ -999,7 +1060,7 @@ impl From<UnResolveCallClosureParams> for UnResolve {
     }
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct UnResolveIterVar {
     pub file_id: FileId,
     pub iter_exprs: Vec<LuaExpr>,

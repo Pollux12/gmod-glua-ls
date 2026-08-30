@@ -315,6 +315,7 @@ fn report_unsafe_receiver(
                     receiver,
                 )
                 || is_expr_guarded_by_current_type_guard_condition(semantic_model, receiver)
+                || is_expr_guarded_by_current_truthiness_condition(semantic_model, receiver)
         };
         if guarded {
             return false;
@@ -696,6 +697,9 @@ fn check_index_expr(
     }
 
     let prefix_type = semantic_model.infer_expr(prefix.clone()).ok()?;
+    if prefix_type.is_never() {
+        return Some(());
+    }
     if prefix_type.is_nullable() {
         if !prefix_type.is_nil()
             && let LuaExpr::IndexExpr(prefix_index_expr) = &prefix
@@ -747,26 +751,98 @@ fn index_expr_has_non_nullable_current_member(
     let Ok(prefix_type) = semantic_model.infer_expr(prefix_expr) else {
         return false;
     };
-    let Some(owner) = member_owner_for_type(prefix_type) else {
-        return false;
-    };
     let Some(key) = literal_member_key(index_expr) else {
         return false;
     };
 
     let db = semantic_model.get_db();
-    let Some(member_item) = db.get_member_index().get_member_item(&owner, &key) else {
-        return false;
-    };
-    let Ok(member_type) = member_item.resolve_type_with_realm_at_offset(
+    type_has_non_nullable_member(
         db,
         &semantic_model.get_file_id(),
         index_expr.get_position(),
-    ) else {
-        return false;
-    };
+        &prefix_type,
+        &key,
+    )
+}
 
-    !member_type.is_nullable()
+fn type_has_non_nullable_member(
+    db: &crate::DbIndex,
+    caller_file_id: &crate::FileId,
+    position: rowan::TextSize,
+    typ: &LuaType,
+    key: &LuaMemberKey,
+) -> bool {
+    match typ {
+        LuaType::TableConst(in_file_range) => {
+            let owner = LuaMemberOwner::Element(in_file_range.clone());
+            let Some(member_item) = db.get_member_index().get_member_item(&owner, key) else {
+                return false;
+            };
+            let Ok(member_type) =
+                member_item.resolve_type_with_realm_at_offset(db, caller_file_id, position)
+            else {
+                return false;
+            };
+            !member_type.is_nullable()
+        }
+        LuaType::Def(def_id) | LuaType::Ref(def_id) => {
+            let member_index = db.get_member_index();
+            let all_types = def_id.collect_super_types_with_self(db, typ.clone());
+            for t in all_types {
+                let owner = match t {
+                    LuaType::Ref(id) | LuaType::Def(id) => LuaMemberOwner::Type(id),
+                    _ => continue,
+                };
+                if let Some(member_item) = member_index.get_member_item(&owner, key) {
+                    if let Ok(member_type) =
+                        member_item.resolve_type_with_realm_at_offset(db, caller_file_id, position)
+                    {
+                        if !member_type.is_nullable() {
+                            return true;
+                        }
+                    }
+                }
+            }
+            false
+        }
+        LuaType::Instance(instance) => {
+            type_has_non_nullable_member(db, caller_file_id, position, instance.get_base(), key)
+        }
+        LuaType::Object(object) => {
+            if let Some(field_type) = object.get_field(key) {
+                !field_type.is_nullable()
+            } else {
+                false
+            }
+        }
+        LuaType::MergedTable(merged) => {
+            let types = merged.get_types();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|t| type_has_non_nullable_member(db, caller_file_id, position, t, key))
+        }
+        LuaType::Union(union) => {
+            let types: Vec<_> = union.types().filter(|t| !t.is_nil()).collect();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|t| type_has_non_nullable_member(db, caller_file_id, position, t, key))
+        }
+        LuaType::MultiLineUnion(mlu) => {
+            let types: Vec<_> = mlu
+                .get_unions()
+                .iter()
+                .map(|(t, _)| t)
+                .filter(|t| !t.is_nil())
+                .collect();
+            !types.is_empty()
+                && types
+                    .iter()
+                    .all(|t| type_has_non_nullable_member(db, caller_file_id, position, t, key))
+        }
+        _ => false,
+    }
 }
 
 fn member_owner_for_type(typ: LuaType) -> Option<LuaMemberOwner> {
@@ -856,8 +932,18 @@ fn is_expr_guarded_by_current_type_guard_condition(
                     .get_block()
                     .is_some_and(|block| range_contains(block.syntax().text_range(), expr_range))
                 && condition_is_positive_type_guard_call(semantic_model, &condition, expr)
-                && !then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr)
-                && !loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr)
+                && if_stat.get_block().is_some_and(|block| {
+                    !guarded_block_reassigns_guarded_expr_before_access(
+                        semantic_model,
+                        &block,
+                        expr,
+                    )
+                })
+                && !loop_back_edge_reassigns_guarded_expr_after_guard(
+                    semantic_model,
+                    if_stat.syntax(),
+                    expr,
+                )
             {
                 return true;
             }
@@ -909,10 +995,13 @@ fn is_expr_guarded_by_current_assigned_value_type_guard_condition(
         if !condition_is_positive_type_guard_call(semantic_model, &condition, &assigned_expr) {
             continue;
         }
-        if then_block_reassigns_guarded_expr_before_access(semantic_model, &if_stat, expr) {
+        if if_stat.get_block().is_some_and(|block| {
+            guarded_block_reassigns_guarded_expr_before_access(semantic_model, &block, expr)
+        }) {
             continue;
         }
-        if loop_back_edge_reassigns_guarded_expr_after_if(semantic_model, &if_stat, expr) {
+        if loop_back_edge_reassigns_guarded_expr_after_guard(semantic_model, if_stat.syntax(), expr)
+        {
             continue;
         }
         return true;
@@ -996,14 +1085,11 @@ fn prior_assignment_value_for_expr(
     Some(assigned_expr)
 }
 
-fn then_block_reassigns_guarded_expr_before_access(
+fn guarded_block_reassigns_guarded_expr_before_access(
     semantic_model: &SemanticModel,
-    if_stat: &LuaIfStat,
+    block: &LuaBlock,
     guarded_expr: &LuaExpr,
 ) -> bool {
-    let Some(block) = if_stat.get_block() else {
-        return false;
-    };
     let access_start = guarded_expr.syntax().text_range().start();
 
     for node in block.syntax().children() {
@@ -1035,12 +1121,12 @@ fn then_block_reassigns_guarded_expr_before_access(
     false
 }
 
-fn loop_back_edge_reassigns_guarded_expr_after_if(
+fn loop_back_edge_reassigns_guarded_expr_after_guard(
     semantic_model: &SemanticModel,
-    if_stat: &LuaIfStat,
+    guard_stat: &LuaSyntaxNode,
     guarded_expr: &LuaExpr,
 ) -> bool {
-    let mut current = if_stat.syntax().clone();
+    let mut current = guard_stat.clone();
 
     while let Some(parent) = current.parent() {
         if LuaSyntaxKind::from(parent.kind()) == LuaSyntaxKind::Block
@@ -1232,6 +1318,111 @@ fn preceding_path_sibling_nodes(if_stat: &LuaIfStat) -> Vec<LuaSyntaxNode> {
 
     nodes.sort_by_key(|node| (node.text_range().start(), node.text_range().end()));
     nodes
+}
+
+/// Whether a plain truthiness test on this very expression dominates its use.
+///
+/// `if x.f then x.f:m() end` proves `x.f` is neither `nil` nor `false` inside the
+/// block — that is the whole meaning of the test. A field with a declared nilable
+/// type already narrows through ordinary inference; one the analyzer could not
+/// resolve does not, because the read fails before narrowing runs and the caller
+/// substitutes the runtime `nil`. Reading the guard off the source recovers what
+/// the narrowing would have said.
+fn is_expr_guarded_by_current_truthiness_condition(
+    semantic_model: &SemanticModel,
+    expr: &LuaExpr,
+) -> bool {
+    let expr_range = expr.syntax().text_range();
+    // A guard holds only if it covers the use, proves the expression truthy,
+    // and nothing between the test and the use puts a nil back. The last part
+    // is why the arms share one predicate: an `elseif` is an `if` with an extra
+    // condition, and a `while` body runs the same statements in the same order.
+    let guard_holds = |block: Option<LuaBlock>,
+                       condition: Option<LuaExpr>,
+                       guard_stat: &LuaSyntaxNode| {
+        let Some(block) = block else {
+            return false;
+        };
+        range_contains(block.syntax().text_range(), expr_range)
+            && condition.is_some_and(|condition| condition_proves_expr_truthy(&condition, expr))
+            && !guarded_block_reassigns_guarded_expr_before_access(semantic_model, &block, expr)
+            && !loop_back_edge_reassigns_guarded_expr_after_guard(semantic_model, guard_stat, expr)
+    };
+
+    for ancestor in expr.syntax().ancestors() {
+        if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
+            if guard_holds(
+                if_stat.get_block(),
+                if_stat.get_condition_expr(),
+                if_stat.syntax(),
+            ) {
+                return true;
+            }
+
+            for elseif_clause in if_stat.get_else_if_clause_list() {
+                if guard_holds(
+                    elseif_clause.get_block(),
+                    elseif_clause.get_condition_expr(),
+                    if_stat.syntax(),
+                ) {
+                    return true;
+                }
+            }
+        }
+
+        if let Some(while_stat) = glua_parser::LuaWhileStat::cast(ancestor.clone())
+            && guard_holds(
+                while_stat.get_block(),
+                while_stat.get_condition_expr(),
+                while_stat.syntax(),
+            )
+        {
+            return true;
+        }
+    }
+
+    false
+}
+
+/// Whether evaluating `condition` truthily proves `expr` non-nil.
+///
+/// A bare truthiness test does, and so does `expr ~= nil`. Only `and` chains
+/// carry that through: every operand of a truthy `and` held, while an `or`
+/// proves nothing about either side.
+fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    match condition {
+        LuaExpr::ParenExpr(paren) => paren
+            .get_expr()
+            .is_some_and(|inner| condition_proves_expr_truthy(&inner, expr)),
+        LuaExpr::BinaryExpr(binary) => {
+            let Some(op) = binary.get_op_token().map(|op| op.get_op()) else {
+                return false;
+            };
+            match op {
+                BinaryOperator::OpAnd => binary.get_exprs().is_some_and(|(left, right)| {
+                    condition_proves_expr_truthy(&left, expr)
+                        || condition_proves_expr_truthy(&right, expr)
+                }),
+                BinaryOperator::OpNe => binary.get_exprs().is_some_and(|(left, right)| {
+                    (is_nil_literal_expr(&right) && expr_text_matches(&left, expr))
+                        || (is_nil_literal_expr(&left) && expr_text_matches(&right, expr))
+                }),
+                _ => false,
+            }
+        }
+        _ => expr_text_matches(condition, expr),
+    }
+}
+
+fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
+    matches!(
+        expr,
+        LuaExpr::LiteralExpr(literal)
+            if matches!(
+                literal.get_literal(),
+                Some(glua_parser::LuaLiteralToken::Nil(_))
+            )
+    )
 }
 
 fn condition_is_positive_type_guard_call(
@@ -3171,6 +3362,32 @@ fn return_type_is_non_nullable_type_guard(return_type: &LuaType) -> bool {
     }
 }
 
+fn is_definitely_nullable(typ: &LuaType) -> bool {
+    if typ.is_unknown() || typ.is_any() {
+        return false;
+    }
+    match typ {
+        LuaType::Nil => true,
+        LuaType::Union(union) => {
+            let has_nil = union.types().any(|t| matches!(t, LuaType::Nil));
+            let has_unconstrained = union.types().any(|t| t.is_any() || t.is_unknown());
+            has_nil && !has_unconstrained
+        }
+        LuaType::MultiLineUnion(mlu) => {
+            let has_nil = mlu
+                .get_unions()
+                .iter()
+                .any(|(t, _)| matches!(t, LuaType::Nil));
+            let has_unconstrained = mlu
+                .get_unions()
+                .iter()
+                .any(|(t, _)| t.is_any() || t.is_unknown());
+            has_nil && !has_unconstrained
+        }
+        _ => false,
+    }
+}
+
 fn check_binary_expr(
     context: &mut DiagnosticContext,
     semantic_model: &SemanticModel,
@@ -3219,31 +3436,47 @@ fn check_binary_expr(
     ) {
         let left_type = semantic_model.infer_expr(left.clone()).ok()?;
 
-        if left_type.is_nullable()
+        if is_definitely_nullable(&left_type)
             && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &left)
             && !is_expr_guarded_by_correlated_multi_return(semantic_model, &left)
             && !is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &left)
         {
-            context.add_diagnostic(
-                DiagnosticCode::NeedCheckNil,
-                left.get_range(),
-                format!("{name} value may be nil", name = left.syntax().text()).to_string(),
-                None,
-            );
+            let is_non_nullable_member = match &left {
+                LuaExpr::IndexExpr(left_index) => {
+                    index_expr_has_non_nullable_current_member(semantic_model, left_index)
+                }
+                _ => false,
+            };
+            if !is_non_nullable_member {
+                context.add_diagnostic(
+                    DiagnosticCode::NeedCheckNil,
+                    left.get_range(),
+                    format!("{name} value may be nil", name = left.syntax().text()).to_string(),
+                    None,
+                );
+            }
         }
 
         let right_type = semantic_model.infer_expr(right.clone()).ok()?;
-        if right_type.is_nullable()
+        if is_definitely_nullable(&right_type)
             && !is_expr_guarded_by_prior_nil_early_return(semantic_model, &right)
             && !is_expr_guarded_by_correlated_multi_return(semantic_model, &right)
             && !is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &right)
         {
-            context.add_diagnostic(
-                DiagnosticCode::NeedCheckNil,
-                right.get_range(),
-                format!("{name} value may be nil", name = right.syntax().text()).to_string(),
-                None,
-            );
+            let is_non_nullable_member = match &right {
+                LuaExpr::IndexExpr(right_index) => {
+                    index_expr_has_non_nullable_current_member(semantic_model, right_index)
+                }
+                _ => false,
+            };
+            if !is_non_nullable_member {
+                context.add_diagnostic(
+                    DiagnosticCode::NeedCheckNil,
+                    right.get_range(),
+                    format!("{name} value may be nil", name = right.syntax().text()).to_string(),
+                    None,
+                );
+            }
         }
     }
 
@@ -3279,6 +3512,19 @@ fn check_condition_expr(
             }
         }
         expr => {
+            let truthy_expr = match &expr {
+                LuaExpr::UnaryExpr(unary)
+                    if unary
+                        .get_op_token()
+                        .is_some_and(|t| t.get_op() == UnaryOperator::OpNot) =>
+                {
+                    unary.get_expr().unwrap_or(expr.clone())
+                }
+                _ => expr.clone(),
+            };
+            if is_sentinel_followed_by_type_guard(semantic_model, &truthy_expr) {
+                return;
+            }
             if let Ok(expr_type) = semantic_model.infer_expr(expr.clone())
                 && contains_gmod_null_type(semantic_model.get_db(), &expr_type)
             {
@@ -3443,6 +3689,45 @@ fn is_nil_sentinel_comparison_before_type_guard_elseif(
         is_type_guard_call_guarding_expr(semantic_model, &guard_call, non_nil_side)
             || type_guard_call_textually_guards_expr(semantic_model, &guard_call, non_nil_side)
     })
+}
+
+fn is_sentinel_followed_by_type_guard(semantic_model: &SemanticModel, expr: &LuaExpr) -> bool {
+    let Some(if_stat) = expr.syntax().ancestors().find_map(LuaIfStat::cast) else {
+        return false;
+    };
+    if !if_body_has_return(&if_stat) {
+        return false;
+    }
+    let mut next_sibling = if_stat.syntax().next_sibling();
+    while let Some(sibling) = next_sibling {
+        if let Some(next_if) = LuaIfStat::cast(sibling.clone()) {
+            if let Some(cond) = next_if.get_condition_expr() {
+                let truthy_cond = match &cond {
+                    LuaExpr::UnaryExpr(unary)
+                        if unary
+                            .get_op_token()
+                            .is_some_and(|t| t.get_op() == UnaryOperator::OpNot) =>
+                    {
+                        unary.get_expr().unwrap_or(cond.clone())
+                    }
+                    _ => cond.clone(),
+                };
+                if let Some(guard_call) = unwrap_paren_call(truthy_cond) {
+                    if is_type_guard_call_guarding_expr(semantic_model, &guard_call, expr)
+                        || type_guard_call_textually_guards_expr(semantic_model, &guard_call, expr)
+                    {
+                        return true;
+                    }
+                }
+            }
+            break;
+        }
+        if !sibling.kind().to_token().is_trivia() {
+            break;
+        }
+        next_sibling = sibling.next_sibling();
+    }
+    false
 }
 
 fn unwrap_paren_call(expr: LuaExpr) -> Option<LuaCallExpr> {

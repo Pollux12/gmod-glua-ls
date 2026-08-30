@@ -82,6 +82,35 @@ fn definition_sort_key(definition: &InFiled<TextRange>) -> (u32, u32, u32) {
     )
 }
 
+/// Merges one owner's named definitions into another's, per field name, so a
+/// name both hold keeps the definitions of each.
+fn merge_field_definitions(
+    into: &mut HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+    from: HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+) {
+    for (field_name, definitions) in from {
+        // The canonical order and the no-duplicates rule `add_field_inner`
+        // maintains on insert have to survive the merge.
+        let slot = into.entry(field_name).or_default();
+        slot.extend(definitions);
+        slot.sort_unstable_by_key(definition_sort_key);
+        slot.dedup();
+    }
+}
+
+/// Appends the wildcard definitions the target does not already hold.
+///
+/// Order is left alone: `add_wildcard_definition` files these in walk order
+/// rather than a canonical one, so sorting here would make a re-indexed
+/// workspace disagree with a cold build.
+fn merge_wildcard_definitions(into: &mut Vec<InFiled<TextRange>>, from: Vec<InFiled<TextRange>>) {
+    for definition in from {
+        if !into.contains(&definition) {
+            into.push(definition);
+        }
+    }
+}
+
 impl DynamicFieldIndex {
     pub fn new() -> Self {
         Self::default()
@@ -138,7 +167,7 @@ impl DynamicFieldIndex {
             .entry(field_name.clone())
             .or_default();
         let definition = InFiled::new(file_id, range);
-        // Kept in canonical order: `get_field_definitions` feeds a union of
+        // Kept in canonical order: `field_definitions` feeds a union of
         // overloads, so insertion order would make the elected arm depend on the
         // batch walk order rather than on the workspace.
         let insert_at = field_definitions.partition_point(|existing| {
@@ -187,6 +216,117 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push(field_name);
         }
+    }
+
+    /// Re-keys owners whose table literal shifted offset.
+    ///
+    /// A dynamic field is filed under the literal's range, and a write from
+    /// another file is not re-collected when this one is re-indexed, so a
+    /// stale key makes the field unreachable from the type the literal has.
+    pub fn remap_table_ranges(
+        &mut self,
+        map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+    ) {
+        fn remap_owner(
+            owner: &DynamicFieldOwner,
+            map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+        ) -> Option<DynamicFieldOwner> {
+            match owner {
+                DynamicFieldOwner::Table(range) => map
+                    .get(range)
+                    .map(|new| DynamicFieldOwner::Table(new.clone())),
+                DynamicFieldOwner::Type(_) => None,
+            }
+        }
+
+        // The moved group is merged into whatever the target key already
+        // holds rather than replacing it. Only literals with a stable anchor
+        // are in `map`, so an unanchored literal's cross-file entry can already
+        // sit on the range an anchored one moves onto; `extend` on the nested
+        // maps would drop that entry instead of merging it.
+        macro_rules! remap_owner_keyed {
+            ($field:expr, |$slot:ident, $group:ident| $merge:block) => {{
+                let moved: Vec<(DynamicFieldOwner, DynamicFieldOwner)> = $field
+                    .keys()
+                    .filter_map(|owner| Some((owner.clone(), remap_owner(owner, map)?)))
+                    .collect();
+                // Detached before any is re-filed: one literal's new range can
+                // be another's old one.
+                let detached: Vec<_> = moved
+                    .into_iter()
+                    .filter_map(|(old, new)| Some((new, $field.remove(&old)?)))
+                    .collect();
+                for (new, group) in detached {
+                    let $slot = $field.entry(new).or_default();
+                    let $group = group;
+                    $merge
+                }
+            }};
+        }
+
+        remap_owner_keyed!(self.owner_fields, |slot, group| {
+            for (field_name, files) in group {
+                slot.entry(field_name).or_default().extend(files);
+            }
+        });
+        remap_owner_keyed!(self.field_definitions, |slot, group| {
+            merge_field_definitions(slot, group)
+        });
+        remap_owner_keyed!(self.direct_field_definitions, |slot, group| {
+            merge_field_definitions(slot, group)
+        });
+        remap_owner_keyed!(self.finite_named_members, |slot, group| {
+            slot.extend(group)
+        });
+        remap_owner_keyed!(self.wildcard_definitions, |slot, group| {
+            merge_wildcard_definitions(slot, group)
+        });
+
+        for entries in self.file_contributions.values_mut() {
+            for (owner, _, _) in entries.iter_mut() {
+                if let Some(new) = remap_owner(owner, map) {
+                    *owner = new;
+                }
+            }
+        }
+        for entries in self.wildcard_file_contributions.values_mut() {
+            for (owner, _) in entries.iter_mut() {
+                if let Some(new) = remap_owner(owner, map) {
+                    *owner = new;
+                }
+            }
+        }
+    }
+
+    /// Every table-literal range this index is keyed by.
+    #[cfg(test)]
+    pub(crate) fn table_ranges(&self) -> Vec<InFiled<TextRange>> {
+        fn owner_range(owner: &DynamicFieldOwner) -> Option<InFiled<TextRange>> {
+            match owner {
+                DynamicFieldOwner::Table(range) => Some(range.clone()),
+                DynamicFieldOwner::Type(_) => None,
+            }
+        }
+        self.owner_fields
+            .keys()
+            .chain(self.field_definitions.keys())
+            .chain(self.direct_field_definitions.keys())
+            .chain(self.finite_named_members.keys())
+            .chain(self.wildcard_definitions.keys())
+            .filter_map(owner_range)
+            .chain(
+                self.file_contributions
+                    .values()
+                    .flatten()
+                    .filter_map(|(owner, _, _)| owner_range(owner)),
+            )
+            .chain(
+                self.wildcard_file_contributions
+                    .values()
+                    .flatten()
+                    .filter_map(|(owner, _)| owner_range(owner)),
+            )
+            .collect()
     }
 
     /// Whether the index has finished being built for the current analysis
@@ -285,16 +425,16 @@ impl DynamicFieldIndex {
             .unwrap_or_default()
     }
 
-    pub fn get_field_definitions(
+    /// Every recorded definition of one field, in canonical order.
+    pub fn field_definitions(
         &self,
         owner: &DynamicFieldOwner,
         field_name: &str,
-    ) -> Vec<InFiled<TextRange>> {
+    ) -> &[InFiled<TextRange>] {
         self.field_definitions
             .get(owner)
             .and_then(|fields| fields.get(field_name))
-            .cloned()
-            .unwrap_or_default()
+            .map_or(&[], Vec::as_slice)
     }
 
     pub fn get_wildcard_definitions(&self, owner: &DynamicFieldOwner) -> Vec<InFiled<TextRange>> {
@@ -560,6 +700,69 @@ mod tests {
         TextRange::new(TextSize::from(start), TextSize::from(end))
     }
 
+    fn shift(
+        file_id: FileId,
+        from: TextRange,
+        to: TextRange,
+    ) -> rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>> {
+        let mut map = rustc_hash::FxHashMap::default();
+        map.insert(InFiled::new(file_id, from), InFiled::new(file_id, to));
+        map
+    }
+
+    /// Every owner-keyed store has to move together. `owner_fields` backs
+    /// `has_field`, so leaving it behind strands the field on a range no type
+    /// resolves to any more.
+    #[test]
+    fn remapping_a_literal_moves_the_field_lookup_with_it() {
+        let edited = FileId::new(1);
+        let contributor = FileId::new(2);
+        let old = DynamicFieldOwner::Table(InFiled::new(edited, range(0, 10)));
+        let new = DynamicFieldOwner::Table(InFiled::new(edited, range(20, 30)));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(old.clone(), SmolStr::new("f"), contributor, range(1, 2));
+        index.remap_table_ranges(&shift(edited, range(0, 10), range(20, 30)));
+
+        assert!(index.has_field(&new, "f"));
+        assert!(!index.has_field(&old, "f"));
+        assert_eq!(index.field_definitions(&new, "f").len(), 1);
+    }
+
+    /// Only anchored literals are remapped, so an unanchored one's cross-file
+    /// entry can already sit on the range an anchored one moves onto. Merging
+    /// has to keep both, per field name.
+    #[test]
+    fn remapping_onto_an_occupied_range_keeps_both_owners_definitions() {
+        let edited = FileId::new(1);
+        let contributor = FileId::new(2);
+        let moved_from = DynamicFieldOwner::Table(InFiled::new(edited, range(0, 10)));
+        let occupied = DynamicFieldOwner::Table(InFiled::new(edited, range(20, 30)));
+
+        let mut index = DynamicFieldIndex::new();
+        index.add_field(
+            moved_from.clone(),
+            SmolStr::new("shared"),
+            contributor,
+            range(1, 2),
+        );
+        index.add_field(
+            occupied.clone(),
+            SmolStr::new("shared"),
+            contributor,
+            range(3, 4),
+        );
+        index.remap_table_ranges(&shift(edited, range(0, 10), range(20, 30)));
+
+        assert_eq!(
+            index.field_definitions(&occupied, "shared"),
+            [
+                InFiled::new(contributor, range(1, 2)),
+                InFiled::new(contributor, range(3, 4)),
+            ]
+        );
+    }
+
     #[test]
     fn remove_prunes_orphaned_field_definitions_without_contribution_entries() {
         let file_to_remove = FileId::new(1);
@@ -589,9 +792,9 @@ mod tests {
 
         index.remove(file_to_remove);
 
-        assert_eq!(index.get_field_definitions(&owner, &field).len(), 1);
+        assert_eq!(index.field_definitions(&owner, &field).len(), 1);
         assert_eq!(
-            index.get_field_definitions(&owner, &field)[0].file_id,
+            index.field_definitions(&owner, &field)[0].file_id,
             remaining_file
         );
         assert_eq!(index.get_wildcard_definitions(&owner).len(), 1);
@@ -645,7 +848,7 @@ mod tests {
 
         assert!(!index.has_field(&owner, &field));
         assert!(index.get_fields(&owner).is_none());
-        assert!(index.get_field_definitions(&owner, &field).is_empty());
+        assert!(index.field_definitions(&owner, &field).is_empty());
     }
 
     #[test]
@@ -668,7 +871,7 @@ mod tests {
         }
 
         assert_eq!(
-            forward.get_field_definitions(&owner, &field),
+            forward.field_definitions(&owner, &field),
             vec![
                 InFiled::new(FileId::new(1), range(3, 4)),
                 InFiled::new(FileId::new(1), range(9, 10)),
@@ -676,8 +879,8 @@ mod tests {
             ]
         );
         assert_eq!(
-            forward.get_field_definitions(&owner, &field),
-            reverse.get_field_definitions(&owner, &field)
+            forward.field_definitions(&owner, &field),
+            reverse.field_definitions(&owner, &field)
         );
     }
 

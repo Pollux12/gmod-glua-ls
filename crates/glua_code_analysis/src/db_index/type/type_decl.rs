@@ -99,6 +99,38 @@ impl LuaTypeDecl {
         matches!(self.extra, LuaTypeExtra::Attribute { .. })
     }
 
+    /// The declaration's kind plus the flags each of its locations carries.
+    ///
+    /// Both live only on the declaration - they touch no member, signature or
+    /// type cache - yet `(exact)` decides whether another file's write creates
+    /// a member on this type, and `(partial)`/`(private)` gate diagnostics that
+    /// other files report.
+    pub fn kind_and_flags(&self) -> (LuaDeclTypeKind, Vec<(FileId, u8)>) {
+        let kind = match &self.extra {
+            LuaTypeExtra::Enum { .. } => LuaDeclTypeKind::Enum,
+            LuaTypeExtra::Class => LuaDeclTypeKind::Class,
+            LuaTypeExtra::Alias { .. } => LuaDeclTypeKind::Alias,
+            LuaTypeExtra::Attribute { .. } => LuaDeclTypeKind::Attribute,
+        };
+        let mut flags: Vec<(FileId, u8)> = self
+            .locations
+            .iter()
+            .map(|location| (location.file_id, location.flag.bits()))
+            .collect();
+        flags.sort_unstable();
+        (kind, flags)
+    }
+
+    /// The enum's base type and flatness, or the attribute's type. `None` for
+    /// a class; an alias's origin has its own accessor.
+    pub fn extra_type(&self) -> (Option<&LuaType>, bool) {
+        match &self.extra {
+            LuaTypeExtra::Enum { base, flat } => (base.as_ref(), *flat),
+            LuaTypeExtra::Attribute { typ } => (typ.as_ref(), false),
+            LuaTypeExtra::Class | LuaTypeExtra::Alias { .. } => (None, false),
+        }
+    }
+
     pub fn is_exact(&self) -> bool {
         self.locations
             .iter()

@@ -12,9 +12,10 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_structural_method_member, is_sub_type_of,
-    member_has_documented_default, sub_type::get_base_type_id,
-    type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
+    TypeCheckResult, check_general_type_compact, is_assignment_added_member,
+    is_structural_method_member, is_sub_type_of, member_has_documented_default,
+    sub_type::get_base_type_id, type_check_fail_reason::TypeCheckFailReason,
+    type_check_guard::TypeCheckGuard,
 };
 
 const GMOD_NULL_TYPE_NAME: &str = "NULL";
@@ -397,6 +398,10 @@ fn check_ref_type_compact_table(
                 }
             }
             None if !source_member_type.is_optional()
+                && !is_assignment_added_member(
+                    context.db,
+                    source_member.property_owner_id.as_ref(),
+                )
                 && !member_has_documented_default(
                     context.db,
                     source_member.property_owner_id.as_ref(),
@@ -468,6 +473,7 @@ fn check_ref_type_compact_object(
                 }
             }
             None if !source_member_type.is_optional()
+                && !is_assignment_added_member(context.db, property_owner_id.as_ref())
                 && !member_has_documented_default(
                     context.db,
                     property_owner_id.as_ref(),

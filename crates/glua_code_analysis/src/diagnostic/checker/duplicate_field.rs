@@ -178,8 +178,7 @@ fn check_decl_duplicate_field(
 
         // 1. 检查 signature
         let signatures = member_infos.iter().filter(|info| {
-            matches!(info.typ, LuaType::Signature(_))
-                && !is_assignment_file_define_member(info.member)
+            matches!(info.typ, LuaType::Signature(_)) && !info.member.is_assignment_define()
         });
         if signatures.clone().count() > 1 {
             for signature in signatures {
@@ -231,11 +230,6 @@ fn check_decl_duplicate_field(
     }
 
     Some(())
-}
-
-fn is_assignment_file_define_member(member: &LuaMember) -> bool {
-    member.get_feature() == LuaMemberFeature::FileDefine
-        && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
 }
 
 /// 特殊处理: require("a").fun = function() end

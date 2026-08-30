@@ -10,7 +10,8 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaMemberOwner, db_index::r#type::type_decl::LuaTypeIdentifier,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner,
+    db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
 pub use humanize_type::{
@@ -18,13 +19,14 @@ pub use humanize_type::{
     humanize_type,
 };
 pub use inference_fact::*;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 // The type index is the hottest hashing site in the analyzer: `LuaTypeOwner`
 // hashing alone was 3.9% of all CPU under the default SipHash.
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
+pub(crate) use type_owner::is_undetermined_type;
 pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
@@ -185,6 +187,310 @@ fn replace_table_consts_in_type<S: std::hash::BuildHasher>(
     }
 }
 
+/// Every table-literal range a type names, directly or nested.
+///
+/// The mirror of [`remap_table_ranges_in_type`]: a test can use it to assert
+/// that no store was left holding a range the remap should have moved.
+#[cfg(test)]
+pub(crate) fn table_ranges_in_type(typ: &LuaType) -> Vec<InFiled<TextRange>> {
+    let mut ranges = Vec::new();
+    TypeVisitTrait::visit_type(typ, &mut |inner| match inner {
+        LuaType::TableConst(range) => ranges.push(range.clone()),
+        LuaType::Instance(instance) => ranges.push(instance.get_range().clone()),
+        _ => {}
+    });
+    ranges
+}
+
+pub(crate) fn remap_table_ranges_in_type(
+    typ: &LuaType,
+    map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+) -> Option<LuaType> {
+    match typ {
+        LuaType::TableConst(old) => map.get(old).map(|new| LuaType::TableConst(new.clone())),
+        LuaType::Instance(inst) => {
+            let mut changed = false;
+            let mut new_base = inst.get_base().clone();
+            if let Some(nb) = remap_table_ranges_in_type(inst.get_base(), map) {
+                new_base = nb;
+                changed = true;
+            }
+            let mut new_range = inst.get_range().clone();
+            if let Some(mapped) = map.get(inst.get_range()) {
+                new_range = mapped.clone();
+                changed = true;
+            }
+            if changed {
+                Some(LuaType::Instance(Arc::new(
+                    crate::db_index::r#type::types::LuaInstanceType::new(new_base, new_range),
+                )))
+            } else {
+                None
+            }
+        }
+        LuaType::Union(union) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = union
+                .into_vec()
+                .into_iter()
+                .map(|sub| {
+                    remap_table_ranges_in_type(&sub, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or(sub)
+                })
+                .collect();
+            changed.then(|| LuaType::from_vec(new_types))
+        }
+        LuaType::Intersection(inter) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = inter
+                .get_types()
+                .iter()
+                .map(|sub| {
+                    remap_table_ranges_in_type(sub, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub.clone())
+                })
+                .collect();
+            changed.then(|| {
+                LuaType::Intersection(Arc::new(crate::LuaIntersectionType::new(new_types)))
+            })
+        }
+        LuaType::MergedTable(merged) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = merged
+                .get_types()
+                .iter()
+                .map(|sub| {
+                    remap_table_ranges_in_type(sub, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub.clone())
+                })
+                .collect();
+            changed
+                .then(|| LuaType::MergedTable(Arc::new(crate::LuaMergedTableType::new(new_types))))
+        }
+        LuaType::Array(arr) => remap_table_ranges_in_type(arr.get_base(), map).map(|new_base| {
+            LuaType::Array(Arc::new(crate::LuaArrayType::new(
+                new_base,
+                arr.get_len().clone(),
+            )))
+        }),
+        LuaType::Tuple(tuple) => {
+            let mut changed = false;
+            let new_types: Vec<LuaType> = tuple
+                .get_types()
+                .iter()
+                .map(|sub| {
+                    remap_table_ranges_in_type(sub, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| sub.clone())
+                })
+                .collect();
+            if changed {
+                Some(LuaType::Tuple(Arc::new(crate::LuaTupleType::new(
+                    new_types,
+                    tuple.status,
+                ))))
+            } else {
+                None
+            }
+        }
+        LuaType::Object(obj) => {
+            let mut changed = false;
+            let mut new_fields = std::collections::BTreeMap::new();
+            for (k, v) in obj.get_fields() {
+                if let Some(nv) = remap_table_ranges_in_type(v, map) {
+                    changed = true;
+                    new_fields.insert(k.clone(), nv);
+                } else {
+                    new_fields.insert(k.clone(), v.clone());
+                }
+            }
+            let mut new_index_access = Vec::new();
+            for (k, v) in obj.get_index_access() {
+                let nk = remap_table_ranges_in_type(k, map).unwrap_or_else(|| k.clone());
+                let nv = remap_table_ranges_in_type(v, map).unwrap_or_else(|| v.clone());
+                if &nk != k || &nv != v {
+                    changed = true;
+                }
+                new_index_access.push((nk, nv));
+            }
+            if changed {
+                Some(LuaType::Object(Arc::new(
+                    crate::LuaObjectType::new_with_fields(new_fields, new_index_access),
+                )))
+            } else {
+                None
+            }
+        }
+        LuaType::Generic(r#gen) => {
+            let mut changed = false;
+            let new_params: Vec<LuaType> = r#gen
+                .get_params()
+                .iter()
+                .map(|p| {
+                    remap_table_ranges_in_type(p, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            if changed {
+                Some(LuaType::Generic(Arc::new(crate::LuaGenericType::new(
+                    r#gen.get_base_type_id(),
+                    new_params,
+                ))))
+            } else {
+                None
+            }
+        }
+        LuaType::TableGeneric(params) => {
+            let mut changed = false;
+            let new_params: Vec<LuaType> = params
+                .iter()
+                .map(|p| {
+                    remap_table_ranges_in_type(p, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| p.clone())
+                })
+                .collect();
+            changed.then(|| LuaType::TableGeneric(Arc::new(new_params)))
+        }
+        LuaType::DocFunction(func) => {
+            let mut changed = false;
+            let mut new_params = Vec::new();
+            for (name, ty) in func.get_params() {
+                if let Some(ty) = ty {
+                    if let Some(nt) = remap_table_ranges_in_type(ty, map) {
+                        changed = true;
+                        new_params.push((name.clone(), Some(nt)));
+                    } else {
+                        new_params.push((name.clone(), Some(ty.clone())));
+                    }
+                } else {
+                    new_params.push((name.clone(), None));
+                }
+            }
+            let new_ret = remap_table_ranges_in_type(func.get_ret(), map)
+                .inspect(|_| changed = true)
+                .unwrap_or_else(|| func.get_ret().clone());
+            if &new_ret != func.get_ret() {
+                changed = true;
+            }
+            if changed {
+                let new_func = crate::LuaFunctionType::new(
+                    func.get_async_state(),
+                    func.is_colon_define(),
+                    func.is_variadic(),
+                    new_params,
+                    new_ret,
+                )
+                .with_optional_params(func.get_optional_params().to_vec())
+                .with_call_arg_roles(func.get_call_arg_roles().to_vec());
+                Some(LuaType::DocFunction(Arc::new(new_func)))
+            } else {
+                None
+            }
+        }
+        LuaType::Variadic(var) => match var.as_ref() {
+            crate::VariadicType::Multi(types) => {
+                let mut changed = false;
+                let new_types: Vec<LuaType> = types
+                    .iter()
+                    .map(|t| {
+                        remap_table_ranges_in_type(t, map)
+                            .inspect(|_| changed = true)
+                            .unwrap_or_else(|| t.clone())
+                    })
+                    .collect();
+                changed.then(|| LuaType::Variadic(Arc::new(crate::VariadicType::Multi(new_types))))
+            }
+            crate::VariadicType::Base(base) => remap_table_ranges_in_type(base, map)
+                .map(|nb| LuaType::Variadic(Arc::new(crate::VariadicType::Base(nb)))),
+        },
+        LuaType::MultiLineUnion(mlu) => {
+            let mut changed = false;
+            let new_unions: Vec<(LuaType, Option<String>)> = mlu
+                .get_unions()
+                .iter()
+                .map(|(ty, doc)| {
+                    if let Some(nt) = remap_table_ranges_in_type(ty, map) {
+                        changed = true;
+                        (nt, doc.clone())
+                    } else {
+                        (ty.clone(), doc.clone())
+                    }
+                })
+                .collect();
+            changed.then(|| {
+                LuaType::MultiLineUnion(Arc::new(crate::LuaMultiLineUnion::new(new_unions)))
+            })
+        }
+        LuaType::TypeGuard(inner) => {
+            remap_table_ranges_in_type(inner, map).map(|nt| LuaType::TypeGuard(Arc::new(nt)))
+        }
+        LuaType::Conditional(cond) => {
+            let mut changed = false;
+            let new_cond = remap_table_ranges_in_type(cond.get_condition(), map)
+                .inspect(|_| changed = true)
+                .unwrap_or_else(|| cond.get_condition().clone());
+            let new_true = remap_table_ranges_in_type(cond.get_true_type(), map)
+                .inspect(|_| changed = true)
+                .unwrap_or_else(|| cond.get_true_type().clone());
+            let new_false = remap_table_ranges_in_type(cond.get_false_type(), map)
+                .inspect(|_| changed = true)
+                .unwrap_or_else(|| cond.get_false_type().clone());
+            if changed {
+                Some(LuaType::Conditional(Arc::new(
+                    crate::LuaConditionalType::new(
+                        new_cond,
+                        new_true,
+                        new_false,
+                        cond.get_infer_params().to_vec(),
+                        cond.has_new,
+                    ),
+                )))
+            } else {
+                None
+            }
+        }
+        LuaType::Mapped(mapped) => remap_table_ranges_in_type(&mapped.value, map).map(|nv| {
+            LuaType::Mapped(Arc::new(crate::LuaMappedType::new(
+                mapped.param.clone(),
+                nv,
+                mapped.is_readonly,
+                mapped.is_optional,
+            )))
+        }),
+        LuaType::TableOf(inner) => {
+            remap_table_ranges_in_type(inner, map).map(|nt| LuaType::TableOf(Box::new(nt)))
+        }
+        LuaType::Call(call) => {
+            let mut changed = false;
+            let new_ops: Vec<LuaType> = call
+                .get_operands()
+                .iter()
+                .map(|op| {
+                    remap_table_ranges_in_type(op, map)
+                        .inspect(|_| changed = true)
+                        .unwrap_or_else(|| op.clone())
+                })
+                .collect();
+            if changed {
+                Some(LuaType::Call(Arc::new(crate::LuaAliasCallType::new(
+                    call.get_call_kind(),
+                    new_ops,
+                ))))
+            } else {
+                None
+            }
+        }
+        // The remaining variants nest no type that can carry a table literal's
+        // range, so there is nothing under them to move.
+        _ => None,
+    }
+}
+
 pub(crate) fn widen_literal_type_for_assignment(typ: &LuaType) -> LuaType {
     match typ {
         LuaType::IntegerConst(_) => LuaType::Integer,
@@ -239,14 +545,22 @@ pub(crate) fn widen_file_define_member_type(typ: &LuaType, widen_table_literals:
 }
 
 pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
-    matches!(
-        typ,
+    match typ {
         LuaType::Table
-            | LuaType::TableConst(_)
-            | LuaType::Object(_)
-            | LuaType::MergedTable(_)
-            | LuaType::TableOf(_)
-    )
+        | LuaType::TableConst(_)
+        | LuaType::Object(_)
+        | LuaType::MergedTable(_)
+        | LuaType::TableGeneric(_)
+        | LuaType::TableOf(_) => true,
+        LuaType::Union(union) => union
+            .types()
+            .all(|t| matches!(t, LuaType::Nil) || is_table_assignment_merge_type(t)),
+        LuaType::MultiLineUnion(multi) => multi
+            .get_unions()
+            .iter()
+            .all(|(t, _)| matches!(t, LuaType::Nil) || is_table_assignment_merge_type(t)),
+        _ => false,
+    }
 }
 
 pub(crate) fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
@@ -360,7 +674,8 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
         return collapse_guarded_table_bootstrap_branches(db, types);
     }
 
-    merge_guarded_table_bootstrap_result(
+    merge_table_assignment_types(
+        db,
         types
             .into_iter()
             .filter(|typ| !is_guarded_table_bootstrap_branch(db, typ))
@@ -370,24 +685,41 @@ pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: Lu
 
 fn collapse_guarded_table_bootstrap_branches(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
     let mut saw_bootstrap = false;
+    let mut bootstraps = Vec::new();
     let mut retained = Vec::with_capacity(types.len());
 
     for typ in types {
         if is_guarded_table_bootstrap_branch(db, &typ) {
             saw_bootstrap = true;
+            bootstraps.push(typ);
         } else {
             retained.push(typ);
         }
     }
 
     if saw_bootstrap {
+        if retained.is_empty() {
+            // Nothing but bootstrap branches: they all name the same table, and
+            // answering bare `table` would throw away the one thing they carry —
+            // which literal that is. A slot with a single such writer keeps it
+            // (the `One` arm returns the cache verbatim), so a slot with several
+            // has to as well, or a member's owner would depend on how many
+            // writers happened to be indexed when the read was taken.
+            return LuaType::from_vec(bootstraps);
+        }
         retained.push(LuaType::Table);
     }
 
-    merge_guarded_table_bootstrap_result(retained)
+    merge_table_assignment_types(db, retained)
 }
 
-fn merge_guarded_table_bootstrap_result(types: Vec<LuaType>) -> LuaType {
+/// Folds several writers' table types into one answer.
+///
+/// Table components merge rather than union: a slot several files each assign a
+/// table literal holds one table at runtime, and every field any writer spells
+/// is a field it can have. Bare `table` drops out whenever a more precise
+/// component is present, since it names no field and would only dilute them.
+pub(crate) fn merge_table_assignment_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
     let mut table_components = Vec::new();
     let mut other_components = Vec::new();
 
@@ -396,6 +728,11 @@ fn merge_guarded_table_bootstrap_result(types: Vec<LuaType>) -> LuaType {
     }
 
     if table_components
+        .iter()
+        .any(|component| is_informative_guarded_table_branch(db, component))
+    {
+        table_components.retain(|component| is_informative_guarded_table_branch(db, component));
+    } else if table_components
         .iter()
         .any(|component| !matches!(component, LuaType::Table))
     {
@@ -434,25 +771,55 @@ fn collect_guarded_table_merge_components(
                 );
             }
         }
+        LuaType::Union(union) => {
+            for component in union.types() {
+                collect_guarded_table_merge_components(
+                    component.clone(),
+                    table_components,
+                    other_components,
+                );
+            }
+        }
+        LuaType::MultiLineUnion(multi_line) => {
+            for (component, _) in multi_line.get_unions() {
+                collect_guarded_table_merge_components(
+                    component.clone(),
+                    table_components,
+                    other_components,
+                );
+            }
+        }
         LuaType::Table
         | LuaType::TableConst(_)
         | LuaType::Object(_)
         | LuaType::TableGeneric(_)
-        | LuaType::TableOf(_) => table_components.push(typ),
-        _ => other_components.push(typ),
+        | LuaType::TableOf(_) => {
+            if !table_components.contains(&typ) {
+                table_components.push(typ);
+            }
+        }
+        _ => {
+            if !other_components.contains(&typ) {
+                other_components.push(typ);
+            }
+        }
     }
 }
 
 fn is_informative_guarded_table_branch(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
         LuaType::TableConst(table_id) => {
-            db.get_member_index()
-                .get_member_len(&LuaMemberOwner::Element(table_id.clone()))
-                > 0
+            let member_index = db.get_member_index();
+            let owner = LuaMemberOwner::Element(table_id.clone());
+            if let Some(members) = member_index.get_members(&owner) {
+                members
+                    .iter()
+                    .any(|m| matches!(m.get_key(), crate::LuaMemberKey::Name(_)))
+            } else {
+                false
+            }
         }
-        LuaType::Object(object) => {
-            !object.get_fields().is_empty() || !object.get_index_access().is_empty()
-        }
+        LuaType::Object(object) => !object.get_fields().is_empty(),
         LuaType::MergedTable(merged) => merged
             .get_types()
             .iter()
@@ -594,6 +961,13 @@ pub struct LuaTypeIndex {
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
+    /// For each decl whose type a write has seeded: that write's source
+    /// position, and whether its right-hand side was a call or index read. See
+    /// `bind_decl_write`.
+    decl_write_claims: HashMap<LuaDeclId, (TextSize, bool)>,
+    /// Counts stored types that actually moved, so a caller can tell a no-op
+    /// write from one that invalidates memoised inference.
+    type_writes: u64,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
@@ -618,6 +992,8 @@ impl LuaTypeIndex {
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
             fact_metadata: HashMap::default(),
+            decl_write_claims: HashMap::default(),
+            type_writes: 0,
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
             support_file_dependents: HashMap::default(),
@@ -931,6 +1307,32 @@ impl LuaTypeIndex {
         {
             return;
         }
+        self.commit_type_cache(owner, cache);
+    }
+
+    /// See [`LuaTypeIndex::type_writes`]. Compare it across an operation to
+    /// learn whether that operation moved any stored type.
+    pub fn type_writes(&self) -> u64 {
+        self.type_writes
+    }
+
+    /// The write that seeded `decl_id`'s type: its source position, and whether
+    /// its right-hand side read through a call or index.
+    pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
+        self.decl_write_claims.get(decl_id).copied()
+    }
+
+    pub fn record_decl_write_claim(
+        &mut self,
+        decl_id: LuaDeclId,
+        position: TextSize,
+        reads_through_call_or_index: bool,
+    ) {
+        self.decl_write_claims
+            .insert(decl_id, (position, reads_through_call_or_index));
+    }
+
+    fn commit_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
         let file_id = owner.get_file_id();
         let replaced = self.insert_type_cache(owner.clone(), cache);
         self.in_filed_type_owner
@@ -940,6 +1342,17 @@ impl LuaTypeIndex {
         if replaced && self.fact_metadata.remove(&owner).is_some() {
             self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
         }
+    }
+
+    /// The type-cache owners recorded for a file, used to re-derive a file's
+    /// decls after a late index (e.g. vgui parent chains) makes a broad fallback
+    /// resolvable.
+    pub fn file_type_owners(&self, file_id: FileId) -> Option<&HashSet<LuaTypeOwner>> {
+        self.in_filed_type_owner.get(&file_id)
+    }
+
+    pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
+        self.file_types.get(&file_id)
     }
 
     pub fn force_bind_type(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) {
@@ -1056,6 +1469,27 @@ impl LuaTypeIndex {
     /// Stores `cache`, keeping [`Self::cache_refs`] in step, and reports
     /// whether a cache was replaced.
     fn insert_type_cache(&mut self, owner: LuaTypeOwner, cache: LuaTypeCache) -> bool {
+        if let Ok(want) = std::env::var("GLUALS_TRACE_WRITE") {
+            let key = format!("{:?}", owner);
+            if key.contains(&want) {
+                eprintln!(
+                    "WRITE {} <- {:?} (was {:?})",
+                    key,
+                    cache.as_type(),
+                    self.types.get(&owner).map(|c| c.as_type().clone())
+                );
+                if std::env::var("GLUALS_TRACE_BT").is_ok() {
+                    eprintln!("{}", std::backtrace::Backtrace::force_capture());
+                }
+            }
+        }
+        if self
+            .types
+            .get(&owner)
+            .is_none_or(|existing| existing.as_type() != cache.as_type())
+        {
+            self.type_writes += 1;
+        }
         let file_id = owner.get_file_id();
         self.cache_refs.add(file_id, cache.as_type());
         let Some(previous) = self.types.insert(owner, cache) else {
@@ -1180,6 +1614,72 @@ impl LuaTypeIndex {
             })
             .collect();
 
+        let mut changed_files = HashSet::default();
+        for (owner, new_cache) in updates {
+            changed_files.insert(owner.get_file_id());
+            self.insert_type_cache(owner, new_cache);
+        }
+        self.rebuild_inference_derived_state(&changed_files);
+    }
+
+    /// Drops the cached types of members that were removed on their own,
+    /// rather than as part of a file sweep.
+    ///
+    /// A member whose owning table literal is gone leaves a cache entry no
+    /// re-index will reach, because the file it belongs to is not being
+    /// re-analysed.
+    pub fn remove_member_type_caches(&mut self, member_ids: &[crate::LuaMemberId]) {
+        for member_id in member_ids {
+            let owner = LuaTypeOwner::Member(*member_id);
+            if let Some(set) = self.in_filed_type_owner.get_mut(&member_id.file_id) {
+                set.remove(&owner);
+            }
+            // `cache_refs` has to come off with the cache, the way
+            // `insert_type_cache` and the file sweep both keep them in step.
+            if let Some(previous) = self.types.remove(&owner) {
+                self.cache_refs
+                    .remove(member_id.file_id, previous.as_type());
+            }
+            self.fact_metadata.remove(&owner);
+        }
+    }
+
+    pub fn remap_table_const(
+        &mut self,
+        map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
+    ) {
+        if map.is_empty() {
+            return;
+        }
+        // Only caches that actually name a table literal in one of the edited
+        // files can contain a range the map moves, and `cache_refs` already
+        // records which files those are. Scanning every cache in the workspace
+        // here would put a full-index walk on the per-keystroke path.
+        let source_files: HashSet<FileId> = map.keys().map(|range| range.file_id).collect();
+        let candidate_owners: HashSet<&LuaTypeOwner> = source_files
+            .iter()
+            .filter_map(|file_id| self.cache_refs.owners(&TypeCacheRef::File(*file_id)))
+            .flatten()
+            .filter_map(|owner_file_id| self.in_filed_type_owner.get(owner_file_id))
+            .flatten()
+            .collect();
+
+        let mut updates = Vec::new();
+        for owner in candidate_owners {
+            let Some(cache) = self.types.get(owner) else {
+                continue;
+            };
+            if let Some(new_type) = remap_table_ranges_in_type(cache.as_type(), map) {
+                let new_cache = match cache {
+                    LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
+                    LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
+                };
+                updates.push((owner.clone(), new_cache));
+            }
+        }
+        // `candidate_owners` comes out of a hash set, so the writes are ordered
+        // before they are applied.
+        updates.sort_unstable_by_key(|(owner, _)| format!("{:?}", owner));
         let mut changed_files = HashSet::default();
         for (owner, new_cache) in updates {
             changed_files.insert(owner.get_file_id());
@@ -1400,6 +1900,7 @@ impl LuaIndex for LuaTypeIndex {
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
         self.fact_metadata.clear();
+        self.decl_write_claims.clear();
         self.definition_facts.clear();
         self.inference_events_by_file.clear();
         self.support_file_dependents.clear();
@@ -1435,6 +1936,9 @@ impl LuaTypeIndex {
 
         if let Some(type_owners) = self.in_filed_type_owner.remove(&file_id) {
             for type_owner in type_owners {
+                if let LuaTypeOwner::Decl(decl_id) = &type_owner {
+                    self.decl_write_claims.remove(decl_id);
+                }
                 self.types.remove(&type_owner);
                 self.fact_metadata.remove(&type_owner);
             }

@@ -2,66 +2,63 @@
 
 ## Repository Scope
 
-- This repository is the Rust backend for GLuaLS, a Garry's Mod GLua language server forked from EmmyLua Analyzer Rust.
-- Garry's Mod correctness and large-workspace performance take priority. Generic Lua language-server compatibility is out of scope unless a task explicitly requires it.
-- The language server used by the VSCode extension is the primary product. `glua_check` and other tools must reuse the same analyzer behavior rather than grow separate rules.
-- Editor UI and shipped annotations live in adjacent repositories, usually `vscode-gmod-glua-ls` and `annotations-gmod-glua-ls`. Locate annotations through the adjacent checkout or `BENCH_ANNOTATIONS` when cross-repository validation is needed.
-- If expected GLua behavior is unclear, confirm the Garry's Mod semantics before implementing generic Lua behavior.
+- Rust backend for GLuaLS, forked from EmmyLua Analyzer Rust. Garry's Mod correctness and large-workspace performance are primary; generic Lua compatibility is out of scope unless explicitly required.
+- The VSCode language server is the product. `glua_check` and other tools must reuse the same analyzer behavior.
+- Editor UI and shipped annotations live in adjacent repos (`vscode-gmod-glua-ls`, `annotations-gmod-glua-ls`). Use the adjacent checkout or `BENCH_ANNOTATIONS` env var.
+- If GLua semantics are unclear, confirm Garry's Mod behavior before implementing generic Lua.
 
 ## Workspace Map
 
-- `crates/glua_code_analysis`: VFS, indexes, analyzer, semantic model, diagnostics, configuration, embedded resources, and most tests.
-- `crates/glua_ls`: LSP server and editor-facing handlers. Handlers should consume analyzer APIs and indexes, not reproduce semantic analysis.
-- `crates/glua_parser`: parser, AST, and syntax APIs.
-- `crates/glua_check`: CLI diagnostics runner and the preferred corpus-diagnostics entry point.
-- `crates/glua_doc_cli`, `crates/schema_to_glua`, and `tools/schema_json_gen`: documentation and schema tooling.
-- `tools/benchmark`: large-workspace benchmark. It requires `BENCH_CODEBASE` and `BENCH_ANNOTATIONS`.
-- `tools/determinism`: diagnostic determinism harness. It requires `DET_CODEBASE` and `DET_ANNOTATIONS`, and answers whether re-analysing a workspace yields the same diagnostics as building it cold. See the module docs for the stage list.
-- `tools/lsp_latency.js`: interactive latency harness. It requires `LSP_CODEBASE` and `LSP_ANNOTATIONS`, and drives a real `glua_ls` binary over stdio using the capabilities and cancellation behaviour VS Code actually uses. Reports completion and diagnostic latency settled versus mid-edit, and asserts that a cancelled diagnostic pull never returns an empty full report (which clears a file's diagnostics in VS Code). Use it before and after any change to reindexing or to the freshness gates — those costs are invisible to unit tests.
-- `docs/mintlify`: user documentation. Follow its nested `AGENTS.md` for changes under that tree.
+- `crates/glua_code_analysis`: VFS, indexes, analyzer, semantic model, diagnostics, config, embedded resources, most tests.
+- `crates/glua_ls`: LSP server and handlers. Consume analyzer APIs; do not reimplement analysis.
+- `crates/glua_parser`, `crates/glua_parser_desc`: parser, AST, syntax APIs.
+- `crates/glua_check`: CLI diagnostics runner; preferred corpus entry point.
+- `crates/glua_doc_cli`, `crates/schema_to_glua`, `tools/schema_json_gen`: docs and schema tooling.
+- `tools/benchmark`: large-workspace benchmark (`BENCH_CODEBASE` + `BENCH_ANNOTATIONS` required).
+- `tools/determinism`: determinism harness (`DET_CODEBASE` + `DET_ANNOTATIONS` required).
+- `tools/lsp_latency.js`: latency harness (`LSP_CODEBASE` + `LSP_ANNOTATIONS`); drives `glua_ls` over stdio with VS Code capabilities. Reports settled vs mid-edit latency and asserts cancelled diagnostic pulls never return empty reports. Run before/after reindexing or freshness-gate changes.
+- `docs/mintlify`: user documentation (see nested `AGENTS.md`).
 
 ## Analysis Architecture
 
-- `EmmyLuaAnalysis` in `crates/glua_code_analysis/src/lib.rs` is the top-level owner of workspace state, configuration, VFS, compilation, diagnostics, and incremental updates.
-- `glua_code_analysis` is the single source of semantic behavior. The LSP and `glua_check` should consume its indexes and APIs rather than implement their own versions of analysis rules.
-- GLuaLS defaults to and assumes `gmod.enabled` is on; disabling it is unsupported. Do not treat Garry's Mod behavior as an optional compatibility layer.
-- Extensible Garry's Mod API behavior is annotation-driven. Call roles, wrapper behavior, and guard metadata are shared through signature metadata; check `crates/glua_code_analysis/src/db_index/signature/gmod_domains.rs` before adding a name-based recognizer.
-- Realm and load-order analysis are first-class. Consider them when changing semantic or editor behavior, and reuse the shared analyzer/index support rather than adding feature-local heuristics. It is very important for the language server to be realm aware.
-- Realm evidence is not path-only: annotations, branches, load edges, filename conventions, and defaults can all contribute. Identically named declarations may legitimately coexist in different realms.
-- Analyzer phase ordering should be treated with caution since it can result in severe regressions, always double-check the current order as in the codebase before making changes.
-- Cross-file analysis should be indexed or precomputed. Diagnostics already provide shared batch data through `SharedDiagnosticData`; reuse it instead of scanning the workspace per file or request.
+- `EmmyLuaAnalysis` in `crates/glua_code_analysis/src/lib.rs` owns workspace state, VFS, compilation, diagnostics, and incremental updates.
+- `glua_code_analysis` is the single source of semantic behavior.
+- `gmod.enabled` defaults on; disabling is unsupported.
+- GMod API extensibility is annotation-driven via signature metadata; check `crates/glua_code_analysis/src/db_index/signature/gmod_domains.rs` before adding name-based recognizers.
+- Realm and load-order are first-class; reuse shared analyzer/index support. Realm evidence includes annotations, branches, load edges, filenames, and defaults — same name may coexist across realms.
+- Analyzer phase ordering is fragile; verify current order before changing it.
+- Cross-file work must be indexed. Reuse `SharedDiagnosticData` for diagnostics instead of per-file workspace scans.
 
 ## Change Requirements
 
-- Always load rust-best-practice skill, and if working on core language server API functionality, the language server spec skill.
-- Fix incorrect inference, realm, load, or member evidence at its root source. Suppressing a diagnostic or adding a special case usually hides the real bug.
-- Incremental edits may invalidate dependent files and cross-file caches. Test edit, deletion, and reopen behavior when changing indexes or cached inference.
-- Dynamic fields and flow narrowing are sensitive to ownership, source range, scope, realm visibility, and edit stability; preserve all of those dimensions.
-- VGUI/scripted classes and helpers such as `AccessorFunc` and `NetworkVar` often use indexed metadata or synthesized members rather than ordinary declarations. Extend the shared model instead of recognizing them separately in each feature.
-- Network diagnostics compare send/receive flows and operation order. Treat dynamic message names, payload branches, and read/write loops conservatively to avoid false positives.
-- Annotation metadata changes need both ingestion coverage and a downstream behavior test. Use the existing Garry's Mod builtins and fixtures rather than recreating behavior in the test.
-- Output derived from hash maps or parallel collection must be sorted before it reaches diagnostics, completions, code lenses, or snapshots.
-- Do not address performance problems with arbitrary budgets, caps, fragile pre-filters or broad work-skipping flags. Profile first, then prefilter, index, cache, or parallelize safe read-only work.
-- Configuration changes must update the config structs, `crates/glua_code_analysis/resources/schema.json`, generated schema output, and user documentation together. Run `cargo run --bin schema_json_gen` and inspect the resulting diff.
-- `.gluarc.json` is exclusive when present; otherwise configs are considered in order: `.luarc.json`, `.emmyrc.json`, `.emmyrc.lua`. Gamemode-base detection scans workspace roots, not the config-file directory.
-- Annotations are external library workspaces, not server-bundled files. Loading may come from `glua_check --gmod-annotations`, `glua_ls --gmod-annotations-path`, or the `gmod.annotationsPath` / `gmod.autoLoadAnnotations` settings.
+- Load `rust-best-practices` skill first; also `language-server-spec` for LSP work.
+- Fix inference/realm/load/member root cause; do not suppress diagnostics or add special cases.
+- Incremental edits may invalidate dependents and caches; test edit, delete, and reopen when changing indexes or cached inference. Preserve ownership, range, scope, realm, and edit stability for dynamic fields/flow narrowing.
+- VGUI/scripted classes (`AccessorFunc`, `NetworkVar`, etc.) use indexed/synthesized members; extend the shared model, don't duplicate per-feature.
+- Network diagnostics compare send/receive flows and order; be conservative with dynamic names, branches, and loops.
+- Annotation metadata changes need ingestion coverage plus a downstream behavior test via real builtins/fixtures.
+- Sort any output derived from hash maps or parallel collection before diagnostics/completions/snapshots.
+- No budgets, caps, or fragile prefilters for performance: they regress functionality on exactly the large or complex workspaces the server exists for. Profile first, then index/cache/optimize/parallelize. Fix performance at the root cause.
+- Config changes must update structs, `crates/glua_code_analysis/resources/schema.json`, and docs together. Run `cargo run --bin schema_json_gen` and commit the diff.
+- `.gluarc.json` is exclusive when present; otherwise consider `.luarc.json`, `.emmyrc.json`, `.emmyrc.lua` in order. Gamemode-base detection scans workspace roots.
+- Annotations are external library workspaces: `glua_check --gmod-annotations`, `glua_ls --gmod-annotations-path` (or `gmod.annotationsPath` / `gmod.autoLoadAnnotations` in config).
 
 ## Testing and Performance
 
-- Use `VirtualWorkspace` and realistic addon or gamemode paths when behavior depends on workspace layout, load order, or realm. Prefer the established Garry's Mod test modules and fixtures over isolated ad hoc cases.
-- Call-role and annotation-driven tests should load the relevant builtins; otherwise they may pass while bypassing the real metadata path.
-- Typical test commands are `cargo test -p glua_code_analysis <test_name>`, `cargo test -p glua_code_analysis`, and `cargo test`.
-- Use `glua_check` JSON output for before/after corpus diagnostic comparisons. The benchmark measures performance; it is not a diagnostics oracle.
-- Changes to indexes, cached inference, or the unresolve/resolution passes must keep incremental re-analysis equal to a cold build. Verify with `cargo run --release -p determinism` on a real workspace; `repeat`, `order`, `fresh`, `reindex`, `allreindex` and `mainexpand` are expected to report IDENTICAL. A third gate, `indexrepeat`, re-indexes each target with its text untouched and requires the **index** to come back identical; the diagnostic gates cannot see index drift, because re-analysis can attach different members or settle a decl's type differently and still produce the same diagnostics. It does **not** pass today (CityRP: 80 type caches, 2 signatures, 11 class members change on a no-op re-index) and that drift is why incremental work cannot be skipped — every "did this actually change?" test answers yes — so treat any *growth* in those counts as yours. Use `DET_TARGETS=gamemode/core/sh_data.lua` as the working repro: it expands to **4 files** and reproduces the same defect at 4/0/3, which is far cheaper to iterate on than the 1306-file one. The remaining drift sits in three readers, each proven by trace: the sibling-widening cache (`lua/stats.rs`, where `visible_member_count_for_owner_key` is 2 cold and 1 warm, so `lookup_widening_cache` returns `FirstSighting` and `get_widened_member_assignment_type` is never called, so nothing arms the settled retry); first-writer-wins on a decl slot (`common/mod.rs:206-215` deliberately keeps an `any`/`unknown` decl cache, pinned by three tests, so the slot is claimed by whichever writer arrives first and an unrelated later assignment can seed it); and attach-candidate lifetime (`analyzer/mod.rs:317-377`, whose retry list lives in a context that dies when `analyze()` returns, making member *existence* batch-dependent — it owns all 11 class-member drifts). Two dead ends already paid for: arming the settled retry from the `FirstSighting` arm fixes two entries and takes the 1306 gate from 80 to **144**, because it widens members cold previously left alone; and `rederive_contributed_member_assignments` cannot fix the widening class at all, because its `take_while` merges each writer only against *earlier* writers so a first writer is never re-derived. The defect is that analysis output depends on how the workspace was *batched*, not on the source alone: `remove_index(batch)` runs before `update_index(batch)`, so a file sees out-of-batch neighbours complete but in-batch neighbours empty until the walk reaches them. A whole-workspace batch hides everything and so reproduces the cold build exactly (`allreindex` and `mainexpand` are both byte-identical to cold); a four-file batch hides almost nothing and lands somewhere else. It is not edit-specific — `split:4` builds the same workspace cold in four batches and produces 299 different diagnostics against `split:1`. Do not "fix" it by re-indexing everything on an edit: that forces the whole-workspace batch, costs more than a cold build, and freezes the least-informed answer. `editrevert` is the drift gate for the *other* edit path. It applies a real edit through `update_file_by_uri` and then takes it back out; the source ends where it started, so the index and the diagnostics have to as well, and it needs no ground-truth build because the pre-edit index is the truth. It covers what the others cannot — `indexrepeat` re-indexes with the text untouched and so never exercises an edit's invalidation, and `noopedit`'s pair is semantically neutral, so the update path skips the re-index outright. It does **not** pass today: on CityRP an edit-and-revert of `gamemode/core/sh_util.lua` leaves 79 type caches, 3 signatures and 11 class member lists moved, plus 2 `need-check-nil` diagnostics. Treat growth in those counts as yours. Both index gates build their own analysis rather than sharing the caller's, because each re-indexes in place and leaves a converged index behind — sharing one let whichever ran second measure against the other's converged state and report a clean 0, which hid the drift rather than removing it. The two edit gates are `noopedit` (formerly `edit`) and `realedit`. `noopedit` gates the semantic no-op skip and nothing more: its edit pair is semantically unchanged, so the update path skips the re-index outright and the stage verifies that skipping preserves state — include at least one wide-expansion target (e.g. CityRP `gamemode/core/sh_util.lua`, 1300 files) so the skip is exercised where it matters most. `realedit` is the gate for incremental re-analysis itself, since its edit changes what the file means; set `DET_EDIT_FIND` and `DET_EDIT_REPLACE` or it skips and nothing gates re-analysis. It does **not** pass today, and the divergence is a known gap rather than something you introduced — but it is a small, fixed one, so measure it before and after your change and treat any *growth* as yours. On CityRP, editing `gamemode/core/sh_util.lua` (`function cityrp.util.Bind(self, callback)` gaining a parameter) gives `cold_edited -> warm: removed=0 added=2`, both `need-check-nil` in `plugins/cwweapons` (`cw_base/shared.lua:999`, `cw_m249_official/shared.lua:304`). The cause is visible in the index diff: a signature is identified by its position, an edit moves the positions of every signature after it, and `CallSiteParamIndex` contributions that *target* a moved signature are only dropped when the contributing file is itself re-indexed. A contributor outside the reindex expansion keeps pointing at the old position, so `rebuild_derived_state` splits one parameter's inferred type across the stale signature id and the current one (`15167` keeps one union arm, `15174` the other). Losing an arm widens callers' inferences to include `Unknown`, which is what makes `need-check-nil` fire downstream. Fixing it means invalidating contributions by *target* file and pulling those contributors into the reindex expansion, which changes the expansion set, so measure the benchmark as well when you do. Note it is far more sensitive than the other gates: changes to the unresolve waves, the infer-cache lifetime, or member ownership can break `realedit` while all seven others still report IDENTICAL. `mainreindex`, `exact`, `split:N` and `editmid` are bisect stages, not gates: the first three run `reindex_files_without_expansion`, which skips production's convergence passes, and `editmid` forces a real offset-shifting re-analysis of the expansion (the batch-composition confluence gap), so they are expected to diverge and only matter for localising a failure the gates already caught. Re-run it before and after, because a change can make a stage identical by *degrading* the cold build rather than by fixing the re-index.
-- Performance changes require profiling or a targeted before/after benchmark. Use `GLUALS_PROFILE=1` for phase timings and `cargo run --release -p benchmark` for the large-workspace harness.
-- For a sampling profile use `samply` (ETW-based on Windows, so it prompts for admin elevation on every run; the user has to approve it). Three things have to be right or you get a useless profile: build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark` so the PDB exists, run the binary from `target/release` (samply resolves the PDB by the relative path recorded in the exe, so it only finds it from that directory), and do **not** pass `--main-thread-only` — the tools run analysis on a spawned big-stack thread, so the main thread only shows a join. A working invocation is `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o <out>.json.gz ./benchmark.exe`. That writes `<out>.json.gz` plus a `<out>.json.syms.json` sidecar; the profile itself holds only addresses, so symbol names come from joining the two by `libs[].debugName` and the frame address against each module's `symbol_table` rva ranges.
-- Performance is extremely important; the language server must be quick and responsive on large workspaces without loss of functionality. You are to always optimise at the root cause of performance issues. Things such as budgets, string based prefilters / guards and other similar "hacks" are unacceptable since they will regress functionality in large or complex codebases.
+- Use `VirtualWorkspace` with realistic addon/gamemode paths; prefer existing GMod fixtures. Call-role tests must load relevant builtins.
+- Tests: `cargo test -p glua_code_analysis <filter>` | `cargo test -p glua_code_analysis` | `cargo test`.
+- Corpus diffs: `glua_check` JSON. Benchmark is for performance only.
+- Determinism (required for index/cache/unresolve changes): `cargo run --release -p determinism`. The harness module docs say what each gate proves and which stages are expected to diverge; read them before interpreting a result. Requires `DET_CODEBASE` and `DET_ANNOTATIONS`; set `DET_EDIT_FIND`/`DET_EDIT_REPLACE` for edit gates or they skip. Every gate must be `+0` diagnostics and `+0` index.
+  Gates: `repeat`, `fresh`, `order`, `reindex`, `allreindex`, `mainexpand`, `noopedit`, `realedit`, `editrevert`, `indexrepeat`, `burst`.
+  Bisect/debug only (expected to diverge): `mainreindex`, `exact`, `split:N`, `editmid`, `restabilize`, `perfile`, `expandwhy`, `faithful`.
+  Use `DET_TARGETS=gamemode/core/sh_data.lua` by default for edit target, `sh_configuration` is good for performance related tests (many related files).
+- Perf: `GLUALS_PROFILE=1` for phase timings; `cargo run --release -p benchmark` for large-workspace. For `samply` (ETW on Windows, needs elevation and therefore user permission first) three things have to be right or the profile is useless: build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark` so the PDB exists; run from `target/release`, because samply resolves the PDB by the relative path recorded in the exe; and do not pass `--main-thread-only`, because analysis runs on a spawned big-stack thread and the main thread only shows a join. Example: `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o out.json.gz ./benchmark.exe`. That writes `out.json.gz` plus an `out.json.syms.json` sidecar; the profile holds only addresses, so symbol names come from joining the two by `libs[].debugName` and the frame address against each module's `symbol_table` rva ranges.
 
 ## Commands
 
-- Format: `cargo fmt --all`.
-- CI-equivalent lint: `cargo clippy --workspace --all-targets --all-features -- -D warnings`.
-- Pre-commit hygiene: `pre-commit run --all --hook-stage manual`.
-- Local release build: `cargo build --release`, optionally with `-p glua_ls`, `-p glua_check`, or `-p glua_doc_cli`.
-- Shipped/CI optimized build: `cargo build --profile dist`.
-- Docs commands run from `docs/mintlify`: `mint dev` and `mint broken-links`.
+- `cargo fmt --all`
+- `cargo clippy --workspace --all-targets --all-features -- -D warnings`
+- `pre-commit run --all-files`, and `pre-commit run --all --hook-stage manual` to include the manual-stage hooks (mixed-line-ending)
+- `cargo build --release` [`-p glua_ls|glua_check|glua_doc_cli`]
+- `cargo build --profile dist` (shipped/CI optimized, thin LTO)
+- `docs/mintlify`: `mint dev` | `mint broken-links`

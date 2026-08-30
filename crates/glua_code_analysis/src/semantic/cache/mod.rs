@@ -123,6 +123,12 @@ pub struct LuaInferCache {
     /// templated tables, each use of the loop value can otherwise re-run the
     /// full iterator inference from the enclosing `for` statement.
     pub for_range_iter_var_type_cache: FxHashMap<LuaDeclId, CacheEntry<LuaType>>,
+    /// Cache for the in-place `ipairs` transform recogniser, keyed by the array
+    /// local's declaration. `None` means the block holds no such transform loop;
+    /// `Some((loop_end, element_type))` records where the transform completes and
+    /// the element type it leaves, so a read is answered without re-scanning the
+    /// declaration's block each time.
+    pub in_place_ipairs_transform_cache: FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>,
     pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
     pub local_reassignments_indexed: bool,
     pub dynamic_field_scope_metatable_cache:
@@ -136,6 +142,13 @@ pub struct LuaInferCache {
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
+    /// `GetParent` reads answered *through* a resolved vgui parent chain.
+    ///
+    /// The mirror of [`Self::vgui_parent_fallback_calls`]: a chain answer taken
+    /// before every group's relations landed can be one the final chain state
+    /// contradicts, so the files holding these reads are re-derived alongside
+    /// the fallback files once the chains settle.
+    pub vgui_parent_chain_calls: FxHashSet<LuaSyntaxId>,
     /// Call sites of a local function, keyed by its declaration. Syntax ids,
     /// not nodes: red nodes are `!Send`.
     pub local_function_call_sites_cache: FxHashMap<LuaDeclId, Arc<Vec<LuaSyntaxId>>>,
@@ -171,6 +184,7 @@ impl LuaInferCache {
             self_base_seed: None,
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
+            in_place_ipairs_transform_cache: FxHashMap::default(),
             local_reassignment_positions_cache: FxHashMap::default(),
             local_reassignments_indexed: false,
             dynamic_field_scope_metatable_cache: FxHashMap::default(),
@@ -179,6 +193,7 @@ impl LuaInferCache {
             dynamic_field_type_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::new(),
             vgui_parent_fallback_calls: FxHashSet::default(),
+            vgui_parent_chain_calls: FxHashSet::default(),
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
             inferred_guard_dependencies: HashSet::new(),
@@ -261,7 +276,52 @@ impl LuaInferCache {
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
+        self.vgui_parent_chain_calls.clear();
         self.call_returns_never_cache.clear();
+    }
+
+    /// Drops every narrowing answer this file has memoised.
+    ///
+    /// A *successful* flow answer survives
+    /// [`Self::clear_deferred_inference_results`], and narrowing a name reads
+    /// the type of whatever it was derived from — so once a value the walk read
+    /// as "not determined yet" becomes known, every answer that read it is
+    /// void, whichever variable it happens to be keyed under. There is no way
+    /// to drop only the ones that read it: the key names what was narrowed, not
+    /// what the narrowing consulted.
+    pub fn clear_flow_results(&mut self) {
+        self.flow_node_cache.clear();
+        self.flow_query_realm = None;
+        self.index_ref_origin_type_cache.clear();
+    }
+
+    /// Drops the narrowing answers that a settling value can have invalidated.
+    ///
+    /// An answer that came back undetermined is one the walk could not pin
+    /// down, so it is exactly what a value becoming known makes wrong. An
+    /// answer that determined something did not read that value as unsettled,
+    /// and those are the expensive ones to rebuild — a fifth of a cold index if
+    /// the whole cache goes.
+    pub fn clear_undetermined_flow_results(&mut self) {
+        fn settled(entry: &CacheEntry<LuaType>) -> bool {
+            match entry {
+                CacheEntry::Cache(typ) => !crate::db_index::is_undetermined_type(typ),
+                _ => false,
+            }
+        }
+        self.flow_node_cache.retain(|_, inner| {
+            inner.retain(|_, entry| settled(entry));
+            !inner.is_empty()
+        });
+        self.index_ref_origin_type_cache
+            .retain(|_, entry| settled(entry));
+    }
+
+    /// Discards what a `for ... in pairs(t)` answer was built from, so it can be
+    /// taken again against a member map that has since grown.
+    pub fn clear_iter_var_results(&mut self) {
+        self.clear_deferred_inference_results();
+        self.for_range_iter_var_type_cache.clear();
     }
 
     /// Discards the inference a wave of deferred resolution can have
@@ -317,6 +377,7 @@ impl LuaInferCache {
         self.dynamic_field_type_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
+        self.vgui_parent_chain_calls.clear();
     }
 
     pub fn get_flow_cache(
