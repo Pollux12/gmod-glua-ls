@@ -227,7 +227,13 @@ fn humanize_simple_type(
 
     let member_owner = LuaMemberOwner::Type(id.clone());
     let member_index = db.get_member_index();
-    let members = member_index.get_sorted_members(&member_owner)?;
+    let mut members = member_index.get_sorted_members(&member_owner)?;
+    // One key names one field. Several files writing it -- a `---@field` and a
+    // `function X.k() end`, say -- describe the same field, and listing it once
+    // per writer says nothing extra. Keeps the first in the index's own order,
+    // so the choice does not depend on the batch.
+    let mut seen_keys = std::collections::HashSet::new();
+    members.retain(|member| seen_keys.insert(member.get_key().clone()));
     let all_count = members.len();
     let mut member_strings = String::new();
     let mut function_vec = Vec::new();

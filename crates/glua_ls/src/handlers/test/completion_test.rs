@@ -1611,18 +1611,11 @@ mod tests {
             r#"
                 cfg.<??>
             "#,
-            vec![
-                VirtualCompletionItem {
-                    label: "alpha".to_string(),
-                    kind: CompletionItemKind::STRUCT,
-                    ..Default::default()
-                },
-                VirtualCompletionItem {
-                    label: "alpha".to_string(),
-                    kind: CompletionItemKind::INTERFACE,
-                    ..Default::default()
-                },
-            ],
+            vec![VirtualCompletionItem {
+                label: "alpha".to_string(),
+                kind: CompletionItemKind::INTERFACE,
+                ..Default::default()
+            }],
         ));
         Ok(())
     }
