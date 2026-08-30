@@ -8,6 +8,7 @@ use super::{
     super::{InferGuard, LuaInferCache, instantiate_type_generic, resolve_signature},
     InferFailReason, InferResult,
 };
+use crate::AsyncState;
 use crate::compilation::analyzer::unresolve::get_wrapped_callable_target_expr;
 use crate::{
     CacheEntry, DbIndex, InFiled, LuaArrayType, LuaFunctionType, LuaGenericType, LuaInstanceType,
@@ -132,6 +133,24 @@ pub fn infer_call_expr_func(
                 infer_union(db, cache, union, call_expr.clone(), args_count)
             }
         }
+        // Calling `any` yields `any`, the same answer every other reader of an
+        // `any` gets. Failing instead makes the call's type depend on whether
+        // some earlier write happened to reach the slot first: a member with
+        // two realm-branched definitions settles to `any`, so the walk can
+        // infer the call against a signature while a later unresolve retry
+        // infers it against the settled `any` and comes back undetermined.
+        // Which of the two lands is a property of how the workspace was
+        // batched, not of the source.
+        // The `...` param is what makes it accept any arity: the arity checker
+        // looks for that name, so omitting it reports every argument as
+        // redundant.
+        LuaType::Any => Ok(Arc::new(LuaFunctionType::new(
+            AsyncState::None,
+            false,
+            true,
+            vec![("...".to_string(), Some(LuaType::Any))],
+            LuaType::Any,
+        ))),
         _ => Err(InferFailReason::None),
     };
     let result = match result {
