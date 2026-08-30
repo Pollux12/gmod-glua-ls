@@ -181,6 +181,118 @@ impl CallSiteParamIndex {
         }
     }
 
+    /// Every signature of `file_id` this index still holds a reference to.
+    ///
+    /// `remove_files` drops what the file itself contributed, never what a
+    /// caller outside the re-index recorded about it, so these are the ids
+    /// that survive an edit on the old position.
+    pub fn stored_signature_ids_for_file(&self, file_id: FileId) -> HashSet<LuaSignatureId> {
+        let mut ids: HashSet<LuaSignatureId> = HashSet::default();
+        if let Some(signatures) = self.contributor_signatures_by_file.get(&file_id) {
+            ids.extend(signatures.iter().copied());
+        }
+        for consumer in self
+            .return_consumers_by_signature_file
+            .get(&file_id)
+            .into_iter()
+            .flatten()
+        {
+            ids.insert(consumer.signature_id);
+        }
+        for (_, contribution) in &self.deferred_contributions {
+            if contribution.signature_id.get_file_id() == file_id {
+                ids.insert(contribution.signature_id);
+            }
+        }
+        // Parked by `remove_files` before the new index existed, so nothing
+        // else will re-home it.
+        for (signature_id, _) in self.pending_previous_params.keys() {
+            if signature_id.get_file_id() == file_id {
+                ids.insert(*signature_id);
+            }
+        }
+        ids
+    }
+
+    /// Re-keys every stored reference to a signature the edit moved inside
+    /// `remap.file_id`, and drops the ones it destroyed.
+    ///
+    /// Returns the contributor files whose evidence named a destroyed
+    /// signature: their entry is gone and only re-analysing them can rebuild
+    /// it. The candidate signatures are looked up through the reverse indexes
+    /// rather than scanned - `remove_files` never touches a contribution filed
+    /// under a *caller* that is not itself being re-indexed, which is exactly
+    /// the set this has to fix.
+    pub fn remap_file_signatures(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let file_id = remap.file_id;
+        let candidates = self.stored_signature_ids_for_file(file_id);
+
+        let mut moved = HashMap::default();
+        let mut lost: HashSet<LuaSignatureId> = HashSet::default();
+        for signature_id in candidates {
+            match remap.signature_id(signature_id) {
+                crate::Remap::Moved(new_id) => {
+                    if new_id != signature_id {
+                        moved.insert(signature_id, new_id);
+                    }
+                }
+                crate::Remap::Unrelated => {}
+                crate::Remap::Lost => {
+                    lost.insert(signature_id);
+                }
+            }
+        }
+
+        let mut dirty = HashSet::default();
+        if !lost.is_empty() {
+            for signature_id in &lost {
+                if let Some(files) = self.contributor_files_by_signature.remove(signature_id) {
+                    dirty.extend(files);
+                }
+                if let Some(signatures) = self
+                    .contributor_signatures_by_file
+                    .get_mut(&signature_id.get_file_id())
+                {
+                    signatures.remove(signature_id);
+                }
+            }
+            for (contributor, contributions) in &mut self.file_contributions {
+                let before = contributions.len();
+                contributions.retain(|c| !lost.contains(&c.signature_id));
+                if contributions.len() != before {
+                    dirty.insert(*contributor);
+                }
+            }
+            self.deferred_contributions.retain(|(contributor, c)| {
+                let keep = !lost.contains(&c.signature_id);
+                if !keep {
+                    dirty.insert(*contributor);
+                }
+                keep
+            });
+            for (consumer_file, consumers) in &mut self.file_return_consumers {
+                let before = consumers.len();
+                consumers.retain(|c| !lost.contains(&c.signature_id));
+                if consumers.len() != before {
+                    dirty.insert(*consumer_file);
+                }
+            }
+            self.pending_previous_params
+                .retain(|(signature_id, _), _| !lost.contains(signature_id));
+        }
+
+        if !moved.is_empty() {
+            self.remap_signatures(&moved);
+        }
+        if !moved.is_empty() || !lost.is_empty() {
+            self.rebuild_derived_state();
+            self.rebuild_return_consumers();
+            self.rebuild_source_dependents();
+        }
+        dirty.remove(&file_id);
+        dirty
+    }
+
     /// Old → new signature id for every source function this batch re-indexed
     /// that kept its access path but changed position.
     ///

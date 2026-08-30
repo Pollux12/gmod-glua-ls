@@ -218,6 +218,76 @@ impl DynamicFieldIndex {
         }
     }
 
+    /// Re-keys the table-literal owners in the edited file and drops the
+    /// groups whose literal the edit destroyed.
+    ///
+    /// Returns the files that contributed a field to a destroyed group: a
+    /// dynamic field is filed under the literal's range and a write from
+    /// another file is not re-collected when this one is re-indexed, so
+    /// nothing else rebuilds it.
+    pub fn remap_file_table_owners(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let owners: HashSet<DynamicFieldOwner> = self
+            .owner_fields
+            .keys()
+            .chain(self.field_definitions.keys())
+            .chain(self.direct_field_definitions.keys())
+            .chain(self.finite_named_members.keys())
+            .chain(self.wildcard_definitions.keys())
+            .filter(|owner| {
+                matches!(owner, DynamicFieldOwner::Table(range) if range.file_id == remap.file_id)
+            })
+            .cloned()
+            .collect();
+
+        let mut moved = rustc_hash::FxHashMap::default();
+        let mut lost: HashSet<DynamicFieldOwner> = HashSet::new();
+        for owner in owners {
+            let DynamicFieldOwner::Table(range) = &owner else {
+                continue;
+            };
+            match remap.table_range(range) {
+                crate::Remap::Moved(new) => {
+                    if &new != range {
+                        moved.insert(range.clone(), new);
+                    }
+                }
+                crate::Remap::Unrelated => {}
+                crate::Remap::Lost => {
+                    lost.insert(owner);
+                }
+            }
+        }
+
+        self.remap_table_ranges(&moved);
+
+        let mut dirty = HashSet::new();
+        if !lost.is_empty() {
+            for owner in &lost {
+                self.owner_fields.remove(owner);
+                self.field_definitions.remove(owner);
+                self.direct_field_definitions.remove(owner);
+                self.finite_named_members.remove(owner);
+                self.wildcard_definitions.remove(owner);
+            }
+            for (file_id, entries) in &mut self.file_contributions {
+                let before = entries.len();
+                entries.retain(|(owner, _, _)| !lost.contains(owner));
+                if entries.len() != before {
+                    dirty.insert(*file_id);
+                }
+            }
+            for (file_id, entries) in &mut self.wildcard_file_contributions {
+                let before = entries.len();
+                entries.retain(|(owner, _)| !lost.contains(owner));
+                if entries.len() != before {
+                    dirty.insert(*file_id);
+                }
+            }
+        }
+        dirty.remove(&remap.file_id);
+        dirty
+    }
+
     /// Re-keys owners whose table literal shifted offset.
     ///
     /// A dynamic field is filed under the literal's range, and a write from

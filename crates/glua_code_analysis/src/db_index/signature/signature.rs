@@ -808,7 +808,6 @@ impl<'de> Deserialize<'de> for LuaSignatureId {
 }
 
 impl LuaSignatureId {
-    #[cfg(test)]
     pub(crate) fn new(file_id: FileId, position: TextSize) -> Self {
         Self { file_id, position }
     }
