@@ -37,7 +37,10 @@ pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerT
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};
 pub use diagnostic::{AnalyzeError, DiagnosticAction, DiagnosticActionKind, DiagnosticIndex};
-pub use dynamic_field::{DynamicFieldIndex, DynamicFieldOwner, is_pure_wildcard_registry};
+pub use dynamic_field::{
+    DynamicFieldIndex, DynamicFieldOwner, canonical_dynamic_field_owner, dynamic_field_owner_of,
+    is_pure_wildcard_registry,
+};
 pub use edit::*;
 pub use flow::*;
 pub use global::{GlobalId, LuaGlobalIndex};

@@ -4,12 +4,49 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use super::traits::LuaIndex;
-use crate::{DbIndex, FileId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId};
+use crate::{
+    DbIndex, FileId, GlobalId, InFiled, LuaMemberId, LuaMemberKey, LuaMemberOwner, LuaTypeDeclId,
+};
 
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
 pub enum DynamicFieldOwner {
     Type(LuaTypeDeclId),
     Table(InFiled<TextRange>),
+    /// A global path whose table several files bootstrap. Keyed by the path
+    /// rather than by one of its literals, so `X.k[v] = w` written against any
+    /// of them lands in the bucket every reader of `X.k` consults.
+    GlobalPath(GlobalId),
+}
+
+/// The one owner a dynamic field written on `owner` belongs to.
+///
+/// Mirrors [`crate::LuaMemberIndex::canonical_owner`]: a table literal that
+/// initialises a global path is not an owner of its own, so a field registered
+/// on it belongs to the path (or, once the path's declaration carries a
+/// `---@class`, to that class). Literals that initialise nothing keep their
+/// range, exactly as before.
+pub fn canonical_dynamic_field_owner(db: &DbIndex, owner: DynamicFieldOwner) -> DynamicFieldOwner {
+    let DynamicFieldOwner::Table(range) = &owner else {
+        return owner;
+    };
+    match db
+        .get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+    {
+        LuaMemberOwner::GlobalPath(path) => DynamicFieldOwner::GlobalPath(path),
+        LuaMemberOwner::Type(type_id) => DynamicFieldOwner::Type(type_id),
+        _ => owner,
+    }
+}
+
+/// The canonical dynamic-field owner a member owner names.
+pub fn dynamic_field_owner_of(db: &DbIndex, owner: &LuaMemberOwner) -> Option<DynamicFieldOwner> {
+    match db.get_member_index().canonical_owner(owner.clone()) {
+        LuaMemberOwner::Type(type_id) => Some(DynamicFieldOwner::Type(type_id)),
+        LuaMemberOwner::GlobalPath(path) => Some(DynamicFieldOwner::GlobalPath(path)),
+        LuaMemberOwner::Element(range) => Some(DynamicFieldOwner::Table(range)),
+        LuaMemberOwner::LocalUnresolve => None,
+    }
 }
 
 /// True when a wildcard (computed-key) assignment is the *only* thing known
@@ -30,7 +67,9 @@ pub fn is_pure_wildcard_registry(db: &DbIndex, owner: &DynamicFieldOwner) -> boo
     let member_owner = match owner {
         DynamicFieldOwner::Type(id) => LuaMemberOwner::Type(id.clone()),
         DynamicFieldOwner::Table(range) => LuaMemberOwner::Element(range.clone()),
+        DynamicFieldOwner::GlobalPath(path) => LuaMemberOwner::GlobalPath(path.clone()),
     };
+    let member_owner = db.get_member_index().canonical_owner(member_owner);
     db.get_member_index()
         .get_members(&member_owner)
         .is_none_or(|members| {
@@ -305,7 +344,7 @@ impl DynamicFieldIndex {
                 DynamicFieldOwner::Table(range) => map
                     .get(range)
                     .map(|new| DynamicFieldOwner::Table(new.clone())),
-                DynamicFieldOwner::Type(_) => None,
+                DynamicFieldOwner::Type(_) | DynamicFieldOwner::GlobalPath(_) => None,
             }
         }
 
@@ -374,7 +413,7 @@ impl DynamicFieldIndex {
         fn owner_range(owner: &DynamicFieldOwner) -> Option<InFiled<TextRange>> {
             match owner {
                 DynamicFieldOwner::Table(range) => Some(range.clone()),
-                DynamicFieldOwner::Type(_) => None,
+                DynamicFieldOwner::Type(_) | DynamicFieldOwner::GlobalPath(_) => None,
             }
         }
         self.owner_fields

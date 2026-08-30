@@ -13,9 +13,7 @@ use crate::{
 
 use super::{
     AnalyzeContext,
-    common::{
-        TypeCacheWriteMode, migrate_global_path_members_when_owner_resolved, write_type_cache,
-    },
+    common::{TypeCacheWriteMode, write_type_cache},
     gmod::ensure_scoped_class_type_decl_for_file,
 };
 use glua_parser::{
@@ -287,17 +285,7 @@ impl<'a> DeclAnalyzer<'a> {
     }
 
     fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
-        let global_id = match (&owner, member.get_feature().is_meta_decl()) {
-            (LuaMemberOwner::GlobalPath(global_id), true) => Some(global_id.clone()),
-            _ => None,
-        };
-        let member_id = self.db.get_member_index_mut().add_member(owner, member);
-
-        if let Some(global_id) = global_id {
-            migrate_global_path_members_when_owner_resolved(self.db, &global_id);
-        }
-
-        member_id
+        self.db.get_member_index_mut().add_member(owner, member)
     }
 
     pub fn get_decl_tree(self) -> LuaDeclarationTree {

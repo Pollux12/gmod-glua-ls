@@ -694,6 +694,10 @@ struct IndexSnapshot {
     /// lookup, which falls back to a by-name search and can land on a sibling.
     super_types: BTreeMap<String, String>,
     class_members: BTreeMap<String, String>,
+    /// Each global path's table literals, sorted. Member ownership is derived
+    /// from this, so a site list that moves between two runs is drift the
+    /// member set can hide.
+    definition_sites: BTreeMap<String, String>,
     signatures: BTreeMap<String, String>,
     decls: HashDumpResult,
     decl_references: HashDumpResult,
@@ -957,6 +961,24 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
+    let mut definition_sites = BTreeMap::new();
+    for (path, sites) in db.get_member_index().sorted_definition_sites() {
+        definition_sites.insert(
+            path.get_name().to_string(),
+            sites
+                .iter()
+                .map(|site| {
+                    format!(
+                        "{}@{:?}",
+                        file_label(analysis, site.file_id),
+                        (u32::from(site.value.start()), u32::from(site.value.end()))
+                    )
+                })
+                .collect::<Vec<_>>()
+                .join(","),
+        );
+    }
+
     // Resolved signature shapes. `inferred_params` covers only call-site-derived
     // facts; a signature's own param and return types are a separate index.
     let mut signatures = BTreeMap::new();
@@ -1197,6 +1219,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         inferred_params,
         super_types,
         class_members,
+        definition_sites,
         signatures,
         decls: decls.finish(),
         decl_references: decl_references.finish(),
@@ -1231,6 +1254,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("PARAM", &snapshot.inferred_params),
             ("SUPER", &snapshot.super_types),
             ("CLSMEM", &snapshot.class_members),
+            ("DEFSITE", &snapshot.definition_sites),
             ("SIG", &snapshot.signatures),
         ] {
             for (key, value) in map {
@@ -1383,6 +1407,12 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             "CM",
             &base.class_members,
             &other.class_members,
+        ),
+        (
+            "definition_sites",
+            "DEFSITE",
+            &base.definition_sites,
+            &other.definition_sites,
         ),
         (
             "inferred_params",

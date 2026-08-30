@@ -27,10 +27,7 @@ use crate::{
     LuaTypeCache, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag, LuaTypeOwner,
     compilation::analyzer::{
         AnalysisPipeline, AnalyzeContext,
-        common::{
-            TypeCacheWriteMode, add_member, migrate_global_members_when_type_resolve,
-            write_type_cache,
-        },
+        common::{TypeCacheWriteMode, add_member, write_type_cache},
     },
     db_index::rebuild_effective_valid_guard_signatures,
     db_index::{
@@ -3881,7 +3878,6 @@ fn collect_scripted_scope_type_bindings_with(
             LuaTypeCache::InferType(LuaType::Def(class_decl_id.clone())),
             TypeCacheWriteMode::ForceOverwrite,
         );
-        migrate_global_members_when_type_resolve(db, decl_id.into());
 
         if let Some(LuaType::TableConst(table_range)) = previous_decl_type {
             let table_member_owner = LuaMemberOwner::Element(table_range);

@@ -738,6 +738,7 @@ fn humanize_table_const_type_detail_and_simple(
 fn owner_has_dynamic_wildcard(db: &DbIndex, owner: &LuaMemberOwner) -> bool {
     let dynamic_owner = match owner {
         LuaMemberOwner::Type(type_id) => DynamicFieldOwner::Type(type_id.clone()),
+        LuaMemberOwner::GlobalPath(path) => DynamicFieldOwner::GlobalPath(path.clone()),
         LuaMemberOwner::Element(table_range) => DynamicFieldOwner::Table(table_range.clone()),
         _ => return false,
     };
