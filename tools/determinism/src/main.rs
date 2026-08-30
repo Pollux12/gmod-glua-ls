@@ -5,45 +5,35 @@
 //! `init_analysis` does, then re-analyses it in various ways and diffs both the
 //! diagnostic sets and the derived indexes they are read from.
 //!
-//! The stages are ordered by how much they re-analyse, which is what makes a
-//! divergence diagnosable: if `allreindex` matches cold but `mainreindex` does
-//! not, re-analysis itself is sound and the gap is in which files a partial
-//! re-index covers; if `allreindex` diverges too, per-file removal is leaving
-//! state behind. `mainexpand` is the production path — it is the one that has to
-//! be identical.
+//! The stages are ordered by how much they re-analyse, which localises a
+//! divergence: `allreindex` matching cold while `mainreindex` does not puts the
+//! gap in which files a partial re-index covers; both diverging puts it in
+//! per-file removal.
 //!
 //! # Release gates vs bisect stages
 //!
-//! Only some stages are pass/fail. The gates are `repeat`, `noopedit`,
-//! `realedit`, `mainexpand`, `allreindex`, `reindex`, `order` and `fresh`: each
-//! of these runs a path the language server actually takes (or a ground-truth
-//! rebuild), so any divergence one of them reports is a defect that ships.
+//! Gates: `repeat`, `fresh`, `order`, `reindex`, `allreindex`, `mainexpand`,
+//! `noopedit`, `realedit`, `editrevert`, `indexrepeat`, `burst`. Each runs a
+//! path the language server takes, or a ground-truth rebuild. Every one must
+//! report `+0` diagnostics and `+0` index.
 //!
-//! `noopedit` and `realedit` gate different halves of editing. `noopedit`
-//! verifies that the semantic no-op gate skips the re-index and that skipping
-//! preserves state — it cannot verify re-analysis, because its edit pair is
-//! exactly what that gate rejects as meaningless. `realedit` is the gate for
-//! re-analysis itself: its edit changes what the file means, so the incremental
-//! result has to land where a cold build of the edited source lands. It does
-//! not reach zero today — see AGENTS.md for the known divergence and its cause
-//! — so measure it before and after a change and treat any *growth* as yours.
+//! `noopedit` and `realedit` gate different halves of editing. `noopedit` gates
+//! the semantic no-op skip; its edit pair is what that gate rejects, so it
+//! cannot reach re-analysis. `realedit`'s edit changes what the file means, so
+//! it gates re-analysis against a cold build of the edited source.
 //!
-//! `mainreindex`, `exact`, `editmid` and `split:N` are **bisect stages** — diagnostic
-//! instruments, not gates, and they are expected to diverge. Both `mainreindex`
-//! and `exact` go through `reindex_files_without_expansion`, which deliberately
-//! skips three convergence passes that production's `reindex_files` performs
+//! Bisect stages, expected to diverge: `mainreindex`, `exact`, `editmid`,
+//! `split:N`. `mainreindex` and `exact` run `reindex_files_without_expansion`,
+//! which skips three convergence passes production performs
 //! (`refresh_file_source_dependencies`,
-//! `reindex_changed_inferred_guard_references` and
-//! `reindex_changed_inferred_param_consumers`). They are "production minus its
-//! fixpoint": a divergence there localises which file's re-analysis perturbs a
-//! fact, and is only a defect if `mainexpand` diverges too. `split:N` likewise
-//! only answers whether a fact depends on batch composition.
+//! `reindex_changed_inferred_guard_references`,
+//! `reindex_changed_inferred_param_consumers`). A divergence there localises
+//! which file's re-analysis perturbs a fact. `split:N` answers whether a fact
+//! depends on batch composition.
 //!
-//! `restabilize` is its own thing: it is a demonstration that re-running does
-//! not converge, not a stage anything is expected to pass.
-//!
-//! `expandwhy` and `faithful` are measurements, not comparisons: they report
-//! numbers rather than diff two snapshots, so they pass or fail nothing.
+//! `restabilize` demonstrates that re-running without removing first does not
+//! converge. `expandwhy` and `faithful` report numbers rather than diff
+//! snapshots, so they gate nothing.
 //!
 //! Example:
 //!   DET_CODEBASE=/path/to/addon DET_ANNOTATIONS=/path/to/annotations/output \
@@ -67,22 +57,11 @@
 //!                     indexrepeat
 //!                               re-index each DET_TARGETS entry with its text
 //!                               untouched and require the INDEX to come back
-//!                               identical. The diagnostic gates cannot see
-//!                               this: re-analysing a file can attach different
-//!                               members, or settle a decl's type differently
-//!                               from the cold build, and still produce the same
-//!                               diagnostics — `repeat` and `noopedit` both
-//!                               report IDENTICAL while the index underneath has
-//!                               drifted. That drift is why no incremental work
-//!                               can be skipped: every "did this actually
-//!                               change?" test answers yes. Does **not** pass
-//!                               today (CityRP: 82 type caches, 3 signatures and
-//!                               11 class members change), and it is a real
-//!                               defect rather than a harness artefact, so treat
-//!                               any *growth* in those counts as yours. Listed
-//!                               last in the default set because it re-indexes
-//!                               in place and leaves that warm state behind, so
-//!                               an in-place stage after it inherits it.
+//!                               identical. Catches drift the diagnostic gates
+//!                               cannot see. Honours DET_INDEXREPEAT_ROUNDS
+//!                               (default 1). Listed last in the default set: it
+//!                               re-indexes in place, so an in-place stage after
+//!                               it inherits that warm state.
 //!                     editmid   offset-shifting no-op edit pair (newline at the
 //!                               front of the file, then removed): the semantic
 //!                               no-op gate cannot fire, so both edits run the
@@ -196,16 +175,12 @@ use std::alloc::{GlobalAlloc, Layout};
 
 /// mimalloc, plus a count of every allocation it hands out.
 ///
-/// A sampling profiler blames the allocator, never the code that asked for the
-/// memory, so it cannot answer "is this phase allocation-bound?". Counting can:
-/// `GLUALS_PROFILE=1` prints allocations alongside each phase's cost, and
-/// dividing by the phase's unit of work gives allocations-per-step directly.
+/// A sampling profiler blames the allocator rather than the caller.
+/// `GLUALS_PROFILE=1` prints allocation counts alongside each phase's cost.
 struct CountingMiMalloc;
 
-/// Sample one in every `DET_ALLOC_SAMPLE` allocations and record where it came
-/// from. This is a poor-man's allocation profiler: it attributes allocations to
-/// source locations, which a CPU sampling profiler cannot do (it blames the
-/// allocator) — and it works even where external profilers fail to read the PDB.
+/// Sample one in every `DET_ALLOC_SAMPLE` allocations and record its source
+/// location.
 mod alloc_sample {
     use std::collections::HashMap;
     use std::sync::Mutex;
@@ -227,11 +202,9 @@ mod alloc_sample {
     /// Raw instruction pointers for the current stack, innermost first. Returns
     /// how many of `buffer` were filled.
     ///
-    /// `backtrace::trace` goes through dbghelp's StackWalkEx on Windows, which
-    /// takes a process-wide lock and costs milliseconds per capture: a full run
-    /// never finished. `RtlCaptureStackBackTrace` unwinds via the x64 unwind
-    /// tables instead and costs microseconds. Elsewhere the crate's own unwinder
-    /// is already cheap enough.
+    /// Windows uses `RtlCaptureStackBackTrace`, which unwinds via the x64
+    /// unwind tables. `backtrace::trace` goes through dbghelp's StackWalkEx
+    /// there, taking a process-wide lock and costing milliseconds per capture.
     #[cfg(windows)]
     fn capture(buffer: &mut [*mut std::ffi::c_void]) -> usize {
         let captured = unsafe {
@@ -265,9 +238,8 @@ mod alloc_sample {
     /// Frame address -> number of sampled allocations whose stack contained it.
     /// Addresses are resolved to names once, at report time.
     static FRAMES: Mutex<Option<HashMap<usize, u64>>> = Mutex::new(None);
-    /// Ordered stacks (innermost first) -> count. Kept alongside FRAMES because
-    /// "which of our functions asked for this memory" needs frame order, which
-    /// the flat per-frame tally throws away.
+    /// Ordered stacks (innermost first) -> count. Kept alongside FRAMES, whose
+    /// flat per-frame tally throws frame order away.
     type StackCounts = HashMap<Box<[usize]>, u64>;
     static STACKS: Mutex<Option<StackCounts>> = Mutex::new(None);
 
@@ -336,10 +308,9 @@ mod alloc_sample {
         });
     }
 
-    /// Attribute each sampled allocation to the innermost frame belonging to our
-    /// own crates. The inclusive tally says an allocation happened *somewhere*
-    /// under a function; this says which of our functions actually asked for the
-    /// memory, which is the line you can go and change.
+    /// Attribute each sampled allocation to the innermost frame in our own
+    /// crates. The inclusive tally says an allocation happened somewhere under a
+    /// function; this says which function asked for it.
     fn nearest_caller_report(top: usize) {
         let stacks = STACKS.lock().unwrap_or_else(|p| p.into_inner());
         let Some(stacks) = stacks.as_ref() else {
@@ -542,9 +513,8 @@ fn build_analysis(codebase: &Path, annotations: &Path) -> EmmyLuaAnalysis {
     build_analysis_with(codebase, annotations, Order::Natural, 1, &[])
 }
 
-/// Comparison key for a workspace file path. The override list is written by
-/// hand from `DET_TARGETS`, so it has to match what the loader collected
-/// regardless of separator or case.
+/// Comparison key for a workspace file path. `DET_TARGETS` is written by hand,
+/// so it has to match the loader's paths regardless of separator or case.
 fn path_key(path: &Path) -> String {
     path.to_string_lossy().replace('\\', "/").to_lowercase()
 }
@@ -689,12 +659,11 @@ fn collect(analysis: &EmmyLuaAnalysis, label: &str) -> BTreeSet<Snapshot> {
 struct IndexSnapshot {
     type_caches: BTreeMap<String, String>,
     /// How each cached type was reached, under `DET_PROVENANCE`. Diffed apart
-    /// from the type so a value that stayed put while the reasoning behind it
-    /// moved is still visible.
+    /// from the type, so a value that stayed put while its reasoning moved is
+    /// still visible.
     type_facts: BTreeMap<String, String>,
     /// The assignment-contribution store, under `DET_PROVENANCE`: which writers
-    /// each owner/key group merges. A member's type is a function of this, so a
-    /// group that gains or loses a writer explains a drifting type directly.
+    /// each owner/key group merges. A member's type is a function of this.
     contribution_groups: BTreeMap<String, String>,
     /// Where each member is currently homed, under `DET_PROVENANCE`. Class
     /// member lists and contribution groups are both keyed off this.
@@ -702,9 +671,8 @@ struct IndexSnapshot {
     members: BTreeSet<String>,
     net_flows: Vec<String>,
     inferred_params: BTreeMap<String, String>,
-    /// Class hierarchy. A `---@class A : B` link that survives a cold build but
-    /// not a partial re-index silently breaks inherited-member lookup, which
-    /// then falls back to a by-name search and can land on a sibling class.
+    /// Class hierarchy. A dropped `---@class A : B` link breaks inherited-member
+    /// lookup, which falls back to a by-name search and can land on a sibling.
     super_types: BTreeMap<String, String>,
     class_members: BTreeMap<String, String>,
     signatures: BTreeMap<String, String>,
@@ -715,10 +683,9 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     let type_index = db.get_type_index();
     let mut type_caches = BTreeMap::new();
     let mut type_facts: BTreeMap<String, String> = BTreeMap::new();
-    // `DET_PROVENANCE=1` records how each cached type was reached, not just what
-    // it is. Drift entries then carry the pass that produced them on both sides,
-    // so the whole set can be grouped by cause in one run rather than traced one
-    // at a time.
+    // `DET_PROVENANCE=1` records how each cached type was reached, so drift
+    // entries carry the producing pass on both sides and can be grouped by
+    // cause.
     let with_provenance = std::env::var_os("DET_PROVENANCE").is_some();
     for (owner, cache) in type_index.iter_type_caches() {
         let value = format!("{:?}", cache.as_type());
@@ -737,10 +704,9 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 None => ("-".into(), "-".into(), String::new()),
             };
             let doc = if cache.is_doc() { "doc" } else { "infer" };
-            // How many writers this member's value is merged from, and whether
-            // any of them contributed an unsettled type. If drift tracks these
-            // rather than the individual site, the cause is the merge, not the
-            // sites.
+            // How many writers this member's value merges, and whether any
+            // contributed an unsettled type. Drift tracking these rather than
+            // the individual site points at the merge.
             let writers = match owner {
                 glua_code_analysis::LuaTypeOwner::Member(member_id) => {
                     let member_index = db.get_member_index();
@@ -799,9 +765,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
 
     let mut super_types = BTreeMap::new();
     // Ordered member list per class. Two members can share a key (a doc `@field`
-    // and a file define, or two partial-class contributions); which one wins is
-    // decided by this order, so drift here silently changes overload selection
-    // without changing the member set at all.
+    // and a file define, or two partial-class contributions) and this order picks
+    // the winner, so drift changes overload selection without changing the set.
     let mut class_members = BTreeMap::new();
     for type_decl in type_index.get_all_types() {
         let decl_id = type_decl.get_id();
@@ -830,9 +795,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
-    // Same visible-item view for *non-type* owners (table constants, element
-    // owners, global paths). Those decide member lookup on anonymous tables,
-    // and drift there is invisible to `class_members`.
+    // The same visible-item view for non-type owners (table constants, element
+    // owners, global paths), which decide member lookup on anonymous tables.
     for (key, owner) in &all_owners {
         if let Some(members) = db.get_member_index().get_members(owner) {
             let ordered = members
@@ -843,9 +807,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
-    // Resolved signature shapes. `inferred_params` only covers call-site-derived
-    // facts; the signature's own param and return types are a separate index and
-    // drift there changes overload selection without moving a single member.
+    // Resolved signature shapes. `inferred_params` covers only call-site-derived
+    // facts; a signature's own param and return types are a separate index.
     let mut signatures = BTreeMap::new();
     for (signature_id, signature) in db.get_signature_index().iter() {
         signatures.insert(
@@ -879,8 +842,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         net_flows.len()
     );
     // Where every member ended up. Contribution groups and class member lists
-    // are both keyed off this, so a member homed differently explains drift in
-    // either without having to trace them apart.
+    // are both keyed off this.
     let mut member_owners = BTreeMap::new();
     if with_provenance {
         for file_id in db.get_vfs().get_all_file_ids() {
@@ -898,9 +860,8 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         }
     }
 
-    // Every assignment-contribution group, so a writer that landed under the
-    // wrong owner is visible as a group that moved rather than as a member
-    // whose type merely changed.
+    // Every assignment-contribution group, so a writer homed under the wrong
+    // owner shows as a moved group rather than a changed type.
     let mut contribution_groups = BTreeMap::new();
     if with_provenance {
         let all_files = db.get_vfs().get_all_file_ids().into_iter().collect();
@@ -1177,16 +1138,13 @@ fn diff(base_label: &str, base: &BTreeSet<Snapshot>, label: &str, other: &BTreeS
 /// Re-index the targets without touching their text and require the index to
 /// come back byte-identical.
 ///
-/// The diagnostic gates cannot see this: re-analysing a file can attach members
-/// or settle a decl's type differently from the cold build and still produce the
-/// same diagnostics, so `repeat` and `noopedit` both report IDENTICAL while the
-/// index underneath has drifted. That drift is what makes incremental work
-/// impossible to skip — every "did this actually change?" test reports yes — so
-/// it needs a gate of its own.
+/// Catches drift the diagnostic gates cannot see: re-analysing a file can attach
+/// members or settle a decl's type differently and still produce the same
+/// diagnostics.
 ///
-/// Like `editrevert` it builds its own analysis, for the same reason: sharing
-/// one with the other index gate lets whichever runs second measure against an
-/// already-converged index and report a clean 0.
+/// Builds its own analysis, as `editrevert` does: sharing one with the other
+/// index gate lets whichever runs second measure against an already-converged
+/// index.
 fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
     let analysis = &mut build_analysis(codebase, annotations);
     for target in targets {
@@ -1214,12 +1172,8 @@ fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
             }
         }
 
-        // Re-indexing the same unchanged file again asks whether the index is
-        // converging on a fixed point or just oscillating. Round 1 measures the
-        // cold build against a re-index; every later round measures a re-index
-        // against the one before it, so a shrinking count means the cold build
-        // had simply not settled, while a steady one means each pass invents a
-        // fresh answer.
+        // Round 1 measures the cold build against a re-index; every later round
+        // measures a re-index against the one before it.
         let rounds = std::env::var("DET_INDEXREPEAT_ROUNDS")
             .ok()
             .and_then(|raw| raw.parse::<usize>().ok())
@@ -1242,10 +1196,9 @@ fn run_index_repeat(codebase: &Path, annotations: &Path, targets: &[String]) {
 
 /// Applies a semantically-neutral edit pair and lets the analysis settle.
 ///
-/// `at_front` decides which kind: appending a trailing newline is a semantic
-/// no-op the update gate can skip outright, while inserting one at the front
-/// shifts every offset in the file, so the gate cannot fire and the full
-/// re-index expansion runs.
+/// `at_front` inserts the newline at the start of the file, shifting every
+/// offset so the update gate cannot skip the re-index. Otherwise it appends,
+/// which the gate can skip outright.
 fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> bool {
     let tag = if at_front { "editmid" } else { "noopedit" };
     let Some(uri) = glua_code_analysis::file_path_to_uri(&target.to_path_buf()) else {
@@ -1311,8 +1264,7 @@ fn noop_edit(analysis: &mut EmmyLuaAnalysis, target: &Path, at_front: bool) -> b
 /// members.
 ///
 /// A member with several writers holds the merge of those writes, so
-/// re-inferring one initializer answers a different question and is expected to
-/// disagree.
+/// re-inferring one initializer is expected to disagree.
 fn refresh_faithfulness(analysis: &EmmyLuaAnalysis) {
     let db = analysis.compilation.get_db();
     let member_index = db.get_member_index();
@@ -1424,9 +1376,9 @@ fn member_initializer_expr(
 
 /// Attributes the re-index expansion to the source that produced each file.
 ///
-/// `expand_reindex_file_ids` unions the dependent sets to a fixpoint and returns
-/// only the total. This mirrors that loop and reports, per round, how many files
-/// each source contributed that no earlier source already had.
+/// Mirrors `expand_reindex_file_ids`, which unions dependent sets to a fixpoint
+/// and returns only the total, and reports per round how many files each source
+/// contributed that no earlier source had.
 fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
     for target in targets {
         let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
@@ -1520,23 +1472,17 @@ fn expand_why(analysis: &EmmyLuaAnalysis, codebase: &Path, targets: &[String]) {
 
 /// Edit a file through the single-file update path, then put it back.
 ///
-/// The source ends up exactly as it started, so the index has to as well. Any
-/// difference is drift the edit path introduced rather than a fact about the
-/// code: state the edit added and the revert did not take away, or state the
-/// edit dropped and the revert did not restore.
+/// The source ends as it started, so the index has to as well. Any difference is
+/// drift the edit path introduced: state the edit added and the revert did not
+/// take away, or state the edit dropped and the revert did not restore.
 ///
-/// This is the update-path counterpart of `indexrepeat`. That stage re-indexes
-/// with the text untouched, so it never exercises the invalidation an edit
-/// triggers; this one does, and unlike `realedit` it needs no ground-truth
-/// build, because the pre-edit index *is* the truth. `noopedit` does not cover
-/// it either: its edit pair is semantically neutral, so the update path skips
-/// the re-index outright and nothing is invalidated.
+/// The update-path counterpart of `indexrepeat`, which re-indexes with the text
+/// untouched and so never exercises an edit's invalidation. Needs no
+/// ground-truth build, because the pre-edit index is the truth.
 ///
-/// It builds its own analysis rather than sharing the caller's. Both index
-/// gates re-index in place and leave a converged index behind, so whichever ran
-/// second would measure drift against the other's converged state instead of
-/// against a cold build and report a clean 0 — the drift does not go away, it
-/// stops being visible.
+/// Builds its own analysis: both index gates re-index in place and leave a
+/// converged index behind, so whichever ran second would measure against the
+/// other's converged state.
 fn edit_revert(codebase: &Path, annotations: &Path, targets: &[String]) {
     let Ok(find) = std::env::var("DET_EDIT_FIND") else {
         eprintln!("[editrevert] SKIPPED: DET_EDIT_FIND is not set, so no drift gate ran");
@@ -1591,12 +1537,9 @@ fn edit_revert(codebase: &Path, annotations: &Path, targets: &[String]) {
 /// Applies a **real** edit and compares the incremental result against a cold
 /// build of the same edited source.
 ///
-/// Every other edit stage perturbs a file without changing what it means, so
-/// they answer "does re-analysis preserve state". This one answers the question
-/// the others cannot: when an edit genuinely changes a published fact, does the
-/// incremental path land where a full build of the edited workspace lands, and
-/// how much of the index does that edit actually move? The second number bounds
-/// what any cheaper re-index mechanism has to reproduce.
+/// The only edit stage whose edit changes what the file means, so it also
+/// measures how much of the index an edit moves. That bounds what a cheaper
+/// re-index mechanism has to reproduce.
 fn real_edit(
     analysis: &mut EmmyLuaAnalysis,
     codebase: &Path,
@@ -1675,19 +1618,15 @@ fn real_edit(
 /// Gate the deferred ripple: several self-indexes, then one re-index over the
 /// union of their separately-captured expansions.
 ///
-/// The LSP debounce runs the edited file's own re-index on a short timer and
-/// owes the dependency ripple afterwards. Deferring that ripple behind a longer
-/// idle timer means a typing burst produces several self-indexes before one
-/// ripple, so the ripple has to run against a *union* of expansions each
-/// captured at a different point.
+/// The LSP debounce re-indexes the edited file on a short timer and owes the
+/// dependency ripple afterwards. Deferring that ripple behind a longer idle
+/// timer means a typing burst produces several self-indexes before one ripple,
+/// so the ripple runs against a union of expansions captured at different
+/// points.
 ///
-/// That union is the whole risk. An expansion recomputed after a self-index is
-/// known to under-expand badly — 739 files collapsed to 8 — which is why the
-/// production path captures before self-indexing. Union survives that, because
-/// a collapsed later capture only ever adds files and the burst's first capture
-/// is taken before any self-index, exactly as today. What it cannot rule out by
-/// argument is a dependent present in *no* capture, and that is what this
-/// stage measures: the burst's result against a cold build of the final text.
+/// An expansion recomputed after a self-index under-expands, which is why the
+/// production path captures before self-indexing. The union can still miss a
+/// dependent present in no capture, which is what this stage measures.
 fn burst_edit(
     analysis: &mut EmmyLuaAnalysis,
     codebase: &Path,
@@ -1745,10 +1684,8 @@ fn burst_edit(
         return;
     }
 
-    // Three keystroke groups, chosen to cover what a burst can do that a single
-    // edit cannot: change meaning, shift offsets only, and introduce a class
-    // definition partway through — the case where reusing the first capture
-    // would miss the new dependents outright.
+    // Three keystroke groups: change meaning, shift offsets only, and introduce
+    // a class definition partway through.
     let step_text = |target: &Target, step: usize| -> String {
         let mut text = target.original.replace(find.as_str(), replace.as_str());
         if step >= 1 {
@@ -1795,9 +1732,7 @@ fn burst_edit(
     let warm = collect(analysis, "warm");
 
     // The control: the same three edits through today's path, one ripple each.
-    // Deferral is only a regression if it drifts further than this does — the
-    // incremental path already drifts from cold on its own, so comparing the
-    // burst against cold alone would charge it for drift it did not cause.
+    // Localises a failure to the deferral or to the path underneath it.
     for target in &resolved {
         analysis.update_file_by_uri(&target.uri, Some(target.original.clone()));
     }
@@ -1823,14 +1758,13 @@ fn burst_edit(
     let truth_index = collect_index(&ground_truth, "cold_burst");
     let truth = collect(&ground_truth, "cold_burst");
 
-    // What the burst genuinely moves, so a reader can tell a real miss from a
-    // change the edits were always going to make.
+    // Context: what the edits themselves move.
     diff_index("cold", &cold_index, "cold_burst", &truth_index);
     diff("cold", cold, "cold_burst", &truth);
-    // What today's path already gets wrong about it.
+    // Context: the same comparison for the undeferred path.
     diff_index("cold_burst", &truth_index, "control", &control_index);
     diff("cold_burst", &truth, "control", &control);
-    // The gate: deferring the ripple must not get more wrong than the control.
+    // The gate: the burst must land where a cold build of the final text lands.
     diff_index("cold_burst", &truth_index, "warm", &warm_index);
     diff("cold_burst", &truth, "warm", &warm);
 
@@ -1865,9 +1799,8 @@ fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[S
     true
 }
 
-/// Analysis recurses over deeply nested syntax. The server does that work on
-/// spawned threads, which get a far larger stack than a process main thread does
-/// on Windows, so the tools have to ask for one explicitly.
+/// Analysis recurses over deeply nested syntax. The server runs it on spawned
+/// threads, which get a larger stack than a Windows process main thread.
 fn main() {
     std::thread::Builder::new()
         .stack_size(256 * 1024 * 1024)
@@ -1975,10 +1908,9 @@ fn run() {
         }
     }
 
-    // Re-run the pipeline over every main-workspace file with the full DB
-    // already populated. Tests whether the cold build under-resolved because
-    // library/std workspace groups were analysed before main-workspace files
-    // existed in the index.
+    // Re-run the pipeline over every main-workspace file with the DB already
+    // populated. Tests whether the cold build under-resolved because library and
+    // std groups were analysed before main-workspace files existed.
     if stages.iter().any(|s| s == "mainreindex") {
         let cold_index = collect_index(&analysis, "cold");
         let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
@@ -2004,11 +1936,9 @@ fn run() {
         diff("after_mainreindex", &after, "after_mainreindex_2", &second);
     }
 
-    // Remove and re-add *every* file, without clearing the index first. Cold and
-    // this stage then analyse exactly the same file set from exactly the same
-    // (empty, for those files) starting point, so any difference isolates state
-    // that `remove_index` fails to drop — as opposed to `mainreindex`, which
-    // legitimately leaves the library workspace resolved.
+    // Remove and re-add every file without clearing the index first. Cold and
+    // this stage analyse the same file set from the same starting point, so a
+    // difference isolates state `remove_index` fails to drop.
     if stages.iter().any(|s| s == "allreindex") {
         let cold_index = collect_index(&analysis, "cold");
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
@@ -2025,11 +1955,9 @@ fn run() {
         diff("cold", &cold, "after_allreindex", &after);
     }
 
-    // Re-run analysis over every file *without* removing anything first, so each
-    // file re-infers against the settled index while every existing fact is
-    // retained. This is the only stage that gives a full build the same
-    // advantage a partial re-index gets from the state it inherits, so it says
-    // whether the cold answer is simply under-converged.
+    // Re-run analysis over every file without removing anything first, so each
+    // file re-infers against the settled index with every existing fact
+    // retained. Says whether the cold answer is under-converged.
     if stages.iter().any(|s| s == "restabilize") {
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
         for round in 0..3 {
@@ -2046,13 +1974,9 @@ fn run() {
         }
     }
 
-    // Remove and re-add each file ON ITS OWN, so every file is re-derived
-    // against the complete settled workspace rather than against the prefix the
-    // cold walk had built when it reached that file. This is the "fully
-    // informed" fixed point: if the index converges here, the cold answer is
-    // simply one computed from an incomplete view, and a subset re-index — which
-    // also sees a settled workspace — is agreeing with the informed answer
-    // rather than drifting.
+    // Remove and re-add each file on its own, so every file is re-derived
+    // against the complete settled workspace rather than the prefix the cold
+    // walk had built when it reached that file.
     if stages.iter().any(|s| s == "perfile") {
         let all_ids = analysis.compilation.get_db().get_vfs().get_all_file_ids();
         let rounds = std::env::var("DET_PERFILE_ROUNDS")
@@ -2084,10 +2008,8 @@ fn run() {
     }
 
     // The production incremental path: `reindex_files` runs the same re-analysis
-    // as `mainreindex` but first widens the set through `expand_reindex_file_ids`.
-    // Comparing the two says whether the expansion is what closes the gap, i.e.
-    // whether `mainreindex`'s divergence is a real defect or an artefact of the
-    // harness bypassing the safety net.
+    // as `mainreindex` but first widens the set through
+    // `expand_reindex_file_ids`.
     if stages.iter().any(|s| s == "mainexpand") {
         let cold_index = collect_index(&analysis, "cold");
         let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
