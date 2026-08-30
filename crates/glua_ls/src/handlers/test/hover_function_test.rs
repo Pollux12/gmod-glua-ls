@@ -828,7 +828,7 @@ mod tests {
             markup.value
         );
         assert!(
-            top_section.contains("function Create(name, safety)"),
+            top_section.contains("function ents.Create(name, safety)"),
             "expected override signature in top section, got: {}",
             markup.value
         );
@@ -838,7 +838,7 @@ mod tests {
             markup.value
         );
         assert!(
-            top_section.contains("function Create(class: string)"),
+            top_section.contains("function ents.Create(class: string)"),
             "expected annotated signature in top section, got: {}",
             markup.value
         );
@@ -986,7 +986,7 @@ mod tests {
         assert!(
             server_markup
                 .value
-                .contains("function Create(name, safety)"),
+                .contains("function ents.Create(name, safety)"),
             "expected server hover to include server override signature, got: {}",
             server_markup.value
         );
@@ -1011,7 +1011,7 @@ mod tests {
         assert!(
             client_markup
                 .value
-                .contains("function Create(class: string)"),
+                .contains("function ents.Create(class: string)"),
             "expected client hover to show shared annotated signature, got: {}",
             client_markup.value
         );
@@ -1030,7 +1030,7 @@ mod tests {
         assert!(
             !client_markup
                 .value
-                .contains("function Create(name, safety)"),
+                .contains("function ents.Create(name, safety)"),
             "did not expect server-only override signature in client hover, got: {}",
             client_markup.value
         );

@@ -1121,7 +1121,7 @@ local EscapeStringMap: {
                 node<??>["key"] = "value"
             "#,
             VirtualHoverResult {
-                value: "```lua\n(global) node: Node {\n    field: number?,\n    method: function,\n}\n```".to_string(),
+                value: "```lua\n(global) node: Node {\n    field: number?,\n    key: string = \"value\",\n    method: function,\n}\n```".to_string(),
             },
         ));
 

@@ -103,7 +103,7 @@ mod tests {
         let detail = item.detail.ok_or("item detail is empty").or_fail()?;
         verify_eq!(
             detail,
-            "function lookup(kind: \"steamid\") -> string (+1 overloads)"
+            "function ix.character.lookup(kind: \"steamid\") -> string (+1 overloads)"
         )?;
         verify_that!(item.documentation, none())?;
         Ok(())
