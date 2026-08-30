@@ -31,7 +31,7 @@ use std::{
 
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
-pub use call_site_param::CallSiteParamIndex;
+pub use call_site_param::{CallSiteParamIndex, CallSiteSourceId};
 pub(crate) use call_site_param::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
 pub use declaration::*;
 pub use dependency::{LuaDependencyIndex, LuaDependencyKind, LuaDependencySite};

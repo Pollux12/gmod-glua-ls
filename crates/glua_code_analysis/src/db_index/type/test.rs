@@ -7,7 +7,7 @@ mod test {
     use rowan::TextRange;
 
     use crate::db_index::traits::LuaIndex;
-    use crate::db_index::r#type::LuaTypeIndex;
+    use crate::db_index::r#type::{LuaTypeIndex, TypeCacheRef};
     use crate::db_index::{LuaDeclTypeKind, LuaTypeFlag};
     use crate::{
         DbIndex, FileId, InFiled, LuaDeclId, LuaDeclLocation, LuaDefinitionId,
@@ -413,6 +413,115 @@ mod test {
 
         index.remove_files(&[provider, table_owner]);
         assert_reference_lookup_matches_scan(&index, &files);
+    }
+
+    #[test]
+    fn signature_type_cache_is_found_by_both_the_symbol_and_the_file_lookup() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+
+        assert_eq!(
+            index.files_with_type_caches_referencing(&[TypeCacheRef::Signature(signature_id)]),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index.files_with_type_caches_referencing_files(
+                &[callee].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index
+                .type_cache_refs_into_file(callee)
+                .cloned()
+                .collect::<HashSet<_>>(),
+            [TypeCacheRef::Signature(signature_id)]
+                .into_iter()
+                .collect::<HashSet<_>>()
+        );
+    }
+
+    #[test]
+    fn removing_the_referencing_file_clears_the_symbol_and_file_lookups() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+
+        index.remove_files(&[consumer]);
+
+        assert!(
+            index
+                .files_with_type_caches_referencing(&[TypeCacheRef::Signature(signature_id)])
+                .is_empty()
+        );
+        assert!(
+            index
+                .files_with_type_caches_referencing_files(
+                    &[callee].into_iter().collect::<HashSet<_>>()
+                )
+                .is_empty()
+        );
+        assert_eq!(index.type_cache_refs_into_file(callee).count(), 0);
+    }
+
+    #[test]
+    fn removing_the_referenced_file_keeps_the_reference_until_its_owner_rebinds() {
+        let callee = FileId::new(1);
+        let consumer = FileId::new(2);
+        let signature_id = LuaSignatureId::new(callee, 5.into());
+        let table_range = InFiled::new(callee, TextRange::new(0.into(), 1.into()));
+        let mut index = LuaTypeIndex::new();
+        index.bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::Signature(signature_id)),
+        );
+        index.bind_type(
+            owner_in(consumer, 20),
+            LuaTypeCache::DocType(LuaType::TableConst(table_range.clone())),
+        );
+
+        index.remove_files(&[callee]);
+
+        assert_eq!(
+            index
+                .type_cache_refs_into_file(callee)
+                .cloned()
+                .collect::<HashSet<_>>(),
+            [
+                TypeCacheRef::Signature(signature_id),
+                TypeCacheRef::Table(table_range)
+            ]
+            .into_iter()
+            .collect::<HashSet<_>>()
+        );
+        assert_eq!(
+            index.files_with_type_caches_referencing_files(
+                &[callee].into_iter().collect::<HashSet<_>>()
+            ),
+            [consumer].into_iter().collect::<HashSet<_>>()
+        );
+
+        index.force_bind_type(
+            owner_in(consumer, 10),
+            LuaTypeCache::DocType(LuaType::String),
+        );
+        index.force_bind_type(
+            owner_in(consumer, 20),
+            LuaTypeCache::DocType(LuaType::String),
+        );
+
+        assert_eq!(index.type_cache_refs_into_file(callee).count(), 0);
     }
 
     #[test]

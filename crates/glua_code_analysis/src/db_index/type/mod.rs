@@ -10,7 +10,7 @@ mod types;
 
 use super::traits::LuaIndex;
 use crate::{
-    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner,
+    DbIndex, FileId, InFiled, LuaDeclId, LuaMemberOwner, LuaSignatureId,
     db_index::r#type::type_decl::LuaTypeIdentifier,
 };
 pub use generic_param::GenericParam;
@@ -850,9 +850,25 @@ fn is_guarded_table_bootstrap_branch(db: &DbIndex, typ: &LuaType) -> bool {
 /// definition sites move as files are indexed, so the file set behind a
 /// `Decl` key is resolved from the live declaration at query time.
 #[derive(Debug, Clone, Hash, PartialEq, Eq)]
-enum TypeCacheRef {
-    File(FileId),
+pub enum TypeCacheRef {
+    Table(InFiled<TextRange>),
+    Instance(InFiled<TextRange>),
+    Signature(LuaSignatureId),
+    Module(FileId),
     Decl(LuaTypeDeclId),
+}
+
+impl TypeCacheRef {
+    /// The file the referenced identity lives in, or `None` for a class, whose
+    /// definition sites are resolved from the live declaration instead.
+    pub fn file_id(&self) -> Option<FileId> {
+        match self {
+            Self::Table(range) | Self::Instance(range) => Some(range.file_id),
+            Self::Signature(signature_id) => Some(signature_id.get_file_id()),
+            Self::Module(file_id) => Some(*file_id),
+            Self::Decl(_) => None,
+        }
+    }
 }
 
 /// Reverse map of `referenced thing -> files whose cached types reference it`,
@@ -861,6 +877,7 @@ enum TypeCacheRef {
 struct TypeCacheRefIndex {
     owner_refs: HashMap<FileId, HashMap<TypeCacheRef, u32>>,
     ref_owners: HashMap<TypeCacheRef, HashSet<FileId>>,
+    refs_by_file: HashMap<FileId, HashSet<TypeCacheRef>>,
 }
 
 impl TypeCacheRefIndex {
@@ -870,6 +887,12 @@ impl TypeCacheRefIndex {
             let count = owner_entry.entry(type_ref.clone()).or_insert(0);
             *count += 1;
             if *count == 1 {
+                if let Some(file_id) = type_ref.file_id() {
+                    self.refs_by_file
+                        .entry(file_id)
+                        .or_default()
+                        .insert(type_ref.clone());
+                }
                 self.ref_owners
                     .entry(type_ref)
                     .or_default()
@@ -882,6 +905,7 @@ impl TypeCacheRefIndex {
         let Some(owner_entry) = self.owner_refs.get_mut(&owner_file_id) else {
             return;
         };
+        let mut dropped = Vec::new();
         for type_ref in collect_type_cache_refs(typ) {
             let Some(count) = owner_entry.get_mut(&type_ref) else {
                 continue;
@@ -891,16 +915,15 @@ impl TypeCacheRefIndex {
                 continue;
             }
             owner_entry.remove(&type_ref);
-            if let Some(owners) = self.ref_owners.get_mut(&type_ref) {
-                owners.remove(&owner_file_id);
-                if owners.is_empty() {
-                    self.ref_owners.remove(&type_ref);
-                }
-            }
+            dropped.push(type_ref);
         }
 
         if owner_entry.is_empty() {
             self.owner_refs.remove(&owner_file_id);
+        }
+
+        for type_ref in dropped {
+            self.drop_owner(&type_ref, owner_file_id);
         }
     }
 
@@ -909,17 +932,44 @@ impl TypeCacheRefIndex {
             return;
         };
         for type_ref in owner_entry.into_keys() {
-            if let Some(owners) = self.ref_owners.get_mut(&type_ref) {
-                owners.remove(&owner_file_id);
-                if owners.is_empty() {
-                    self.ref_owners.remove(&type_ref);
-                }
-            }
+            self.drop_owner(&type_ref, owner_file_id);
+        }
+    }
+
+    fn drop_owner(&mut self, type_ref: &TypeCacheRef, owner_file_id: FileId) {
+        let Some(owners) = self.ref_owners.get_mut(type_ref) else {
+            return;
+        };
+        owners.remove(&owner_file_id);
+        if !owners.is_empty() {
+            return;
+        }
+        self.ref_owners.remove(type_ref);
+        let Some(file_id) = type_ref.file_id() else {
+            return;
+        };
+        let Some(refs) = self.refs_by_file.get_mut(&file_id) else {
+            return;
+        };
+        refs.remove(type_ref);
+        if refs.is_empty() {
+            self.refs_by_file.remove(&file_id);
         }
     }
 
     fn owners(&self, type_ref: &TypeCacheRef) -> Option<&HashSet<FileId>> {
         self.ref_owners.get(type_ref)
+    }
+
+    fn refs_into_file(&self, file_id: FileId) -> impl Iterator<Item = &TypeCacheRef> {
+        self.refs_by_file.get(&file_id).into_iter().flatten()
+    }
+
+    fn owners_referencing_file(&self, file_id: FileId) -> impl Iterator<Item = FileId> {
+        self.refs_into_file(file_id)
+            .filter_map(|type_ref| self.ref_owners.get(type_ref))
+            .flatten()
+            .copied()
     }
 }
 
@@ -928,16 +978,16 @@ fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     typ.visit_type(&mut |inner| {
         match inner {
             LuaType::TableConst(range) => {
-                refs.insert(TypeCacheRef::File(range.file_id));
+                refs.insert(TypeCacheRef::Table(range.clone()));
             }
             LuaType::Instance(instance) => {
-                refs.insert(TypeCacheRef::File(instance.get_range().file_id));
+                refs.insert(TypeCacheRef::Instance(instance.get_range().clone()));
             }
             LuaType::Signature(signature_id) => {
-                refs.insert(TypeCacheRef::File(signature_id.get_file_id()));
+                refs.insert(TypeCacheRef::Signature(*signature_id));
             }
             LuaType::ModuleRef(file_id) => {
-                refs.insert(TypeCacheRef::File(*file_id));
+                refs.insert(TypeCacheRef::Module(*file_id));
             }
             LuaType::Ref(type_id) | LuaType::Def(type_id) => {
                 refs.insert(TypeCacheRef::Decl(type_id.clone()));
@@ -970,6 +1020,7 @@ pub struct LuaTypeIndex {
     type_writes: u64,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
+    support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
     support_file_dependents: HashMap<FileId, HashSet<FileId>>,
 }
 
@@ -996,6 +1047,7 @@ impl LuaTypeIndex {
             type_writes: 0,
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
+            support_dependents: HashMap::default(),
             support_file_dependents: HashMap::default(),
         }
     }
@@ -1445,6 +1497,20 @@ impl LuaTypeIndex {
         dependents
     }
 
+    /// The files whose inference read one of `nodes` as supporting evidence.
+    pub fn files_depending_on_inference_nodes(
+        &self,
+        nodes: &[LuaInferenceNodeId],
+    ) -> HashSet<FileId> {
+        let mut dependents = HashSet::default();
+        for node in nodes {
+            if let Some(files) = self.support_dependents.get(node) {
+                dependents.extend(files.iter().copied());
+            }
+        }
+        dependents
+    }
+
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         self.types.get(owner)
     }
@@ -1519,7 +1585,8 @@ impl LuaTypeIndex {
 
         let mut events_by_file: HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>> =
             HashMap::default();
-        let mut support_file_dependents = HashMap::default();
+        let mut support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>> =
+            HashMap::default();
 
         for (owner, metadata) in &self.fact_metadata {
             let Some(cache) = self.types.get(owner) else {
@@ -1535,7 +1602,7 @@ impl LuaTypeIndex {
                 owner.get_file_id(),
                 &fact,
                 &mut events_by_file,
-                &mut support_file_dependents,
+                &mut support_dependents,
             );
         }
 
@@ -1544,7 +1611,7 @@ impl LuaTypeIndex {
                 definition.file_id(),
                 fact,
                 &mut events_by_file,
-                &mut support_file_dependents,
+                &mut support_dependents,
             );
         }
 
@@ -1556,7 +1623,14 @@ impl LuaTypeIndex {
                 (file_id, events.into())
             })
             .collect();
-        self.support_file_dependents = support_file_dependents;
+        self.support_file_dependents = HashMap::default();
+        for (node, dependents) in &support_dependents {
+            self.support_file_dependents
+                .entry(node.file_id())
+                .or_default()
+                .extend(dependents.iter().copied());
+        }
+        self.support_dependents = support_dependents;
     }
 
     pub fn iter_type_caches(&self) -> impl Iterator<Item = (&LuaTypeOwner, &LuaTypeCache)> {
@@ -1658,9 +1732,8 @@ impl LuaTypeIndex {
         let source_files: HashSet<FileId> = map.keys().map(|range| range.file_id).collect();
         let candidate_owners: HashSet<&LuaTypeOwner> = source_files
             .iter()
-            .filter_map(|file_id| self.cache_refs.owners(&TypeCacheRef::File(*file_id)))
-            .flatten()
-            .filter_map(|owner_file_id| self.in_filed_type_owner.get(owner_file_id))
+            .flat_map(|file_id| self.cache_refs.owners_referencing_file(*file_id))
+            .filter_map(|owner_file_id| self.in_filed_type_owner.get(&owner_file_id))
             .flatten()
             .collect();
 
@@ -1695,9 +1768,11 @@ impl LuaTypeIndex {
         let mut dependent_files = HashSet::default();
         let mut visited_decls = HashSet::default();
         for file_id in file_ids {
-            if let Some(owners) = self.cache_refs.owners(&TypeCacheRef::File(*file_id)) {
-                dependent_files.extend(owners.iter().copied().filter(|o| !file_ids.contains(o)));
-            }
+            dependent_files.extend(
+                self.cache_refs
+                    .owners_referencing_file(*file_id)
+                    .filter(|owner_file_id| !file_ids.contains(owner_file_id)),
+            );
 
             // A file that only *names* a class still has to be re-analysed when
             // a changed file is one of that class's definition sites: its
@@ -1743,6 +1818,29 @@ impl LuaTypeIndex {
         );
 
         dependent_files
+    }
+
+    /// The files whose cached types reference any of `refs`.
+    ///
+    /// Unlike [`files_with_type_caches_referencing_files`](Self::files_with_type_caches_referencing_files)
+    /// this is the raw reverse lookup: a [`TypeCacheRef::Decl`] answers the
+    /// files that name the class, without consulting its definition sites.
+    pub fn files_with_type_caches_referencing(&self, refs: &[TypeCacheRef]) -> HashSet<FileId> {
+        let mut dependent_files = HashSet::default();
+        for type_ref in refs {
+            if let Some(owners) = self.cache_refs.owners(type_ref) {
+                dependent_files.extend(owners.iter().copied());
+            }
+        }
+        dependent_files
+    }
+
+    /// The identities declared in `file_id` that some cached type references.
+    pub fn type_cache_refs_into_file(
+        &self,
+        file_id: FileId,
+    ) -> impl Iterator<Item = &TypeCacheRef> {
+        self.cache_refs.refs_into_file(file_id)
     }
 
     pub fn files_with_cross_file_type_caches_referencing_files<S: std::hash::BuildHasher>(
@@ -1903,6 +2001,7 @@ impl LuaIndex for LuaTypeIndex {
         self.decl_write_claims.clear();
         self.definition_facts.clear();
         self.inference_events_by_file.clear();
+        self.support_dependents.clear();
         self.support_file_dependents.clear();
     }
 }
@@ -1952,7 +2051,7 @@ fn collect_fact_derived_state(
     owner_file_id: FileId,
     fact: &LuaTypeFact,
     events_by_file: &mut HashMap<FileId, Vec<LuaInferenceDiagnosticEvent>>,
-    support_file_dependents: &mut HashMap<FileId, HashSet<FileId>>,
+    support_dependents: &mut HashMap<LuaInferenceNodeId, HashSet<FileId>>,
 ) {
     for step in fact.provenance() {
         events_by_file
@@ -1963,8 +2062,8 @@ fn collect_fact_derived_state(
                 fact: fact.clone(),
             });
         for support in step.support.iter() {
-            support_file_dependents
-                .entry(support.file_id())
+            support_dependents
+                .entry(support.clone())
                 .or_default()
                 .insert(owner_file_id);
         }
@@ -2274,6 +2373,7 @@ mod batch_removal_tests {
             left.inference_events_by_file,
             right.inference_events_by_file
         );
+        assert_eq!(left.support_dependents, right.support_dependents);
         assert_eq!(left.support_file_dependents, right.support_file_dependents);
         assert_eq!(left.cache_refs, right.cache_refs);
     }
