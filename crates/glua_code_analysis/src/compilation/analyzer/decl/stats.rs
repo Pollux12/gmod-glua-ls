@@ -5,8 +5,8 @@ use glua_parser::{
 };
 
 use crate::{
-    LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId, LuaSignatureId, LuaType,
-    LuaTypeCache,
+    GlobalId, InFiled, LuaDeclExtra, LuaMemberFeature, LuaMemberId, LuaSemanticDeclId,
+    LuaSignatureId, LuaType, LuaTypeCache,
     compilation::analyzer::common::bind_type,
     db_index::{
         LocalAttribute, LuaDecl, LuaDeclInitializer, LuaMember, LuaMemberKey, LuaMemberOwner,
@@ -144,19 +144,16 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                     value_expr_id,
                 );
 
-                let decl_id = decl.get_id();
                 analyzer.add_decl(decl);
 
                 // Record the `{}` this global is written with while the value
-                // expression is already in hand. The global-member owner
-                // election needs it to see declarations whose type has not been
-                // inferred yet; re-deriving it there would mean resolving a
-                // node per election, which measured 6x slower.
+                // expression is already in hand: it is a definition site of the
+                // path, and the path owns the literal's members.
                 if let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr) {
-                    analyzer
-                        .db
-                        .get_decl_index_mut()
-                        .set_global_initializer_table(decl_id, table_expr.get_range());
+                    analyzer.db.get_member_index_mut().set_definition_site(
+                        GlobalId::new(name),
+                        InFiled::new(file_id, table_expr.get_range()),
+                    );
                 }
             }
             LuaVarExpr::IndexExpr(index_expr) => {
@@ -189,18 +186,16 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 };
 
                 let (owner, global_id) = find_index_owner(analyzer, index_expr.clone());
-                // The `{}` this nested global path is written with, recorded for
-                // the same reason the `NameExpr` branch above records a root
-                // global's: the election that ranks a path's declarations must
-                // see all of them from decl analysis onward, not only the ones
-                // inference has already reached.
-                if global_id.is_some()
+                // The `{}` this nested global path is written with is a
+                // definition site of the path, exactly as the `NameExpr` branch
+                // above records a root global's.
+                if let Some(global_id) = &global_id
                     && let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr)
                 {
-                    analyzer
-                        .db
-                        .get_decl_index_mut()
-                        .set_global_member_initializer_table(member_id, table_expr.get_range());
+                    analyzer.db.get_member_index_mut().set_definition_site(
+                        global_id.clone(),
+                        InFiled::new(file_id, table_expr.get_range()),
+                    );
                 }
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
 

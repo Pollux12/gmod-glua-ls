@@ -23,6 +23,48 @@ use crate::{
 use std::sync::Arc;
 use std::vec;
 
+/// Files the members of the global path this class is annotated on under the
+/// class.
+///
+/// `---@class C` above `X = {}` or `X.k = X.k or {}` gives one table two
+/// names, and every reader of the annotated type looks the members up on the
+/// class. Recorded here, from the tag, because documentation analysis runs for
+/// every file before any file resolves: reading it back off the type cache
+/// instead would hand the binding to whichever file inference reached first.
+fn bind_annotated_global_path_class(
+    analyzer: &mut DocAnalyzer,
+    class_decl_id: &LuaTypeDeclId,
+) -> Option<()> {
+    let LuaAst::LuaAssignStat(assign) = analyzer.comment.get_owner()? else {
+        return None;
+    };
+    let file_id = analyzer.file_id;
+    let path = match assign.child::<LuaVarExpr>()? {
+        LuaVarExpr::NameExpr(name_expr) => {
+            let decl_id = LuaDeclId::new(file_id, name_expr.get_position());
+            let decl = analyzer.db.get_decl_index().get_decl(&decl_id)?;
+            if !decl.is_global() {
+                return None;
+            }
+            crate::GlobalId::new(decl.get_name())
+        }
+        LuaVarExpr::IndexExpr(index_expr) => {
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+            analyzer
+                .db
+                .get_member_index()
+                .get_member(&member_id)?
+                .get_global_id()?
+                .clone()
+        }
+    };
+    analyzer
+        .db
+        .get_member_index_mut()
+        .set_global_path_class(path, class_decl_id.clone(), file_id);
+    Some(())
+}
+
 pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<()> {
     let file_id = analyzer.file_id;
     let name = tag.get_name_token()?.get_name_text().to_string();
@@ -33,6 +75,7 @@ pub fn analyze_class(analyzer: &mut DocAnalyzer, tag: LuaDocTagClass) -> Option<
         .find_type_decl(file_id, &name)?;
 
     let class_decl_id = class_decl.get_id();
+    bind_annotated_global_path_class(analyzer, &class_decl_id);
     analyzer.current_type_id = Some(class_decl_id.clone());
     if let Some(generic_params) = tag.get_generic_decl() {
         let generic_params = get_generic_params(analyzer, generic_params);

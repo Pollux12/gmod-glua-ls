@@ -146,8 +146,12 @@ fn check_block_visibility(
                 (LuaType::Def(left), LuaMemberOwner::Type(right)) => {
                     return Some(left == *right);
                 }
-                (LuaType::TableConst(left), LuaMemberOwner::Element(right)) => {
-                    return Some(left == *right);
+                (LuaType::TableConst(left), _) => {
+                    return Some(
+                        db.get_member_index()
+                            .canonical_owner(LuaMemberOwner::Element(left))
+                            == *member_owner,
+                    );
                 }
                 _ => {}
             }
@@ -183,7 +187,11 @@ fn check_def_visibility(
         },
         VisibilityKind::Private => match (typ, member_owner) {
             (LuaType::Def(left), LuaMemberOwner::Type(right)) => Some(left == *right),
-            (LuaType::TableConst(left), LuaMemberOwner::Element(right)) => Some(left == *right),
+            (LuaType::TableConst(left), _) => Some(
+                db.get_member_index()
+                    .canonical_owner(LuaMemberOwner::Element(left))
+                    == *member_owner,
+            ),
             _ => Some(false),
         },
         _ => None,

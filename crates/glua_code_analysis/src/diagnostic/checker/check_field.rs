@@ -2242,7 +2242,10 @@ fn is_shapeless_table_const(db: &DbIndex, typ: &LuaType) -> bool {
         .is_none_or(|members| members.is_empty())
         && db
             .get_dynamic_field_index()
-            .get_fields(&crate::DynamicFieldOwner::Table(table_range.clone()))
+            .get_fields(&crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            ))
             .is_none_or(|fields| fields.is_empty())
 }
 
@@ -2297,7 +2300,10 @@ fn has_dynamic_field_for_type(
             })
         }
         LuaType::TableConst(table_range) => {
-            let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+            let owner = crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            );
             index.has_field(&owner, field_name) || owner_wildcard_covers_any_field(db, &owner)
         }
         LuaType::Instance(instance) => {

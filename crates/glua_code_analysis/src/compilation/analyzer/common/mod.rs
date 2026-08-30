@@ -1,9 +1,4 @@
-mod migrate_global_member;
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
-pub(super) use migrate_global_member::{
-    migrate_global_members_when_type_resolve, migrate_global_path_members_when_owner_resolved,
-    reconcile_directly_attached_candidate_members, reconcile_parked_global_path_members,
-};
 use rowan::{TextRange, TextSize};
 
 use crate::{
@@ -95,9 +90,12 @@ pub fn write_type_cache(
     mode: TypeCacheWriteMode,
 ) {
     match mode {
-        TypeCacheWriteMode::InsertOnly => db.get_type_index_mut().bind_type(owner, cache),
-        TypeCacheWriteMode::ForceOverwrite => db.get_type_index_mut().force_bind_type(owner, cache),
+        TypeCacheWriteMode::InsertOnly => db.get_type_index_mut().bind_type(owner.clone(), cache),
+        TypeCacheWriteMode::ForceOverwrite => db
+            .get_type_index_mut()
+            .force_bind_type(owner.clone(), cache),
     }
+    bind_global_path_class(db, &owner);
 }
 
 /// Binds an inferred/declared type and preserves the legacy declaration merge
@@ -122,9 +120,16 @@ pub fn bind_type(
         if should_replace_uninformative_inferred_cache(&type_owner, decl_type_cache, &type_cache) {
             db.get_type_index_mut()
                 .force_bind_type(type_owner.clone(), type_cache);
-            migrate_global_members_when_type_resolve(db, type_owner);
+            bind_global_path_class(db, &type_owner);
         } else {
-            merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+            // A guarded `X.k = X.k or {}` bootstrap of a path whose
+            // declaration carries a `---@class` assigns that class's own
+            // table: the literal canonicalises to the class owner. Merging it
+            // into the class type states nothing new, and widens `C` to
+            // `C|table`.
+            if !incoming_is_the_declared_class_table(db, decl_type, type_cache.as_type()) {
+                merge_def_type(db, decl_type.clone(), type_cache.as_type().clone(), 0);
+            }
         }
     }
 
@@ -135,9 +140,80 @@ pub fn bind_type(
 /// literal to its base type on the way in.
 fn seed_type_slot(db: &mut DbIndex, type_owner: LuaTypeOwner, type_cache: LuaTypeCache) {
     let type_cache = widen_mutable_decl_literal(db, &type_owner, type_cache);
+    let type_cache = match class_table_seed_type(db, type_cache.as_type()) {
+        Some(class_type) => LuaTypeCache::InferType(class_type),
+        None => type_cache,
+    };
     db.get_type_index_mut()
         .force_bind_type(type_owner.clone(), type_cache);
-    migrate_global_members_when_type_resolve(db, type_owner);
+    bind_global_path_class(db, &type_owner);
+}
+
+/// The class a table literal belongs to, when it is the table a
+/// class-annotated global path was declared with.
+///
+/// `X.k = X.k or {}` in a second file assigns the very table the first file
+/// annotated, and a reader of `X.k` holds that same table. Seeding the literal
+/// instead of the class hands both an empty table where the class stands.
+fn class_table_seed_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
+    let LuaType::TableConst(range) = typ else {
+        return None;
+    };
+    let class = db
+        .get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+        .get_type_id()?
+        .clone();
+    Some(LuaType::Ref(class))
+}
+
+fn incoming_is_the_declared_class_table(
+    db: &DbIndex,
+    declared: &LuaType,
+    incoming: &LuaType,
+) -> bool {
+    let (LuaType::Def(class) | LuaType::Ref(class)) = declared else {
+        return false;
+    };
+    let LuaType::TableConst(range) = incoming else {
+        return false;
+    };
+    db.get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+        .get_type_id()
+        == Some(class)
+}
+
+/// Files a global path's members under the class its declaration is annotated
+/// with.
+///
+/// `---@class oslib` on `os = {}` gives one table two names, and every reader
+/// of the annotated type looks its members up on the class. Without this the
+/// path's members and the class's are two disjoint sets, and the workspace
+/// precedence between two files writing the same key (annotations over the std
+/// stub) never gets to apply.
+fn bind_global_path_class(db: &mut DbIndex, type_owner: &LuaTypeOwner) -> Option<()> {
+    let class = match db.get_type_index().get_type_cache(type_owner)?.as_type() {
+        LuaType::Def(id) | LuaType::Ref(id) => id.clone(),
+        _ => return None,
+    };
+    let (path, file_id) = match type_owner {
+        LuaTypeOwner::Decl(decl_id) => {
+            let decl = db.get_decl_index().get_decl(decl_id)?;
+            if !decl.is_global() {
+                return None;
+            }
+            (crate::GlobalId::new(decl.get_name()), decl_id.file_id)
+        }
+        LuaTypeOwner::Member(member_id) => {
+            let member = db.get_member_index().get_member(member_id)?;
+            (member.get_global_id()?.clone(), member_id.file_id)
+        }
+        _ => return None,
+    };
+    db.get_member_index_mut()
+        .set_global_path_class(path, class, file_id);
+    Some(())
 }
 
 /// A declaration written more than once holds a primitive over its lifetime,
@@ -359,7 +435,7 @@ pub fn bind_resolved_type(
     {
         db.get_type_index_mut()
             .force_bind_type(type_owner.clone(), type_cache);
-        migrate_global_members_when_type_resolve(db, type_owner);
+        bind_global_path_class(db, &type_owner);
         return Some(());
     }
 
@@ -489,52 +565,6 @@ pub fn add_member(db: &mut DbIndex, owner: LuaMemberOwner, member_id: LuaMemberI
         .add_member_to_owner(owner.clone(), member_id);
 
     Some(())
-}
-
-fn get_owner_id(db: &DbIndex, type_owner: &LuaTypeOwner) -> Option<LuaMemberOwner> {
-    let type_cache = db.get_type_index().get_type_cache(type_owner)?;
-    member_owner_from_type(type_cache.as_type())
-}
-
-fn member_owner_from_type(typ: &LuaType) -> Option<LuaMemberOwner> {
-    match typ {
-        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
-            Some(LuaMemberOwner::Type(type_id.clone()))
-        }
-        LuaType::TableConst(id) => Some(LuaMemberOwner::Element(id.clone())),
-        LuaType::Instance(inst) => member_owner_from_type(inst.get_base())
-            .or_else(|| Some(LuaMemberOwner::Element(inst.get_range().clone()))),
-        LuaType::TypeGuard(inner) => member_owner_from_type(inner),
-        LuaType::Union(union) => preferred_owner_from_types(union.types()),
-        LuaType::Intersection(intersection) => {
-            preferred_owner_from_types(intersection.get_types().iter())
-        }
-        LuaType::MultiLineUnion(union) => {
-            preferred_owner_from_types(union.get_unions().iter().map(|(typ, _)| typ))
-        }
-        _ => None,
-    }
-}
-
-fn preferred_owner_from_types<'a>(
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaMemberOwner> {
-    let mut fallback_owner = None;
-    for typ in types {
-        let Some(owner) = member_owner_from_type(typ) else {
-            continue;
-        };
-
-        if matches!(owner, LuaMemberOwner::Type(_)) {
-            return Some(owner);
-        }
-
-        if fallback_owner.is_none() {
-            fallback_owner = Some(owner);
-        }
-    }
-
-    fallback_owner
 }
 
 #[cfg(test)]

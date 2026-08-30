@@ -497,7 +497,10 @@ fn dynamic_field_definitions(
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_owner(
             db,
             caller_file_id,
-            &crate::DynamicFieldOwner::Table(table_range.clone()),
+            &crate::canonical_dynamic_field_owner(
+                db,
+                crate::DynamicFieldOwner::Table(table_range.clone()),
+            ),
             field_name,
             access_position,
         ),

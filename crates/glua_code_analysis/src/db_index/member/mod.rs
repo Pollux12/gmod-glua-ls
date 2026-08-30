@@ -63,6 +63,20 @@ pub struct LuaMemberIndex {
     /// Per-writer evidence for the member assignment widening merge. See
     /// [`MemberAssignmentContribution`].
     assignment_contributions: MemberAssignmentContributionStore,
+    /// The owner a table literal that initialises a global path resolves to:
+    /// the `{}` of `X = {}` or of the GLua-idiomatic `X = X or {}`, at any
+    /// depth. Held as the owner rather than the path so the normaliser can
+    /// hand back a reference. See [`LuaMemberIndex::canonical_owner`].
+    definition_site_owner: HashMap<crate::InFiled<TextRange>, LuaMemberOwner>,
+    /// The reverse of [`Self::definition_site_owner`], each path's sites sorted
+    /// by `(file id, range)`.
+    path_definition_sites: HashMap<GlobalId, Vec<crate::InFiled<TextRange>>>,
+    definition_sites_by_file: HashMap<FileId, Vec<crate::InFiled<TextRange>>>,
+    /// The class a global path's declaration carries (`---@class oslib` on
+    /// `os = {}`). Such a path's members belong to the class, which is where
+    /// every reader of the annotated type looks for them.
+    global_path_class_owner: HashMap<GlobalId, LuaMemberOwner>,
+    global_path_classes_by_file: HashMap<FileId, Vec<GlobalId>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -109,6 +123,11 @@ impl LuaMemberIndex {
             alias_contributed_slots: HashMap::default(),
             member_function_scope_ranges: HashMap::default(),
             assignment_contributions: MemberAssignmentContributionStore::default(),
+            definition_site_owner: HashMap::default(),
+            path_definition_sites: HashMap::default(),
+            definition_sites_by_file: HashMap::default(),
+            global_path_class_owner: HashMap::default(),
+            global_path_classes_by_file: HashMap::default(),
         }
     }
 
@@ -136,6 +155,7 @@ impl LuaMemberIndex {
     }
 
     pub fn add_member(&mut self, owner: LuaMemberOwner, member: LuaMember) -> LuaMemberId {
+        let owner = self.canonical(&owner).clone();
         let id = member.get_id();
         let file_id = member.get_file_id();
         let function_scope = self.assignment_file_define_scope_for_member(&member);
@@ -165,6 +185,7 @@ impl LuaMemberIndex {
     }
 
     pub fn add_member_to_owner(&mut self, owner: LuaMemberOwner, id: LuaMemberId) -> Option<()> {
+        let owner = self.canonical(&owner).clone();
         let member = self.get_member(&id)?;
         let key = member.get_key().clone();
         let is_decl = member.get_feature().is_decl();
@@ -592,6 +613,7 @@ impl LuaMemberIndex {
     /// Removes `id` from `owner` entirely, including the item
     /// `set_member_owner` leaves behind.
     pub fn detach_member_from_owner(&mut self, owner: &LuaMemberOwner, id: LuaMemberId) {
+        let owner = &self.canonical(owner).clone();
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
@@ -624,6 +646,7 @@ impl LuaMemberIndex {
         owner: LuaMemberOwner,
         id: LuaMemberId,
     ) -> Option<()> {
+        let owner = self.canonical(&owner).clone();
         let member = self.get_member(&id)?;
         let file_id = member.get_file_id();
         let key = member.get_key().clone();
@@ -649,51 +672,6 @@ impl LuaMemberIndex {
 
         self.add_in_file_object(file_id, MemberOrOwner::Owner(owner));
         Some(())
-    }
-
-    /// Whether every write
-    /// [`add_member_alias_to_owner`](Self::add_member_alias_to_owner) would
-    /// perform for `(owner, id)` is already in the index, so calling it would
-    /// leave the index unchanged.
-    pub(crate) fn alias_to_owner_is_recorded(
-        &self,
-        owner: &LuaMemberOwner,
-        id: LuaMemberId,
-    ) -> bool {
-        let Some(member) = self.get_member(&id) else {
-            return false;
-        };
-        let key = member.get_key();
-
-        let is_indexed =
-            |index: &HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>| {
-                index
-                    .get(owner)
-                    .and_then(|members_by_key| members_by_key.get(key))
-                    .is_some_and(|member_ids| member_ids.contains(&id))
-            };
-        if self.member_current_owner.get(&id) != Some(owner)
-            && !(is_indexed(&self.member_owner_key_index)
-                && is_indexed(&self.member_owner_key_history_index))
-        {
-            return false;
-        }
-
-        let item_holds_member = self
-            .owner_members
-            .get(owner)
-            .and_then(|owner_members| owner_members.get_member(key))
-            .is_some_and(|item| match item {
-                LuaMemberIndexItem::One(existing_id) => *existing_id == id,
-                LuaMemberIndexItem::Many(ids) => ids.contains(&id),
-            });
-        if !item_holds_member {
-            return false;
-        }
-
-        self.in_filed
-            .get(&member.get_file_id())
-            .is_some_and(|objects| objects.contains(&MemberOrOwner::Owner(owner.clone())))
     }
 
     fn should_preserve_assignment_file_define_member(
@@ -1001,6 +979,7 @@ impl LuaMemberIndex {
         file_id: FileId,
         id: LuaMemberId,
     ) -> Option<()> {
+        let owner = self.canonical(&owner).clone();
         let previous_owner = self.member_current_owner.insert(id, owner.clone());
         if previous_owner.is_none() {
             self.add_current_member_key(id);
@@ -1041,6 +1020,163 @@ impl LuaMemberIndex {
 
     /// Every global path that currently has members parked on it, in a
     /// stable order.
+    /// Records `site` as a table literal that initialises the global `path`.
+    ///
+    /// A path's members all live on [`LuaMemberOwner::GlobalPath`]; its literals
+    /// are definition sites, not owners. The site is decided by the file that
+    /// owns the range, and that file's declaration walk always precedes any
+    /// member insertion naming the range, so a member never has to be re-homed:
+    /// the decl walk is pre-order, so `X = {}` registers before the literal's
+    /// own fields are added, and every later phase runs after the whole batch's
+    /// decl phase. A file cannot name another file's literal range
+    /// syntactically, so a foreign write is always `a.b.c = v`, which the decl
+    /// analyzer already routes to the path.
+    pub fn set_definition_site(&mut self, path: GlobalId, site: crate::InFiled<TextRange>) {
+        let owner = LuaMemberOwner::GlobalPath(path.clone());
+        if self.definition_site_owner.get(&site) == Some(&owner) {
+            return;
+        }
+        self.forget_definition_site(&site);
+        self.definition_site_owner.insert(site.clone(), owner);
+        let sites = self.path_definition_sites.entry(path).or_default();
+        if let Err(at) = sites.binary_search_by_key(&site_sort_key(&site), site_sort_key) {
+            sites.insert(at, site.clone());
+        }
+        self.definition_sites_by_file
+            .entry(site.file_id)
+            .or_default()
+            .push(site);
+    }
+
+    /// The literals initialising `path`, sorted by `(file id, range)`.
+    pub fn definition_sites(&self, path: &GlobalId) -> &[crate::InFiled<TextRange>] {
+        self.path_definition_sites
+            .get(path)
+            .map_or(&[], |sites| sites.as_slice())
+    }
+
+    /// The one owner a table literal's members belong to.
+    ///
+    /// A literal that initialises a global path is not an owner: its members
+    /// belong to the path, alongside every other literal's and every
+    /// `path.k = v` write's. Applied wherever an owner enters or is looked up
+    /// in this index, so producers keep building [`LuaMemberOwner::Element`]
+    /// and never see the difference.
+    pub fn canonical_owner(&self, owner: LuaMemberOwner) -> LuaMemberOwner {
+        match self.canonical(&owner) {
+            canonical if canonical == &owner => owner,
+            canonical => canonical.clone(),
+        }
+    }
+
+    fn canonical<'a>(&'a self, owner: &'a LuaMemberOwner) -> &'a LuaMemberOwner {
+        let owner = match owner {
+            LuaMemberOwner::Element(range) => {
+                self.definition_site_owner.get(range).unwrap_or(owner)
+            }
+            _ => owner,
+        };
+        match owner {
+            LuaMemberOwner::GlobalPath(path) => {
+                self.global_path_class_owner.get(path).unwrap_or(owner)
+            }
+            _ => owner,
+        }
+    }
+
+    /// Records that `path`'s declaration is annotated `---@class`, and moves
+    /// the members already filed under the path onto the class.
+    ///
+    /// A global with a class annotation has two names for one table, and every
+    /// reader of the annotated type looks the members up on the class. Which
+    /// class wins is decided by name so two files annotating one global do not
+    /// depend on which was analysed first.
+    pub fn set_global_path_class(
+        &mut self,
+        path: GlobalId,
+        class: crate::LuaTypeDeclId,
+        file_id: FileId,
+    ) {
+        if let Some(current) = self
+            .global_path_class_owner
+            .get(&path)
+            .and_then(LuaMemberOwner::get_type_id)
+            && current.get_name() <= class.get_name()
+        {
+            return;
+        }
+        self.global_path_class_owner
+            .insert(path.clone(), LuaMemberOwner::Type(class.clone()));
+        self.global_path_classes_by_file
+            .entry(file_id)
+            .or_default()
+            .push(path.clone());
+
+        let path_owner = LuaMemberOwner::GlobalPath(path);
+        let class_owner = LuaMemberOwner::Type(class);
+        let mut member_ids = self
+            .owner_members
+            .get(&path_owner)
+            .into_iter()
+            .flat_map(|members| members.get_member_items())
+            .flat_map(member_ids_from_item)
+            .filter(|id| {
+                !self.synthesized_owner_members.contains(id)
+                    && self.member_current_owner.get(id) == Some(&path_owner)
+            })
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
+        member_ids.dedup();
+        for member_id in member_ids {
+            self.set_member_owner(class_owner.clone(), member_id.file_id, member_id);
+            self.add_member_to_owner(class_owner.clone(), member_id);
+        }
+    }
+
+    fn remove_file_definition_sites(&mut self, file_id: FileId) {
+        let Some(sites) = self.definition_sites_by_file.remove(&file_id) else {
+            return;
+        };
+        for site in sites {
+            self.forget_definition_site(&site);
+        }
+    }
+
+    fn forget_definition_site(&mut self, site: &crate::InFiled<TextRange>) {
+        let Some(path) = self
+            .definition_site_owner
+            .remove(site)
+            .and_then(|owner| owner.get_path().cloned())
+        else {
+            return;
+        };
+        if let Some(sites) = self.path_definition_sites.get_mut(&path) {
+            sites.retain(|held| held != site);
+            if sites.is_empty() {
+                self.path_definition_sites.remove(&path);
+            }
+        }
+        if let Some(sites) = self.definition_sites_by_file.get_mut(&site.file_id) {
+            sites.retain(|held| held != site);
+            if sites.is_empty() {
+                self.definition_sites_by_file.remove(&site.file_id);
+            }
+        }
+    }
+
+    /// Every path with at least one definition site, and its sites, in a stable
+    /// order. Used by the determinism harness to observe that ownership does
+    /// not depend on index order.
+    pub fn sorted_definition_sites(&self) -> Vec<(&GlobalId, &[crate::InFiled<TextRange>])> {
+        let mut entries: Vec<(&GlobalId, &[crate::InFiled<TextRange>])> = self
+            .path_definition_sites
+            .iter()
+            .map(|(path, sites)| (path, sites.as_slice()))
+            .collect();
+        entries.sort_unstable_by(|left, right| left.0.get_name().cmp(right.0.get_name()));
+        entries
+    }
+
     pub fn sorted_global_path_owners(&self) -> Vec<GlobalId> {
         let mut global_ids = self
             .owner_members
@@ -1090,6 +1226,7 @@ impl LuaMemberIndex {
     }
 
     pub fn get_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
         if owner_members.get_member_len() == 0 {
             return Some(Vec::new());
@@ -1116,6 +1253,7 @@ impl LuaMemberIndex {
     /// The owner's members whose key is an expression rather than a name, in
     /// the same order [`Self::get_members`] would yield them.
     pub fn get_expr_key_members(&self, owner: &LuaMemberOwner) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
         let mut member_ids = Vec::new();
         for key in owner_members.expr_keys() {
@@ -1144,6 +1282,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<Vec<&LuaMember>> {
+        let owner = self.canonical(owner);
         let owner_members = self.owner_members.get(owner)?;
         let mut member_ids = match owner_members.get_member(key) {
             Some(LuaMemberIndexItem::One(id)) => vec![*id],
@@ -1164,7 +1303,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
     ) -> impl Iterator<Item = &'a LuaMemberKey> + 'a {
         self.owner_members
-            .get(owner)
+            .get(self.canonical(owner))
             .into_iter()
             .flat_map(LuaOwnerMembers::get_member_keys)
     }
@@ -1189,12 +1328,14 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Option<&LuaMemberIndexItem> {
+        let owner = self.canonical(owner);
         self.owner_members
             .get(owner)
             .and_then(|map| map.get_member(key))
     }
 
     pub fn get_member_len(&self, owner: &LuaMemberOwner) -> usize {
+        let owner = self.canonical(owner);
         self.owner_members
             .get(owner)
             .map_or(0, |map| map.get_member_len())
@@ -1207,6 +1348,7 @@ impl LuaMemberIndex {
     /// key can outlive the member it points at. Stops at the first live id
     /// rather than materialising the owner's whole member list.
     pub fn has_live_member(&self, owner: &LuaMemberOwner) -> bool {
+        let owner = self.canonical(owner);
         let Some(owner_members) = self.owner_members.get(owner) else {
             return false;
         };
@@ -1229,6 +1371,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> usize {
+        let owner = self.canonical(owner);
         self.member_owner_key_index
             .get(owner)
             .and_then(|owner_items| owner_items.get(key))
@@ -1242,6 +1385,7 @@ impl LuaMemberIndex {
         key: &LuaMemberKey,
         excluded_member_id: LuaMemberId,
     ) -> bool {
+        let owner = self.canonical(owner);
         let Some(member_ids) = self
             .member_owner_key_index
             .get(owner)
@@ -1269,6 +1413,7 @@ impl LuaMemberIndex {
         key: &LuaMemberKey,
         id: LuaMemberId,
     ) -> bool {
+        let owner = self.canonical(owner);
         self.member_owner_key_index
             .get(owner)
             .and_then(|owner_items| owner_items.get(key))
@@ -1280,6 +1425,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
         let Some(owner_items) = self.member_owner_key_index.get(owner) else {
             return Vec::new();
         };
@@ -1302,6 +1448,7 @@ impl LuaMemberIndex {
     /// Every member ever keyed under `owner`, including ones hidden by the
     /// latest-assignment view and ones since re-homed to a concrete owner.
     pub fn get_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
         let Some(owner_items) = self.member_owner_key_history_index.get(owner) else {
             return Vec::new();
         };
@@ -1322,6 +1469,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         global_id: &GlobalId,
     ) -> Vec<LuaMemberId> {
+        let owner = self.canonical(owner);
         // The member key is the part of the path below the owner, so the members
         // declaring it are one bucket of the owner's history rather than all of
         // it. Reading the whole history to filter it built and sorted every
@@ -1542,6 +1690,7 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         key: &LuaMemberKey,
     ) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
         let Some(member_ids) = self
             .member_owner_key_history_index
             .get(owner)
@@ -1572,6 +1721,7 @@ impl LuaMemberIndex {
     /// owner region wholesale. Ordinary semantic lookup should continue using
     /// `get_members`, which applies runtime overwrite visibility.
     pub fn get_current_owner_member_history(&self, owner: &LuaMemberOwner) -> Vec<&LuaMember> {
+        let owner = self.canonical(owner);
         let Some(member_ids) = self.current_owner_member_history.get(owner) else {
             return Vec::new();
         };
@@ -1707,6 +1857,14 @@ impl LuaMemberIndex {
     }
 }
 
+fn site_sort_key(site: &crate::InFiled<TextRange>) -> (u32, u32, u32) {
+    (
+        site.file_id.id,
+        site.value.start().into(),
+        site.value.end().into(),
+    )
+}
+
 fn stable_member_sort_key(member: &LuaMember) -> (u32, u32, u32, u16) {
     let member_id = member.get_id();
     member_id_sort_key(member_id)
@@ -1814,6 +1972,14 @@ impl LuaMemberIndex {
         }
         self.function_scope_ranges.remove(&file_id);
         self.conditional_branch_ranges.remove(&file_id);
+        self.remove_file_definition_sites(file_id);
+        for path in self
+            .global_path_classes_by_file
+            .remove(&file_id)
+            .unwrap_or_default()
+        {
+            self.global_path_class_owner.remove(&path);
+        }
     }
 
     /// Drops an owner entry from every file that registered it.
@@ -1862,6 +2028,32 @@ impl LuaMemberIndex {
             }
         }
 
+        // A definition site is a literal range in the edited file too, and the
+        // edit moves it exactly as it moves an element owner's. It owns no
+        // members of its own, so a site the edit destroyed dirties nothing:
+        // the path keeps every other file's members, and this file re-registers
+        // its own sites when it is re-indexed.
+        let mut deleted_sites: Vec<crate::InFiled<TextRange>> = Vec::new();
+        let sites = self
+            .definition_sites_by_file
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default();
+        for site in sites {
+            match remap.table_range(&site) {
+                crate::Remap::Moved(new) => {
+                    if new != site {
+                        moved.insert(site, new);
+                    }
+                }
+                crate::Remap::Unrelated => {}
+                crate::Remap::Lost => deleted_sites.push(site),
+            }
+        }
+        for site in &deleted_sites {
+            self.forget_definition_site(site);
+        }
+
         self.remap_elements(&moved);
         let empty = rustc_hash::FxHashMap::default();
         self.assignment_contributions
@@ -1907,6 +2099,7 @@ impl LuaMemberIndex {
                     .collect::<Vec<_>>()
             })
             .collect();
+        self.remap_definition_sites(map);
         self.assignment_contributions.remap_element_owners(map);
         self.assignment_contributions.remap_table_ranges(map);
         let moved_slots: Vec<(
@@ -1962,6 +2155,27 @@ impl LuaMemberIndex {
         }
     }
 
+    /// Re-keys the definition sites an edit moved.
+    fn remap_definition_sites(
+        &mut self,
+        map: &rustc_hash::FxHashMap<crate::InFiled<TextRange>, crate::InFiled<TextRange>>,
+    ) {
+        let mut moves: Vec<(crate::InFiled<TextRange>, GlobalId)> = map
+            .keys()
+            .filter_map(|old| {
+                let path = self.definition_site_owner.get(old)?.get_path()?.clone();
+                Some((old.clone(), path))
+            })
+            .collect();
+        moves.sort_unstable_by_key(|(old, _)| site_sort_key(old));
+        for (old, _) in &moves {
+            self.forget_definition_site(old);
+        }
+        for (old, path) in moves {
+            self.set_definition_site(path, map[&old].clone());
+        }
+    }
+
     /// Drops the owners for table literals an edit removed, and every member
     /// filed under them.
     ///
@@ -1973,6 +2187,10 @@ impl LuaMemberIndex {
     ) -> Vec<LuaMemberId> {
         let mut forgotten = Vec::new();
         for range in deleted {
+            // A file removal hands its literals here wholesale; a definition
+            // site among them leaves the store with the file, not with the
+            // path's members.
+            self.forget_definition_site(range);
             let owner = LuaMemberOwner::Element(range.clone());
             if let Some(member_items) = self.owner_members.remove(&owner) {
                 let member_ids: Vec<LuaMemberId> = member_items
@@ -2033,6 +2251,11 @@ impl LuaIndex for LuaMemberIndex {
         self.alias_contributed_slots.clear();
         self.member_function_scope_ranges.clear();
         self.assignment_contributions.clear();
+        self.definition_site_owner.clear();
+        self.path_definition_sites.clear();
+        self.definition_sites_by_file.clear();
+        self.global_path_class_owner.clear();
+        self.global_path_classes_by_file.clear();
     }
 }
 
@@ -2111,6 +2334,141 @@ mod tests {
             .into_iter()
             .map(|member| member.get_id())
             .collect()
+    }
+
+    fn site(file: u32, start: u32, end: u32) -> crate::InFiled<TextRange> {
+        crate::InFiled::new(
+            FileId::new(file),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        )
+    }
+
+    fn path(name: &str) -> LuaMemberOwner {
+        LuaMemberOwner::GlobalPath(GlobalId::new(name))
+    }
+
+    #[test]
+    fn an_inline_literal_field_is_owned_by_the_path_not_the_literal() {
+        let mut index = LuaMemberIndex::new();
+        let site = site(1, 10, 12);
+        index.set_definition_site(GlobalId::new("cityrp.util"), site.clone());
+        let member_id = make_index_member_id(FileId::new(1), 11);
+        index.add_member(
+            LuaMemberOwner::Element(site.clone()),
+            make_member(member_id, "Bind"),
+        );
+
+        assert_eq!(
+            index.get_member_owner(&member_id),
+            Some(&path("cityrp.util"))
+        );
+        assert_eq!(
+            owner_member_ids(&index, &LuaMemberOwner::Element(site)),
+            owner_member_ids(&index, &path("cityrp.util"))
+        );
+    }
+
+    #[test]
+    fn a_literal_that_is_not_a_definition_site_keeps_its_element_owner() {
+        let mut index = LuaMemberIndex::new();
+        let anonymous = site(1, 40, 42);
+        let member_id = make_index_member_id(FileId::new(1), 41);
+        index.add_member(
+            LuaMemberOwner::Element(anonymous.clone()),
+            make_member(member_id, "Bind"),
+        );
+
+        assert_eq!(
+            index.get_member_owner(&member_id),
+            Some(&LuaMemberOwner::Element(anonymous))
+        );
+    }
+
+    #[test]
+    fn three_literals_in_three_files_share_one_owner() {
+        let mut index = LuaMemberIndex::new();
+        for file in 1..=3u32 {
+            index.set_definition_site(GlobalId::new("cityrp.util"), site(file, 10, 12));
+            index.add_member(
+                LuaMemberOwner::Element(site(file, 10, 12)),
+                make_member(make_index_member_id(FileId::new(file), 20 + file), "Bind"),
+            );
+        }
+
+        assert_eq!(owner_member_ids(&index, &path("cityrp.util")).len(), 3);
+        assert_eq!(
+            index.definition_sites(&GlobalId::new("cityrp.util")).len(),
+            3
+        );
+        assert_eq!(
+            index
+                .definition_sites(&GlobalId::new("cityrp.util"))
+                .iter()
+                .map(|s| s.file_id.id)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn removing_one_definition_site_file_keeps_the_other_files_members() {
+        let mut index = LuaMemberIndex::new();
+        for file in 1..=3u32 {
+            index.set_definition_site(GlobalId::new("cityrp.util"), site(file, 10, 12));
+            index.add_member(
+                LuaMemberOwner::Element(site(file, 10, 12)),
+                make_member(make_index_member_id(FileId::new(file), 20 + file), "Bind"),
+            );
+        }
+        index.remove_files(&[FileId::new(2)]);
+
+        assert_eq!(
+            index.definition_sites(&GlobalId::new("cityrp.util")).len(),
+            2
+        );
+        for file in [1u32, 3] {
+            let member_id = make_index_member_id(FileId::new(file), 20 + file);
+            assert_eq!(
+                index.get_member_owner(&member_id),
+                Some(&path("cityrp.util"))
+            );
+        }
+    }
+
+    #[test]
+    fn insertion_order_does_not_change_owners() {
+        let owners_for = |order: [u32; 3]| {
+            let mut index = LuaMemberIndex::new();
+            for file in order {
+                index.set_definition_site(GlobalId::new("cityrp.util"), site(file, 10, 12));
+                index.add_member(
+                    LuaMemberOwner::Element(site(file, 10, 12)),
+                    make_member(make_index_member_id(FileId::new(file), 20 + file), "Bind"),
+                );
+            }
+            let mut owners = (1..=3u32)
+                .map(|file| {
+                    let member_id = make_index_member_id(FileId::new(file), 20 + file);
+                    format!("{:?}", index.get_member_owner(&member_id))
+                })
+                .collect::<Vec<_>>();
+            owners.sort();
+            let sites = index
+                .definition_sites(&GlobalId::new("cityrp.util"))
+                .iter()
+                .map(|s| s.file_id.id)
+                .collect::<Vec<_>>();
+            (owners, sites)
+        };
+
+        let baseline = owners_for([1, 2, 3]);
+        for order in [[3, 2, 1], [2, 1, 3], [2, 3, 1], [3, 1, 2], [1, 3, 2]] {
+            assert_eq!(
+                owners_for(order),
+                baseline,
+                "order {order:?} changed ownership"
+            );
+        }
     }
 
     #[test]
@@ -2800,64 +3158,6 @@ mod tests {
             "aliasing an id already in the item must not add it again"
         );
         assert_eq!(owner_member_ids(&index, &owner).len(), 2);
-    }
-
-    #[test]
-    fn alias_to_owner_is_recorded_exactly_when_the_alias_is_a_no_op() {
-        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("SharedTable"));
-        let other_owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OtherTable"));
-        let own_member_id = make_index_member_id(FileId::new(1), 10);
-        let aliased_member_id = make_index_member_id(FileId::new(2), 20);
-
-        let mut index = LuaMemberIndex::new();
-        index.add_member(
-            owner.clone(),
-            make_member_with_feature(own_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-        index.add_member(
-            other_owner,
-            make_member_with_feature(aliased_member_id, "field", LuaMemberFeature::FileDefine),
-        );
-
-        // Everything `add_member_alias_to_owner` writes, read back in a
-        // deterministic order. Comparing the index's `Debug` instead would
-        // compare `HashSet` iteration order, which varies per process and makes
-        // the assertion pass or fail at random.
-        let key = LuaMemberKey::Name("field".into());
-        let written_state = |index: &LuaMemberIndex| {
-            let mut in_filed: Vec<String> = index
-                .in_filed
-                .get(&aliased_member_id.file_id)
-                .map(|objects| objects.iter().map(|object| format!("{object:?}")).collect())
-                .unwrap_or_default();
-            in_filed.sort();
-            (
-                index.get_member_item(&owner, &key).cloned(),
-                index
-                    .member_owner_key_index
-                    .get(&owner)
-                    .and_then(|keys| keys.get(&key))
-                    .cloned(),
-                index
-                    .member_owner_key_history_index
-                    .get(&owner)
-                    .and_then(|keys| keys.get(&key))
-                    .cloned(),
-                in_filed,
-            )
-        };
-
-        assert!(!index.alias_to_owner_is_recorded(&owner, aliased_member_id));
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-        assert!(index.alias_to_owner_is_recorded(&owner, aliased_member_id));
-
-        let recorded = written_state(&index);
-        index.add_member_alias_to_owner(owner.clone(), aliased_member_id);
-        assert_eq!(
-            recorded,
-            written_state(&index),
-            "a recorded alias must write nothing when applied again"
-        );
     }
 
     #[test]

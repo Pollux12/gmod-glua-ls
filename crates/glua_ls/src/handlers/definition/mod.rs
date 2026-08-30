@@ -317,7 +317,10 @@ fn collect_dynamic_field_locations(
             }
         }
         LuaType::TableConst(table_range) => {
-            let owner = glua_code_analysis::DynamicFieldOwner::Table(table_range.clone());
+            let owner = glua_code_analysis::canonical_dynamic_field_owner(
+                semantic_model.get_db(),
+                glua_code_analysis::DynamicFieldOwner::Table(table_range.clone()),
+            );
             let definitions = semantic_model
                 .get_db()
                 .get_dynamic_field_index()

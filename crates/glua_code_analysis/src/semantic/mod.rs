@@ -216,17 +216,32 @@ fn declared_call_contract_authority(
     let Some(member_owner) = db.get_member_index().get_member_owner(&member_id) else {
         return DeclaredCallContractAuthority::Independent;
     };
-    let expected_receiver_type = match member_owner {
-        LuaMemberOwner::Type(owner_id) => LuaType::Ref(owner_id.clone()),
-        LuaMemberOwner::Element(range) => LuaType::TableConst(range.clone()),
-        _ => return DeclaredCallContractAuthority::Independent,
+    let member_owner = member_owner.clone();
+    let expected_receiver_type = match &member_owner {
+        LuaMemberOwner::Type(owner_id) => Some(LuaType::Ref(owner_id.clone())),
+        LuaMemberOwner::Element(range) => Some(LuaType::TableConst(range.clone())),
+        // A global path's table has no type of its own; the receiver is
+        // compared to it as an owner below.
+        LuaMemberOwner::GlobalPath(_) => None,
+        LuaMemberOwner::LocalUnresolve => return DeclaredCallContractAuthority::Independent,
     };
     let Some(receiver) = index.get_prefix_expr() else {
         return DeclaredCallContractAuthority::Independent;
     };
     let receiver_fact = infer_expr_fact_with_cache(db, cache, receiver);
+    let receiver_owner = match receiver_fact.typ() {
+        LuaType::TableConst(range) => Some(range.clone()),
+        LuaType::Instance(instance) => Some(instance.get_range().clone()),
+        _ => None,
+    }
+    .map(|range| {
+        db.get_member_index()
+            .canonical_owner(LuaMemberOwner::Element(range))
+    });
     if receiver_fact.confidence() >= LuaInferenceConfidence::Certain
-        && check_type_compact(db, receiver_fact.typ(), &expected_receiver_type).is_ok()
+        && (expected_receiver_type.is_some_and(|expected_receiver_type| {
+            check_type_compact(db, receiver_fact.typ(), &expected_receiver_type).is_ok()
+        }) || receiver_owner == Some(member_owner))
     {
         DeclaredCallContractAuthority::Independent
     } else {

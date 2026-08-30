@@ -3440,14 +3440,15 @@ marauth.character = marauth.character or {}
 "#,
         );
 
+        // Both files bootstrap `marauth` with their own `{}`, and both write
+        // `marauth.character`. The two literals are definition sites of one
+        // path, so every writer of the field belongs to that path -- which
+        // literal a given file wrote is not part of the answer.
         let owner = first_index_expr_member_owner(&ws, child_file, "marauth.character");
-        let LuaMemberOwner::Element(owner_range) = owner else {
-            panic!("expected marauth.character to be owned by a table element, got {owner:?}");
-        };
         assert_that!(
-            owner_range.file_id,
-            eq(child_file),
-            "child guarded field assignment should attach to the current file's table owner"
+            owner == LuaMemberOwner::GlobalPath(crate::GlobalId::new("marauth")),
+            eq(true),
+            "a guarded field assignment on a multi-file global belongs to the path"
         );
     }
 
@@ -3540,16 +3541,28 @@ marauth.character = marauth.character or {}
         );
         let consumer = ws.def_file("lua/no_widen_guarded/c.lua", "local cfg = Store.cfg\n");
 
+        // The plain writer wins under either load order: a.lua first leaves
+        // `{a=1}` for b.lua's guard to keep, b.lua first has its `{b=2}`
+        // clobbered by a.lua's unguarded write. What must not happen is
+        // widening to a bare `table`.
         let cfg_type = local_name_type(&mut ws, consumer, "cfg");
-        let LuaType::MergedTable(merged) = &cfg_type else {
-            panic!("guarded merge should keep concrete tables, got {cfg_type:?}");
+        let LuaType::TableConst(range) = &cfg_type else {
+            panic!("guarded merge should keep a concrete table, got {cfg_type:?}");
         };
+        let owner = LuaMemberOwner::Element(range.clone());
+        let keys = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| format!("{:?}", member.get_key()))
+            .collect::<Vec<_>>();
         assert!(
-            merged
-                .get_types()
-                .iter()
-                .all(|typ| matches!(typ, LuaType::TableConst(_))),
-            "guarded merge must not widen its table literals, got {cfg_type:?}"
+            keys.iter().any(|key| key.contains('a')),
+            "the plain writer's literal must win, got {cfg_type:?} with {keys:?}"
         );
     }
 

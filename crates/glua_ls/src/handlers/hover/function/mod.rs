@@ -566,6 +566,13 @@ fn hover_doc_function_type(
                         push_typed_owner_prefix(&prefix, LuaType::Ref(type_decl_id.clone()));
                     }
                 }
+                LuaMemberOwner::GlobalPath(path) => {
+                    name.push_str(path.get_name());
+                    if is_method {
+                        type_label = "(method) ";
+                    }
+                    name.push(if is_method { ':' } else { '.' });
+                }
                 LuaMemberOwner::Element(element_id) => {
                     if let Some(LuaType::Ref(type_decl_id) | LuaType::Def(type_decl_id)) =
                         extract_parent_type_from_element(builder.semantic_model, element_id)

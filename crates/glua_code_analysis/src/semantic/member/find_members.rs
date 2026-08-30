@@ -1204,7 +1204,10 @@ fn append_dynamic_fields_for_table(
         return false;
     }
 
-    let owner = crate::DynamicFieldOwner::Table(table_range.clone());
+    let owner = crate::canonical_dynamic_field_owner(
+        db,
+        crate::DynamicFieldOwner::Table(table_range.clone()),
+    );
     let prefix_type = LuaType::TableConst(table_range.clone());
     if let Some(should_stop) = append_keyed_dynamic_field(
         db,

@@ -256,38 +256,17 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             }
         }
 
-        // Members that landed on a global path before the global's owner was
-        // known are attached now that it is. See
-        // `reconcile_parked_global_path_members`.
-        {
-            let _p = Profile::new("reconcile_parked_global_path_members");
-            common::reconcile_parked_global_path_members(db);
-        }
-
-        // Writes that inferred their prefix to one concrete declaration of a
-        // multi-declaration global attach directly to that table and never
-        // park, so which table won depends on batch composition. Re-apply the
-        // ownership rule to them now that every declaration stands. See
-        // `reconcile_directly_attached_candidate_members`.
-        {
-            let _p = Profile::new("reconcile_directly_attached_candidate_members");
-            common::reconcile_directly_attached_candidate_members(db);
-        }
-
-        // Runs after both reconcile passes: the sibling set it widens against
-        // is read through owner visibility, and before the reconciles that
-        // visibility still reflects whichever owners the walk had reached —
-        // a property of the batch, not of the source. A partial re-index
-        // inherits the settled homes while a cold build is still mid-migration,
-        // and the same candidate then widens against two different sibling
-        // sets.
+        // Runs after every write has landed: the sibling set it widens against
+        // is read through owner visibility, and mid-walk that visibility still
+        // reflects whichever owners the walk had reached — a property of the
+        // batch, not of the source.
         {
             let _p = Profile::new("rewiden_settled_member_assignments");
             rewiden_settled_member_assignments(db, &mut context);
         }
 
-        // Runs last of the settled passes: it needs every member to have reached
-        // its final owner, because the writer set it merges is grouped by owner.
+        // Runs last of the settled passes: the writer set it merges is grouped
+        // by owner.
         {
             let _p = Profile::new("rederive_contributed_member_assignments");
             let analyzed_files = context.analyzed_file_ids();
@@ -301,14 +280,6 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         {
             let _p = Profile::new("attach_settled_index_expr_members (late)");
             attach_settled_index_expr_members(db, &mut context);
-        }
-
-        // The late attach can still place members straight onto whichever
-        // candidate table its prefix resolved to, so the direct-attached
-        // repair has to see its results too.
-        {
-            let _p = Profile::new("reconcile_directly_attached_candidate_members (late)");
-            common::reconcile_directly_attached_candidate_members(db);
         }
 
         // Every write and every alias this batch performed has landed, so the

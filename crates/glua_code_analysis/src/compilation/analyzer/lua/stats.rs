@@ -540,9 +540,45 @@ fn get_var_owner(analyzer: &mut LuaAnalyzer, var: LuaVarExpr) -> LuaTypeOwner {
     }
 }
 
+/// Whether the write goes through a computed index (`t[k].field = v`).
+///
+/// Which entry `t[k]` names is not knowable statically, so the declaration walk
+/// files such a write under the path's placeholder segment (`t.[]`). Re-homing
+/// it onto whichever concrete entry the prefix *type* happened to resolve to
+/// makes ownership a function of how far inference had run when the write was
+/// analysed, which differs between a cold build and a warm re-index.
+fn prefix_path_has_computed_segment(prefix_expr: &LuaExpr) -> bool {
+    let mut current = prefix_expr.clone();
+    loop {
+        let LuaExpr::IndexExpr(index_expr) = current else {
+            return false;
+        };
+        if matches!(
+            index_expr.get_index_key(),
+            Some(LuaIndexKey::Expr(_) | LuaIndexKey::Idx(_))
+        ) {
+            return true;
+        }
+        match index_expr.get_prefix_expr() {
+            Some(next) => current = next,
+            None => return false,
+        }
+    }
+}
+
 fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Option<()> {
     let index_expr = LuaIndexExpr::cast(var_expr.syntax().clone())?;
     let prefix_expr = index_expr.get_prefix_expr()?;
+
+    if prefix_path_has_computed_segment(&prefix_expr) {
+        let member_id = LuaMemberId::new(index_expr.get_syntax_id(), analyzer.file_id);
+        if matches!(
+            analyzer.db.get_member_index().get_member_owner(&member_id),
+            Some(LuaMemberOwner::GlobalPath(_))
+        ) {
+            return Some(());
+        }
+    }
 
     if let Some((member_owner, set_owner_only)) =
         try_resolve_scoped_class_prefix_member_owner(analyzer, &prefix_expr)

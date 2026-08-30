@@ -529,6 +529,19 @@ fn analyze_dynamic_fields(
         profile.propagation_time += propagate_start.elapsed();
     }
 
+    // A field written on one of a global path's bootstrap literals belongs to
+    // the path, not to that literal: every file's `X.k = X.k or {}` names a
+    // different `{}` and every reader of `X.k` has to see all of them.
+    for (owner, _, _, _) in &mut collected {
+        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+    }
+    for (owner, _, _) in &mut collected_wildcards {
+        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+    }
+    for (owner, _, _, _, _) in &mut collected_finite_members {
+        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+    }
+
     let insert_start = profile_enabled.then(std::time::Instant::now);
     let index = db.get_dynamic_field_index_mut();
     for (field_name, file_id) in collected_unattributed {
