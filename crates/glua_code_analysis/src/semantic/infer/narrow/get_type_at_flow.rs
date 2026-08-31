@@ -2728,13 +2728,13 @@ fn numeric_table_index_query_from_decl_initializer(
     if initializer.get_ret_idx() != 0 {
         return None;
     }
-    let expr = initializer
-        .get_expr_syntax_id()
-        .to_node_from_root(root.syntax())
-        .and_then(LuaExpr::cast)?;
-    let LuaExpr::IndexExpr(index_expr) = expr else {
+    let expr_id = initializer.get_expr_syntax_id();
+    if !LuaIndexExpr::can_cast(expr_id.get_kind()) {
         return None;
-    };
+    }
+    let index_expr = expr_id
+        .to_node_from_root(root.syntax())
+        .and_then(LuaIndexExpr::cast)?;
     let access_index = index_expr_numeric_key_value(db, cache, &index_expr)?;
     let prefix_expr = index_expr.get_prefix_expr()?;
     let query_root = index_expr_root_id(db, cache, prefix_expr)?;
@@ -2903,13 +2903,13 @@ fn numeric_table_index_query_key_name_from_initializer(
     if initializer.get_ret_idx() != 0 {
         return None;
     }
-    let expr = initializer
-        .get_expr_syntax_id()
-        .to_node_from_root(root.syntax())
-        .and_then(LuaExpr::cast)?;
-    let LuaExpr::IndexExpr(index_expr) = expr else {
+    let expr_id = initializer.get_expr_syntax_id();
+    if !LuaIndexExpr::can_cast(expr_id.get_kind()) {
         return None;
-    };
+    }
+    let index_expr = expr_id
+        .to_node_from_root(root.syntax())
+        .and_then(LuaIndexExpr::cast)?;
     let LuaIndexKey::Expr(LuaExpr::NameExpr(name_expr)) = index_expr.get_index_key()? else {
         return None;
     };
