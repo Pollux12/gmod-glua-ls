@@ -1,6 +1,7 @@
 mod generic_param;
 mod humanize_type;
 mod inference_fact;
+pub(crate) mod read_set;
 mod test;
 mod type_decl;
 mod type_ops;
@@ -1628,6 +1629,7 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
+        read_set::record(owner);
         self.types.get(owner)
     }
 

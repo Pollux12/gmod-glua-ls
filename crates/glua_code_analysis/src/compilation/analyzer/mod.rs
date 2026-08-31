@@ -30,8 +30,8 @@ use crate::{
     semantic::infer_expr_fact_with_cache,
 };
 use glua_parser::{
-    BinaryOperator, LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaNameExpr,
-    LuaSyntaxId, LuaSyntaxNode,
+    BinaryOperator, LuaAstNode, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr, LuaIndexExpr,
+    LuaNameExpr, LuaSyntaxId, LuaSyntaxNode, LuaTableField,
 };
 use infer_cache_manager::InferCacheManager;
 use lua::LuaReturnPoint;
@@ -299,23 +299,52 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         // A loop over a global has to enumerate the table every realm's file
-        // contributed to, so the copies of that global settle first.
+        // contributed to, so the copies of that global settle first; and only
+        // now is every member attached, so a loop that enumerates a table can
+        // be answered from the whole map rather than the part of it this batch
+        // had reached.
+        //
+        // Run to a fixpoint. Each pass reads one immutable snapshot of the
+        // database, so an answer corrected in this round is invisible to the
+        // reads that feed it until the next one -- and the chain runs from a
+        // member map to the table a read answers with, to the loop variable
+        // that enumerates it, to the key a dynamic write is filed under.
+        // Looping rounds is what lets the later hops see the earlier ones.
+        //
+        // No round cap: the loop ends when a round moves no type write. Each
+        // round re-derives the same candidates against a strictly more complete
+        // database than the last, so the answers stop moving once every hop of
+        // the chain has seen the hop before it. On CityRP cold that is four
+        // rounds, three of them productive.
         {
-            let _p = Profile::new("rederive_settled_global_reads");
-            rederive_settled_global_reads(db, &mut context);
-        }
-
-        // Only now is every member attached, so a loop that enumerates a table
-        // can be answered from the whole map rather than the part of it this
-        // batch had reached.
-        {
-            let _p = Profile::new("rederive_settled_iter_vars");
-            // Everything that read a loop variable resolved while it still held
-            // the answer the partial map gave, so moving one means re-reading
-            // the initializers that could still take a better answer.
-            if rederive_settled_iter_vars(db, &mut context) {
-                refresh_settled_initializer_caches(db, &mut context);
+            let _p = Profile::new("settled_tail_fixpoint");
+            // `None` on the first round: every candidate is re-derived once.
+            // After that a candidate is only worth re-deriving when a cache it
+            // actually read has since moved, which is what each pass records as
+            // it runs. See [`crate::db_index::read_set`].
+            let mut moved_owners: Option<HashSet<LuaTypeOwner>> = None;
+            loop {
+                let _round = Profile::new("settled_tail_round");
+                rederive_settled_global_reads(db, &mut context);
+                let (moved, iter_var_owners) =
+                    rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
+                if !moved {
+                    break;
+                }
+                // Everything that read a loop variable resolved while it still
+                // held the answer the partial map gave, so moving one means
+                // re-reading the initializers that could still take a better
+                // answer -- and re-taking the keys the moved types were minted
+                // into.
+                let mut round_owners =
+                    refresh_settled_initializer_caches(db, &mut context, moved_owners.as_ref());
+                round_owners.extend(iter_var_owners);
+                refresh_settled_expr_type_member_keys(db, &mut context);
+                moved_owners = Some(round_owners);
             }
+            context.settled_iter_var_candidates.clear();
+            context.settled_global_read_candidates.clear();
+            context.settled_multi_decl_global_read_candidates.clear();
         }
 
         {
@@ -478,6 +507,7 @@ fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeCont
 /// settled iterator variables, plus the cache side effects inference produced.
 struct IterVarRefreshResult {
     file_id: FileId,
+    reads: HashSet<LuaTypeOwner>,
     pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
     guard_dependencies: HashSet<crate::LuaInferredGuardOwner>,
     updates: Vec<unresolve::IterVarTypeUpdate>,
@@ -487,6 +517,7 @@ impl IterVarRefreshResult {
     fn new(file_id: FileId) -> Self {
         Self {
             file_id,
+            reads: HashSet::default(),
             pending_type_decls: Vec::new(),
             guard_dependencies: HashSet::new(),
             updates: Vec::new(),
@@ -533,10 +564,16 @@ impl SettledIterVarCandidate {
 /// only what had been attached by then and can fall back to `any` where the
 /// field's own annotation says otherwise. Taking the answer again once every
 /// member has landed is both the deterministic and the more faithful one.
-fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
-    let mut candidates = std::mem::take(&mut context.settled_iter_var_candidates);
+fn rederive_settled_iter_vars(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+) -> (bool, HashSet<LuaTypeOwner>) {
+    // Kept, not taken: the settled tail runs to a fixpoint and each round
+    // re-derives the same candidates against what the previous one landed.
+    let mut candidates = context.settled_iter_var_candidates.clone();
     if candidates.is_empty() {
-        return false;
+        return (false, HashSet::default());
     }
     candidates.sort_by_key(|iter_var| {
         (
@@ -558,7 +595,11 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
     }
 
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
     file_ids.sort_unstable();
+    if file_ids.is_empty() {
+        return (false, HashSet::default());
+    }
     context
         .infer_manager
         .clear_files_iter_var_results(&file_ids.iter().copied().collect());
@@ -581,6 +622,7 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
             },
         );
         let mut result = IterVarRefreshResult::new(file_id);
+        crate::db_index::read_set::arm();
         let root = db
             .get_vfs()
             .get_syntax_tree(&file_id)
@@ -601,19 +643,25 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
                 }
             }
         }
+        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
     });
 
     let writes_before = db.get_type_index().type_writes();
+    let mut written = HashSet::default();
     for result in results {
+        context
+            .settled_read_sets
+            .insert(result.file_id, result.reads);
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
             result.guard_dependencies,
         );
         for update in result.updates {
+            written.insert(update.owner.clone());
             common::write_type_cache(db, update.owner.clone(), update.cache.clone(), update.mode);
             // The same answer serves the iter-var reads: mirror it into the
             // per-file iter-var cache the way the sequential re-derivation's
@@ -628,7 +676,107 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
             }
         }
     }
-    db.get_type_index().type_writes() != writes_before
+    (db.get_type_index().type_writes() != writes_before, written)
+}
+
+/// Re-files dynamically keyed writes under the key their key expression infers
+/// to now.
+///
+/// `t[k] = v` is filed under the type `k` inferred to at the moment the walk
+/// reached the write, so a key taken off a member map the walk had only partly
+/// built names a slot that selects the wrong writers. The member's own id is
+/// its identity, so once the settled passes have moved the types the key was
+/// minted from, the member moves to the slot the settled key names instead of a
+/// second key being minted and the first left orphaned.
+fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let mut file_ids = context
+        .analyzed_file_ids()
+        .into_iter()
+        .filter(|file_id| {
+            db.get_member_index()
+                .get_file_members(*file_id)
+                .iter()
+                .any(|member| member.get_key().is_expr())
+        })
+        .collect::<Vec<_>>();
+    if file_ids.is_empty() {
+        return;
+    }
+    file_ids.sort_unstable();
+
+    let analysis_phase = context.infer_manager.current_phase();
+    let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+
+    // Read-only per file, applied on the caller thread in file and source
+    // order, like every other settled pass.
+    let results = parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let mut infer_cache = crate::LuaInferCache::new(
+            file_id,
+            crate::CacheOptions {
+                analysis_phase,
+                dynamic_fields_visible,
+                building_dynamic_field_index: false,
+            },
+        );
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            return Vec::new();
+        };
+
+        let mut members = db
+            .get_member_index()
+            .get_file_members(file_id)
+            .into_iter()
+            .filter(|member| member.get_key().is_expr())
+            .map(|member| (member.get_id(), member.get_key().clone()))
+            .collect::<Vec<_>>();
+        members.sort_by_key(|(member_id, _)| member_id.get_syntax_id().get_range().start());
+
+        let mut updates = Vec::new();
+        for (member_id, current_key) in members {
+            let Some(node) = member_id.get_syntax_id().to_node_from_root(&root) else {
+                continue;
+            };
+            let index_key = if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+                index_expr.get_index_key()
+            } else if let Some(table_field) = LuaTableField::cast(node) {
+                table_field.get_field_key()
+            } else {
+                None
+            };
+            let Some(index_key) = index_key else {
+                continue;
+            };
+            let Ok(settled_key) =
+                LuaMemberKey::from_index_key_or_unknown(db, &mut infer_cache, &index_key)
+            else {
+                continue;
+            };
+            // Only ever a better-resolved key. A key expression that still
+            // answers `nil`, `unknown`, `any` or an unbound template ref has
+            // not settled -- it is a read that has not resolved, and filing a
+            // write under it would move the write off the wildcard key that
+            // dynamic reads do match and onto one nothing selects.
+            if settled_key == current_key
+                || matches!(&settled_key, LuaMemberKey::ExprType(typ)
+                    if !crate::db_index::is_informative_type(typ) || typ.contain_tpl())
+            {
+                continue;
+            }
+            updates.push((member_id, settled_key));
+        }
+        updates
+    });
+
+    for updates in results {
+        for (member_id, settled_key) in updates {
+            db.get_member_index_mut()
+                .rekey_member(member_id, settled_key);
+        }
+    }
 }
 
 /// Re-derives `local x = SomeGlobal` reads.
@@ -640,8 +788,8 @@ fn rederive_settled_iter_vars(db: &mut DbIndex, context: &mut AnalyzeContext) ->
 /// it resolves every writer has landed. Taking the read again here gives both
 /// the complete set.
 fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let standard = std::mem::take(&mut context.settled_global_read_candidates);
-    let multi_decl = std::mem::take(&mut context.settled_multi_decl_global_read_candidates);
+    let standard = context.settled_global_read_candidates.clone();
+    let multi_decl = context.settled_multi_decl_global_read_candidates.clone();
     if standard.is_empty() && multi_decl.is_empty() {
         return;
     }
@@ -962,8 +1110,8 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
 }
 
 fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_local_decl_initializer_caches(db, context, false, false);
-    refresh_member_initializer_caches(db, context, false);
+    refresh_local_decl_initializer_caches(db, context, false, false, None);
+    refresh_member_initializer_caches(db, context, false, None);
 }
 
 /// [`refresh_initializer_caches`] for a late pass that moved a handful of types.
@@ -973,11 +1121,22 @@ fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
 /// is about whether the *first* answer was taken before the dynamic-field index
 /// existed, which a later pass cannot change, and asking it again means
 /// inferring every candidate in the workspace a second time.
-fn refresh_settled_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
+fn refresh_settled_initializer_caches(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+) -> HashSet<LuaTypeOwner> {
     // Members first: a declaration that reads one of them takes its answer from
     // whatever the member holds when the read is taken.
-    refresh_member_initializer_caches(db, context, true);
-    refresh_local_decl_initializer_caches(db, context, true, true);
+    let mut written = refresh_member_initializer_caches(db, context, true, moved_owners);
+    written.extend(refresh_local_decl_initializer_caches(
+        db,
+        context,
+        true,
+        true,
+        moved_owners,
+    ));
+    written
 }
 
 fn refresh_local_decl_initializer_caches(
@@ -985,9 +1144,10 @@ fn refresh_local_decl_initializer_caches(
     context: &mut AnalyzeContext,
     settled_only: bool,
     iter_vars_settled: bool,
-) {
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+) -> HashSet<LuaTypeOwner> {
     if context.uninformative_local_decl_candidates.is_empty() {
-        return;
+        return HashSet::default();
     }
 
     let mut candidates_by_file = HashMap::<FileId, Vec<LuaDeclId>>::new();
@@ -1001,7 +1161,11 @@ fn refresh_local_decl_initializer_caches(
         candidates.sort_by_key(|decl_id| decl_id.position);
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
     file_ids.sort();
+    if file_ids.is_empty() {
+        return HashSet::default();
+    }
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
@@ -1026,6 +1190,7 @@ fn refresh_local_decl_initializer_caches(
             return InitializerRefreshResult::new(file_id);
         };
         let mut result = InitializerRefreshResult::new(file_id);
+        crate::db_index::read_set::arm();
         for decl_id in &candidates_by_file[&file_id] {
             let type_owner = (*decl_id).into();
             let current_cache = db.get_type_index().get_type_cache(&type_owner).cloned();
@@ -1059,11 +1224,19 @@ fn refresh_local_decl_initializer_caches(
             if !copies_settled_iter_var && !initializer_reads_through_call_or_index(&expr) {
                 continue;
             }
+            // A slot whose writers had not all landed answers with a flat
+            // union instead of the merge, and that answer was cached as if it
+            // were final. See [`cached_provisional_slot_union`].
+            let cached_a_provisional_slot_union = !current_is_uninformative
+                && current_cache
+                    .as_ref()
+                    .is_some_and(|current| cached_provisional_slot_union(current.as_type()));
             if !copies_settled_iter_var
                 && settled_only
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
+                && !cached_a_provisional_slot_union
             {
                 continue;
             }
@@ -1193,6 +1366,7 @@ fn refresh_local_decl_initializer_caches(
                 || is_nominal_refinement
                 || is_settled_widening
                 || cached_a_blind_dynamic_field_read
+                || cached_a_provisional_slot_union
             {
                 result.updates.push(InitializerCacheUpdate::Overwrite {
                     owner: type_owner,
@@ -1200,6 +1374,7 @@ fn refresh_local_decl_initializer_caches(
                 });
             }
         }
+        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
@@ -1207,6 +1382,9 @@ fn refresh_local_decl_initializer_caches(
 
     let mut updates = Vec::new();
     for result in results {
+        context
+            .settled_read_sets
+            .insert(result.file_id, result.reads);
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
@@ -1214,7 +1392,38 @@ fn refresh_local_decl_initializer_caches(
         );
         updates.extend(result.updates);
     }
+    let written = updates
+        .iter()
+        .map(InitializerCacheUpdate::owner)
+        .cloned()
+        .collect();
     apply_initializer_cache_updates(db, updates);
+    written
+}
+
+/// Whether the cached answer is the flat union a member slot falls back to when
+/// one of its writers had no type yet.
+///
+/// `resolve_member_type`'s `All` arm merges a slot's writers into one table only
+/// when every one of them already reads as a table assignment; a sibling the
+/// walk has not reached flips it to a plain union of the table literals
+/// instead. What decided that is how far the batch had got, not the source, so
+/// the read is provisional and worth taking again once every writer has landed.
+///
+/// A settled merge answers `MergedTable`, never this shape, so re-reading is
+/// idempotent: the repaired cache no longer matches.
+fn cached_provisional_slot_union(typ: &LuaType) -> bool {
+    let LuaType::Union(union) = typ else {
+        return false;
+    };
+    let mut count = 0;
+    for component in union.types() {
+        if !matches!(component, LuaType::TableConst(_)) {
+            return false;
+        }
+        count += 1;
+    }
+    count > 1
 }
 
 /// Whether the re-derived type is a union that already contains everything the
@@ -1253,9 +1462,10 @@ fn refresh_member_initializer_caches(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
     iter_vars_settled: bool,
-) {
+    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+) -> HashSet<LuaTypeOwner> {
     if context.member_initializer_reinfer_candidates.is_empty() {
-        return;
+        return HashSet::default();
     }
 
     let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::new();
@@ -1269,7 +1479,11 @@ fn refresh_member_initializer_caches(
         candidates.sort_by_key(LuaMemberId::get_position);
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
     file_ids.sort();
+    if file_ids.is_empty() {
+        return HashSet::default();
+    }
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
 
@@ -1290,6 +1504,7 @@ fn refresh_member_initializer_caches(
             return InitializerRefreshResult::new(file_id);
         };
         let mut result = InitializerRefreshResult::new(file_id);
+        crate::db_index::read_set::arm();
         for member_id in &candidates_by_file[&file_id] {
             let type_owner = LuaTypeOwner::Member(*member_id);
             let Some(current_cache) = db.get_type_index().get_type_cache(&type_owner).cloned()
@@ -1340,6 +1555,7 @@ fn refresh_member_initializer_caches(
                 fact: LuaTypeFact::certain(inferred_type),
             });
         }
+        result.reads = crate::db_index::read_set::disarm();
         result.pending_type_decls = infer_cache.take_pending_str_tpl_type_decls();
         result.guard_dependencies = infer_cache.take_inferred_guard_dependencies();
         result
@@ -1347,6 +1563,9 @@ fn refresh_member_initializer_caches(
 
     let mut updates = Vec::new();
     for result in results {
+        context
+            .settled_read_sets
+            .insert(result.file_id, result.reads);
         context.infer_manager.merge_inference_side_effects(
             result.file_id,
             result.pending_type_decls,
@@ -1354,11 +1573,18 @@ fn refresh_member_initializer_caches(
         );
         updates.extend(result.updates);
     }
+    let written = updates
+        .iter()
+        .map(InitializerCacheUpdate::owner)
+        .cloned()
+        .collect();
     apply_initializer_cache_updates(db, updates);
+    written
 }
 
 struct InitializerRefreshResult {
     file_id: FileId,
+    reads: HashSet<LuaTypeOwner>,
     pending_type_decls: Vec<crate::PendingStrTplTypeDecl>,
     guard_dependencies: HashSet<LuaInferredGuardOwner>,
     updates: Vec<InitializerCacheUpdate>,
@@ -1368,6 +1594,7 @@ impl InitializerRefreshResult {
     fn new(file_id: FileId) -> Self {
         Self {
             file_id,
+            reads: HashSet::default(),
             pending_type_decls: Vec::new(),
             guard_dependencies: HashSet::new(),
             updates: Vec::new(),
@@ -1388,6 +1615,16 @@ enum InitializerCacheUpdate {
         owner: LuaTypeOwner,
         fact: LuaTypeFact,
     },
+}
+
+impl InitializerCacheUpdate {
+    fn owner(&self) -> &LuaTypeOwner {
+        match self {
+            InitializerCacheUpdate::Bind { owner, .. }
+            | InitializerCacheUpdate::Overwrite { owner, .. }
+            | InitializerCacheUpdate::ReplaceFact { owner, .. } => owner,
+        }
+    }
 }
 
 fn apply_initializer_cache_updates(db: &mut DbIndex, updates: Vec<InitializerCacheUpdate>) {
@@ -1771,6 +2008,10 @@ pub struct AnalyzeContext {
     settled_guarded_bootstrap_candidates: Vec<LuaMemberId>,
     /// See [`AnalyzeContext::record_settled_iter_var_candidate`].
     settled_iter_var_candidates: Vec<UnResolveIterVar>,
+    /// Per file, the type caches its settled re-derivation actually read, from
+    /// the last round it ran in. A later round only re-derives a file whose
+    /// read set the previous round moved. See [`crate::db_index::read_set`].
+    settled_read_sets: HashMap<FileId, HashSet<LuaTypeOwner>>,
     /// See [`AnalyzeContext::record_settled_global_read_candidate`].
     settled_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
     /// Decls reading through a multi-declaration global. Unlike
@@ -1815,6 +2056,7 @@ impl AnalyzeContext {
             settled_member_widening_candidates: HashMap::new(),
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
+            settled_read_sets: HashMap::new(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
             vgui_parent_fallback_files: HashSet::new(),
@@ -1840,6 +2082,26 @@ impl AnalyzeContext {
 
     pub fn add_inferred_return_candidate(&mut self, return_: UnResolveReturn) {
         self.inferred_return_candidates.push(return_);
+    }
+
+    /// Whether `file_id`'s settled re-derivation could answer differently now.
+    ///
+    /// `None` is the first round, where nothing has been recorded yet and every
+    /// candidate runs. After that a file is worth re-deriving only if one of the
+    /// caches it read last time is among the ones the previous round moved -- or
+    /// if it has no recorded read set, which means it has not run yet.
+    fn settled_file_reads_moved(
+        &self,
+        file_id: FileId,
+        moved_owners: Option<&HashSet<LuaTypeOwner>>,
+    ) -> bool {
+        let Some(moved_owners) = moved_owners else {
+            return true;
+        };
+        match self.settled_read_sets.get(&file_id) {
+            Some(reads) => reads.iter().any(|owner| moved_owners.contains(owner)),
+            None => true,
+        }
     }
 
     pub(crate) fn analyzed_file_ids(&self) -> HashSet<FileId> {

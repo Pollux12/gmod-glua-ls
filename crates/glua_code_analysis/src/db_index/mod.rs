@@ -23,6 +23,7 @@ mod semantic_decl;
 mod signature;
 mod traits;
 mod r#type;
+pub(crate) use r#type::read_set;
 
 use std::{
     collections::{HashMap, HashSet},

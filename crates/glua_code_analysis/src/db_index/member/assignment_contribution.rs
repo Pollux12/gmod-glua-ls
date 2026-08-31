@@ -69,6 +69,18 @@ impl MemberAssignmentContributionStore {
         }
     }
 
+    /// Moves this member's contribution to `new_key`, keeping the writer group
+    /// it is filed under in step with the member's key.
+    pub fn rekey_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) {
+        let Some((owner, _)) = self.contribution_group_of(&member_id) else {
+            return;
+        };
+        let Some(contribution) = self.contribution_of(&member_id).cloned() else {
+            return;
+        };
+        self.record(owner, new_key, member_id, contribution);
+    }
+
     pub fn contributions(
         &self,
         store_key: &MemberAssignmentContributionKey,
