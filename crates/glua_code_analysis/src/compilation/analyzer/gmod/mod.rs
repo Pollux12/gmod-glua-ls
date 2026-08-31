@@ -12128,19 +12128,22 @@ fn rebuild_gmod_load_index(
 
     drop(_p_prep);
     let _p_sites = crate::profile::PhaseGuard::new("gmodload/resolve_sites");
-    let dependency_sites = db
+    let mut dependency_sites = db
         .get_file_dependencies_index()
         .iter_dependency_sites()
         .flat_map(|(_, sites)| sites.iter().cloned())
         .map(|site| resolve_load_dependency_site(db, site))
         .collect::<Vec<_>>();
+    // `iter_dependency_sites` walks a `HashMap`, and this vector is the visit order of the
+    // load fixpoint below, so it decides both the edge order and (through the `states` stamp)
+    // the edge set. Order it by a property of the source text instead.
+    dependency_sites.sort_by_cached_key(|site| load_site_sort_key(db, site));
     drop(_p_sites);
     let _p_dyn = crate::profile::PhaseGuard::new("gmodload/dynamic_loaders");
     let dynamic_loaders = collect_dynamic_loaders(db, &file_ids, annotated_global_call_roles);
     drop(_p_dyn);
 
     let _p_fix = crate::profile::PhaseGuard::new("gmodload/fixpoint");
-    let mut unresolved_edges = Vec::new();
     for _ in 0..file_ids.len().max(1) {
         let mut changed = false;
         for site in &dependency_sites {
@@ -12150,7 +12153,7 @@ fn rebuild_gmod_load_index(
                 &resolved_branch_ranges,
                 site,
             );
-            changed |= apply_load_site(&mut file_infos, &mut unresolved_edges, site, source_states);
+            changed |= apply_load_site(&mut file_infos, site, source_states);
         }
         changed |= apply_dynamic_loaders(
             &mut file_infos,
@@ -12161,6 +12164,19 @@ fn rebuild_gmod_load_index(
         if !changed {
             break;
         }
+    }
+
+    // Edges are recorded once, after convergence: a site visited before its source's realm was
+    // established would otherwise record an extra edge stamped with the partial state mask.
+    let mut unresolved_edges = Vec::new();
+    for site in &dependency_sites {
+        let source_states = source_states_for_load_site(
+            &file_infos,
+            &fallback_masks,
+            &resolved_branch_ranges,
+            site,
+        );
+        record_load_site_edge(&mut file_infos, &mut unresolved_edges, site, source_states);
     }
     drop(_p_fix);
 
@@ -14155,17 +14171,38 @@ fn source_states_for_load_site(
     }
 }
 
-fn apply_load_site(
+fn load_site_sort_key(db: &DbIndex, site: &LuaDependencySite) -> (String, u32, u32, u8, String) {
+    let source_path = db
+        .get_vfs()
+        .get_file_path(&site.source_file_id)
+        .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
+        .unwrap_or_default();
+    let kind_rank = match site.kind {
+        LuaDependencyKind::Require => 0,
+        LuaDependencyKind::Include => 1,
+        LuaDependencyKind::CompileFile => 2,
+        LuaDependencyKind::AddCSLuaFile => 3,
+        LuaDependencyKind::IncludeCS => 4,
+    };
+    (
+        source_path,
+        site.range.start().into(),
+        site.range.end().into(),
+        kind_rank,
+        site.path.clone().unwrap_or_default(),
+    )
+}
+
+fn record_load_site_edge(
     file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
     unresolved_edges: &mut Vec<GmodLoadEdge>,
     site: &LuaDependencySite,
     source_states: GmodStateMask,
-) -> bool {
-    let edge_kind = GmodLoadEdgeKind::from(site.kind);
+) {
     let edge = GmodLoadEdge {
         source_file_id: site.source_file_id,
         target_file_id: site.target_file_id,
-        kind: edge_kind,
+        kind: GmodLoadEdgeKind::from(site.kind),
         states: source_states,
         path: site.path.clone(),
         original_expr: Some(site.original_expr.clone()),
@@ -14176,6 +14213,21 @@ fn apply_load_site(
         if !unresolved_edges.contains(&edge) {
             unresolved_edges.push(edge);
         }
+        return;
+    };
+
+    file_infos
+        .entry(target_file_id)
+        .or_insert_with(GmodFileLoadInfo::fallback_shared)
+        .add_incoming_edge(edge);
+}
+
+fn apply_load_site(
+    file_infos: &mut HashMap<FileId, GmodFileLoadInfo>,
+    site: &LuaDependencySite,
+    source_states: GmodStateMask,
+) -> bool {
+    let Some(target_file_id) = site.target_file_id else {
         return false;
     };
 
@@ -14239,7 +14291,6 @@ fn apply_load_site(
         }
     }
 
-    target_info.add_incoming_edge(edge);
     changed
 }
 
