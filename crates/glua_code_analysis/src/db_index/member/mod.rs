@@ -177,6 +177,56 @@ impl LuaMemberIndex {
         id
     }
 
+    /// Files an existing member under a different key.
+    ///
+    /// A dynamically keyed write is filed under the type its key expression
+    /// inferred to, and that type is a function of how far the walk had got.
+    /// Once the settled passes have taken the key again against the complete
+    /// map, the member has to move to the slot the settled key names — the
+    /// member's own id is its identity, so moving it keeps the writers of a
+    /// slot together instead of orphaning the old key.
+    ///
+    /// Every removal path reads the key back off the member, so the member and
+    /// all key-indexed maps move together; a half-moved member would leave the
+    /// old slot behind on the next `remove_files`.
+    pub fn rekey_member(&mut self, member_id: LuaMemberId, new_key: LuaMemberKey) -> Option<()> {
+        let old_key = self.get_member(&member_id)?.get_key().clone();
+        if old_key == new_key {
+            return Some(());
+        }
+
+        let owner = self.member_current_owner.get(&member_id).cloned();
+        if let Some(owner) = &owner {
+            self.remove_member_from_all_owner_key_indexes(owner, member_id);
+            self.remove_current_member_key(member_id);
+            if let Some(owner_members) = self.owner_members.get_mut(owner) {
+                let slot_empty = match owner_members.get_member_mut(&old_key) {
+                    Some(LuaMemberIndexItem::One(id)) => *id == member_id,
+                    Some(LuaMemberIndexItem::Many(ids)) => {
+                        ids.retain(|id| *id != member_id);
+                        ids.is_empty()
+                    }
+                    None => false,
+                };
+                if slot_empty {
+                    owner_members.remove_member(&old_key);
+                }
+            }
+        }
+
+        self.members.get_mut(&member_id)?.set_key(new_key.clone());
+        self.assignment_contributions
+            .rekey_member(member_id, new_key);
+
+        if let Some(owner) = owner {
+            self.add_current_member_key(member_id);
+            self.add_member_to_owner_key_index(owner.clone(), member_id);
+            self.add_member_to_owner_key_history_index(owner.clone(), member_id);
+            self.add_member_to_owner(owner, member_id);
+        }
+        Some(())
+    }
+
     fn add_in_file_object(&mut self, file_id: FileId, member_or_owner: MemberOrOwner) {
         self.in_filed
             .entry(file_id)
@@ -3737,5 +3787,110 @@ mod tests {
         index.set_member_owner(owner.clone(), sibling_file, sibling_write);
         index.add_member_to_owner(owner.clone(), sibling_write);
         assert!(index.member_reachable_for_owner_key(&owner, &key, sibling_write));
+    }
+
+    fn make_expr_member(member_id: LuaMemberId, key: LuaMemberKey) -> LuaMember {
+        LuaMember::new(member_id, key, LuaMemberFeature::FileFieldDecl, None)
+    }
+
+    #[test]
+    fn rekey_member_moves_the_member_between_slots() {
+        let file = FileId::new(1);
+        let owner = LuaMemberOwner::Element(site(1, 10, 12));
+        let old_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
+        let new_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let mover = make_index_member_id(file, 20);
+        let stayer = make_index_member_id(file, 30);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_expr_member(mover, old_key.clone()));
+        index.add_member(owner.clone(), make_expr_member(stayer, old_key.clone()));
+
+        index.rekey_member(mover, new_key.clone());
+
+        assert_eq!(index.get_member(&mover).unwrap().get_key(), &new_key);
+        assert_eq!(
+            index
+                .get_members_with_key(&owner, &new_key)
+                .unwrap()
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![mover]
+        );
+        assert_eq!(
+            index
+                .get_members_with_key(&owner, &old_key)
+                .unwrap()
+                .iter()
+                .map(|member| member.get_id())
+                .collect::<Vec<_>>(),
+            vec![stayer]
+        );
+        assert!(
+            index
+                .get_current_members_for_key(&old_key)
+                .iter()
+                .all(|member| member.get_id() == stayer)
+        );
+        assert_eq!(index.get_current_members_for_key(&new_key).len(), 1);
+        // The whole-owner view still yields both, once each.
+        let mut owner_ids = index
+            .get_members(&owner)
+            .unwrap()
+            .iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        owner_ids.sort_by_key(|id| member_id_sort_key(*id));
+        assert_eq!(owner_ids, vec![mover, stayer]);
+    }
+
+    #[test]
+    fn removing_a_rekeyed_members_file_leaves_no_residue() {
+        let file = FileId::new(1);
+        let owner = LuaMemberOwner::Element(site(1, 10, 12));
+        let old_key = LuaMemberKey::ExprType(crate::LuaType::Integer);
+        let new_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let member_id = make_index_member_id(file, 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(owner.clone(), make_expr_member(member_id, old_key.clone()));
+        index.record_member_assignment_contribution(
+            member_id,
+            crate::db_index::MemberAssignmentContribution {
+                bound_type: crate::LuaType::Integer,
+                source_type: crate::LuaType::Integer,
+                doc_type: None,
+                guarded_bootstrap: false,
+                preserve_table_literals: false,
+            },
+        );
+        index.rekey_member(member_id, new_key.clone());
+
+        index.remove_files(&[file]);
+
+        assert!(index.get_member(&member_id).is_none());
+        assert!(index.get_file_members(file).is_empty());
+        assert!(index.get_members(&owner).is_none());
+        assert!(!index.owner_members.contains_key(&owner));
+        for key in [&old_key, &new_key] {
+            assert!(index.get_current_members_for_key(key).is_empty());
+            assert!(!index.current_members_by_key.contains_key(key));
+        }
+        assert!(!index.member_owner_key_index.contains_key(&owner));
+        assert!(!index.member_owner_key_history_index.contains_key(&owner));
+        assert!(!index.member_current_owner.contains_key(&member_id));
+        assert!(
+            index
+                .assignment_contributions
+                .contribution_of(&member_id)
+                .is_none()
+        );
+        assert!(
+            index
+                .assignment_contributions
+                .contribution_group_of(&member_id)
+                .is_none()
+        );
     }
 }

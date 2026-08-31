@@ -35,6 +35,13 @@ impl LuaMember {
         &self.key
     }
 
+    /// Only [`crate::LuaMemberIndex::rekey_member`] may call this: every key
+    /// map has to move with the member, or a later removal reads the new key
+    /// back and leaves the old slot behind.
+    pub(crate) fn set_key(&mut self, key: LuaMemberKey) {
+        self.key = key;
+    }
+
     pub fn get_file_id(&self) -> FileId {
         self.member_id.file_id
     }
