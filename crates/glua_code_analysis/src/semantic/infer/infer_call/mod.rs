@@ -2053,15 +2053,25 @@ fn signature_is_generic(
     if signature.is_generic() {
         return Some(true);
     }
-    let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
-        return None;
-    };
-    let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
-    match prefix_type {
-        // 对于 Generic 直接认为是泛型
-        LuaType::Generic(_) => Some(true),
-        _ => Some(prefix_type.contain_tpl()),
+    let call_syntax_id = call_expr.get_syntax_id();
+    if let Some(cached) = cache.signature_is_generic_cache.get(&call_syntax_id) {
+        return *cached;
     }
+    let result = (|| -> Option<bool> {
+        let LuaExpr::IndexExpr(index_expr) = call_expr.get_prefix_expr()? else {
+            return None;
+        };
+        let prefix_type = infer_expr(db, cache, index_expr.get_prefix_expr()?).ok()?;
+        match prefix_type {
+            // 对于 Generic 直接认为是泛型
+            LuaType::Generic(_) => Some(true),
+            _ => Some(prefix_type.contain_tpl()),
+        }
+    })();
+    cache
+        .signature_is_generic_cache
+        .insert(call_syntax_id, result);
+    result
 }
 
 fn apply_signature_return_kinds_to_function(

@@ -1,8 +1,8 @@
 use glua_parser::{
-    LuaAssignStat, LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr,
-    LuaExpr, LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat,
-    LuaLocalStat, LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr,
-    LuaTableField, LuaVarExpr, PathTrait,
+    LuaAstNode, LuaAstToken, LuaBlock, LuaCallExpr, LuaChunk, LuaClosureExpr, LuaExpr,
+    LuaForRangeStat, LuaFuncStat, LuaIndexExpr, LuaIndexKey, LuaLocalFuncStat, LuaLocalStat,
+    LuaNameExpr, LuaReturnStat, LuaStat, LuaSyntaxId, LuaSyntaxNode, LuaTableExpr, LuaTableField,
+    LuaVarExpr, PathTrait,
 };
 use rowan::TextSize;
 use std::sync::Arc;
@@ -582,72 +582,9 @@ fn has_local_reassignment_between(
         return false;
     }
 
-    if !cache.local_reassignments_indexed {
-        collect_local_reassignment_positions(db, cache);
-    }
-
-    cache
-        .local_reassignment_positions_cache
-        .get(&decl_id)
-        .and_then(|positions| positions.first())
-        .is_some_and(|position| *position < query_position)
-}
-
-fn collect_local_reassignment_positions(db: &DbIndex, cache: &mut LuaInferCache) {
-    cache.local_reassignments_indexed = true;
-    let file_id = cache.get_file_id();
-    let Some(root) = db
-        .get_vfs()
-        .get_syntax_tree(&file_id)
-        .map(|tree| tree.get_red_root())
-    else {
-        return;
-    };
-
-    let references = db.get_reference_index().get_local_reference(&file_id);
-    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
-    for assign_stat in root.descendants().filter_map(LuaAssignStat::cast) {
-        let position = assign_stat.get_position();
-
-        let (vars, _) = assign_stat.get_var_and_expr_list();
-        for var in vars {
-            let LuaVarExpr::NameExpr(name_expr) = var else {
-                continue;
-            };
-
-            let assigned_decl_id = references
-                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
-                .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
-            let Some(assigned_decl_id) = assigned_decl_id else {
-                continue;
-            };
-            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
-                continue;
-            }
-
-            cache
-                .local_reassignment_positions_cache
-                .entry(assigned_decl_id)
-                .or_default()
-                .push(position);
-        }
-    }
-
-    for positions in cache.local_reassignment_positions_cache.values_mut() {
-        positions.sort_unstable();
-        positions.dedup();
-    }
-}
-
-fn assignment_name_decl_id(
-    decl_tree: Option<&crate::LuaDeclarationTree>,
-    name_expr: &LuaNameExpr,
-) -> Option<LuaDeclId> {
-    let name = name_expr.get_name_text()?;
-
-    decl_tree
-        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
-        .map(|decl| decl.get_id())
+    db.get_reference_index()
+        .first_local_reassignment(cache.get_file_id(), &decl_id)
+        .is_some_and(|position| position < query_position)
 }
 
 fn try_infer_local_initializer_type(

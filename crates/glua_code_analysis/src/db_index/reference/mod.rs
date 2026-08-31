@@ -5,7 +5,7 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use file_reference::{DeclReference, DeclReferenceCell, FileReference};
 use glua_parser::LuaSyntaxId;
-use rowan::TextRange;
+use rowan::{TextRange, TextSize};
 use smol_str::SmolStr;
 use string_reference::StringReference;
 
@@ -19,6 +19,9 @@ pub struct LuaReferenceIndex {
     global_references: HashMap<SmolStr, HashMap<FileId, HashSet<LuaSyntaxId>>>,
     string_references: HashMap<FileId, StringReference>,
     type_references: HashMap<FileId, HashMap<LuaTypeDeclId, HashSet<TextRange>>>,
+    /// Where each of a file's locals is first reassigned, computed once when the
+    /// file is indexed.
+    local_reassignments: HashMap<FileId, HashMap<LuaDeclId, TextSize>>,
     /// Bumped whenever a file's references change, so a memo over facts derived
     /// from one file's references can tell a hit from a stale entry. Values come
     /// from a counter that never restarts, so a revision is never reused after a
@@ -41,6 +44,7 @@ impl LuaReferenceIndex {
             global_references: HashMap::default(),
             string_references: HashMap::default(),
             type_references: HashMap::default(),
+            local_reassignments: HashMap::default(),
             file_revision: HashMap::default(),
             next_revision: 1,
         }
@@ -149,6 +153,26 @@ impl LuaReferenceIndex {
             .entry(type_decl_id)
             .or_default()
             .insert(range);
+    }
+
+    pub fn set_local_reassignments(
+        &mut self,
+        file_id: FileId,
+        positions: HashMap<LuaDeclId, TextSize>,
+    ) {
+        self.local_reassignments.insert(file_id, positions);
+    }
+
+    /// Where `decl_id` is first reassigned within `file_id`, if at all.
+    pub fn first_local_reassignment(
+        &self,
+        file_id: FileId,
+        decl_id: &LuaDeclId,
+    ) -> Option<TextSize> {
+        self.local_reassignments
+            .get(&file_id)?
+            .get(decl_id)
+            .copied()
     }
 
     pub fn get_local_reference(&self, file_id: &FileId) -> Option<&FileReference> {
@@ -273,6 +297,7 @@ impl LuaIndex for LuaReferenceIndex {
         self.file_references.remove(&file_id);
         self.string_references.remove(&file_id);
         self.type_references.remove(&file_id);
+        self.local_reassignments.remove(&file_id);
         let mut to_be_remove = Vec::new();
         for (key, references) in self.index_reference.iter_mut() {
             references.remove(&file_id);
@@ -309,6 +334,8 @@ impl LuaIndex for LuaReferenceIndex {
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
         self.type_references
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
+        self.local_reassignments
+            .retain(|file_id, _| !removed_file_ids.contains(file_id));
 
         self.index_reference.retain(|_, references| {
             references.retain(|file_id, _| !removed_file_ids.contains(file_id));
@@ -325,6 +352,7 @@ impl LuaIndex for LuaReferenceIndex {
         self.file_references.clear();
         self.string_references.clear();
         self.type_references.clear();
+        self.local_reassignments.clear();
         self.index_reference.clear();
         self.global_references.clear();
     }
