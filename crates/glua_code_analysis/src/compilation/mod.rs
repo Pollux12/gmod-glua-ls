@@ -50,6 +50,7 @@ impl LuaCompilation {
     /// this list is always empty.
     pub fn update_index(&mut self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let mut need_analyzed_files = vec![];
+        let mut analyzed_file_ids = vec![];
         for file_id in file_ids {
             let tree = match self.db.get_vfs().get_syntax_tree(&file_id) {
                 Some(tree) => tree,
@@ -58,10 +59,21 @@ impl LuaCompilation {
                     continue;
                 }
             };
+            analyzed_file_ids.push(file_id);
             need_analyzed_files.push(InFiled {
                 file_id,
                 value: tree.get_chunk_node(),
             });
+        }
+
+        // Removing a file unresolved every dependency site that named it.
+        // Now that it is back, those sites point at it again. Done here rather
+        // than on the edit path so every caller of `update_index` is symmetric
+        // with `remove_index`, not just the one that prompted it.
+        for file_id in &analyzed_file_ids {
+            self.db
+                .get_file_dependencies_index_mut()
+                .relink_unresolved_target(*file_id);
         }
 
         analyzer::analyze(&mut self.db, need_analyzed_files);

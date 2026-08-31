@@ -169,7 +169,17 @@ pub struct FileFacts {
     decl_positions: FxHashSet<TextSize>,
     member_ids: FxHashSet<LuaSyntaxId>,
     syntax_ids: FxHashSet<LuaSyntaxId>,
-    table_ranges: FxHashSet<TextRange>,
+    /// Every node range in the new tree. Answers "is this identity already
+    /// current": a range the new tree still holds is one the re-index rebuilt
+    /// from the new text, so mapping it again would shift it twice.
+    node_ranges: FxHashSet<TextRange>,
+    /// The ranges something can still own members on: a table literal in the
+    /// new tree, or a range the re-indexed file registers an `Element` owner
+    /// at. An owner is keyed by whatever expression the write was made on - a
+    /// literal, but also a `vgui.Create(..)` call - so "is there still an
+    /// owner here" is not a question the tree alone answers. Answers "did the
+    /// mapped range land on something that still holds members".
+    owner_ranges: FxHashSet<TextRange>,
 }
 
 impl FileFacts {
@@ -191,24 +201,31 @@ impl FileFacts {
             .map(|member| *member.get_id().get_syntax_id())
             .collect();
 
+        let mut owner_ranges = db
+            .get_member_index()
+            .element_owner_ranges_in_file(file_id)
+            .into_iter()
+            .map(|range| range.value)
+            .collect::<FxHashSet<_>>();
         let mut syntax_ids = FxHashSet::default();
-        let mut table_ranges = FxHashSet::default();
+        let mut node_ranges = FxHashSet::default();
         if let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) {
             for element in tree.get_red_root().descendants_with_tokens() {
                 match element {
                     rowan::NodeOrToken::Node(node) => {
                         syntax_ids.insert(LuaSyntaxId::from_node(&node));
+                        node_ranges.insert(node.text_range());
                     }
                     rowan::NodeOrToken::Token(token) => {
                         syntax_ids.insert(LuaSyntaxId::from_token(&token));
                     }
                 }
             }
-            table_ranges = tree
-                .get_chunk_node()
-                .descendants::<LuaTableExpr>()
-                .map(|table| table.get_range())
-                .collect();
+            owner_ranges.extend(
+                tree.get_chunk_node()
+                    .descendants::<LuaTableExpr>()
+                    .map(|table| table.get_range()),
+            );
         }
 
         Self {
@@ -216,7 +233,8 @@ impl FileFacts {
             decl_positions,
             member_ids,
             syntax_ids,
-            table_ranges,
+            node_ranges,
+            owner_ranges,
         }
     }
 }
@@ -287,19 +305,69 @@ impl FileRemap {
         }
     }
 
-    /// Rejects a mapped identity the re-indexed file does not actually hold.
-    fn validate<T>(
+    /// Whether the identity sits entirely in the edit's unchanged prefix.
+    ///
+    /// `map` and `map_range` return an offset unchanged exactly when it lies
+    /// before the hunk, and those bytes are identical in both texts, so the
+    /// code the identity names is still there whatever the index happens to
+    /// enumerate. Checking existence for it would reject live identities the
+    /// facts cannot see - a `DocTagClass` node, say, which the syntax tree's
+    /// `descendants_with_tokens` walk does not reach.
+    fn is_before_the_hunk<T: PartialEq>(&self, original: &T, mapped: &Remap<T>) -> bool {
+        matches!(mapped, Remap::Moved(value) if value == original)
+    }
+
+    /// Resolves a mapped identity against the re-indexed file.
+    ///
+    /// An identity the file still holds was rebuilt from the new text, so it
+    /// is already in the new coordinates and mapping it again would shift it a
+    /// second time. Only what the re-index left behind - the references
+    /// another file recorded - has to move. A mapped identity that lands on
+    /// nothing is lost.
+    fn resolve<T: PartialEq>(
         &self,
+        original: &T,
         mapped: Remap<T>,
-        exists: impl FnOnce(&FileFacts, &T) -> bool,
+        exists: impl Fn(&FileFacts, &T) -> bool,
     ) -> Remap<T> {
-        let (Some(facts), Remap::Moved(value)) = (&self.facts, &mapped) else {
+        let Some(facts) = &self.facts else {
             return mapped;
         };
-        if exists(facts, value) {
-            mapped
-        } else {
-            Remap::Lost
+        // `Unrelated` here means the identity is not in this file at all, so
+        // the file's own facts say nothing about it.
+        if matches!(mapped, Remap::Unrelated) || self.is_before_the_hunk(original, &mapped) {
+            return mapped;
+        }
+        if exists(facts, original) {
+            return Remap::Unrelated;
+        }
+        match &mapped {
+            Remap::Moved(value) if !exists(facts, value) => Remap::Lost,
+            _ => mapped,
+        }
+    }
+
+    /// [`resolve`](Self::resolve) where "already current" and "the mapped
+    /// position is real" are not answered by the same set.
+    fn resolve_with<T: PartialEq>(
+        &self,
+        original: &T,
+        mapped: Remap<T>,
+        current: impl Fn(&FileFacts, &T) -> bool,
+        lands_on: impl Fn(&FileFacts, &T) -> bool,
+    ) -> Remap<T> {
+        let Some(facts) = &self.facts else {
+            return mapped;
+        };
+        if matches!(mapped, Remap::Unrelated) || self.is_before_the_hunk(original, &mapped) {
+            return mapped;
+        }
+        if current(facts, original) {
+            return Remap::Unrelated;
+        }
+        match &mapped {
+            Remap::Moved(value) if !lands_on(facts, value) => Remap::Lost,
+            _ => mapped,
         }
     }
 
@@ -309,7 +377,7 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.validate(mapped, |facts, id| {
+        self.resolve(&id, mapped, |facts, id| {
             facts.signature_positions.contains(&id.get_position())
         })
     }
@@ -320,7 +388,7 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.validate(mapped, |facts, id| {
+        self.resolve(&id, mapped, |facts, id| {
             facts.decl_positions.contains(&id.position)
         })
     }
@@ -331,7 +399,7 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.validate(mapped, |facts, id| facts.syntax_ids.contains(id))
+        self.resolve(&id, mapped, |facts, id| facts.syntax_ids.contains(id))
     }
 
     pub fn member_id(&self, id: LuaMemberId) -> Remap<LuaMemberId> {
@@ -343,7 +411,7 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.validate(mapped, |facts, id| {
+        self.resolve(&id, mapped, |facts, id| {
             facts.member_ids.contains(id.get_syntax_id())
         })
     }
@@ -356,9 +424,12 @@ impl FileRemap {
             Remap::Unrelated => Remap::Unrelated,
             Remap::Lost => Remap::Lost,
         };
-        self.validate(mapped, |facts, range| {
-            facts.table_ranges.contains(&range.value)
-        })
+        self.resolve_with(
+            range,
+            mapped,
+            |facts, range| facts.node_ranges.contains(&range.value),
+            |facts, range| facts.owner_ranges.contains(&range.value),
+        )
     }
 
     pub fn type_owner(&self, owner: &LuaTypeOwner) -> Remap<LuaTypeOwner> {
