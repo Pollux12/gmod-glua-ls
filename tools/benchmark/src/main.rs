@@ -179,78 +179,78 @@ fn run_incremental_edits(
             .get_file_path(&file_id)
             .and_then(|p| p.file_name().map(|n| n.to_string_lossy().into_owned()))
             .unwrap_or_else(|| format!("{file_id:?}"));
-        let edited_text = format!("{text}\n-- bench incremental edit\n");
-        if std::env::var_os("BENCH_EDIT_LANDMARKS").is_some() {
-            eprintln!(
-                "  [incremental] BEGIN {name} at t+{:.3}s",
-                PROCESS_START
-                    .get()
-                    .map_or(0.0, |s| s.elapsed().as_secs_f64())
-            );
-        }
-        // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
-        // position-based request actually depends on: re-indexing the edited
-        // file alone, then the dependency ripple. It reports what a handler
-        // gated on the edited file's own freshness would wait for.
-        let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
-            // The expansion has to be captured before the edit lands, exactly as
-            // the production edit path does; recomputing it after the edited
-            // file has been re-indexed under-expands.
-            let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
-            analysis.update_file_text_only(&uri, edited_text);
-            // Just the edited file's own entries — no cross-file stabilization
-            // and no expansion. This is the floor a position-based request has
-            // to wait for if it is gated on its own file rather than on the
-            // whole ripple.
-            let t = Instant::now();
-            analysis.self_index_files(vec![file_id]);
-            let self_only = t.elapsed();
-            // `BENCH_EDIT_SELF_ONLY=1` stops after the edited file's own
-            // entries, so a profile of the run contains nothing but the cost a
-            // per-file freshness gate would pay.
-            let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-                std::time::Duration::ZERO
+        for (label, edited_text) in incremental_edit_variants(&text) {
+            let name = format!("{name} [{label}]");
+            let text = text.clone();
+            if std::env::var_os("BENCH_EDIT_LANDMARKS").is_some() {
+                eprintln!(
+                    "  [incremental] BEGIN {name} at t+{:.3}s",
+                    PROCESS_START
+                        .get()
+                        .map_or(0.0, |s| s.elapsed().as_secs_f64())
+                );
+            }
+            // `BENCH_EDIT_STAGED=1` splits the keystroke into the two halves a
+            // position-based request actually depends on: re-indexing the edited
+            // file alone, then the dependency ripple. It reports what a handler
+            // gated on the edited file's own freshness would wait for.
+            let reindex = if std::env::var_os("BENCH_EDIT_STAGED").is_some() {
+                analysis.update_file_text_only(&uri, edited_text);
+                // Phase 1: the edited file's own entries, the remap of every
+                // reference into it, and the diff that says who still has to be
+                // re-analysed. This is the floor a position-based request has to
+                // wait for if it is gated on its own file rather than on the ripple.
+                let t = Instant::now();
+                let dirty = analysis.self_index_and_diff(vec![file_id]);
+                let self_only = t.elapsed();
+                let dirty_len = dirty.dirty_len();
+                // `BENCH_EDIT_SELF_ONLY=1` stops after phase 1, so a profile of the
+                // run contains nothing but the cost a per-file freshness gate pays.
+                let ripple = if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+                    std::time::Duration::ZERO
+                } else {
+                    let t = Instant::now();
+                    analysis.ripple(dirty);
+                    t.elapsed()
+                };
+                eprintln!("  [incremental] {name} dirty set: {dirty_len} file(s)");
+                eprintln!(
+                    "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
+                    self_only.as_secs_f64(),
+                    ripple.as_secs_f64()
+                );
+                self_only + ripple
             } else {
                 let t = Instant::now();
-                analysis.reindex_expanded_files(vec![file_id], expansion);
+                analysis.update_file_by_uri(&uri, Some(edited_text));
                 t.elapsed()
             };
-            eprintln!(
-                "  [incremental] {name} staged: {:.3}s self-only + {:.3}s ripple",
-                self_only.as_secs_f64(),
-                ripple.as_secs_f64()
-            );
-            self_only + ripple
-        } else {
-            let t = Instant::now();
-            analysis.update_file_by_uri(&uri, Some(edited_text));
-            t.elapsed()
-        };
 
-        let t = Instant::now();
-        let shared = analysis.precompute_diagnostic_shared_data();
-        analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
-        let diagnostics = t.elapsed();
-        let elapsed = reindex + diagnostics;
-        total += elapsed;
-        worst = worst.max(elapsed);
-        edited += 1;
-        eprintln!(
-            "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
-            elapsed.as_secs_f64(),
-            reindex.as_secs_f64(),
-            diagnostics.as_secs_f64()
-        );
-        // Reverting through the full path costs a whole ripple per iteration —
-        // several times the self-index being measured, and untimed, so it
-        // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
-        // exists to leave nothing but the self-index in the profile, so the
-        // revert has to match it.
-        if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
-            analysis.update_file_text_only(&uri, text);
-            analysis.self_index_files(vec![file_id]);
-        } else {
-            analysis.update_file_by_uri(&uri, Some(text));
+            let t = Instant::now();
+            let shared = analysis.precompute_diagnostic_shared_data();
+            analysis.diagnose_file_with_shared(file_id, CancellationToken::new(), shared);
+            let diagnostics = t.elapsed();
+            let elapsed = reindex + diagnostics;
+            total += elapsed;
+            worst = worst.max(elapsed);
+            edited += 1;
+            eprintln!(
+                "  [incremental] {name} (reindexes {expansion} files): {:.3}s ({:.3}s reindex + {:.3}s diagnostics)",
+                elapsed.as_secs_f64(),
+                reindex.as_secs_f64(),
+                diagnostics.as_secs_f64()
+            );
+            // Reverting through the full path costs a whole ripple per iteration —
+            // several times the self-index being measured, and untimed, so it
+            // would dominate any profile of this loop. `BENCH_EDIT_SELF_ONLY`
+            // exists to leave nothing but the self-index in the profile, so the
+            // revert has to match it.
+            if std::env::var_os("BENCH_EDIT_SELF_ONLY").is_some() {
+                analysis.update_file_text_only(&uri, text);
+                analysis.self_index_files(vec![file_id]);
+            } else {
+                analysis.update_file_by_uri(&uri, Some(text));
+            }
         }
     }
     if edited == 0 {
@@ -263,6 +263,45 @@ fn run_incremental_edits(
         worst.as_secs_f64()
     );
     Some(worst)
+}
+
+/// The edits this harness applies to one sampled file, each labelled with the
+/// class of change it makes.
+///
+/// `no-op` is a comment appended at EOF: nothing above it moves and nothing it
+/// exports changes, so a correct edit path does no cross-file work at all.
+/// The other two do change what the file exports, which is what makes the
+/// ripple numbers a workload measurement rather than a floor.
+fn incremental_edit_variants(text: &str) -> Vec<(&'static str, String)> {
+    let mut variants = vec![
+        ("no-op", format!("{text}\n-- bench incremental edit\n")),
+        (
+            "new-export",
+            format!("{text}\nfunction BenchIncrementalExport() end\n"),
+        ),
+    ];
+    if let Some(edited) = add_param_to_first_function(text) {
+        variants.push(("param-add", edited));
+    }
+    variants
+}
+
+/// Adds a parameter to the file's first top-level `function name(...)`, which
+/// changes a signature its existing callers are already evidence for.
+///
+/// Returns `None` when the file declares no top-level function, in which case
+/// the harness simply skips this class for that file.
+fn add_param_to_first_function(text: &str) -> Option<String> {
+    let at = text.find("\nfunction ")? + 1;
+    let open = text[at..].find('(')? + at;
+    let close = text[open..].find(')')? + open;
+    let existing = text[open + 1..close].trim();
+    let params = if existing.is_empty() {
+        "benchAddedParam".to_string()
+    } else {
+        format!("{existing}, benchAddedParam")
+    };
+    Some(format!("{}{params}{}", &text[..open + 1], &text[close..]))
 }
 
 /// Everything a *consumer* of a file could observe from it: the members it

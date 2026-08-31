@@ -131,8 +131,11 @@
 //!                     mainreindex  re-analyse every main-workspace file at
 //!                               once, deliberately *without* the dependency
 //!                               expansion
-//!                     mainexpand   same set, but through `reindex_files`, i.e.
-//!                               the expansion the LSP actually applies
+//!                     mainexpand   same set, but through `self_index_and_diff`
+//!                               + `ripple`, i.e. the two-phase edit path the
+//!                               LSP actually applies. Phase 1 re-indexes the
+//!                               set; phase 2 re-analyses only the files whose
+//!                               facts the diff says changed.
 //!                     allreindex   re-analyse every file, library included,
 //!                               via per-file removal rather than `clear_index`
 //!                     restabilize  re-run analysis over every file *without*
@@ -2510,17 +2513,19 @@ fn run() {
         }
     }
 
-    // The production incremental path: `reindex_files` runs the same re-analysis
-    // as `mainreindex` but first widens the set through
-    // `expand_reindex_file_ids`.
+    // The production incremental path: phase 1 re-indexes the set and reports
+    // what it invalidated, phase 2 re-analyses only that.
     if stages.iter().any(|s| s == "mainexpand") {
         let cold_index = collect_index(&analysis, "cold");
         let main_ids = analysis.get_main_workspace_file_ids_for_diagnostics();
         let t = Instant::now();
-        analysis.reindex_files(main_ids.clone());
+        let dirty = analysis.self_index_and_diff(main_ids.clone());
+        let dirty_len = dirty.dirty_len();
+        analysis.ripple(dirty);
         eprintln!(
-            "[mainexpand] reindexed {} main files through the production expansion ({:.2}s)",
+            "[mainexpand] re-indexed {} main files, rippled {} more ({:.2}s)",
             main_ids.len(),
+            dirty_len,
             t.elapsed().as_secs_f64()
         );
         let after_index = collect_index(&analysis, "after_mainexpand");

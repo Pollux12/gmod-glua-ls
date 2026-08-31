@@ -993,7 +993,26 @@ mod test {
             ws.expr_ty("generated_entity"),
             ws.ty("sent_realm_generated")
         );
-        ws.def_file(
+        {
+            let db = ws.get_db_mut();
+            let edge = db
+                .get_type_index()
+                .get_super_type_entries(&LuaTypeDeclId::global("sent_realm_generated"))
+                .and_then(|entries| entries.first())
+                .expect("generated superclass edge");
+            assert_eq!(edge.file_id, file_id);
+            assert_eq!(
+                db.get_gmod_infer_index()
+                    .get_realm_at_offset(&file_id, edge.value.source_range.start()),
+                GmodRealm::Client
+            );
+        }
+
+        // A real declaration of the same class supersedes the generated one:
+        // `should_attach_super` only fires while the only declaration is
+        // auto-generated. Asserted here because it is what a cold build of both
+        // files produces, and an incremental one has to match it.
+        let contract_file_id = ws.def_file(
             "sv_generated_contract.lua",
             r#"
                 ---@class GeneratedRightBase
@@ -1011,16 +1030,16 @@ mod test {
         assert_eq!(ws.expr_ty("generated_realm_param"), LuaType::Number);
 
         let db = ws.get_db_mut();
-        let edge = db
+        let entries = db
             .get_type_index()
             .get_super_type_entries(&LuaTypeDeclId::global("sent_realm_generated"))
-            .and_then(|entries| entries.first())
-            .expect("generated superclass edge");
-        assert_eq!(edge.file_id, file_id);
+            .expect("superclass edge");
         assert_eq!(
-            db.get_gmod_infer_index()
-                .get_realm_at_offset(&file_id, edge.value.source_range.start()),
-            GmodRealm::Client
+            entries
+                .iter()
+                .map(|entry| entry.file_id)
+                .collect::<Vec<_>>(),
+            vec![contract_file_id]
         );
     }
 

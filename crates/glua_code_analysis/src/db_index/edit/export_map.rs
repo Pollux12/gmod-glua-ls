@@ -920,6 +920,29 @@ pub(crate) fn hash_type(remap: &FileRemap, typ: &LuaType, hasher: &mut impl Hash
     }
 }
 
+/// The identities a symbol's cached type names, as reverse-index keys.
+///
+/// A file that read this symbol cached the *value*, so its own cache names
+/// those identities: the table literal, the signature, the class. Looking them
+/// up finds exactly the readers, without dirtying everyone who merely holds a
+/// member on the same owner.
+fn push_cached_type_refs(db: &DbIndex, owner: &LuaTypeOwner, out: &mut Vec<crate::TypeCacheRef>) {
+    let Some(cache) = db.get_type_index().get_type_cache(owner) else {
+        return;
+    };
+    crate::TypeVisitTrait::visit_type(cache.as_type(), &mut |inner| match inner {
+        LuaType::TableConst(range) => out.push(crate::TypeCacheRef::Table(range.clone())),
+        LuaType::Instance(instance) => {
+            out.push(crate::TypeCacheRef::Instance(instance.get_range().clone()))
+        }
+        LuaType::Signature(signature_id) => out.push(crate::TypeCacheRef::Signature(*signature_id)),
+        LuaType::Ref(type_id) | LuaType::Def(type_id) => {
+            out.push(crate::TypeCacheRef::Decl(type_id.clone()))
+        }
+        _ => {}
+    });
+}
+
 /// The files that read any of the facts in `diff`.
 ///
 /// Queries are batched per reverse index rather than issued per key: the
@@ -929,36 +952,37 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
     let mut type_refs: Vec<crate::TypeCacheRef> = Vec::new();
     let mut nodes: Vec<LuaInferenceNodeId> = Vec::new();
     let mut signatures: Vec<LuaSignatureId> = Vec::new();
-    let mut owners: Vec<LuaMemberOwner> = Vec::new();
+    // Each owner, and whether the key that named it appeared or vanished.
+    let mut owners: Vec<(LuaMemberOwner, bool)> = Vec::new();
     let mut net_messages: Vec<SmolStr> = Vec::new();
     let mut file_level = false;
 
     // A key that appeared or vanished also reaches files that read through its
-    // owner and found nothing: a failed read records no dependency edge.
+    // owner and found nothing: a failed lookup records no dependency edge, and
+    // it may now hit. A key whose hash merely changed has no such readers - the
+    // ones it has are named by the edges below.
     let structural: FxHashSet<&ExportKey> = diff.added.iter().chain(&diff.removed).collect();
 
     for key in diff.keys() {
         match key {
             ExportKey::Member(member_id) | ExportKey::AssignmentContribution(member_id) => {
-                nodes.push(LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Member(
-                    *member_id,
-                )));
-                if structural.contains(key)
-                    && let Some(owner) = db.get_member_index().get_member_owner(member_id)
-                {
-                    owners.push(owner.clone());
+                let owner = LuaTypeOwner::Member(*member_id);
+                push_cached_type_refs(db, &owner, &mut type_refs);
+                nodes.push(LuaInferenceNodeId::TypeOwner(owner));
+                if let Some(owner) = db.get_member_index().get_member_owner(member_id) {
+                    owners.push((owner.clone(), structural.contains(key)));
                 }
             }
             ExportKey::TypeDecl(type_decl_id) => {
                 type_refs.push(crate::TypeCacheRef::Decl(type_decl_id.clone()));
             }
             ExportKey::TypeCache(owner) => {
+                push_cached_type_refs(db, owner, &mut type_refs);
                 nodes.push(LuaInferenceNodeId::TypeOwner(owner.clone()));
                 if let LuaTypeOwner::Member(member_id) = owner
-                    && structural.contains(key)
                     && let Some(owner) = db.get_member_index().get_member_owner(member_id)
                 {
-                    owners.push(owner.clone());
+                    owners.push((owner.clone(), structural.contains(key)));
                 }
             }
             ExportKey::Signature(signature_id) => {
@@ -1004,7 +1028,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
             ExportKey::Metatable(range) => {
                 type_refs.push(crate::TypeCacheRef::Table(range.clone()));
                 type_refs.push(crate::TypeCacheRef::Instance(range.clone()));
-                owners.push(LuaMemberOwner::Element(range.clone()));
+                owners.push((LuaMemberOwner::Element(range.clone()), true));
             }
             ExportKey::Realm(RealmSubject::Decl(decl_id)) => {
                 nodes.push(LuaInferenceNodeId::TypeOwner(LuaTypeOwner::Decl(*decl_id)));
@@ -1023,7 +1047,10 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
 
     let member_index = db.get_member_index();
     let mut dependents = FxHashSet::default();
-    for owner in &owners {
+    for (owner, structural) in &owners {
+        // A reader that resolved a member through this owner cached the owner
+        // itself - the class it named, the literal it indexed - so the reverse
+        // index finds it whether the member appeared or merely changed.
         match owner {
             LuaMemberOwner::Element(range) => {
                 type_refs.push(crate::TypeCacheRef::Table(range.clone()));
@@ -1038,6 +1065,14 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
             // failed is not reachable, which is the same gap as today.
             LuaMemberOwner::GlobalPath(_) => {}
             LuaMemberOwner::LocalUnresolve => continue,
+        }
+        // Walking every member of the owner is only for a key that appeared or
+        // vanished: a sibling read that found nothing recorded no edge at all.
+        // A member whose value merely changed is reached through the ref above,
+        // and enumerating a hub owner's members here dirties hundreds of files
+        // that read none of it.
+        if !structural {
+            continue;
         }
         for member in member_index.get_members(owner).unwrap_or_default() {
             let member_id = member.get_id();

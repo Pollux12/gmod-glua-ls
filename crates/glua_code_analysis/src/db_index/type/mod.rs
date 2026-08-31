@@ -1088,6 +1088,14 @@ impl TypeCacheRefIndex {
     }
 }
 
+fn super_entry_sort_key(entry: &InFiled<LuaSuperType>) -> (FileId, TextSize, TextSize) {
+    (
+        entry.file_id,
+        entry.value.source_range.start(),
+        entry.value.source_range.end(),
+    )
+}
+
 fn collect_type_cache_refs(typ: &LuaType) -> HashSet<TypeCacheRef> {
     let mut refs = HashSet::default();
     typ.visit_type(&mut |inner| {
@@ -1323,13 +1331,22 @@ impl LuaTypeIndex {
         source_range: TextRange,
         super_type: LuaType,
     ) {
-        self.supers.entry(decl_id).or_default().push(InFiled::new(
+        // Kept in source order rather than the order the files happened to be
+        // analysed in: an incremental re-analysis visits the declaring files in
+        // a different order than a cold build, and the first entry decides
+        // which declaration a consumer resolves against.
+        let entry = InFiled::new(
             file_id,
             LuaSuperType {
                 source_range,
                 typ: super_type,
             },
-        ));
+        );
+        let supers = self.supers.entry(decl_id).or_default();
+        let at = supers.partition_point(|existing| {
+            super_entry_sort_key(existing) <= super_entry_sort_key(&entry)
+        });
+        supers.insert(at, entry);
     }
 
     fn has_super_type_at_source(
