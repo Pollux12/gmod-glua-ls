@@ -135,10 +135,10 @@ pub fn is_table_namespace_type(typ: &LuaType) -> bool {
         | LuaType::TableOf(_)
         | LuaType::Object(_)
         | LuaType::Global => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => is_table_namespace_type(typ),
-            LuaUnionType::Multi(types) => {
-                let mut non_nil_types = types.iter().filter(|typ| !matches!(typ, LuaType::Nil));
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => is_table_namespace_type(typ),
+            None => {
+                let mut non_nil_types = union.types().filter(|typ| !matches!(typ, LuaType::Nil));
                 non_nil_types.next().is_some_and(is_table_namespace_type)
                     && non_nil_types.all(is_table_namespace_type)
             }
@@ -178,10 +178,10 @@ pub fn get_completion_tags(
 }
 
 fn get_union_completion_kind(union: &LuaUnionType) -> CompletionItemKind {
-    let kinds = match union {
-        LuaUnionType::Nullable(typ) => return get_completion_kind(typ),
-        LuaUnionType::Multi(types) => types
-            .iter()
+    let kinds = match union.nullable_inner() {
+        Some(typ) => return get_completion_kind(typ),
+        None => union
+            .types()
             .filter(|typ| !matches!(typ, LuaType::Nil))
             .map(get_completion_kind)
             .collect::<Vec<_>>(),

@@ -1115,6 +1115,32 @@ impl LuaUnionType {
         Self::from_vec(types)
     }
 
+    /// Builds a `Multi` union out of members that are already in their final
+    /// form, skipping the normalisation [`from_vec`](Self::from_vec) applies.
+    pub(crate) fn from_multi_unchecked(types: Vec<LuaType>) -> Self {
+        Self::Multi(types)
+    }
+
+    /// The `T` of a `T|nil` union, or `None` for any other union.
+    pub fn nullable_inner(&self) -> Option<&LuaType> {
+        match self {
+            LuaUnionType::Nullable(ty) => Some(ty),
+            LuaUnionType::Multi(_) => None,
+        }
+    }
+
+    /// Number of members, counting the implicit `nil` of a nullable union.
+    pub fn len(&self) -> usize {
+        match self {
+            LuaUnionType::Nullable(_) => 2,
+            LuaUnionType::Multi(types) => types.len(),
+        }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     pub fn into_vec(&self) -> Vec<LuaType> {
         match self {
             LuaUnionType::Nullable(ty) => vec![ty.clone(), LuaType::Nil],
@@ -1938,7 +1964,15 @@ impl LuaMappedType {
 /// `variant_detail` differentiates same-variant entries cheaply
 /// (e.g., by pointer address for Arc-wrapped types, or by value for Copy types).
 pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
-    let disc: u8 = match ty {
+    (lua_type_sort_ordinal(ty), lua_type_sort_detail(ty))
+}
+
+/// The discriminant half of [`lua_type_sort_key`], on its own.
+///
+/// Callers that only compare variants pay nothing for the detail half, which
+/// for the complex variants means hashing a `Debug` rendering of the type.
+pub(crate) fn lua_type_sort_ordinal(ty: &LuaType) -> u8 {
+    match ty {
         LuaType::Nil => 0,
         LuaType::Boolean => 1,
         LuaType::BooleanConst(_) => 2,
@@ -1990,12 +2024,14 @@ pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
         LuaType::Conditional(_) => 48,
         LuaType::ConditionalInfer(_) => 49,
         LuaType::Mapped(_) => 50,
-    };
+    }
+}
 
-    // For same-variant tiebreaking, use a deterministic identity value.
-    // Copy types use their value; Arc-wrapped types use content hashing
-    // for determinism (pointer addresses vary across runs/edits).
-    let detail: u64 = match ty {
+// For same-variant tiebreaking, use a deterministic identity value.
+// Copy types use their value; Arc-wrapped types use content hashing
+// for determinism (pointer addresses vary across runs/edits).
+fn lua_type_sort_detail(ty: &LuaType) -> u64 {
+    match ty {
         LuaType::BooleanConst(b) => *b as u64,
         LuaType::IntegerConst(n) => *n as u64,
         LuaType::DocIntegerConst(n) => *n as u64,
@@ -2031,10 +2067,81 @@ pub(crate) fn lua_type_sort_key(ty: &LuaType) -> (u8, u64) {
         | LuaType::Io => 0,
         // Arc-wrapped complex types: hash Debug representation for determinism.
         // Pointer addresses are non-deterministic across runs/edits.
-        _ => hash_str_content(&format!("{ty:?}")),
-    };
+        _ => memoized_debug_detail(ty),
+    }
+}
 
-    (disc, detail)
+/// [`lua_type_sort_detail`]'s `Debug` hash, computed once per allocation.
+///
+/// Rendering a whole type through `Debug` to hash it is the expensive half of
+/// the sort key, and a union re-sorts the same members on every rebuild. The
+/// hash is a pure function of the type's contents, which are immutable, so it
+/// is cached against the identity of the allocation the type points at. The
+/// cache owns a clone of the type, which keeps that allocation alive: no other
+/// live type can reuse the address while it is a key, and dropping an entry
+/// drops the type with it. Nothing derived from the address leaves this
+/// function.
+fn memoized_debug_detail(ty: &LuaType) -> u64 {
+    /// Entries are dropped wholesale rather than individually, so a session that
+    /// churns through types cannot grow the cache without bound.
+    const CAPACITY: usize = 1 << 16;
+
+    thread_local! {
+        static MEMO: std::cell::RefCell<rustc_hash::FxHashMap<(u8, usize), (LuaType, u64)>> =
+            Default::default();
+    }
+
+    let Some(address) = payload_address(ty) else {
+        return hash_str_content(&format!("{ty:?}"));
+    };
+    // Two variants can wrap the same allocation (`TplRef` and `ConstTplRef`),
+    // and they render differently.
+    let id = (lua_type_sort_ordinal(ty), address);
+
+    MEMO.with(|memo| {
+        if let Some((_, detail)) = memo.borrow().get(&id) {
+            return *detail;
+        }
+        let detail = hash_str_content(&format!("{ty:?}"));
+        let mut memo = memo.borrow_mut();
+        if memo.len() >= CAPACITY {
+            memo.clear();
+        }
+        memo.insert(id, (ty.clone(), detail));
+        detail
+    })
+}
+
+/// The address of the allocation a complex type points at, or `None` for the
+/// variants that hold their payload inline.
+fn payload_address(ty: &LuaType) -> Option<usize> {
+    fn addr<T>(ptr: *const T) -> usize {
+        ptr as usize
+    }
+
+    Some(match ty {
+        LuaType::Array(a) => addr(Arc::as_ptr(a)),
+        LuaType::Tuple(a) => addr(Arc::as_ptr(a)),
+        LuaType::DocFunction(a) => addr(Arc::as_ptr(a)),
+        LuaType::Object(a) => addr(Arc::as_ptr(a)),
+        LuaType::Union(a) => addr(Arc::as_ptr(a)),
+        LuaType::Intersection(a) => addr(Arc::as_ptr(a)),
+        LuaType::MergedTable(a) => addr(Arc::as_ptr(a)),
+        LuaType::Generic(a) => addr(Arc::as_ptr(a)),
+        LuaType::TableGeneric(a) => addr(Arc::as_ptr(a)),
+        LuaType::TplRef(a) | LuaType::ConstTplRef(a) => addr(Arc::as_ptr(a)),
+        LuaType::StrTplRef(a) => addr(Arc::as_ptr(a)),
+        LuaType::Variadic(a) => addr(Arc::as_ptr(a)),
+        LuaType::Instance(a) => addr(Arc::as_ptr(a)),
+        LuaType::Call(a) => addr(Arc::as_ptr(a)),
+        LuaType::MultiLineUnion(a) => addr(Arc::as_ptr(a)),
+        LuaType::TypeGuard(a) => addr(Arc::as_ptr(a)),
+        LuaType::DocAttribute(a) => addr(Arc::as_ptr(a)),
+        LuaType::Conditional(a) => addr(Arc::as_ptr(a)),
+        LuaType::Mapped(a) => addr(Arc::as_ptr(a)),
+        LuaType::TableOf(a) => addr(a.as_ref() as *const LuaType),
+        _ => return None,
+    })
 }
 
 /// Deterministic hash of a string's content for use as a sort key detail.
@@ -2177,5 +2284,31 @@ mod tests {
                 "{name} hashed its allocation, not its contents"
             );
         }
+    }
+
+    /// The sort key's `Debug` hash is memoised against the address of the type's
+    /// allocation, which only holds while the cache pins that allocation: two
+    /// equal types allocated apart still key alike, and two variants sharing one
+    /// allocation still key apart.
+    #[test]
+    fn memoised_sort_keys_follow_contents_not_allocations() {
+        let build = || LuaType::TableGeneric(Arc::new(vec![LuaType::String, LuaType::Integer]));
+        let (left, right) = (build(), build());
+        assert_eq!(lua_type_sort_key(&left), lua_type_sort_key(&right));
+        assert_eq!(
+            lua_type_sort_key(&left).1,
+            hash_str_content(&format!("{left:?}")),
+            "memoised detail drifted from the hash it caches"
+        );
+
+        let shared = Arc::new(GenericTpl::new(
+            GenericTplId::Type(3),
+            ArcIntern::new(SmolStr::new("T")),
+            None,
+        ));
+        assert_ne!(
+            lua_type_sort_key(&LuaType::TplRef(shared.clone())).1,
+            lua_type_sort_key(&LuaType::ConstTplRef(shared)).1
+        );
     }
 }

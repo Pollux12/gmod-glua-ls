@@ -1,7 +1,6 @@
-use std::ops::Deref;
-
-use crate::db_index::r#type::types::lua_type_sort_key;
+use crate::db_index::r#type::types::{lua_type_sort_key, lua_type_sort_ordinal};
 use crate::{DbIndex, LuaMultiLineUnion, LuaType, LuaUnionType, get_real_type};
+use rustc_hash::FxHashSet;
 
 // Union member *order* is preserved here, but the member *set* is
 // canonical.
@@ -68,6 +67,9 @@ pub(crate) fn union_type_all(types: Vec<LuaType>) -> LuaType {
 /// [`visiting_order_is_observable`] decides for the caller.
 fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
     let mut members: Vec<LuaType> = Vec::with_capacity(types.len());
+    let mut present = 0u64;
+    let mut hashed: FxHashSet<LuaType> =
+        FxHashSet::with_capacity_and_hasher(types.len(), Default::default());
     for typ in types {
         match typ {
             // `never` is absorbed by any sibling, so it only survives when it is
@@ -77,11 +79,11 @@ fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
             LuaType::Union(union) => {
                 for member in union.into_vec() {
                     if !matches!(member, LuaType::Never) {
-                        absorb(&mut members, member);
+                        add_member(&mut members, &mut present, &mut hashed, member);
                     }
                 }
             }
-            other => absorb(&mut members, other),
+            other => add_member(&mut members, &mut present, &mut hashed, other),
         }
     }
 
@@ -89,6 +91,74 @@ fn union_all_absorbed(types: Vec<LuaType>) -> LuaType {
         return LuaType::Never;
     }
     LuaType::from_vec_structural(members)
+}
+
+/// [`absorb`], with the common case answered by a hash set instead of a scan.
+///
+/// `absorb` scans every member sharing a discriminant with the incoming type,
+/// and the rule that decides them is a full structural equality — so a union of
+/// n distinct `Ref`s or `TableConst`s costs O(n²). When nothing already present
+/// can collapse with `ty` across discriminants, and `ty`'s own discriminant has
+/// no same-discriminant rule but equality, that scan is exactly a de-duplication
+/// and `hashed` gives the same answer in one hash.
+///
+/// `hashed` holds every member this shortcut inserted, and only those: a member
+/// `absorb` inserted or merged away is one whose partner discriminant is set in
+/// `present`, and `present` is only ever widened, so an equal type arriving
+/// later cannot reach the shortcut and find the set out of date.
+fn add_member(
+    members: &mut Vec<LuaType>,
+    present: &mut u64,
+    hashed: &mut FxHashSet<LuaType>,
+    ty: LuaType,
+) {
+    if dedups_by_equality(&ty)
+        && collapse_partner_ordinals(&ty)
+            .iter()
+            .all(|ordinal| *present & 1 << ordinal == 0)
+    {
+        if hashed.insert(ty.clone()) {
+            *present |= 1 << lua_type_sort_ordinal(&ty);
+            members.push(ty);
+        }
+        return;
+    }
+    absorb(members, present, ty);
+}
+
+/// Whether two members of this type's discriminant can only collapse by being
+/// equal, and that equality agrees with `Hash`.
+///
+/// `BooleanConst` is the one discriminant with a rule of its own (two different
+/// literals give `boolean`). `FloatConst` is left out because `0.0 == -0.0`
+/// while their bit patterns — what `Hash` uses — differ. Every other type is
+/// decided by [`try_collapse`]'s trailing equality rule, including `Ref`, whose
+/// own arm compares the same ids that `PartialEq` does.
+fn dedups_by_equality(ty: &LuaType) -> bool {
+    matches!(
+        ty,
+        LuaType::Nil
+            | LuaType::Boolean
+            | LuaType::Integer
+            | LuaType::Number
+            | LuaType::String
+            | LuaType::Table
+            | LuaType::Userdata
+            | LuaType::Function
+            | LuaType::Thread
+            | LuaType::SelfInfer
+            | LuaType::Global
+            | LuaType::Unknown
+            | LuaType::Io
+            | LuaType::IntegerConst(_)
+            | LuaType::DocIntegerConst(_)
+            | LuaType::StringConst(_)
+            | LuaType::DocStringConst(_)
+            | LuaType::TableConst(_)
+            | LuaType::Ref(_)
+            | LuaType::Def(_)
+            | LuaType::Signature(_)
+    )
 }
 
 /// Whether the order `union_type_all` visits members in can change its answer.
@@ -217,8 +287,9 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
             if let Some(merged) = union_sorted_insert(left, source, right) {
                 return merged;
             }
-            let mut members = left.deref().clone().into_vec();
-            absorb(&mut members, right.clone());
+            let mut members = left.into_vec();
+            let mut present = ordinal_mask(&members);
+            absorb(&mut members, &mut present, right.clone());
             LuaType::from_vec_structural(members)
         }
         // The *source* joins the union, not the dereferenced view of it:
@@ -228,15 +299,17 @@ fn union_type_impl(match_source: &LuaType, source: &LuaType, target: &LuaType) -
         // `try_collapse`), and `absorb` matches an alias by identity, which
         // is the same answer the other two union arms give.
         (left, LuaType::Union(right)) if !left.is_union() => {
-            let mut members = right.deref().clone().into_vec();
-            absorb(&mut members, source.clone());
+            let mut members = right.into_vec();
+            let mut present = ordinal_mask(&members);
+            absorb(&mut members, &mut present, source.clone());
             LuaType::from_vec_structural(members)
         }
         // two union
         (LuaType::Union(left), LuaType::Union(right)) => {
             let mut members = left.into_vec();
+            let mut present = ordinal_mask(&members);
             for member in right.into_vec() {
-                absorb(&mut members, member);
+                absorb(&mut members, &mut present, member);
             }
             LuaType::from_vec_structural(members)
         }
@@ -306,8 +379,44 @@ fn multi_line_union_contains(union: &LuaMultiLineUnion, other: &LuaType) -> bool
         })
 }
 
+/// This type's bit in a discriminant mask.
+///
+/// The masks are `u64`, so every ordinal has to stay under 64; the largest
+/// [`lua_type_sort_ordinal`] hands out today is 50. Going over would silently
+/// produce a wrong mask in release, so it is checked here, the one place a bit
+/// is taken.
+fn ordinal_bit(ty: &LuaType) -> u64 {
+    let ordinal = lua_type_sort_ordinal(ty);
+    debug_assert!(
+        ordinal < 64,
+        "sort ordinal {ordinal} does not fit in a u64 discriminant mask"
+    );
+    1 << ordinal
+}
+
+/// Bitset of the sort discriminants present in a member list.
+fn ordinal_mask(members: &[LuaType]) -> u64 {
+    members
+        .iter()
+        .fold(0, |mask, member| mask | ordinal_bit(member))
+}
+
+/// The discriminants of every member `ty` could collapse with: its collapse
+/// partners, plus its own for the equality rules, plus `never`.
+fn collapse_candidate_mask(ty: &LuaType) -> u64 {
+    collapse_partner_ordinals(ty).iter().fold(
+        ordinal_bit(ty) | ordinal_bit(&LuaType::Never),
+        |mask, ordinal| mask | 1 << ordinal,
+    )
+}
+
 /// Add `ty` to an existing union's member list, applying absorption rules.
-fn absorb(members: &mut Vec<LuaType>, ty: LuaType) {
+///
+/// `present` is [`ordinal_mask`] over `members`, carried across calls so that a
+/// member with no possible partner costs a mask test rather than a scan. It is
+/// only ever widened, so a member removed by a merge leaves a stale bit behind:
+/// that costs a scan that finds nothing, never a missed collapse.
+fn absorb(members: &mut Vec<LuaType>, present: &mut u64, ty: LuaType) {
     let mut ty = ty;
     // A merged member keeps the slot of the member it merged with, so absorbing
     // never reorders the survivors. Member order is semantic for overloads and
@@ -316,17 +425,27 @@ fn absorb(members: &mut Vec<LuaType>, ty: LuaType) {
     let mut slot = members.len();
 
     'restart: loop {
-        for i in 0..members.len() {
-            if let Some(merged) = try_collapse(&members[i], &members[i], &ty) {
-                members.remove(i);
-                ty = merged;
-                slot = slot.min(i);
-                continue 'restart;
+        let candidates = collapse_candidate_mask(&ty);
+        if candidates & *present != 0 {
+            for i in 0..members.len() {
+                // Anything that collapses sorts under a candidate discriminant,
+                // so the rest are skipped without reaching `try_collapse`, whose
+                // last rule is a full structural equality.
+                if candidates & 1 << lua_type_sort_ordinal(&members[i]) == 0 {
+                    continue;
+                }
+                if let Some(merged) = try_collapse(&members[i], &members[i], &ty) {
+                    members.remove(i);
+                    ty = merged;
+                    slot = slot.min(i);
+                    continue 'restart;
+                }
             }
         }
         break;
     }
 
+    *present |= 1 << lua_type_sort_ordinal(&ty);
     members.insert(slot.min(members.len()), ty);
 }
 
@@ -429,10 +548,10 @@ fn collapse_partner_ordinals(typ: &LuaType) -> &'static [u8] {
 
 /// Whether a sorted member list holds any type with this sort discriminant.
 fn contains_ordinal(members: &[LuaType], ordinal: u8) -> bool {
-    let at = members.partition_point(|member| lua_type_sort_key(member).0 < ordinal);
+    let at = members.partition_point(|member| lua_type_sort_ordinal(member) < ordinal);
     members
         .get(at)
-        .is_some_and(|member| lua_type_sort_key(member).0 == ordinal)
+        .is_some_and(|member| lua_type_sort_ordinal(member) == ordinal)
 }
 
 #[cfg(test)]
@@ -526,8 +645,9 @@ mod union_shortcut_tests {
             let source = LuaType::Union(union.clone());
 
             let general = {
-                let mut rebuilt = union.deref().clone().into_vec();
-                absorb(&mut rebuilt, incoming.clone());
+                let mut rebuilt = union.into_vec();
+                let mut present = ordinal_mask(&rebuilt);
+                absorb(&mut rebuilt, &mut present, incoming.clone());
                 LuaType::from_vec_structural(rebuilt)
             };
             if let Some(fast) = union_sorted_insert(&union, &source, &incoming) {
@@ -559,6 +679,32 @@ mod union_shortcut_tests {
     fn two_different_boolean_literals_collapse_to_boolean() {
         let types = vec![LuaType::BooleanConst(true), LuaType::BooleanConst(false)];
         assert_eq!(union_all_absorbed(types.clone()), fold(types));
+    }
+
+    /// The shape the hash-set shortcut exists for: a wide union of members
+    /// sharing one discriminant, mixed with the one same-discriminant rule that
+    /// is not plain equality.
+    #[test]
+    fn many_references_beside_boolean_literals_match_the_fold() {
+        let mut next = rng(0x1234_5678_9abc_def1);
+        for _ in 0..200 {
+            let mut types = (0..40)
+                .map(|i| LuaType::Ref(LuaTypeDeclId::global(&format!("Class{}", i % 25))))
+                .collect::<Vec<_>>();
+            types.insert(
+                (next() % 40) as usize,
+                LuaType::BooleanConst(next() & 1 == 0),
+            );
+            types.insert(
+                (next() % 40) as usize,
+                LuaType::BooleanConst(next() & 1 == 0),
+            );
+            types.insert((next() % 40) as usize, LuaType::Boolean);
+            if visiting_order_is_observable(&types) {
+                continue;
+            }
+            assert_eq!(union_all_absorbed(types.clone()), fold(types.clone()));
+        }
     }
 
     #[test]

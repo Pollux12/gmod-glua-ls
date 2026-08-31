@@ -2,7 +2,7 @@ use rustc_hash::FxHashSet;
 
 use crate::{
     CacheEntry, DbIndex, GlobalId, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId,
-    LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
+    LuaSignatureId, LuaTypeCache, LuaTypeOwner, TypeOps,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
@@ -462,10 +462,9 @@ fn should_defer_weak_gmod_dynamic_index_alias(
 fn is_weak_dynamic_index_alias_type(expr_type: &LuaType) -> bool {
     match expr_type {
         LuaType::Any | LuaType::Unknown => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(inner) => inner.is_any() || inner.is_unknown(),
-            LuaUnionType::Multi(_) => false,
-        },
+        LuaType::Union(union) => union
+            .nullable_inner()
+            .is_some_and(|inner| inner.is_any() || inner.is_unknown()),
         _ => false,
     }
 }

@@ -503,12 +503,12 @@ pub fn visit_call_arg_roles_from_type<F>(
         LuaType::Instance(instance) => {
             visit_call_arg_roles_from_type(db, instance.get_base(), arg_idx, visitor);
         }
-        LuaType::Union(union) => match union.as_ref() {
-            crate::db_index::LuaUnionType::Nullable(inner) => {
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(inner) => {
                 visit_call_arg_roles_from_type(db, inner, arg_idx, visitor);
             }
-            crate::db_index::LuaUnionType::Multi(types) => {
-                for typ in types {
+            None => {
+                for typ in union.types() {
                     visit_call_arg_roles_from_type(db, typ, arg_idx, visitor);
                 }
             }

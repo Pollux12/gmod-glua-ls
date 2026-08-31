@@ -1,4 +1,4 @@
-use glua_code_analysis::{LuaType, LuaUnionType};
+use glua_code_analysis::LuaType;
 use glua_parser::{LuaExpr, LuaLiteralToken, UnaryOperator};
 
 use crate::handlers::{
@@ -114,9 +114,9 @@ pub(super) fn is_gmod_literal_constructor_type(typ: &LuaType) -> bool {
             is_gmod_literal_constructor_name(&id.get_simple_name())
         }
         LuaType::Instance(instance) => is_gmod_literal_constructor_type(instance.get_base()),
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => is_gmod_literal_constructor_type(typ),
-            LuaUnionType::Multi(types) => types.iter().any(is_gmod_literal_constructor_type),
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => is_gmod_literal_constructor_type(typ),
+            None => union.types().any(is_gmod_literal_constructor_type),
         },
         LuaType::Intersection(intersection) => intersection
             .get_types()
@@ -130,9 +130,9 @@ pub(crate) fn is_color_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Ref(id) | LuaType::Def(id) => id.get_simple_name() == "Color",
         LuaType::Instance(instance) => is_color_type(instance.get_base()),
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => is_color_type(typ),
-            LuaUnionType::Multi(types) => types.iter().any(is_color_type),
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => is_color_type(typ),
+            None => union.types().any(is_color_type),
         },
         LuaType::Intersection(intersection) => intersection.get_types().iter().any(is_color_type),
         _ => false,
