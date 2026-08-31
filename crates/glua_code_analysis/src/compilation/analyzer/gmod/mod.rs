@@ -38,9 +38,9 @@ use crate::{
         GmodLoadRootKind, GmodLoadStatus, GmodNamedSiteMetadata, GmodNetReceiveSiteMetadata,
         GmodRealm, GmodRealmFileMetadata, GmodRealmRange, GmodScopedClassInfo, GmodStateMask,
         GmodSystemFileMetadata, GmodTimerKind, GmodTimerSiteMetadata, LuaDependencyKind,
-        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetOpDescriptor,
-        NetOpDirection, NetOpEntry, NetReceiveFlow, NetSendFlow, NetSendKind,
-        TableNumericRangePopulation, WorkspaceKind,
+        LuaDependencySite, LuaMemberOwner, NetFlowFrame, NetFlowKind, NetHelperNameMemo,
+        NetNameExpansion, NetOpDescriptor, NetOpDirection, NetOpEntry, NetReceiveFlow, NetSendFlow,
+        NetSendKind, TableNumericRangePopulation, WorkspaceKind,
     },
     infer_expr,
     profile::Profile,
@@ -513,14 +513,20 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
         let reach = HelperStartReachCache::default();
-        let helper_call_sites = crate::profile::phase("gmodnet/helper_call_sites", || {
-            let op_names = net_operation_names(&annotated_global_call_roles);
-            let mut names = crate::profile::phase("gmodnet/helper_names", || {
-                net_producing_function_names(db, &op_names)
-            });
-            names.extend(op_names);
-            net_helper_call_sites(db, names, &collected_files)
-        });
+        let mut helper_name_memo = db.get_gmod_network_index_mut().take_helper_name_memo();
+        let helper_call_sites = {
+            let db: &DbIndex = db;
+            crate::profile::phase("gmodnet/helper_call_sites", || {
+                let op_names = net_operation_names(&annotated_global_call_roles);
+                let mut names = crate::profile::phase("gmodnet/helper_names", || {
+                    net_producing_function_names(db, &op_names, &mut helper_name_memo)
+                });
+                names.extend(op_names);
+                net_helper_call_sites(db, names, &collected_files)
+            })
+        };
+        db.get_gmod_network_index_mut()
+            .restore_helper_name_memo(helper_name_memo);
         let collected = crate::profile::phase("gmodnet/collect_flows", || {
             super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
                 collect_file_network_flows(
@@ -1249,90 +1255,115 @@ fn var_expr_written_name(var_expr: &LuaVarExpr) -> Option<SmolStr> {
 ///
 /// Nothing is scanned. The cost is proportional to how much net code the
 /// workspace actually has, not to its size.
-fn net_producing_function_names(db: &DbIndex, op_names: &HashSet<SmolStr>) -> HashSet<SmolStr> {
+fn net_producing_function_names(
+    db: &DbIndex,
+    op_names: &HashSet<SmolStr>,
+    memo: &mut NetHelperNameMemo,
+) -> HashSet<SmolStr> {
+    let reference_index = db.get_reference_index();
     let mut names: HashSet<SmolStr> = HashSet::new();
     let mut visited_decls: HashSet<LuaDeclId> = HashSet::new();
     // Seeded from the net operations' own references rather than from the
     // pre-pass's recorded call sites: that record is only written for files
     // that also need hook metadata, so it is not a complete list of net ops.
     // The reference index records every reference unconditionally.
-    let mut frontier: Vec<InFiled<LuaSyntaxId>> = op_names
-        .iter()
-        .flat_map(|name| name_reference_sites(db, name))
-        .collect();
+    let mut expanded_names: HashSet<SmolStr> = op_names.clone();
+    let mut pending_names: Vec<SmolStr> = op_names.iter().cloned().collect();
+    let mut pending_decls: Vec<LuaDeclId> = Vec::new();
 
-    while !frontier.is_empty() {
-        // Grouped so each file's red tree is built once per round rather than
-        // once per site.
-        let mut by_file: FxHashMap<FileId, Vec<LuaSyntaxId>> = FxHashMap::default();
-        for site in frontier.drain(..) {
-            by_file.entry(site.file_id).or_default().push(site.value);
-        }
-
-        let mut fresh: Vec<SmolStr> = Vec::new();
-        let mut next: Vec<InFiled<LuaSyntaxId>> = Vec::new();
-        for (file_id, syntax_ids) in by_file {
-            let Some(root) = db
-                .get_vfs()
-                .get_syntax_tree(&file_id)
-                .map(|tree| tree.get_red_root())
-            else {
-                continue;
-            };
-            for syntax_id in syntax_ids {
-                let Some(node) = syntax_id.to_node_from_root(&root) else {
-                    continue;
-                };
-                let Some(closure) = node.ancestors().find_map(LuaClosureExpr::cast) else {
-                    continue;
-                };
-                let Some(name) = closure_declared_name(&closure) else {
-                    continue;
-                };
-                // A local enters neither name-keyed reference table, so a chain
-                // through local wrappers only continues if the next level comes
-                // from the declaration's own references.
-                if let Some(decl_id) = closure_local_decl_id(file_id, &closure)
-                    && visited_decls.insert(decl_id)
-                {
-                    next.extend(decl_reference_sites(db, decl_id));
+    loop {
+        let expansions = if let Some(name) = pending_names.pop() {
+            reference_index
+                .files_referencing_name(&name)
+                .into_iter()
+                .map(|file_id| {
+                    let revision = reference_index.file_reference_revision(file_id);
+                    if let Some(expansion) = memo.name(file_id, revision, &name) {
+                        return expansion.clone();
+                    }
+                    let expansion = expand_sites(
+                        db,
+                        file_id,
+                        &reference_index.name_references_in_file(&name, file_id),
+                    );
+                    memo.set_name(file_id, revision, name.clone(), expansion.clone());
+                    expansion
+                })
+                .collect::<Vec<_>>()
+        } else if let Some(decl_id) = pending_decls.pop() {
+            let file_id = decl_id.file_id;
+            let revision = reference_index.file_reference_revision(file_id);
+            let expansion = match memo.decl(file_id, revision, &decl_id) {
+                Some(expansion) => expansion.clone(),
+                None => {
+                    let expansion = expand_sites(db, file_id, &decl_read_sites(db, decl_id));
+                    memo.set_decl(file_id, revision, decl_id, expansion.clone());
+                    expansion
                 }
-                if names.insert(name.clone()) {
-                    fresh.push(name);
+            };
+            vec![expansion]
+        } else {
+            break;
+        };
+
+        for expansion in expansions {
+            // A local enters neither name-keyed reference table, so a chain
+            // through local wrappers only continues if the next level comes
+            // from the declaration's own references.
+            for decl_id in expansion.locals {
+                if visited_decls.insert(decl_id) {
+                    pending_decls.push(decl_id);
+                }
+            }
+            // A newly named function's callers are the next level, and the
+            // reference index already knows where they are.
+            for name in expansion.names {
+                names.insert(name.clone());
+                if expanded_names.insert(name.clone()) {
+                    pending_names.push(name);
                 }
             }
         }
-
-        // A newly named function's callers are the next level, and the
-        // reference index already knows where they are.
-        for name in fresh {
-            next.extend(name_reference_sites(db, &name));
-        }
-        frontier = next;
     }
 
     names
 }
 
-/// Every place a name is referenced, from the reference index.
-fn name_reference_sites(db: &DbIndex, name: &SmolStr) -> Vec<InFiled<LuaSyntaxId>> {
-    let reference_index = db.get_reference_index();
-    let member_key = LuaMemberKey::Name(name.clone());
-    reference_index
-        .get_index_references(&member_key)
-        .into_iter()
-        .flatten()
-        .chain(
-            reference_index
-                .get_global_references(name)
-                .into_iter()
-                .flatten(),
-        )
-        .collect()
+/// One file's contribution for a set of reference sites: the written name of
+/// each site's innermost enclosing closure, and that closure's local binding
+/// when it has one.
+///
+/// Pure in the file's syntax tree and its own declaration references, which is
+/// what [`NetHelperNameMemo`] keys on.
+fn expand_sites(db: &DbIndex, file_id: FileId, sites: &[LuaSyntaxId]) -> NetNameExpansion {
+    let mut expansion = NetNameExpansion::default();
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return expansion;
+    };
+    for syntax_id in sites {
+        let Some(node) = syntax_id.to_node_from_root(&root) else {
+            continue;
+        };
+        let Some(closure) = node.ancestors().find_map(LuaClosureExpr::cast) else {
+            continue;
+        };
+        let Some(name) = closure_declared_name(&closure) else {
+            continue;
+        };
+        if let Some(decl_id) = closure_local_decl_id(file_id, &closure) {
+            expansion.locals.push(decl_id);
+        }
+        expansion.names.push(name);
+    }
+    expansion
 }
 
 /// Every place a local declaration is read, from the reference index.
-fn decl_reference_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<InFiled<LuaSyntaxId>> {
+fn decl_read_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<LuaSyntaxId> {
     let Some(references) = db
         .get_reference_index()
         .get_decl_references(&decl_id.file_id, &decl_id)
@@ -1343,12 +1374,7 @@ fn decl_reference_sites(db: &DbIndex, decl_id: LuaDeclId) -> Vec<InFiled<LuaSynt
         .cells
         .iter()
         .filter(|cell| !cell.is_write)
-        .map(|cell| {
-            InFiled::new(
-                decl_id.file_id,
-                LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range),
-            )
-        })
+        .map(|cell| LuaSyntaxId::new(glua_parser::LuaSyntaxKind::NameExpr.into(), cell.range))
         .collect()
 }
 

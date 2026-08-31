@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rowan::TextRange;
 use smol_str::SmolStr;
 
-use super::LuaIndex;
+use super::{LuaDeclId, LuaIndex};
 use crate::{FileId, GmodRealm};
 
 mod pair;
@@ -224,6 +224,93 @@ pub struct FileNetworkData {
     pub receive_flows: Vec<NetReceiveFlow>,
 }
 
+/// What one reference site in one file contributes to the net-helper name
+/// closure: the written names of the functions enclosing the sites, and the
+/// local declarations those functions are bound to (whose own references carry
+/// the chain onward).
+#[derive(Debug, Clone, Default)]
+pub struct NetNameExpansion {
+    pub names: Vec<SmolStr>,
+    pub locals: Vec<LuaDeclId>,
+}
+
+/// Memo of the per-file step of the net-helper name closure.
+///
+/// The step is a pure function of one file's syntax tree and one file's own
+/// references, so an entry stays valid until that file's reference revision
+/// moves — which covers a re-index, a removal, and a late cross-file reference
+/// written by a retained unresolve alike.
+#[derive(Debug, Default)]
+pub struct NetHelperNameMemo {
+    files: HashMap<FileId, NetHelperFileMemo>,
+}
+
+#[derive(Debug, Default)]
+struct NetHelperFileMemo {
+    revision: u64,
+    names: HashMap<SmolStr, NetNameExpansion>,
+    decls: HashMap<LuaDeclId, NetNameExpansion>,
+}
+
+impl NetHelperNameMemo {
+    fn valid(&self, file_id: FileId, revision: u64) -> Option<&NetHelperFileMemo> {
+        self.files
+            .get(&file_id)
+            .filter(|memo| memo.revision == revision)
+    }
+
+    fn entry(&mut self, file_id: FileId, revision: u64) -> &mut NetHelperFileMemo {
+        let memo = self.files.entry(file_id).or_default();
+        if memo.revision != revision {
+            *memo = NetHelperFileMemo {
+                revision,
+                ..Default::default()
+            };
+        }
+        memo
+    }
+
+    pub fn name(
+        &self,
+        file_id: FileId,
+        revision: u64,
+        name: &SmolStr,
+    ) -> Option<&NetNameExpansion> {
+        self.valid(file_id, revision)?.names.get(name)
+    }
+
+    pub fn set_name(
+        &mut self,
+        file_id: FileId,
+        revision: u64,
+        name: SmolStr,
+        expansion: NetNameExpansion,
+    ) {
+        self.entry(file_id, revision).names.insert(name, expansion);
+    }
+
+    pub fn decl(
+        &self,
+        file_id: FileId,
+        revision: u64,
+        decl_id: &LuaDeclId,
+    ) -> Option<&NetNameExpansion> {
+        self.valid(file_id, revision)?.decls.get(decl_id)
+    }
+
+    pub fn set_decl(
+        &mut self,
+        file_id: FileId,
+        revision: u64,
+        decl_id: LuaDeclId,
+        expansion: NetNameExpansion,
+    ) {
+        self.entry(file_id, revision)
+            .decls
+            .insert(decl_id, expansion);
+    }
+}
+
 #[derive(Debug, Default)]
 pub struct GmodNetworkIndex {
     file_data: HashMap<FileId, FileNetworkData>,
@@ -236,6 +323,10 @@ pub struct GmodNetworkIndex {
     /// call to name — resolve it here instead of from a hardcoded table.
     /// Workspace-global and rebuilt per analyze pass, so it is not per-file state.
     canonical_ops: HashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
+    /// See [`NetHelperNameMemo`]. Kept here so it survives across analyze
+    /// passes; its own revision guard, not this index's lifecycle, decides
+    /// whether an entry is usable.
+    helper_name_memo: NetHelperNameMemo,
 }
 
 impl GmodNetworkIndex {
@@ -246,7 +337,19 @@ impl GmodNetworkIndex {
             receive_flows_by_message: HashMap::new(),
             materialized_definition_counts: HashMap::new(),
             canonical_ops: HashMap::new(),
+            helper_name_memo: NetHelperNameMemo::default(),
         }
+    }
+
+    /// Lends the net-helper name memo out for a pass. The index holds it again
+    /// through [`Self::restore_helper_name_memo`]; leaving it out only costs the
+    /// pass its hits.
+    pub fn take_helper_name_memo(&mut self) -> NetHelperNameMemo {
+        std::mem::take(&mut self.helper_name_memo)
+    }
+
+    pub fn restore_helper_name_memo(&mut self, memo: NetHelperNameMemo) {
+        self.helper_name_memo = memo;
     }
 
     /// Replaces the canonical op table. Called once per analyze pass with
@@ -406,6 +509,7 @@ impl GmodNetworkIndex {
         self.receive_flows_by_message.clear();
         self.materialized_definition_counts.clear();
         self.canonical_ops.clear();
+        self.helper_name_memo.files.clear();
     }
 
     fn index_file_data(&mut self, file_id: FileId, data: &FileNetworkData) {
@@ -479,6 +583,9 @@ impl GmodNetworkIndex {
 impl LuaIndex for GmodNetworkIndex {
     fn remove(&mut self, file_id: FileId) {
         self.remove_file(file_id);
+        // Memory hygiene only: the memo's revision guard already rejects a stale
+        // entry, this stops a removed file's entry from outliving the file.
+        self.helper_name_memo.files.remove(&file_id);
     }
 
     fn clear(&mut self) {
@@ -520,6 +627,32 @@ mod tests {
             reads: Vec::new(),
             reads_opaque: false,
         }
+    }
+
+    #[test]
+    fn helper_name_memo_entries_only_answer_for_the_revision_they_were_stored_at() {
+        let file_id = FileId::new(1);
+        let name: SmolStr = "Send".into();
+        let expansion = NetNameExpansion {
+            names: vec![SmolStr::new("SendThing")],
+            locals: Vec::new(),
+        };
+        let mut memo = NetHelperNameMemo::default();
+
+        memo.set_name(file_id, 7, name.clone(), expansion);
+        assert!(memo.name(file_id, 7, &name).is_some());
+        assert!(memo.name(file_id, 8, &name).is_none());
+        assert!(memo.name(FileId::new(2), 7, &name).is_none());
+
+        // Storing at a newer revision drops everything the old one held.
+        memo.set_name(
+            file_id,
+            8,
+            SmolStr::new("Other"),
+            NetNameExpansion::default(),
+        );
+        assert!(memo.name(file_id, 8, &name).is_none());
+        assert!(memo.name(file_id, 8, &SmolStr::new("Other")).is_some());
     }
 
     #[test]
