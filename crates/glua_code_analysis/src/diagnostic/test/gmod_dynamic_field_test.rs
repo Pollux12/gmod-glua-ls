@@ -1684,4 +1684,80 @@ mod test {
             vec!["Undefined field `bogus`. "]
         );
     }
+
+    fn panel_annotations(ws: &mut VirtualWorkspace) {
+        ws.def_gmod_call_arg_builtins();
+        ws.def_file(
+            "annotations/gmod.lua",
+            r#"
+            ---@meta
+            ---@class Entity
+            ---@class Panel : Entity
+            ---@class DPanel : Panel
+            ---@class Vector
+            ---@field x number
+            ---@return Vector
+            function Vector(x, y, z) end
+            ---@generic T: Panel
+            ---@param classname `T`
+            ---@param parent? Panel
+            ---@return (instance) T?
+            function vgui.Create(classname, parent) end
+            "#,
+        );
+    }
+
+    /// A write in the enclosing function runs before the closure defined inside
+    /// it can be called, so the field is not nil-able at the closure's read.
+    #[gtest]
+    fn test_enclosing_function_write_is_visible_in_nested_closure() {
+        let mut ws = VirtualWorkspace::new();
+        panel_annotations(&mut ws);
+        let file_id = ws.def_file(
+            "lua/nested_closure_write.lua",
+            r#"
+            local ENT = {}
+            function ENT:Initialize()
+                self.frame = vgui.Create("DPanel")
+                self.frame.col = Vector(1, 2, 3)
+                self.frame.Paint = function(pnl, w, h)
+                    print(pnl.col.x)
+                end
+            end
+            "#,
+        );
+
+        assert_eq!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            Vec::<String>::new()
+        );
+    }
+
+    /// A write in a sibling function proves nothing about ordering, so the read
+    /// inside the closure stays nil-able.
+    #[gtest]
+    fn test_sibling_function_write_stays_nilable() {
+        let mut ws = VirtualWorkspace::new();
+        panel_annotations(&mut ws);
+        let file_id = ws.def_file(
+            "lua/sibling_function_write.lua",
+            r#"
+            local ENT = {}
+            function ENT:Initialize()
+                self.frame = vgui.Create("DPanel")
+                self.frame.Paint = function(pnl, w, h)
+                    print(pnl.col.x)
+                end
+            end
+            function ENT:Draw()
+                self.frame.col = Vector(1, 2, 3)
+            end
+            "#,
+        );
+
+        assert_eq!(
+            nil_diagnostic_messages_for_file(&mut ws, file_id),
+            vec!["pnl.col may be nil"]
+        );
+    }
 }

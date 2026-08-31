@@ -3179,3 +3179,45 @@ fn conditional_seed_that_is_not_an_absence_guard_is_not_an_initialiser() {
         "#
     ));
 }
+
+/// A `false` seed in a table literal is an inferred "not set yet" placeholder,
+/// not a declared contract, so a later write of another type is not a mismatch.
+#[test]
+fn inferred_false_seed_is_lenient() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class FalseSeed.Player
+        local game = { betting = { curPlayer = false } }
+
+        ---@param ply FalseSeed.Player
+        local function setTurn(ply)
+            game.betting.curPlayer = ply
+        end
+        "#
+    ));
+}
+
+/// A declared `boolean` field is a contract and still reports.
+#[test]
+fn declared_boolean_field_still_reports() {
+    let mut ws = crate::VirtualWorkspace::new();
+
+    assert!(!ws.check_code_for(
+        crate::DiagnosticCode::AssignTypeMismatch,
+        r#"
+        ---@class DeclaredBool.Player
+        ---@class DeclaredBool.Betting
+        ---@field curPlayer boolean
+        ---@type DeclaredBool.Betting
+        local betting
+
+        ---@param ply DeclaredBool.Player
+        local function setTurn(ply)
+            betting.curPlayer = ply
+        end
+        "#
+    ));
+}

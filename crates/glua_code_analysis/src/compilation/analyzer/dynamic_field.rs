@@ -1672,32 +1672,32 @@ fn infer_integer_const(
     }
 }
 
-fn field_names_from_for_range_pairs_key(
+/// The single argument of the `pairs(..)` a `for ... in` loop iterates, when
+/// `name_expr` names that loop's `var_index`-th variable.
+pub(crate) struct ForRangePairsSource {
+    pub(crate) iter_decl_id: LuaDeclId,
+    pub(crate) source_expr: LuaExpr,
+}
+
+pub(crate) fn for_range_pairs_source_for_var(
     db: &DbIndex,
     file_id: crate::FileId,
-    key_expr: LuaExpr,
-) -> Option<ForRangePairsFieldNames> {
-    let LuaExpr::NameExpr(name_expr) = key_expr else {
-        return None;
-    };
-    let name_text = name_expr.get_name_text()?;
-    let for_range = name_expr
-        .syntax()
-        .ancestors()
-        .find_map(LuaForRangeStat::cast)?;
-
-    let iter_name = for_range.get_var_name_list().next()?;
-    if iter_name.get_name_text() != name_text {
-        return None;
-    }
-    let iter_decl_id = LuaDeclId::new(file_id, iter_name.get_position());
-    let key_decl_id = db
+    name_expr: &glua_parser::LuaNameExpr,
+    var_index: usize,
+) -> Option<ForRangePairsSource> {
+    let name_decl_id = db
         .get_reference_index()
         .get_local_reference(&file_id)?
         .get_decl_id(&name_expr.get_range())?;
-    if key_decl_id != iter_decl_id {
-        return None;
-    }
+    let (for_range, iter_decl_id) = name_expr
+        .syntax()
+        .ancestors()
+        .filter_map(LuaForRangeStat::cast)
+        .find_map(|for_range| {
+            let iter_name = for_range.get_var_name_list().nth(var_index)?;
+            let iter_decl_id = LuaDeclId::new(file_id, iter_name.get_position());
+            (iter_decl_id == name_decl_id).then_some((for_range, iter_decl_id))
+        })?;
 
     let mut iter_exprs = for_range.get_expr_list();
     let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.next() else {
@@ -1708,20 +1708,40 @@ fn field_names_from_for_range_pairs_key(
     }
 
     let args_list = call_expr.get_args_list()?;
-    let table_expr = if args_list.is_single_arg_no_parens() {
+    let source_expr = if args_list.is_single_arg_no_parens() {
         match args_list.get_single_arg_expr()? {
-            glua_parser::LuaSingleArgExpr::TableExpr(table_expr) => table_expr,
-            glua_parser::LuaSingleArgExpr::LiteralExpr(_) => return None,
+            glua_parser::LuaSingleArgExpr::TableExpr(table_expr) => LuaExpr::TableExpr(table_expr),
+            glua_parser::LuaSingleArgExpr::LiteralExpr(literal) => LuaExpr::LiteralExpr(literal),
         }
     } else {
         let mut args = args_list.get_args();
-        let Some(LuaExpr::TableExpr(table_expr)) = args.next() else {
-            return None;
-        };
+        let source_expr = args.next()?;
         if args.next().is_some() {
             return None;
         }
-        table_expr
+        source_expr
+    };
+
+    Some(ForRangePairsSource {
+        iter_decl_id,
+        source_expr,
+    })
+}
+
+fn field_names_from_for_range_pairs_key(
+    db: &DbIndex,
+    file_id: crate::FileId,
+    key_expr: LuaExpr,
+) -> Option<ForRangePairsFieldNames> {
+    let LuaExpr::NameExpr(name_expr) = key_expr else {
+        return None;
+    };
+    let ForRangePairsSource {
+        iter_decl_id,
+        source_expr,
+    } = for_range_pairs_source_for_var(db, file_id, &name_expr, 0)?;
+    let LuaExpr::TableExpr(table_expr) = source_expr else {
+        return None;
     };
 
     let (mut names, may_have_other_string_names) =

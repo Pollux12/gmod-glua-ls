@@ -42,6 +42,7 @@ pub(crate) use infer::narrow::{InferConditionFlow, cast_type};
 pub use infer::narrow::{
     explicit_param_string_default_reaches_flow, inferred_string_default_reaches_flow,
 };
+pub(crate) use infer::pairs_iter_value_registry_path;
 pub(crate) use infer::resolve_decl_backed_global_path_member_type;
 use infer::{infer_call_arg_expr_list_types, infer_expr_list_types, infer_expr_list_value_type_at};
 pub use infer::{infer_table_field_value_should_be, infer_table_should_be};

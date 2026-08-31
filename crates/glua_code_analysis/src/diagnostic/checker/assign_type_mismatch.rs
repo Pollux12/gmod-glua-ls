@@ -715,7 +715,14 @@ fn is_inferred_collection_member_type(db: &DbIndex, typ: &LuaType) -> bool {
 
 fn is_lenient_inferred_member_type(db: &DbIndex, typ: &LuaType) -> bool {
     match typ {
-        LuaType::Nil | LuaType::Unknown | LuaType::Never | LuaType::Array(_) => true,
+        // An inferred `false` is the Lua idiom for "not set yet", the same role
+        // `nil` plays here, so it is evidence rather than a contract. `true` is
+        // a positive assertion and stays strict, as does a declared boolean.
+        LuaType::Nil
+        | LuaType::Unknown
+        | LuaType::Never
+        | LuaType::Array(_)
+        | LuaType::BooleanConst(false) => true,
         LuaType::Tuple(tuple) => tuple.is_infer_resolve(),
         // Shaped sequential literals infer as TableConst and are mutable dynamic
         // tables, so later modification must not be flagged. Object/keyed

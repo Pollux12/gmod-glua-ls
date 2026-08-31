@@ -3,7 +3,7 @@ mod test {
     use std::collections::HashSet;
     use std::sync::Arc;
 
-    use crate::{LuaType, LuaUnionType, VirtualWorkspace};
+    use crate::{GlobalId, LuaMemberOwner, LuaType, LuaUnionType, VirtualWorkspace};
 
     #[test]
     fn test_closure_param_infer() {
@@ -570,5 +570,152 @@ mod test {
         assert_eq!(ws.humanize_type(def_ty.clone()), "{ a: string }");
         assert_eq!(ws.humanize_type(alias_ty.clone()), "{ a: string }");
         assert_eq!(def_ty, alias_ty);
+    }
+
+    fn registry_files(reg: &str, source: &str) -> Vec<(String, String)> {
+        vec![
+            (
+                format!("lua/autorun/sh_{reg}_registry.lua"),
+                format!(
+                    r#"
+                    {reg} = {{}}
+                    {reg}.alpha = {{}}
+                    {reg}.beta = {{}}
+                    {reg}.gamma = {{}}
+                    "#
+                ),
+            ),
+            (
+                format!("lua/autorun/sh_{reg}_write.lua"),
+                format!(
+                    r#"
+                    function {reg}_Write(keys)
+                        for _, entry in pairs({source}) do
+                            for _, key in pairs(keys) do
+                                entry[key] = {{ door = 1 }}
+                            end
+                        end
+                    end
+                    "#
+                ),
+            ),
+            (
+                format!("lua/autorun/sh_{reg}_read.lua"),
+                format!(
+                    r#"
+                    function {reg}_Read(name, key)
+                        return {reg}[name][key]
+                    end
+
+                    function {reg}_ReadThroughIterVar(key)
+                        for _, entry in pairs({reg}) do
+                            return entry[key]
+                        end
+                    end
+                    "#
+                ),
+            ),
+        ]
+    }
+
+    fn load_registry(reg: &str, source: &str, reverse: bool) -> VirtualWorkspace {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let mut files = registry_files(reg, source);
+        if reverse {
+            files.reverse();
+        }
+        ws.def_files(
+            files
+                .iter()
+                .map(|(path, source)| (path.as_str(), source.as_str()))
+                .collect(),
+        );
+        ws
+    }
+
+    fn wildcard_bucket_keys(ws: &VirtualWorkspace, reg: &str) -> Vec<String> {
+        let owner = LuaMemberOwner::GlobalPath(GlobalId::new(&format!("{reg}.[]")));
+        ws.analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_members(&owner)
+            .unwrap_or_default()
+            .iter()
+            .map(|member| format!("{:?}", member.get_key()))
+            .collect()
+    }
+
+    #[test]
+    fn pairs_value_var_write_files_onto_the_registry_wildcard_bucket() {
+        let ws = load_registry("REGWRITE", "REGWRITE", false);
+        assert_eq!(
+            wildcard_bucket_keys(&ws, "REGWRITE"),
+            vec!["ExprType(Unknown)".to_string()]
+        );
+    }
+
+    /// Without the wildcard bucket this read answers `any?`, which is what the
+    /// `may be nil` reports on such registries come from.
+    #[test]
+    fn pairs_value_var_write_is_read_back_through_the_registry_path() {
+        let mut ws = load_registry("REGREAD", "REGREAD", false);
+        let ty = ws.expr_ty("REGREAD_Read('alpha', 'door')");
+        assert_eq!(ws.humanize_type(ty), "table");
+    }
+
+    /// Same member, reached through a second loop's value variable. Nullable
+    /// here because the write is in another file, where a computed-key write is
+    /// evidence about the values a registry holds, not that this key is one.
+    #[test]
+    fn pairs_value_var_write_is_read_back_through_another_iter_var() {
+        let mut ws = load_registry("REGITER", "REGITER", false);
+        let ty = ws.expr_ty("REGITER_ReadThroughIterVar('door')");
+        assert_eq!(ws.humanize_type(ty), "table?");
+    }
+
+    #[test]
+    fn registry_wildcard_bucket_does_not_depend_on_file_order() {
+        let forward = load_registry("REGORDER", "REGORDER", false);
+        let reverse = load_registry("REGORDER", "REGORDER", true);
+        assert_eq!(
+            wildcard_bucket_keys(&forward, "REGORDER"),
+            wildcard_bucket_keys(&reverse, "REGORDER")
+        );
+        assert_eq!(
+            wildcard_bucket_keys(&reverse, "REGORDER"),
+            vec!["ExprType(Unknown)".to_string()]
+        );
+    }
+
+    #[test]
+    fn pairs_over_a_call_result_files_nothing() {
+        let ws = load_registry("REGCALL", "GetRegistry()", false);
+        assert_eq!(wildcard_bucket_keys(&ws, "REGCALL"), Vec::<String>::new());
+        assert_eq!(
+            wildcard_bucket_keys(&ws, "GetRegistry"),
+            Vec::<String>::new()
+        );
+    }
+
+    #[test]
+    fn pairs_over_a_local_registry_files_nothing() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        ws.def_file(
+            "lua/autorun/sh_local_registry.lua",
+            r#"
+            local reg = {}
+            reg.alpha = {}
+
+            function LocalRegistryWrite(keys)
+                for _, entry in pairs(reg) do
+                    for _, key in pairs(keys) do
+                        entry[key] = { door = 1 }
+                    end
+                end
+            end
+            "#,
+        );
+        assert_eq!(wildcard_bucket_keys(&ws, "reg"), Vec::<String>::new());
     }
 }
