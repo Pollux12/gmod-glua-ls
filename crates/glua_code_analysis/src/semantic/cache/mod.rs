@@ -9,13 +9,24 @@ use smol_str::SmolStr;
 use std::{collections::HashSet, sync::Arc};
 
 use crate::{
-    DbIndex, FileId, FlowId, GmodRealm, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
+    DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
     LuaMemberId, LuaMemberKey, LuaSemanticDeclId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::{InferFailReason, ParamInferenceSource},
 };
 
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
+
+/// The syntax-derived facts about one dynamic-field definition site.
+///
+/// Both are a pure function of the definition's file tree, so they are read
+/// once per definition instead of re-walking from the root on every access
+/// position that consults it.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct DynamicFieldDefinitionSyntax {
+    pub member_id: Option<LuaMemberId>,
+    pub enclosing_assign_range: Option<TextRange>,
+}
 
 #[derive(Debug, Copy, Clone, PartialEq, Eq, Hash, Default)]
 pub enum FlowOrigin {
@@ -138,6 +149,8 @@ pub struct LuaInferCache {
     pub local_class_table_member_ids_cache:
         FxHashMap<(LuaTypeDeclId, LuaMemberKey), Arc<Vec<LuaMemberId>>>,
     pub dynamic_field_type_cache: FxHashMap<LuaMemberId, Option<LuaType>>,
+    pub dynamic_field_definition_syntax_cache:
+        FxHashMap<InFiled<TextRange>, DynamicFieldDefinitionSyntax>,
     pub dynamic_field_resolving: HashSet<LuaMemberId>,
     pub vgui_parent_fallback_calls: FxHashSet<LuaSyntaxId>,
     /// `GetParent` reads answered *through* a resolved vgui parent chain.
@@ -191,6 +204,7 @@ impl LuaInferCache {
             dynamic_field_resolution_cache: FxHashMap::default(),
             local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
+            dynamic_field_definition_syntax_cache: FxHashMap::default(),
             dynamic_field_resolving: HashSet::default(),
             vgui_parent_fallback_calls: FxHashSet::default(),
             vgui_parent_chain_calls: FxHashSet::default(),
@@ -273,6 +287,7 @@ impl LuaInferCache {
         self.dynamic_field_resolution_cache.clear();
         self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
+        self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
         self.vgui_parent_chain_calls.clear();
@@ -377,6 +392,7 @@ impl LuaInferCache {
         self.dynamic_field_resolution_cache.clear();
         self.local_class_table_member_ids_cache.clear();
         self.dynamic_field_type_cache.clear();
+        self.dynamic_field_definition_syntax_cache.clear();
         self.dynamic_field_resolving.clear();
         self.vgui_parent_fallback_calls.clear();
         self.vgui_parent_chain_calls.clear();
