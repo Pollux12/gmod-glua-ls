@@ -573,6 +573,16 @@ fn dynamic_field_definition_visibility_at(
     if definition_function != access_function
         && (definition_function.is_some() || access_function.is_some())
     {
+        // A write in a function that encloses the reading one runs before the
+        // inner function can be called, so it is at least as good evidence as
+        // the cross-file write trusted unconditionally above.
+        if let (Some(definition_function), Some(access_function)) =
+            (definition_function, access_function)
+            && definition_function.contains_range(access_function)
+            && definition.value.start() <= access_position
+        {
+            return Some(DynamicFieldDefinitionVisibility::Runtime);
+        }
         return Some(DynamicFieldDefinitionVisibility::ShapeOnly);
     }
 

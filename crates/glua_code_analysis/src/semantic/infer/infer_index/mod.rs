@@ -15,8 +15,8 @@ use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
     LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     compilation::{
-        analyzer::dominating_guarded_table_bootstrap_range, get_scripted_class_info_for_file,
-        get_scripted_class_type_decl_id,
+        analyzer::{dominating_guarded_table_bootstrap_range, for_range_pairs_source_for_var},
+        get_scripted_class_info_for_file, get_scripted_class_type_decl_id,
     },
     db_index::{
         DbIndex, LuaGenericType, LuaIntersectionType, LuaMember, LuaMemberIndexItem, LuaMemberKey,
@@ -803,6 +803,17 @@ fn infer_table_member_owner(
                 return Ok(nullable_if_needed(db, member_type));
             }
 
+            // Ahead of the no-table-data fallback below: a write through the
+            // path this element is reached by -- including the wildcard segment
+            // a `for _, v in pairs(REG)` write files under -- states the value,
+            // and giving up with `any?` while that member exists would be the
+            // walk's answer rather than the program's.
+            if let Ok(global_path_type) =
+                infer_global_path_member(db, cache, index_expr.clone(), Some(key.clone()))
+            {
+                return Ok(global_path_type);
+            }
+
             if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
                 if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                     // Presence is proven, the element type is not.
@@ -810,11 +821,8 @@ fn infer_table_member_owner(
                 }
                 return Ok(nullable_any_type());
             }
-            if let Ok(global_path_type) =
-                infer_global_path_member(db, cache, index_expr.clone(), Some(key.clone()))
-            {
-                Ok(global_path_type)
-            } else if is_table_const_from_doc_tag(db, &inst) {
+
+            if is_table_const_from_doc_tag(db, &inst) {
                 Ok(nullable_any_type())
             } else {
                 Err(InferFailReason::FieldNotFound)
@@ -2648,6 +2656,11 @@ pub(crate) fn global_expr_access_path(
     file_id: FileId,
     expr: &LuaExpr,
 ) -> Option<String> {
+    global_rooted_access_path(db, file_id, expr)
+        .or_else(|| pairs_iter_value_registry_path(db, file_id, expr))
+}
+
+fn global_rooted_access_path(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> Option<String> {
     if !expr_root_is_global(db, file_id, expr) {
         return None;
     }
@@ -2657,6 +2670,36 @@ pub(crate) fn global_expr_access_path(
         LuaExpr::IndexExpr(index_expr) => index_expr.get_owner_access_path().map(Into::into),
         _ => None,
     }
+}
+
+/// The registry path a `for _, v in pairs(REG)` value variable stands for.
+///
+/// Such a variable names *some* value of `REG`, never a particular one, which
+/// is what the wildcard segment `REG.[]` means -- the bucket a `REG[k].field`
+/// write already files under. Resolving it from the syntax keeps the answer
+/// independent of how far inference had run, which a prefix-type lookup cannot
+/// promise.
+///
+/// The source must be a name or index path rooted in a global.
+/// `get_owner_access_path` walks through calls, so `pairs(player.GetAll())`
+/// would otherwise file `Player` members onto `player.GetAll.[]`.
+pub(crate) fn pairs_iter_value_registry_path(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> Option<String> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let source = for_range_pairs_source_for_var(db, file_id, name_expr, 1)?;
+    if !matches!(
+        source.source_expr,
+        LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)
+    ) {
+        return None;
+    }
+    let path = global_rooted_access_path(db, file_id, &source.source_expr)?;
+    Some(format!("{path}.[]"))
 }
 
 fn expr_root_is_global(db: &DbIndex, file_id: FileId, expr: &LuaExpr) -> bool {

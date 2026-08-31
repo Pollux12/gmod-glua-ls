@@ -26,6 +26,7 @@ pub(crate) use infer_index::check_iter_var_range;
 pub(crate) use infer_index::global_expr_access_path;
 pub use infer_index::infer_index_expr;
 pub(crate) use infer_index::infer_member_by_member_key;
+pub(crate) use infer_index::pairs_iter_value_registry_path;
 pub(crate) use infer_index::resolve_decl_backed_global_path_member_type;
 pub(crate) use infer_name::find_self_ref_id;
 pub(crate) use infer_name::infer_authoritative_method_self_type;

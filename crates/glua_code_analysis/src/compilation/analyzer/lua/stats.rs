@@ -1,8 +1,8 @@
 use std::collections::HashSet;
 
 use crate::{
-    CacheEntry, DbIndex, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId,
-    LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
+    CacheEntry, DbIndex, GlobalId, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId,
+    LuaSignatureId, LuaTypeCache, LuaTypeOwner, LuaUnionType, TypeOps,
     compilation::analyzer::{
         common::{
             DeclWrite, TypeCacheWriteMode, add_member, bind_decl_write, bind_type,
@@ -15,7 +15,7 @@ use crate::{
         LuaDeclId, LuaMember, LuaMemberFeature, LuaMemberId, LuaMemberOwner, LuaType,
         MemberAssignmentContribution, member_id_sort_key,
     },
-    semantic::{merge_open_table_types, remove_false_or_nil},
+    semantic::{merge_open_table_types, pairs_iter_value_registry_path, remove_false_or_nil},
 };
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
@@ -588,6 +588,16 @@ fn set_index_expr_owner(analyzer: &mut LuaAnalyzer, var_expr: LuaVarExpr) -> Opt
     }
 
     if let Some(member_owner) = direct_local_table_prefix_member_owner(analyzer, &prefix_expr) {
+        apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
+        return Some(());
+    }
+
+    // A write through the value variable of `for _, v in pairs(REG)` states a
+    // field on *every* value of `REG`, so it belongs on the registry's wildcard
+    // segment rather than on whichever entry the prefix type had settled to.
+    if let Some(path) = pairs_iter_value_registry_path(analyzer.db, analyzer.file_id, &prefix_expr)
+    {
+        let member_owner = LuaMemberOwner::GlobalPath(GlobalId::new(&path));
         apply_index_expr_member_owner(analyzer, index_expr, member_owner, false);
         return Some(());
     }

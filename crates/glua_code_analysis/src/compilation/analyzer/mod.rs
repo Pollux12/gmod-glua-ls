@@ -12,6 +12,7 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
+pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use lua::{dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func};
 
 use std::{
