@@ -223,6 +223,17 @@ impl LuaMemberIndex {
             self.add_member_to_owner_key_index(owner.clone(), member_id);
             self.add_member_to_owner_key_history_index(owner.clone(), member_id);
             self.add_member_to_owner(owner, member_id);
+            // The old key's slot was resolved as a conditional-branch slot;
+            // the new key's has only been through `classify_member_insert`,
+            // which cannot know the write is one arm of a branch and drops
+            // every arm after the first. Re-resolve the slot the member landed
+            // in, the same way marking it in the first place would have.
+            if self
+                .conditional_branch_assignment_members
+                .contains(&member_id)
+            {
+                self.resolve_conditional_branch_owner_key_item(member_id, false);
+            }
         }
         Some(())
     }
@@ -1714,6 +1725,59 @@ impl LuaMemberIndex {
 
     pub fn mark_non_overwriting_assignment_member(&mut self, member_id: LuaMemberId) {
         self.non_overwriting_assignment_members.insert(member_id);
+        self.readmit_preserved_assignment_co_writers(member_id);
+    }
+
+    /// Re-admits the co-writers this member's slot lost before the member was
+    /// known to be a guarded self-assignment (`t.k = t.k or {}`).
+    ///
+    /// `classify_member_insert` accumulates guarded writers only when every
+    /// writer already in the slot is marked, and a write is marked *after* it
+    /// is inserted. On a cold build the co-writer is in the same batch and its
+    /// own mark merges it back; re-indexing one file collapses the slot to that
+    /// file's writer and drops a co-writer the batch does not re-analyse, which
+    /// nothing then restores. Re-applying the accumulate rule here is the
+    /// answer a different arrival order would have produced, so both paths
+    /// settle on it.
+    fn readmit_preserved_assignment_co_writers(&mut self, member_id: LuaMemberId) -> Option<()> {
+        if !self.is_preserved_assignment_member(member_id) {
+            return None;
+        }
+        let owner = self.member_current_owner.get(&member_id)?.clone();
+        let key = self.get_member(&member_id)?.get_key().clone();
+        let visible = self
+            .owner_members
+            .get(&owner)
+            .and_then(|owner_members| owner_members.get_member(&key))
+            .map(member_ids_from_item)?;
+        // Only a slot whose every writer is a guarded assignment accumulates
+        // them all; one holding a real writer keeps deciding by the rules that
+        // put it there.
+        if !visible
+            .iter()
+            .all(|id| self.is_preserved_assignment_member(*id))
+        {
+            return None;
+        }
+        let co_writers = self
+            .get_current_owner_members_for_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect::<Vec<_>>();
+        for co_writer in co_writers {
+            if co_writer != member_id
+                && !visible.contains(&co_writer)
+                && self.is_preserved_assignment_member(co_writer)
+            {
+                self.merge_member_into_owner_item(owner.clone(), key.clone(), co_writer);
+            }
+        }
+        Some(())
+    }
+
+    fn is_preserved_assignment_member(&self, member_id: LuaMemberId) -> bool {
+        self.non_overwriting_assignment_members.contains(&member_id)
+            && self.is_assignment_file_define_member(member_id)
     }
 
     pub fn is_non_overwriting_assignment_member(&self, member_id: LuaMemberId) -> bool {
@@ -3891,6 +3955,99 @@ mod tests {
                 .assignment_contributions
                 .contribution_group_of(&member_id)
                 .is_none()
+        );
+    }
+
+    /// `pMeta[fn] = function(...)` in each arm of `if optional then ... else
+    /// ... end` is a conditional-branch slot, first resolved while the key is
+    /// still `ExprType(unknown)`. The settled tail then rekeys the members onto
+    /// the key the index expression actually infers to, and the plain insert
+    /// classifier that runs on the way in keeps only the first arm.
+    #[test]
+    fn rekeying_a_conditional_branch_member_re_resolves_its_new_slot() {
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("Player"));
+        let old_key = LuaMemberKey::ExprType(crate::LuaType::Unknown);
+        let new_key = LuaMemberKey::ExprType(crate::LuaType::String);
+        let first_arm = make_index_member_id(FileId::new(1), 10);
+        let second_arm = make_index_member_id(FileId::new(1), 20);
+        let third_arm = make_index_member_id(FileId::new(1), 40);
+        let fourth_arm = make_index_member_id(FileId::new(1), 50);
+
+        let mut index = LuaMemberIndex::new();
+        for (member_id, branch, if_range) in [
+            (first_arm, (5, 15), (0, 30)),
+            (second_arm, (15, 25), (0, 30)),
+            (third_arm, (35, 45), (30, 60)),
+            (fourth_arm, (45, 55), (30, 60)),
+        ] {
+            index.add_conditional_branch_range(
+                FileId::new(1),
+                TextRange::new(TextSize::new(branch.0), TextSize::new(branch.1)),
+                TextRange::new(TextSize::new(if_range.0), TextSize::new(if_range.1)),
+            );
+            index.add_member(
+                owner.clone(),
+                LuaMember::new(
+                    member_id,
+                    old_key.clone(),
+                    LuaMemberFeature::FileDefine,
+                    None,
+                ),
+            );
+            index.mark_conditional_branch_assignment_member(member_id, true);
+        }
+        let all_arms = vec![first_arm, second_arm, third_arm, fourth_arm];
+        assert_eq!(owner_member_ids(&index, &owner), all_arms);
+
+        for member_id in all_arms.iter().copied() {
+            index.rekey_member(member_id, new_key.clone());
+        }
+
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            all_arms,
+            "every arm must survive the key move, as they did under the old key"
+        );
+    }
+
+    /// `holdem.games = holdem.games or {}` is written by both `cl_init.lua` and
+    /// `sv_init.lua`, and both survive a cold build. Re-indexing one of them
+    /// re-inserts its write before the walk marks it a guarded self-assignment,
+    /// so the plain classifier collapses the slot to it; the other file is not
+    /// in the batch, so nothing else can bring its writer back.
+    #[test]
+    fn marking_a_guarded_writer_readmits_the_co_writer_its_reinsert_evicted() {
+        let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("holdem"));
+        let client = make_index_member_id(FileId::new(1), 10);
+        let server = make_index_member_id(FileId::new(2), 20);
+
+        let mut index = LuaMemberIndex::new();
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(client, "games", LuaMemberFeature::FileDefine),
+        );
+        index.mark_non_overwriting_assignment_member(client);
+        index.add_member_to_owner(owner.clone(), client);
+        assert_eq!(owner_member_ids(&index, &owner), vec![client]);
+
+        // The re-index of the server file: its write arrives before the walk
+        // marks it, so the classifier collapses the slot to it.
+        index.add_member(
+            owner.clone(),
+            make_member_with_feature(server, "games", LuaMemberFeature::FileDefine),
+        );
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![server],
+            "the unmarked re-insert evicts the co-writer, which is what the mark repairs"
+        );
+
+        index.mark_non_overwriting_assignment_member(server);
+
+        assert_eq!(
+            owner_member_ids(&index, &owner),
+            vec![client, server],
+            "the co-writer in a file this batch never touched must come back"
         );
     }
 }
