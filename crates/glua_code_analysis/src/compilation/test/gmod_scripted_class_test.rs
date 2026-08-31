@@ -11978,4 +11978,78 @@ GM.TestValue = 1"#,
         }
         assert!(found_call, "should find GetInputBool CallExpr");
     }
+
+    /// Two addons ship an `init.lua` for one class. Their `NetworkVar` calls are replayed into
+    /// a delegating class in the order `build_class_file_map` produced, and `add_call` dedups on
+    /// a syntax id that carries no file id, so the same byte offsets in both files collide and
+    /// the later file wins. That order has to come from the paths, not from file ids, which
+    /// differ between a cold build and an incremental session.
+    fn delegating_members_for_class_file_order(reversed: bool) -> Vec<String> {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        emmyrc
+            .gmod
+            .scripted_class_scopes
+            .set_include(vec![legacy_scope("entities/**")]);
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        let first = (
+            "lua/entities/target_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Alpha")
+                end
+            "#,
+        );
+        let second = (
+            "addons/z_other/lua/entities/target_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    self:NetworkVar("String", "Bravo")
+                end
+            "#,
+        );
+
+        if reversed {
+            ws.def_file(second.0, second.1);
+            ws.def_file(first.0, first.1);
+        } else {
+            ws.def_file(first.0, first.1);
+            ws.def_file(second.0, second.1);
+        }
+        ws.def_file(
+            "lua/entities/delegating_ent/init.lua",
+            r#"
+                function ENT:SetupDataTables()
+                    scripted_ents.GetMember("target_ent", "SetupDataTables")(self)
+                end
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("delegating_ent"));
+        let mut member_names = db
+            .get_member_index()
+            .get_members(&owner)
+            .expect("expected members")
+            .iter()
+            .filter_map(|member| member.get_key().get_name().map(|name| name.to_string()))
+            .collect::<Vec<_>>();
+        member_names.sort();
+        member_names
+    }
+
+    #[gtest]
+    fn test_class_file_order_does_not_depend_on_definition_order() {
+        let forward = delegating_members_for_class_file_order(false);
+        let reversed = delegating_members_for_class_file_order(true);
+
+        assert!(
+            forward.iter().any(|name| name.starts_with("Get")),
+            "fixture produced no synthesized members: {forward:?}"
+        );
+        assert_eq!(forward, reversed);
+    }
 }

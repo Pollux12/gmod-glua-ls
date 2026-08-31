@@ -5145,16 +5145,31 @@ fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
                 .get_file_path(&file_id)
                 .and_then(|p| p.file_name().and_then(|name| name.to_str()))
                 .is_some_and(|name| name == "init.lua");
-            let file_ids = map.entry(info.class_name.clone()).or_insert_with(Vec::new);
-            if is_init {
-                file_ids.insert(0, file_id);
-            } else {
-                file_ids.push(file_id);
-            }
+            let file_ids = map
+                .entry(info.class_name.clone())
+                .or_insert_with(Vec::<(bool, FileId)>::new);
+            file_ids.push((is_init, file_id));
         }
     }
 
-    map
+    // The per-class vector is replayed into `add_call`, which dedups on a `LuaSyntaxId` carrying
+    // no file id, so the order decides which file's call survives a collision. File-id order is
+    // not stable between a cold build and an incremental session; normalized path is.
+    map.into_iter()
+        .map(|(class_name, mut file_ids)| {
+            file_ids.sort_by_cached_key(|(is_init, file_id)| {
+                let path = vfs
+                    .get_file_path(file_id)
+                    .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
+                    .unwrap_or_default();
+                (!*is_init, path)
+            });
+            (
+                class_name,
+                file_ids.into_iter().map(|(_, file_id)| file_id).collect(),
+            )
+        })
+        .collect()
 }
 
 /// Walk a scripted class file's AST looking for `scripted_ents.GetMember` delegation
