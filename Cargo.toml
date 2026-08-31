@@ -78,6 +78,7 @@ unicode-general-category = "1.0.0"
 luars = { version = "0.11.0", features = ["serde"] }
 reqwest = "0.13.1"
 rustc-hash = "2"
+rayon = "1.11"
 
 [patch.crates-io]
 emmylua_codestyle = { path = "vendor/emmylua_codestyle" }

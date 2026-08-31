@@ -1939,54 +1939,27 @@ impl EmmyLuaAnalysis {
                     .map(|(uri, _)| self.compilation.get_db_mut().get_vfs_mut().file_id(uri))
                     .collect();
 
-                // Parse in parallel
+                // Parse in parallel on rayon's persistent pool. `collect` on an
+                // indexed parallel iterator preserves input order, so `parsed`
+                // stays aligned with `to_parse` and `file_ids`.
+                use rayon::prelude::*;
                 let config = self.emmyrc.clone();
-                let n_threads = std::thread::available_parallelism()
-                    .map(|n| n.get())
-                    .unwrap_or(1)
-                    .min(16);
-                let next_idx = std::sync::atomic::AtomicUsize::new(0);
-
-                // Each slot stores the parsed result
-                let parsed: Vec<std::sync::Mutex<Option<(LuaSyntaxTree, LineIndex)>>> = (0
-                    ..to_parse.len())
-                    .map(|_| std::sync::Mutex::new(None))
+                crate::compilation::analyzer::parallel::init_pool();
+                let parsed: Vec<(LuaSyntaxTree, LineIndex)> = to_parse
+                    .par_iter()
+                    .map_init(rowan::NodeCache::default, |node_cache, (_, text)| {
+                        let parse_config = config.get_parse_config(node_cache);
+                        let tree = LuaParser::parse(text, parse_config);
+                        let line_index = LineIndex::parse(text);
+                        (tree, line_index)
+                    })
                     .collect();
-
-                std::thread::scope(|s| {
-                    for _ in 0..n_threads {
-                        let next = &next_idx;
-                        let files = &to_parse;
-                        let results = &parsed;
-                        let cfg = &config;
-                        s.spawn(move || {
-                            let mut node_cache = rowan::NodeCache::default();
-                            loop {
-                                let idx = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                                if idx >= files.len() {
-                                    break;
-                                }
-                                let (_, text) = &files[idx];
-                                let parse_config = cfg.get_parse_config(&mut node_cache);
-                                let tree = LuaParser::parse(text, parse_config);
-                                let line_index = LineIndex::parse(text);
-                                *results[idx].lock().expect("mutex poisoned") =
-                                    Some((tree, line_index));
-                            }
-                        });
-                    }
-                });
 
                 // Insert pre-parsed results (sequential, fast FxHashMap inserts)
                 let vfs = self.compilation.get_db_mut().get_vfs_mut();
-                for (i, ((_uri, text), file_id)) in
-                    to_parse.into_iter().zip(file_ids.iter()).enumerate()
+                for (((_uri, text), file_id), (tree, line_index)) in
+                    to_parse.into_iter().zip(file_ids.iter()).zip(parsed)
                 {
-                    let (tree, line_index) = parsed[i]
-                        .lock()
-                        .expect("mutex poisoned")
-                        .take()
-                        .expect("parsed result missing");
                     vfs.insert_preparsed(*file_id, text, tree, line_index);
                     removed_files.insert(*file_id);
                     updated_files.insert(*file_id);

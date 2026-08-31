@@ -129,17 +129,17 @@ impl LuaDiagnostic {
         // significant for the "first definition wins" realm-candidate rule).
         let workspace_file_ids_ref = &workspace_file_ids;
         let realm_candidate_file_ids_ref = &realm_candidate_file_ids;
-        let (
-            workspace_realm_data,
-            missing_required_fields,
-            await_candidates,
-            param_type_candidates,
-            nodiscard_candidates,
-            decl_annotation_realms,
-            sorted_send_flows,
-            property_name_candidates,
-        ) = std::thread::scope(|s| {
-            let workspace_realms = s.spawn(|| {
+        crate::compilation::analyzer::parallel::init_pool();
+        let mut workspace_realm_data = None;
+        let mut missing_required_fields = None;
+        let mut await_candidates = None;
+        let mut param_type_candidates = None;
+        let mut nodiscard_candidates = None;
+        let mut decl_annotation_realms = None;
+        let mut sorted_send_flows = None;
+        let mut property_name_candidates = None;
+        rayon::scope(|s| {
+            s.spawn(|_| {
                 let mut gm_method_realms = FxHashMap::default();
                 let mut callee_realms_by_workspace = FxHashMap::default();
                 let mut realm_call_candidates_by_workspace = FxHashMap::default();
@@ -161,50 +161,44 @@ impl LuaDiagnostic {
                         Arc::new(callee_realm_data.realm_call_candidates),
                     );
                 }
-                (
+                workspace_realm_data = Some((
                     gm_method_realms,
                     callee_realms_by_workspace,
                     realm_call_candidates_by_workspace,
-                )
+                ));
             });
-            let missing = s.spawn(|| precompute_missing_required_fields(db));
-            let await_c = s.spawn(|| precompute_await_candidates(db));
-            let param_type = s.spawn(|| precompute_param_type_candidates(db));
-            let nodiscard = s.spawn(|| precompute_nodiscard_candidates(db));
-            let property_names = s.spawn(|| precompute_property_name_candidates(db));
-            let decl_realms =
-                s.spawn(|| precompute_decl_annotation_realms(db, workspace_file_ids_ref));
-            let send_flows =
-                s.spawn(|| precompute_sorted_send_flows(db.get_gmod_network_index(), db.get_vfs()));
-            (
-                workspace_realms
-                    .join()
-                    .expect("workspace realm precompute panicked"),
-                missing
-                    .join()
-                    .expect("precompute_missing_required_fields panicked"),
-                await_c
-                    .join()
-                    .expect("precompute_await_candidates panicked"),
-                param_type
-                    .join()
-                    .expect("precompute_param_type_candidates panicked"),
-                nodiscard
-                    .join()
-                    .expect("precompute_nodiscard_candidates panicked"),
-                decl_realms
-                    .join()
-                    .expect("precompute_decl_annotation_realms panicked"),
-                Arc::new(
-                    send_flows
-                        .join()
-                        .expect("precompute_sorted_send_flows panicked"),
-                ),
-                property_names
-                    .join()
-                    .expect("precompute_property_name_candidates panicked"),
-            )
+            s.spawn(|_| missing_required_fields = Some(precompute_missing_required_fields(db)));
+            s.spawn(|_| await_candidates = Some(precompute_await_candidates(db)));
+            s.spawn(|_| param_type_candidates = Some(precompute_param_type_candidates(db)));
+            s.spawn(|_| nodiscard_candidates = Some(precompute_nodiscard_candidates(db)));
+            s.spawn(|_| property_name_candidates = Some(precompute_property_name_candidates(db)));
+            s.spawn(|_| {
+                decl_annotation_realms = Some(precompute_decl_annotation_realms(
+                    db,
+                    workspace_file_ids_ref,
+                ))
+            });
+            s.spawn(|_| {
+                sorted_send_flows = Some(Arc::new(precompute_sorted_send_flows(
+                    db.get_gmod_network_index(),
+                    db.get_vfs(),
+                )))
+            });
         });
+        // `rayon::scope` propagates task panics, so every slot is filled here.
+        let workspace_realm_data = workspace_realm_data.expect("workspace realm precompute ran");
+        let missing_required_fields =
+            missing_required_fields.expect("precompute_missing_required_fields ran");
+        let await_candidates = await_candidates.expect("precompute_await_candidates ran");
+        let param_type_candidates =
+            param_type_candidates.expect("precompute_param_type_candidates ran");
+        let nodiscard_candidates =
+            nodiscard_candidates.expect("precompute_nodiscard_candidates ran");
+        let decl_annotation_realms =
+            decl_annotation_realms.expect("precompute_decl_annotation_realms ran");
+        let sorted_send_flows = sorted_send_flows.expect("precompute_sorted_send_flows ran");
+        let property_name_candidates =
+            property_name_candidates.expect("precompute_property_name_candidates ran");
         let (gm_method_realms, callee_realms_by_workspace, realm_call_candidates_by_workspace) =
             workspace_realm_data;
         Arc::new(SharedDiagnosticData {
