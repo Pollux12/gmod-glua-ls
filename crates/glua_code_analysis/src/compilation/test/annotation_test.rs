@@ -1570,4 +1570,92 @@ mod test {
             "#,
         ));
     }
+
+    /// A class documented in two files is one shared property. The merged view takes each
+    /// scalar field from the lowest-sorting contributor, whichever order the files arrive in,
+    /// and re-indexing one file leaves the other's contribution standing.
+    fn shared_doc_description(ws: &mut VirtualWorkspace) -> Option<String> {
+        ws.get_db_mut()
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::TypeDecl(LuaTypeDeclId::global(
+                "SharedDoc",
+            )))
+            .and_then(|property| property.description().cloned())
+    }
+
+    const SHARED_DOC_A: (&str, &str) = (
+        "lua/shared_doc_a.lua",
+        "--- doc from a\n---@class SharedDoc\n---@field alpha integer\n",
+    );
+    const SHARED_DOC_B: (&str, &str) = (
+        "lua/shared_doc_b.lua",
+        "--- doc from b\n---@class SharedDoc\n---@field beta integer\n",
+    );
+
+    #[test]
+    fn test_class_documented_in_two_files_merges_in_path_order() {
+        let mut a_first = VirtualWorkspace::new();
+        a_first.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        a_first.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+
+        let mut b_first = VirtualWorkspace::new();
+        b_first.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+        b_first.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+
+        assert_eq!(
+            shared_doc_description(&mut a_first).as_deref(),
+            Some("doc from a")
+        );
+        assert_eq!(
+            shared_doc_description(&mut b_first).as_deref(),
+            Some("doc from a")
+        );
+    }
+
+    #[test]
+    fn test_reindexing_one_documenting_file_keeps_the_other_contribution() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        ws.def_file(SHARED_DOC_B.0, SHARED_DOC_B.1);
+
+        // Re-index the winner; b's contribution has to be what is left.
+        ws.def_file(SHARED_DOC_A.0, "---@class SharedDoc\n");
+
+        assert_eq!(
+            shared_doc_description(&mut ws).as_deref(),
+            Some("doc from b")
+        );
+
+        // And the winner coming back retakes the field.
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+
+        assert_eq!(
+            shared_doc_description(&mut ws).as_deref(),
+            Some("doc from a")
+        );
+    }
+
+    #[test]
+    fn test_reindexing_a_documenting_file_does_not_accumulate_tags() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(SHARED_DOC_A.0, SHARED_DOC_A.1);
+        ws.def_file(
+            SHARED_DOC_B.0,
+            "--- doc from b\n---@class SharedDoc\n---@see Other\n",
+        );
+        ws.def_file(
+            SHARED_DOC_B.0,
+            "--- doc from b\n---@class SharedDoc\n---@see Other\n",
+        );
+
+        let tags = ws
+            .get_db_mut()
+            .get_property_index()
+            .get_property(&LuaSemanticDeclId::TypeDecl(LuaTypeDeclId::global(
+                "SharedDoc",
+            )))
+            .and_then(|property| property.tag_content().map(|tags| tags.get_all_tags().len()));
+
+        assert_eq!(tags, Some(1));
+    }
 }

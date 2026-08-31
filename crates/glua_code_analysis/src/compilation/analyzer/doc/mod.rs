@@ -55,6 +55,7 @@ impl AnalysisPipeline for DocAnalysisPipeline {
         let workspace_id = context.workspace_id.unwrap_or(WorkspaceId::MAIN);
         for in_filed_tree in tree_list.iter() {
             let root = &in_filed_tree.value;
+            register_property_merge_order(db, in_filed_tree.file_id);
             let mut generic_index = FileGenericIndex::new();
             for comment in root.descendants::<LuaComment>() {
                 let mut analyzer = DocAnalyzer::new(
@@ -69,6 +70,34 @@ impl AnalysisPipeline for DocAnalysisPipeline {
             }
         }
     }
+}
+
+/// A class documented in several files shares one property. Tell the property index how those
+/// files order against each other: annotations and other libraries before the main workspace,
+/// then lowest normalized path.
+fn register_property_merge_order(db: &mut DbIndex, file_id: FileId) {
+    let workspace_rank = match db
+        .get_module_index()
+        .get_workspace_id(file_id)
+        .map(|workspace_id| db.get_module_index().get_workspace_kind(workspace_id))
+    {
+        Some(crate::WorkspaceKind::Std) => 0,
+        Some(crate::WorkspaceKind::Library) => 1,
+        Some(crate::WorkspaceKind::Remote) => 2,
+        Some(crate::WorkspaceKind::Main) => 3,
+        None => 4,
+    };
+    let path = db
+        .get_vfs()
+        .get_file_path(&file_id)
+        .map(|path| {
+            std::sync::Arc::from(crate::vfs::normalize_path_for_ordering(
+                &path.to_string_lossy(),
+            ))
+        })
+        .unwrap_or_else(|| std::sync::Arc::from(""));
+    db.get_property_index_mut()
+        .set_file_merge_order(file_id, workspace_rank, path);
 }
 
 fn analyze_comment(analyzer: &mut DocAnalyzer) -> Option<()> {

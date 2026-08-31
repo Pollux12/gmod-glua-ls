@@ -2,6 +2,9 @@ mod decl_feature;
 #[allow(clippy::module_inception)]
 mod property;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use decl_feature::{DeclFeatureFlag, PropertyDeclFeature};
@@ -26,11 +29,29 @@ pub struct LuaInferredStringDefault {
     pub source_range: TextRange,
 }
 
+/// Merge order of one file's contribution to a shared property: annotation and library
+/// workspaces before the main workspace, then lowest normalized path. File ids are not stable
+/// between a cold build and an incremental session, so they are only the final tie-break.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+struct PropertyContributorKey {
+    workspace_rank: u8,
+    normalized_path: Arc<str>,
+    file_id: u32,
+}
+
 #[derive(Debug)]
 pub struct LuaPropertyIndex {
+    /// Merged view, read by `get_property`. For the common single-contributor property this is
+    /// the contribution itself and nothing else is stored.
     properties: HashMap<LuaPropertyId, LuaCommonProperty>,
     property_owners_map: HashMap<LuaSemanticDeclId, LuaPropertyId>,
     signature_owner_by_property: HashMap<LuaPropertyId, LuaSignatureId>,
+
+    /// `TypeDecl` properties are keyed by class name alone, so several files can document one
+    /// class. Only those properties get per-file contributions; everything else stays sole.
+    sole_contributor: HashMap<LuaPropertyId, FileId>,
+    contributions: HashMap<LuaPropertyId, BTreeMap<PropertyContributorKey, LuaCommonProperty>>,
+    file_merge_order: HashMap<FileId, (u8, Arc<str>)>,
 
     id_count: u32,
     in_filed_owner: HashMap<FileId, HashSet<LuaSemanticDeclId>>,
@@ -57,6 +78,9 @@ impl LuaPropertyIndex {
             properties: HashMap::default(),
             property_owners_map: HashMap::default(),
             signature_owner_by_property: HashMap::default(),
+            sole_contributor: HashMap::default(),
+            contributions: HashMap::default(),
+            file_merge_order: HashMap::default(),
             inferred_string_defaults: HashMap::default(),
             inferred_string_defaults_file_owners: HashMap::default(),
         }
@@ -82,6 +106,91 @@ impl LuaPropertyIndex {
         }
     }
 
+    /// Records the merge order of a file's documentation contributions. Called once per file
+    /// before its doc tags are analyzed; a file that never registers sorts last.
+    pub fn set_file_merge_order(&mut self, file_id: FileId, workspace_rank: u8, path: Arc<str>) {
+        self.file_merge_order
+            .insert(file_id, (workspace_rank, path));
+    }
+
+    fn contributor_key(&self, file_id: FileId) -> PropertyContributorKey {
+        let (workspace_rank, normalized_path) = self
+            .file_merge_order
+            .get(&file_id)
+            .cloned()
+            .unwrap_or((u8::MAX, Arc::from("")));
+        PropertyContributorKey {
+            workspace_rank,
+            normalized_path,
+            file_id: file_id.id,
+        }
+    }
+
+    /// Applies one file's write to that file's own contribution, then republishes the merged view.
+    fn contribute(
+        &mut self,
+        file_id: FileId,
+        owner_id: LuaSemanticDeclId,
+        write: impl FnOnce(&mut LuaCommonProperty),
+    ) -> Option<()> {
+        let (_, property_id) = self.get_or_create_property(owner_id.clone())?;
+
+        self.in_filed_owner
+            .entry(file_id)
+            .or_default()
+            .insert(owner_id);
+
+        if !self.contributions.contains_key(&property_id) {
+            match self.sole_contributor.get(&property_id).copied() {
+                None => {
+                    self.sole_contributor.insert(property_id, file_id);
+                    write(self.properties.get_mut(&property_id)?);
+                    return Some(());
+                }
+                Some(sole) if sole == file_id => {
+                    write(self.properties.get_mut(&property_id)?);
+                    return Some(());
+                }
+                Some(sole) => {
+                    // Second writer: the merged value so far is the first file's contribution.
+                    let sole_value = self
+                        .properties
+                        .get(&property_id)
+                        .cloned()
+                        .unwrap_or_default();
+                    let sole_key = self.contributor_key(sole);
+                    self.contributions
+                        .entry(property_id)
+                        .or_default()
+                        .insert(sole_key, sole_value);
+                    self.sole_contributor.remove(&property_id);
+                }
+            }
+        }
+
+        let key = self.contributor_key(file_id);
+        write(
+            self.contributions
+                .get_mut(&property_id)?
+                .entry(key)
+                .or_default(),
+        );
+        self.rebuild_merged(property_id);
+
+        Some(())
+    }
+
+    fn rebuild_merged(&mut self, property_id: LuaPropertyId) {
+        let Some(contributions) = self.contributions.get(&property_id) else {
+            return;
+        };
+        let mut merged = LuaCommonProperty::new();
+        for contribution in contributions.values() {
+            merged.merge_from(contribution);
+        }
+        self.properties.insert(property_id, merged);
+    }
+
     pub fn add_owner_map(
         &mut self,
         source_owner_id: LuaSemanticDeclId,
@@ -89,6 +198,9 @@ impl LuaPropertyIndex {
         file_id: FileId,
     ) -> Option<()> {
         let (_, property_id) = self.get_or_create_property(source_owner_id.clone())?;
+        // Owner aliases are always within one file, so this file owns the property outright
+        // unless a doc contribution has already promoted it.
+        self.sole_contributor.entry(property_id).or_insert(file_id);
         self.property_owners_map
             .insert(same_property_owner_id.clone(), property_id);
         if let LuaSemanticDeclId::Signature(signature_id) = &source_owner_id {
@@ -116,15 +228,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         description: String,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_description(description);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_description(description)
+        })
     }
 
     pub fn add_visibility(
@@ -133,15 +239,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         visibility: VisibilityKind,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.visibility = visibility;
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.visibility = visibility;
+        })
     }
 
     pub fn add_source(
@@ -150,15 +250,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         source: String,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_source(source);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_source(source)
+        })
     }
 
     pub fn add_default_value(
@@ -167,15 +261,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         default_value: LuaDocDefaultValue,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_default_value(default_value);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_default_value(default_value)
+        })
     }
 
     pub fn add_deprecated(
@@ -184,15 +272,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         message: Option<String>,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_deprecated(message);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_deprecated(message)
+        })
     }
 
     pub fn add_version(
@@ -201,15 +283,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         version_conds: Vec<LuaVersionCondition>,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_version_cond(version_conds);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_version_cond(version_conds)
+        })
     }
 
     pub fn add_see(
@@ -219,21 +295,14 @@ impl LuaPropertyIndex {
         mut see_content: String,
         see_description: Option<String>,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-
         if let Some(see_description) = see_description {
             see_content += " ";
             see_content += &see_description;
         }
 
-        property.add_extra_tag("see".into(), see_content);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_tag("see".into(), see_content)
+        })
     }
 
     pub fn add_other(
@@ -243,15 +312,9 @@ impl LuaPropertyIndex {
         tag_name: String,
         other_content: String,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_tag(tag_name, other_content);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_tag(tag_name, other_content)
+        })
     }
 
     pub fn add_export(
@@ -260,15 +323,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         export: property::LuaExport,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_extra_export(export);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_extra_export(export)
+        })
     }
 
     pub fn add_decl_feature(
@@ -277,15 +334,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         feature: PropertyDeclFeature,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_decl_feature(feature);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_decl_feature(feature)
+        })
     }
 
     pub fn add_attribute_use(
@@ -294,14 +345,9 @@ impl LuaPropertyIndex {
         owner_id: LuaSemanticDeclId,
         attribute_use: LuaAttributeUse,
     ) -> Option<()> {
-        let (property, _) = self.get_or_create_property(owner_id.clone())?;
-        property.add_attribute_use(attribute_use);
-
-        self.in_filed_owner
-            .entry(file_id)
-            .or_default()
-            .insert(owner_id);
-        Some(())
+        self.contribute(file_id, owner_id, |property| {
+            property.add_attribute_use(attribute_use)
+        })
     }
 
     /// Every documented symbol this file declares, with its property.
@@ -377,16 +423,60 @@ impl LuaPropertyIndex {
     }
 }
 
+impl LuaPropertyIndex {
+    /// Drops one file's contribution to a property. The property and the owner mapping that
+    /// reaches it only go when no other file still documents it.
+    fn drop_contribution(&mut self, file_id: FileId, owner_id: &LuaSemanticDeclId) {
+        let Some(property_id) = self.property_owners_map.get(owner_id).copied() else {
+            return;
+        };
+
+        if let Some(contributions) = self.contributions.get_mut(&property_id) {
+            contributions.retain(|key, _| key.file_id != file_id.id);
+            match contributions.len() {
+                0 => {
+                    self.contributions.remove(&property_id);
+                }
+                1 => {
+                    let (key, value) = self
+                        .contributions
+                        .remove(&property_id)
+                        .and_then(|mut map| map.pop_first())
+                        .expect("length checked above");
+                    self.sole_contributor
+                        .insert(property_id, FileId::new(key.file_id));
+                    self.properties.insert(property_id, value);
+                    return;
+                }
+                _ => {
+                    self.rebuild_merged(property_id);
+                    return;
+                }
+            }
+        } else if self
+            .sole_contributor
+            .get(&property_id)
+            .is_some_and(|sole| *sole != file_id)
+        {
+            // Another file created and owns this property; nothing of ours to drop.
+            return;
+        }
+
+        self.property_owners_map.remove(owner_id);
+        self.properties.remove(&property_id);
+        self.signature_owner_by_property.remove(&property_id);
+        self.sole_contributor.remove(&property_id);
+    }
+}
+
 impl LuaIndex for LuaPropertyIndex {
     fn remove(&mut self, file_id: FileId) {
         if let Some(property_owner_ids) = self.in_filed_owner.remove(&file_id) {
             for property_owner_id in property_owner_ids {
-                if let Some(property_id) = self.property_owners_map.remove(&property_owner_id) {
-                    self.properties.remove(&property_id);
-                    self.signature_owner_by_property.remove(&property_id);
-                }
+                self.drop_contribution(file_id, &property_owner_id);
             }
         }
+        self.file_merge_order.remove(&file_id);
         // Clean up inferred string defaults owned by this file.
         if let Some(decl_ids) = self.inferred_string_defaults_file_owners.remove(&file_id) {
             for decl_id in decl_ids {
@@ -399,6 +489,9 @@ impl LuaIndex for LuaPropertyIndex {
         self.properties.clear();
         self.property_owners_map.clear();
         self.signature_owner_by_property.clear();
+        self.sole_contributor.clear();
+        self.contributions.clear();
+        self.file_merge_order.clear();
         self.in_filed_owner.clear();
         self.inferred_string_defaults.clear();
         self.inferred_string_defaults_file_owners.clear();
@@ -434,5 +527,43 @@ pub fn try_extract_signature_id_from_field(
             doc_func,
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rowan::TextSize;
+
+    use super::*;
+
+    /// A file's owner set holds both an alias and its source. Removing the file has to unmap
+    /// both: a leftover mapping to a deleted property makes every later write to that owner
+    /// disappear, because `get_or_create_property` finds the id and no value behind it.
+    #[test]
+    fn removing_a_file_unmaps_every_alias_of_its_property() {
+        let file_id = FileId::new(1);
+        let source = LuaSemanticDeclId::LuaDecl(LuaDeclId::new(file_id, TextSize::new(0)));
+        let alias = LuaSemanticDeclId::LuaDecl(LuaDeclId::new(file_id, TextSize::new(10)));
+
+        let mut index = LuaPropertyIndex::new();
+        index.add_owner_map(source.clone(), alias.clone(), file_id);
+        index.add_description(file_id, source.clone(), "first".to_string());
+
+        index.remove(file_id);
+        assert!(index.get_property(&source).is_none());
+        assert!(index.get_property(&alias).is_none());
+
+        // Whichever owner the removal visited last is the one a stale mapping would strand,
+        // so both have to accept a write again.
+        index.add_description(file_id, source.clone(), "second".to_string());
+        index.add_description(file_id, alias.clone(), "third".to_string());
+        assert_eq!(
+            index.get_property(&source).and_then(|p| p.description()),
+            Some(&"second".to_string())
+        );
+        assert_eq!(
+            index.get_property(&alias).and_then(|p| p.description()),
+            Some(&"third".to_string())
+        );
     }
 }

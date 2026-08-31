@@ -472,12 +472,15 @@ fn net_flows(db: &DbIndex, file_id: FileId, map: &mut ExportMap) {
 
 // --- 11. Metatable bindings this file declares ---
 fn metatables(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
-    for (table, metatable) in &db.get_metatable_index().metatables {
-        if table.file_id != file_id {
+    for (table, binding) in db.get_metatable_index().iter_bindings() {
+        if binding.writer_file_id != file_id {
             continue;
         }
         let key_range = remapped(remap.table_range(table), table.clone());
-        let value_range = remapped(remap.table_range(metatable), metatable.clone());
+        let value_range = remapped(
+            remap.table_range(&binding.metatable),
+            binding.metatable.clone(),
+        );
         map.insert(
             ExportKey::Metatable(key_range),
             hash_with(|h| {
