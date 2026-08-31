@@ -1,5 +1,6 @@
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::{
-    collections::{HashMap, HashSet, VecDeque},
+    collections::VecDeque,
     hash::{Hash, Hasher},
     path::Path,
     sync::{Arc, Mutex},
@@ -160,8 +161,8 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
         });
 
         let t0 = do_profile.then(std::time::Instant::now);
-        let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::new();
-        let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::new();
+        let mut branch_realm_ranges: HashMap<FileId, Vec<GmodRealmRange>> = HashMap::default();
+        let mut annotation_realms: HashMap<FileId, GmodRealm> = HashMap::default();
         // Wall-clock for the parallel read-only collection pass (hook/system/net
         // flow/realm/fileparam metadata) and the sequential scoped-class merge.
         let mut t_collect = std::time::Duration::ZERO;
@@ -944,7 +945,7 @@ fn build_call_roles_and_registry(
 
     let mut signatures_by_file: HashMap<FileId, Vec<LuaSignatureId>> =
         crate::profile::phase("ccs/signatures_by_file", || {
-            let mut map: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::new();
+            let mut map: HashMap<FileId, Vec<LuaSignatureId>> = HashMap::default();
             for (signature_id, _) in db.get_signature_index().iter() {
                 map.entry(signature_id.get_file_id())
                     .or_default()
@@ -1113,10 +1114,10 @@ impl HelperRegistryBuilder {
                 )
             });
 
-        let mut globals: HashMap<GlobalId, (FileId, LuaSyntaxId)> = HashMap::new();
-        let mut methods: HashMap<SmolStr, (FileId, LuaSyntaxId)> = HashMap::new();
-        let mut signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)> = HashMap::new();
-        let mut duplicate_methods = HashSet::new();
+        let mut globals: HashMap<GlobalId, (FileId, LuaSyntaxId)> = HashMap::default();
+        let mut methods: HashMap<SmolStr, (FileId, LuaSyntaxId)> = HashMap::default();
+        let mut signatures: HashMap<LuaSignatureId, (FileId, LuaSyntaxId)> = HashMap::default();
+        let mut duplicate_methods = HashSet::default();
         for (signature_id, file_id, syntax_id, global_id) in self.definitions {
             let target = (file_id, syntax_id);
             signatures.entry(signature_id).or_insert(target);
@@ -1261,8 +1262,8 @@ fn net_producing_function_names(
     memo: &mut NetHelperNameMemo,
 ) -> HashSet<SmolStr> {
     let reference_index = db.get_reference_index();
-    let mut names: HashSet<SmolStr> = HashSet::new();
-    let mut visited_decls: HashSet<LuaDeclId> = HashSet::new();
+    let mut names: HashSet<SmolStr> = HashSet::default();
+    let mut visited_decls: HashSet<LuaDeclId> = HashSet::default();
     // Seeded from the net operations' own references rather than from the
     // pre-pass's recorded call sites: that record is only written for files
     // that also need hook metadata, so it is not a complete list of net ops.
@@ -1474,8 +1475,8 @@ struct FileFunctionMap {
 
 impl FileFunctionMap {
     fn build(root: &LuaChunk) -> Self {
-        let mut bare: HashMap<String, LuaBlock> = HashMap::new();
-        let mut duplicate_bare = HashSet::new();
+        let mut bare: HashMap<String, LuaBlock> = HashMap::default();
+        let mut duplicate_bare = HashSet::default();
         let mut all_blocks: Vec<LuaBlock> = Vec::new();
         for node in root.syntax().descendants() {
             if let Some(local_func_stat) = LuaLocalFuncStat::cast(node.clone()) {
@@ -2004,8 +2005,8 @@ fn resolve_helper_start_message(
         ctx,
         site,
         call_expr,
-        &HashMap::new(),
-        &mut HashSet::new(),
+        &HashMap::default(),
+        &mut HashSet::default(),
     )
 }
 
@@ -2074,7 +2075,7 @@ fn resolve_helper_send(
     site: &NetWalkSite,
     call_expr: &LuaCallExpr,
 ) -> Option<(NetSendKind, Option<String>)> {
-    resolve_helper_send_recursive(ctx, site, call_expr, &mut HashSet::new())
+    resolve_helper_send_recursive(ctx, site, call_expr, &mut HashSet::default())
 }
 
 fn resolve_helper_send_recursive(
@@ -2256,8 +2257,8 @@ fn collect_unannotated_net_wrapper_send_flows(
     site: &NetWalkSite,
 ) -> Vec<NetSendFlow> {
     let mut flows = Vec::new();
-    let mut visited = HashSet::new();
-    let empty_bindings = HashMap::new();
+    let mut visited = HashSet::default();
+    let empty_bindings = HashMap::default();
 
     let calls = net_candidate_call_exprs(ctx.db, site, ctx.helper_call_sites);
     for call_expr in calls {
@@ -2300,7 +2301,7 @@ fn net_candidate_call_exprs(
         // the helper, so this file's own bindings of a helper name count as
         // call sites too. Chains settle by iterating, bounded by the number of
         // bindings in the file.
-        let mut aliases: HashSet<SmolStr> = HashSet::new();
+        let mut aliases: HashSet<SmolStr> = HashSet::default();
         let bindings = decl_tree
             .get_decls()
             .values()
@@ -2525,7 +2526,7 @@ fn helper_call_string_bindings(
         .parent()
         .and_then(LuaClosureExpr::cast)
     else {
-        return HashMap::new();
+        return HashMap::default();
     };
     let params = get_closure_param_names(&closure);
     let args = call_expr
@@ -2584,7 +2585,7 @@ fn collect_net_receive_flow(
         call_expr,
         message_idx,
         callback_idx,
-        &HashMap::new(),
+        &HashMap::default(),
         call_expr.get_range(),
     )
 }
@@ -2647,8 +2648,8 @@ fn collect_unannotated_net_wrapper_receive_flows(
         site,
         call_expr,
         call_expr,
-        &HashMap::new(),
-        &mut HashSet::new(),
+        &HashMap::default(),
+        &mut HashSet::default(),
         &mut flows,
     );
     flows
@@ -3065,7 +3066,7 @@ fn collect_net_read_ops_from_block(
     block: LuaBlock,
     reads: &mut Vec<NetOpEntry>,
 ) {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     collect_net_ops_recursive(
         ctx,
         site,
@@ -3086,7 +3087,7 @@ fn collect_net_write_ops_from_stat(
     stat: &LuaStat,
     writes: &mut Vec<NetOpEntry>,
 ) {
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     collect_net_ops_recursive(
         ctx,
         site,
@@ -4065,7 +4066,7 @@ fn resolve_vgui_parent_relations(
     file_ids.sort_by_key(|file_id| file_id.id);
     let _p_cand = crate::profile::PhaseGuard::new("vgui/parent_candidates");
     let mut forwarding_parent_candidates =
-        HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::new();
+        HashMap::<(LuaTypeDeclId, String), ForwardingParentCandidate>::default();
     for file_id in &file_ids {
         let calls = db
             .get_gmod_class_metadata_index()
@@ -4208,8 +4209,8 @@ fn resolve_vgui_parent_relations(
     db.get_gmod_class_metadata_index_mut()
         .set_vgui_resolved_parent_sources(&resolved_sources_by_file);
 
-    let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::new();
-    let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::new();
+    let mut direct_parents_by_child = HashMap::<LuaTypeDeclId, Vec<Vec<LuaTypeDeclId>>>::default();
+    let mut relations_by_child = HashMap::<LuaTypeDeclId, Vec<ResolvedVguiParentSource>>::default();
     for (_, relations) in &relations_by_file {
         for relation in relations {
             for child_type_id in &relation.child_type_ids {
@@ -4227,7 +4228,7 @@ fn resolve_vgui_parent_relations(
         }
     }
 
-    let mut direct_chain_memo = HashMap::new();
+    let mut direct_chain_memo = HashMap::default();
     let mut resolved_by_file = Vec::new();
     for (file_id, relations) in relations_by_file {
         let mut resolved = Vec::with_capacity(relations.len());
@@ -4331,7 +4332,7 @@ fn index_vgui_forwarding_parent_candidates(
             db,
             cache,
             root,
-            &HashMap::new(),
+            &HashMap::default(),
             &call_expr,
             &call.parent,
         );
@@ -4496,7 +4497,7 @@ mod forwarding_parent_candidate_tests {
     fn identical_forwarding_candidates_remain_consistent() {
         let key = (LuaTypeDeclId::global("Container"), "Add".to_string());
         let parent_type_ids = vec![LuaTypeDeclId::global("DTileLayout")];
-        let mut candidates = HashMap::new();
+        let mut candidates = HashMap::default();
 
         record_vgui_forwarding_parent_candidate(
             &mut candidates,
@@ -4516,7 +4517,7 @@ mod forwarding_parent_candidate_tests {
     #[test]
     fn disagreeing_forwarding_candidates_remain_conflicted() {
         let key = (LuaTypeDeclId::global("Container"), "Add".to_string());
-        let mut candidates = HashMap::new();
+        let mut candidates = HashMap::default();
 
         record_vgui_forwarding_parent_candidate(
             &mut candidates,
@@ -4632,7 +4633,7 @@ fn resolve_vgui_direct_parent_chain(
         type_ids,
         direct_parents_by_child,
         memo,
-        &mut HashSet::new(),
+        &mut HashSet::default(),
     )
 }
 
@@ -4853,7 +4854,7 @@ fn index_vgui_field_assignment_parents(
     cache: &mut LuaInferCache,
     root: &LuaSyntaxNode,
 ) -> HashMap<String, Vec<VguiFieldAssignmentParent>> {
-    let mut assignments = HashMap::new();
+    let mut assignments = HashMap::default();
     for assign in root.descendants().filter_map(LuaAssignStat::cast) {
         let (vars, exprs) = assign.get_var_and_expr_list();
         for (target, value) in vars.iter().zip(exprs) {
@@ -5160,7 +5161,7 @@ fn resolve_getmember_network_var_delegations(
 
 /// Build a mapping from class_name to all file ids for known scripted entity classes.
 fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
-    let mut map = HashMap::new();
+    let mut map = HashMap::default();
     let gmod_infer = db.get_gmod_infer_index();
     let vfs = db.get_vfs();
     let all_file_ids = vfs.get_all_file_ids();
@@ -5210,7 +5211,7 @@ fn find_and_resolve_getmember_delegations(
 ) {
     // Collect local variable names assigned from scripted_ents.GetMember calls.
     // Map: local_name -> (target_class_name, target_method_name)
-    let mut getmember_locals: HashMap<String, (String, String)> = HashMap::new();
+    let mut getmember_locals: HashMap<String, (String, String)> = HashMap::default();
 
     for node in chunk.syntax().descendants() {
         // Match: local Name = scripted_ents.GetMember("class", "method")
@@ -5562,7 +5563,7 @@ fn synthesize_vgui_registrations(
     // Tracks local table regions that have already been registered via
     // `vgui.RegisterTable` so that subsequent `vgui.CreateFromTable` calls
     // referencing the same region do not trigger a second class synthesis.
-    let mut registered_table_regions: HashSet<(LuaDeclId, TextSize)> = HashSet::new();
+    let mut registered_table_regions: HashSet<(LuaDeclId, TextSize)> = HashSet::default();
 
     for file_id in file_ids.iter().copied() {
         // Borrow first and skip files with no VGUI-relevant calls before paying
@@ -5772,7 +5773,8 @@ fn synthesize_vgui_registrations(
     // Synthesize AccessorFunc members for VGUI-registered classes. Group by
     // file so each accessor target is resolved once instead of once per
     // registration in that file.
-    let mut registrations_by_file: HashMap<FileId, Vec<&VguiRegistrationRegion>> = HashMap::new();
+    let mut registrations_by_file: HashMap<FileId, Vec<&VguiRegistrationRegion>> =
+        HashMap::default();
     for registration in &vgui_registration_regions {
         registrations_by_file
             .entry(registration.file_id)
@@ -8058,7 +8060,7 @@ fn synthesize_panel_class_with_id(
             let member_source_ranges =
                 collect_panel_member_source_ranges(cache, db, file_id, decl_id, &table_range);
 
-            let mut table_member_ids = HashSet::new();
+            let mut table_member_ids = HashSet::default();
             for (source_idx, source_range) in member_source_ranges.iter().enumerate() {
                 let is_initializer_fallback = source_idx > 0;
                 let source_owner = LuaMemberOwner::Element(source_range.clone());
@@ -9632,9 +9634,9 @@ impl<'a> AnnotatedGmodCallRoleMap<'a> {
     ) -> Self {
         let mut role_map = Self {
             global_roles,
-            local_roles_by_decl: HashMap::new(),
-            local_roles_by_path: HashMap::new(),
-            local_candidate_names: HashSet::new(),
+            local_roles_by_decl: HashMap::default(),
+            local_roles_by_path: HashMap::default(),
+            local_candidate_names: HashSet::default(),
         };
 
         for func_stat in root.descendants::<LuaFuncStat>() {
@@ -11709,7 +11711,7 @@ fn collect_compilefile_execution_environment_flow(
                 &roles,
                 value,
                 reassigned_decls,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) {
                 add_compilefile_flow(&mut flow, destination, source);
             }
@@ -11740,7 +11742,7 @@ fn collect_compilefile_execution_environment_flow(
                 &roles,
                 target_expr,
                 reassigned_decls,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -11749,7 +11751,7 @@ fn collect_compilefile_execution_environment_flow(
                 file_id,
                 environment_expr,
                 reassigned_decls,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) else {
                 continue;
             };
@@ -11781,7 +11783,7 @@ fn collect_compilefile_execution_environment_flow(
                 &roles,
                 arg,
                 reassigned_decls,
-                &mut HashSet::new(),
+                &mut HashSet::default(),
             ) {
                 add_compilefile_flow(&mut flow, *param, source);
             }
@@ -11796,7 +11798,7 @@ fn rebuild_compilefile_execution_environments(
     updated_source_files: usize,
     roles_changed: bool,
 ) {
-    let mut environments = HashMap::<FileId, HashMap<FileId, HashSet<String>>>::new();
+    let mut environments = HashMap::<FileId, HashMap<FileId, HashSet<String>>>::default();
     let mut cached_source_files = 0usize;
     let mut edge_count = 0usize;
     let mut seed_count = 0usize;
@@ -11810,7 +11812,7 @@ fn rebuild_compilefile_execution_environments(
         seed_count += flow.seeds.len();
         site_count += flow.sites.len();
 
-        let mut targets = HashMap::<LuaDeclId, CompilefileTargetState>::new();
+        let mut targets = HashMap::<LuaDeclId, CompilefileTargetState>::default();
         let mut queue = VecDeque::new();
         for (decl_id, path) in &flow.seeds {
             let Some(target) = resolve_compilefile_target(db, source_file_id, path) else {
@@ -12155,7 +12157,7 @@ fn rebuild_gmod_load_index(
         .iter()
         .map(|file_id| (*file_id, GmodFileLoadInfo::fallback_shared()))
         .collect::<HashMap<_, _>>();
-    let mut fallback_masks = HashMap::new();
+    let mut fallback_masks = HashMap::default();
 
     for file_id in &file_ids {
         if let Some(realm) = infer_realm_from_load_path_hint(db, *file_id) {
@@ -12234,7 +12236,7 @@ fn mark_main_workspace_load_shadows(
     file_ids: &[FileId],
 ) {
     let module_index = db.get_module_index();
-    let mut files_by_load_identity: HashMap<String, Vec<FileId>> = HashMap::new();
+    let mut files_by_load_identity: HashMap<String, Vec<FileId>> = HashMap::default();
 
     for file_id in file_ids {
         let Some(info) = file_infos.get(file_id) else {
@@ -12517,7 +12519,7 @@ fn collect_dynamic_loaders(
     file_ids: &[FileId],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) -> Vec<DynamicLoadPattern> {
-    let mut relative_paths_by_parent: HashMap<String, Vec<(FileId, String)>> = HashMap::new();
+    let mut relative_paths_by_parent: HashMap<String, Vec<(FileId, String)>> = HashMap::default();
     for file_id in file_ids {
         let Some(path) = gmod_relative_path(db, *file_id) else {
             continue;
@@ -12703,7 +12705,7 @@ fn collect_dynamic_load_usages(
             result_kind,
             collect_dynamic_load_usage_in_block(
                 &block,
-                HashSet::from([file_name_var]),
+                HashSet::from_iter([file_name_var]),
                 db,
                 file_id,
                 &wrappers,
@@ -12840,7 +12842,7 @@ fn collect_dynamic_wrapper_call_usage(
 }
 
 fn collect_dynamic_load_wrappers(root: &LuaChunk) -> HashMap<String, DynamicLoadWrapper> {
-    let mut wrappers = HashMap::new();
+    let mut wrappers = HashMap::default();
 
     for local_func_stat in root.descendants::<LuaLocalFuncStat>() {
         let Some(name) = local_func_stat
@@ -12900,10 +12902,10 @@ fn collect_top_level_dynamic_load_call_aliases(
     annotated_roles: &AnnotatedGmodCallRoleMap,
 ) -> HashMap<String, DynamicLoadAlias> {
     let Some(block) = root.get_block() else {
-        return HashMap::new();
+        return HashMap::default();
     };
 
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     let mut changed = true;
     while changed {
         changed = false;
@@ -12942,7 +12944,7 @@ fn collect_dynamic_load_call_aliases(
     block: &LuaBlock,
     annotated_roles: &AnnotatedGmodCallRoleMap,
 ) -> HashMap<String, DynamicLoadAlias> {
-    let mut aliases = HashMap::new();
+    let mut aliases = HashMap::default();
     let mut changed = true;
     while changed {
         changed = false;
@@ -13611,7 +13613,7 @@ fn expr_references_name(expr: &LuaExpr, expected_name: &str) -> bool {
 }
 
 fn collect_static_string_bindings(root: &LuaChunk) -> HashMap<String, String> {
-    let mut bindings = HashMap::new();
+    let mut bindings = HashMap::default();
     for node in root.syntax().descendants() {
         if let Some(local_stat) = LuaLocalStat::cast(node.clone()) {
             let names = local_stat.get_local_name_list().collect::<Vec<_>>();

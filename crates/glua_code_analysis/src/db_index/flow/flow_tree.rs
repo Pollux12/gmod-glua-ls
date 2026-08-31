@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaSyntaxId};
 use internment::ArcIntern;
@@ -119,11 +119,11 @@ mod tests {
         infos: Vec<AssignmentFlowInfo>,
     ) -> FlowTree {
         FlowTree::new(
-            HashMap::new(),
+            HashMap::default(),
             nodes,
             branches,
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
             infos,
             FileNarrowingCapability::default(),
         )
@@ -480,7 +480,7 @@ impl FlowTree {
     ) -> std::sync::Arc<[LuaDefinitionId]> {
         let mut definitions = Vec::new();
         let mut pending = vec![flow_id];
-        let mut visited = HashSet::new();
+        let mut visited = HashSet::default();
 
         while let Some(current) = pending.pop() {
             if !visited.insert(current) {

@@ -11,14 +11,14 @@
 //! armed flag is a plain `Cell<bool>` so a call outside the settled tail (the
 //! walk asks for type caches constantly) pays one thread-local bool read.
 
+use rustc_hash::FxHashSet;
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
 
 use super::type_owner::LuaTypeOwner;
 
 thread_local! {
     static ARMED: Cell<bool> = const { Cell::new(false) };
-    static READS: RefCell<HashSet<LuaTypeOwner>> = RefCell::new(HashSet::new());
+    static READS: RefCell<FxHashSet<LuaTypeOwner>> = RefCell::new(FxHashSet::default());
 }
 
 /// Starts collecting on this thread, discarding anything left over.
@@ -28,7 +28,7 @@ pub(crate) fn arm() {
 }
 
 /// Stops collecting and hands back what was read since [`arm`].
-pub(crate) fn disarm() -> HashSet<LuaTypeOwner> {
+pub(crate) fn disarm() -> FxHashSet<LuaTypeOwner> {
     ARMED.with(|armed| armed.set(false));
     READS.with(|reads| std::mem::take(&mut *reads.borrow_mut()))
 }

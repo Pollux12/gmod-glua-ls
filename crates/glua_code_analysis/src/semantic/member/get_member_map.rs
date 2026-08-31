@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::{DbIndex, FileId, LuaMemberKey, LuaType, WorkspaceId};
 
@@ -10,7 +10,7 @@ use super::{
 pub fn get_member_map(
     db: &DbIndex,
     prefix_type: &LuaType,
-) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
     let members = find_members::find_members(db, prefix_type)?;
     build_member_map(members)
 }
@@ -20,7 +20,7 @@ pub fn get_member_map_in_workspace_for_file(
     prefix_type: &LuaType,
     workspace_id: WorkspaceId,
     file_id: FileId,
-) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
     let members =
         find_members::find_members_in_workspace_for_file(db, prefix_type, workspace_id, file_id)?;
     build_member_map(members)
@@ -32,7 +32,7 @@ pub fn get_member_map_in_workspace_for_file_at_offset(
     workspace_id: WorkspaceId,
     file_id: FileId,
     caller_position: rowan::TextSize,
-) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
     let members = find_members::find_members_in_workspace_for_file_at_offset(
         db,
         prefix_type,
@@ -45,8 +45,8 @@ pub fn get_member_map_in_workspace_for_file_at_offset(
 
 fn build_member_map(
     members: Vec<LuaMemberInfo>,
-) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
-    let mut member_map = HashMap::new();
+) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    let mut member_map = FxHashMap::default();
     for member in members {
         let key = member.key.clone();
         let typ = &member.typ;

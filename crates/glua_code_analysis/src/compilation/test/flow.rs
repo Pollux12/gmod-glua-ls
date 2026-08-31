@@ -3257,7 +3257,7 @@ _2 = a[1]
                 .compilation
                 .get_db()
                 .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]]))
+                .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[2]]))
                 .contains(&file_id)
         );
     }
@@ -3932,16 +3932,19 @@ _2 = a[1]
 
             let signature_index = ws.analysis.compilation.get_db().get_signature_index();
             assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[1]])),
-                HashSet::from([file_ids[2]])
+                signature_index
+                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[1]])),
+                HashSet::from_iter([file_ids[2]])
             );
             assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[2]])),
-                HashSet::from([file_ids[3]])
+                signature_index
+                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[2]])),
+                HashSet::from_iter([file_ids[3]])
             );
             assert_eq!(
-                signature_index.inferred_guard_consumers_for_files(&HashSet::from([file_ids[3]])),
-                HashSet::from([file_ids[4]])
+                signature_index
+                    .inferred_guard_consumers_for_files(&HashSet::from_iter([file_ids[3]])),
+                HashSet::from_iter([file_ids[4]])
             );
 
             ws.analysis
@@ -3954,7 +3957,7 @@ _2 = a[1]
                     .iter()
                     .map(|file_id| {
                         signature_index
-                            .inferred_guard_facts_for_files(&HashSet::from([*file_id]))
+                            .inferred_guard_facts_for_files(&HashSet::from_iter([*file_id]))
                             .into_values()
                             .next()
                             .expect("wrapper inferred guard")
@@ -4446,7 +4449,7 @@ _2 = a[1]
                 .compilation
                 .get_db()
                 .get_signature_index()
-                .inferred_guard_consumers_for_files(&HashSet::from([new_file_id]))
+                .inferred_guard_consumers_for_files(&HashSet::from_iter([new_file_id]))
                 .contains(&consumer_file_id)
         );
     }

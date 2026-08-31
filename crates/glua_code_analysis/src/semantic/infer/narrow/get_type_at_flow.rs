@@ -4057,7 +4057,7 @@ mod tests {
         let root = parser.get_chunk_node();
         let db = DbIndex::new();
         let flow_tree = FlowTree::new(
-            HashMap::new(),
+            HashMap::default(),
             vec![
                 FlowNode {
                     id: FlowId(0),
@@ -4076,8 +4076,8 @@ mod tests {
                 },
             ],
             vec![vec![FlowId(0), FlowId(1)]],
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
             vec![AssignmentFlowInfo::default(); 3],
             FileNarrowingCapability::default(),
         );
@@ -4158,7 +4158,7 @@ mod tests {
             .expect("condition name expression");
         let db = DbIndex::new();
         let flow_tree = FlowTree::new(
-            HashMap::new(),
+            HashMap::default(),
             vec![
                 FlowNode {
                     id: FlowId(0),
@@ -4172,8 +4172,8 @@ mod tests {
                 },
             ],
             Vec::new(),
-            HashMap::new(),
-            HashMap::new(),
+            HashMap::default(),
+            HashMap::default(),
             vec![AssignmentFlowInfo::default(); 2],
             FileNarrowingCapability::default(),
         );

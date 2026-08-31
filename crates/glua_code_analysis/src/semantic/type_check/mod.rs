@@ -10,7 +10,8 @@ mod type_check_context;
 mod type_check_fail_reason;
 mod type_check_guard;
 
-use std::{collections::HashMap, ops::Deref};
+use rustc_hash::FxHashMap as HashMap;
+use std::ops::Deref;
 
 use complex_type::check_complex_type_compact;
 use func_type::{check_doc_func_type_compact, check_sig_type_compact};

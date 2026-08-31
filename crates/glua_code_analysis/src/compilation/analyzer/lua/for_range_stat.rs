@@ -1,5 +1,5 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, FileId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
@@ -339,7 +339,7 @@ fn try_infer_pairs_iter_types_from_table_members(
 
 fn infer_table_projection_key_type(db: &DbIndex, inner: &LuaType) -> LuaType {
     let mut pending = vec![inner.clone()];
-    let mut visited_types = HashSet::new();
+    let mut visited_types = HashSet::default();
     let mut key_type = None;
 
     while let Some(typ) = pending.pop() {
@@ -451,12 +451,12 @@ fn try_compact_record_values(db: &DbIndex, values: &[LuaType]) -> Option<LuaType
         return None;
     }
 
-    let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::new();
+    let mut fields: HashMap<LuaMemberKey, (LuaType, usize)> = HashMap::default();
     for value in values {
         let Some(member_map) = get_member_map(db, value) else {
             continue;
         };
-        let mut present_keys = HashSet::new();
+        let mut present_keys = HashSet::default();
         for (key, member_infos) in member_map.iter() {
             if matches!(key, LuaMemberKey::None) || member_infos.is_empty() {
                 continue;

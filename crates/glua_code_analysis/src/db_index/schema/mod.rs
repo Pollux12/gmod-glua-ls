@@ -1,6 +1,6 @@
 mod schema_file;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use url::Url;
 
@@ -9,13 +9,13 @@ pub use schema_file::*;
 
 #[derive(Debug)]
 pub struct JsonSchemaIndex {
-    schema_files: HashMap<Url, JsonSchemaFile>,
+    schema_files: FxHashMap<Url, JsonSchemaFile>,
 }
 
 impl JsonSchemaIndex {
     pub fn new() -> Self {
         Self {
-            schema_files: HashMap::new(),
+            schema_files: FxHashMap::default(),
         }
     }
 

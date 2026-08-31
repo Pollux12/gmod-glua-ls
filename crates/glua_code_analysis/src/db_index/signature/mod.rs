@@ -3,8 +3,8 @@ mod gmod_domains;
 #[allow(clippy::module_inception)]
 mod signature;
 
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
-use std::collections::{HashMap, HashSet};
 
 pub use async_state::AsyncState;
 pub use gmod_domains::{
@@ -118,19 +118,19 @@ impl Default for LuaSignatureIndex {
 impl LuaSignatureIndex {
     pub fn new() -> Self {
         Self {
-            signatures: HashMap::new(),
-            in_file_signatures: HashMap::new(),
-            local_func_decls: HashMap::new(),
-            effective_valid_guard_signatures: HashMap::new(),
-            inferred_positive_guards: HashMap::new(),
-            inferred_guard_owners: HashMap::new(),
-            inferred_guard_facts: HashMap::new(),
-            inferred_guard_owners_by_file: HashMap::new(),
-            inferred_guard_consumers: HashMap::new(),
-            inferred_guard_dependencies: HashMap::new(),
+            signatures: HashMap::default(),
+            in_file_signatures: HashMap::default(),
+            local_func_decls: HashMap::default(),
+            effective_valid_guard_signatures: HashMap::default(),
+            inferred_positive_guards: HashMap::default(),
+            inferred_guard_owners: HashMap::default(),
+            inferred_guard_facts: HashMap::default(),
+            inferred_guard_owners_by_file: HashMap::default(),
+            inferred_guard_consumers: HashMap::default(),
+            inferred_guard_dependencies: HashMap::default(),
             inferred_positive_guards_changed: false,
-            receiver_out_param_member_names: HashMap::new(),
-            in_file_receiver_out_param_member_names: HashMap::new(),
+            receiver_out_param_member_names: HashMap::default(),
+            in_file_receiver_out_param_member_names: HashMap::default(),
         }
     }
 
@@ -474,7 +474,8 @@ mod tests {
             .entry(source_file_id)
             .or_default()
             .insert(owner.clone());
-        index.set_inferred_guard_dependencies(consumer_file_id, HashSet::from([owner.clone()]));
+        index
+            .set_inferred_guard_dependencies(consumer_file_id, HashSet::from_iter([owner.clone()]));
 
         index.remove(consumer_file_id);
 
@@ -482,7 +483,7 @@ mod tests {
         assert!(index.inferred_guard_consumers.is_empty());
         assert!(
             index
-                .inferred_guard_consumers_for_files(&HashSet::from([source_file_id]))
+                .inferred_guard_consumers_for_files(&HashSet::from_iter([source_file_id]))
                 .is_empty()
         );
     }
@@ -505,7 +506,7 @@ mod tests {
                 narrowed_type: LuaType::String,
             },
         );
-        index.set_inferred_guard_dependencies(consumer_file_id, HashSet::from([owner]));
+        index.set_inferred_guard_dependencies(consumer_file_id, HashSet::from_iter([owner]));
 
         index.remove(source_file_id);
 

@@ -1,4 +1,5 @@
-use std::collections::{HashMap, hash_map::Entry};
+use rustc_hash::FxHashMap as HashMap;
+use std::collections::hash_map::Entry;
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaTupleType, LuaType, RenderLevel,
@@ -213,7 +214,7 @@ fn collect_type_members(
 
     // Build a merged view of class members (including supertypes). When the same key appears
     // multiple times (override), keep the first one (subclass wins).
-    let mut map: HashMap<LuaMemberKey, LuaType> = HashMap::new();
+    let mut map: HashMap<LuaMemberKey, LuaType> = HashMap::default();
     let mut index_keys: Vec<LuaMemberKey> = Vec::new();
     if collect_index_keys {
         index_keys.reserve(type_members.len());

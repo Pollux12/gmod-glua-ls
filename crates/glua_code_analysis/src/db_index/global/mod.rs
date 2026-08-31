@@ -1,6 +1,7 @@
 mod global_id;
 
-use std::collections::{BTreeMap, HashMap};
+use rustc_hash::FxHashMap;
+use std::collections::BTreeMap;
 
 pub use global_id::GlobalId;
 
@@ -10,7 +11,7 @@ use super::{LuaDeclId, LuaIndex, LuaModuleIndex, WorkspaceId};
 
 #[derive(Debug)]
 pub struct LuaGlobalIndex {
-    global_decl: HashMap<GlobalId, Vec<LuaDeclId>>,
+    global_decl: FxHashMap<GlobalId, Vec<LuaDeclId>>,
 }
 
 /// Canonical order for a global's declarations: source position, with the file
@@ -29,7 +30,7 @@ impl Default for LuaGlobalIndex {
 impl LuaGlobalIndex {
     pub fn new() -> Self {
         Self {
-            global_decl: HashMap::new(),
+            global_decl: FxHashMap::default(),
         }
     }
 
@@ -46,7 +47,7 @@ impl LuaGlobalIndex {
     }
 
     pub fn get_all_global_decl_ids(&self) -> Vec<LuaDeclId> {
-        // `global_decl` is a `HashMap`, so its iteration order is not stable
+        // `global_decl` is a `FxHashMap`, so its iteration order is not stable
         // across index states; sort so callers see the same sequence whatever
         // order the globals were discovered in.
         let mut decls = self
@@ -144,7 +145,7 @@ impl LuaIndex for LuaGlobalIndex {
         let removed_file_ids = file_ids
             .iter()
             .copied()
-            .collect::<std::collections::HashSet<_>>();
+            .collect::<rustc_hash::FxHashSet<_>>();
         self.global_decl.retain(|_, decl_ids| {
             decl_ids.retain(|decl_id| !removed_file_ids.contains(&decl_id.file_id));
             !decl_ids.is_empty()

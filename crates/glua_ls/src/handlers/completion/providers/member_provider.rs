@@ -8,8 +8,8 @@ use glua_parser::{
     LuaFuncStat, LuaIndexExpr, LuaLocalFuncStat, LuaNameExpr, LuaStringToken, PathTrait,
 };
 use rowan::TextSize;
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use smol_str::SmolStr;
-use std::collections::{HashMap, HashSet};
 
 use crate::handlers::completion::{
     add_completions::{CompletionTriggerStatus, add_member_completion_with_description_hint},
@@ -197,7 +197,7 @@ fn dedupe_member_infos(
     let db = builder.semantic_model.get_db();
     for infos in members.values_mut() {
         resolve_slot_writes(db, infos);
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         infos.retain(|info| seen.insert(MemberInfoIdentity::from(info)));
     }
 }
@@ -280,7 +280,7 @@ impl From<&LuaMemberInfo> for MemberInfoIdentity {
 fn collect_member_identities(
     members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) -> MemberIdentityMap {
-    let mut existing: MemberIdentityMap = HashMap::new();
+    let mut existing: MemberIdentityMap = HashMap::default();
     for (key, infos) in members {
         let entry = existing.entry(key.clone()).or_default();
         entry.extend(infos.iter().map(MemberInfoIdentity::from));
@@ -677,7 +677,7 @@ impl RealmFilter {
         Self {
             enabled,
             call_mask,
-            walked: HashMap::new(),
+            walked: HashMap::default(),
         }
     }
 
@@ -828,7 +828,7 @@ mod tests {
     #[gtest]
     fn push_unique_member_info_keeps_distinct_overload_indices() -> Result<()> {
         let key = LuaMemberKey::Name("lookup".into());
-        let mut members = HashMap::new();
+        let mut members = HashMap::default();
         let mut existing = collect_member_identities(&members);
 
         push_unique_member_info(

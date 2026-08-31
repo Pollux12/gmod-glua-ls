@@ -1,7 +1,7 @@
 use crate::{DiagnosticCode, SemanticModel};
 use glua_parser::{LuaAstNode, LuaAstToken, LuaDocTagOther, LuaTokenKind};
+use rustc_hash::FxHashSet;
 use serde_json::Value;
-use std::collections::HashSet;
 
 use super::{Checker, DiagnosticContext};
 
@@ -14,7 +14,7 @@ impl Checker for UnknownDocTag {
     ];
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
-        let known_tags: HashSet<_> = semantic_model
+        let known_tags: FxHashSet<_> = semantic_model
             .get_emmyrc()
             .doc
             .known_tags
@@ -38,7 +38,7 @@ impl Checker for UnknownDocTag {
 fn check_tag(
     context: &mut DiagnosticContext,
     tag_other: &LuaDocTagOther,
-    known_tags: &HashSet<&str>,
+    known_tags: &FxHashSet<&str>,
 ) -> Option<()> {
     if let Some(token) = tag_other.token_by_kind(LuaTokenKind::TkTagOther)
         && !known_tags.contains(token.get_text())

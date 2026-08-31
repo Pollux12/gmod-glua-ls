@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaChunk, LuaExpr, LuaIndexExpr, LuaIndexMemberExpr};
 
@@ -274,7 +274,7 @@ fn collect_field_exist_narrow_candidates(
     // open bases must not fan out into every scripted subclass.
     let reverse_owners = collect_reverse_member_owner_types(db, member_key);
     let mut candidates = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
 
     for owner in reverse_owners {
         if !owner_fits_antecedent(db, &owner, &antecedent_arms) {
@@ -345,7 +345,7 @@ fn collect_field_exist_narrow_candidates(
 
 fn collect_antecedent_nominal_arms(left_type: &LuaType) -> Vec<LuaType> {
     let mut arms = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     collect_antecedent_nominal_arms_into(left_type, &mut arms, &mut seen);
     arms
 }
@@ -353,7 +353,7 @@ fn collect_antecedent_nominal_arms(left_type: &LuaType) -> Vec<LuaType> {
 fn collect_antecedent_nominal_arms_into(
     left_type: &LuaType,
     arms: &mut Vec<LuaType>,
-    seen: &mut HashSet<LuaType>,
+    seen: &mut FxHashSet<LuaType>,
 ) {
     match left_type {
         LuaType::Union(union_type) => {
@@ -375,7 +375,7 @@ fn collect_antecedent_nominal_arms_into(
 
 fn collect_reverse_member_owner_types(db: &DbIndex, member_key: &LuaMemberKey) -> Vec<LuaType> {
     let mut owners = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for member in db
         .get_member_index()
         .get_current_members_for_key(member_key)
@@ -482,7 +482,7 @@ fn expand_surviving_subtypes_for_falsy_overrides(
     }
 
     let mut expanded = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for candidate in &candidates {
         if falsy_override_parents.iter().any(|p| p == candidate) {
             continue;

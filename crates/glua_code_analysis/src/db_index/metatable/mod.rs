@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 
 use rowan::{TextRange, TextSize};
@@ -61,9 +61,9 @@ impl Default for LuaMetatableIndex {
 impl LuaMetatableIndex {
     pub fn new() -> Self {
         Self {
-            metatables: HashMap::new(),
-            by_writer: HashMap::new(),
-            factory_bindings: HashMap::new(),
+            metatables: HashMap::default(),
+            by_writer: HashMap::default(),
+            factory_bindings: HashMap::default(),
         }
     }
 
@@ -133,9 +133,9 @@ impl LuaMetatableIndex {
     /// file other than the one that wrote the call, so both sides are mapped.
     /// Returns the files whose binding named a literal the edit destroyed.
     pub fn remap_file_ranges(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let mut dirty = HashSet::new();
+        let mut dirty = HashSet::default();
         let mut rebuilt: HashMap<InFiled<TextRange>, Vec<MetatableBinding>> =
-            HashMap::with_capacity(self.metatables.len());
+            HashMap::with_capacity_and_hasher(self.metatables.len(), Default::default());
         for (table, bindings) in std::mem::take(&mut self.metatables) {
             let new_table = map_range(remap, &table);
             for binding in bindings {

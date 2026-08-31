@@ -14,7 +14,7 @@ pub(crate) use loader::normalize_path_for_ordering;
 pub use loader::{LuaFileInfo, load_workspace_files, read_file_with_encoding};
 use lsp_types::Uri;
 use rowan::NodeCache;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 pub use virtual_url::VirtualUrlGenerator;
@@ -23,12 +23,12 @@ use crate::Emmyrc;
 
 #[derive(Debug)]
 pub struct Vfs {
-    file_id_map: HashMap<PathBuf, u32>,
-    file_path_map: HashMap<u32, PathBuf>,
-    remote_file_id_map: HashMap<Uri, FileId>,
+    file_id_map: FxHashMap<PathBuf, u32>,
+    file_path_map: FxHashMap<u32, PathBuf>,
+    remote_file_id_map: FxHashMap<Uri, FileId>,
     file_data: Vec<Option<FileContent>>,
-    line_index_map: HashMap<FileId, LineIndex>,
-    tree_map: HashMap<FileId, LuaSyntaxTree>,
+    line_index_map: FxHashMap<FileId, LineIndex>,
+    tree_map: FxHashMap<FileId, LuaSyntaxTree>,
     emmyrc: Option<Arc<Emmyrc>>,
     node_cache: NodeCache,
     /// Monotonic counter bumped whenever file *content* (or existence) changes.
@@ -96,12 +96,12 @@ impl Default for Vfs {
 impl Vfs {
     pub fn new() -> Self {
         Vfs {
-            file_id_map: HashMap::new(),
-            file_path_map: HashMap::new(),
-            remote_file_id_map: HashMap::new(),
+            file_id_map: FxHashMap::default(),
+            file_path_map: FxHashMap::default(),
+            remote_file_id_map: FxHashMap::default(),
             file_data: Vec::new(),
-            line_index_map: HashMap::new(),
-            tree_map: HashMap::new(),
+            line_index_map: FxHashMap::default(),
+            tree_map: FxHashMap::default(),
             emmyrc: None,
             node_cache: NodeCache::default(),
             content_revision: 0,

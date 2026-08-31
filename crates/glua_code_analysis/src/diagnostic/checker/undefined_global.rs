@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaBlock, LuaCallExpr,
@@ -24,7 +24,7 @@ impl Checker for UndefinedGlobalChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let mut use_range_set = HashSet::new();
+        let mut use_range_set = HashSet::default();
         let guarded_range_set = calc_guarded_name_expr_ranges(semantic_model);
         // Positions where an undefined-global read is "silent" (the read itself
         // can't crash; the resulting nil just propagates). We demote these from
@@ -49,7 +49,7 @@ impl Checker for UndefinedGlobalChecker {
 }
 
 fn calc_guarded_name_expr_ranges(semantic_model: &SemanticModel) -> HashSet<TextRange> {
-    let mut guarded_ranges = HashSet::new();
+    let mut guarded_ranges = HashSet::default();
     let root = semantic_model.get_root();
 
     for if_stat in root.descendants::<LuaIfStat>() {
@@ -104,8 +104,8 @@ fn calc_continuation_guarded_name_expr_ranges(
     semantic_model: &SemanticModel,
     root: &glua_parser::LuaChunk,
 ) -> HashSet<TextRange> {
-    let mut guarded_ranges = HashSet::new();
-    let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::new();
+    let mut guarded_ranges = HashSet::default();
+    let mut guard_rules_by_name = HashMap::<String, Vec<ContinuationGuardRule>>::default();
 
     for block in root.descendants::<LuaBlock>() {
         let block_range = block.get_range();
@@ -187,7 +187,7 @@ fn collect_short_circuit_guarded_name_expr_ranges(
         return;
     };
 
-    let mut lhs_guard_ranges = HashSet::new();
+    let mut lhs_guard_ranges = HashSet::default();
     let lhs_guarded_names =
         collect_truthy_guarded_names(semantic_model, &left_expr, &mut lhs_guard_ranges);
     guarded_ranges.extend(lhs_guard_ranges);
@@ -251,7 +251,7 @@ fn extract_continuation_guarded_names(
     semantic_model: &SemanticModel,
     expr: &LuaExpr,
 ) -> HashSet<String> {
-    let mut names = HashSet::new();
+    let mut names = HashSet::default();
 
     match expr {
         LuaExpr::ParenExpr(paren_expr) => {
@@ -267,11 +267,11 @@ fn extract_continuation_guarded_names(
                 .get_op_token()
                 .is_some_and(|op| op.get_op() == UnaryOperator::OpNot);
             if !is_not {
-                return HashSet::new();
+                return HashSet::default();
             }
 
             if let Some(inner_expr) = unary_expr.get_expr() {
-                let mut condition_guard_ranges = HashSet::new();
+                let mut condition_guard_ranges = HashSet::default();
                 names.extend(collect_truthy_guarded_names(
                     semantic_model,
                     &inner_expr,
@@ -284,7 +284,7 @@ fn extract_continuation_guarded_names(
                 .get_op_token()
                 .is_some_and(|op| op.get_op() == BinaryOperator::OpEq);
             if !is_eq {
-                return HashSet::new();
+                return HashSet::default();
             }
 
             let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
@@ -308,7 +308,7 @@ fn collect_clause_guarded_name_ranges(
     block: &glua_parser::LuaBlock,
     guarded_ranges: &mut HashSet<TextRange>,
 ) {
-    let mut condition_guard_ranges = HashSet::new();
+    let mut condition_guard_ranges = HashSet::default();
     let truthy_names =
         collect_truthy_guarded_names(semantic_model, condition, &mut condition_guard_ranges);
     guarded_ranges.extend(condition_guard_ranges);
@@ -335,7 +335,7 @@ fn collect_truthy_guarded_names(
 ) -> HashSet<String> {
     match expr {
         LuaExpr::NameExpr(name_expr) => {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(name_text) = name_expr.get_name_text() {
                 condition_guard_ranges.insert(name_expr.get_range());
                 names.insert(name_text.to_string());
@@ -350,7 +350,7 @@ fn collect_truthy_guarded_names(
             .unwrap_or_default(),
         LuaExpr::UnaryExpr(unary_expr) => {
             let Some(inner_expr) = unary_expr.get_expr() else {
-                return HashSet::new();
+                return HashSet::default();
             };
 
             let is_not = unary_expr
@@ -368,7 +368,7 @@ fn collect_truthy_guarded_names(
         }
         LuaExpr::BinaryExpr(binary_expr) => {
             let Some((left_expr, right_expr)) = binary_expr.get_exprs() else {
-                return HashSet::new();
+                return HashSet::default();
             };
 
             let op = binary_expr
@@ -401,10 +401,10 @@ fn collect_truthy_guarded_names(
                         &right_expr,
                         condition_guard_ranges,
                     );
-                    HashSet::new()
+                    HashSet::default()
                 }
                 BinaryOperator::OpNe => {
-                    let mut names = HashSet::new();
+                    let mut names = HashSet::default();
                     if let Some(name_expr) = name_compared_with_nil(&left_expr, &right_expr)
                         && let Some(name_text) = name_expr.get_name_text()
                     {
@@ -417,7 +417,7 @@ fn collect_truthy_guarded_names(
                     if let Some(name_expr) = name_compared_with_nil(&left_expr, &right_expr) {
                         condition_guard_ranges.insert(name_expr.get_range());
                     }
-                    HashSet::new()
+                    HashSet::default()
                 }
                 // Comparison / arithmetic / bitwise operators do not produce
                 // truthy names (e.g. `x.y < 4` doesn't make `x.y` a truthy
@@ -436,12 +436,12 @@ fn collect_truthy_guarded_names(
                         &right_expr,
                         condition_guard_ranges,
                     );
-                    HashSet::new()
+                    HashSet::default()
                 }
             }
         }
         LuaExpr::CallExpr(call_expr) => {
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(guarded_target) = guarded_call_target_name(semantic_model, call_expr)
                 && let Some(name_text) = guarded_target.name()
             {
@@ -457,7 +457,7 @@ fn collect_truthy_guarded_names(
             // If we're checking `if ctp.Disable then`, it implies `ctp` exists.
             // For nested chains like `foo.bar.baz`, recurse into the prefix so
             // the deepest base name (`foo`) is still registered as guarded.
-            let mut names = HashSet::new();
+            let mut names = HashSet::default();
             if let Some(prefix_expr) = index_expr.get_prefix_expr() {
                 if let Some(name_expr) = unwrap_paren_to_name_expr(&prefix_expr)
                     && let Some(name_text) = name_expr.get_name_text()
@@ -474,7 +474,7 @@ fn collect_truthy_guarded_names(
             }
             names
         }
-        _ => HashSet::new(),
+        _ => HashSet::default(),
     }
 }
 
@@ -604,7 +604,7 @@ fn collect_truthy_guarded_names_with_not_chain(
         match &current_expr {
             LuaExpr::ParenExpr(paren_expr) => {
                 let Some(inner_expr) = paren_expr.get_expr() else {
-                    return HashSet::new();
+                    return HashSet::default();
                 };
                 current_expr = inner_expr;
             }
@@ -618,7 +618,7 @@ fn collect_truthy_guarded_names_with_not_chain(
 
                 not_count += 1;
                 let Some(inner_expr) = unary_expr.get_expr() else {
-                    return HashSet::new();
+                    return HashSet::default();
                 };
                 current_expr = inner_expr;
             }
@@ -630,7 +630,7 @@ fn collect_truthy_guarded_names_with_not_chain(
     if not_count.is_multiple_of(2) {
         names
     } else {
-        HashSet::new()
+        HashSet::default()
     }
 }
 
@@ -851,7 +851,7 @@ fn collect_silent_assignment_rhs_names(expr: &LuaExpr, ranges: &mut HashSet<Text
 }
 
 fn calc_silent_use_name_expr_ranges(root: &glua_parser::LuaChunk) -> HashSet<TextRange> {
-    let mut ranges = HashSet::new();
+    let mut ranges = HashSet::default();
 
     // Direct call arguments: `f(UNDEF)` and `f((UNDEF))`.
     for call_expr in root.descendants::<LuaCallExpr>() {

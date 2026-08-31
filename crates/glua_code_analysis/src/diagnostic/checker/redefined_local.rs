@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, DiagnosticCode, GmodClassCallArgSource, GmodClassCallLiteral,
@@ -29,8 +29,8 @@ impl Checker for RedefinedLocalChecker {
         let Some(root_scope) = decl_tree.get_root_scope() else {
             return;
         };
-        let mut diagnostics = HashSet::new();
-        let mut visible_locals = HashMap::new();
+        let mut diagnostics = HashSet::default();
+        let mut visible_locals = HashMap::default();
         let mut changes = Vec::new();
         let gmod_enabled = semantic_model.get_emmyrc().gmod.enabled;
         let syntax_registrations =

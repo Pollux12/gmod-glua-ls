@@ -157,7 +157,7 @@ pub struct LuaInferCache {
     /// the call targets through the reference, property, member and signature
     /// indexes.
     pub call_returns_never_cache: FxHashMap<LuaSyntaxId, bool>,
-    inferred_guard_dependencies: HashSet<LuaInferredGuardOwner>,
+    inferred_guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
 }
 
 impl LuaInferCache {
@@ -177,7 +177,7 @@ impl LuaInferCache {
             param_type_cache: FxHashMap::default(),
             param_type_source_cache: FxHashMap::default(),
             expr_var_ref_id_cache: FxHashMap::default(),
-            narrow_by_literal_stop_position_cache: HashSet::new(),
+            narrow_by_literal_stop_position_cache: HashSet::default(),
             scripted_global_singleton_type_cache: None,
             pending_str_tpl_type_decls: Vec::new(),
             self_type_cache: FxHashMap::default(),
@@ -191,12 +191,12 @@ impl LuaInferCache {
             dynamic_field_resolution_cache: FxHashMap::default(),
             local_class_table_member_ids_cache: FxHashMap::default(),
             dynamic_field_type_cache: FxHashMap::default(),
-            dynamic_field_resolving: HashSet::new(),
+            dynamic_field_resolving: HashSet::default(),
             vgui_parent_fallback_calls: FxHashSet::default(),
             vgui_parent_chain_calls: FxHashSet::default(),
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
-            inferred_guard_dependencies: HashSet::new(),
+            inferred_guard_dependencies: FxHashSet::default(),
         }
     }
 
@@ -246,7 +246,7 @@ impl LuaInferCache {
         self.inferred_guard_dependencies.insert(owner);
     }
 
-    pub fn take_inferred_guard_dependencies(&mut self) -> HashSet<LuaInferredGuardOwner> {
+    pub fn take_inferred_guard_dependencies(&mut self) -> FxHashSet<LuaInferredGuardOwner> {
         std::mem::take(&mut self.inferred_guard_dependencies)
     }
 

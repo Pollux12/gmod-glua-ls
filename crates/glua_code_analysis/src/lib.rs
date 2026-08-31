@@ -36,13 +36,13 @@ pub use library_collision::LibraryDefinitionCollision;
 use lsp_types::Uri;
 pub use profile::Profile;
 use resources::load_resource_std;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 use schema_to_glua::SchemaConverter;
 pub use semantic::*;
-use std::collections::{HashMap, VecDeque};
+use std::collections::VecDeque;
 use std::path::{Component, Path};
 use std::str::FromStr;
-use std::{collections::HashSet, path::PathBuf, sync::Arc};
+use std::{path::PathBuf, sync::Arc};
 pub use test_lib::{GMOD_CALL_ARG_BUILTINS_FIXTURE, VirtualWorkspace};
 use tokio_util::sync::CancellationToken;
 use url::Url;
@@ -52,13 +52,13 @@ pub use vfs::*;
 /// re-analysis.
 #[derive(Clone, Debug, Default)]
 pub(crate) struct InferredGuardSnapshot {
-    facts: HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
-    consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
+    facts: FxHashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
+    consumers: FxHashMap<LuaInferredGuardOwner, FxHashSet<FileId>>,
     /// Parameter types inferred from the snapshotted files' call sites, keyed by
     /// the callee signature they belong to.
-    inferred_params: HashMap<(LuaSignatureId, usize), LuaType>,
+    inferred_params: FxHashMap<(LuaSignatureId, usize), LuaType>,
     /// The files the snapshot was taken for, needed to recompute the same set.
-    snapshot_file_ids: HashSet<FileId>,
+    snapshot_file_ids: FxHashSet<FileId>,
 }
 
 impl InferredGuardSnapshot {
@@ -80,8 +80,8 @@ impl InferredGuardSnapshot {
 
 #[derive(Default)]
 struct InferredGuardReferenceFiles {
-    files: HashSet<FileId>,
-    alias_calls: HashSet<FileId>,
+    files: FxHashSet<FileId>,
+    alias_calls: FxHashSet<FileId>,
 }
 
 #[cfg(test)]
@@ -172,7 +172,7 @@ fn is_call_prefix(expr: &LuaExpr) -> bool {
 
 fn expr_resolves_to_inferred_guard_owner(
     db: &DbIndex,
-    caches: &mut HashMap<FileId, LuaInferCache>,
+    caches: &mut FxHashMap<FileId, LuaInferCache>,
     owner: &LuaInferredGuardOwner,
     file_id: FileId,
     expr: &LuaExpr,
@@ -186,7 +186,7 @@ fn expr_resolves_to_inferred_guard_owner(
 
 fn call_resolves_to_inferred_guard_owner(
     db: &DbIndex,
-    caches: &mut HashMap<FileId, LuaInferCache>,
+    caches: &mut FxHashMap<FileId, LuaInferCache>,
     owner: &LuaInferredGuardOwner,
     file_id: FileId,
     prefix_expr: &LuaExpr,
@@ -231,8 +231,8 @@ pub fn call_expr_is_net_op(
     db_index::signature_has_net_op_metadata(db, signature_id)
 }
 
-pub async fn fetch_schema_urls(urls: Vec<Url>) -> HashMap<Url, String> {
-    let mut url_contents = HashMap::new();
+pub async fn fetch_schema_urls(urls: Vec<Url>) -> FxHashMap<Url, String> {
+    let mut url_contents = FxHashMap::default();
     for url in urls {
         if url.scheme() == "file" {
             if let Ok(path) = url.to_file_path()
@@ -283,7 +283,7 @@ pub(crate) fn dependency_site_path_keys(
         return Vec::new();
     }
 
-    let mut keys = HashSet::new();
+    let mut keys = FxHashSet::default();
     insert_dependency_path_key_variants(&mut keys, dependency_path.clone());
 
     if let Some(source_parent) = db
@@ -303,7 +303,7 @@ pub(crate) fn dependency_site_path_keys(
 
 fn select_cross_file_stabilization_dependents(
     all_dependents: impl IntoIterator<Item = FileId>,
-    changed: &HashSet<FileId>,
+    changed: &FxHashSet<FileId>,
 ) -> Vec<FileId> {
     let mut dependents = all_dependents
         .into_iter()
@@ -315,7 +315,7 @@ fn select_cross_file_stabilization_dependents(
 }
 
 fn dependency_path_keys_for_target(db: &DbIndex, target_path: &Path) -> Vec<String> {
-    let mut keys = HashSet::new();
+    let mut keys = FxHashSet::default();
     let Some(target_path_text) = target_path.to_str() else {
         return Vec::new();
     };
@@ -344,7 +344,7 @@ fn dependency_path_keys_for_target(db: &DbIndex, target_path: &Path) -> Vec<Stri
     keys
 }
 
-fn insert_dependency_path_key_variants(keys: &mut HashSet<String>, path: String) {
+fn insert_dependency_path_key_variants(keys: &mut FxHashSet<String>, path: String) {
     let normalized = normalize_dependency_path(&path);
     if normalized.is_empty() {
         return;
@@ -422,11 +422,11 @@ pub struct EmmyLuaAnalysis {
 /// about the edit that produced them.
 #[derive(Debug, Default)]
 pub struct DirtySet {
-    files: HashSet<FileId>,
+    files: FxHashSet<FileId>,
     /// The files whose text this burst changed. Drives removal seeds, guard
     /// propagation sources and `refresh_file_source_dependencies`.
-    sources: HashSet<FileId>,
-    removed: HashSet<FileId>,
+    sources: FxHashSet<FileId>,
+    removed: FxHashSet<FileId>,
     guard_snapshot: InferredGuardSnapshot,
     /// Whether guard facts or call-site-inferred params could have moved.
     ///
@@ -436,7 +436,7 @@ pub struct DirtySet {
     guard_work: bool,
     /// The edited files whose exports actually moved.
     #[cfg(test)]
-    changed_sources: HashSet<FileId>,
+    changed_sources: FxHashSet<FileId>,
 }
 
 impl DirtySet {
@@ -464,12 +464,12 @@ impl DirtySet {
     }
 
     #[cfg(test)]
-    pub fn files(&self) -> &HashSet<FileId> {
+    pub fn files(&self) -> &FxHashSet<FileId> {
         &self.files
     }
 
     #[cfg(test)]
-    pub fn changed_sources(&self) -> &HashSet<FileId> {
+    pub fn changed_sources(&self) -> &FxHashSet<FileId> {
         &self.changed_sources
     }
 }
@@ -645,7 +645,8 @@ impl EmmyLuaAnalysis {
                 .get_file_dependencies()
                 .collect_file_dependents(vec![file_id]);
             dirty.files.extend(dependents);
-            let unresolved = self.unresolved_path_dependency_dependents(&HashSet::from([file_id]));
+            let unresolved =
+                self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
             dirty.files.extend(unresolved);
             dirty.files.remove(&file_id);
         }
@@ -753,7 +754,7 @@ impl EmmyLuaAnalysis {
                     .collect_file_dependents(vec![file_id]);
                 dirty.files.extend(dependents);
                 let unresolved =
-                    self.unresolved_path_dependency_dependents(&HashSet::from([file_id]));
+                    self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
                 dirty.files.extend(unresolved);
                 dirty.files.remove(&file_id);
             }
@@ -867,7 +868,7 @@ impl EmmyLuaAnalysis {
     /// Re-analyses `expansion` with `file_ids` as the files that changed.
     ///
     fn reindex_expanded_files_inner(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
-        let incremental_source_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let incremental_source_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
         let removed_file_ids = file_ids
             .iter()
             .copied()
@@ -878,7 +879,7 @@ impl EmmyLuaAnalysis {
                     .get_syntax_tree(file_id)
                     .is_none()
             })
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
 
         self.compilation
             .get_db_mut()
@@ -887,7 +888,7 @@ impl EmmyLuaAnalysis {
 
         let mut file_ids = expansion;
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
-        let guard_fact_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
+        let guard_fact_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
         self.compilation.remove_index(file_ids.clone());
         let update_file_ids = file_ids
@@ -1076,7 +1077,7 @@ impl EmmyLuaAnalysis {
                 )
             }) {
                 let unresolved =
-                    self.unresolved_path_dependency_dependents(&HashSet::from([file_id]));
+                    self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
                 dirty.files.extend(unresolved);
             }
         }
@@ -1102,7 +1103,7 @@ impl EmmyLuaAnalysis {
     /// file-granular rollup would add every reader of every support node in
     /// the file - including the ones this edit left byte for byte alone.
     fn evidence_dependents(&self, file_id: FileId) -> Vec<FileId> {
-        let files = HashSet::from([file_id]);
+        let files = FxHashSet::from_iter([file_id]);
         let db = self.compilation.get_db();
         let call_site_index = db.get_call_site_param_index();
         let mut dependents = call_site_index.collect_source_dependents(&files);
@@ -1178,7 +1179,7 @@ impl EmmyLuaAnalysis {
                 .collect::<FxHashMap<_, _>>();
             // Their pre-batch guard facts join the snapshot for the same
             // reason the edited files' did: the re-index below overwrites them.
-            let batch_set = batch.iter().copied().collect::<HashSet<_>>();
+            let batch_set = batch.iter().copied().collect::<FxHashSet<_>>();
             dirty
                 .guard_snapshot
                 .merge(self.inferred_guard_snapshot(&batch_set));
@@ -1246,7 +1247,7 @@ impl EmmyLuaAnalysis {
             return;
         }
 
-        let changed = file_ids.iter().copied().collect::<HashSet<_>>();
+        let changed = file_ids.iter().copied().collect::<FxHashSet<_>>();
         let all_dependents = self
             .compilation
             .get_db()
@@ -1284,7 +1285,7 @@ impl EmmyLuaAnalysis {
 
     pub fn expand_reindex_file_ids(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
         let _p = Profile::new("expand_reindex_file_ids");
-        let mut expanded = file_ids.into_iter().collect::<HashSet<_>>();
+        let mut expanded = file_ids.into_iter().collect::<FxHashSet<_>>();
         loop {
             // Include/require callers must be rebuilt with their changed target.
             // Traverse the indexed dependency graph; never rescan workspace ASTs.
@@ -1349,7 +1350,7 @@ impl EmmyLuaAnalysis {
 
     fn add_vgui_forwarding_removal_seed(
         &self,
-        removed_file_ids: &HashSet<FileId>,
+        removed_file_ids: &FxHashSet<FileId>,
         reindex_file_ids: &mut Vec<FileId>,
     ) {
         if removed_file_ids.is_empty() {
@@ -1398,13 +1399,13 @@ impl EmmyLuaAnalysis {
         reindex_file_ids.dedup();
     }
 
-    fn unresolved_path_dependency_dependents(&self, file_ids: &HashSet<FileId>) -> Vec<FileId> {
+    fn unresolved_path_dependency_dependents(&self, file_ids: &FxHashSet<FileId>) -> Vec<FileId> {
         let db = self.compilation.get_db();
         let target_path_keys = file_ids
             .iter()
             .filter_map(|file_id| db.get_vfs().get_file_path(file_id).cloned())
             .flat_map(|target_path| dependency_path_keys_for_target(db, &target_path))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
 
         db.get_file_dependencies_index()
             .collect_unresolved_path_dependents(target_path_keys)
@@ -1412,10 +1413,10 @@ impl EmmyLuaAnalysis {
 
     fn reindex_changed_inferred_guard_references(
         &mut self,
-        source_file_ids: &HashSet<FileId>,
+        source_file_ids: &FxHashSet<FileId>,
         old_snapshot: &InferredGuardSnapshot,
         already_reindexed: &[FileId],
-        incremental_source_file_ids: &HashSet<FileId>,
+        incremental_source_file_ids: &FxHashSet<FileId>,
     ) {
         let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
         let mut profile_changed_facts = 0usize;
@@ -1426,7 +1427,7 @@ impl EmmyLuaAnalysis {
             .iter()
             .copied()
             .chain(already_reindexed.iter().copied())
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let mut new_facts = self
             .compilation
             .get_db()
@@ -1446,7 +1447,7 @@ impl EmmyLuaAnalysis {
                     && old_facts.get(*owner) != new_facts.get(*owner)
             })
             .cloned()
-            .collect::<HashSet<_>>()
+            .collect::<FxHashSet<_>>()
             .into_iter()
             .collect::<Vec<_>>();
         if changed_owners.is_empty() {
@@ -1467,7 +1468,7 @@ impl EmmyLuaAnalysis {
         let mut frontier_old_consumers = old_snapshot.consumers.clone();
 
         while !changed_owners.is_empty() {
-            let mut reference_files = HashSet::new();
+            let mut reference_files = FxHashSet::default();
             for owner in &changed_owners {
                 let newly_added =
                     !frontier_old_facts.contains_key(owner) && new_facts.contains_key(owner);
@@ -1510,7 +1511,7 @@ impl EmmyLuaAnalysis {
 
             let mut reindex_file_ids = reference_files.into_iter().collect::<Vec<_>>();
             reindex_file_ids.sort_unstable();
-            let wave_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
+            let wave_file_ids = reindex_file_ids.iter().copied().collect::<FxHashSet<_>>();
             let old_wave_snapshot = self.inferred_guard_snapshot(&wave_file_ids);
             self.compilation.remove_index(reindex_file_ids.clone());
             let update_file_ids = reindex_file_ids
@@ -1550,7 +1551,7 @@ impl EmmyLuaAnalysis {
                         && old_wave_snapshot.facts.get(*owner) != new_facts.get(*owner)
                 })
                 .cloned()
-                .collect::<HashSet<_>>()
+                .collect::<FxHashSet<_>>()
                 .into_iter()
                 .collect();
             frontier_old_facts = old_wave_snapshot.facts;
@@ -1578,7 +1579,7 @@ impl EmmyLuaAnalysis {
         }
     }
 
-    fn inferred_guard_snapshot(&self, file_ids: &HashSet<FileId>) -> InferredGuardSnapshot {
+    fn inferred_guard_snapshot(&self, file_ids: &FxHashSet<FileId>) -> InferredGuardSnapshot {
         let signature_index = self.compilation.get_db().get_signature_index();
         let facts = signature_index.inferred_guard_facts_for_files(file_ids);
         let consumers = facts
@@ -1624,7 +1625,7 @@ impl EmmyLuaAnalysis {
             .iter()
             .copied()
             .chain(old_snapshot.snapshot_file_ids.iter().copied())
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let mut changed_files = old_params
             .keys()
             .chain(new_params.keys())
@@ -1659,10 +1660,10 @@ impl EmmyLuaAnalysis {
     fn reconcile_equivalent_inferred_guard_owners(
         &mut self,
         old_snapshot: &InferredGuardSnapshot,
-        new_facts: &HashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
-        reindexed_file_ids: &HashSet<FileId>,
-    ) -> HashSet<LuaInferredGuardOwner> {
-        let mut reconciled = HashSet::new();
+        new_facts: &FxHashMap<LuaInferredGuardOwner, LuaInferredPositiveGuard>,
+        reindexed_file_ids: &FxHashSet<FileId>,
+    ) -> FxHashSet<LuaInferredGuardOwner> {
+        let mut reconciled = FxHashSet::default();
         for owner in old_snapshot
             .facts
             .keys()
@@ -1741,7 +1742,7 @@ impl EmmyLuaAnalysis {
         };
 
         let db = self.compilation.get_db();
-        let mut caches = HashMap::<FileId, LuaInferCache>::new();
+        let mut caches = FxHashMap::<FileId, LuaInferCache>::default();
         let mut matching_references = references
             .into_iter()
             .filter_map(|reference| {
@@ -1764,7 +1765,7 @@ impl EmmyLuaAnalysis {
 
         let mut result = InferredGuardReferenceFiles::default();
         let mut alias_queue = VecDeque::new();
-        let mut visited_aliases = HashSet::new();
+        let mut visited_aliases = FxHashSet::default();
         for (file_id, expr) in matching_references {
             if call_resolves_to_inferred_guard_owner(db, &mut caches, owner, file_id, &expr) {
                 result.files.insert(file_id);
@@ -1841,7 +1842,7 @@ impl EmmyLuaAnalysis {
         let removed_file_ids = is_removed
             .then_some(fid)
             .into_iter()
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let mut reindex_file_ids = vec![fid];
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
         self.compilation.remove_index(reindex_file_ids.clone());
@@ -1861,8 +1862,8 @@ impl EmmyLuaAnalysis {
     }
 
     pub fn update_files_by_uri(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
-        let mut removed_files = HashSet::new();
-        let mut updated_files = HashSet::new();
+        let mut removed_files = FxHashSet::default();
+        let mut updated_files = FxHashSet::default();
         let mut files = files;
         files.sort_by_cached_key(|(uri, _)| {
             uri_to_file_path(uri)
@@ -1872,19 +1873,21 @@ impl EmmyLuaAnalysis {
         let old_source_file_ids = files
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let removed_source_file_ids = files
             .iter()
             .filter(|(_, text)| text.is_none())
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let mut old_guard_fact_file_ids =
             self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
         self.add_vgui_forwarding_removal_seed(
             &removed_source_file_ids,
             &mut old_guard_fact_file_ids,
         );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
+        let old_guard_fact_file_ids = old_guard_fact_file_ids
+            .into_iter()
+            .collect::<FxHashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
 
         // Separate files into: unchanged (skip), to-remove, and to-parse
@@ -1974,7 +1977,7 @@ impl EmmyLuaAnalysis {
                     }
                 });
 
-                // Insert pre-parsed results (sequential, fast HashMap inserts)
+                // Insert pre-parsed results (sequential, fast FxHashMap inserts)
                 let vfs = self.compilation.get_db_mut().get_vfs_mut();
                 for (i, ((_uri, text), file_id)) in
                     to_parse.into_iter().zip(file_ids.iter()).enumerate()
@@ -2008,7 +2011,7 @@ impl EmmyLuaAnalysis {
 
         let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
         self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
+        let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -2063,22 +2066,24 @@ impl EmmyLuaAnalysis {
         let old_source_file_ids = files
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let removed_source_file_ids = files
             .iter()
             .filter(|(_, text)| text.is_none())
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
-            .collect::<HashSet<_>>();
+            .collect::<FxHashSet<_>>();
         let mut old_guard_fact_file_ids =
             self.expand_reindex_file_ids(old_source_file_ids.iter().copied().collect());
         self.add_vgui_forwarding_removal_seed(
             &removed_source_file_ids,
             &mut old_guard_fact_file_ids,
         );
-        let old_guard_fact_file_ids = old_guard_fact_file_ids.into_iter().collect::<HashSet<_>>();
+        let old_guard_fact_file_ids = old_guard_fact_file_ids
+            .into_iter()
+            .collect::<FxHashSet<_>>();
         let old_guard_facts = self.inferred_guard_snapshot(&old_guard_fact_file_ids);
-        let mut removed_files = HashSet::new();
-        let mut updated_files = HashSet::new();
+        let mut removed_files = FxHashSet::default();
+        let mut updated_files = FxHashSet::default();
         {
             let _p = Profile::new("update files");
             for (uri, text) in files {
@@ -2119,7 +2124,7 @@ impl EmmyLuaAnalysis {
 
         let mut removed_files = self.expand_reindex_file_ids(removed_files.into_iter().collect());
         self.add_vgui_forwarding_removal_seed(&removed_source_file_ids, &mut removed_files);
-        let guard_fact_file_ids = removed_files.iter().copied().collect::<HashSet<_>>();
+        let guard_fact_file_ids = removed_files.iter().copied().collect::<FxHashSet<_>>();
         self.compilation.remove_index(removed_files.clone());
         updated_files.extend(removed_files.into_iter().filter(|file_id| {
             self.compilation
@@ -2155,13 +2160,13 @@ impl EmmyLuaAnalysis {
                 self.compilation
                     .get_db()
                     .get_call_site_param_index()
-                    .collect_contribution_signature_files(&HashSet::from([file_id])),
+                    .collect_contribution_signature_files(&FxHashSet::from_iter([file_id])),
             );
             reindex_file_ids.sort_unstable();
             reindex_file_ids.dedup();
-            let removed_file_ids = HashSet::from([file_id]);
+            let removed_file_ids = FxHashSet::from_iter([file_id]);
             self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-            let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<HashSet<_>>();
+            let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<FxHashSet<_>>();
             let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
             // Members other files own on this file's table literals are filed
             // under *their* file, so `remove_index` never reaches them. A
@@ -2198,7 +2203,7 @@ impl EmmyLuaAnalysis {
                 &guard_fact_file_ids,
                 &old_guard_facts,
                 &reindex_file_ids,
-                &HashSet::new(),
+                &FxHashSet::default(),
             );
             let remap = FileRemap::validated(
                 self.compilation.get_db(),
@@ -2238,7 +2243,7 @@ impl EmmyLuaAnalysis {
 
     pub fn set_workspace_diagnostic_configs(
         &mut self,
-        configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+        configs: std::collections::HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
     ) {
         self.diagnostic.set_workspace_configs(configs);
     }
@@ -2359,7 +2364,7 @@ impl EmmyLuaAnalysis {
             .get_need_resolve_schemas()
     }
 
-    pub fn apply_fetched_schemas(&mut self, url_contents: HashMap<Url, String>) {
+    pub fn apply_fetched_schemas(&mut self, url_contents: FxHashMap<Url, String>) {
         if url_contents.is_empty() {
             return;
         }
@@ -2585,7 +2590,7 @@ mod tests {
         let changed_a = FileId { id: 1 };
         let changed_b = FileId { id: 2 };
         let unchanged_dependent = FileId { id: 3 };
-        let changed = HashSet::from([changed_a, changed_b]);
+        let changed = HashSet::from_iter([changed_a, changed_b]);
 
         assert_eq!(
             select_cross_file_stabilization_dependents(
@@ -2800,7 +2805,7 @@ mod tests {
                 },
             );
 
-        let removed_file_ids = HashSet::from([helper_file_id]);
+        let removed_file_ids = HashSet::from_iter([helper_file_id]);
         let mut reindex_file_ids = vec![helper_file_id];
         analysis.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
 

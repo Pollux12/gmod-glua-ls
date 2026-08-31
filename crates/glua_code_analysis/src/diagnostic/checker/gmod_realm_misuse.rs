@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -469,7 +469,7 @@ fn resolve_callee_realms(
 
     let is_bare_name_call = matches!(prefix_expr, LuaExpr::NameExpr(_));
 
-    // Fast path: GM method annotations (O(1) HashMap lookup, no inference needed).
+    // Fast path: GM method annotations (O(1) FxHashMap lookup, no inference needed).
     // Only applies to member calls (index expressions like GM:Method or GAMEMODE.Method).
     if !is_bare_name_call {
         if let Some(index_expr) = LuaIndexExpr::cast(prefix_expr.syntax().clone()) {
@@ -520,7 +520,7 @@ fn resolve_callee_realms(
         }
     }
 
-    // Resolve realms: try precomputed first (O(1) HashMap lookup), then
+    // Resolve realms: try precomputed first (O(1) FxHashMap lookup), then
     // fall back to expensive member/global resolution paths.
     let mut realms = Vec::new();
 
@@ -756,7 +756,7 @@ fn resolve_member_candidate_realms(
         && resolved_member.get_key() == &member_key
         && let Some(resolved_owner) = member_index.get_current_owner(resolved_member_id)
     {
-        let mut seen: HashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
+        let mut seen: FxHashSet<LuaMemberId> = all_member_ids.iter().copied().collect();
         push_cached_member_ids_for_owner_key(
             member_index,
             resolved_owner,
@@ -1101,7 +1101,7 @@ fn collect_all_member_ids_for_type_key(
         owners
     };
     let mut result = Vec::new();
-    let mut seen = std::collections::HashSet::new();
+    let mut seen = rustc_hash::FxHashSet::default();
 
     for owner in &owners {
         push_cached_member_ids_for_owner_key(
@@ -1156,7 +1156,7 @@ fn subtype_member_owners_for_key(
     // every missing member name.
     let member_index = db.get_member_index();
     let mut subtype_ids = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     for member in member_index.get_current_members_for_key(member_key) {
         let Some(owner) = member_index.get_current_owner(&member.get_id()) else {
             continue;
@@ -1186,7 +1186,7 @@ fn push_cached_member_ids_for_owner_key(
     member_key: &LuaMemberKey,
     owner_key_member_candidate_cache: &mut OwnerKeyMemberCandidateCache,
     result: &mut Vec<LuaMemberId>,
-    seen: &mut HashSet<LuaMemberId>,
+    seen: &mut FxHashSet<LuaMemberId>,
 ) -> bool {
     let cache_key = (owner.clone(), member_key.clone());
     if let Some(member_ids) = owner_key_member_candidate_cache.get(&cache_key) {
@@ -1208,7 +1208,7 @@ fn push_cached_member_ids_for_owner_key(
         owner,
         member_key,
         &mut owner_key_member_ids,
-        &mut HashSet::new(),
+        &mut FxHashSet::default(),
     );
     owner_key_member_candidate_cache.insert(cache_key, owner_key_member_ids.clone());
     if !found {
@@ -1228,7 +1228,7 @@ fn push_member_ids_for_owner_key(
     owner: &LuaMemberOwner,
     member_key: &LuaMemberKey,
     result: &mut Vec<LuaMemberId>,
-    seen: &mut HashSet<LuaMemberId>,
+    seen: &mut FxHashSet<LuaMemberId>,
 ) -> bool {
     let indexed_members = member_index.get_members_for_owner_key(owner, member_key);
     if indexed_members.is_empty() {
@@ -1271,14 +1271,14 @@ fn owner_type_to_member_owners(
     db: &crate::DbIndex,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     owner_type_to_member_owners_inner(typ, db, &mut visited, include_inherited_members)
 }
 
 fn owner_type_to_member_owners_inner(
     typ: &LuaType,
     db: &crate::DbIndex,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     if !visited.insert(typ.clone()) {
@@ -1360,7 +1360,7 @@ fn owner_type_to_member_owners_inner(
 fn expand_type_decl_member_owners(
     type_decl_id: &crate::LuaTypeDeclId,
     db: &crate::DbIndex,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
     include_inherited_members: bool,
 ) -> Vec<LuaMemberOwner> {
     let mut owners = vec![LuaMemberOwner::Type(type_decl_id.clone())];

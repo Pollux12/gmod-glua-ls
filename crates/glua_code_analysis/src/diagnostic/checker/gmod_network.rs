@@ -466,7 +466,7 @@ fn check_bits_mismatch(
     sorted_send_flows: &SortedSendFlowCache,
     infer_index: &crate::GmodInferIndex,
 ) {
-    use std::collections::HashSet;
+    use rustc_hash::FxHashSet;
 
     for receive_flow in receive_flows {
         if receive_flow.reads_opaque {
@@ -483,7 +483,7 @@ fn check_bits_mismatch(
             continue;
         };
 
-        let mut reported: HashSet<(usize, u32, u32)> = HashSet::new();
+        let mut reported: FxHashSet<(usize, u32, u32)> = FxHashSet::default();
 
         for (send_file_id, send_flow, _) in matching_send_flows {
             if send_flow.is_wrapped {

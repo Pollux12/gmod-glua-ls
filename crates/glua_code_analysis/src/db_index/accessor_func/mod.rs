@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use glua_parser::LuaSyntaxId;
 use smol_str::SmolStr;
@@ -14,8 +14,8 @@ pub struct AccessorFuncAnnotation {
 
 #[derive(Debug, Default)]
 pub struct AccessorFuncAnnotationIndex {
-    by_name: HashMap<SmolStr, Vec<AccessorFuncAnnotation>>,
-    by_file: HashMap<FileId, Vec<SmolStr>>,
+    by_name: FxHashMap<SmolStr, Vec<AccessorFuncAnnotation>>,
+    by_file: FxHashMap<FileId, Vec<SmolStr>>,
 }
 
 impl AccessorFuncAnnotationIndex {
@@ -95,7 +95,7 @@ pub struct AccessorFuncCallMetadata {
 
 #[derive(Debug, Default)]
 pub struct AccessorFuncCallIndex {
-    calls: HashMap<FileId, Vec<AccessorFuncCallMetadata>>,
+    calls: FxHashMap<FileId, Vec<AccessorFuncCallMetadata>>,
 }
 
 impl AccessorFuncCallIndex {

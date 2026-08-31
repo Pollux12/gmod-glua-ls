@@ -1,17 +1,17 @@
 mod test;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use serde_json::Value;
 
 #[derive(Debug, Clone)]
 pub struct FlattenConfigObject {
-    config: HashMap<String, Value>,
+    config: FxHashMap<String, Value>,
 }
 
 impl FlattenConfigObject {
     pub fn parse(luals_json: Value) -> Self {
-        let mut config = HashMap::new();
+        let mut config = FxHashMap::default();
         flatten_object("", &luals_json, &mut config);
         Self { config }
     }
@@ -21,7 +21,7 @@ impl FlattenConfigObject {
     }
 }
 
-fn flatten_object(prefix: &str, val: &Value, config: &mut HashMap<String, Value>) {
+fn flatten_object(prefix: &str, val: &Value, config: &mut FxHashMap<String, Value>) {
     match val {
         Value::Object(map) => {
             for (k, v) in map.iter() {

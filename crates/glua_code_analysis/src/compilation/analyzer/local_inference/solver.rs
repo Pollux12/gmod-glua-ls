@@ -23,7 +23,7 @@ pub(crate) fn solve_local_inference_graph(
     nodes: &FxHashMap<LuaInferenceNodeId, Vec<ContextualTypeEvidence>>,
 ) -> LocalInferenceSolveResult {
     let components = strongly_connected_components(nodes);
-    let mut resolved = HashMap::<LuaInferenceNodeId, LuaTypeFact>::new();
+    let mut resolved = HashMap::<LuaInferenceNodeId, LuaTypeFact>::default();
 
     loop {
         let mut progress = false;

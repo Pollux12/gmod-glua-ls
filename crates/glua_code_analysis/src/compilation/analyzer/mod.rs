@@ -15,10 +15,8 @@ pub(crate) mod unresolve;
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use lua::{dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func};
 
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 
 use crate::{
     AsyncState, FileId, GmodScopedClassInfo, InFiled, InferFailReason, LuaDeclId, LuaDefinitionId,
@@ -520,7 +518,7 @@ impl IterVarRefreshResult {
             file_id,
             reads: HashSet::default(),
             pending_type_decls: Vec::new(),
-            guard_dependencies: HashSet::new(),
+            guard_dependencies: HashSet::default(),
             updates: Vec::new(),
         }
     }
@@ -586,7 +584,7 @@ fn rederive_settled_iter_vars(
         )
     });
 
-    let mut candidates_by_file = HashMap::<FileId, Vec<SettledIterVarCandidate>>::new();
+    let mut candidates_by_file = HashMap::<FileId, Vec<SettledIterVarCandidate>>::default();
     for iter_var in candidates {
         let candidate = SettledIterVarCandidate::new(&iter_var);
         candidates_by_file
@@ -1151,7 +1149,7 @@ fn refresh_local_decl_initializer_caches(
         return HashSet::default();
     }
 
-    let mut candidates_by_file = HashMap::<FileId, Vec<LuaDeclId>>::new();
+    let mut candidates_by_file = HashMap::<FileId, Vec<LuaDeclId>>::default();
     for decl_id in &context.uninformative_local_decl_candidates {
         candidates_by_file
             .entry(decl_id.file_id)
@@ -1469,7 +1467,7 @@ fn refresh_member_initializer_caches(
         return HashSet::default();
     }
 
-    let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::new();
+    let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::default();
     for member_id in &context.member_initializer_reinfer_candidates {
         candidates_by_file
             .entry(member_id.file_id)
@@ -1597,7 +1595,7 @@ impl InitializerRefreshResult {
             file_id,
             reads: HashSet::default(),
             pending_type_decls: Vec::new(),
-            guard_dependencies: HashSet::new(),
+            guard_dependencies: HashSet::default(),
             updates: Vec::new(),
         }
     }
@@ -1913,7 +1911,7 @@ fn module_analyze(
         return vec![];
     }
 
-    let mut file_tree_map: HashMap<WorkspaceId, Vec<InFiled<LuaChunk>>> = HashMap::new();
+    let mut file_tree_map: HashMap<WorkspaceId, Vec<InFiled<LuaChunk>>> = HashMap::default();
     for in_filed_tree in need_analyzed_files {
         let file_id = in_filed_tree.file_id;
         if let Some(path) = db.get_vfs().get_file_path(&file_id).cloned() {
@@ -2035,7 +2033,7 @@ impl AnalyzeContext {
     pub fn new() -> Self {
         Self {
             tree_list: Vec::new(),
-            metas: HashSet::new(),
+            metas: HashSet::default(),
             scripted_scope_files: None,
             scripted_scope_infos: None,
             gmod_global_call_roles: None,
@@ -2044,23 +2042,23 @@ impl AnalyzeContext {
             pending_call_site_return_consumers: Vec::new(),
             pending_call_site_definition_refreshes: Vec::new(),
             call_site_return_targets: Vec::new(),
-            call_site_return_definition_refreshes: HashMap::new(),
-            pending_unresolve_decl_ids: HashSet::new(),
-            uninformative_local_decl_candidates: HashSet::new(),
-            member_initializer_reinfer_candidates: HashSet::new(),
+            call_site_return_definition_refreshes: HashMap::default(),
+            pending_unresolve_decl_ids: HashSet::default(),
+            uninformative_local_decl_candidates: HashSet::default(),
+            member_initializer_reinfer_candidates: HashSet::default(),
             infer_manager: InferCacheManager::new(),
-            inferred_guard_dependencies: HashMap::new(),
+            inferred_guard_dependencies: HashMap::default(),
             inferred_guard_candidates: Vec::new(),
             early_callable_signatures: Vec::new(),
             early_member_owner_candidates: Vec::new(),
             settled_member_attach_candidates: Vec::new(),
-            settled_member_widening_candidates: HashMap::new(),
+            settled_member_widening_candidates: HashMap::default(),
             settled_guarded_bootstrap_candidates: Vec::new(),
             settled_iter_var_candidates: Vec::new(),
-            settled_read_sets: HashMap::new(),
+            settled_read_sets: HashMap::default(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
-            vgui_parent_fallback_files: HashSet::new(),
+            vgui_parent_fallback_files: HashSet::default(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -2452,7 +2450,7 @@ impl AnalyzeContext {
                 .map(|in_filed_tree| in_filed_tree.file_id)
                 .collect::<HashSet<_>>();
             self.scripted_scope_files = Some(Arc::new(file_ids));
-            self.scripted_scope_infos = Some(Arc::new(HashMap::new()));
+            self.scripted_scope_infos = Some(Arc::new(HashMap::default()));
             return;
         }
 

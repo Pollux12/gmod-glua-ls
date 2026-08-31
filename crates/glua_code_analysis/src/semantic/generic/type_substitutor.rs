@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use super::tpl_pattern::constant_decay;
 use crate::{GenericTplId, LuaType, LuaTypeDeclId};
@@ -19,14 +19,14 @@ impl Default for TypeSubstitutor {
 impl TypeSubstitutor {
     pub fn new() -> Self {
         Self {
-            tpl_replace_map: HashMap::new(),
-            alias_type_ids: HashSet::new(),
+            tpl_replace_map: HashMap::default(),
+            alias_type_ids: HashSet::default(),
             self_type: None,
         }
     }
 
     pub fn from_type_array(type_array: Vec<LuaType>) -> Self {
-        let mut tpl_replace_map = HashMap::new();
+        let mut tpl_replace_map = HashMap::default();
         for (i, ty) in type_array.into_iter().enumerate() {
             tpl_replace_map.insert(
                 GenericTplId::Type(i as u32),
@@ -35,7 +35,7 @@ impl TypeSubstitutor {
         }
         Self {
             tpl_replace_map,
-            alias_type_ids: HashSet::new(),
+            alias_type_ids: HashSet::default(),
             self_type: None,
         }
     }
@@ -49,7 +49,7 @@ impl TypeSubstitutor {
         alias_type_id: LuaTypeDeclId,
         parent: Option<&TypeSubstitutor>,
     ) -> Self {
-        let mut tpl_replace_map = HashMap::new();
+        let mut tpl_replace_map = HashMap::default();
         for (i, ty) in type_array.into_iter().enumerate() {
             tpl_replace_map.insert(
                 GenericTplId::Type(i as u32),

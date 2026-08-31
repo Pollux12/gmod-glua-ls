@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexExpr, LuaSyntaxKind, LuaVarExpr,
@@ -20,8 +20,8 @@ impl Checker for CheckExportChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let mut checked_index_expr = HashSet::new();
-        let mut exported_key_cache: ExportedKeyCache = HashMap::new();
+        let mut checked_index_expr = HashSet::default();
+        let mut exported_key_cache: ExportedKeyCache = HashMap::default();
         for node in root.descendants::<LuaAst>() {
             if context.is_cancelled() {
                 return;
@@ -266,10 +266,10 @@ fn module_source_declares_exported_key(
         return false;
     };
 
-    let mut exported_local_names = HashSet::new();
-    let mut exported_keys = HashSet::new();
-    let mut local_table_init_keys: HashMap<String, HashSet<String>> = HashMap::new();
-    let mut local_assigned_keys: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut exported_local_names = HashSet::default();
+    let mut exported_keys = HashSet::default();
+    let mut local_table_init_keys: HashMap<String, HashSet<String>> = HashMap::default();
+    let mut local_assigned_keys: HashMap<String, HashSet<String>> = HashMap::default();
 
     for node in module_root.descendants().filter_map(LuaAst::cast) {
         match node {

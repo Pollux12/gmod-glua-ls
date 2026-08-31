@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use rowan::TextRange;
 
@@ -18,8 +18,8 @@ pub struct TableNumericRangePopulation {
 
 #[derive(Debug, Default)]
 pub struct NumericRangePopulationIndex {
-    by_file: HashMap<FileId, Vec<TableNumericRangePopulation>>,
-    by_global: HashMap<String, Vec<TableNumericRangePopulation>>,
+    by_file: FxHashMap<FileId, Vec<TableNumericRangePopulation>>,
+    by_global: FxHashMap<String, Vec<TableNumericRangePopulation>>,
 }
 
 impl NumericRangePopulationIndex {

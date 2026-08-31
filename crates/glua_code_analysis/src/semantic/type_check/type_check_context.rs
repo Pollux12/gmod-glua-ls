@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use crate::{DbIndex, InferFailReason, LuaMemberId, LuaMemberIndexItem, LuaType, LuaTypeFact};
 
@@ -13,7 +13,7 @@ pub struct TypeCheckContext<'db> {
     pub detail: bool,
     pub db: &'db DbIndex,
     pub level: TypeCheckCheckLevel,
-    member_facts: HashMap<LuaMemberId, LuaTypeFact>,
+    member_facts: FxHashMap<LuaMemberId, LuaTypeFact>,
 }
 
 impl<'db> TypeCheckContext<'db> {
@@ -22,11 +22,11 @@ impl<'db> TypeCheckContext<'db> {
             detail,
             db,
             level,
-            member_facts: HashMap::new(),
+            member_facts: FxHashMap::default(),
         }
     }
 
-    pub fn with_member_facts(mut self, member_facts: HashMap<LuaMemberId, LuaTypeFact>) -> Self {
+    pub fn with_member_facts(mut self, member_facts: FxHashMap<LuaMemberId, LuaTypeFact>) -> Self {
         self.member_facts = member_facts;
         self
     }

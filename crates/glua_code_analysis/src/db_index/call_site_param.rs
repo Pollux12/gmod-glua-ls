@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::path::PathBuf;
 
 use rowan::TextSize;
@@ -307,19 +307,19 @@ impl CallSiteParamIndex {
         &self,
         updates: &[(FileId, Vec<(String, LuaSignatureId, Vec<usize>)>)],
     ) -> HashMap<LuaSignatureId, LuaSignatureId> {
-        let mut moved = HashMap::new();
+        let mut moved = HashMap::default();
         for (file_id, signatures) in updates {
             let Some(previous) = self.previous_source_signatures.get(file_id) else {
                 continue;
             };
-            let mut by_path: HashMap<&str, Vec<LuaSignatureId>> = HashMap::new();
+            let mut by_path: HashMap<&str, Vec<LuaSignatureId>> = HashMap::default();
             for (path, signature_id) in previous {
                 by_path
                     .entry(path.as_str())
                     .or_default()
                     .push(*signature_id);
             }
-            let mut current: HashMap<&str, Vec<LuaSignatureId>> = HashMap::new();
+            let mut current: HashMap<&str, Vec<LuaSignatureId>> = HashMap::default();
             for (path, signature_id, _) in signatures {
                 current
                     .entry(path.as_str())
@@ -394,7 +394,8 @@ impl CallSiteParamIndex {
                 .collect();
         }
         let parked = std::mem::take(&mut self.pending_previous_params);
-        self.pending_previous_params = HashMap::with_capacity(parked.len());
+        self.pending_previous_params =
+            HashMap::with_capacity_and_hasher(parked.len(), Default::default());
         for ((signature_id, param_idx), fact) in parked {
             match moved.get(&signature_id) {
                 // A remapped entry describes the signature now at that
@@ -464,7 +465,7 @@ impl CallSiteParamIndex {
         &mut self,
         updates: Vec<(FileId, Vec<(LuaSignatureId, usize, LuaTypeFact)>)>,
     ) -> HashSet<LuaSignatureId> {
-        let mut affected_params = HashSet::new();
+        let mut affected_params = HashSet::default();
         for (file_id, _) in &updates {
             if let Some(contributions) = self.file_contributions.get(file_id) {
                 affected_params.extend(
@@ -559,14 +560,14 @@ impl CallSiteParamIndex {
     /// caller can requeue the returns and consumers derived from them.
     pub(crate) fn flush_deferred_contributions(&mut self) -> HashSet<LuaSignatureId> {
         if self.deferred_contributions.is_empty() {
-            return HashSet::new();
+            return HashSet::default();
         }
         let queued = std::mem::take(&mut self.deferred_contributions);
         let affected = queued
             .iter()
             .map(|(_, contribution)| (contribution.signature_id, contribution.param_idx))
             .collect();
-        let previous = self.snapshot_param_facts(affected, HashMap::new());
+        let previous = self.snapshot_param_facts(affected, HashMap::default());
         for (file_id, contribution) in queued {
             self.file_contributions
                 .entry(file_id)
@@ -583,7 +584,7 @@ impl CallSiteParamIndex {
         &self,
         file_ids: &HashSet<FileId>,
     ) -> HashMap<(LuaSignatureId, usize), LuaType> {
-        let mut out = HashMap::new();
+        let mut out = HashMap::default();
         for file_id in file_ids {
             let Some(contributions) = self.file_contributions.get(file_id) else {
                 continue;
@@ -757,7 +758,10 @@ impl CallSiteParamIndex {
             .unwrap_or_default()
     }
 
-    pub fn collect_source_dependents(&self, source_files: &HashSet<FileId>) -> Vec<FileId> {
+    pub fn collect_source_dependents<S: std::hash::BuildHasher>(
+        &self,
+        source_files: &std::collections::HashSet<FileId, S>,
+    ) -> Vec<FileId> {
         let mut dependents = source_files
             .iter()
             .filter_map(|file_id| self.source_file_dependents.get(file_id))
@@ -858,7 +862,7 @@ impl CallSiteParamIndex {
         self.inference_events_by_file.clear();
 
         let mut accumulators =
-            HashMap::<LuaSignatureId, HashMap<usize, CallSiteParamAccumulator>>::new();
+            HashMap::<LuaSignatureId, HashMap<usize, CallSiteParamAccumulator>>::default();
 
         for file_id in sorted_file_ids(&self.file_contributions) {
             let Some(contributions) = self.file_contributions.get(&file_id) else {
@@ -1232,7 +1236,7 @@ mod tests {
         index.remove(source_file);
         let changed = index.set_files_fact_contributions(vec![(source_file, Vec::new())]);
 
-        assert_eq!(changed, HashSet::from([signature_id]));
+        assert_eq!(changed, HashSet::from_iter([signature_id]));
     }
 
     #[test]
@@ -1254,7 +1258,7 @@ mod tests {
 
         assert_eq!(
             index.flush_deferred_contributions(),
-            HashSet::from([signature_id])
+            HashSet::from_iter([signature_id])
         );
         assert_eq!(
             inferred_union_members(&index, &signature_id),
@@ -1388,7 +1392,7 @@ mod tests {
         let callee = FileId::new(1);
         let caller = FileId::new(2);
         let signature_id = signature_id(callee, 100);
-        let callee_files = HashSet::from([callee]);
+        let callee_files = HashSet::from_iter([callee]);
 
         let mut index = CallSiteParamIndex::new();
         index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
@@ -1424,7 +1428,7 @@ mod tests {
                 .is_empty()
         );
         assert_eq!(
-            index.collect_contributor_files(&HashSet::from([callee])),
+            index.collect_contributor_files(&HashSet::from_iter([callee])),
             vec![caller]
         );
     }
@@ -1437,7 +1441,7 @@ mod tests {
 
         let mut index = CallSiteParamIndex::new();
         index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
-        index.forget_removed_files(&HashSet::from([callee]));
+        index.forget_removed_files(&HashSet::from_iter([callee]));
 
         assert!(
             index
@@ -1446,7 +1450,7 @@ mod tests {
         );
         assert!(
             index
-                .collect_contributor_files(&HashSet::from([callee]))
+                .collect_contributor_files(&HashSet::from_iter([callee]))
                 .is_empty()
         );
     }
@@ -1459,7 +1463,7 @@ mod tests {
 
         let mut index = CallSiteParamIndex::new();
         index.set_files_contributions(vec![(caller, vec![(signature_id, 0, LuaType::String)])]);
-        index.forget_removed_files(&HashSet::from([caller]));
+        index.forget_removed_files(&HashSet::from_iter([caller]));
 
         assert!(
             index
@@ -1468,7 +1472,7 @@ mod tests {
         );
         assert!(
             index
-                .collect_contributor_files(&HashSet::from([callee]))
+                .collect_contributor_files(&HashSet::from_iter([callee]))
                 .is_empty()
         );
     }

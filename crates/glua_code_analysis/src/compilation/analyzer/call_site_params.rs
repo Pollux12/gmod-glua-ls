@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::{Arc, Mutex, OnceLock},
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use crate::db_index::{CallSiteReturnConsumer, CallSiteReturnConsumerTarget};
 use crate::{
@@ -82,7 +80,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
             .get_syntax_tree(&file_id)
             .map(|tree| tree.get_chunk_node())
         else {
-            return (file_id, Vec::new(), HashSet::new());
+            return (file_id, Vec::new(), HashSet::default());
         };
         (
             file_id,
@@ -91,7 +89,7 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
         )
     });
     let mut source_signature_updates = Vec::with_capacity(file_metadata.len());
-    let mut exact_receiver_member_keys = HashSet::new();
+    let mut exact_receiver_member_keys = HashSet::default();
     for (file_id, source_signatures, member_keys) in file_metadata {
         source_signature_updates.push((file_id, source_signatures));
         exact_receiver_member_keys.extend(member_keys);
@@ -114,8 +112,8 @@ fn analyze_call_site_param_files(db: &mut DbIndex, context: &mut AnalyzeContext)
             let mut receiver_signatures = Vec::new();
             let mut receiver_consumers = Vec::new();
             let mut deferred = Vec::new();
-            let mut exact_receiver_eligibility = HashMap::new();
-            let mut authoritative_receiver_signatures = HashMap::new();
+            let mut exact_receiver_eligibility = HashMap::default();
+            let mut authoritative_receiver_signatures = HashMap::default();
             let Some(root) = db
                 .get_vfs()
                 .get_syntax_tree(&file_id)
@@ -363,8 +361,8 @@ fn collect_vgui_named_callback_receiver_types(
         return;
     }
     let red_root = root.syntax().clone();
-    let mut candidates: HashMap<LuaDeclId, Option<VguiNamedCallbackCandidate>> = HashMap::new();
-    let mut candidate_names = HashSet::new();
+    let mut candidates: HashMap<LuaDeclId, Option<VguiNamedCallbackCandidate>> = HashMap::default();
+    let mut candidate_names = HashSet::default();
 
     for field in root.syntax().descendants().filter_map(LuaTableField::cast) {
         let Some(LuaExpr::NameExpr(name_expr)) = field.get_value_expr() else {
@@ -418,7 +416,7 @@ fn collect_vgui_named_callback_receiver_types(
             .or_insert(Some(candidate));
     }
 
-    let mut references_by_decl: HashMap<LuaDeclId, Vec<LuaNameExpr>> = HashMap::new();
+    let mut references_by_decl: HashMap<LuaDeclId, Vec<LuaNameExpr>> = HashMap::default();
     for name_expr in root.syntax().descendants().filter_map(LuaNameExpr::cast) {
         if !name_expr
             .get_name_text()
@@ -1458,10 +1456,13 @@ fn exact_receiver_key_has_candidate(db: &DbIndex, member_key: &LuaMemberKey) -> 
     let Some(first_member) = members.next() else {
         return true;
     };
-    member_value_may_have_exact_receiver_signature(db, first_member.get_id(), &mut HashSet::new())
-        || members.any(|member| {
-            member_value_may_have_exact_receiver_signature(db, member.get_id(), &mut HashSet::new())
-        })
+    member_value_may_have_exact_receiver_signature(
+        db,
+        first_member.get_id(),
+        &mut HashSet::default(),
+    ) || members.any(|member| {
+        member_value_may_have_exact_receiver_signature(db, member.get_id(), &mut HashSet::default())
+    })
 }
 
 fn exact_receiver_member_key(index_expr: &glua_parser::LuaIndexExpr) -> Option<LuaMemberKey> {
@@ -1770,7 +1771,7 @@ fn signature_ids_from_include_returned_table_member(
     let Some(member_id) = exact_source_member_id(db, cache, &source_expr) else {
         return Vec::new();
     };
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
     let target_file_ids =
         include_targets_from_member(db, cache, file_id, call_position, member_id, &mut visited);
     let [target_file_id] = target_file_ids.as_slice() else {

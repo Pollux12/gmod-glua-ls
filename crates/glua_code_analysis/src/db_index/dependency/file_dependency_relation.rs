@@ -1,5 +1,6 @@
 use crate::FileId;
-use std::collections::{HashMap, HashSet, VecDeque};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::collections::VecDeque;
 
 #[derive(Debug)]
 pub struct FileDependencyRelation<'a> {
@@ -124,13 +125,13 @@ impl<'a> FileDependencyRelation<'a> {
 
     /// Get all direct and indirect dependencies for the file list
     pub fn collect_file_dependents(&self, file_ids: Vec<FileId>) -> Vec<FileId> {
-        let mut reverse_map: HashMap<FileId, Vec<FileId>> = HashMap::new();
+        let mut reverse_map: HashMap<FileId, Vec<FileId>> = HashMap::default();
         for (&fid, deps) in self.dependencies.iter() {
             for &dep in deps {
                 reverse_map.entry(dep).or_default().push(fid);
             }
         }
-        let mut result = HashSet::new();
+        let mut result = HashSet::default();
         let mut queue = VecDeque::new();
         for file_id in file_ids {
             queue.push_back(file_id);
@@ -154,15 +155,15 @@ mod tests {
 
     #[test]
     fn test_best_analysis_order() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // 文件1依赖文件2
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
         // 文件2没有依赖
-        map.insert(FileId::new(2), HashSet::new());
+        map.insert(FileId::new(2), HashSet::default());
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[FileId::new(1), FileId::new(2)], &HashSet::default());
@@ -172,22 +173,22 @@ mod tests {
 
     #[test]
     fn test_best_analysis_order2() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // 文件1依赖文件2和文件3
         map.insert(1.into(), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(2.into());
             s.insert(3.into());
             s
         });
         // 文件2依赖文件3
         map.insert(2.into(), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(3.into());
             s
         });
         // 文件3没有依赖
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         let rel = FileDependencyRelation::new(&map);
         let result =
             rel.get_best_analysis_order(&[1.into(), 2.into(), 3.into()], &HashSet::default());
@@ -197,23 +198,23 @@ mod tests {
 
     #[test]
     fn test_no_deps_files_first() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // 文件1依赖文件2
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
         // 文件2依赖文件1（循环依赖）
         map.insert(FileId::new(2), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(1));
             s
         });
         // 文件3没有依赖
-        map.insert(FileId::new(3), HashSet::new());
+        map.insert(FileId::new(3), HashSet::default());
         // 文件4没有依赖
-        map.insert(FileId::new(4), HashSet::new());
+        map.insert(FileId::new(4), HashSet::default());
 
         let rel = FileDependencyRelation::new(&map);
         let result = rel.get_best_analysis_order(
@@ -236,12 +237,12 @@ mod tests {
 
     #[test]
     fn the_analysis_order_places_every_dependency_before_its_dependents() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
         map.insert(2.into(), [3.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
-        map.insert(5.into(), HashSet::new());
+        map.insert(5.into(), HashSet::default());
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
         let metas = HashSet::from_iter([FileId::new(5)]);
@@ -266,12 +267,12 @@ mod tests {
 
     #[test]
     fn a_level_never_contains_a_file_depending_on_a_sibling() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into(), 3.into()].into_iter().collect());
         map.insert(2.into(), [3.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         map.insert(4.into(), [1.into()].into_iter().collect());
-        map.insert(5.into(), HashSet::new());
+        map.insert(5.into(), HashSet::default());
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=5).map(FileId::new).collect();
 
@@ -290,10 +291,10 @@ mod tests {
 
     #[test]
     fn cyclic_files_each_get_their_own_level() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         map.insert(1.into(), [2.into()].into_iter().collect());
         map.insert(2.into(), [1.into()].into_iter().collect());
-        map.insert(3.into(), HashSet::new());
+        map.insert(3.into(), HashSet::default());
         let rel = FileDependencyRelation::new(&map);
         let files: Vec<FileId> = (1..=3).map(FileId::new).collect();
 
@@ -306,13 +307,13 @@ mod tests {
 
     #[test]
     fn test_collect_file_dependents() {
-        let mut deps = HashMap::new();
+        let mut deps = HashMap::default();
         deps.insert(
             FileId::new(1),
             [FileId::new(2), FileId::new(3)].iter().cloned().collect(),
         );
         deps.insert(FileId::new(2), [FileId::new(3)].iter().cloned().collect());
-        deps.insert(FileId::new(3), HashSet::new());
+        deps.insert(FileId::new(3), HashSet::default());
         deps.insert(FileId::new(4), [FileId::new(3)].iter().cloned().collect());
 
         let rel = FileDependencyRelation::new(&deps);
@@ -323,17 +324,17 @@ mod tests {
 
     #[test]
     fn test_meta_files_first() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // 所有文件都没有依赖
-        map.insert(FileId::new(1), HashSet::new());
-        map.insert(FileId::new(2), HashSet::new());
-        map.insert(FileId::new(3), HashSet::new());
-        map.insert(FileId::new(4), HashSet::new());
+        map.insert(FileId::new(1), HashSet::default());
+        map.insert(FileId::new(2), HashSet::default());
+        map.insert(FileId::new(3), HashSet::default());
+        map.insert(FileId::new(4), HashSet::default());
 
         let rel = FileDependencyRelation::new(&map);
 
         // 文件2和4是meta文件
-        let mut metas = HashSet::new();
+        let mut metas = HashSet::default();
         metas.insert(FileId::new(2));
         metas.insert(FileId::new(4));
 
@@ -356,21 +357,21 @@ mod tests {
 
     #[test]
     fn test_meta_with_dependencies() {
-        let mut map = HashMap::new();
+        let mut map = HashMap::default();
         // File 1 depends on file 2 (meta)
         map.insert(FileId::new(1), {
-            let mut s = HashSet::new();
+            let mut s = HashSet::default();
             s.insert(FileId::new(2));
             s
         });
         // File 2 (meta) has no dependencies
-        map.insert(FileId::new(2), HashSet::new());
+        map.insert(FileId::new(2), HashSet::default());
         // File 3 has no dependencies
-        map.insert(FileId::new(3), HashSet::new());
+        map.insert(FileId::new(3), HashSet::default());
 
         let rel = FileDependencyRelation::new(&map);
 
-        let mut metas = HashSet::new();
+        let mut metas = HashSet::default();
         metas.insert(FileId::new(2));
 
         let result =

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
     DbIndex, FileId, LuaTypeCache, LuaTypeOwner,
@@ -15,7 +15,7 @@ use super::stats::is_assignment_file_define_member;
 /// Re-derives member assignment widenings from the complete writer set.
 pub(in crate::compilation::analyzer) fn rederive_contributed_member_assignments(
     db: &mut DbIndex,
-    analyzed_files: &HashSet<FileId>,
+    analyzed_files: &FxHashSet<FileId>,
 ) {
     let store_keys = db
         .get_member_index()

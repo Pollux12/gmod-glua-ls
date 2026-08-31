@@ -1,5 +1,6 @@
 use glua_parser::{LuaAst, LuaAstNode, LuaDocTagCast};
 use rowan::TextRange;
+use rustc_hash::FxHashSet;
 use std::collections::HashSet;
 
 use crate::{
@@ -211,14 +212,14 @@ fn cast_type_check(
 }
 
 fn expand_type(db: &DbIndex, typ: &LuaType) -> Option<LuaType> {
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     expand_type_recursive(db, typ, &mut visited)
 }
 
 fn expand_type_recursive(
     db: &DbIndex,
     typ: &LuaType,
-    visited: &mut HashSet<LuaType>,
+    visited: &mut FxHashSet<LuaType>,
 ) -> Option<LuaType> {
     // TODO: 优化性能
     // 防止无限递归, 性能很有问题, 但 @cast 使用频率不高, 这是可以接受的
@@ -247,7 +248,7 @@ fn expand_type_recursive(
         }
         LuaType::Union(union_type) => {
             // 递归展开 union 中的每个类型
-            let mut expanded_types = HashSet::new();
+            let mut expanded_types = HashSet::default();
             let mut has_nil = false;
             for inner_type in union_type.types() {
                 if inner_type.is_nil() {

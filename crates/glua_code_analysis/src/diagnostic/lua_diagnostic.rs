@@ -1,9 +1,9 @@
+use rustc_hash::FxHashMap;
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Instant;
 
 use log::info;
-use rustc_hash::FxHashMap;
 
 pub use super::checker::DiagnosticContext;
 use super::checker::SharedDiagnosticData;
@@ -25,7 +25,7 @@ use tokio_util::sync::CancellationToken;
 pub struct LuaDiagnostic {
     enable: bool,
     config: Arc<LuaDiagnosticConfig>,
-    workspace_configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
+    workspace_configs: FxHashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
 }
 
 impl Default for LuaDiagnostic {
@@ -39,7 +39,7 @@ impl LuaDiagnostic {
         Self {
             enable: true,
             config: Arc::new(LuaDiagnosticConfig::default()),
-            workspace_configs: HashMap::new(),
+            workspace_configs: FxHashMap::default(),
         }
     }
 
@@ -53,7 +53,7 @@ impl LuaDiagnostic {
         &mut self,
         configs: HashMap<WorkspaceId, Arc<LuaDiagnosticConfig>>,
     ) {
-        self.workspace_configs = configs;
+        self.workspace_configs = configs.into_iter().collect();
     }
 
     // 只开启指定的诊断
@@ -140,9 +140,9 @@ impl LuaDiagnostic {
             property_name_candidates,
         ) = std::thread::scope(|s| {
             let workspace_realms = s.spawn(|| {
-                let mut gm_method_realms = HashMap::new();
-                let mut callee_realms_by_workspace = HashMap::new();
-                let mut realm_call_candidates_by_workspace = HashMap::new();
+                let mut gm_method_realms = FxHashMap::default();
+                let mut callee_realms_by_workspace = FxHashMap::default();
+                let mut realm_call_candidates_by_workspace = FxHashMap::default();
                 for workspace_id in module_index.get_main_workspace_ids() {
                     let realms = Arc::new(precompute_gm_method_realms(db, workspace_id));
                     let mut callee_realm_data = precompute_callee_realm_data_for_workspace(

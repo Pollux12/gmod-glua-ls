@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use rowan::{TextRange, TextSize};
 
@@ -219,7 +219,7 @@ impl GenericEffectId {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TagGenericParams {
-    params: HashMap<String, (usize, GenericParam)>,
+    params: FxHashMap<String, (usize, GenericParam)>,
     is_func: bool,
     next_index: usize,
 }
@@ -227,7 +227,7 @@ pub struct TagGenericParams {
 impl TagGenericParams {
     pub fn new(is_func: bool, start: usize) -> Self {
         Self {
-            params: HashMap::new(),
+            params: FxHashMap::default(),
             is_func,
             next_index: start,
         }
