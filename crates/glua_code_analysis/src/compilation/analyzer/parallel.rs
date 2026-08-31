@@ -4,8 +4,8 @@
 //! collection) process each file independently: they read only the file's own
 //! AST plus pre-existing immutable `&DbIndex` state, and produce a per-file
 //! result that is merged back into the db sequentially afterward. These helpers
-//! run the per-file work across a small thread pool using `std::thread::scope`,
-//! mirroring the existing parallel diagnostics path.
+//! run the per-file work on rayon's persistent global thread pool, so a cold run
+//! pays for thread creation once instead of once per pass.
 //!
 //! Safety model:
 //! - `&DbIndex` is shared immutably across worker threads. The diagnostics phase
@@ -17,15 +17,18 @@
 //! - Results are written back to the db on the caller's thread in deterministic
 //!   file order, preserving identical behavior to the sequential version.
 
+use std::sync::Once;
 use std::sync::atomic::{AtomicUsize, Ordering};
+
+use rayon::prelude::*;
 
 use crate::db_index::DbIndex;
 use crate::{FileId, profile::Profile};
 
-/// Below this many files, `thread::scope` spawn/join and atomic dispatch cost
-/// more than the per-file work itself saves, so the batch runs inline. Picked
-/// from the profiled cost of one pass over a handful of small files versus
-/// spawning/parking a worker pool for it.
+/// Below this many files, dispatch and cross-thread handoff cost more than the
+/// per-file work itself saves, so the batch runs inline. Picked from the
+/// profiled cost of one pass over a handful of small files versus fanning it
+/// out to a worker pool.
 const MIN_PARALLEL_FILES: usize = 8;
 
 /// Number of worker threads to use for per-file analysis passes. Capped at 16 to
@@ -38,6 +41,20 @@ fn worker_count(file_count: usize) -> usize {
         .map(|n| n.get())
         .unwrap_or(1);
     cores.clamp(1, 16).min(file_count)
+}
+
+/// Size rayon's global pool to the same 16-thread cap the scoped pool used.
+/// `build_global` is a no-op error if something already initialized the pool.
+pub(crate) fn init_pool() {
+    static INIT: Once = Once::new();
+    INIT.call_once(|| {
+        let cores = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(1);
+        let _ = rayon::ThreadPoolBuilder::new()
+            .num_threads(cores.clamp(1, 16))
+            .build_global();
+    });
 }
 
 /// Run `f` for every file id concurrently and collect the results into a `Vec`
@@ -59,54 +76,38 @@ where
     }
 
     let _p = Profile::cond_new("parallel map_files", n > 1);
-
-    // Pre-fill the output so workers can write by index without coordination.
-    // Each slot is written exactly once by exactly one worker, so we use a raw
-    // pointer wrapper guarded by the disjoint-index invariant.
-    let mut results: Vec<Option<T>> = (0..n).map(|_| None).collect();
-    let slots = SlotsPtr(results.as_mut_ptr());
-    let next = AtomicUsize::new(0);
+    init_pool();
 
     // Longest-processing-time-first dispatch. Per-file cost spans orders of
-    // magnitude, so handing work out in slice order let a large file drawn last
-    // run alone while every other worker idled. Only the order in which slots
-    // are claimed changes; each still holds its own file's result, so callers
-    // see the same index-aligned `Vec` as before.
+    // magnitude, so feeding work in slice order let a large file drawn last run
+    // alone while every other worker idled. Only the order in which files are
+    // picked up changes; each result carries its own index, so callers see the
+    // same index-aligned `Vec` as before.
     let dispatch = dispatch_order(db, file_ids);
     let report_step = if crate::progress::is_active() {
         (n / 50).max(1)
     } else {
         0
     };
+    let done = AtomicUsize::new(0);
 
-    std::thread::scope(|scope| {
-        for _ in 0..workers {
-            let next = &next;
-            let f = &f;
-            let slots = &slots;
-            let dispatch = &dispatch;
-            scope.spawn(move || {
-                loop {
-                    let seq = next.fetch_add(1, Ordering::Relaxed);
-                    if seq >= n {
-                        break;
-                    }
-                    if report_step != 0 && seq.is_multiple_of(report_step) {
-                        crate::progress::advance_current_phase(seq, n, "files");
-                    }
-                    let idx = dispatch[seq];
-                    let file_id = file_ids[idx];
-                    let value = f(db, file_id);
-                    // SAFETY: each `idx` is handed to exactly one worker via the
-                    // atomic counter, so writes target disjoint slots and never
-                    // alias. The `Vec` outlives the scope.
-                    unsafe {
-                        slots.0.add(idx).write(Some(value));
-                    }
+    let computed: Vec<(usize, T)> = dispatch
+        .par_iter()
+        .map(|&idx| {
+            if report_step != 0 {
+                let seq = done.fetch_add(1, Ordering::Relaxed);
+                if seq.is_multiple_of(report_step) {
+                    crate::progress::advance_current_phase(seq, n, "files");
                 }
-            });
-        }
-    });
+            }
+            (idx, f(db, file_ids[idx]))
+        })
+        .collect();
+
+    let mut results: Vec<Option<T>> = (0..n).map(|_| None).collect();
+    for (idx, value) in computed {
+        results[idx] = Some(value);
+    }
 
     results
         .into_iter()
@@ -128,12 +129,3 @@ fn dispatch_order(db: &DbIndex, file_ids: &[FileId]) -> Vec<usize> {
     });
     order
 }
-
-/// Wrapper making a `*mut Option<T>` shareable across the scoped threads. Safe
-/// because workers only write disjoint indices (enforced by the atomic counter).
-struct SlotsPtr<T>(*mut Option<T>);
-
-// SAFETY: the pointer is only used to write disjoint slots from worker threads;
-// `T: Send` ensures the written values can cross threads.
-unsafe impl<T: Send> Sync for SlotsPtr<T> {}
-unsafe impl<T: Send> Send for SlotsPtr<T> {}

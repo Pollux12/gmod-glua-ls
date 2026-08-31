@@ -64,3 +64,4 @@ luars.workspace = true
 reqwest.workspace = true
 schema_to_glua.workspace = true
 rustc-hash.workspace = true
+rayon.workspace = true
