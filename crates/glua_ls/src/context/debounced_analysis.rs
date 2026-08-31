@@ -1,4 +1,4 @@
-use glua_code_analysis::{EmmyLuaAnalysis, FileId};
+use glua_code_analysis::{DirtySet, EmmyLuaAnalysis, FileId};
 use lsp_types::Uri;
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -386,20 +386,13 @@ impl DebouncedAnalysis {
         }
     }
 
-    /// Re-index the edited files' own entries, and report the dependency
-    /// expansion the ripple still owes them.
-    ///
-    /// The expansion is captured *before* the self-index, because deriving it
-    /// from a partly-updated index under-expands and leaves dependents holding
-    /// inferences a cold build would not produce.
+    /// Re-index the edited files' own entries, and report which other files
+    /// the edit invalidated.
     ///
     /// This takes the write lock and gives it back, which is the whole point: a
     /// freshness flag published while the lock is still held buys a waiting
     /// request nothing, since it cannot read the index until the lock is free.
-    async fn self_index_without_queuing(
-        &self,
-        file_ids: Vec<FileId>,
-    ) -> Option<(Vec<FileId>, Vec<FileId>)> {
+    async fn self_index_without_queuing(&self, file_ids: Vec<FileId>) -> Option<DirtySet> {
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
@@ -407,13 +400,13 @@ impl DebouncedAnalysis {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
-                // Change-aware: only expand to dependents when the file's
-                // exported interface actually changed. Most keystrokes (typing
-                // inside a function, trailing comment, local rename) keep the
-                // same fingerprint and collapse the ripple to empty.
-                let (changed, expansion) = guard.self_index_files_and_get_ripple_with_changed(file_ids);
+                // Change-aware: the dirty set holds only the files that read a
+                // fact this edit actually moved. Most keystrokes (typing inside
+                // a function, trailing comment, local rename) export nothing
+                // new and leave it empty.
+                let dirty = guard.self_index_and_diff(file_ids);
                 cache.invalidate();
-                (changed, expansion)
+                dirty
             }) => match result {
                 Ok(result) => Some(result),
                 Err(err) => {
@@ -424,11 +417,7 @@ impl DebouncedAnalysis {
         }
     }
 
-    async fn reindex_files_without_queuing(
-        &self,
-        file_ids: Vec<FileId>,
-        expansion: Vec<FileId>,
-    ) -> bool {
+    async fn ripple_without_queuing(&self, dirty: DirtySet) -> bool {
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
@@ -438,7 +427,7 @@ impl DebouncedAnalysis {
             _ = self.shutdown.cancelled() => false,
             result = tokio::task::spawn_blocking(move || {
                 let mut guard = analysis.blocking_write();
-                guard.reindex_expanded_files(file_ids, expansion);
+                guard.ripple(dirty);
                 // Invalidate under the write lock so no reader can observe the
                 // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
@@ -481,9 +470,9 @@ impl DebouncedAnalysis {
     pub async fn run(&self) {
         let mut idle_workspace_diagnostic_token: Option<CancellationToken> = None;
         // The ripple owed by the self-indexes run so far in this typing burst,
-        // and the union of the expansions each of them captured.
+        // and the union of the dirty sets each of them reported.
         let mut owed_files: HashSet<FileId> = HashSet::new();
-        let mut owed_expansion: HashSet<FileId> = HashSet::new();
+        let mut owed_ripple: Option<DirtySet> = None;
         let mut burst_started_at: Option<Instant> = None;
         loop {
             // Register before testing the condition: `notify_waiters()` stores
@@ -537,9 +526,7 @@ impl DebouncedAnalysis {
                 // instead of waiting out the whole dependency ripple. The
                 // ripple is by far the larger half — measured on a gamemode
                 // workspace, 106ms against 5.1s.
-                let Some((changed_files, expansion)) =
-                    self.self_index_without_queuing(file_ids.clone()).await
-                else {
+                let Some(dirty) = self.self_index_without_queuing(file_ids.clone()).await else {
                     if self.shutdown.is_cancelled() {
                         return;
                     }
@@ -572,12 +559,11 @@ impl DebouncedAnalysis {
                 // would put them behind the whole ripple.
                 self.await_reader_handoff().await;
 
-                if expansion.is_empty() {
-                    // No exports changed - the self-index already makes these
-                    // files answerable, and no dependent needs re-indexing.
-                    // Clear them from reindexing immediately so dirty state
-                    // can settle without waiting for a ripple that will never
-                    // come.
+                if dirty.is_empty() {
+                    // Nothing else reads a fact this edit moved - the
+                    // self-index already makes these files answerable. Clear
+                    // them from reindexing immediately so dirty state can
+                    // settle without waiting for a ripple that will never come.
                     {
                         let mut reindexing = self.reindexing_files.lock().await;
                         for id in &file_ids {
@@ -586,38 +572,31 @@ impl DebouncedAnalysis {
                     }
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
-                    if owed_files.is_empty() {
+                    if owed_ripple.is_none() {
                         continue;
                     }
                 } else {
-                    // Only the files whose exports actually changed need a
-                    // ripple; the rest are already settled by the self-index.
-                    let changed_set: HashSet<FileId> = changed_files.iter().copied().collect();
-                    {
-                        let mut reindexing = self.reindexing_files.lock().await;
-                        for id in &file_ids {
-                            if !changed_set.contains(id) {
-                                reindexing.remove(id);
-                            }
-                        }
+                    owed_files.extend(file_ids.iter().copied());
+                    match &mut owed_ripple {
+                        Some(owed) => owed.extend(dirty),
+                        none => *none = Some(dirty),
                     }
-                    owed_files.extend(changed_files.iter().copied());
-                    owed_expansion.extend(expansion);
                     burst_started_at.get_or_insert_with(Instant::now);
                 }
             }
 
-            if owed_files.is_empty() {
+            let Some(owed) = owed_ripple.take() else {
                 self.refresh_dirty_state().await;
                 self.reindex_notify.notify_waiters();
                 continue;
-            }
+            };
 
             // Hold the ripple until typing has genuinely stopped. Another edit
             // sends us back for its own self-index, and the ripple it owes
             // joins this one.
             let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
             if !self.ripple_quiet_elapsed(burst_started_at_instant).await {
+                owed_ripple = Some(owed);
                 continue;
             }
 
@@ -627,21 +606,14 @@ impl DebouncedAnalysis {
                     ids.sort();
                     ids
                 };
-                let ripple_expansion: Vec<FileId> = {
-                    let mut ids: Vec<FileId> = owed_expansion.iter().copied().collect();
-                    ids.sort();
-                    ids
-                };
                 log::info!(
-                    "ripple: {} edited file(s) over {} file(s) after {}ms quiet",
+                    "ripple: {} edited file(s) over {} dirty file(s) after {}ms quiet",
                     ripple_files.len(),
-                    ripple_expansion.len(),
+                    owed.dirty_len(),
                     RIPPLE_QUIET.as_millis()
                 );
 
-                let reindex_completed = self
-                    .reindex_files_without_queuing(ripple_files.clone(), ripple_expansion)
-                    .await;
+                let reindex_completed = self.ripple_without_queuing(owed).await;
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
@@ -650,7 +622,6 @@ impl DebouncedAnalysis {
                     }
                 }
                 owed_files.clear();
-                owed_expansion.clear();
                 burst_started_at = None;
 
                 self.reindex_notify.notify_waiters();
@@ -1116,10 +1087,12 @@ mod tests {
                 Arc::new(AtomicU8::new(0)),
                 test_lsp_features(),
             );
+            let dirty = debounced_analysis
+                .self_index_without_queuing(vec![api_file_id])
+                .await
+                .expect("self-index should complete");
             verify_that!(
-                debounced_analysis
-                    .reindex_files_without_queuing(vec![api_file_id], vec![api_file_id])
-                    .await,
+                debounced_analysis.ripple_without_queuing(dirty).await,
                 eq(true)
             )?;
 

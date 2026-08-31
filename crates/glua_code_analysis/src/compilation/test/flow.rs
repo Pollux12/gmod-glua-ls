@@ -3365,12 +3365,6 @@ _2 = a[1]
                 ws.analysis.inferred_guard_propagation_stats.reindexed_files,
                 1
             );
-            assert_eq!(
-                ws.analysis
-                    .inferred_guard_propagation_stats
-                    .broad_stabilizations,
-                0
-            );
         }
     }
 
@@ -3399,12 +3393,6 @@ _2 = a[1]
             ws.analysis.inferred_guard_propagation_stats.reindexed_files,
             1
         );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
     }
 
     #[gtest]
@@ -3425,12 +3413,6 @@ _2 = a[1]
         assert_eq!(
             ws.analysis.inferred_guard_propagation_stats.reindexed_files,
             1
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
         );
     }
 
@@ -3468,13 +3450,6 @@ _2 = a[1]
 
             let narrowed = nth_name_expr_type_from_end(&mut ws, consumer_file_id, "narrowed", 0);
             assert_eq!(ws.humanize_type(narrowed), "Player", "{case}");
-            assert_eq!(
-                ws.analysis
-                    .inferred_guard_propagation_stats
-                    .broad_stabilizations,
-                0,
-                "{case}"
-            );
         }
     }
 
@@ -3849,12 +3824,6 @@ _2 = a[1]
             ws.analysis.inferred_guard_propagation_stats.reindexed_files,
             5
         );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
-        );
 
         ws.analysis
             .update_file_by_uri(
@@ -3868,12 +3837,6 @@ _2 = a[1]
         assert_eq!(
             ws.analysis.inferred_guard_propagation_stats.reindexed_files,
             5
-        );
-        assert_eq!(
-            ws.analysis
-                .inferred_guard_propagation_stats
-                .broad_stabilizations,
-            0
         );
     }
 

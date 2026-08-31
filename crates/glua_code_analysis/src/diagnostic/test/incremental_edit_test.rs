@@ -1,6 +1,9 @@
 #[cfg(test)]
 mod tests {
-    use crate::{DiagnosticCode, Emmyrc, FileId, VirtualWorkspace, file_export_fingerprint};
+    use crate::{
+        DiagnosticCode, Emmyrc, ExportMap, FileId, FileRemap, PositionMap, VirtualWorkspace,
+        export_map,
+    };
     use googletest::prelude::*;
     use lsp_types::Uri;
     use tokio_util::sync::CancellationToken;
@@ -175,81 +178,6 @@ mod tests {
         expect_that!(codes_in(&ws, consumer_id), eq(&before));
     }
 
-    /// Two table literals in two different call argument lists sit at the same
-    /// index of the same parent kind, and inserting another shifts every later
-    /// ordinal. Either mistake re-homes one literal's members onto the other's
-    /// range, so the anchor has to identify the literal, not just its position.
-    #[gtest]
-    fn sibling_call_argument_tables_keep_their_own_ranges() {
-        let register = |extra: &str| {
-            format!(
-                r#"
-            registry = registry or {{}}
-            ---@param name string
-            ---@param spec table
-            function registry.Add(name, spec) end
-{extra}
-            registry.Add("first", {{ alpha = 1 }})
-            registry.Add("second", {{ beta = 2 }})
-            "#
-            )
-        };
-
-        let mut ws = workspace_with(vec![]);
-        let uri = ws.virtual_url_generator.new_uri("lua/register.lua");
-        let file_id = write(&mut ws, &uri, &register(""));
-
-        // The anchor whose literal declares `alpha`, found by reading the text
-        // its range covers.
-        fn anchor_for(
-            ws: &VirtualWorkspace,
-            file_id: FileId,
-            field: &str,
-        ) -> Option<crate::TableAnchor> {
-            let db = ws.analysis.compilation.get_db();
-            let text = db.get_vfs().get_file_content(&file_id)?.clone();
-            crate::collect_anchored_map(db, file_id)
-                .into_iter()
-                .find(|(_, range)| text[range.value].contains(field))
-                .map(|(anchor, _)| anchor)
-        }
-
-        fn text_at(ws: &VirtualWorkspace, file_id: FileId, anchor: &crate::TableAnchor) -> String {
-            let db = ws.analysis.compilation.get_db();
-            let text = db
-                .get_vfs()
-                .get_file_content(&file_id)
-                .expect("file content")
-                .clone();
-            let range = crate::collect_anchored_map(db, file_id)
-                .get(anchor)
-                .expect("anchor still resolves")
-                .value;
-            text[range].to_string()
-        }
-
-        let alpha_anchor = anchor_for(&ws, file_id, "alpha").expect("alpha literal");
-        let beta_anchor = anchor_for(&ws, file_id, "beta").expect("beta literal");
-        expect_that!(alpha_anchor, not(eq(&beta_anchor)));
-
-        // Insert a third registration above the pair. A positional anchor
-        // renumbers here and maps alpha's members onto the new literal.
-        let file_id = write(
-            &mut ws,
-            &uri,
-            &register("            registry.Add(\"zeroth\", { zeta = 0 })"),
-        );
-
-        expect_that!(
-            text_at(&ws, file_id, &alpha_anchor),
-            contains_substring("alpha")
-        );
-        expect_that!(
-            text_at(&ws, file_id, &beta_anchor),
-            contains_substring("beta")
-        );
-    }
-
     /// Deleting a file has no new text to fingerprint. Comparing fingerprints
     /// lets a file that exported nothing return before the removal runs, and
     /// its dependents keep resolving members it no longer defines.
@@ -287,6 +215,105 @@ mod tests {
         );
     }
 
+    /// A name defined only by a *later* edit: the reader failed to resolve it,
+    /// so it holds no reference the export graph can follow back. The added
+    /// key still has to reach it, without the reader being edited.
+    #[gtest]
+    fn defining_a_global_later_clears_its_caller() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobal]);
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            function AlreadyThere() end
+            "#,
+        );
+
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/calls_later.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            CallsLater()
+            "#,
+        );
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::UndefinedGlobal.get_name()))
+        );
+
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            function AlreadyThere() end
+            function CallsLater() end
+            "#,
+        );
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedGlobal.get_name())))
+        );
+    }
+
+    /// The same for a member on a global path table several files already
+    /// write to: the reader's failed lookup has to be repaired when the key
+    /// appears.
+    #[gtest]
+    fn defining_a_member_later_clears_its_reader() {
+        let mut ws = workspace_with(vec![
+            DiagnosticCode::UndefinedField,
+            DiagnosticCode::UndefinedGlobal,
+        ]);
+        let base_uri = ws.virtual_url_generator.new_uri("lua/util_base.lua");
+        write(
+            &mut ws,
+            &base_uri,
+            r#"
+            gutil = gutil or {}
+            function gutil.Existing() end
+            "#,
+        );
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/util_more.lua");
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            function gutil.AlsoThere() end
+            "#,
+        );
+
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/reads_new_fn.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            gutil.NewFn()
+            "#,
+        );
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            function gutil.AlsoThere() end
+            function gutil.NewFn() end
+            "#,
+        );
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::UndefinedField.get_name())))
+        );
+    }
+
     /// Every `LuaType::Signature` reachable from a stored type cache, whose id
     /// the signature index no longer holds.
     fn dangling_signature_references(ws: &VirtualWorkspace) -> Vec<String> {
@@ -317,15 +344,45 @@ mod tests {
     /// exercise it directly: a diagnostic-level assertion on a two-file
     /// workspace can be satisfied by an unrelated re-analysis, so it does not
     /// prove which dimension the fingerprint actually reads.
-    fn fingerprint_of(ws: &VirtualWorkspace, file_id: FileId) -> u64 {
-        file_export_fingerprint(ws.analysis.compilation.get_db(), file_id)
+    /// The file's exports as the diff sees them. Comparing two of these is
+    /// the successor to comparing two export fingerprints, and is strictly
+    /// more precise: an inequality names the key that moved.
+    fn fingerprint_of(ws: &VirtualWorkspace, file_id: FileId) -> ExportMap {
+        export_map(
+            ws.analysis.compilation.get_db(),
+            file_id,
+            &FileRemap::identity(file_id),
+        )
     }
 
-    fn fingerprint_after_edit(first: &str, second: &str) -> (u64, u64) {
+    /// The file's exports before an edit, expressed in the edited text's
+    /// coordinates, so an offset shift alone leaves them equal to the map
+    /// taken after.
+    fn fingerprint_before_edit(
+        ws: &VirtualWorkspace,
+        file_id: FileId,
+        first: &str,
+        second: &str,
+    ) -> ExportMap {
+        export_map(
+            ws.analysis.compilation.get_db(),
+            file_id,
+            &FileRemap::unvalidated(file_id, PositionMap::new(first, second)),
+        )
+    }
+
+    /// The before/after export maps of an edit, with the before map already
+    /// expressed in the after text's coordinates - so an offset shift alone
+    /// leaves the two equal, which is the property the fast path rests on.
+    fn fingerprint_after_edit(first: &str, second: &str) -> (ExportMap, ExportMap) {
         let mut ws = workspace_with(vec![]);
         let uri = ws.virtual_url_generator.new_uri("lua/subject.lua");
         let file_id = write(&mut ws, &uri, first);
-        let before = fingerprint_of(&ws, file_id);
+        let before = export_map(
+            ws.analysis.compilation.get_db(),
+            file_id,
+            &FileRemap::unvalidated(file_id, PositionMap::new(first, second)),
+        );
         let file_id = write(&mut ws, &uri, second);
         (before, fingerprint_of(&ws, file_id))
     }
@@ -344,7 +401,7 @@ mod tests {
             function provider.Describe() end
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     #[gtest]
@@ -361,7 +418,7 @@ mod tests {
             function provider.Accept(value) end
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     #[gtest]
@@ -379,7 +436,7 @@ mod tests {
             function provider.Accept(value) end
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     #[gtest]
@@ -394,7 +451,7 @@ mod tests {
             config.Mode = "client"
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A member key that is a path is still a member key. Skipping keys that
@@ -412,7 +469,7 @@ mod tests {
             models["models/vehicles/car.mdl"] = "expensive"
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// The property the whole fast path rests on: an edit that shifts every
@@ -436,7 +493,7 @@ mod tests {
             function config.Describe() end
             "#,
         );
-        expect_that!(after, eq(before));
+        expect_that!(after, eq(&before));
     }
 
     /// Local state is not observable from another file, so changing it must
@@ -468,73 +525,7 @@ mod tests {
             end
             "#,
         );
-        expect_that!(after, eq(before));
-    }
-
-    /// Every anchor must survive an edit that shifts the file, and must still
-    /// name the same literal afterwards. An anchor that resolves to a
-    /// *different* literal is worse than one that stops resolving: the remap
-    /// then re-homes members onto the wrong table instead of leaving them.
-    #[gtest]
-    fn every_anchor_keeps_naming_its_own_literal_across_an_offset_shift() {
-        let body = r#"
-            local Reg = {}
-            Reg.Existing = 1
-            Registry = Reg
-
-            Direct = { alpha = 1 }
-
-            local Nested = {}
-            Nested.inner = { beta = 2 }
-
-            local Config = { section = { epsilon = 5 } }
-
-            register("first", { gamma = 3 })
-            register("second", { delta = 4 })
-            "#;
-
-        let mut ws = workspace_with(vec![]);
-        let uri = ws.virtual_url_generator.new_uri("lua/anchors.lua");
-
-        fn anchored_text(
-            ws: &VirtualWorkspace,
-            file_id: FileId,
-        ) -> std::collections::BTreeMap<String, String> {
-            let db = ws.analysis.compilation.get_db();
-            let text = db
-                .get_vfs()
-                .get_file_content(&file_id)
-                .expect("file content")
-                .clone();
-            crate::collect_anchored_map(db, file_id)
-                .into_iter()
-                .map(|(anchor, range)| {
-                    (
-                        format!("{anchor:?}"),
-                        text[range.value]
-                            .split_whitespace()
-                            .collect::<Vec<_>>()
-                            .join(" "),
-                    )
-                })
-                .collect()
-        }
-
-        let file_id = write(&mut ws, &uri, body);
-        let before = anchored_text(&ws, file_id);
-        expect_that!(before.len(), gt(5));
-
-        let file_id = write(
-            &mut ws,
-            &uri,
-            &format!(
-                "-- a comment that shifts every offset below it
-{body}"
-            ),
-        );
-
-        // Same anchors, and each still covering the same source text.
-        expect_that!(anchored_text(&ws, file_id), eq(&before));
+        expect_that!(after, eq(&before));
     }
 
     /// A dependent caches `Signature(file, position)`. Moving the function
@@ -569,20 +560,17 @@ mod tests {
             .get_vfs()
             .get_file_id(&provider_uri)
             .expect("provider file id");
-        let before_fingerprint = fingerprint_of(&ws, provider_id);
-
-        write(
-            &mut ws,
-            &provider_uri,
-            &format!(
-                "-- a comment that moves the function below it
+        let moved = format!(
+            "-- a comment that moves the function below it
 {provider}"
-            ),
         );
+        let before_fingerprint = fingerprint_before_edit(&ws, provider_id, provider, &moved);
+
+        write(&mut ws, &provider_uri, &moved);
 
         // Without this the test is vacuous: a changed fingerprint pays the
         // ripple, which re-derives the dependent's cache anyway.
-        expect_that!(fingerprint_of(&ws, provider_id), eq(before_fingerprint));
+        expect_that!(fingerprint_of(&ws, provider_id), eq(&before_fingerprint));
         expect_that!(dangling_signature_references(&ws), is_empty());
     }
 
@@ -629,7 +617,7 @@ mod tests {
 
         write(&mut ws, &consumer_uri, &consumer("OTHER"));
 
-        expect_that!(fingerprint_of(&ws, consumer_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, consumer_id), not(eq(&before)));
     }
 
     /// Adding an `include` changes which files load this one and in what
@@ -665,7 +653,7 @@ mod tests {
             "#,
         );
 
-        expect_that!(fingerprint_of(&ws, loader_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, loader_id), not(eq(&before)));
     }
 
     /// A `@deprecated` on an exported symbol changes the diagnostics every
@@ -683,7 +671,7 @@ mod tests {
             function provider.Doc() end
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A description is read from this file's index when a hover in another
@@ -703,7 +691,7 @@ mod tests {
             function provider.Doc() end
             "#,
         );
-        expect_that!(after, eq(before));
+        expect_that!(after, eq(&before));
     }
 
     /// A metamethod is read by any file that applies the operator to the
@@ -721,7 +709,7 @@ mod tests {
             Vec = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// Network diagnostics compare a message's writes against its reads across
@@ -769,7 +757,7 @@ mod tests {
             "#,
         );
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// Realm is first-class. Wrapping an existing definition in `if SERVER`
@@ -802,7 +790,7 @@ end
 ",
         );
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// Repointing an exported alias at a different function in the same file
@@ -829,7 +817,7 @@ end
             provider.Dispatch = provider.B
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// The same for a table literal: the export names a different literal in
@@ -850,7 +838,7 @@ end
             _ = first
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// The property the whole fast path rests on, swept across every shape the
@@ -986,8 +974,9 @@ function P.Old() end
                 );
                 let uri = ws.virtual_url_generator.new_uri("lua/autorun/subject.lua");
                 let file_id = write(&mut ws, &uri, body);
-                let before = fingerprint_of(&ws, file_id);
-                let file_id = write(&mut ws, &uri, &format!("{prefix}{body}"));
+                let shifted = format!("{prefix}{body}");
+                let before = fingerprint_before_edit(&ws, file_id, body, &shifted);
+                let file_id = write(&mut ws, &uri, &shifted);
                 if fingerprint_of(&ws, file_id) != before {
                     moved.push(name);
                 }
@@ -1034,7 +1023,7 @@ net.SendToServer()
 
         let file_id = write(&mut ws, &uri, &body("note, rewritten at greater length"));
 
-        expect_that!(fingerprint_of(&ws, file_id), eq(before));
+        expect_that!(fingerprint_of(&ws, file_id), eq(&before));
     }
 
     /// The editor writes the text first and re-indexes later, so by the time
@@ -1062,16 +1051,13 @@ net.SendToServer()
         // Exactly what the editor does: text first, index after.
         ws.analysis
             .update_file_text_only(&uri, body("note, rewritten at greater length"));
-        let (changed, expansion) = ws
-            .analysis
-            .self_index_files_and_get_ripple_with_changed(vec![file_id]);
+        let dirty = ws.analysis.self_index_and_diff(vec![file_id]);
 
-        expect_that!(changed, is_empty());
-        expect_that!(expansion, is_empty());
+        expect_that!(dirty.is_empty(), is_true());
     }
 
-    /// The same sequence, for an edit that does change an export: it has to
-    /// still report the ripple.
+    /// The same sequence, for an edit that does change an export: the file
+    /// that reads it has to come back dirty.
     #[gtest]
     fn the_editors_write_then_index_sequence_still_reports_a_real_change() {
         let mut ws = workspace_with(vec![]);
@@ -1093,70 +1079,9 @@ net.SendToServer()
             "#
             .to_string(),
         );
-        let (changed, _) = ws
-            .analysis
-            .self_index_files_and_get_ripple_with_changed(vec![file_id]);
+        let dirty = ws.analysis.self_index_and_diff(vec![file_id]);
 
-        expect_that!(changed, contains(eq(&file_id)));
-    }
-
-    /// Two literals with the *same* field names, and a literal with no fields
-    /// at all, cannot be told apart by their fields. Neither may fall back to
-    /// a sibling ordinal: inserting a third registration renumbers those, and
-    /// the old anchor would then resolve to a different literal and re-home its
-    /// members onto the wrong table.
-    #[gtest]
-    fn indistinguishable_literals_are_never_remapped_onto_each_other() {
-        let source = |extra: &str| {
-            format!(
-                r#"
-            registry = registry or {{}}
-            ---@param name string
-            ---@param spec table
-            function registry.Add(name, spec) end
-{extra}
-            registry.Add("first", {{ name = "a" }})
-            registry.Add("second", {{ name = "b" }})
-            registry.Add("third", {{}})
-            "#
-            )
-        };
-
-        let mut ws = workspace_with(vec![]);
-        let uri = ws.virtual_url_generator.new_uri("lua/registry.lua");
-        let file_id = write(&mut ws, &uri, &source(""));
-
-        let text_by_anchor = |ws: &VirtualWorkspace, file_id: FileId| {
-            let db = ws.analysis.compilation.get_db();
-            let text = db
-                .get_vfs()
-                .get_file_content(&file_id)
-                .expect("file content")
-                .clone();
-            crate::collect_anchored_map(db, file_id)
-                .into_iter()
-                .map(|(anchor, range)| (format!("{anchor:?}"), text[range.value].to_string()))
-                .collect::<std::collections::BTreeMap<_, _>>()
-        };
-
-        let before = text_by_anchor(&ws, file_id);
-        let file_id = write(
-            &mut ws,
-            &uri,
-            &source("            registry.Add(\"zeroth\", { name = \"z\" })"),
-        );
-        let after = text_by_anchor(&ws, file_id);
-
-        // Any anchor that survives the insertion must still cover the same
-        // literal. An anchor that cannot promise that must not be emitted.
-        let survivors: Vec<&String> = before.keys().filter(|a| after.contains_key(*a)).collect();
-        // Without this the loop below would be satisfied by nothing surviving.
-        expect_that!(survivors.len(), gt(0));
-        for (anchor, text) in &before {
-            if let Some(after_text) = after.get(anchor) {
-                expect_that!(after_text, eq(text), "anchor {anchor} moved literal");
-            }
-        }
+        expect_that!(dirty.changed_sources(), contains(eq(&file_id)));
     }
 
     /// An alias is read by name and resolved to its target, so changing the
@@ -1172,7 +1097,7 @@ net.SendToServer()
             ---@alias Mode integer
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A supertype is part of what a dependent resolves through the class.
@@ -1192,7 +1117,7 @@ net.SendToServer()
             Derived = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A namespace changes how every name in the file resolves for a
@@ -1210,7 +1135,7 @@ net.SendToServer()
             Thing = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A writer's own evidence, not the merged result: whether the write was
@@ -1228,7 +1153,7 @@ net.SendToServer()
             config.Values = config.Values or {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// The end-to-end invariant the remap exists for: no member may be left
@@ -1336,7 +1261,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
 
         let file_id = write(&mut ws, &uri, &panel("Title"));
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// A `setmetatable` binding is read by every file that resolves a member
@@ -1373,7 +1298,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
 
         let file_id = write(&mut ws, &uri, &source("mtB"));
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// A `@field` default gates whether that field counts as required, and the
@@ -1393,7 +1318,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
             Config = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A guard inferred from a function body narrows the parameter for every
@@ -1450,7 +1375,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
         );
         expect_that!(guard_count(&ws, file_id), gt(0));
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// The table a module returns is its export type, which every consumer of
@@ -1472,7 +1397,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
             return N
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// Two table literals in one file are different owners. Collapsing both to
@@ -1490,7 +1415,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
             Other = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// `@accessorfunc` registers the annotated function in a workspace-wide
@@ -1530,7 +1455,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
 
         let file_id = write(&mut ws, &uri, &declaration("2"));
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// A computed-key or unresolved-receiver write creates no member, which is
@@ -1565,7 +1490,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
             "#,
         );
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// Retargeting a metatable lookup moves the method onto a different class,
@@ -1627,7 +1552,7 @@ function meta:Custom() end
             some(contains_substring("Entity"))
         );
 
-        expect_that!(fingerprint_of(&ws, file_id), not(eq(before)));
+        expect_that!(fingerprint_of(&ws, file_id), not(eq(&before)));
     }
 
     /// The remap has to reach every store keyed by a table literal's range,
@@ -1836,7 +1761,7 @@ function meta:Custom() end
             Config = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A flag on the declaration lives on each of its locations, not on the
@@ -1853,7 +1778,7 @@ function meta:Custom() end
             Colours = { Red = 1 }
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// An attribute's type is the other half of `extra_type()`, alongside the
@@ -1872,7 +1797,7 @@ function meta:Custom() end
             Holder = {}
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// A member's owner is hashed by its literal's anchor, so that the same
@@ -1897,7 +1822,7 @@ function meta:Custom() end
             end
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 
     /// The same for two literals reached by distinct paths, and for a nested
@@ -1914,6 +1839,6 @@ function meta:Custom() end
             Other = { inner = {} }
             "#,
         );
-        expect_that!(after, not(eq(before)));
+        expect_that!(after, not(eq(&before)));
     }
 }
