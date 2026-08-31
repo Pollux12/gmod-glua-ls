@@ -514,6 +514,7 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
         let file_ids: Vec<FileId> = tree_list.iter().map(|tree| tree.file_id).collect();
         let collected_files: FxHashSet<FileId> = file_ids.iter().copied().collect();
         let reach = HelperStartReachCache::default();
+        let resolve_shared = Arc::new(NetResolveShared::default());
         let mut helper_name_memo = db.get_gmod_network_index_mut().take_helper_name_memo();
         let helper_call_sites = {
             let db: &DbIndex = db;
@@ -537,6 +538,7 @@ impl AnalysisPipeline for GmodNetworkAnalysisPipeline {
                     &annotated_global_call_roles,
                     &reach,
                     &helper_call_sites,
+                    &resolve_shared,
                 )
             })
         });
@@ -557,6 +559,7 @@ fn collect_file_network_flows(
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     reach: &HelperStartReachCache,
     helper_call_sites: &NetHelperCallSites,
+    resolve_shared: &Arc<NetResolveShared>,
 ) -> crate::db_index::FileNetworkData {
     let Some(root) = db
         .get_vfs()
@@ -567,7 +570,7 @@ fn collect_file_network_flows(
     };
 
     let mut local_fns = LocalFnCache::default();
-    let mut net = NetCallResolver::default();
+    let mut net = NetCallResolver::new(file_id, Some(resolve_shared.clone()));
     // One memo for both walks: the receive walk and the three send walks start
     // from the same call expressions and reach the same helpers, so a shared
     // memo resolves each of them once.
@@ -1657,7 +1660,7 @@ fn collect_file_gmod_metadata(
     // One resolver per file: it memoizes signature resolution per call site and
     // holds an infer cache per file touched, including helper bodies expanded
     // from other files.
-    let mut net = NetCallResolver::default();
+    let mut net = NetCallResolver::new(file_id, None);
 
     // Hook metadata collection never expands wrapper chains for send flows, so
     // this cache stays empty; it exists only to satisfy the shared context.
@@ -3549,6 +3552,57 @@ enum NetCallRole {
     Payload(NetOpDescriptor),
 }
 
+const NET_RESOLVE_SHARDS: usize = 32;
+
+type NetSiteKey = (FileId, LuaSyntaxId);
+
+/// Sharded, lock-per-shard memo keyed by call site, shared across the worker
+/// threads of one net-analyze pass.
+struct ShardedSiteMemo<V> {
+    shards: [Mutex<FxHashMap<NetSiteKey, V>>; NET_RESOLVE_SHARDS],
+}
+
+impl<V> Default for ShardedSiteMemo<V> {
+    fn default() -> Self {
+        ShardedSiteMemo {
+            shards: std::array::from_fn(|_| Mutex::default()),
+        }
+    }
+}
+
+impl<V: Clone> ShardedSiteMemo<V> {
+    fn shard(&self, key: &NetSiteKey) -> &Mutex<FxHashMap<NetSiteKey, V>> {
+        let mut hasher = rustc_hash::FxHasher::default();
+        key.hash(&mut hasher);
+        &self.shards[hasher.finish() as usize % NET_RESOLVE_SHARDS]
+    }
+
+    fn get(&self, key: &NetSiteKey) -> Option<V> {
+        self.shard(key).lock().ok()?.get(key).cloned()
+    }
+
+    fn insert(&self, key: NetSiteKey, value: V) {
+        if let Ok(mut shard) = self.shard(&key).lock() {
+            shard.insert(key, value);
+        }
+    }
+}
+
+/// Cross-file call-site resolution shared by every file's [`NetCallResolver`]
+/// for the duration of one net-analyze pass.
+///
+/// When N caller files expand into the same helper file, each caller's private
+/// memo re-resolves that helper's call sites from scratch. The pass holds
+/// `&DbIndex` immutably, so a site's role and signature are pure functions of
+/// `(file_id, syntax_id, db)`: every thread computes the same answer, and
+/// first-write-wins insertion cannot change any result. Nothing collected here
+/// is written into an index, and the table is dropped when the pass ends.
+#[derive(Default)]
+struct NetResolveShared {
+    role: ShardedSiteMemo<Option<NetCallRole>>,
+    signature: ShardedSiteMemo<Option<LuaSignatureId>>,
+}
+
 /// Resolves [`NetCallRole`] for call expressions, memoizing per call site.
 ///
 /// Signature resolution runs type inference, which is far more expensive than
@@ -3556,8 +3610,12 @@ enum NetCallRole {
 /// and wrapped-send passes both scan the same statements, and helper expansion
 /// can revisit a body. One [`LuaInferCache`] is kept per file so expansion into
 /// a helper defined in another file still resolves against that file.
-#[derive(Default)]
 struct NetCallResolver {
+    /// File this resolver walks. Its own sites are resolved once regardless, so
+    /// they stay in the private memo; only cross-file helper sites, which every
+    /// caller of that helper would otherwise redo, go through `shared`.
+    owner: FileId,
+    shared: Option<Arc<NetResolveShared>>,
     caches: HashMap<FileId, LuaInferCache>,
     memo: HashMap<(FileId, LuaSyntaxId), Option<NetCallRole>>,
     /// `role` memoises the *role*, but the signature behind it is asked for
@@ -3570,6 +3628,24 @@ struct NetCallResolver {
 }
 
 impl NetCallResolver {
+    fn new(owner: FileId, shared: Option<Arc<NetResolveShared>>) -> Self {
+        NetCallResolver {
+            owner,
+            shared,
+            caches: HashMap::default(),
+            memo: HashMap::default(),
+            signature_memo: HashMap::default(),
+        }
+    }
+
+    /// The shared table, but only for sites outside the file being walked.
+    fn cross_file_shared(&self, file_id: FileId) -> Option<Arc<NetResolveShared>> {
+        if file_id == self.owner {
+            return None;
+        }
+        self.shared.clone()
+    }
+
     fn role(
         &mut self,
         db: &DbIndex,
@@ -3580,7 +3656,17 @@ impl NetCallResolver {
         if let Some(cached) = self.memo.get(&key) {
             return cached.clone();
         }
-        let resolved = self.resolve_uncached(db, file_id, call_expr);
+        let shared = self.cross_file_shared(file_id);
+        let resolved = match shared.as_ref().and_then(|shared| shared.role.get(&key)) {
+            Some(cached) => cached,
+            None => {
+                let resolved = self.resolve_uncached(db, file_id, call_expr);
+                if let Some(shared) = shared {
+                    shared.role.insert(key, resolved.clone());
+                }
+                resolved
+            }
+        };
         self.memo.insert(key, resolved.clone());
         resolved
     }
@@ -3660,8 +3746,20 @@ impl NetCallResolver {
         if let Some(cached) = self.signature_memo.get(&key) {
             return *cached;
         }
-
-        let resolved = self.signature_id_uncached(db, file_id, call_expr);
+        let shared = self.cross_file_shared(file_id);
+        let resolved = match shared
+            .as_ref()
+            .and_then(|shared| shared.signature.get(&key))
+        {
+            Some(cached) => cached,
+            None => {
+                let resolved = self.signature_id_uncached(db, file_id, call_expr);
+                if let Some(shared) = shared {
+                    shared.signature.insert(key, resolved);
+                }
+                resolved
+            }
+        };
         self.signature_memo.insert(key, resolved);
         resolved
     }
