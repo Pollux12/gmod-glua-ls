@@ -123,6 +123,70 @@ impl LuaCommonProperty {
         self.attribute_uses.as_ref()
     }
 
+    /// Folds a later contributor's documentation into an earlier one's. Scalar fields keep the
+    /// first value supplied; the additive fields union in contributor order.
+    pub fn merge_from(&mut self, other: &LuaCommonProperty) {
+        if self.visibility == VisibilityKind::Public {
+            self.visibility = other.visibility;
+        }
+        // A bare `---@class Foo` records an empty description, which must not mask the docs
+        // another file wrote for the same class.
+        if self
+            .description
+            .as_deref()
+            .is_none_or(|text| text.is_empty())
+            && other
+                .description
+                .as_deref()
+                .is_some_and(|text| !text.is_empty())
+        {
+            self.description.clone_from(&other.description);
+        }
+        if self.default_value.is_none() {
+            self.default_value.clone_from(&other.default_value);
+        }
+        if self.source.is_none() {
+            self.source.clone_from(&other.source);
+        }
+        if self.deprecated.is_none() {
+            self.deprecated.clone_from(&other.deprecated);
+        }
+        if self.version_conds.is_none() {
+            self.version_conds.clone_from(&other.version_conds);
+        }
+        if self.export.is_none() {
+            self.export.clone_from(&other.export);
+        }
+        self.decl_features = self.decl_features.union(other.decl_features);
+
+        if let Some(tags) = other.tag_content() {
+            for (tag, content) in tags.get_all_tags() {
+                let merged = self
+                    .tag_content
+                    .get_or_insert_with(|| Box::new(LuaTagContent::new()));
+                if !merged
+                    .tags
+                    .iter()
+                    .any(|existing| existing == &(tag.clone(), content.clone()))
+                {
+                    merged.add_tag(tag.clone(), content.clone());
+                }
+            }
+        }
+
+        if let Some(uses) = other.attribute_uses() {
+            for attribute_use in uses.iter() {
+                let merged = Arc::make_mut(
+                    self.attribute_uses
+                        .get_or_insert_with(|| Arc::new(Vec::new())),
+                );
+                if !merged.contains(attribute_use) {
+                    merged.push(attribute_use.clone());
+                }
+            }
+        }
+    }
+
     pub fn find_attribute_use(&self, id: &str) -> Option<&LuaAttributeUse> {
         self.attribute_uses.as_ref().and_then(|attribute_uses| {
             attribute_uses

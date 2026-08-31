@@ -25,10 +25,13 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     let Some(metatable_range) = resolve_metatable_backing_table(analyzer, &metatable) else {
         return Some(());
     };
+    let writer_sort_key = writer_sort_key(analyzer);
 
     analyzer.db.get_metatable_index_mut().add(
         InFiled::new(file_id, table.get_range()),
         metatable_range.clone(),
+        file_id,
+        writer_sort_key.clone(),
     );
 
     if let Some(binding) = setmetatable_factory_binding(
@@ -45,10 +48,12 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     }
 
     if let Some(backing_table) = resolve_metatable_backing_table(analyzer, &table) {
-        analyzer
-            .db
-            .get_metatable_index_mut()
-            .add(backing_table, metatable_range.clone());
+        analyzer.db.get_metatable_index_mut().add(
+            backing_table,
+            metatable_range.clone(),
+            file_id,
+            writer_sort_key,
+        );
     }
 
     let metatable_table = match metatable {
@@ -63,6 +68,21 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
     }
 
     Some(())
+}
+
+/// Ordering key for the writing file, so several writers of one table literal resolve the same
+/// way in a cold build and an incremental session.
+fn writer_sort_key(analyzer: &LuaAnalyzer) -> std::sync::Arc<str> {
+    analyzer
+        .db
+        .get_vfs()
+        .get_file_path(&analyzer.file_id)
+        .map(|path| {
+            std::sync::Arc::from(crate::vfs::normalize_path_for_ordering(
+                &path.to_string_lossy(),
+            ))
+        })
+        .unwrap_or_else(|| std::sync::Arc::from(""))
 }
 
 fn setmetatable_factory_binding(

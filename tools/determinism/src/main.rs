@@ -1196,8 +1196,11 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     }
 
     let mut metatables = HashDump::new("metatables");
-    for (table, metatable) in &db.get_metatable_index().metatables {
-        metatables.insert(format!("{table:?}"), format!("{metatable:?}"));
+    for (table, binding) in db.get_metatable_index().iter_bindings() {
+        metatables.insert(
+            format!("{table:?} <- {:?}", binding.writer_file_id),
+            format!("{:?}", binding.metatable),
+        );
     }
     let mut metatable_factory_bindings = HashDump::new("metatable_factory_bindings");
     for &file_id in &all_files {
