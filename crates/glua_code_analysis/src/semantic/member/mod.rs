@@ -23,7 +23,7 @@ pub use get_member_map::{
     get_member_map_in_workspace_for_file_at_offset,
 };
 use glua_parser::{
-    LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaTableExpr, LuaTableField,
+    LuaAssignStat, LuaExpr, LuaFuncStat, LuaSyntaxKind, LuaSyntaxNode, LuaTableExpr, LuaTableField,
 };
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::{
@@ -156,6 +156,13 @@ pub(crate) fn local_class_table_member_ids(
         let Some(decl_tree) = db.get_decl_index().get_decl_tree(&location.file_id) else {
             continue;
         };
+        let Some(root) = db
+            .get_vfs()
+            .get_syntax_tree(&location.file_id)
+            .map(|tree| tree.get_red_root())
+        else {
+            continue;
+        };
         for decl in decl_tree.get_decls().values() {
             // `local_table_decl_member_owner` opens with these two conditions
             // and they are field reads, so they run before the index lookups.
@@ -169,7 +176,7 @@ pub(crate) fn local_class_table_member_ids(
             if !decl_binds_type(db, decl, type_id) {
                 continue;
             }
-            let Some(owner) = local_table_decl_member_owner(db, decl) else {
+            let Some(owner) = local_table_decl_member_owner(decl, &root) else {
                 continue;
             };
             let Some(member_item) = member_index.get_member_item(&owner, member_key) else {
@@ -228,18 +235,17 @@ fn decl_binds_type(db: &DbIndex, decl: &LuaDecl, type_id: &LuaTypeDeclId) -> boo
         })
 }
 
-fn local_table_decl_member_owner(db: &DbIndex, decl: &LuaDecl) -> Option<LuaMemberOwner> {
+fn local_table_decl_member_owner(decl: &LuaDecl, root: &LuaSyntaxNode) -> Option<LuaMemberOwner> {
     let initializer = decl.get_initializer()?;
     if initializer.get_ret_idx() != 0 {
         return None;
     }
 
-    let root = db
-        .get_vfs()
-        .get_syntax_tree(&decl.get_id().file_id)?
-        .get_red_root();
-    let node = initializer.get_expr_syntax_id().to_node_from_root(&root)?;
-    let table_expr = LuaTableExpr::cast(node)?;
+    let expr_id = initializer.get_expr_syntax_id();
+    if !LuaTableExpr::can_cast(expr_id.get_kind()) {
+        return None;
+    }
+    let table_expr = LuaTableExpr::cast(expr_id.to_node_from_root(root)?)?;
     Some(LuaMemberOwner::Element(InFiled::new(
         decl.get_id().file_id,
         table_expr.get_range(),
