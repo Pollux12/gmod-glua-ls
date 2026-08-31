@@ -49,6 +49,10 @@ pub struct LuaDependencyIndex {
     resolved_sites_by_target: HashMap<FileId, Vec<DependencySiteLocation>>,
     /// Normalized target path key -> unresolved callers.
     unresolved_dependents_by_path_key: HashMap<String, HashSet<FileId>>,
+    /// The sites a file's removal unresolved, so re-indexing it can put them
+    /// back. Keyed by the removed target; each entry is the site's source file
+    /// and the path it named.
+    unresolved_by_removal: HashMap<FileId, Vec<(FileId, Option<String>)>>,
     #[cfg(test)]
     target_transition_site_visits: usize,
 }
@@ -68,6 +72,7 @@ impl LuaDependencyIndex {
             dependency_sites: HashMap::new(),
             resolved_sites_by_target: HashMap::new(),
             unresolved_dependents_by_path_key: HashMap::new(),
+            unresolved_by_removal: HashMap::new(),
             #[cfg(test)]
             target_transition_site_visits: 0,
         }
@@ -274,6 +279,57 @@ impl LuaDependencyIndex {
         }
     }
 
+    /// The exact inverse of [`transition_target_sites_to_unresolved`]: a file
+    /// that is indexed again re-resolves the sites its removal unresolved.
+    ///
+    /// Removing a file unresolves its callers' sites in place, and only the
+    /// caller's own re-analysis used to put the target back. A path that
+    /// re-indexes the target alone therefore left every includer pointing at
+    /// nothing - invisible in diagnostics, wrong in the index. Only the sites
+    /// the removal actually flipped are restored, so this cannot resolve a
+    /// site a build would have left unresolved on its own.
+    ///
+    /// [`transition_target_sites_to_unresolved`]: Self::transition_target_sites_to_unresolved
+    pub fn relink_unresolved_target(&mut self, target_file_id: FileId) {
+        let Some(unresolved_by_removal) = self.unresolved_by_removal.remove(&target_file_id) else {
+            return;
+        };
+
+        let mut restored: Vec<(FileId, usize, LuaDependencySite)> = Vec::new();
+        for (source_file_id, path) in unresolved_by_removal {
+            let Some(sites) = self.dependency_sites.get_mut(&source_file_id) else {
+                continue;
+            };
+            for (site_index, site) in sites.iter_mut().enumerate() {
+                if site.target_file_id.is_some() || site.path != path {
+                    continue;
+                }
+                let unresolved = site.clone();
+                site.target_file_id = Some(target_file_id);
+                restored.push((source_file_id, site_index, unresolved));
+            }
+        }
+        if restored.is_empty() {
+            return;
+        }
+
+        let unresolved = restored
+            .iter()
+            .map(|(_, _, site)| site.clone())
+            .collect::<Vec<_>>();
+        self.unindex_unresolved_sites(&unresolved);
+        for (source_file_id, site_index, site) in restored {
+            self.add_dependency_file(source_file_id, target_file_id, site.kind);
+            self.resolved_sites_by_target
+                .entry(target_file_id)
+                .or_default()
+                .push(DependencySiteLocation {
+                    source_file_id,
+                    site_index,
+                });
+        }
+    }
+
     fn transition_target_sites_to_unresolved(&mut self, target_file_id: FileId) {
         let Some(mut locations) = self.resolved_sites_by_target.remove(&target_file_id) else {
             return;
@@ -283,6 +339,7 @@ impl LuaDependencyIndex {
         let mut site_visits = 0;
         let dependency_sites = &mut self.dependency_sites;
         let unresolved_dependents_by_path_key = &mut self.unresolved_dependents_by_path_key;
+        let mut flipped = Vec::new();
         for location in locations {
             #[cfg(test)]
             {
@@ -297,6 +354,10 @@ impl LuaDependencyIndex {
             };
             site.target_file_id = None;
             Self::index_unresolved_site(unresolved_dependents_by_path_key, site);
+            flipped.push((location.source_file_id, site.path.clone()));
+        }
+        if !flipped.is_empty() {
+            self.unresolved_by_removal.insert(target_file_id, flipped);
         }
         #[cfg(test)]
         {
@@ -340,6 +401,7 @@ impl LuaIndex for LuaDependencyIndex {
         self.dependency_sites.clear();
         self.resolved_sites_by_target.clear();
         self.unresolved_dependents_by_path_key.clear();
+        self.unresolved_by_removal.clear();
         #[cfg(test)]
         {
             self.target_transition_site_visits = 0;
