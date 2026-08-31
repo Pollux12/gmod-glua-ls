@@ -17,7 +17,8 @@ use super::{
     gmod::ensure_scoped_class_type_decl_for_file,
 };
 use glua_parser::{
-    LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaIfStat, LuaSyntaxKind, LuaVarExpr,
+    LuaAssignStat, LuaAst, LuaAstNode, LuaChunk, LuaFuncStat, LuaIfStat, LuaNameExpr,
+    LuaSyntaxKind, LuaVarExpr,
 };
 use rowan::{TextRange, TextSize, WalkEvent};
 
@@ -81,8 +82,68 @@ impl AnalysisPipeline for DeclAnalysisPipeline {
             }
 
             db.get_decl_index_mut().add_decl_tree(decl_tree);
+
+            let reassignments =
+                collect_local_reassignments(db, in_filed_tree.file_id, &in_filed_tree.value);
+            db.get_reference_index_mut()
+                .set_local_reassignments(in_filed_tree.file_id, reassignments);
         }
     }
+}
+
+/// Where each local declared in `file_id` is first reassigned. Derived from the
+/// file's own syntax tree, local references and declaration tree, all of which
+/// are complete for the file at this point in the decl walk.
+fn collect_local_reassignments(
+    db: &DbIndex,
+    file_id: FileId,
+    chunk: &LuaChunk,
+) -> rustc_hash::FxHashMap<LuaDeclId, TextSize> {
+    let mut positions = rustc_hash::FxHashMap::default();
+    let references = db.get_reference_index().get_local_reference(&file_id);
+    let decl_tree = db.get_decl_index().get_decl_tree(&file_id);
+    for assign_stat in chunk.syntax().descendants().filter_map(LuaAssignStat::cast) {
+        let position = assign_stat.get_position();
+
+        let (vars, _) = assign_stat.get_var_and_expr_list();
+        for var in vars {
+            let LuaVarExpr::NameExpr(name_expr) = var else {
+                continue;
+            };
+
+            let assigned_decl_id = references
+                .and_then(|refs| refs.get_decl_id(&name_expr.get_range()))
+                .or_else(|| assignment_name_decl_id(decl_tree, &name_expr));
+            let Some(assigned_decl_id) = assigned_decl_id else {
+                continue;
+            };
+            if assigned_decl_id.file_id != file_id || position <= assigned_decl_id.position {
+                continue;
+            }
+
+            positions
+                .entry(assigned_decl_id)
+                .and_modify(|first| {
+                    if position < *first {
+                        *first = position;
+                    }
+                })
+                .or_insert(position);
+        }
+    }
+
+    positions
+}
+
+fn assignment_name_decl_id(
+    decl_tree: Option<&LuaDeclarationTree>,
+    name_expr: &LuaNameExpr,
+) -> Option<LuaDeclId> {
+    let name = name_expr.get_name_text()?;
+
+    decl_tree
+        .and_then(|tree| tree.find_local_decl(&name, name_expr.get_position()))
+        .map(|decl| decl.get_id())
 }
 
 /// Records where each branch of `stat` begins and ends, and which `if` they

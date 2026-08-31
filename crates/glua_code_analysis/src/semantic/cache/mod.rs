@@ -129,8 +129,6 @@ pub struct LuaInferCache {
     /// the element type it leaves, so a read is answered without re-scanning the
     /// declaration's block each time.
     pub in_place_ipairs_transform_cache: FxHashMap<LuaDeclId, Option<(TextSize, LuaType)>>,
-    pub local_reassignment_positions_cache: FxHashMap<LuaDeclId, Vec<TextSize>>,
-    pub local_reassignments_indexed: bool,
     pub dynamic_field_scope_metatable_cache:
         FxHashMap<TextRange, FxHashMap<VarRefId, Vec<(TextRange, LuaType)>>>,
     pub dynamic_field_resolution_cache: FxHashMap<
@@ -157,6 +155,10 @@ pub struct LuaInferCache {
     /// the call targets through the reference, property, member and signature
     /// indexes.
     pub call_returns_never_cache: FxHashMap<LuaSyntaxId, bool>,
+    /// Whether a call site's signature is generic, keyed by the call
+    /// expression. Consulted per call-site during inference, so re-inferring
+    /// the call prefix each time is avoided.
+    pub signature_is_generic_cache: FxHashMap<LuaSyntaxId, Option<bool>>,
     inferred_guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
 }
 
@@ -185,8 +187,6 @@ impl LuaInferCache {
             decl_cache: FxHashMap::default(),
             for_range_iter_var_type_cache: FxHashMap::default(),
             in_place_ipairs_transform_cache: FxHashMap::default(),
-            local_reassignment_positions_cache: FxHashMap::default(),
-            local_reassignments_indexed: false,
             dynamic_field_scope_metatable_cache: FxHashMap::default(),
             dynamic_field_resolution_cache: FxHashMap::default(),
             local_class_table_member_ids_cache: FxHashMap::default(),
@@ -196,6 +196,7 @@ impl LuaInferCache {
             vgui_parent_chain_calls: FxHashSet::default(),
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
+            signature_is_generic_cache: FxHashMap::default(),
             inferred_guard_dependencies: FxHashSet::default(),
         }
     }
@@ -268,8 +269,6 @@ impl LuaInferCache {
         self.self_base_seed = None;
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
-        self.local_reassignment_positions_cache.clear();
-        self.local_reassignments_indexed = false;
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.local_class_table_member_ids_cache.clear();
@@ -278,6 +277,7 @@ impl LuaInferCache {
         self.vgui_parent_fallback_calls.clear();
         self.vgui_parent_chain_calls.clear();
         self.call_returns_never_cache.clear();
+        self.signature_is_generic_cache.clear();
     }
 
     /// Drops every narrowing answer this file has memoised.
@@ -333,6 +333,7 @@ impl LuaInferCache {
         // A resolved signature return is exactly what turns this answer from
         // `false` to `true`, so it cannot survive a wave.
         self.call_returns_never_cache.clear();
+        self.signature_is_generic_cache.clear();
         self.flow_node_cache.retain(|_, inner| {
             inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
             !inner.is_empty()
@@ -359,6 +360,7 @@ impl LuaInferCache {
         self.param_type_cache.clear();
         self.param_type_source_cache.clear();
         self.call_returns_never_cache.clear();
+        self.signature_is_generic_cache.clear();
         // Local reference identities come directly from immutable reference
         // indexes and are safe to retain. Global/member/self roots can be
         // selected through types and overloads that unresolve is about to
@@ -552,10 +554,6 @@ mod tests {
         cache
             .narrow_by_literal_stop_position_cache
             .insert(syntax_id);
-        cache
-            .local_reassignment_positions_cache
-            .insert(decl_id, vec![TextSize::from(9)]);
-        cache.local_reassignments_indexed = true;
 
         cache.clear_for_unresolve(&DbIndex::new());
 
@@ -566,11 +564,6 @@ mod tests {
             Some(&GmodRealm::Server)
         );
         assert!(cache.narrow_by_literal_stop_position_cache.is_empty());
-        assert_eq!(
-            cache.local_reassignment_positions_cache.get(&decl_id),
-            Some(&vec![TextSize::from(9)])
-        );
-        assert!(cache.local_reassignments_indexed);
     }
 
     #[test]
