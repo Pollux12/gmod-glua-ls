@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaClosureExpr, LuaDocTagParam, LuaDocTagReturn, LuaStat};
 
@@ -70,7 +70,7 @@ fn check_doc(
         DiagnosticCode::IncompleteSignatureDoc
     };
 
-    let doc_param_names: HashSet<String> = comment
+    let doc_param_names: FxHashSet<String> = comment
         .children::<LuaDocTagParam>()
         .filter_map(|param| {
             param
@@ -114,7 +114,7 @@ fn check_doc(
 fn check_params(
     context: &mut DiagnosticContext,
     closure_expr: &LuaClosureExpr,
-    doc_param_names: &HashSet<String>,
+    doc_param_names: &FxHashSet<String>,
     code: DiagnosticCode,
     is_global: bool,
     function_name: &str,

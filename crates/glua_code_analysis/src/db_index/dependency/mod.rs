@@ -1,6 +1,6 @@
 mod file_dependency_relation;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use file_dependency_relation::FileDependencyRelation;
 use rowan::TextRange;
@@ -66,13 +66,13 @@ impl Default for LuaDependencyIndex {
 impl LuaDependencyIndex {
     pub fn new() -> Self {
         Self {
-            dependencies: HashMap::new(),
-            dependency_kinds: HashMap::new(),
-            dependency_callers_by_target: HashMap::new(),
-            dependency_sites: HashMap::new(),
-            resolved_sites_by_target: HashMap::new(),
-            unresolved_dependents_by_path_key: HashMap::new(),
-            unresolved_by_removal: HashMap::new(),
+            dependencies: HashMap::default(),
+            dependency_kinds: HashMap::default(),
+            dependency_callers_by_target: HashMap::default(),
+            dependency_sites: HashMap::default(),
+            resolved_sites_by_target: HashMap::default(),
+            unresolved_dependents_by_path_key: HashMap::default(),
+            unresolved_by_removal: HashMap::default(),
             #[cfg(test)]
             target_transition_site_visits: 0,
         }
@@ -166,7 +166,7 @@ impl LuaDependencyIndex {
         &self,
         path_keys: impl IntoIterator<Item = String>,
     ) -> Vec<FileId> {
-        let mut dependents = HashSet::new();
+        let mut dependents = HashSet::default();
         for path_key in path_keys {
             if let Some(path_dependents) = self.unresolved_dependents_by_path_key.get(&path_key) {
                 dependents.extend(path_dependents.iter().copied());

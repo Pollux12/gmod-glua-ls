@@ -3,7 +3,7 @@ use std::{ops::Deref, sync::Arc};
 use glua_parser::{
     LuaAstNode, LuaCallExpr, LuaExpr, LuaIndexMemberExpr, LuaLiteralToken, LuaTableExpr, LuaVarExpr,
 };
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
     DbIndex, GlobalId, GmodHookKind, InferFailReason, InferGuard, InferGuardRef, LuaDocParamInfo,
@@ -281,7 +281,7 @@ pub fn resolve_gmod_hook_callback_doc_function(
     let hook_name = hook_site.hook_name.as_ref()?.clone();
     let member_key = LuaMemberKey::Name(hook_name.clone().into());
     let mut candidates = Vec::new();
-    let mut seen_member_ids = HashSet::new();
+    let mut seen_member_ids = FxHashSet::default();
     for owner_name in iter_hook_owner_names(db) {
         for owner in [
             LuaMemberOwner::Type(LuaTypeDeclId::global(&owner_name)),

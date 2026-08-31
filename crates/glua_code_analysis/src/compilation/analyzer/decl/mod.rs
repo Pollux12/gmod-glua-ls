@@ -3,7 +3,7 @@ mod exprs;
 mod members;
 mod stats;
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
     compilation::analyzer::AnalysisPipeline,
@@ -234,7 +234,7 @@ pub struct DeclAnalyzer<'a> {
     root: LuaChunk,
     decl: LuaDeclarationTree,
     scoped_class_info: Option<GmodScopedClassInfo>,
-    scoped_class_global_names: Option<HashSet<String>>,
+    scoped_class_global_names: Option<FxHashSet<String>>,
     seeded_scoped_class_decl: bool,
     legacy_module_envs: Vec<LegacyModuleEnv>,
     scopes: Vec<LuaScopeId>,
@@ -251,7 +251,8 @@ impl<'a> DeclAnalyzer<'a> {
         scoped_class_info: Option<GmodScopedClassInfo>,
     ) -> DeclAnalyzer<'a> {
         let scoped_class_global_names = scoped_class_info.as_ref().map(|info| {
-            let mut names = HashSet::with_capacity(1 + info.aliases.len());
+            let mut names =
+                FxHashSet::with_capacity_and_hasher(1 + info.aliases.len(), Default::default());
             names.insert(info.global_name.clone());
             names.extend(info.aliases.iter().cloned());
             names

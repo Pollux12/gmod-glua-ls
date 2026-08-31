@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     LuaAstNode, LuaDocTagClass, LuaDocTagField, LuaIndexExpr, LuaStat, LuaSyntaxKind, LuaSyntaxNode,
@@ -47,7 +47,7 @@ fn get_decl_set(
         .get_db()
         .get_decl_index()
         .get_decl_tree(&file_id)?;
-    let mut type_decl_id_set = HashSet::new();
+    let mut type_decl_id_set = HashSet::default();
     for (decl_id, decl) in decl_tree.get_decls() {
         if context.is_cancelled() {
             return Some(type_decl_id_set);
@@ -126,7 +126,7 @@ fn check_decl_duplicate_field(
         .get_member_index()
         .get_members(&type_decl.get_id().into())?;
 
-    let mut member_map: HashMap<&LuaMemberKey, Vec<&LuaMember>> = HashMap::new();
+    let mut member_map: HashMap<&LuaMemberKey, Vec<&LuaMember>> = HashMap::default();
 
     for member in members.iter() {
         if context.is_cancelled() {

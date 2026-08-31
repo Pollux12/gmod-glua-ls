@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaAstToken, LuaDocTagClass};
 use rowan::TextRange;
@@ -46,7 +46,7 @@ fn check_doc_tag_class(
     let name = class_decl.get_full_name();
 
     let mut queue = Vec::new();
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
 
     queue.push(class_decl.get_id());
     while let Some(current_id) = queue.pop() {

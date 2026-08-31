@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaIndexExpr, LuaSyntaxKind};
 use rowan::NodeOrToken;
@@ -45,13 +45,13 @@ pub fn enum_variable_is_param(
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeclGuard {
-    decl_set: HashSet<LuaDeclId>,
+    decl_set: FxHashSet<LuaDeclId>,
 }
 
 impl DeclGuard {
     pub fn new() -> Self {
         Self {
-            decl_set: HashSet::new(),
+            decl_set: FxHashSet::default(),
         }
     }
 

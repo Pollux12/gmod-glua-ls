@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     DbIndex, InFiled, InferGuardRef, LuaGenericType, LuaIntersectionType, LuaMemberKey,
@@ -270,7 +270,7 @@ fn find_index_intersection(
     infer_guard: &InferGuardRef,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
-    let mut members: HashMap<LuaMemberKey, LuaType> = HashMap::new();
+    let mut members: HashMap<LuaMemberKey, LuaType> = HashMap::default();
 
     for member in intersection.get_types() {
         let Some(sub_members) = find_index_operations_guard(db, member, infer_guard) else {
@@ -278,7 +278,7 @@ fn find_index_intersection(
         };
 
         // Within a single component type, treat duplicate keys as overrides (first wins).
-        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        let mut component_seen: HashSet<LuaMemberKey> = HashSet::default();
         for member in sub_members {
             if !component_seen.insert(member.key.clone()) {
                 continue;

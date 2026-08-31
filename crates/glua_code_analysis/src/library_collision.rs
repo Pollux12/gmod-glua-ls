@@ -1,7 +1,5 @@
-use std::{
-    collections::{BTreeSet, HashMap},
-    path::PathBuf,
-};
+use rustc_hash::FxHashMap as HashMap;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use crate::{
     EmmyLuaAnalysis, FileId, LuaMember, LuaMemberKey, LuaMemberOwner, LuaTypeFlag, WorkspaceId,
@@ -63,7 +61,7 @@ impl EmmyLuaAnalysis {
     pub fn library_definition_collisions(&self) -> Vec<LibraryDefinitionCollision> {
         let db = self.compilation.get_db();
         let module_index = db.get_module_index();
-        let mut collisions = HashMap::<(WorkspaceId, WorkspaceId), CollisionAccumulator>::new();
+        let mut collisions = HashMap::<(WorkspaceId, WorkspaceId), CollisionAccumulator>::default();
 
         for type_decl in db.get_type_index().get_all_types() {
             if !type_decl.get_id().is_global() {
@@ -148,7 +146,7 @@ fn collect_library_locations(
     module_index: &crate::LuaModuleIndex,
     file_ids: impl Iterator<Item = FileId>,
 ) -> Vec<LibraryLocation> {
-    let mut by_workspace = HashMap::<WorkspaceId, LibraryLocation>::new();
+    let mut by_workspace = HashMap::<WorkspaceId, LibraryLocation>::default();
     for file_id in file_ids {
         let Some(workspace_id) = module_index.get_workspace_id(file_id) else {
             continue;

@@ -17,7 +17,7 @@
 //! The detector is intentionally tolerant: malformed KV files are skipped,
 //! cycles are broken, and nothing is added when no metadata is found.
 
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::path::{Path, PathBuf};
 
 /// Validate that `name` is a plausible gamemode folder name.
@@ -61,7 +61,7 @@ pub fn read_gamemode_base(txt_path: &Path) -> Option<String> {
 ///   * are deduplicated while preserving discovery order.
 pub fn detect_gamemode_base_libraries(workspace_root: &Path) -> Vec<PathBuf> {
     let mut out: Vec<PathBuf> = Vec::new();
-    let mut seen: HashSet<PathBuf> = HashSet::new();
+    let mut seen: FxHashSet<PathBuf> = FxHashSet::default();
     let workspace_root_canon = canonicalize_or(workspace_root);
 
     // Layout 2: workspace root *is* a gamemode folder.
@@ -130,10 +130,10 @@ fn walk_chain(
     gamemodes_dir: &Path,
     workspace_root_canon: &Path,
     out: &mut Vec<PathBuf>,
-    seen: &mut HashSet<PathBuf>,
+    seen: &mut FxHashSet<PathBuf>,
 ) {
     let mut current = start_folder.to_path_buf();
-    let mut visited_names: HashSet<String> = HashSet::new();
+    let mut visited_names: FxHashSet<String> = FxHashSet::default();
     if let Some(name) = current.file_name().and_then(|s| s.to_str()) {
         visited_names.insert(name.to_string());
     }

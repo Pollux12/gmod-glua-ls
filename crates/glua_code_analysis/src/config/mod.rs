@@ -6,7 +6,8 @@ mod pre_process;
 #[cfg(test)]
 mod test;
 
-use std::{collections::HashMap, path::Path};
+use rustc_hash::FxHashMap as HashMap;
+use std::path::Path;
 
 pub use config_loader::{ConfigLoadError, load_configs, load_configs_raw, try_load_configs};
 pub use configs::{
@@ -94,7 +95,7 @@ impl Emmyrc {
         node_cache: &'cache mut NodeCache,
     ) -> ParserConfig<'cache> {
         let lua_language_level = self.get_language_level();
-        let mut special_like = HashMap::new();
+        let mut special_like = HashMap::default();
         for (name, func) in self.runtime.special.iter() {
             if let Some(func) = (*func).into() {
                 special_like.insert(name.clone(), func);

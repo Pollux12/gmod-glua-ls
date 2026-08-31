@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use glua_parser::{LuaAstPtr, LuaExpr, LuaNameToken, LuaSyntaxId};
 use internment::ArcIntern;
@@ -39,7 +39,7 @@ pub struct FlowBinder<'a> {
     /// immutable `&DbIndex`, enabling parallel per-file binding. The pipeline
     /// drains these into the diagnostic index sequentially afterward.
     pub errors: Vec<AnalyzeError>,
-    pub decl_bind_expr_ref: HashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
+    pub decl_bind_expr_ref: FxHashMap<LuaDeclId, LuaAstPtr<LuaExpr>>,
     pub start: FlowId,
     pub unreachable: FlowId,
     pub loop_label: FlowId,
@@ -48,10 +48,10 @@ pub struct FlowBinder<'a> {
     pub false_target: FlowId,
     flow_nodes: Vec<FlowNode>,
     multiple_antecedents: Vec<Vec<FlowId>>,
-    labels: HashMap<LuaClosureId, HashMap<SmolStr, FlowId>>,
+    labels: FxHashMap<LuaClosureId, FxHashMap<SmolStr, FlowId>>,
     goto_stats: Vec<GotoCache>,
-    bindings: HashMap<LuaSyntaxId, FlowId>,
-    branch_label_info: HashMap<FlowId, BranchLabelInfo>,
+    bindings: FxHashMap<LuaSyntaxId, FlowId>,
+    branch_label_info: FxHashMap<FlowId, BranchLabelInfo>,
     assignment_flow_info: Vec<AssignmentFlowInfo>,
     // Counters for tracking modifications inside branch blocks.
     name_assign_count: u32,
@@ -71,17 +71,17 @@ impl<'a> FlowBinder<'a> {
             errors: Vec::new(),
             flow_nodes: Vec::new(),
             multiple_antecedents: Vec::new(),
-            decl_bind_expr_ref: HashMap::new(),
-            labels: HashMap::new(),
+            decl_bind_expr_ref: FxHashMap::default(),
+            labels: FxHashMap::default(),
             start: FlowId::default(),
             unreachable: FlowId::default(),
             break_target_label: FlowId::default(),
-            bindings: HashMap::new(),
+            bindings: FxHashMap::default(),
             goto_stats: Vec::new(),
             loop_label: FlowId::default(),
             true_target: FlowId::default(),
             false_target: FlowId::default(),
-            branch_label_info: HashMap::new(),
+            branch_label_info: FxHashMap::default(),
             assignment_flow_info: Vec::new(),
             name_assign_count: 0,
             index_assign_count: 0,

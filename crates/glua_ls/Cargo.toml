@@ -39,6 +39,7 @@ dirs.workspace = true
 wax.workspace = true
 internment.workspace = true
 smol_str.workspace = true
+rustc-hash.workspace = true
 
 [dependencies.clap]
 workspace = true

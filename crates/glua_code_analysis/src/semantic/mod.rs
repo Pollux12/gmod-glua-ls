@@ -12,7 +12,7 @@ mod semantic_info;
 mod type_check;
 mod visibility;
 
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 /// Test-only work counter, re-exported so scaling guards can assert on the
@@ -459,7 +459,7 @@ impl<'a> SemanticModel<'a> {
     pub fn get_member_info_map(
         &self,
         prefix_type: &LuaType,
-    ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    ) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
         let module_index = self.db.get_module_index();
         if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
             return member::get_member_map_in_workspace_for_file(
@@ -477,7 +477,7 @@ impl<'a> SemanticModel<'a> {
         &self,
         prefix_type: &LuaType,
         position_offset: rowan::TextSize,
-    ) -> Option<HashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
+    ) -> Option<FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>> {
         let module_index = self.db.get_module_index();
         if let Some(workspace_id) = module_index.get_workspace_id(self.file_id) {
             return member::get_member_map_in_workspace_for_file_at_offset(
@@ -515,7 +515,7 @@ impl<'a> SemanticModel<'a> {
         compact_type: &LuaType,
         compact_expr: &LuaExpr,
     ) -> TypeCheckResult {
-        let mut member_facts = HashMap::new();
+        let mut member_facts = FxHashMap::default();
         self.collect_table_expr_member_facts(compact_expr, &mut member_facts);
         let runtime_compact_type = self.infer_closure_body_type_for_check(compact_expr);
         check_type_compact_detail_with_member_facts(
@@ -538,7 +538,7 @@ impl<'a> SemanticModel<'a> {
     fn collect_table_expr_member_facts(
         &self,
         expr: &LuaExpr,
-        member_facts: &mut HashMap<LuaMemberId, LuaTypeFact>,
+        member_facts: &mut FxHashMap<LuaMemberId, LuaTypeFact>,
     ) {
         let Some(table_expr) = LuaTableExpr::cast(expr.syntax().clone()) else {
             return;

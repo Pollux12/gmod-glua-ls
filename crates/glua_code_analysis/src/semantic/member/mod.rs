@@ -3,8 +3,6 @@ mod find_members;
 mod get_member_map;
 mod infer_raw_member;
 
-use std::collections::HashSet;
-
 use rustc_hash::FxHashSet;
 
 use crate::{
@@ -73,7 +71,7 @@ pub(crate) fn intersect_member_types(db: &DbIndex, left: LuaType, right: LuaType
 pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaType {
     let mut table_components = Vec::new();
     let mut other_types = Vec::new();
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
 
     for typ in types {
         if typ.is_never() {
@@ -797,7 +795,7 @@ fn find_member_origin_owner_inner(
     member_id: LuaMemberId,
     caller_position: Option<rowan::TextSize>,
 ) -> Option<LuaSemanticDeclId> {
-    let mut visited_members = HashSet::new();
+    let mut visited_members = FxHashSet::default();
 
     let mut current_owner = resolve_member_owner(db, infer_config, &member_id, caller_position);
     let mut final_owner = current_owner.clone();

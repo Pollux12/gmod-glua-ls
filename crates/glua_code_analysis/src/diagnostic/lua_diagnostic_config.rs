@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::LuaLanguageLevel;
 use lsp_types::DiagnosticSeverity;
@@ -43,7 +43,7 @@ impl LuaDiagnosticConfig {
             })
             .collect();
 
-        let mut severity = HashMap::new();
+        let mut severity = HashMap::default();
         for (code, sev) in &emmyrc.diagnostics.severity {
             severity.insert(*code, (*sev).into());
         }

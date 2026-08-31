@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::hash::Hash;
 use std::path::Path;
 use std::sync::Arc;
@@ -1067,7 +1067,7 @@ fn merge_scripted_class_definitions(
         }
     }
 
-    let mut seen = HashSet::new();
+    let mut seen = HashSet::default();
     resolved.retain(|definition| seen.insert(definition.id.clone()));
 
     if !legacy_include.is_empty() && !has_definition_entries {
@@ -1440,7 +1440,7 @@ impl EmmyrcGmodScriptedClassScopes {
     }
 
     pub fn hook_owner_globals(&self) -> Vec<String> {
-        let mut seen = HashSet::new();
+        let mut seen = HashSet::default();
         let mut globals = Vec::new();
 
         for definition in self
@@ -1627,12 +1627,12 @@ impl EmmyrcGmodScriptedClassScopes {
     {
         let definitions = self.resolved_definitions_slice();
         if definitions.is_empty() {
-            return (HashSet::new(), HashMap::new());
+            return (HashSet::default(), HashMap::default());
         }
 
         let compiled_definitions = compile_scope_definitions(definitions);
-        let mut scope_files = HashSet::new();
-        let mut matches = HashMap::new();
+        let mut scope_files = HashSet::default();
+        let mut matches = HashMap::default();
         for (file_id, file_path) in files {
             let candidate_paths = build_scope_candidate_paths(file_path);
             if !compiled_definitions.iter().any(|definition| {

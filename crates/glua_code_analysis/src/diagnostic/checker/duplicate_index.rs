@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use glua_parser::{LuaAstNode, LuaIndexKey, LuaTableExpr};
 
@@ -37,7 +37,7 @@ fn check_table_duplicate_index(
         return Some(());
     }
 
-    let mut index_map: HashMap<String, Vec<LuaIndexKey>> = HashMap::new();
+    let mut index_map: FxHashMap<String, Vec<LuaIndexKey>> = FxHashMap::default();
 
     for field in fields {
         if context.is_cancelled() {

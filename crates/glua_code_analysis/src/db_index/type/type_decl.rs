@@ -417,9 +417,9 @@ impl LuaTypeDeclId {
     }
 
     pub fn collect_super_types(&self, db: &DbIndex, collected_types: &mut Vec<LuaType>) {
-        // BFS with HashSet for O(1) visited check instead of Vec::contains O(n).
+        // BFS with FxHashSet for O(1) visited check instead of Vec::contains O(n).
         let mut queue = Vec::new();
-        let mut visited = std::collections::HashSet::new();
+        let mut visited = rustc_hash::FxHashSet::default();
         visited.insert(self.clone());
         queue.push(self.clone());
 

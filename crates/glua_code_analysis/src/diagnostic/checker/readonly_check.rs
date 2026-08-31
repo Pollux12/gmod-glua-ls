@@ -56,7 +56,7 @@ impl ReadOnlyCandidates {
         }
     }
 
-    fn names(&self) -> &std::collections::HashSet<String> {
+    fn names(&self) -> &rustc_hash::FxHashSet<String> {
         &self.candidates.readonly
     }
 

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use rustc_hash::FxHashMap;
 
@@ -60,7 +60,7 @@ impl InferCacheManager {
         &mut self,
         file_id: FileId,
         pending_type_decls: Vec<PendingStrTplTypeDecl>,
-        guard_dependencies: HashSet<LuaInferredGuardOwner>,
+        guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
     ) {
         let infer_cache = self.get_infer_cache(file_id);
         for pending in pending_type_decls {
@@ -111,7 +111,7 @@ impl InferCacheManager {
         pending
     }
 
-    pub fn clear_files(&mut self, file_ids: &HashSet<FileId>) {
+    pub fn clear_files(&mut self, file_ids: &FxHashSet<FileId>) {
         for file_id in file_ids {
             if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
                 infer_cache.clear();
@@ -125,7 +125,7 @@ impl InferCacheManager {
         }
     }
 
-    pub fn clear_files_iter_var_results(&mut self, file_ids: &HashSet<FileId>) {
+    pub fn clear_files_iter_var_results(&mut self, file_ids: &FxHashSet<FileId>) {
         for file_id in file_ids {
             if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
                 infer_cache.clear_iter_var_results();
@@ -139,7 +139,7 @@ impl InferCacheManager {
         }
     }
 
-    pub fn clear_files_deferred_results(&mut self, file_ids: &HashSet<FileId>) {
+    pub fn clear_files_deferred_results(&mut self, file_ids: &FxHashSet<FileId>) {
         for file_id in file_ids {
             if let Some(infer_cache) = self.infer_map.get_mut(file_id) {
                 infer_cache.clear_deferred_inference_results();
@@ -149,7 +149,7 @@ impl InferCacheManager {
 
     pub fn drain_inferred_guard_dependencies(
         &mut self,
-    ) -> Vec<(FileId, HashSet<LuaInferredGuardOwner>)> {
+    ) -> Vec<(FileId, FxHashSet<LuaInferredGuardOwner>)> {
         self.infer_map
             .iter_mut()
             .map(|(file_id, cache)| (*file_id, cache.take_inferred_guard_dependencies()))

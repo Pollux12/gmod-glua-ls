@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{DbIndex, LuaType, LuaTypeDeclId};
 
@@ -24,7 +24,7 @@ fn check_sub_type_of_iterative(
 
     let type_index = db.get_type_index();
     let mut stack = Vec::with_capacity(4);
-    let mut visited = HashSet::with_capacity(4);
+    let mut visited = FxHashSet::with_capacity_and_hasher(4, Default::default());
 
     stack.push(sub_type_ref_id);
     while let Some(current_id) = stack.pop() {

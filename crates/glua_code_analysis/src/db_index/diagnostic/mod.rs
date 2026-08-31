@@ -1,7 +1,7 @@
 mod analyze_error;
 mod diagnostic_action;
 
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 pub use analyze_error::AnalyzeError;
 pub use diagnostic_action::{DiagnosticAction, DiagnosticActionKind};
@@ -28,10 +28,10 @@ impl Default for DiagnosticIndex {
 impl DiagnosticIndex {
     pub fn new() -> Self {
         Self {
-            diagnostic_actions: HashMap::new(),
-            diagnostics: HashMap::new(),
-            file_diagnostic_disabled: HashMap::new(),
-            file_diagnostic_enabled: HashMap::new(),
+            diagnostic_actions: HashMap::default(),
+            diagnostics: HashMap::default(),
+            file_diagnostic_disabled: HashMap::default(),
+            file_diagnostic_enabled: HashMap::default(),
         }
     }
 

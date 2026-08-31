@@ -11,14 +11,13 @@ pub use module_info::ModuleInfo;
 pub use module_node::{ModuleNode, ModuleNodeId};
 use regex::Regex;
 use rowan::TextSize;
-use rustc_hash::FxHashMap;
+use rustc_hash::{FxHashMap, FxHashSet};
 pub(crate) use workspace::WorkspaceResolutionKey;
 pub use workspace::{Workspace, WorkspaceId, WorkspaceKind};
 
 use super::traits::LuaIndex;
 use crate::{Emmyrc, FileId};
 use std::{
-    collections::{HashMap, HashSet},
     path::{Path, PathBuf},
     sync::Arc,
 };
@@ -93,7 +92,7 @@ impl LuaModuleIndex {
         info!("update module pattern: {:?}", self.module_patterns);
     }
 
-    pub fn set_module_replace_patterns(&mut self, patterns: HashMap<String, String>) {
+    pub fn set_module_replace_patterns(&mut self, patterns: FxHashMap<String, String>) {
         self.module_replace_vec.clear();
         for (key, value) in patterns {
             let key_pattern = match Regex::new(&key) {
@@ -165,7 +164,7 @@ impl LuaModuleIndex {
             if let std::collections::hash_map::Entry::Vacant(e) = self.module_nodes.entry(child_id)
             {
                 let new_node = ModuleNode {
-                    children: HashMap::new(),
+                    children: FxHashMap::default(),
                     file_ids: Vec::new(),
                     parent: Some(parent_node_id),
                 };
@@ -872,7 +871,7 @@ impl LuaModuleIndex {
     }
 
     pub fn next_main_workspace_id(&self) -> u32 {
-        let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
+        let used: FxHashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
         let mut candidate = WorkspaceId::MAIN.id;
         while candidate == WorkspaceId::REMOTE.id || used.contains(&candidate) {
             candidate += 1;
@@ -881,7 +880,7 @@ impl LuaModuleIndex {
     }
 
     pub fn next_library_workspace_id(&self) -> u32 {
-        let used: HashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
+        let used: FxHashSet<u32> = self.workspaces.iter().map(|w| w.id.id).collect();
         let mut candidate = WorkspaceId::REMOTE.id + 1;
         while used.contains(&candidate) {
             candidate += 1;

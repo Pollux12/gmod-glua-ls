@@ -241,7 +241,7 @@ fn collect_dynamic_fields_for_file(
     Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)>,
     Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)>,
     Vec<FiniteNamedMemberEvidence>,
-    std::collections::HashSet<LuaInferredGuardOwner>,
+    rustc_hash::FxHashSet<LuaInferredGuardOwner>,
     Vec<SmolStr>,
 ) {
     let mut collected_unattributed: Vec<SmolStr> = Vec::new();

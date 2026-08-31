@@ -1,4 +1,3 @@
-use std::collections::HashSet;
 use std::hash::{Hash, Hasher};
 
 use rowan::TextRange;
@@ -102,7 +101,7 @@ pub fn diff_exports(old: &ExportMap, new: &ExportMap) -> ChangedExports {
 /// no key, so it reads as a removed export and dirties its dependents.
 pub fn export_map(db: &DbIndex, file_id: FileId, remap: &FileRemap) -> ExportMap {
     let mut map = ExportMap::default();
-    let files = HashSet::from([file_id]);
+    let files = FxHashSet::from_iter([file_id]);
 
     members(db, file_id, remap, &mut map);
     assignment_contributions(db, file_id, remap, &mut map);
@@ -152,7 +151,7 @@ fn members(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap
 // --- 2. Per-writer assignment contributions ---
 fn assignment_contributions(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
     let store = db.get_member_index().member_assignment_contributions();
-    for store_key in store.keys_for_files(&HashSet::from([file_id])) {
+    for store_key in store.keys_for_files(&FxHashSet::from_iter([file_id])) {
         let Some(contributions) = store.contributions(&store_key) else {
             continue;
         };
@@ -331,7 +330,7 @@ fn signatures(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut Export
 // --- 6. Parameter types this file's call sites are evidence for ---
 fn contributed_params(
     db: &DbIndex,
-    files: &HashSet<FileId>,
+    files: &FxHashSet<FileId>,
     remap: &FileRemap,
     map: &mut ExportMap,
 ) {
@@ -348,7 +347,12 @@ fn contributed_params(
 }
 
 // --- 7. Inferred guard facts produced by this file ---
-fn inferred_guards(db: &DbIndex, files: &HashSet<FileId>, remap: &FileRemap, map: &mut ExportMap) {
+fn inferred_guards(
+    db: &DbIndex,
+    files: &FxHashSet<FileId>,
+    remap: &FileRemap,
+    map: &mut ExportMap,
+) {
     for (owner, guard) in db
         .get_signature_index()
         .inferred_guard_facts_for_files(files)

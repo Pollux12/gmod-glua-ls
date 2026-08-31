@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
     LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaSemanticDeclId, LuaTupleType, LuaType,
@@ -337,7 +337,7 @@ fn check_ref_type_compact_table(
         return Ok(()); // empty member donot need check
     };
 
-    let mut checked_keys = HashSet::new();
+    let mut checked_keys = HashSet::default();
 
     for source_member in source_type_members {
         let key = source_member.key;
@@ -435,7 +435,7 @@ fn check_ref_type_compact_object(
         return Ok(());
     };
 
-    let mut checked_keys = HashSet::new();
+    let mut checked_keys = HashSet::default();
     for source_member in source_type_members {
         let key = source_member.key;
         if !checked_keys.insert(key.clone()) {
@@ -522,7 +522,7 @@ fn check_ref_type_compact_tuple(
     };
 
     let tuple_types = tuple_type.get_types();
-    let mut checked_keys = HashSet::new();
+    let mut checked_keys = HashSet::default();
     for member in source_type_members {
         let key = member.key;
         if !checked_keys.insert(key.clone()) {

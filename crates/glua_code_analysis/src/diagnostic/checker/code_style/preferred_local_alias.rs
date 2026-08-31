@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaExpr, LuaIndexExpr, LuaLocalStat, LuaSyntaxKind, PathTrait,
@@ -186,13 +186,13 @@ struct LocalAliasInfo {
 impl LocalAliasSet {
     fn new() -> Self {
         LocalAliasSet {
-            local_alias_stack: vec![HashMap::new()],
-            disable_check: HashSet::new(),
+            local_alias_stack: vec![HashMap::default()],
+            disable_check: HashSet::default(),
         }
     }
 
     fn push(&mut self) {
-        self.local_alias_stack.push(HashMap::new());
+        self.local_alias_stack.push(HashMap::default());
     }
 
     fn pop(&mut self) {

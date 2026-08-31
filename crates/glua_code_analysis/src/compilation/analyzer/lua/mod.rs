@@ -77,7 +77,7 @@ impl AnalysisPipeline for LuaAnalysisPipeline {
         let scripted_scope_files = if gmod_enabled {
             context.get_or_compute_scripted_scope_files(db)
         } else {
-            Arc::new(std::collections::HashSet::new())
+            Arc::new(rustc_hash::FxHashSet::default())
         };
 
         let file_dependency = db.get_file_dependencies_index().get_file_dependencies();

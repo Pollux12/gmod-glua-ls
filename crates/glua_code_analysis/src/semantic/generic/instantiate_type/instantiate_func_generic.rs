@@ -1,4 +1,5 @@
-use std::{collections::HashSet, ops::Deref, sync::Arc};
+use rustc_hash::FxHashSet as HashSet;
+use std::{ops::Deref, sync::Arc};
 
 use glua_parser::{LuaAstNode, LuaCallExpr, LuaChunk, LuaDocTypeList, LuaExpr, LuaNameExpr};
 use internment::ArcIntern;
@@ -322,7 +323,7 @@ pub fn instantiate_func_generic(
     call_expr: LuaCallExpr,
 ) -> Result<LuaFunctionType, InferFailReason> {
     let file_id = cache.get_file_id().clone();
-    let mut generic_tpls = HashSet::new();
+    let mut generic_tpls = HashSet::default();
     let mut contain_self = false;
     func.visit_type(&mut |t| match t {
         LuaType::TplRef(generic_tpl) | LuaType::ConstTplRef(generic_tpl) => {

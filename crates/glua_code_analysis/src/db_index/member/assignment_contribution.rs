@@ -1,5 +1,5 @@
 use rustc_hash::FxHashMap;
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use super::{LuaMemberId, LuaMemberKey, LuaMemberOwner};
 use crate::{FileId, InFiled, LuaType};
@@ -58,7 +58,7 @@ impl MemberAssignmentContributionStore {
     }
     /// Drops every entry the removed files contributed, in one sweep keyed by
     /// file rather than a whole-store scan per file.
-    pub fn remove_files<S: std::hash::BuildHasher>(&mut self, removed: &HashSet<FileId, S>) {
+    pub fn remove_files(&mut self, removed: &FxHashSet<FileId>) {
         for file_id in removed {
             let Some(entries) = self.by_file.remove(file_id) else {
                 continue;
@@ -112,9 +112,9 @@ impl MemberAssignmentContributionStore {
     /// The distinct groups the given files wrote to.
     pub fn keys_for_files(
         &self,
-        files: &HashSet<FileId>,
-    ) -> HashSet<MemberAssignmentContributionKey> {
-        let mut keys = HashSet::new();
+        files: &FxHashSet<FileId>,
+    ) -> FxHashSet<MemberAssignmentContributionKey> {
+        let mut keys = FxHashSet::default();
         for file_id in files {
             let Some(entries) = self.by_file.get(file_id) else {
                 continue;

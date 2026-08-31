@@ -7,9 +7,9 @@ use glua_parser::{
 };
 use internment::ArcIntern;
 use rowan::{TextRange, TextSize};
+use rustc_hash::FxHashSet;
 use smol_str::SmolStr;
 use std::borrow::Cow;
-use std::collections::HashSet;
 
 use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
@@ -58,7 +58,7 @@ use super::{
     type_decl_is_vgui_panel,
 };
 
-type TableMemberLookupGuard = HashSet<InFiled<TextRange>>;
+type TableMemberLookupGuard = FxHashSet<InFiled<TextRange>>;
 
 fn visible_super_types_for_index(
     db: &DbIndex,
@@ -2032,7 +2032,7 @@ fn get_expr_key_members(
 fn get_all_member_key(db: &DbIndex, origin_type: &LuaType) -> Option<Vec<LuaMemberKey>> {
     let mut result = Vec::new();
     let mut stack = vec![origin_type.clone()]; // 堆栈用于迭代处理
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if visited.contains(&current_type) {
@@ -3272,9 +3272,9 @@ fn get_expr_member_key(
     expr: &LuaExpr,
 ) -> Option<Vec<LuaMemberKey>> {
     let expr_type = infer_expr(db, cache, expr.clone()).ok()?;
-    let mut keys: HashSet<LuaMemberKey> = HashSet::new();
+    let mut keys: FxHashSet<LuaMemberKey> = FxHashSet::default();
     let mut stack = vec![expr_type.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if !visited.insert(current_type.clone()) {

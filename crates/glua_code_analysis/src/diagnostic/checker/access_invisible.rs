@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 use std::sync::Arc;
 
 use glua_parser::{LuaAst, LuaAstNode, LuaAstToken, LuaIndexExpr, LuaNameExpr, VisibilityKind};
@@ -116,7 +116,7 @@ impl AccessInvisibleCandidates {
         }
     }
 
-    fn explicit_names(&self) -> &HashSet<String> {
+    fn explicit_names(&self) -> &FxHashSet<String> {
         &self.candidates.access_invisible
     }
 

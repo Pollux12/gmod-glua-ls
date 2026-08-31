@@ -25,11 +25,8 @@ mod traits;
 mod r#type;
 pub(crate) use r#type::read_set;
 
-use std::{
-    collections::{HashMap, HashSet},
-    path::PathBuf,
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap, FxHashSet};
+use std::{path::PathBuf, sync::Arc};
 
 use crate::{Emmyrc, FileId, Vfs, profile::Profile};
 pub use accessor_func::*;
@@ -94,7 +91,7 @@ pub struct DbIndex {
     /// type-erased so `db_index` stays decoupled from the analyzer crate layer.
     /// Invalidated automatically by comparing `Vfs::content_revision`.
     helper_registry_cache: RevisionedCache,
-    file_helper_scan_cache: HashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
+    file_helper_scan_cache: FxHashMap<FileId, Arc<dyn std::any::Any + Send + Sync>>,
     /// Bumped on every *mutable* handle to the type, member, signature or module
     /// index; memos over facts derived from those key on it. It covers those four
     /// and no others — the decl, global, dynamic-field and gmod-infer indexes all
@@ -163,7 +160,7 @@ impl DbIndex {
             json_schema_index: JsonSchemaIndex::new(),
             emmyrc: Arc::new(Emmyrc::default()),
             helper_registry_cache: RevisionedCache::default(),
-            file_helper_scan_cache: HashMap::new(),
+            file_helper_scan_cache: FxHashMap::default(),
         }
     }
 
@@ -294,13 +291,13 @@ impl DbIndex {
     pub fn publish_inference_facts(
         &mut self,
         mut updates: Vec<(LuaInferenceNodeId, LuaTypeFact)>,
-    ) -> HashSet<FileId> {
+    ) -> FxHashSet<FileId> {
         // Writes into `types_index` below go direct rather than through
         // `get_type_index_mut`, so bump the revision here too.
         self.type_structure_revision = next_type_structure_revision();
         updates.sort_by(|(left_node, _), (right_node, _)| left_node.stable_cmp(right_node));
 
-        let mut conflicting_nodes = HashSet::new();
+        let mut conflicting_nodes = FxHashSet::default();
         for pair in updates.windows(2) {
             let [(left_node, left_fact), (right_node, right_fact)] = pair else {
                 unreachable!();
@@ -310,7 +307,7 @@ impl DbIndex {
             }
         }
 
-        let mut changed_files = HashSet::new();
+        let mut changed_files = FxHashSet::default();
         let mut previous_node = None;
         for (node, fact) in updates {
             if conflicting_nodes.contains(&node) || previous_node.as_ref() == Some(&node) {

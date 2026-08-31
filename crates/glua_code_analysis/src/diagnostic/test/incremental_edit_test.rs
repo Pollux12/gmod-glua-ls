@@ -1353,7 +1353,7 @@ vgui.Register(\"MyPanel\", PANEL, \"Panel\")
                 .compilation
                 .get_db()
                 .get_signature_index()
-                .inferred_guard_facts_for_files(&std::collections::HashSet::from([file_id]))
+                .inferred_guard_facts_for_files(&std::collections::HashSet::from_iter([file_id]))
                 .len()
         }
 

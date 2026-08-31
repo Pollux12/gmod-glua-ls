@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
     DiagnosticCode, DocTypeInferContext, LuaType, SemanticModel, TypeCheckFailReason,
@@ -216,7 +216,7 @@ fn add_type_check_diagnostic(
 fn is_nullable(typ: &LuaType) -> bool {
     let mut stack: Vec<LuaType> = Vec::new();
     stack.push(typ.clone());
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     while let Some(typ) = stack.pop() {
         if visited.contains(&typ) {
             continue;

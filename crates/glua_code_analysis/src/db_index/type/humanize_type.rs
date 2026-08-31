@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use itertools::Itertools;
 
@@ -232,7 +232,7 @@ fn humanize_simple_type(
     // `function X.k() end`, say -- describe the same field, and listing it once
     // per writer says nothing extra. Keeps the first in the index's own order,
     // so the choice does not depend on the batch.
-    let mut seen_keys = std::collections::HashSet::new();
+    let mut seen_keys = rustc_hash::FxHashSet::default();
     members.retain(|member| seen_keys.insert(member.get_key().clone()));
     let all_count = members.len();
     let mut member_strings = String::new();
@@ -318,7 +318,7 @@ where
         RenderLevel::Minimal => 2,
     };
     // Sort before truncation so rendered subsets stay canonical across runs.
-    let mut seen = HashSet::new();
+    let mut seen = FxHashSet::default();
     let mut type_strings = Vec::new();
     let mut has_nil = false;
     let mut has_function = false;

@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use glua_parser::{
     LuaAstNode, LuaAstToken, LuaChunk, LuaExpr, LuaForRangeStat, LuaLocalName, LuaLocalStat,
@@ -30,7 +30,7 @@ impl Checker for UnusedChecker {
             .get_decls()
             .values()
             .map(|decl| (decl.get_range(), decl))
-            .collect::<HashMap<_, _>>();
+            .collect::<FxHashMap<_, _>>();
         for decl in decl_tree.get_decls().values() {
             if decl.is_global() || decl.is_param() && decl.get_name() == "..." {
                 continue;
@@ -128,7 +128,7 @@ fn get_unused_check_result(
 
 fn should_ignore_positional_placeholder(
     ref_index: &LuaReferenceIndex,
-    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decls_by_range: &FxHashMap<TextRange, &LuaDecl>,
     decl: &LuaDecl,
     root: &LuaChunk,
 ) -> bool {
@@ -138,7 +138,7 @@ fn should_ignore_positional_placeholder(
 
 fn is_generic_for_placeholder(
     ref_index: &LuaReferenceIndex,
-    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decls_by_range: &FxHashMap<TextRange, &LuaDecl>,
     decl: &LuaDecl,
     root: &LuaChunk,
 ) -> bool {
@@ -167,7 +167,7 @@ fn is_generic_for_placeholder(
 
 fn is_local_multireturn_placeholder(
     ref_index: &LuaReferenceIndex,
-    decls_by_range: &HashMap<TextRange, &LuaDecl>,
+    decls_by_range: &FxHashMap<TextRange, &LuaDecl>,
     decl: &LuaDecl,
     root: &LuaChunk,
 ) -> bool {

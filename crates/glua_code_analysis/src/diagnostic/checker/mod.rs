@@ -52,7 +52,7 @@ use glua_parser::{
 };
 use lsp_types::{Diagnostic, DiagnosticSeverity, DiagnosticTag, NumberOrString};
 use rowan::{TextRange, TextSize};
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
@@ -515,7 +515,7 @@ impl<'a> DiagnosticContext<'a> {
 }
 
 fn collect_assignment_prefix_events(root: &LuaChunk) -> AssignmentPrefixEvents {
-    let mut events: AssignmentPrefixEvents = HashMap::new();
+    let mut events: AssignmentPrefixEvents = HashMap::default();
     for node in root.descendants::<LuaAst>() {
         let LuaAst::LuaAssignStat(assign_stat) = node else {
             continue;

@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    time::Duration,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::time::Duration;
 
 use glua_parser::{
     LuaAssignStat, LuaAst, LuaAstNode, LuaBinaryExpr, LuaCallExpr, LuaElseIfClauseStat, LuaExpr,
@@ -38,13 +36,13 @@ impl Checker for CheckFieldChecker {
 
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
-        let mut checked_index_expr = HashSet::new();
+        let mut checked_index_expr = HashSet::default();
         let assignment_prefixes = context.get_assignment_prefix_events(&root);
         let initialized_assignment_accesses =
             if has_reusable_table_literal_assignment(&assignment_prefixes) {
                 collect_initialized_assignment_accesses(&root, &assignment_prefixes)
             } else {
-                HashSet::new()
+                HashSet::default()
             };
         let mut state = CheckFieldState::default();
         let profile_enabled = log::log_enabled!(log::Level::Info);
@@ -190,7 +188,7 @@ fn collect_initialized_assignment_accesses(
     root: &glua_parser::LuaChunk,
     assignment_prefixes: &AssignmentPrefixEvents,
 ) -> HashSet<LuaSyntaxNode> {
-    let mut initialized_accesses = HashSet::new();
+    let mut initialized_accesses = HashSet::default();
     for assign in root.descendants::<LuaAssignStat>() {
         let (vars, _) = assign.get_var_and_expr_list();
         for var in vars {
@@ -1080,9 +1078,9 @@ fn check_enum_self_reference(
 }
 
 fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSet<LuaType> {
-    let mut type_set = HashSet::new();
+    let mut type_set = HashSet::default();
     let mut stack = vec![prefix_typ.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if context.is_cancelled() {
@@ -1108,9 +1106,9 @@ fn get_prefix_types(context: &DiagnosticContext, prefix_typ: &LuaType) -> HashSe
 }
 
 fn get_key_types(context: &DiagnosticContext, db: &DbIndex, typ: &LuaType) -> HashSet<LuaType> {
-    let mut type_set = HashSet::new();
+    let mut type_set = HashSet::default();
     let mut stack = vec![typ.clone()];
-    let mut visited = HashSet::new();
+    let mut visited = HashSet::default();
 
     while let Some(current_type) = stack.pop() {
         if context.is_cancelled() {

@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rowan::TextSize;
 use smol_str::SmolStr;
@@ -548,7 +548,7 @@ fn super_types_for_context<'a>(
             )
         },
     );
-    let mut seen_super_types = HashSet::new();
+    let mut seen_super_types = HashSet::default();
     visible.retain(|(_, _, _, _, super_type)| seen_super_types.insert(*super_type));
 
     Some(
@@ -627,7 +627,7 @@ fn find_workspace_scoped_owner_members(
     match filter {
         FindMemberFilter::All => {
             let owner_members = member_index.get_members(owner)?;
-            let mut seen = HashSet::new();
+            let mut seen = HashSet::default();
             let mut members = Vec::new();
 
             for member in owner_members {
@@ -800,7 +800,7 @@ fn find_intersection_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
-    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
 
     for typ in intersection_type.get_types().iter() {
         let instantiated_type = ctx.instantiate_type(db, typ);
@@ -811,7 +811,7 @@ fn find_intersection_members(
         };
 
         // Within a single component type, treat duplicate keys as overrides (first wins).
-        let mut component_seen: HashSet<LuaMemberKey> = HashSet::new();
+        let mut component_seen: HashSet<LuaMemberKey> = HashSet::default();
         for member in sub_members {
             if !component_seen.insert(member.key.clone()) {
                 continue;
@@ -871,7 +871,7 @@ fn find_merged_table_members(
     filter: &FindMemberFilter,
 ) -> FindMembersResult {
     let mut order: Vec<LuaMemberKey> = Vec::new();
-    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+    let mut members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
 
     for typ in merged_table.get_types().iter() {
         let instantiated_type = ctx.instantiate_type(db, typ);
@@ -887,7 +887,7 @@ fn find_merged_table_members(
         // table then disagrees with the union every other reader of that slot
         // gets from `resolve_member_item_type`. Union within the component,
         // then merge components as table fragments below.
-        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::new();
+        let mut component_members: HashMap<LuaMemberKey, LuaMemberInfo> = HashMap::default();
         let mut component_order: Vec<LuaMemberKey> = Vec::new();
         for member in sub_members {
             match component_members.entry(member.key.clone()) {

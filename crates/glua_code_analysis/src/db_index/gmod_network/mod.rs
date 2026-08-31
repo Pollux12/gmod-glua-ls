@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -242,14 +242,14 @@ pub struct NetNameExpansion {
 /// written by a retained unresolve alike.
 #[derive(Debug, Default)]
 pub struct NetHelperNameMemo {
-    files: HashMap<FileId, NetHelperFileMemo>,
+    files: FxHashMap<FileId, NetHelperFileMemo>,
 }
 
 #[derive(Debug, Default)]
 struct NetHelperFileMemo {
     revision: u64,
-    names: HashMap<SmolStr, NetNameExpansion>,
-    decls: HashMap<LuaDeclId, NetNameExpansion>,
+    names: FxHashMap<SmolStr, NetNameExpansion>,
+    decls: FxHashMap<LuaDeclId, NetNameExpansion>,
 }
 
 impl NetHelperNameMemo {
@@ -313,16 +313,16 @@ impl NetHelperNameMemo {
 
 #[derive(Debug, Default)]
 pub struct GmodNetworkIndex {
-    file_data: HashMap<FileId, FileNetworkData>,
-    send_flows_by_message: HashMap<String, Vec<(FileId, usize)>>,
-    receive_flows_by_message: HashMap<String, Vec<(FileId, usize)>>,
-    materialized_definition_counts: HashMap<(FileId, TextRange), usize>,
+    file_data: FxHashMap<FileId, FileNetworkData>,
+    send_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
+    receive_flows_by_message: FxHashMap<String, Vec<(FileId, usize)>>,
+    materialized_definition_counts: FxHashMap<(FileId, TextRange), usize>,
     /// Canonical function metadata per `(wire_format, direction)`, derived from
     /// annotated signatures during analysis. Features that must *emit* a net call
     /// — read completions, "expected `x`, got `y`" messages when one side has no
     /// call to name — resolve it here instead of from a hardcoded table.
     /// Workspace-global and rebuilt per analyze pass, so it is not per-file state.
-    canonical_ops: HashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
+    canonical_ops: FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
     /// See [`NetHelperNameMemo`]. Kept here so it survives across analyze
     /// passes; its own revision guard, not this index's lifecycle, decides
     /// whether an entry is usable.
@@ -332,11 +332,11 @@ pub struct GmodNetworkIndex {
 impl GmodNetworkIndex {
     pub fn new() -> Self {
         Self {
-            file_data: HashMap::new(),
-            send_flows_by_message: HashMap::new(),
-            receive_flows_by_message: HashMap::new(),
-            materialized_definition_counts: HashMap::new(),
-            canonical_ops: HashMap::new(),
+            file_data: FxHashMap::default(),
+            send_flows_by_message: FxHashMap::default(),
+            receive_flows_by_message: FxHashMap::default(),
+            materialized_definition_counts: FxHashMap::default(),
+            canonical_ops: FxHashMap::default(),
             helper_name_memo: NetHelperNameMemo::default(),
         }
     }
@@ -356,7 +356,7 @@ impl GmodNetworkIndex {
     /// metadata collected from annotated signatures.
     pub fn set_canonical_ops(
         &mut self,
-        canonical_ops: HashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
+        canonical_ops: FxHashMap<(SmolStr, NetOpDirection), CanonicalNetOp>,
     ) {
         self.canonical_ops = canonical_ops;
     }
@@ -383,8 +383,8 @@ impl GmodNetworkIndex {
     /// Every annotated wire format, paired with whether a write and a read exist
     /// for it. Used by the coverage test that guards against a typo silently
     /// breaking pairing for one op.
-    pub fn wire_format_coverage(&self) -> HashMap<SmolStr, (bool, bool)> {
-        let mut coverage: HashMap<SmolStr, (bool, bool)> = HashMap::new();
+    pub fn wire_format_coverage(&self) -> FxHashMap<SmolStr, (bool, bool)> {
+        let mut coverage: FxHashMap<SmolStr, (bool, bool)> = FxHashMap::default();
         for (wire_format, direction) in self.canonical_ops.keys() {
             let entry = coverage
                 .entry(wire_format.clone())

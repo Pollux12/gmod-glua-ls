@@ -868,9 +868,7 @@ mod test {
 
         assert_eq!(
             db.publish_inference_facts(vec![(node.clone(), fact.clone())]),
-            [file_id()]
-                .into_iter()
-                .collect::<std::collections::HashSet<_>>()
+            [file_id()].into_iter().collect::<HashSet<_>>()
         );
         assert_eq!(db.get_inference_fact(&node), Some(fact));
     }

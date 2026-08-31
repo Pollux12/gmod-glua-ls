@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rowan::TextRange;
 
@@ -300,12 +300,12 @@ pub struct GmodLoadIndex {
 impl GmodLoadIndex {
     pub fn new() -> Self {
         Self {
-            file_infos: HashMap::new(),
+            file_infos: HashMap::default(),
             unresolved_edges: Vec::new(),
-            execution_environments: HashMap::new(),
-            execution_environment_sites: HashMap::new(),
-            execution_environment_file_flows: HashMap::new(),
-            execution_environment_role_sources: HashSet::new(),
+            execution_environments: HashMap::default(),
+            execution_environment_sites: HashMap::default(),
+            execution_environment_file_flows: HashMap::default(),
+            execution_environment_role_sources: HashSet::default(),
             execution_environment_roles_dirty: false,
         }
     }
@@ -688,9 +688,9 @@ mod tests {
         let source = FileId::new(1);
         let target = FileId::new(2);
         let mut index = GmodLoadIndex::new();
-        index.set_execution_environment_sites(HashMap::from([(
+        index.set_execution_environment_sites(HashMap::from_iter([(
             source,
-            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
+            HashMap::from_iter([(target, HashSet::from_iter(["simple".to_string()]))]),
         )]));
 
         index.remove(source);
@@ -703,9 +703,9 @@ mod tests {
         let source = FileId::new(1);
         let target = FileId::new(2);
         let mut index = GmodLoadIndex::new();
-        index.set_execution_environment_sites(HashMap::from([(
+        index.set_execution_environment_sites(HashMap::from_iter([(
             source,
-            HashMap::from([(target, HashSet::from(["simple".to_string()]))]),
+            HashMap::from_iter([(target, HashSet::from_iter(["simple".to_string()]))]),
         )]));
 
         index.clear();

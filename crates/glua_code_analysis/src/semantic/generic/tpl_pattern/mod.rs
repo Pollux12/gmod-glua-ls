@@ -24,7 +24,7 @@ use crate::{
 };
 
 use super::type_substitutor::TypeSubstitutor;
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 type TplPatternMatchResult = Result<(), InferFailReason>;
 
@@ -1106,7 +1106,7 @@ fn is_pairs_call(context: &mut TplContext) -> Option<bool> {
 fn try_handle_pairs_metamethod(
     context: &mut TplContext,
     table_generic_params: &[LuaType],
-    members: &HashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
+    members: &FxHashMap<LuaMemberKey, Vec<LuaMemberInfo>>,
 ) -> TplPatternMatchResult {
     let pairs_member = members
         .get(&LuaMemberKey::Name("__pairs".into()))

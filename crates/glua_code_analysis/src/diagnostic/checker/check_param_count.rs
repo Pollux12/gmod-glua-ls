@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use glua_parser::{
     LuaAst, LuaAstNode, LuaAstToken, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaForRangeStat,
@@ -406,7 +406,7 @@ fn get_params_len(params: &[(String, Option<LuaType>)]) -> Option<usize> {
 fn is_nullable(db: &DbIndex, typ: &LuaType) -> bool {
     let mut stack: Vec<LuaType> = Vec::new();
     stack.push(typ.clone());
-    let mut visited = HashSet::new();
+    let mut visited = FxHashSet::default();
     while let Some(typ) = stack.pop() {
         if visited.contains(&typ) {
             continue;

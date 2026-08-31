@@ -1,7 +1,5 @@
-use std::{
-    collections::{HashMap, HashSet},
-    sync::Arc,
-};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
+use std::sync::Arc;
 
 use glua_parser::{
     LuaAssignStat, LuaAstNode, LuaCallArgList, LuaCallExpr, LuaClosureExpr, LuaExpr, LuaIndexKey,
@@ -24,7 +22,7 @@ impl Checker for MissingFieldsChecker {
     fn check(context: &mut DiagnosticContext, semantic_model: &SemanticModel) {
         let root = semantic_model.get_root().clone();
 
-        let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::new();
+        let mut type_cache: HashMap<LuaType, Arc<HashSet<String>>> = HashMap::default();
         for expr in root.descendants::<LuaTableExpr>() {
             if context.is_cancelled() {
                 return;
@@ -49,7 +47,7 @@ fn check_table_expr(
     let mut union_has_array_type = false;
     let table_type = match semantic_model.infer_table_should_be(expr.clone())? {
         LuaType::Union(union) => {
-            let mut set = HashSet::new();
+            let mut set = HashSet::default();
             for ty in union.types() {
                 if context.is_cancelled() {
                     return Some(());
@@ -148,7 +146,7 @@ fn check_table_expr(
         LuaType::Intersection(intersections) => type_cache
             .entry(table_type.clone())
             .or_insert_with(|| {
-                let mut computed_fields = HashSet::new();
+                let mut computed_fields = HashSet::default();
                 for intersection_component in intersections.get_types() {
                     if context.is_cancelled() {
                         return Arc::new(computed_fields);
@@ -422,9 +420,9 @@ fn get_required_fields_for_types(
     mut is_cancelled: impl FnMut() -> bool,
 ) -> Option<HashSet<String>> {
     let member_index = db.get_member_index();
-    let mut required_fields: HashSet<String> = HashSet::new();
+    let mut required_fields: HashSet<String> = HashSet::default();
 
-    let mut optional_type = HashSet::new();
+    let mut optional_type = HashSet::default();
     for super_type in types {
         if is_cancelled() {
             return Some(required_fields);
@@ -476,8 +474,8 @@ fn get_required_fields_for_types(
         is_cancelled: &mut impl FnMut() -> bool,
     ) -> Option<()> {
         let members = member_index.get_members(&LuaMemberOwner::Type(type_decl_id))?;
-        let mut type_required_fields = HashSet::new();
-        let mut type_optional_fields = HashSet::new();
+        let mut type_required_fields = HashSet::default();
+        let mut type_optional_fields = HashSet::default();
 
         for member in members {
             if is_cancelled() {

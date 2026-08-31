@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use rustc_hash::FxHashMap;
 
 use rowan::NodeCache;
 
@@ -8,7 +8,7 @@ pub struct ParserConfig<'cache> {
     pub level: LuaLanguageLevel,
     lexer_config: LexerConfig,
     node_cache: Option<&'cache mut NodeCache>,
-    special_like: HashMap<String, SpecialFunction>,
+    special_like: FxHashMap<String, SpecialFunction>,
     pub enable_emmylua_doc: bool,
 }
 
@@ -16,7 +16,7 @@ impl<'cache> ParserConfig<'cache> {
     pub fn new(
         level: LuaLanguageLevel,
         node_cache: Option<&'cache mut NodeCache>,
-        special_like: HashMap<String, SpecialFunction>,
+        special_like: FxHashMap<String, SpecialFunction>,
         non_std_symbols: LuaNonStdSymbolSet,
         enable_emmylua_doc: bool,
     ) -> Self {
@@ -76,7 +76,7 @@ impl<'cache> ParserConfig<'cache> {
                 non_std_symbols: LuaNonStdSymbolSet::new(),
             },
             node_cache: None,
-            special_like: HashMap::new(),
+            special_like: FxHashMap::default(),
             enable_emmylua_doc: true,
         }
     }
@@ -91,7 +91,7 @@ impl Default for ParserConfig<'_> {
                 non_std_symbols: LuaNonStdSymbolSet::new(),
             },
             node_cache: None,
-            special_like: HashMap::new(),
+            special_like: FxHashMap::default(),
             enable_emmylua_doc: true,
         }
     }

@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use rustc_hash::FxHashSet;
 
 use crate::{
     CacheEntry, DbIndex, GlobalId, InFiled, InferFailReason, LuaMemberKey, LuaSemanticDeclId,
@@ -709,14 +709,14 @@ fn should_skip_ambiguous_unknown_key_table_owner(
 pub(in crate::compilation::analyzer) fn has_multiple_distinct_index_expr_member_owners(
     typ: &LuaType,
 ) -> bool {
-    let mut owners = HashSet::new();
+    let mut owners = FxHashSet::default();
     collect_distinct_index_expr_member_owners(typ, &mut owners);
     owners.len() > 1
 }
 
 fn collect_distinct_index_expr_member_owners(
     typ: &LuaType,
-    owners: &mut HashSet<LuaMemberOwner>,
+    owners: &mut FxHashSet<LuaMemberOwner>,
 ) -> bool {
     match typ {
         LuaType::TableConst(in_file_range) => {
@@ -771,7 +771,7 @@ fn collect_distinct_index_expr_member_owners(
 }
 
 fn insert_index_expr_member_owner(
-    owners: &mut HashSet<LuaMemberOwner>,
+    owners: &mut FxHashSet<LuaMemberOwner>,
     owner: LuaMemberOwner,
 ) -> bool {
     owners.insert(owner);

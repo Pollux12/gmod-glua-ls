@@ -9,7 +9,7 @@ pub(super) fn collect_numeric_range_table_populations_for_file(
     let Some(block) = root.get_block() else {
         return Vec::new();
     };
-    let mut local_helpers: HashMap<String, LuaClosureExpr> = HashMap::new();
+    let mut local_helpers: HashMap<String, LuaClosureExpr> = HashMap::default();
     let mut populations = Vec::new();
     let mut cache = LuaInferCache::new(file_id, Default::default());
 
@@ -113,7 +113,7 @@ fn numeric_range_populations_from_outer_call(
 ) -> Option<Vec<TableNumericRangePopulation>> {
     let block = outer_closure.get_block()?;
     let mut populations = Vec::new();
-    let mut populated_tables: HashSet<String> = HashSet::new();
+    let mut populated_tables: HashSet<String> = HashSet::default();
 
     for stat in block.get_stats() {
         match stat {
@@ -656,7 +656,7 @@ fn pre_loop_local_stat_is_harmless(
             &expr,
             helpers,
             protected_names,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         )
     })
 }
@@ -710,7 +710,13 @@ fn pre_loop_call_is_harmless(
     protected_names: &HashSet<String>,
     active_helpers: &mut HashSet<String>,
 ) -> bool {
-    if call_write_effect_is_allowed(db, cache, call_expr, protected_names, &mut HashSet::new()) {
+    if call_write_effect_is_allowed(
+        db,
+        cache,
+        call_expr,
+        protected_names,
+        &mut HashSet::default(),
+    ) {
         return true;
     }
     let Some(helper_name) = call_expr_name(call_expr) else {
@@ -937,7 +943,7 @@ fn branchy_local_stat_is_safe(
             &expr,
             helpers,
             protected_names,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         )
     })
 }
@@ -991,7 +997,7 @@ fn branchy_assignment_is_safe(
             expr,
             helpers,
             protected_names,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         )
     })
 }
@@ -1093,7 +1099,7 @@ fn condition_calls_are_safe(
             &condition,
             helpers,
             protected_names,
-            &mut HashSet::new(),
+            &mut HashSet::default(),
         )
     })
 }
@@ -1392,7 +1398,7 @@ fn numeric_range_rhs_is_safe(
         return true;
     }
 
-    let mut active_helpers = HashSet::new();
+    let mut active_helpers = HashSet::default();
     calls.into_iter().all(|call_expr| {
         numeric_range_call_is_safe(
             db,
@@ -1450,17 +1456,22 @@ fn numeric_range_call_is_safe(
         );
     }
 
-    call_write_effect_is_allowed(db, cache, call_expr, protected_names, &mut HashSet::new())
-        && call_args_are_safe(
-            db,
-            cache,
-            file_id,
-            containing_closure,
-            call_expr,
-            helpers,
-            protected_names,
-            active_helpers,
-        )
+    call_write_effect_is_allowed(
+        db,
+        cache,
+        call_expr,
+        protected_names,
+        &mut HashSet::default(),
+    ) && call_args_are_safe(
+        db,
+        cache,
+        file_id,
+        containing_closure,
+        call_expr,
+        helpers,
+        protected_names,
+        active_helpers,
+    )
 }
 
 fn call_write_effect_overlaps_protected_names(
@@ -1671,7 +1682,7 @@ fn population_bounded_write_roots(
     helpers: &HashMap<String, LuaClosureExpr>,
 ) -> Vec<String> {
     let mut roots = Vec::new();
-    let mut active_helpers = HashSet::new();
+    let mut active_helpers = HashSet::default();
     collect_closure_bounded_write_roots(
         db,
         cache,

@@ -4,8 +4,8 @@ mod resolve;
 mod resolve_closure;
 
 use rustc_hash::FxHashMap;
+use rustc_hash::FxHashSet;
 use std::cmp::Ordering;
-use std::collections::HashSet;
 use std::time::Duration;
 
 use crate::{
@@ -295,7 +295,7 @@ fn requeue_flushed_call_site_returns(
     context: &mut AnalyzeContext,
     infer_manager: &mut InferCacheManager,
     reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
-    changed_signatures: &HashSet<LuaSignatureId>,
+    changed_signatures: &FxHashSet<LuaSignatureId>,
     log_enabled: bool,
 ) {
     let consumers = db
@@ -444,7 +444,7 @@ fn try_resolve(
     // therefore not progress, and is parked instead. Every wave now either
     // resolves an item or retires an `(item, reason)` pair, both of which are
     // finite, so the loop terminates.
-    let mut requeued: HashSet<(UnResolveIdentity, InferFailReason)> = HashSet::new();
+    let mut requeued: FxHashSet<(UnResolveIdentity, InferFailReason)> = FxHashSet::default();
     // Waves have no file count to report, so they report what is still deferred.
     let initial_outstanding: usize = reason_resolve.values().map(Vec::len).sum();
     loop {
@@ -460,7 +460,7 @@ fn try_resolve(
         let mut to_be_remove = Vec::new();
         let mut retain_unresolve = Vec::new();
         let mut parked = Vec::new();
-        let mut retry_file_ids = HashSet::new();
+        let mut retry_file_ids = FxHashSet::default();
 
         // Only re-sort keys when the set of reason groups has changed.
         // This avoids cloning and sorting on every inner loop iteration.
@@ -946,7 +946,7 @@ impl UnResolve {
 
     /// Returns a deterministic sort key (file_id, text_position) for stable ordering.
     /// This ensures unresolves are processed in a consistent order regardless of
-    /// HashMap iteration order or other non-deterministic sources during collection.
+    /// FxHashMap iteration order or other non-deterministic sources during collection.
     fn sort_key(&self) -> (u32, u32) {
         match self {
             UnResolve::Decl(d) => (d.file_id.id, u32::from(d.decl_id.position)),

@@ -416,14 +416,14 @@ pub(super) fn stabilize_unguarded_children(
     if !db.get_emmyrc().gmod.enabled {
         return Vec::new();
     }
-    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::new();
+    let mut scores = HashMap::<LuaDefinitionId, UnguardedChildCandidates>::default();
     let mut deferred_definitions = FxHashSet::<LuaDefinitionId>::default();
     let mut nested_scores =
-        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::new();
+        HashMap::<NestedUnguardedChildTarget, NestedUnguardedChildCandidates>::default();
     let mut sources =
         HashMap::<(LuaDefinitionId, crate::LuaTypeDeclId), InFiled<glua_parser::LuaSyntaxId>>::new(
         );
-    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::new();
+    let mut initializer_refinements = HashMap::<crate::LuaDeclId, LuaType>::default();
     let mut declared_path_bases = DeclaredPathBases::default();
     let subtype_index_start = profile.as_ref().map(|_| std::time::Instant::now());
     let direct_subtype_members = precompute_direct_subtype_members(db);
@@ -678,7 +678,7 @@ pub(super) fn stabilize_unguarded_children(
                             .entry(definition.clone())
                             .or_insert_with(|| UnguardedChildCandidates {
                                 parent_type: base_type.clone(),
-                                children: HashMap::new(),
+                                children: HashMap::default(),
                             })
                             .children
                             .entry(child_id.clone())
@@ -1077,7 +1077,7 @@ fn collect_member_path_unguarded_child_evidence(
             .entry(target)
             .or_insert_with(|| NestedUnguardedChildCandidates {
                 parent_type: current.clone(),
-                children: HashMap::new(),
+                children: HashMap::default(),
                 receivers: FxHashSet::default(),
                 source: source.clone(),
             });

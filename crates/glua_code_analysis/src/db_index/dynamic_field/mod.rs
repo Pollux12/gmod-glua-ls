@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use rowan::TextRange;
 use smol_str::SmolStr;
@@ -279,7 +279,7 @@ impl DynamicFieldIndex {
             .collect();
 
         let mut moved = rustc_hash::FxHashMap::default();
-        let mut lost: HashSet<DynamicFieldOwner> = HashSet::new();
+        let mut lost: HashSet<DynamicFieldOwner> = HashSet::default();
         for owner in owners {
             let DynamicFieldOwner::Table(range) = &owner else {
                 continue;
@@ -299,7 +299,7 @@ impl DynamicFieldIndex {
 
         self.remap_table_ranges(&moved);
 
-        let mut dirty = HashSet::new();
+        let mut dirty = HashSet::default();
         if !lost.is_empty() {
             for owner in &lost {
                 self.owner_fields.remove(owner);
@@ -647,7 +647,7 @@ fn normalize_file_contributions(
         .iter()
         .map(|(file_id, entries)| {
             let entry_counts = entries.iter().cloned().fold(
-                HashMap::<(DynamicFieldOwner, SmolStr, TextRange), usize>::new(),
+                HashMap::<(DynamicFieldOwner, SmolStr, TextRange), usize>::default(),
                 |mut counts, entry| {
                     *counts.entry(entry).or_default() += 1;
                     counts
@@ -666,7 +666,7 @@ fn normalize_wildcard_file_contributions(
         .iter()
         .map(|(file_id, entries)| {
             let entry_counts = entries.iter().cloned().fold(
-                HashMap::<(DynamicFieldOwner, TextRange), usize>::new(),
+                HashMap::<(DynamicFieldOwner, TextRange), usize>::default(),
                 |mut counts, entry| {
                     *counts.entry(entry).or_default() += 1;
                     counts
@@ -688,7 +688,7 @@ fn normalize_field_definitions(
                 .iter()
                 .map(|(field_name, definitions)| {
                     let definition_counts = definitions.iter().cloned().fold(
-                        HashMap::<InFiled<TextRange>, usize>::new(),
+                        HashMap::<InFiled<TextRange>, usize>::default(),
                         |mut counts, definition| {
                             *counts.entry(definition).or_default() += 1;
                             counts
@@ -711,7 +711,7 @@ impl LuaIndex for DynamicFieldIndex {
         let removed: HashSet<FileId> = file_ids.iter().copied().collect();
         // The definition maps are swept once for the whole batch: retaining
         // per file made removal cost O(files × index) on high fan-in edits.
-        let mut files_with_removed_fields: HashSet<FileId> = HashSet::new();
+        let mut files_with_removed_fields: HashSet<FileId> = HashSet::default();
         self.field_definitions.retain(|_, fields| {
             fields.retain(|_, definitions| {
                 definitions.retain(|definition| {
@@ -738,7 +738,7 @@ impl LuaIndex for DynamicFieldIndex {
             !members.is_empty()
         });
 
-        let mut files_with_removed_wildcards: HashSet<FileId> = HashSet::new();
+        let mut files_with_removed_wildcards: HashSet<FileId> = HashSet::default();
         self.wildcard_definitions.retain(|_, definitions| {
             definitions.retain(|definition| {
                 if removed.contains(&definition.file_id) {

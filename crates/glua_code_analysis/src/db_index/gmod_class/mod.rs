@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use glua_parser::LuaSyntaxId;
 use rowan::TextSize;
@@ -355,13 +355,13 @@ struct DermaSkinDefinition {
 impl GmodClassMetadataIndex {
     pub fn new() -> Self {
         Self {
-            file_metadata: HashMap::new(),
-            vgui_panels: HashMap::new(),
-            derma_skins: HashMap::new(),
-            vgui_forwarding_parents: HashMap::new(),
-            vgui_panel_parent_chains: HashMap::new(),
-            incomplete_vgui_panel_parent_chains: HashSet::new(),
-            pending_vgui_parent_relation_files: HashMap::new(),
+            file_metadata: HashMap::default(),
+            vgui_panels: HashMap::default(),
+            derma_skins: HashMap::default(),
+            vgui_forwarding_parents: HashMap::default(),
+            vgui_panel_parent_chains: HashMap::default(),
+            incomplete_vgui_panel_parent_chains: HashSet::default(),
+            pending_vgui_parent_relation_files: HashMap::default(),
         }
     }
 
@@ -544,8 +544,8 @@ impl GmodClassMetadataIndex {
     }
 
     fn recompute_derived_caches(&mut self) {
-        let mut vgui_panels = HashMap::new();
-        let mut derma_skins = HashMap::new();
+        let mut vgui_panels = HashMap::default();
+        let mut derma_skins = HashMap::default();
 
         for (file_id, file_metadata) in &self.file_metadata {
             for call in &file_metadata.vgui_register_calls {
@@ -729,8 +729,8 @@ impl GmodClassMetadataIndex {
         // Order-free despite the hash-ordered walk: a chain survives only if
         // every relation agrees on it — any disagreement marks the child
         // incomplete and the entry is dropped below, whichever one landed first.
-        let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::new();
-        let mut incomplete = HashSet::new();
+        let mut parent_chains = HashMap::<LuaTypeDeclId, Vec<LuaTypeDeclId>>::default();
+        let mut incomplete = HashSet::default();
         for metadata in self.file_metadata.values() {
             for call in &metadata.vgui_parent_calls {
                 for relation in &call.relations {
