@@ -19,6 +19,12 @@ pub struct LuaReferenceIndex {
     global_references: HashMap<SmolStr, HashMap<FileId, HashSet<LuaSyntaxId>>>,
     string_references: HashMap<FileId, StringReference>,
     type_references: HashMap<FileId, HashMap<LuaTypeDeclId, HashSet<TextRange>>>,
+    /// Bumped whenever a file's references change, so a memo over facts derived
+    /// from one file's references can tell a hit from a stale entry. Values come
+    /// from a counter that never restarts, so a revision is never reused after a
+    /// removal.
+    file_revision: HashMap<FileId, u64>,
+    next_revision: u64,
 }
 
 impl Default for LuaReferenceIndex {
@@ -35,7 +41,53 @@ impl LuaReferenceIndex {
             global_references: HashMap::default(),
             string_references: HashMap::default(),
             type_references: HashMap::default(),
+            file_revision: HashMap::default(),
+            next_revision: 1,
         }
+    }
+
+    /// Revision of `file_id`'s references. Zero until the file records one.
+    pub fn file_reference_revision(&self, file_id: FileId) -> u64 {
+        self.file_revision.get(&file_id).copied().unwrap_or(0)
+    }
+
+    fn bump_file_revision(&mut self, file_id: FileId) {
+        let revision = self.next_revision;
+        self.next_revision += 1;
+        self.file_revision.insert(file_id, revision);
+    }
+
+    /// Every file that references `name`, from both name-keyed tables. The sites
+    /// themselves are not materialized.
+    pub fn files_referencing_name(&self, name: &SmolStr) -> HashSet<FileId> {
+        let member_key = LuaMemberKey::Name(name.clone());
+        self.index_reference
+            .get(&member_key)
+            .into_iter()
+            .flatten()
+            .chain(self.global_references.get(name).into_iter().flatten())
+            .map(|(file_id, _)| *file_id)
+            .collect()
+    }
+
+    /// Every site in `file_id` that references `name`, from both name-keyed
+    /// tables.
+    pub fn name_references_in_file(&self, name: &SmolStr, file_id: FileId) -> Vec<LuaSyntaxId> {
+        let member_key = LuaMemberKey::Name(name.clone());
+        self.index_reference
+            .get(&member_key)
+            .and_then(|references| references.get(&file_id))
+            .into_iter()
+            .flatten()
+            .chain(
+                self.global_references
+                    .get(name)
+                    .and_then(|references| references.get(&file_id))
+                    .into_iter()
+                    .flatten(),
+            )
+            .copied()
+            .collect()
     }
 
     pub fn add_decl_reference(
@@ -49,6 +101,7 @@ impl LuaReferenceIndex {
             .entry(file_id)
             .or_default()
             .add_decl_reference(decl_id, range, is_write);
+        self.bump_file_revision(file_id);
     }
 
     pub fn add_global_reference(&mut self, name: &str, file_id: FileId, syntax_id: LuaSyntaxId) {
@@ -59,6 +112,7 @@ impl LuaReferenceIndex {
             .entry(file_id)
             .or_default()
             .insert(syntax_id);
+        self.bump_file_revision(file_id);
     }
 
     pub fn add_index_reference(
@@ -73,6 +127,7 @@ impl LuaReferenceIndex {
             .entry(file_id)
             .or_default()
             .insert(syntax_id);
+        self.bump_file_revision(file_id);
     }
 
     pub fn add_string_reference(&mut self, file_id: FileId, string: &str, range: TextRange) {
@@ -214,6 +269,7 @@ impl LuaReferenceIndex {
 
 impl LuaIndex for LuaReferenceIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.bump_file_revision(file_id);
         self.file_references.remove(&file_id);
         self.string_references.remove(&file_id);
         self.type_references.remove(&file_id);
@@ -243,6 +299,9 @@ impl LuaIndex for LuaReferenceIndex {
     }
 
     fn remove_files(&mut self, file_ids: &[FileId]) {
+        for &file_id in file_ids {
+            self.bump_file_revision(file_id);
+        }
         let removed_file_ids = file_ids.iter().copied().collect::<HashSet<_>>();
         self.file_references
             .retain(|file_id, _| !removed_file_ids.contains(file_id));
@@ -262,6 +321,7 @@ impl LuaIndex for LuaReferenceIndex {
     }
 
     fn clear(&mut self) {
+        self.file_revision.clear();
         self.file_references.clear();
         self.string_references.clear();
         self.type_references.clear();
@@ -277,6 +337,49 @@ mod tests {
 
     use super::{LuaIndex, LuaReferenceIndex};
     use crate::{FileId, LuaMemberKey, db_index::LuaTypeDeclId};
+
+    #[test]
+    fn name_lookups_union_both_tables_and_a_write_moves_the_file_revision() {
+        let first = FileId::new(1);
+        let second = FileId::new(2);
+        let range = TextRange::new(TextSize::new(0), TextSize::new(1));
+        let other_range = TextRange::new(TextSize::new(4), TextSize::new(5));
+        let mut index = LuaReferenceIndex::new();
+        let global_site = LuaSyntaxId::new(LuaSyntaxKind::NameExpr.into(), range);
+        let index_site = LuaSyntaxId::new(LuaSyntaxKind::IndexExpr.into(), other_range);
+        let name: smol_str::SmolStr = "Send".into();
+
+        index.add_global_reference(&name, first, global_site);
+        index.add_index_reference(LuaMemberKey::Name(name.clone()), first, index_site);
+        index.add_global_reference(&name, second, global_site);
+        let first_revision = index.file_reference_revision(first);
+
+        assert_eq!(
+            index.files_referencing_name(&name),
+            [first, second].into_iter().collect()
+        );
+        let mut sites = index.name_references_in_file(&name, first);
+        sites.sort_by_key(|site| site.get_range().start());
+        assert_eq!(sites, vec![global_site, index_site]);
+        assert_eq!(
+            index.name_references_in_file(&name, second),
+            vec![global_site]
+        );
+
+        index.add_decl_reference(
+            crate::db_index::LuaDeclId::new(first, TextSize::new(0)),
+            first,
+            range,
+            false,
+        );
+        assert_ne!(index.file_reference_revision(first), first_revision);
+
+        let before_removal = index.file_reference_revision(second);
+        index.remove(second);
+        assert!(index.files_referencing_name(&name).contains(&first));
+        assert!(!index.files_referencing_name(&name).contains(&second));
+        assert_ne!(index.file_reference_revision(second), before_removal);
+    }
 
     #[test]
     fn batch_removal_keeps_references_from_surviving_files() {
