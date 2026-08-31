@@ -3669,4 +3669,55 @@ mod test {
             eq(true)
         );
     }
+
+    /// Every load site contributes exactly one incoming edge, carrying the converged state
+    /// mask, and the edges are ordered by the normalized path of the including file. Before
+    /// the sites were sorted and the edges recorded after convergence, a site visited ahead of
+    /// its source's realm also left an edge stamped with the empty mask.
+    #[gtest]
+    fn test_load_index_incoming_edges_are_one_per_site_in_source_path_order() {
+        let mut ws = VirtualWorkspace::new();
+        set_gmod_enabled(&mut ws);
+
+        let target_id = ws.def_file("lua/myaddon/target.lua", "return true");
+        let b_id = ws.def_file(
+            "lua/myaddon/b_middle.lua",
+            r#"include("myaddon/target.lua")"#,
+        );
+        let a_id = ws.def_file(
+            "lua/myaddon/a_middle.lua",
+            r#"include("myaddon/target.lua")"#,
+        );
+        ws.def_file(
+            "lua/autorun/server/sv_boot.lua",
+            r#"
+            include("myaddon/b_middle.lua")
+            include("myaddon/a_middle.lua")
+            "#,
+        );
+
+        let db = ws.get_db_mut();
+        let target_info = db
+            .get_gmod_load_index()
+            .get_file_info(&target_id)
+            .expect("target should have load info");
+
+        // Each `include` registers two dependency sites, one on the call range and one on the
+        // path-argument range, so two edges per including file is one edge per site.
+        assert_eq!(
+            target_info
+                .incoming_edges
+                .iter()
+                .map(|edge| edge.source_file_id)
+                .collect::<Vec<_>>(),
+            vec![a_id, a_id, b_id, b_id],
+        );
+        assert_that!(
+            target_info
+                .incoming_edges
+                .iter()
+                .all(|edge| edge.states == GmodStateMask::SERVER),
+            eq(true)
+        );
+    }
 }
