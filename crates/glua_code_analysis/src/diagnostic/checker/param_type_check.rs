@@ -9,8 +9,8 @@ use rowan::TextRange;
 use crate::{
     DbIndex, DiagnosticCode, LuaDeclExtra, LuaFunctionType, LuaMemberId, LuaMemberKey,
     LuaMemberOwner, LuaOperatorMetaMethod, LuaOperatorOwner, LuaSemanticDeclId, LuaSignature,
-    LuaSignatureId, LuaType, LuaTypeOwner, LuaUnionType, RenderLevel, SemanticDeclLevel,
-    SemanticModel, TypeCheckFailReason, TypeCheckResult, TypeOps, TypeVisitTrait, VariadicType,
+    LuaSignatureId, LuaType, LuaTypeOwner, RenderLevel, SemanticDeclLevel, SemanticModel,
+    TypeCheckFailReason, TypeCheckResult, TypeOps, TypeVisitTrait, VariadicType,
     diagnostic::checker::assign_type_mismatch::check_table_expr, humanize_type, infer_index_expr,
     is_authoritative_self_receiver_type, resolve_alias_type,
 };
@@ -1805,16 +1805,13 @@ fn should_suppress_lua_primitive_coercion(param_type: &LuaType, expr_type: &LuaT
     let param_is_nullable = !std::ptr::eq(core_param, param_type);
 
     match expr_type {
-        LuaType::Union(union) => match union.as_ref() {
+        LuaType::Union(union) => match union.nullable_inner() {
             // `T|nil` — T must be coercible and param must accept nil.
-            LuaUnionType::Nullable(inner) => {
-                param_is_nullable && is_primitive_coercible_to(core_param, inner)
-            }
+            Some(inner) => param_is_nullable && is_primitive_coercible_to(core_param, inner),
             // General union — all members must be coercible; nil passes only if param is nullable.
-            // Iterates the inner Vec directly — no allocation.
-            LuaUnionType::Multi(types) => {
-                !types.is_empty()
-                    && types.iter().all(|t| {
+            None => {
+                !union.is_empty()
+                    && union.types().all(|t| {
                         if matches!(t, LuaType::Nil) {
                             param_is_nullable
                         } else {
@@ -1829,10 +1826,10 @@ fn should_suppress_lua_primitive_coercion(param_type: &LuaType, expr_type: &LuaT
 
 /// Unwraps a nullable param type (`T?` → `T`), returning the inner type.
 fn strip_nullable_param(ty: &LuaType) -> &LuaType {
-    if let LuaType::Union(union) = ty {
-        if let LuaUnionType::Nullable(inner) = union.as_ref() {
-            return inner;
-        }
+    if let LuaType::Union(union) = ty
+        && let Some(inner) = union.nullable_inner()
+    {
+        return inner;
     }
     ty
 }

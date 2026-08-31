@@ -11,7 +11,6 @@ mod type_check_fail_reason;
 mod type_check_guard;
 
 use rustc_hash::FxHashMap as HashMap;
-use std::ops::Deref;
 
 use complex_type::check_complex_type_compact;
 use func_type::{check_doc_func_type_compact, check_sig_type_compact};
@@ -166,8 +165,8 @@ fn check_general_type_compact(
         .allow_nullable_as_non_nullable
         && let LuaType::Union(union_type) = compact_type
     {
-        match union_type.deref() {
-            LuaUnionType::Nullable(non_nullable_type) => {
+        match union_type.nullable_inner() {
+            Some(non_nullable_type) => {
                 return check_general_type_compact(
                     context,
                     source,
@@ -175,9 +174,9 @@ fn check_general_type_compact(
                     check_guard.next_level()?,
                 );
             }
-            LuaUnionType::Multi(types) if types.contains(&LuaType::Nil) => {
-                let non_nil: Vec<LuaType> = types
-                    .iter()
+            None if union_type.types().any(|t| matches!(t, LuaType::Nil)) => {
+                let non_nil: Vec<LuaType> = union_type
+                    .types()
                     .filter(|t| !matches!(t, LuaType::Nil))
                     .cloned()
                     .collect();
@@ -187,7 +186,7 @@ fn check_general_type_compact(
                         .next()
                         .expect("non_nil has exactly 1 element")
                 } else {
-                    LuaType::Union(LuaUnionType::Multi(non_nil).into())
+                    LuaType::Union(LuaUnionType::from_multi_unchecked(non_nil).into())
                 };
                 return check_general_type_compact(
                     context,
@@ -343,7 +342,7 @@ fn fast_eq_check(a: &LuaType, b: &LuaType) -> bool {
         | (LuaType::Any, LuaType::Any) => true,
         (LuaType::Ref(type_id_left), LuaType::Ref(type_id_right)) => type_id_left == type_id_right,
         (LuaType::Union(u), LuaType::Ref(type_id_right)) => {
-            if let LuaUnionType::Nullable(LuaType::Ref(type_id_left)) = u.deref() {
+            if let Some(LuaType::Ref(type_id_left)) = u.nullable_inner() {
                 return type_id_left == type_id_right;
             }
             false

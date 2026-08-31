@@ -11,7 +11,7 @@ use smol_str::SmolStr;
 
 use crate::{
     DbIndex, DiagnosticCode, FileId, GlobalId, InferFailReason, LuaAliasCallKind, LuaAliasCallType,
-    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, LuaUnionType, SemanticModel,
+    LuaInferenceConfidence, LuaMemberKey, LuaMemberOwner, LuaType, SemanticModel,
     check_type_compact, enum_variable_is_param, get_keyof_members, get_real_type,
     semantic::{
         infer_owner_raw_member_type_with_realm, infer_param_is_weak, is_doc_tag_table_const,
@@ -445,10 +445,10 @@ fn is_invalid_prefix_type(typ: &LuaType) -> bool {
             // Treating it as invalid suppresses diagnostics like typed-object key mismatches.
             LuaType::TableConst(_) => return false,
             LuaType::Union(union) => {
-                return match union.as_ref() {
-                    LuaUnionType::Nullable(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
-                    LuaUnionType::Multi(types) => types
-                        .iter()
+                return match union.nullable_inner() {
+                    Some(typ) => typ.is_nil() || is_invalid_prefix_type(typ),
+                    None => union
+                        .types()
                         .all(|typ| typ.is_nil() || is_invalid_prefix_type(typ)),
                 };
             }
@@ -519,11 +519,9 @@ fn has_unresolved_metatable_index(
         LuaType::Instance(instance) => {
             has_unresolved_metatable_index(db, semantic_model, instance.get_base(), position)
         }
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(typ) => {
-                has_unresolved_metatable_index(db, semantic_model, typ, position)
-            }
-            LuaUnionType::Multi(types) => types.iter().any(|typ| {
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(typ) => has_unresolved_metatable_index(db, semantic_model, typ, position),
+            None => union.types().any(|typ| {
                 !typ.is_nil() && has_unresolved_metatable_index(db, semantic_model, typ, position)
             }),
         },

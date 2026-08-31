@@ -2,7 +2,7 @@ use std::collections::HashSet;
 
 use glua_code_analysis::{
     LuaCompilation, LuaDeclExtra, LuaDeclId, LuaMemberId, LuaMemberIndexItem, LuaMemberOwner,
-    LuaSemanticDeclId, LuaType, LuaTypeDeclId, LuaUnionType, SemanticDeclLevel, SemanticModel,
+    LuaSemanticDeclId, LuaType, LuaTypeDeclId, SemanticDeclLevel, SemanticModel,
 };
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaSyntaxKind, LuaTableExpr, LuaTableField};
 use rowan::TextSize;
@@ -411,9 +411,9 @@ fn table_is_class(table_type: &LuaType, depth: usize) -> bool {
     }
     match table_type {
         LuaType::Ref(_) | LuaType::Def(_) | LuaType::Generic(_) => true,
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(t) => table_is_class(t, depth + 1),
-            LuaUnionType::Multi(ts) => ts.iter().any(|t| table_is_class(t, depth + 1)),
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(t) => table_is_class(t, depth + 1),
+            None => union.types().any(|t| table_is_class(t, depth + 1)),
         },
         _ => false,
     }

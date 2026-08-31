@@ -5,7 +5,7 @@ use glua_parser::{
 
 use crate::{
     DbIndex, InFiled, InferFailReason, LuaDeclExtra, LuaInferCache, LuaInstanceType, LuaMemberKey,
-    LuaMemberOwner, LuaType, LuaUnionType, SemanticDeclLevel, infer_expr,
+    LuaMemberOwner, LuaType, SemanticDeclLevel, infer_expr,
     semantic::{
         SemanticDeclGuard, get_member_value_expr, infer::InferResult, infer_expr_semantic_decl,
         member::find_members_with_key,
@@ -551,11 +551,11 @@ fn last_table_literal_index_value(table: &LuaTableExpr) -> Option<LuaExpr> {
 
 fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
     match typ {
-        LuaType::Union(union) => match union.as_ref() {
-            LuaUnionType::Nullable(inner) => classify_metatable_index_candidate(inner),
-            LuaUnionType::Multi(types) => {
+        LuaType::Union(union) => match union.nullable_inner() {
+            Some(inner) => classify_metatable_index_candidate(inner),
+            None => {
                 let mut supported_types = Vec::new();
-                for typ in types.iter().filter(|typ| !typ.is_nil()) {
+                for typ in union.types().filter(|typ| !typ.is_nil()) {
                     match classify_metatable_index_candidate(typ) {
                         MetatableIndexCandidate::Supported(typ) => supported_types.push(typ),
                         MetatableIndexCandidate::Unsupported => {

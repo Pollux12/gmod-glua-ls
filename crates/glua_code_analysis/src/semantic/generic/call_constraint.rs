@@ -318,18 +318,18 @@ fn get_union_constraint_type(
     union_type: &LuaUnionType,
     depth: usize,
 ) -> Option<LuaType> {
-    match union_type {
-        LuaUnionType::Nullable(typ) => {
+    match union_type.nullable_inner() {
+        Some(typ) => {
             let constraint_type = get_constraint_type(semantic_model, typ, depth + 1)?;
             Some(TypeOps::Union.apply(semantic_model.get_db(), &constraint_type, &LuaType::Nil))
         }
-        LuaUnionType::Multi(types) => {
+        None => {
             let mut constraint_types = None;
-            for (idx, typ) in types.iter().enumerate() {
+            for (idx, typ) in union_type.types().enumerate() {
                 if let Some(constraint_type) = get_constraint_type(semantic_model, typ, depth + 1) {
                     let constraint_types = constraint_types.get_or_insert_with(|| {
-                        let mut mapped = Vec::with_capacity(types.len());
-                        mapped.extend(types[..idx].iter().cloned());
+                        let mut mapped = Vec::with_capacity(union_type.len());
+                        mapped.extend(union_type.types().take(idx).cloned());
                         mapped
                     });
                     constraint_types.push(constraint_type);

@@ -1,7 +1,7 @@
 use glua_parser::{LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaExpr, LuaSyntaxNode};
 
 use crate::{
-    DbIndex, LuaInferCache, LuaType, LuaUnionType, TypeOps, check_type_compact,
+    DbIndex, LuaInferCache, LuaType, TypeOps, check_type_compact,
     db_index::{LuaMemberOwner, LuaTypeCache, LuaTypeDeclId},
     semantic::{
         infer::{InferResult, narrow::remove_false_or_nil},
@@ -43,15 +43,13 @@ fn can_empty_table_satisfy_type(db: &DbIndex, ty: &LuaType) -> bool {
 
         // For unions, at least ONE type must be satisfiable by {}
         LuaType::Union(union_type) => {
-            match union_type.as_ref() {
-                LuaUnionType::Nullable(inner) => {
-                    // For Type?, check the inner type (nil is already removed)
-                    can_empty_table_satisfy_type(db, inner)
-                }
-                LuaUnionType::Multi(types) => {
-                    // At least one type in union must be satisfiable
-                    types.iter().any(|t| can_empty_table_satisfy_type(db, t))
-                }
+            match union_type.nullable_inner() {
+                // For Type?, check the inner type (nil is already removed)
+                Some(inner) => can_empty_table_satisfy_type(db, inner),
+                // At least one type in union must be satisfiable
+                None => union_type
+                    .types()
+                    .any(|t| can_empty_table_satisfy_type(db, t)),
             }
         }
 
