@@ -33,8 +33,8 @@ pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cac
 use rowan::{TextRange, TextSize};
 
 use super::{
-    InferFailReason, LuaInferCache, SemanticDeclLevel, infer_expr, infer_expr_list_value_type_at,
-    infer_node_semantic_decl, infer_table_should_be,
+    DynamicFieldDefinitionSyntax, InferFailReason, LuaInferCache, SemanticDeclLevel, infer_expr,
+    infer_expr_list_value_type_at, infer_node_semantic_decl, infer_table_should_be,
 };
 
 pub fn get_buildin_type_map_type_id(type_: &LuaType) -> Option<LuaTypeDeclId> {
@@ -311,7 +311,7 @@ enum DynamicFieldDefinitionVisibility {
 }
 
 struct VisibleDynamicFieldDefinition {
-    location: InFiled<TextRange>,
+    member_id: Option<LuaMemberId>,
     visibility: DynamicFieldDefinitionVisibility,
 }
 
@@ -339,9 +339,11 @@ pub(crate) fn resolve_dynamic_field_member(
     let Some(field_name) = member_key.get_name() else {
         return Ok(None);
     };
+    let caller_file_id = cache.get_file_id();
     let definitions = dynamic_field_definitions(
         db,
-        cache.get_file_id(),
+        cache,
+        caller_file_id,
         prefix_type,
         field_name,
         access_position,
@@ -364,8 +366,7 @@ pub(crate) fn resolve_dynamic_field_member(
     let mut semantic_decl = None;
     let mut has_runtime_type = false;
     for definition in definitions {
-        let location = definition.location;
-        let Some(member_id) = dynamic_field_member_id(db, location.file_id, location.value) else {
+        let Some(member_id) = definition.member_id else {
             continue;
         };
         if semantic_decl.is_none() {
@@ -479,6 +480,7 @@ fn dynamic_field_definition_cache(cache: &LuaInferCache, file_id: FileId) -> Lua
 
 fn dynamic_field_definitions(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     caller_file_id: FileId,
     prefix_type: &LuaType,
     field_name: &str,
@@ -487,6 +489,7 @@ fn dynamic_field_definitions(
     match prefix_type {
         LuaType::Ref(type_id) | LuaType::Def(type_id) => dynamic_field_definitions_for_owner(
             db,
+            cache,
             caller_file_id,
             &crate::DynamicFieldOwner::Type(type_id.clone()),
             field_name,
@@ -494,6 +497,7 @@ fn dynamic_field_definitions(
         ),
         LuaType::TableConst(table_range) => dynamic_field_definitions_for_owner(
             db,
+            cache,
             caller_file_id,
             &crate::canonical_dynamic_field_owner(
                 db,
@@ -504,6 +508,7 @@ fn dynamic_field_definitions(
         ),
         LuaType::Instance(instance) => dynamic_field_definitions(
             db,
+            cache,
             caller_file_id,
             instance.get_base(),
             field_name,
@@ -515,6 +520,7 @@ fn dynamic_field_definitions(
 
 fn dynamic_field_definitions_for_owner(
     db: &DbIndex,
+    cache: &mut LuaInferCache,
     caller_file_id: FileId,
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
@@ -526,31 +532,42 @@ fn dynamic_field_definitions_for_owner(
         db.get_member_index()
             .enclosing_function_scope_range(caller_file_id, position)
     });
-    db.get_dynamic_field_index()
+    let mut visible = Vec::new();
+    // Consulted in the index's canonical order, unfiltered and unsorted: the
+    // elected arm and the elected semantic decl both follow it.
+    for definition in db
+        .get_dynamic_field_index()
         .field_definitions(owner, field_name)
-        .iter()
-        .filter(|definition| dynamic_fields_global || definition.file_id == caller_file_id)
-        .filter(|definition| is_dynamic_field_realm_compatible(db, caller_mask, definition))
-        .filter_map(|definition| {
-            dynamic_field_definition_visibility_at(
-                db,
-                caller_file_id,
-                definition,
-                access_position,
-                access_function,
-            )
-            .map(|visibility| VisibleDynamicFieldDefinition {
-                location: definition.clone(),
+    {
+        if !(dynamic_fields_global || definition.file_id == caller_file_id) {
+            continue;
+        }
+        if !is_dynamic_field_realm_compatible(db, caller_mask, definition) {
+            continue;
+        }
+        let syntax = dynamic_field_definition_syntax(db, cache, definition);
+        if let Some(visibility) = dynamic_field_definition_visibility_at(
+            db,
+            caller_file_id,
+            definition,
+            syntax.enclosing_assign_range,
+            access_position,
+            access_function,
+        ) {
+            visible.push(VisibleDynamicFieldDefinition {
+                member_id: syntax.member_id,
                 visibility,
-            })
-        })
-        .collect()
+            });
+        }
+    }
+    visible
 }
 
 fn dynamic_field_definition_visibility_at(
     db: &DbIndex,
     caller_file_id: FileId,
     definition: &crate::InFiled<TextRange>,
+    enclosing_assign_range: Option<TextRange>,
     access_position: Option<TextSize>,
     access_function: Option<TextRange>,
 ) -> Option<DynamicFieldDefinitionVisibility> {
@@ -560,7 +577,9 @@ fn dynamic_field_definition_visibility_at(
     if definition.file_id != caller_file_id {
         return Some(DynamicFieldDefinitionVisibility::Runtime);
     }
-    if definition_enclosing_assignment_contains(db, definition, access_position) {
+    if enclosing_assign_range
+        .is_some_and(|range| range.contains(access_position) && range != definition.value)
+    {
         return None;
     }
 
@@ -588,28 +607,73 @@ fn dynamic_field_definition_visibility_at(
         .then_some(DynamicFieldDefinitionVisibility::Runtime)
 }
 
-fn definition_enclosing_assignment_contains(
+/// The definition site's member id and enclosing assignment range.
+///
+/// Both are read off the definition file's tree alone, so they are memoised
+/// per definition rather than re-walked from the root for every access
+/// position that consults the same definition.
+fn dynamic_field_definition_syntax(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    definition: &crate::InFiled<TextRange>,
+) -> DynamicFieldDefinitionSyntax {
+    if let Some(cached) = cache.dynamic_field_definition_syntax_cache.get(definition) {
+        return *cached;
+    }
+    let syntax = dynamic_field_definition_syntax_uncached(db, definition);
+    cache
+        .dynamic_field_definition_syntax_cache
+        .insert(definition.clone(), syntax);
+    syntax
+}
+
+fn dynamic_field_definition_syntax_uncached(
     db: &DbIndex,
     definition: &crate::InFiled<TextRange>,
-    access_position: TextSize,
-) -> bool {
-    let Some(root) = db.get_vfs().get_syntax_tree(&definition.file_id) else {
-        return false;
+) -> DynamicFieldDefinitionSyntax {
+    let mut syntax = DynamicFieldDefinitionSyntax::default();
+    let file_id = definition.file_id;
+    let range = definition.value;
+    let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+        return syntax;
     };
-    let root = root.get_red_root();
-    let Some(token) = root
-        .token_at_offset(definition.value.start())
-        .right_biased()
-    else {
-        return false;
+    let root = tree.get_red_root();
+    let Some(token) = root.token_at_offset(range.start()).right_biased() else {
+        return syntax;
     };
-    token
-        .parent_ancestors()
-        .find_map(LuaAssignStat::cast)
-        .is_some_and(|assign_stat| {
-            let range = assign_stat.get_range();
-            range.contains(access_position) && range != definition.value
-        })
+
+    let mut current = token.parent();
+    while let Some(node) = current {
+        if syntax.member_id.is_none() {
+            if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
+                // Legacy: range matches the full index expression. New: range
+                // matches the index key (field name) within it.
+                if index_expr.get_range() == range
+                    || index_expr.get_index_key().and_then(|key| key.get_range()) == Some(range)
+                {
+                    syntax.member_id = Some(LuaMemberId::new(index_expr.get_syntax_id(), file_id));
+                }
+            }
+            if syntax.member_id.is_none()
+                && let Some(table_field) = LuaTableField::cast(node.clone())
+                && (table_field.get_range() == range
+                    || table_field.get_field_key().and_then(|key| key.get_range()) == Some(range))
+            {
+                syntax.member_id = Some(LuaMemberId::new(table_field.get_syntax_id(), file_id));
+            }
+        }
+        if syntax.enclosing_assign_range.is_none()
+            && let Some(assign_stat) = LuaAssignStat::cast(node.clone())
+        {
+            syntax.enclosing_assign_range = Some(assign_stat.get_range());
+        }
+        if syntax.member_id.is_some() && syntax.enclosing_assign_range.is_some() {
+            break;
+        }
+        current = node.parent();
+    }
+
+    syntax
 }
 
 fn effective_dynamic_field_state_mask(
@@ -646,39 +710,6 @@ fn is_dynamic_field_realm_compatible(
         definition.file_id,
         Some(definition.value.start()),
     ))
-}
-
-fn dynamic_field_member_id(db: &DbIndex, file_id: FileId, range: TextRange) -> Option<LuaMemberId> {
-    let root = db.get_vfs().get_syntax_tree(&file_id)?.get_red_root();
-    let token = root.token_at_offset(range.start()).right_biased()?;
-    let mut current = token.parent();
-    while let Some(node) = current {
-        if let Some(index_expr) = LuaIndexExpr::cast(node.clone()) {
-            // Legacy: range matches the full index expression
-            if index_expr.get_range() == range {
-                return Some(LuaMemberId::new(index_expr.get_syntax_id(), file_id));
-            }
-            // New: range matches the index key (field name) within this expression
-            if let Some(key) = index_expr.get_index_key() {
-                if key.get_range() == Some(range) {
-                    return Some(LuaMemberId::new(index_expr.get_syntax_id(), file_id));
-                }
-            }
-        }
-        if let Some(table_field) = LuaTableField::cast(node.clone()) {
-            if table_field.get_range() == range {
-                return Some(LuaMemberId::new(table_field.get_syntax_id(), file_id));
-            }
-            if let Some(key) = table_field.get_field_key()
-                && key.get_range() == Some(range)
-            {
-                return Some(LuaMemberId::new(table_field.get_syntax_id(), file_id));
-            }
-        }
-        current = node.parent();
-    }
-
-    None
 }
 
 pub(crate) fn member_key_as_type(key: &LuaMemberKey) -> Option<LuaType> {

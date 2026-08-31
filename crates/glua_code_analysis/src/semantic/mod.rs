@@ -21,8 +21,8 @@ use std::sync::{Arc, Mutex, MutexGuard};
 pub(crate) use infer::narrow::get_type_at_flow::BASELINE_FLOW_WALKS;
 
 pub use cache::{
-    CacheEntry, CacheOptions, LuaAnalysisPhase, LuaInferCache, PendingStrTplTypeDecl,
-    VarRefCacheRootKey,
+    CacheEntry, CacheOptions, DynamicFieldDefinitionSyntax, LuaAnalysisPhase, LuaInferCache,
+    PendingStrTplTypeDecl, VarRefCacheRootKey,
 };
 pub use decl::{enum_variable_is_param, parse_require_module_info};
 use glua_parser::{
