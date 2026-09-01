@@ -807,13 +807,6 @@ fn compute_iter_var_updates(
     Ok(updates)
 }
 
-/// The write mode for a settled iterator-variable type.
-///
-/// A raw template ref is a placeholder left by an unbound generic, never a valid
-/// fact, so a real type replaces it, as does a settled union that already
-/// contains everything the cache holds. A documented type is an authority
-/// decision — `---@param` is legal on a `for ... in` variable — so it is never
-/// overwritten; anything else keeps insert-only precedence.
 /// Write mode for the settled re-derivation.
 ///
 /// [`iter_var_write_mode`] only accepts an answer that widens the cached one,
@@ -835,6 +828,13 @@ fn settled_iter_var_write_mode(
     TypeCacheWriteMode::ForceOverwrite
 }
 
+/// The write mode for a settled iterator-variable type.
+///
+/// A raw template ref is a placeholder left by an unbound generic, never a valid
+/// fact, so a real type replaces it, as does a settled union that already
+/// contains everything the cache holds. A documented type is an authority
+/// decision — `---@param` is legal on a `for ... in` variable — so it is never
+/// overwritten; anything else keeps insert-only precedence.
 fn iter_var_write_mode(cached: Option<&LuaTypeCache>, settled: &LuaType) -> TypeCacheWriteMode {
     let Some(cached) = cached.filter(|cached| !cached.is_doc()) else {
         return TypeCacheWriteMode::InsertOnly;

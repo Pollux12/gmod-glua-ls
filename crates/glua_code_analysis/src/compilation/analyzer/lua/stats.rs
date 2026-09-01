@@ -1616,11 +1616,6 @@ fn reads_global_name(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
         .is_none()
 }
 
-/// Whether the initializer reads through a global whose root name has more than
-/// one declaration — the `X = X or {}` per-realm bootstrap whose backing tables
-/// the walk merges incrementally. Recurses index/call prefixes and operator
-/// operands so a member path (`cityrp.presidential.Taxes`) or an arithmetic read
-/// (`... / 100`) is caught, not only a bare `local x = cityrp`.
 /// Record the current file if any `panel:GetParent()` read in it fell back to
 /// the broad `Panel` type because the vgui parent chain was not complete. The
 /// chains finish in the gmod-post pass; the fallback set accumulates over the
@@ -1638,6 +1633,11 @@ fn note_vgui_parent_fallback_file(analyzer: &mut LuaAnalyzer) {
     }
 }
 
+/// Whether the initializer reads through a global whose root name has more than
+/// one declaration — the `X = X or {}` per-realm bootstrap whose backing tables
+/// the walk merges incrementally. Recurses index/call prefixes and operator
+/// operands so a member path (`cityrp.presidential.Taxes`) or an arithmetic read
+/// (`... / 100`) is caught, not only a bare `local x = cityrp`.
 fn initializer_reads_through_multi_decl_global(analyzer: &LuaAnalyzer, expr: &LuaExpr) -> bool {
     let Some(root_name) = global_read_root_name(analyzer, expr) else {
         return false;
@@ -1783,11 +1783,6 @@ fn should_defer_pending_local_alias(
     analyzer.context.has_pending_decl_unresolve(decl_id)
 }
 
-/// Whether `expr` reads out of `decl_id` itself: the `x = x.field` shape,
-/// and the same read buried in an operand or call argument (`width =
-/// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
-/// self-contradiction — the value still cannot be the decl's lifetime type,
-/// because it was computed from a read that type would reject.
 /// Whether `expr` is the default-value idiom for `decl_id` — `p = p or DEFAULT`.
 ///
 /// The result always includes the declaration's own type, so unlike a plain
@@ -1818,6 +1813,11 @@ pub(crate) fn expr_fills_own_default(
         .is_some_and(|decl| decl.get_id() == decl_id)
 }
 
+/// Whether `expr` reads out of `decl_id` itself: the `x = x.field` shape,
+/// and the same read buried in an operand or call argument (`width =
+/// bit.bor(bit.lshift(width:byte(1), 24), ...)`). Depth does not change the
+/// self-contradiction — the value still cannot be the decl's lifetime type,
+/// because it was computed from a read that type would reject.
 pub(crate) fn expr_reads_out_of_decl(
     db: &DbIndex,
     file_id: crate::FileId,
@@ -3013,13 +3013,6 @@ fn guarded_table_bootstrap_range(
     )
 }
 
-/// The one table a repeated `x.y = x.y or {}` guard names.
-///
-/// Every such writer means "reuse it if it is there", so at runtime they are all
-/// the same table and only the first to run creates it. Giving each writer its
-/// own literal instead makes a file that re-guards the namespace read its own
-/// empty table and lose whatever another file attached, so they resolve to the
-/// earliest writer's literal — the one that would have won at runtime.
 /// Re-derives the literal each `x.y = x.y or {}` writer names, now that every
 /// writer of the slot has landed.
 ///
@@ -3091,6 +3084,13 @@ pub(in crate::compilation::analyzer) fn resettle_guarded_table_bootstraps(
     }
 }
 
+/// The one table a repeated `x.y = x.y or {}` guard names.
+///
+/// Every such writer means "reuse it if it is there", so at runtime they are all
+/// the same table and only the first to run creates it. Giving each writer its
+/// own literal instead makes a file that re-guards the namespace read its own
+/// empty table and lose whatever another file attached, so they resolve to the
+/// earliest writer's literal — the one that would have won at runtime.
 fn canonical_guarded_table_bootstrap_type(
     db: &crate::DbIndex,
     member_id: LuaMemberId,
