@@ -509,8 +509,42 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
             }
         }
         // The remaining variants nest no type that can carry a table literal's
-        // range, so there is nothing under them to move.
-        _ => None,
+        // range, so there is nothing under them to move. Listed rather than
+        // matched with a wildcard so that a new `LuaType` variant fails to
+        // compile here, which is what keeps this arm list in step with
+        // `hash_type`.
+        LuaType::Unknown
+        | LuaType::Any
+        | LuaType::Nil
+        | LuaType::Table
+        | LuaType::Userdata
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::Boolean
+        | LuaType::String
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::Io
+        | LuaType::SelfInfer
+        | LuaType::Global
+        | LuaType::Never
+        | LuaType::BooleanConst(_)
+        | LuaType::StringConst(_)
+        | LuaType::IntegerConst(_)
+        | LuaType::FloatConst(_)
+        | LuaType::DocStringConst(_)
+        | LuaType::DocIntegerConst(_)
+        | LuaType::DocBooleanConst(_)
+        | LuaType::Ref(_)
+        | LuaType::Def(_)
+        | LuaType::TplRef(_)
+        | LuaType::ConstTplRef(_)
+        | LuaType::StrTplRef(_)
+        | LuaType::Namespace(_)
+        | LuaType::Language(_)
+        | LuaType::ModuleRef(_)
+        | LuaType::DocAttribute(_)
+        | LuaType::ConditionalInfer(_) => None,
     }
 }
 
@@ -1526,7 +1560,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         if replaced && self.fact_metadata.remove(&owner).is_some() {
-            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+            self.mark_inference_derived_state_dirty();
         }
     }
 
@@ -1549,7 +1583,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         if self.fact_metadata.remove(&owner).is_some() {
-            self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+            self.mark_inference_derived_state_dirty();
         }
     }
 
@@ -1575,7 +1609,7 @@ impl LuaTypeIndex {
             .or_default()
             .insert(owner.clone());
         self.fact_metadata.insert(owner, metadata);
-        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        self.mark_inference_derived_state_dirty();
     }
 
     pub fn force_bind_type_fact(
@@ -1584,12 +1618,12 @@ impl LuaTypeIndex {
         cache: LuaTypeCache,
         metadata: LuaTypeFactMetadata,
     ) {
-        let file_id = self.force_bind_type_fact_unchecked(owner, cache, metadata);
-        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        self.force_bind_type_fact_unchecked(owner, cache, metadata);
+        self.mark_inference_derived_state_dirty();
     }
 
     pub fn get_type_fact(&self, owner: &LuaTypeOwner) -> Option<LuaTypeFact> {
-        let cache = self.types.get(owner)?;
+        let cache = self.read_type_cache(owner)?;
         let fact = match self.fact_metadata.get(owner) {
             Some(metadata) => LuaTypeFact::from_normalized_parts(
                 cache.as_type().clone(),
@@ -1603,8 +1637,8 @@ impl LuaTypeIndex {
     }
 
     pub fn bind_definition_fact(&mut self, definition: LuaDefinitionId, fact: LuaTypeFact) {
-        let file_id = self.bind_definition_fact_unchecked(definition, fact);
-        self.rebuild_inference_derived_state(&[file_id].into_iter().collect::<HashSet<_>>());
+        self.bind_definition_fact_unchecked(definition, fact);
+        self.mark_inference_derived_state_dirty();
     }
 
     pub fn get_definition_fact(&self, definition: &LuaDefinitionId) -> Option<&LuaTypeFact> {
@@ -1646,6 +1680,19 @@ impl LuaTypeIndex {
     }
 
     pub fn get_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
+        self.read_type_cache(owner)
+    }
+
+    /// The one way an inference reads a stored type, so every such read lands in
+    /// the read set.
+    ///
+    /// The settled tail skips a candidate whose reads have not moved, so a read
+    /// that goes unrecorded is a candidate that never gets re-derived — a stale
+    /// answer with nothing to report it. Recording one that did not matter only
+    /// costs a re-derivation, so anything reaching `types` on behalf of a caller
+    /// goes through here. The write paths compare against `types` directly:
+    /// what a write overwrites is not something it depends on.
+    fn read_type_cache(&self, owner: &LuaTypeOwner) -> Option<&LuaTypeCache> {
         read_set::record(owner);
         self.types.get(owner)
     }
@@ -1717,13 +1764,7 @@ impl LuaTypeIndex {
     /// rather than run once per binding. No reader runs inside an analysis
     /// batch: the events are read by the inference-trust diagnostic and the
     /// support dependents by reindex expansion, both after `analyze` returns.
-    pub(crate) fn rebuild_inference_derived_state<S: std::hash::BuildHasher>(
-        &mut self,
-        changed_files: &std::collections::HashSet<FileId, S>,
-    ) {
-        if changed_files.is_empty() {
-            return;
-        }
+    pub(crate) fn mark_inference_derived_state_dirty(&mut self) {
         self.derived_state_dirty = true;
     }
 
@@ -1814,7 +1855,9 @@ impl LuaTypeIndex {
             changed_files.insert(owner.get_file_id());
             self.insert_type_cache(owner, new_cache);
         }
-        self.rebuild_inference_derived_state(&changed_files);
+        if !changed_files.is_empty() {
+            self.mark_inference_derived_state_dirty();
+        }
     }
 
     pub fn replace_table_const_types<S: std::hash::BuildHasher>(
@@ -1844,7 +1887,9 @@ impl LuaTypeIndex {
             changed_files.insert(owner.get_file_id());
             self.insert_type_cache(owner, new_cache);
         }
-        self.rebuild_inference_derived_state(&changed_files);
+        if !changed_files.is_empty() {
+            self.mark_inference_derived_state_dirty();
+        }
     }
 
     /// Drops the cached types of members that were removed on their own,
@@ -1949,7 +1994,7 @@ impl LuaTypeIndex {
     /// nodes the fact was derived from, which is what
     /// `files_depending_on_inference_nodes` indexes. Neither is reachable from
     /// `cache_refs`, so both are visited here rather than located by a reverse
-    /// index - the same walk `rebuild_inference_derived_state` already makes on
+    /// index - the same walk `flush_inference_derived_state` already makes on
     /// every analyse.
     fn remap_inference_facts(
         &mut self,
@@ -2047,7 +2092,9 @@ impl LuaTypeIndex {
             changed_files.insert(owner.get_file_id());
             self.insert_type_cache(owner, new_cache);
         }
-        self.rebuild_inference_derived_state(&changed_files);
+        if !changed_files.is_empty() {
+            self.mark_inference_derived_state_dirty();
+        }
         changed_files
     }
 
@@ -2274,7 +2321,9 @@ impl LuaIndex for LuaTypeIndex {
         self.definition_facts
             .retain(|definition, _| !changed_files.contains(&definition.file_id()));
 
-        self.rebuild_inference_derived_state(&changed_files);
+        if !changed_files.is_empty() {
+            self.mark_inference_derived_state_dirty();
+        }
         self.flush_inference_derived_state();
     }
 

@@ -3,8 +3,14 @@
 //! The settled tail runs to a fixpoint, and re-deriving every candidate every
 //! round costs the same as the first round however little moved. A candidate
 //! only needs re-deriving when a cache it *read* has since changed, and the
-//! read set is free to collect: the inference already asks the type index for
-//! every cache it consults.
+//! read set is free to collect.
+//!
+//! What makes that safe is that every read of a stored type goes through
+//! `LuaTypeIndex::read_type_cache`, which records here. A read that bypassed it
+//! would leave a candidate looking unaffected by a cache it actually depends
+//! on, and the fixpoint would settle on the stale answer. Over-recording is
+//! harmless — it costs one re-derivation — so a new reader belongs on that
+//! accessor rather than on `types` directly.
 //!
 //! Worker-local by construction — each file is re-derived on one thread, and
 //! the collector is a thread local armed around that file's inference. The

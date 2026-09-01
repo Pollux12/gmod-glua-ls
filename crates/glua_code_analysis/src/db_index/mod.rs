@@ -345,8 +345,9 @@ impl DbIndex {
             }
         }
 
-        self.types_index
-            .rebuild_inference_derived_state(&changed_files);
+        if !changed_files.is_empty() {
+            self.types_index.mark_inference_derived_state_dirty();
+        }
         self.types_index.flush_inference_derived_state();
         changed_files
     }

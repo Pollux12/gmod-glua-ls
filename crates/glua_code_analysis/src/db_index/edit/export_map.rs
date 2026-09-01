@@ -901,26 +901,58 @@ pub(crate) fn hash_type(remap: &FileRemap, typ: &LuaType, hasher: &mut impl Hash
             tpl.get_prefix().hash(hasher);
             tpl.get_name().hash(hasher);
             tpl.get_suffix().hash(hasher);
-            format!("{:?}", tpl.get_tpl_id()).hash(hasher);
+            tpl.get_tpl_id().hash(hasher);
             if let Some(constraint) = tpl.get_constraint() {
                 hash_type(remap, constraint, hasher);
             }
         }
-        LuaType::TplRef(tpl) | LuaType::ConstTplRef(tpl) => {
-            match typ {
-                LuaType::ConstTplRef(_) => "ConstTplRef".hash(hasher),
-                _ => "TplRef".hash(hasher),
-            }
-            format!("{:?}", tpl.get_tpl_id()).hash(hasher);
-            tpl.get_name().hash(hasher);
-            match tpl.get_constraint() {
-                Some(constraint) => hash_type(remap, constraint, hasher),
-                None => "NoConstraint".hash(hasher),
-            }
+        LuaType::TplRef(tpl) => hash_tpl_ref("TplRef", remap, tpl, hasher),
+        LuaType::ConstTplRef(tpl) => hash_tpl_ref("ConstTplRef", remap, tpl, hasher),
+        // An interned name, with no nested type and no source position: the
+        // name is the whole identity.
+        LuaType::Namespace(name) => {
+            "Namespace".hash(hasher);
+            name.hash(hasher);
         }
-        // The remaining variants hold no nested type and no source position,
-        // so their `Debug` form describes them precisely and stably.
-        other => format!("{:?}", other).hash(hasher),
+        LuaType::Language(name) => {
+            "Language".hash(hasher);
+            name.hash(hasher);
+        }
+        LuaType::ConditionalInfer(name) => {
+            "ConditionalInfer".hash(hasher);
+            name.hash(hasher);
+        }
+        // Payload-free variants: the discriminant is the whole identity. Listed
+        // rather than matched with a wildcard so that a new `LuaType` variant
+        // fails to compile here instead of being hashed as if it carried
+        // nothing — a variant holding a range or a nested type would then hash
+        // equal across an edit that moved it, and its dependents would never be
+        // re-analysed.
+        LuaType::Unknown
+        | LuaType::Any
+        | LuaType::Nil
+        | LuaType::Table
+        | LuaType::Userdata
+        | LuaType::Function
+        | LuaType::Thread
+        | LuaType::Boolean
+        | LuaType::String
+        | LuaType::Integer
+        | LuaType::Number
+        | LuaType::Io
+        | LuaType::SelfInfer
+        | LuaType::Global
+        | LuaType::Never => std::mem::discriminant(typ).hash(hasher),
+    }
+}
+
+fn hash_tpl_ref(tag: &str, remap: &FileRemap, tpl: &crate::GenericTpl, hasher: &mut impl Hasher) {
+    tag.hash(hasher);
+    tpl.get_tpl_id().hash(hasher);
+    tpl.get_name().hash(hasher);
+    match tpl.get_constraint() {
+        Some(constraint) => hash_type(remap, constraint, hasher),
+        None => "NoConstraint".hash(hasher),
     }
 }
 
