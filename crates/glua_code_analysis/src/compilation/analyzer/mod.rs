@@ -1108,9 +1108,37 @@ fn resolve_early_member_owners(db: &mut DbIndex, context: &mut AnalyzeContext) -
     resolved
 }
 
+/// Which pass is re-reading the initializer caches.
+#[derive(Clone, Copy)]
+enum InitializerPass<'a> {
+    /// The full pass, which reads every candidate once.
+    Full,
+    /// The settled tail, which only re-reads a candidate whose evidence moved.
+    /// `moved` is `None` on the first round, before any read set exists.
+    Settled {
+        moved: Option<&'a HashSet<LuaTypeOwner>>,
+    },
+}
+
+impl<'a> InitializerPass<'a> {
+    /// Whether the index has settled, so an answer taken now is final rather
+    /// than one the rest of the batch may still improve.
+    fn is_settled(self) -> bool {
+        matches!(self, InitializerPass::Settled { .. })
+    }
+
+    /// The owners the previous round moved, or `None` to re-read everything.
+    fn moved(self) -> Option<&'a HashSet<LuaTypeOwner>> {
+        match self {
+            InitializerPass::Full => None,
+            InitializerPass::Settled { moved } => moved,
+        }
+    }
+}
+
 fn refresh_initializer_caches(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    refresh_local_decl_initializer_caches(db, context, false, false, None);
-    refresh_member_initializer_caches(db, context, false, None);
+    refresh_local_decl_initializer_caches(db, context, InitializerPass::Full);
+    refresh_member_initializer_caches(db, context, InitializerPass::Full);
 }
 
 /// [`refresh_initializer_caches`] for a late pass that moved a handful of types.
@@ -1127,23 +1155,18 @@ fn refresh_settled_initializer_caches(
 ) -> HashSet<LuaTypeOwner> {
     // Members first: a declaration that reads one of them takes its answer from
     // whatever the member holds when the read is taken.
-    let mut written = refresh_member_initializer_caches(db, context, true, moved_owners);
-    written.extend(refresh_local_decl_initializer_caches(
-        db,
-        context,
-        true,
-        true,
-        moved_owners,
-    ));
+    let pass = InitializerPass::Settled {
+        moved: moved_owners,
+    };
+    let mut written = refresh_member_initializer_caches(db, context, pass);
+    written.extend(refresh_local_decl_initializer_caches(db, context, pass));
     written
 }
 
 fn refresh_local_decl_initializer_caches(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
-    settled_only: bool,
-    iter_vars_settled: bool,
-    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+    pass: InitializerPass<'_>,
 ) -> HashSet<LuaTypeOwner> {
     if context.uninformative_local_decl_candidates.is_empty() {
         return HashSet::default();
@@ -1160,7 +1183,7 @@ fn refresh_local_decl_initializer_caches(
         candidates.sort_by_key(|decl_id| decl_id.position);
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, pass.moved()));
     file_ids.sort();
     if file_ids.is_empty() {
         return HashSet::default();
@@ -1219,7 +1242,7 @@ fn refresh_local_decl_initializer_caches(
             // the copy landed, and the settle has just moved it. What it holds
             // now is no evidence against re-reading it.
             let copies_settled_iter_var =
-                iter_vars_settled && common::reads_settling_iter_var(db, file_id, &expr);
+                pass.is_settled() && common::reads_settling_iter_var(db, file_id, &expr);
             if !copies_settled_iter_var && !initializer_reads_through_call_or_index(&expr) {
                 continue;
             }
@@ -1231,7 +1254,7 @@ fn refresh_local_decl_initializer_caches(
                     .as_ref()
                     .is_some_and(|current| cached_provisional_slot_union(current.as_type()));
             if !copies_settled_iter_var
-                && settled_only
+                && pass.is_settled()
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
@@ -1460,8 +1483,7 @@ fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
 fn refresh_member_initializer_caches(
     db: &mut DbIndex,
     context: &mut AnalyzeContext,
-    iter_vars_settled: bool,
-    moved_owners: Option<&HashSet<LuaTypeOwner>>,
+    pass: InitializerPass<'_>,
 ) -> HashSet<LuaTypeOwner> {
     if context.member_initializer_reinfer_candidates.is_empty() {
         return HashSet::default();
@@ -1478,7 +1500,7 @@ fn refresh_member_initializer_caches(
         candidates.sort_by_key(LuaMemberId::get_position);
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
-    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, moved_owners));
+    file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, pass.moved()));
     file_ids.sort();
     if file_ids.is_empty() {
         return HashSet::default();
@@ -1521,7 +1543,7 @@ fn refresh_member_initializer_caches(
             // held when the copy landed, and the settle has just moved it. What
             // it holds now is no evidence against re-reading it.
             let copies_settled_iter_var =
-                iter_vars_settled && common::reads_settling_iter_var(db, file_id, &expr);
+                pass.is_settled() && common::reads_settling_iter_var(db, file_id, &expr);
             if !copies_settled_iter_var
                 && !current_is_uninformative
                 && single_nominal_type_id(current_cache.as_type()).is_none()
