@@ -7,7 +7,6 @@ use crate::{
 #[derive(Debug, Clone)]
 pub(in crate::compilation::analyzer::lua) struct MemberAssignmentWideningState {
     pub(in crate::compilation::analyzer::lua) no_table_literal_widen_type: LuaType,
-    pub(in crate::compilation::analyzer::lua) table_literal_widen_type: LuaType,
     pub(in crate::compilation::analyzer::lua) doc_type: Option<LuaType>,
     pub(in crate::compilation::analyzer::lua) all_table_assignment_merge_types: bool,
     class_bootstrap_type: Option<LuaType>,
@@ -30,7 +29,6 @@ impl MemberAssignmentWideningState {
 
         Self {
             no_table_literal_widen_type: widen_related_assignment_type(assigned_type, false),
-            table_literal_widen_type: widen_related_assignment_type(assigned_type, true),
             doc_type,
             all_table_assignment_merge_types: is_table_assignment_merge_type(assigned_type),
             class_bootstrap_type,
@@ -68,11 +66,6 @@ pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_st
             &new_state.no_table_literal_widen_type,
         );
     }
-    state.table_literal_widen_type = TypeOps::Union.apply(
-        db,
-        &state.table_literal_widen_type,
-        &new_state.table_literal_widen_type,
-    );
     if let Some(doc_type) = new_state.doc_type {
         state.doc_type = Some(match state.doc_type.take() {
             Some(current) => TypeOps::Union.apply(db, &current, &doc_type),
@@ -90,7 +83,6 @@ pub(in crate::compilation::analyzer::lua) fn merge_member_assignment_widening_st
 pub(in crate::compilation::analyzer::lua) fn decide_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
-    _allow_table_literal_widening: bool,
     previous_states: impl IntoIterator<Item = &'a MemberAssignmentWideningState>,
 ) -> MemberAssignmentWideningDecision {
     let previous_states = previous_states.into_iter().collect::<Vec<_>>();
@@ -193,7 +185,6 @@ fn merged_table_assignment_type(
 pub(in crate::compilation::analyzer::lua) fn union_member_assignment_widening<'a>(
     db: &DbIndex,
     incoming_type: &LuaType,
-    _allow_table_literal_widening: bool,
     previous_states: impl IntoIterator<Item = &'a MemberAssignmentWideningState>,
 ) -> LuaType {
     let previous_states = previous_states.into_iter().collect::<Vec<_>>();
