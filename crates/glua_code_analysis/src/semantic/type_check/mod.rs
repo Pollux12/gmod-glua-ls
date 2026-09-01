@@ -46,6 +46,21 @@ fn is_assignment_added_member(db: &DbIndex, property_owner_id: Option<&LuaSemant
         .is_some_and(crate::LuaMember::is_assignment_define)
 }
 
+/// Whether a literal that omits this member fails to satisfy the type.
+///
+/// Three things excuse an omission, and they are all exemptions from the same
+/// rule, so they are asked together: the member is declared optional, it was
+/// added by a runtime write rather than declared, or it documents a default.
+pub(super) fn member_is_required(
+    db: &DbIndex,
+    property_owner_id: Option<&LuaSemanticDeclId>,
+    member_type: &LuaType,
+) -> bool {
+    !member_type.is_optional()
+        && !is_assignment_added_member(db, property_owner_id)
+        && !member_has_documented_default(db, property_owner_id, Some(member_type))
+}
+
 // A documented default makes a member optional for presence only.
 fn member_has_documented_default(
     db: &DbIndex,

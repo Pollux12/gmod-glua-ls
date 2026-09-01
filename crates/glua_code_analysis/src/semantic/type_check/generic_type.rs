@@ -10,8 +10,7 @@ use crate::{
 };
 
 use super::{
-    TypeCheckResult, check_general_type_compact, is_assignment_added_member,
-    is_structural_method_member, member_has_documented_default,
+    TypeCheckResult, check_general_type_compact, is_structural_method_member, member_is_required,
     type_check_fail_reason::TypeCheckFailReason, type_check_guard::TypeCheckGuard,
 };
 
@@ -204,13 +203,11 @@ fn check_generic_type_compact_table(
                     ));
                 }
             }
-            None if !source_member_type.is_optional()
-                && !is_assignment_added_member(context.db, property_owner_id.as_ref())
-                && !member_has_documented_default(
-                    context.db,
-                    property_owner_id.as_ref(),
-                    Some(&source_member_type),
-                ) =>
+            None if member_is_required(
+                context.db,
+                property_owner_id.as_ref(),
+                &source_member_type,
+            ) =>
             {
                 if !context.detail {
                     return Err(TypeCheckFailReason::TypeNotMatch);
