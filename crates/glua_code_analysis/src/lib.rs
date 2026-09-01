@@ -417,8 +417,6 @@ pub struct EmmyLuaAnalysis {
     pub emmyrc: Arc<Emmyrc>,
     #[cfg(test)]
     pub(crate) inferred_guard_propagation_stats: InferredGuardPropagationStats,
-    /// Export fingerprints taken before a VFS mutation, for the paths that
-    /// write the text and re-index later. See [`Self::stash_pre_edit_state`].
     /// The text each file's current index entries were built from, stashed by
     /// the first write that does not re-index.
     ///

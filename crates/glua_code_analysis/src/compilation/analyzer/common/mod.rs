@@ -80,9 +80,7 @@ pub enum TypeCacheWriteMode {
 /// Writes a type cache using the requested low-level write mode.
 ///
 /// Call sites fall into doc-annotation, assignment-inferred, and
-/// resolved-synthesized families. Authority-based precedence was evaluated and
-/// rejected in Phase C2 for lack of evidence; see
-/// `.slim/deepwork/indexing-type-source-refactor.md`.
+/// resolved-synthesized families.
 pub fn write_type_cache(
     db: &mut DbIndex,
     owner: LuaTypeOwner,
