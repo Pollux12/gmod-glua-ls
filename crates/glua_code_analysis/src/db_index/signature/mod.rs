@@ -50,7 +50,15 @@ pub struct LuaSignatureIndex {
     inferred_guard_owners_by_file: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_guard_consumers: HashMap<LuaInferredGuardOwner, HashSet<FileId>>,
     inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
+    inferred_return_dependencies: HashMap<LuaSignatureId, HashSet<FileId>>,
+    inferred_return_consumers: HashMap<FileId, HashSet<LuaSignatureId>>,
+    settled_reads_by_file: HashMap<FileId, HashSet<LuaSignatureId>>,
+    settled_read_dependents: HashMap<LuaSignatureId, HashSet<FileId>>,
     inferred_positive_guards_changed: bool,
+    /// Count of inferred-return changes, for telling a pass that moved a
+    /// return from one that did not.
+    return_writes: u64,
+    return_write_versions: HashMap<LuaSignatureId, u64>,
     receiver_out_param_member_names: HashMap<String, usize>,
     in_file_receiver_out_param_member_names: HashMap<FileId, HashSet<String>>,
 }
@@ -116,6 +124,25 @@ impl Default for LuaSignatureIndex {
 }
 
 impl LuaSignatureIndex {
+    /// Compare it across an operation to tell whether the operation changed
+    /// any inferred return.
+    pub fn return_writes(&self) -> u64 {
+        self.return_writes
+    }
+
+    pub(crate) fn note_return_write(&mut self, signature_id: LuaSignatureId) {
+        self.return_writes += 1;
+        self.return_write_versions
+            .insert(signature_id, self.return_writes);
+    }
+
+    pub(crate) fn return_write_version(&self, signature_id: &LuaSignatureId) -> u64 {
+        self.return_write_versions
+            .get(signature_id)
+            .copied()
+            .unwrap_or(0)
+    }
+
     pub fn new() -> Self {
         Self {
             signatures: HashMap::default(),
@@ -128,7 +155,13 @@ impl LuaSignatureIndex {
             inferred_guard_owners_by_file: HashMap::default(),
             inferred_guard_consumers: HashMap::default(),
             inferred_guard_dependencies: HashMap::default(),
+            inferred_return_dependencies: HashMap::default(),
+            inferred_return_consumers: HashMap::default(),
+            settled_reads_by_file: HashMap::default(),
+            settled_read_dependents: HashMap::default(),
             inferred_positive_guards_changed: false,
+            return_writes: 0,
+            return_write_versions: HashMap::default(),
             receiver_out_param_member_names: HashMap::default(),
             in_file_receiver_out_param_member_names: HashMap::default(),
         }
@@ -143,6 +176,7 @@ impl LuaSignatureIndex {
     }
 
     pub fn get(&self, signature_id: &LuaSignatureId) -> Option<&LuaSignature> {
+        crate::db_index::read_set::record_signature(signature_id);
         self.signatures.get(signature_id)
     }
 
@@ -336,6 +370,156 @@ impl LuaSignatureIndex {
         }
     }
 
+    pub(crate) fn set_inferred_return_dependencies(
+        &mut self,
+        signature_id: LuaSignatureId,
+        source_file_ids: HashSet<FileId>,
+    ) {
+        self.clear_inferred_return_dependencies(signature_id);
+        for source_file_id in &source_file_ids {
+            self.inferred_return_consumers
+                .entry(*source_file_id)
+                .or_default()
+                .insert(signature_id);
+        }
+        if !source_file_ids.is_empty() {
+            self.inferred_return_dependencies
+                .insert(signature_id, source_file_ids);
+        }
+    }
+
+    fn clear_inferred_return_dependencies(&mut self, signature_id: LuaSignatureId) {
+        let Some(source_file_ids) = self.inferred_return_dependencies.remove(&signature_id) else {
+            return;
+        };
+        for source_file_id in source_file_ids {
+            if let Some(consumers) = self.inferred_return_consumers.get_mut(&source_file_id) {
+                consumers.remove(&signature_id);
+                if consumers.is_empty() {
+                    self.inferred_return_consumers.remove(&source_file_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn inferred_return_dependents_for_files(
+        &self,
+        source_file_ids: &HashSet<FileId>,
+    ) -> HashSet<FileId> {
+        source_file_ids
+            .iter()
+            .filter_map(|file_id| self.inferred_return_consumers.get(file_id))
+            .flatten()
+            .map(LuaSignatureId::get_file_id)
+            .collect()
+    }
+
+    pub(crate) fn set_settled_reads(
+        &mut self,
+        file_id: FileId,
+        reads: impl IntoIterator<Item = LuaSignatureId>,
+    ) {
+        self.clear_settled_reads(file_id);
+        let reads = reads
+            .into_iter()
+            .filter(|signature_id| signature_id.get_file_id() != file_id)
+            .collect::<HashSet<_>>();
+        for signature_id in &reads {
+            self.settled_read_dependents
+                .entry(*signature_id)
+                .or_default()
+                .insert(file_id);
+        }
+        if !reads.is_empty() {
+            self.settled_reads_by_file.insert(file_id, reads);
+        }
+    }
+
+    fn clear_settled_reads(&mut self, file_id: FileId) {
+        let Some(reads) = self.settled_reads_by_file.remove(&file_id) else {
+            return;
+        };
+        for signature_id in reads {
+            if let Some(dependents) = self.settled_read_dependents.get_mut(&signature_id) {
+                dependents.remove(&file_id);
+                if dependents.is_empty() {
+                    self.settled_read_dependents.remove(&signature_id);
+                }
+            }
+        }
+    }
+
+    pub(crate) fn settled_read_dependents_for_signatures(
+        &self,
+        signature_ids: &[LuaSignatureId],
+    ) -> HashSet<FileId> {
+        signature_ids
+            .iter()
+            .filter_map(|signature_id| self.settled_read_dependents.get(signature_id))
+            .flatten()
+            .copied()
+            .collect()
+    }
+
+    pub(crate) fn settled_read_dependents_for_files(
+        &self,
+        file_ids: &HashSet<FileId>,
+    ) -> HashSet<FileId> {
+        self.settled_read_dependents
+            .iter()
+            .filter(|(signature_id, _)| file_ids.contains(&signature_id.get_file_id()))
+            .flat_map(|(_, dependents)| dependents.iter().copied())
+            .collect()
+    }
+
+    pub(crate) fn remap_settled_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let old_ids = self
+            .settled_read_dependents
+            .keys()
+            .filter(|signature_id| signature_id.get_file_id() == remap.file_id)
+            .copied()
+            .collect::<Vec<_>>();
+        let mut dirty = HashSet::default();
+        let mut updates = Vec::new();
+        for old_id in old_ids {
+            let new_id = match remap.signature_id(old_id) {
+                crate::Remap::Moved(new_id) if new_id != old_id => Some(new_id),
+                crate::Remap::Moved(_) | crate::Remap::Unrelated => continue,
+                crate::Remap::Lost => None,
+            };
+            let dependents = self
+                .settled_read_dependents
+                .get(&old_id)
+                .cloned()
+                .unwrap_or_default();
+            if new_id.is_none() {
+                dirty.extend(dependents.iter().copied());
+            }
+            updates.push((old_id, new_id, dependents));
+        }
+
+        for (old_id, _, _) in &updates {
+            self.settled_read_dependents.remove(old_id);
+        }
+        for (old_id, new_id, dependents) in updates {
+            for dependent in &dependents {
+                if let Some(reads) = self.settled_reads_by_file.get_mut(dependent) {
+                    reads.remove(&old_id);
+                    if let Some(new_id) = new_id {
+                        reads.insert(new_id);
+                    }
+                }
+            }
+            if let Some(new_id) = new_id {
+                self.settled_read_dependents
+                    .entry(new_id)
+                    .or_default()
+                    .extend(dependents);
+            }
+        }
+        dirty
+    }
+
     pub fn clear_inferred_positive_guards_for_file(&mut self, file_id: FileId) {
         let old_owners = self
             .inferred_guard_owners_by_file
@@ -402,10 +586,14 @@ impl LuaSignatureIndex {
 
 impl LuaIndex for LuaSignatureIndex {
     fn remove(&mut self, file_id: FileId) {
+        self.clear_settled_reads(file_id);
         self.clear_inferred_guard_dependencies(file_id);
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
             for signature_id in signature_ids {
-                self.signatures.remove(&signature_id);
+                self.clear_inferred_return_dependencies(signature_id);
+                if self.signatures.remove(&signature_id).is_some() {
+                    self.note_return_write(signature_id);
+                }
                 self.local_func_decls.remove(&signature_id);
             }
         }
@@ -438,6 +626,7 @@ impl LuaIndex for LuaSignatureIndex {
         self.signatures.clear();
         self.in_file_signatures.clear();
         self.local_func_decls.clear();
+        self.return_write_versions.clear();
         self.effective_valid_guard_signatures.clear();
         self.inferred_positive_guards.clear();
         self.inferred_guard_owners.clear();
@@ -445,6 +634,10 @@ impl LuaIndex for LuaSignatureIndex {
         self.inferred_guard_owners_by_file.clear();
         self.inferred_guard_consumers.clear();
         self.inferred_guard_dependencies.clear();
+        self.inferred_return_dependencies.clear();
+        self.inferred_return_consumers.clear();
+        self.settled_reads_by_file.clear();
+        self.settled_read_dependents.clear();
         self.inferred_positive_guards_changed = false;
         self.receiver_out_param_member_names.clear();
         self.in_file_receiver_out_param_member_names.clear();

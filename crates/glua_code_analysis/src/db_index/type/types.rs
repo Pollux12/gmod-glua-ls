@@ -321,7 +321,11 @@ impl LuaType {
 
     pub fn is_always_truthy(&self) -> bool {
         match self {
-            LuaType::Nil | LuaType::Boolean | LuaType::Any | LuaType::Unknown => false,
+            // `never` has no values to be truthy; it is inference that found
+            // nothing, and must not decide a branch or swallow an `or` arm.
+            LuaType::Nil | LuaType::Boolean | LuaType::Any | LuaType::Unknown | LuaType::Never => {
+                false
+            }
             LuaType::BooleanConst(boolean) | LuaType::DocBooleanConst(boolean) => *boolean,
             LuaType::Union(u) => u.is_always_truthy(),
             LuaType::TypeGuard(_) => false,

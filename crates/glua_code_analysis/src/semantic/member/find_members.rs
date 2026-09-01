@@ -913,9 +913,14 @@ fn find_merged_table_members(
                     entry.insert(member);
                 }
                 std::collections::hash_map::Entry::Occupied(mut entry) => {
-                    let merged_type =
-                        merge_open_table_types(db, vec![entry.get().typ.clone(), member.typ]);
-                    entry.get_mut().typ = merged_type;
+                    // Components that are one slot answer identically; merging
+                    // that answer with itself would fold a union of rival
+                    // tables into one table.
+                    if entry.get().typ != member.typ {
+                        let merged_type =
+                            merge_open_table_types(db, vec![entry.get().typ.clone(), member.typ]);
+                        entry.get_mut().typ = merged_type;
+                    }
                 }
             }
         }

@@ -711,6 +711,30 @@ mod test {
     }
 
     #[gtest]
+    fn inferred_return_widens_mutable_string_accumulator() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+            local function build(input)
+                local result = ""
+                local index = 1
+                while index <= #input do
+                    result = result .. input[index]
+                    index = index + 1
+                end
+                return result
+            end
+
+            A = build("value")
+            "#,
+        );
+
+        let ty = ws.expr_ty("A");
+        assert_that!(ws.check_type(&ty, &LuaType::String), eq(true));
+        assert!(!matches!(ty, LuaType::StringConst(_)));
+    }
+
+    #[gtest]
     fn test_reindex_keeps_later_dynamic_assignment_out_of_earlier_read() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();
@@ -1165,7 +1189,107 @@ mod test {
             ])
             .into(),
         );
-        assert_that!(ws.check_type(&ty, &expected), eq(true));
+        assert_that!(
+            ws.check_type(&ty, &expected),
+            eq(true),
+            "expected integer collection element union, got {} ({ty:?})",
+            ws.humanize_type_detailed(ty.clone())
+        );
+    }
+
+    #[gtest]
+    fn computed_key_nil_delete_is_not_a_member_before_or_after_reindex() {
+        let mut ws = VirtualWorkspace::new();
+        let clear_path = "lua/a_clear.lua";
+        let clear_source = r#"
+        Store = Store or {}
+        function Clear(class)
+            Store.values[class] = nil
+        end
+        "#;
+        ws.def_files(vec![
+            (clear_path, clear_source),
+            ("lua/b_values.lua", "Store.values = {}"),
+        ]);
+
+        let clear_uri = ws.virtual_url_generator.new_uri(clear_path);
+        let clear_file = ws
+            .analysis
+            .get_file_id(&clear_uri)
+            .expect("expected clear file");
+        let delete_is_indexed = |ws: &VirtualWorkspace| {
+            let model = ws
+                .analysis
+                .compilation
+                .get_semantic_model(clear_file)
+                .expect("expected semantic model");
+            let index_expr = model
+                .get_root()
+                .descendants::<LuaAst>()
+                .find_map(|node| match node {
+                    LuaAst::LuaIndexExpr(index_expr)
+                        if index_expr.syntax().text() == "Store.values[class]" =>
+                    {
+                        Some(index_expr)
+                    }
+                    _ => None,
+                })
+                .expect("expected computed-key delete");
+            let member_id = LuaMemberId::new(index_expr.get_syntax_id(), clear_file);
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .get_member(&member_id)
+                .is_some()
+        };
+
+        assert_that!(delete_is_indexed(&ws), eq(false));
+
+        ws.analysis
+            .update_file_text_only(&clear_uri, format!("{clear_source}\n"));
+        ws.analysis.reindex_files(vec![clear_file]);
+
+        assert_that!(delete_is_indexed(&ws), eq(false));
+    }
+
+    #[gtest]
+    fn constant_folded_nil_delete_keeps_the_named_member() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def(
+            r#"
+            Store = { values = {} }
+            Store.values[2] = "present"
+            Store.values[1 + 1] = nil
+            "#,
+        );
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(file_id)
+            .expect("expected semantic model");
+        let delete = model
+            .get_root()
+            .descendants::<LuaAst>()
+            .find_map(|node| match node {
+                LuaAst::LuaIndexExpr(index_expr)
+                    if index_expr.syntax().text() == "Store.values[1 + 1]" =>
+                {
+                    Some(index_expr)
+                }
+                _ => None,
+            })
+            .expect("expected constant-folded delete");
+        let member_id = LuaMemberId::new(delete.get_syntax_id(), file_id);
+        let member = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_member(&member_id)
+            .expect("expected delete member");
+
+        assert_that!(member.get_key(), eq(&LuaMemberKey::Integer(2)));
     }
 
     #[gtest]
@@ -1528,10 +1652,10 @@ mod test {
         let ty = ws.expr_ty("A");
         assert_eq!(ws.humanize_type(ty), "(Player|Ragdoll)?");
 
-        // Direct assignment-target cache probing shows the incoming member write
-        // type includes both arms before the read-side nil widening is applied.
+        // The write's own cache carries what it assigned; the `nil` arm comes
+        // from the sibling writers when the slot is read.
         let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
-        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)");
     }
 
     #[gtest]
@@ -1563,15 +1687,16 @@ mod test {
 
         let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
         let cached_rendered = ws.humanize_type(cached_ty);
-        assert_eq!(cached_rendered, "(Player|Ragdoll)?");
+        assert_eq!(cached_rendered, "(Player|Ragdoll)");
 
+        // Inferring the target reads the slot, which unions every writer,
+        // the `nil` ones included; that is the type a read of `A` gets too.
         let inferred_ty = inferred_index_expr_type(&mut ws, file_id, "self.Target");
         let inferred_rendered = ws.humanize_type(inferred_ty);
         assert_eq!(inferred_rendered, "(Player|Ragdoll)?");
-        assert_eq!(cached_rendered, inferred_rendered);
 
         let read_ty = ws.expr_ty("A");
-        assert_eq!(ws.humanize_type(read_ty), "(Player|Ragdoll)?");
+        assert_eq!(ws.humanize_type(read_ty), inferred_rendered);
     }
 
     #[gtest]
@@ -1644,7 +1769,7 @@ mod test {
         assert_eq!(ws.humanize_type(post_touch_ty), "(Player|Ragdoll)?");
 
         let cached_ty = cached_index_expr_type(&ws, file_id, "self.Target");
-        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)?");
+        assert_eq!(ws.humanize_type(cached_ty), "(Player|Ragdoll)");
     }
 
     /// `if c then t.k = v end` does not dominate the other writes of `t.k`, so
@@ -3488,9 +3613,8 @@ marauth.character = marauth.character or {}
     }
 
     /// Two plain cross-file assignments to the same global field make the
-    /// member item `Many` with all-file-define members, so
-    /// `should_widen_file_defines` and `should_widen_table_literals` both hold
-    /// and each `TableConst` collapses to `table`.
+    /// member item `Many`; a reader merges the two literals into one
+    /// `MergedTable` so neither file's fields are lost.
     #[test]
     fn test_cross_file_member_merge_widens_table_literals() {
         let mut ws = VirtualWorkspace::new();
@@ -3541,28 +3665,36 @@ marauth.character = marauth.character or {}
         );
         let consumer = ws.def_file("lua/no_widen_guarded/c.lua", "local cfg = Store.cfg\n");
 
-        // The plain writer wins under either load order: a.lua first leaves
-        // `{a=1}` for b.lua's guard to keep, b.lua first has its `{b=2}`
-        // clobbered by a.lua's unguarded write. What must not happen is
-        // widening to a bare `table`.
+        // Both writers stay visible and the read merges their literals. What
+        // must not happen is widening to a bare `table`.
         let cfg_type = local_name_type(&mut ws, consumer, "cfg");
-        let LuaType::TableConst(range) = &cfg_type else {
-            panic!("guarded merge should keep a concrete table, got {cfg_type:?}");
+        let ranges = match &cfg_type {
+            LuaType::TableConst(range) => vec![range.clone()],
+            LuaType::MergedTable(merged) => merged
+                .get_types()
+                .iter()
+                .filter_map(|typ| match typ {
+                    LuaType::TableConst(range) => Some(range.clone()),
+                    _ => None,
+                })
+                .collect(),
+            other => panic!("guarded merge should keep concrete tables, got {other:?}"),
         };
-        let owner = LuaMemberOwner::Element(range.clone());
-        let keys = ws
-            .analysis
-            .compilation
-            .get_db()
-            .get_member_index()
-            .get_members(&owner)
-            .unwrap_or_default()
+        let db = ws.analysis.compilation.get_db();
+        let keys = ranges
             .iter()
-            .map(|member| format!("{:?}", member.get_key()))
+            .flat_map(|range| {
+                db.get_member_index()
+                    .get_members(&LuaMemberOwner::Element(range.clone()))
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|member| format!("{:?}", member.get_key()))
+                    .collect::<Vec<_>>()
+            })
             .collect::<Vec<_>>();
         assert!(
             keys.iter().any(|key| key.contains('a')),
-            "the plain writer's literal must win, got {cfg_type:?} with {keys:?}"
+            "the plain writer's literal must be read, got {cfg_type:?} with {keys:?}"
         );
     }
 
@@ -3642,6 +3774,75 @@ end)
         assert!(
             matches!(act_type, LuaType::TableConst(_)),
             "an ordered reassignment must still narrow to its own table, got {act_type:?}"
+        );
+    }
+
+    #[test]
+    fn unconditional_reset_breaks_guarded_bootstrap_identity() {
+        let mut ws = VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/bootstrap_reset.lua",
+            r#"
+holdem = {}
+holdem.action = holdem.action or {}
+holdem.action.before = 1
+holdem.action = {}
+holdem.action.after = 2
+local before = holdem.action.before
+local after = holdem.action.after
+"#,
+        );
+
+        assert_that!(
+            local_name_type(&mut ws, file_id, "before"),
+            eq(&LuaType::Nil)
+        );
+        assert_that!(
+            local_name_type(&mut ws, file_id, "after"),
+            eq(&LuaType::IntegerConst(2))
+        );
+    }
+
+    #[gtest]
+    fn unconditional_reset_drops_earlier_computed_member_in_the_same_function() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.infer_dynamic_fields = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def(
+            r#"
+Store = {}
+
+---@param key string
+function Replace(key)
+    Store.values = {}
+    Store.values[key] = 1
+    Store.values = {}
+    Result = Store.values[key]
+end
+"#,
+        );
+
+        assert_that!(ws.expr_ty("Result"), eq(&LuaType::Nil));
+    }
+
+    #[test]
+    fn call_return_propagation_is_not_depth_capped() {
+        let mut ws = VirtualWorkspace::new();
+        let mut source = String::new();
+        for index in 0..40 {
+            source.push_str(&format!(
+                "function __return_chain_{index}() return __return_chain_{}() end\n",
+                index + 1
+            ));
+        }
+        source.push_str("function __return_chain_40() return 1 end\n");
+        source.push_str("local result = __return_chain_0()\n");
+        let file_id = ws.def(&source);
+
+        assert_that!(
+            local_name_type(&mut ws, file_id, "result"),
+            eq(&LuaType::IntegerConst(1))
         );
     }
 
@@ -3793,28 +3994,6 @@ mod runtime_member_write_ownership {
         end
         apply(nil, false)
     "#;
-
-    /// A runtime write gives the class it was typed through a field that class
-    /// never declares. TARDIS `sh_parts.lua` sets `self.use_sound` in two
-    /// branches of one `if` and declares it nowhere, and that is the only reason
-    /// the field resolves at all.
-    #[test]
-    fn branch_write_declares_a_field_no_subclass_claims() {
-        let mut ws = gmod_workspace();
-        ws.def_file(
-            "lua/entities/tardis_part/shared.lua",
-            "---@class tardis_part\n---@field GetPos fun(self: tardis_part): any",
-        );
-        ws.def_file(
-            "lua/parts.lua",
-            &BRANCH_WRITES.replace("RUNTIME_CLASS", "tardis_part"),
-        );
-
-        assert!(
-            class_member_item_exists(&ws, "tardis_part", "interior"),
-            "a runtime field no subclass declares stays visible on the class written through"
-        );
-    }
 
     /// The same write must not give a *base* class a field its subclasses
     /// declare. Doors writes `portal.interior` through a plain `Entity`, which

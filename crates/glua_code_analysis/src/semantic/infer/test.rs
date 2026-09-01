@@ -836,7 +836,7 @@ mod test {
             "value",
         );
 
-        assert_eq!(ty, ws.ty("boolean|unknown"));
+        assert_eq!(ty, ws.ty("boolean|any"));
     }
 
     #[test]
@@ -1311,6 +1311,7 @@ mod test {
             &missing_key,
             file_id,
             None,
+            None,
         );
         assert!(
             matches!(missing_lookup, Err(InferFailReason::FieldNotFound)),
@@ -1323,6 +1324,7 @@ mod test {
             LuaMemberOwner::Element(table_id),
             &existing_key,
             file_id,
+            None,
             None,
         );
         assert!(

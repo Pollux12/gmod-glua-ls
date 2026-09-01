@@ -189,21 +189,6 @@ fn replace_table_consts_in_type<S: std::hash::BuildHasher>(
     }
 }
 
-/// Every table-literal range a type names, directly or nested.
-///
-/// The mirror of [`remap_table_ranges_in_type`]: a test can use it to assert
-/// that no store was left holding a range the remap should have moved.
-#[cfg(test)]
-pub(crate) fn table_ranges_in_type(typ: &LuaType) -> Vec<InFiled<TextRange>> {
-    let mut ranges = Vec::new();
-    TypeVisitTrait::visit_type(typ, &mut |inner| match inner {
-        LuaType::TableConst(range) => ranges.push(range.clone()),
-        LuaType::Instance(instance) => ranges.push(instance.get_range().clone()),
-        _ => {}
-    });
-    ranges
-}
-
 /// The identities one edited file moved, as old -> new.
 ///
 /// Borrowed rather than owned so building one costs nothing: it is threaded
@@ -687,13 +672,6 @@ fn widen_table_literals_for_assignment(typ: &LuaType) -> LuaType {
     }
 }
 
-pub(crate) fn widen_file_define_member_type(typ: &LuaType, widen_table_literals: bool) -> LuaType {
-    match typ {
-        LuaType::TableConst(_) if widen_table_literals => LuaType::Table,
-        _ => widen_literal_type_for_assignment(typ),
-    }
-}
-
 pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
     match typ {
         LuaType::Table
@@ -711,104 +689,6 @@ pub(crate) fn is_table_assignment_merge_type(typ: &LuaType) -> bool {
             .all(|(t, _)| matches!(t, LuaType::Nil) || is_table_assignment_merge_type(t)),
         _ => false,
     }
-}
-
-pub(crate) fn prefer_class_assignment_type(typ: &LuaType) -> Option<LuaType> {
-    match typ {
-        LuaType::Def(def_id) => Some(LuaType::Def(def_id.clone())),
-        LuaType::Ref(ref_id) => Some(LuaType::Ref(ref_id.clone())),
-        LuaType::Instance(instance) => prefer_class_assignment_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => prefer_class_assignment_type(inner),
-        LuaType::Union(union) => prefer_class_assignment_type_from_iter(union.types()),
-        LuaType::Intersection(intersection) => {
-            prefer_class_assignment_type_from_iter(intersection.get_types().iter())
-        }
-        LuaType::MultiLineUnion(union) => {
-            prefer_class_assignment_type_from_iter(union.get_unions().iter().map(|(typ, _)| typ))
-        }
-        _ => None,
-    }
-}
-
-fn prefer_class_assignment_type_from_iter<'a>(
-    types: impl Iterator<Item = &'a LuaType>,
-) -> Option<LuaType> {
-    for typ in types {
-        if let Some(class_type) = prefer_class_assignment_type(typ) {
-            return Some(class_type);
-        }
-    }
-
-    None
-}
-
-pub(crate) fn is_class_bootstrap_compatible_type(typ: &LuaType, class_type: &LuaType) -> bool {
-    if is_same_class_type(typ, class_type) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_bootstrap_compatible_type(inner, class_type),
-        LuaType::Instance(instance) => {
-            is_class_bootstrap_compatible_type(instance.get_base(), class_type)
-                || is_table_bootstrap_type(typ)
-        }
-        LuaType::Union(union) => union
-            .types()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(|sub_type| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_bootstrap_compatible_type(sub_type, class_type)),
-        _ => is_table_bootstrap_type(typ),
-    }
-}
-
-pub(crate) fn is_class_neutral_bootstrap_type(typ: &LuaType) -> bool {
-    if is_table_bootstrap_type(typ) {
-        return true;
-    }
-
-    match typ {
-        LuaType::TypeGuard(inner) => is_class_neutral_bootstrap_type(inner),
-        LuaType::Union(union) => union.types().all(is_class_neutral_bootstrap_type),
-        LuaType::Intersection(intersection) => intersection
-            .get_types()
-            .iter()
-            .all(is_class_neutral_bootstrap_type),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(sub_type, _)| is_class_neutral_bootstrap_type(sub_type)),
-        _ => false,
-    }
-}
-
-pub(crate) fn is_same_class_type(left: &LuaType, right: &LuaType) -> bool {
-    match (
-        class_decl_id_from_type(left),
-        class_decl_id_from_type(right),
-    ) {
-        (Some(left_id), Some(right_id)) => left_id == right_id,
-        _ => false,
-    }
-}
-
-pub(crate) fn class_decl_id_from_type(typ: &LuaType) -> Option<crate::LuaTypeDeclId> {
-    match typ {
-        LuaType::Def(def_id) | LuaType::Ref(def_id) => Some(def_id.clone()),
-        LuaType::Instance(instance) => class_decl_id_from_type(instance.get_base()),
-        LuaType::TypeGuard(inner) => class_decl_id_from_type(inner),
-        _ => None,
-    }
-}
-
-pub(crate) fn is_table_bootstrap_type(typ: &LuaType) -> bool {
-    typ.is_table() || matches!(typ, LuaType::Unknown | LuaType::Nil | LuaType::Never)
 }
 
 pub(crate) fn prune_redundant_guarded_table_bootstrap_type(db: &DbIndex, typ: LuaType) -> LuaType {
@@ -876,6 +756,14 @@ pub(crate) fn merge_table_assignment_types(db: &DbIndex, types: Vec<LuaType>) ->
     for typ in types {
         collect_guarded_table_merge_components(typ, &mut table_components, &mut other_components);
     }
+    let mut seen: Vec<LuaType> = Vec::new();
+    table_components.retain(|component| {
+        if seen.contains(component) {
+            return false;
+        }
+        seen.push(component.clone());
+        true
+    });
 
     if table_components
         .iter()
@@ -1168,6 +1056,8 @@ pub struct LuaTypeIndex {
     types: HashMap<LuaTypeOwner, LuaTypeCache>,
     cache_refs: TypeCacheRefIndex,
     in_filed_type_owner: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    settled_reads_by_file: HashMap<FileId, HashSet<LuaTypeOwner>>,
+    settled_read_dependents: HashMap<LuaTypeOwner, HashSet<FileId>>,
     fact_metadata: HashMap<LuaTypeOwner, LuaTypeFactMetadata>,
     /// For each decl whose type a write has seeded: that write's source
     /// position, and whether its right-hand side was a call or index read. See
@@ -1176,6 +1066,7 @@ pub struct LuaTypeIndex {
     /// Counts stored types that actually moved, so a caller can tell a no-op
     /// write from one that invalidates memoised inference.
     type_writes: u64,
+    type_write_versions: HashMap<LuaTypeOwner, u64>,
     definition_facts: HashMap<LuaDefinitionId, LuaTypeFact>,
     inference_events_by_file: HashMap<FileId, Arc<[LuaInferenceDiagnosticEvent]>>,
     support_dependents: HashMap<LuaInferenceNodeId, HashSet<FileId>>,
@@ -1201,9 +1092,12 @@ impl LuaTypeIndex {
             types: HashMap::default(),
             cache_refs: TypeCacheRefIndex::default(),
             in_filed_type_owner: HashMap::default(),
+            settled_reads_by_file: HashMap::default(),
+            settled_read_dependents: HashMap::default(),
             fact_metadata: HashMap::default(),
             decl_write_claims: HashMap::default(),
             type_writes: 0,
+            type_write_versions: HashMap::default(),
             definition_facts: HashMap::default(),
             inference_events_by_file: HashMap::default(),
             support_dependents: HashMap::default(),
@@ -1544,6 +1438,10 @@ impl LuaTypeIndex {
         self.type_writes
     }
 
+    pub(crate) fn type_write_version(&self, owner: &LuaTypeOwner) -> u64 {
+        self.type_write_versions.get(owner).copied().unwrap_or(0)
+    }
+
     /// The write that seeded `decl_id`'s type: its source position, and whether
     /// its right-hand side read through a call or index.
     pub fn decl_write_claim(&self, decl_id: &LuaDeclId) -> Option<(TextSize, bool)> {
@@ -1577,6 +1475,90 @@ impl LuaTypeIndex {
     /// resolvable.
     pub fn file_type_owners(&self, file_id: FileId) -> Option<&HashSet<LuaTypeOwner>> {
         self.in_filed_type_owner.get(&file_id)
+    }
+
+    pub(crate) fn set_settled_reads(
+        &mut self,
+        file_id: FileId,
+        reads: impl IntoIterator<Item = LuaTypeOwner>,
+    ) {
+        self.clear_settled_reads(file_id);
+        let reads = reads
+            .into_iter()
+            .filter(|owner| owner.get_file_id() != file_id)
+            .collect::<HashSet<_>>();
+        if reads.is_empty() {
+            return;
+        }
+        for owner in &reads {
+            self.settled_read_dependents
+                .entry(owner.clone())
+                .or_default()
+                .insert(file_id);
+        }
+        self.settled_reads_by_file.insert(file_id, reads);
+    }
+
+    fn clear_settled_reads(&mut self, file_id: FileId) {
+        let Some(reads) = self.settled_reads_by_file.remove(&file_id) else {
+            return;
+        };
+        for owner in reads {
+            if let Some(dependents) = self.settled_read_dependents.get_mut(&owner) {
+                dependents.remove(&file_id);
+                if dependents.is_empty() {
+                    self.settled_read_dependents.remove(&owner);
+                }
+            }
+        }
+    }
+
+    fn remap_settled_reads(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let old_owners = self
+            .settled_read_dependents
+            .keys()
+            .filter(|owner| owner.get_file_id() == remap.file_id)
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut dirty = HashSet::default();
+        let mut updates = Vec::new();
+        for old_owner in old_owners {
+            let new_owner = match remap.type_owner(&old_owner) {
+                crate::Remap::Moved(new_owner) if new_owner != old_owner => Some(new_owner),
+                crate::Remap::Moved(_) | crate::Remap::Unrelated => continue,
+                crate::Remap::Lost => None,
+            };
+            let dependents = self
+                .settled_read_dependents
+                .get(&old_owner)
+                .cloned()
+                .unwrap_or_default();
+            if new_owner.is_none() {
+                dirty.extend(dependents.iter().copied());
+            }
+            updates.push((old_owner, new_owner, dependents));
+        }
+
+        for (old_owner, _, _) in &updates {
+            self.settled_read_dependents.remove(old_owner);
+        }
+        for (old_owner, new_owner, dependents) in updates {
+            for dependent in &dependents {
+                if let Some(reads) = self.settled_reads_by_file.get_mut(dependent) {
+                    reads.remove(&old_owner);
+                    if let Some(new_owner) = &new_owner {
+                        reads.insert(new_owner.clone());
+                    }
+                }
+            }
+            if let Some(new_owner) = new_owner {
+                self.settled_read_dependents
+                    .entry(new_owner)
+                    .or_default()
+                    .extend(dependents);
+            }
+        }
+        dirty
     }
 
     pub fn get_file_type_decl_ids(&self, file_id: FileId) -> Option<&Vec<LuaTypeDeclId>> {
@@ -1670,6 +1652,11 @@ impl LuaTypeIndex {
                 dependents.extend(files.iter().copied());
             }
         }
+        for (owner, files) in &self.settled_read_dependents {
+            if file_ids.contains(&owner.get_file_id()) {
+                dependents.extend(files.iter().copied());
+            }
+        }
         dependents
     }
 
@@ -1681,6 +1668,11 @@ impl LuaTypeIndex {
         let mut dependents = HashSet::default();
         for node in nodes {
             if let Some(files) = self.support_dependents.get(node) {
+                dependents.extend(files.iter().copied());
+            }
+            if let LuaInferenceNodeId::TypeOwner(owner) = node
+                && let Some(files) = self.settled_read_dependents.get(owner)
+            {
                 dependents.extend(files.iter().copied());
             }
         }
@@ -1744,7 +1736,7 @@ impl LuaTypeIndex {
             .get(&owner)
             .is_none_or(|existing| existing.as_type() != cache.as_type())
         {
-            self.type_writes += 1;
+            self.note_type_write(&owner);
         }
         let file_id = owner.get_file_id();
         self.cache_refs.add(file_id, cache.as_type());
@@ -1753,6 +1745,12 @@ impl LuaTypeIndex {
         };
         self.cache_refs.remove(file_id, previous.as_type());
         true
+    }
+
+    fn note_type_write(&mut self, owner: &LuaTypeOwner) {
+        self.type_writes += 1;
+        self.type_write_versions
+            .insert(owner.clone(), self.type_writes);
     }
 
     pub(crate) fn bind_definition_fact_unchecked(
@@ -1917,6 +1915,7 @@ impl LuaTypeIndex {
             if let Some(previous) = self.types.remove(&owner) {
                 self.cache_refs
                     .remove(member_id.file_id, previous.as_type());
+                self.note_type_write(&owner);
             }
             self.fact_metadata.remove(&owner);
         }
@@ -1990,6 +1989,7 @@ impl LuaTypeIndex {
                 signatures: &signatures,
             },
         ));
+        dirty.extend(self.remap_settled_reads(remap));
         dirty.remove(&remap.file_id);
         dirty
     }
@@ -2345,8 +2345,11 @@ impl LuaIndex for LuaTypeIndex {
         self.types.clear();
         self.cache_refs = TypeCacheRefIndex::default();
         self.in_filed_type_owner.clear();
+        self.settled_reads_by_file.clear();
+        self.settled_read_dependents.clear();
         self.fact_metadata.clear();
         self.decl_write_claims.clear();
+        self.type_write_versions.clear();
         self.definition_facts.clear();
         self.inference_events_by_file.clear();
         self.support_dependents.clear();
@@ -2357,6 +2360,7 @@ impl LuaIndex for LuaTypeIndex {
 
 impl LuaTypeIndex {
     fn remove_file_raw(&mut self, file_id: FileId) {
+        self.clear_settled_reads(file_id);
         self.file_namespace.remove(&file_id);
         self.file_using_namespace.remove(&file_id);
         if let Some(type_id_list) = self.file_types.remove(&file_id) {
@@ -2387,7 +2391,9 @@ impl LuaTypeIndex {
                 if let LuaTypeOwner::Decl(decl_id) = &type_owner {
                     self.decl_write_claims.remove(decl_id);
                 }
-                self.types.remove(&type_owner);
+                if self.types.remove(&type_owner).is_some() {
+                    self.note_type_write(&type_owner);
+                }
                 self.fact_metadata.remove(&type_owner);
             }
         }

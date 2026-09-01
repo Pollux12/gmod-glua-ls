@@ -691,11 +691,8 @@ struct IndexSnapshot {
     /// from the type, so a value that stayed put while its reasoning moved is
     /// still visible.
     type_facts: BTreeMap<String, String>,
-    /// The assignment-contribution store, under `DET_PROVENANCE`: which writers
-    /// each owner/key group merges. A member's type is a function of this.
-    contribution_groups: BTreeMap<String, String>,
     /// Where each member is currently homed, under `DET_PROVENANCE`. Class
-    /// member lists and contribution groups are both keyed off this.
+    /// member lists are keyed off this.
     member_owners: BTreeMap<String, String>,
     members: BTreeSet<String>,
     net_flows: Vec<String>,
@@ -869,20 +866,18 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                 None => ("-".into(), "-".into(), String::new()),
             };
             let doc = if cache.is_doc() { "doc" } else { "infer" };
-            // How many writers this member's value merges, and whether any
-            // contributed an unsettled type. Drift tracking these rather than
-            // the individual site points at the merge.
+            // How many writers share this member's slot. Drift tracking these
+            // rather than the individual site points at the merge.
             let writers = match owner {
                 glua_code_analysis::LuaTypeOwner::Member(member_id) => {
                     let member_index = db.get_member_index();
                     member_index
                         .get_member(member_id)
                         .zip(member_index.get_member_owner(member_id))
-                        .and_then(|(member, member_owner)| {
+                        .map(|(member, member_owner)| {
                             member_index
-                                .member_assignment_contributions()
-                                .contributions(&(member_owner.clone(), member.get_key().clone()))
-                                .map(|group| group.len())
+                                .get_current_owner_members_for_key(member_owner, member.get_key())
+                                .len()
                         })
                         .map(|len| format!("w{len}"))
                         .unwrap_or_else(|| "w-".into())
@@ -1040,34 +1035,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
                     format!("{:?}", member_index.get_current_owner(&member.get_id())),
                 );
             }
-        }
-    }
-
-    // Every assignment-contribution group, so a writer homed under the wrong
-    // owner shows as a moved group rather than a changed type.
-    let mut contribution_groups = BTreeMap::new();
-    if with_provenance {
-        let all_files = db.get_vfs().get_all_file_ids().into_iter().collect();
-        let store = member_index.member_assignment_contributions();
-        for group_key in store.keys_for_files(&all_files) {
-            let Some(group) = store.contributions(&group_key) else {
-                continue;
-            };
-            let mut ids = group
-                .keys()
-                .map(|member_id| {
-                    format!(
-                        "{}:{:?}",
-                        member_id.file_id.id,
-                        u32::from(member_id.get_position())
-                    )
-                })
-                .collect::<Vec<_>>();
-            ids.sort();
-            contribution_groups.insert(
-                format!("{:?}|{:?}", group_key.0, group_key.1),
-                ids.join(","),
-            );
         }
     }
 
@@ -1268,7 +1235,6 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
     let snapshot = IndexSnapshot {
         type_caches,
         type_facts,
-        contribution_groups,
         member_owners,
         members,
         net_flows,
@@ -1441,12 +1407,6 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
     for (name, prefix, base_map, other_map) in [
         ("type_caches", "TC", &base.type_caches, &other.type_caches),
         ("type_facts", "TF", &base.type_facts, &other.type_facts),
-        (
-            "contribution_groups",
-            "CG",
-            &base.contribution_groups,
-            &other.contribution_groups,
-        ),
         (
             "member_owners",
             "MO",
@@ -1859,11 +1819,10 @@ fn refresh_faithfulness(analysis: &EmmyLuaAnalysis) {
             };
             let writers = member_index
                 .get_member_owner(&member_id)
-                .and_then(|owner| {
+                .map(|owner| {
                     member_index
-                        .member_assignment_contributions()
-                        .contributions(&(owner.clone(), member.get_key().clone()))
-                        .map(|group| group.len())
+                        .get_current_owner_members_for_key(owner, member.get_key())
+                        .len()
                 })
                 .unwrap_or(1);
             let stat = &mut stats[usize::from(writers > 1)];

@@ -29,10 +29,9 @@ use crate::{
             holds_unbound_iter_template, write_type_cache,
         },
         lua::{
-            analyze_return_correlations, analyze_return_point, compute_module_semantic_id,
+            compute_module_semantic_id, derive_inferred_return_with_reads,
             has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
-            is_guarded_table_assignment_index_expr, preserve_guarded_table_assignment_members,
-            resolve_index_expr_member_owner_for_file,
+            is_guarded_table_assignment_index_expr, resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -259,9 +258,6 @@ fn create_deferred_index_expr_member(
         let function_scope = member_index
             .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
         member_index.set_member_function_scope_range(member_id, function_scope);
-        if guarded {
-            preserve_guarded_table_assignment_members(db, member_id);
-        }
     }
     Some(())
 }
@@ -394,7 +390,7 @@ pub fn try_resolve_member(
             }
 
             if set_owner_only {
-                db.get_member_index_mut().set_member_owner(
+                db.get_member_index_mut().set_member_owner_only(
                     member_owner,
                     member_id.file_id,
                     member_id,
@@ -437,9 +433,6 @@ pub fn try_resolve_member(
             db,
             member_id.into(),
             LuaTypeCache::InferType(expr_type.clone()),
-        );
-        crate::compilation::analyzer::lua::record_resolved_member_assignment_contribution(
-            db, member_id, &expr_type,
         );
         crate::compilation::analyzer::lua::mark_resolved_member_assignment(db, member_id);
     }
@@ -612,13 +605,14 @@ pub fn try_resolve_return_point(
         && signature.resolve_return == SignatureReturnStatus::InferResolve
     {
         let current_return = signature.get_return_type();
-        if !current_return.is_unknown() && !current_return.is_any() {
+        if !is_unsettled_inferred_return(&current_return) {
             return Ok(());
         }
     }
 
-    let return_correlations = analyze_return_correlations(db, cache, &return_.return_points);
-    let return_docs = analyze_return_point(db, cache, &return_.return_points)?;
+    let (return_correlations, return_docs) =
+        derive_inferred_return_with_reads(db, cache, return_.signature_id, &return_.return_points);
+    let return_docs = return_docs?;
 
     let inferred_return = return_docs_to_type(&return_docs);
     let inherited_tail = db
@@ -658,13 +652,24 @@ pub fn try_resolve_return_point(
                 return_kind: ReturnTypeKind::default(),
             }));
         signature.set_return_correlations(return_correlations);
+        db.get_signature_index_mut()
+            .note_return_write(return_.signature_id);
         return Ok(());
     }
 
     if should_apply_resolved_return_docs(signature, &return_docs) {
+        let moved = signature
+            .return_docs
+            .iter()
+            .map(|doc| &doc.type_ref)
+            .ne(return_docs.iter().map(|doc| &doc.type_ref));
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
         signature.set_return_correlations(return_correlations);
+        if moved {
+            db.get_signature_index_mut()
+                .note_return_write(return_.signature_id);
+        }
     }
 
     Ok(())
@@ -689,8 +694,14 @@ fn should_apply_resolved_return_docs(
         return true; // Allow upgrading Unknown to Any
     }
 
-    (current_return.is_unknown() || current_return.is_any())
-        && !(new_return.is_unknown() || new_return.is_any())
+    is_unsettled_inferred_return(&current_return) && !is_unsettled_inferred_return(&new_return)
+}
+
+/// An inferred return that says nothing yet. `never` belongs here: a function
+/// whose body returns an expression cannot return no value, so a `never`
+/// return is an operand that had not resolved when the body was read.
+pub(crate) fn is_unsettled_inferred_return(return_type: &LuaType) -> bool {
+    return_type.is_unknown() || return_type.is_any() || return_type.is_never()
 }
 
 fn return_docs_to_type(return_docs: &[LuaDocReturnInfo]) -> LuaType {
@@ -790,6 +801,24 @@ fn compute_iter_var_updates(
             .cloned()
             .unwrap_or(LuaType::Unknown);
         let ret_type = TypeOps::Remove.apply(db, &ret_type, &LuaType::Nil);
+        // A raw template ref is the placeholder an unbound generic leaves for
+        // an arm it could not see into, not a type the variable holds, so the
+        // arms that did bind are the answer. A placeholder alone stays as it
+        // is: it is what marks the variable as still waiting.
+        let ret_type = match &ret_type {
+            LuaType::Union(union)
+                if ret_type.contain_tpl() && union.types().any(|arm| !arm.contain_tpl()) =>
+            {
+                LuaType::from_vec(
+                    union
+                        .types()
+                        .filter(|arm| !arm.contain_tpl())
+                        .cloned()
+                        .collect(),
+                )
+            }
+            _ => ret_type,
+        };
 
         let owner: LuaTypeOwner = decl_id.into();
         let cached = db.get_type_index().get_type_cache(&owner);

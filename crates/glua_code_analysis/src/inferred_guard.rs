@@ -412,8 +412,7 @@ impl EmmyLuaAnalysis {
             return;
         }
 
-        let expanded = self.expand_reindex_file_ids(changed_files);
-        let expanded = expanded
+        let changed_files = changed_files
             .into_iter()
             .filter(|file_id| {
                 self.compilation
@@ -423,11 +422,16 @@ impl EmmyLuaAnalysis {
                     .is_some()
             })
             .collect::<Vec<_>>();
-        if expanded.is_empty() {
+        if changed_files.is_empty() {
             return;
         }
-        self.compilation.remove_index(expanded.clone());
-        self.compilation.update_index(expanded);
+        // The parameter's consumers are the bodies that read it, which are the
+        // files owning these signatures. Whatever those bodies then derive
+        // differently is found by diffing their exports, the same way any
+        // other edit ripples; expanding to every dependency re-analysed the
+        // workspace for one parameter.
+        let dirty = self.self_index_and_diff(changed_files);
+        self.ripple(dirty);
     }
 
     pub(crate) fn reconcile_equivalent_inferred_guard_owners(

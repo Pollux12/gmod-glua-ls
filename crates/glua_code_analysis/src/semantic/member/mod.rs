@@ -28,6 +28,7 @@ use glua_parser::{
 use glua_parser::{LuaAstNode, LuaIndexExpr};
 pub(crate) use infer_raw_member::{
     infer_owner_raw_member_type_with_realm, resolve_member_item_with_realm,
+    source_survives_table_generation_cutoff,
 };
 pub use infer_raw_member::{infer_raw_member_type, infer_raw_member_type_with_cache};
 use rowan::{TextRange, TextSize};
@@ -79,19 +80,9 @@ pub(crate) fn merge_open_table_types(db: &DbIndex, types: Vec<LuaType>) -> LuaTy
         }
 
         if let LuaType::Union(union) = &typ {
-            let mut nested_components = Vec::new();
-            let mut all_components_are_tables = true;
-            for component in union.into_vec() {
-                if is_open_table_merge_component(&component) {
-                    nested_components.push(component);
-                } else {
-                    all_components_are_tables = false;
-                    break;
-                }
-            }
-
-            if all_components_are_tables {
-                for component in nested_components {
+            let components = union.into_vec();
+            if components.iter().all(is_open_table_merge_component) {
+                for component in components {
                     if seen.insert(component.clone()) {
                         table_components.push(component);
                     }
@@ -302,6 +293,21 @@ mod tests {
 
         assert_eq!(merged_table.get_types(), &[table_of, object]);
     }
+
+    #[test]
+    fn merge_open_table_types_keeps_mixed_union_alternatives_distinct() {
+        let db = DbIndex::new();
+        let mut left_fields = BTreeMap::new();
+        left_fields.insert(LuaMemberKey::Name("left".into()), LuaType::Integer);
+        let left = LuaType::Object(LuaObjectType::new_with_fields(left_fields, Vec::new()).into());
+        let mut right_fields = BTreeMap::new();
+        right_fields.insert(LuaMemberKey::Name("right".into()), LuaType::String);
+        let right =
+            LuaType::Object(LuaObjectType::new_with_fields(right_fields, Vec::new()).into());
+        let mixed = LuaType::from_vec_structural(vec![left, right, LuaType::BooleanConst(false)]);
+
+        assert_eq!(merge_open_table_types(&db, vec![mixed.clone()]), mixed);
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -500,18 +506,23 @@ fn dynamic_field_definitions(
             &crate::DynamicFieldOwner::Type(type_id.clone()),
             field_name,
             access_position,
+            None,
         ),
-        LuaType::TableConst(table_range) => dynamic_field_definitions_for_owner(
-            db,
-            cache,
-            caller_file_id,
-            &crate::canonical_dynamic_field_owner(
+        LuaType::TableConst(table_range) => {
+            let table_owner = crate::DynamicFieldOwner::Table(table_range.clone());
+            let owner = crate::canonical_dynamic_field_owner(db, table_owner.clone());
+            let source_min_position = (owner != table_owner)
+                .then(|| InFiled::new(table_range.file_id, table_range.value.start()));
+            dynamic_field_definitions_for_owner(
                 db,
-                crate::DynamicFieldOwner::Table(table_range.clone()),
-            ),
-            field_name,
-            access_position,
-        ),
+                cache,
+                caller_file_id,
+                &owner,
+                field_name,
+                access_position,
+                source_min_position.as_ref(),
+            )
+        }
         LuaType::Instance(instance) => dynamic_field_definitions(
             db,
             cache,
@@ -531,6 +542,7 @@ fn dynamic_field_definitions_for_owner(
     owner: &crate::DynamicFieldOwner,
     field_name: &str,
     access_position: Option<TextSize>,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> Vec<VisibleDynamicFieldDefinition> {
     let dynamic_fields_global = db.get_emmyrc().gmod.dynamic_fields_global;
     let caller_mask = effective_dynamic_field_state_mask(db, caller_file_id, access_position);
@@ -545,6 +557,16 @@ fn dynamic_field_definitions_for_owner(
         .get_dynamic_field_index()
         .field_definitions(owner, field_name)
     {
+        if source_min_position.is_some_and(|source_min_position| {
+            !source_survives_table_generation_cutoff(
+                db,
+                definition.file_id,
+                definition.value.start(),
+                source_min_position,
+            )
+        }) {
+            continue;
+        }
         if !(dynamic_fields_global || definition.file_id == caller_file_id) {
             continue;
         }

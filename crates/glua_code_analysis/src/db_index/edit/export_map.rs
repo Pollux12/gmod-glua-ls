@@ -34,7 +34,6 @@ pub enum RealmSubject {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum ExportKey {
     Member(LuaMemberId),
-    AssignmentContribution(LuaMemberId),
     TypeDecl(LuaTypeDeclId),
     TypeCache(LuaTypeOwner),
     Signature(LuaSignatureId),
@@ -104,7 +103,6 @@ pub fn export_map(db: &DbIndex, file_id: FileId, remap: &FileRemap) -> ExportMap
     let files = FxHashSet::from_iter([file_id]);
 
     members(db, file_id, remap, &mut map);
-    assignment_contributions(db, file_id, remap, &mut map);
     type_decls(db, file_id, remap, &mut map);
     type_caches(db, file_id, remap, &mut map);
     signatures(db, file_id, remap, &mut map);
@@ -143,41 +141,11 @@ fn members(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap
                     None => "NoOwner".hash(h),
                 }
                 member.get_feature().hash(h);
+                member_index
+                    .is_non_overwriting_assignment_member(member.get_id())
+                    .hash(h);
             }),
         );
-    }
-}
-
-// --- 2. Per-writer assignment contributions ---
-fn assignment_contributions(db: &DbIndex, file_id: FileId, remap: &FileRemap, map: &mut ExportMap) {
-    let store = db.get_member_index().member_assignment_contributions();
-    for store_key in store.keys_for_files(&FxHashSet::from_iter([file_id])) {
-        let Some(contributions) = store.contributions(&store_key) else {
-            continue;
-        };
-        // A bucket this file wrote nothing into is another file's fact, and
-        // gets no key here.
-        for (member_id, contribution) in contributions {
-            if member_id.file_id != file_id {
-                continue;
-            }
-            let key_id = remapped(remap.member_id(*member_id), *member_id);
-            map.insert(
-                ExportKey::AssignmentContribution(key_id),
-                hash_with(|h| {
-                    hash_member_owner(remap, &store_key.0, h);
-                    hash_member_key(remap, &store_key.1, h);
-                    hash_type(remap, &contribution.bound_type, h);
-                    hash_type(remap, &contribution.source_type, h);
-                    match &contribution.doc_type {
-                        Some(doc) => hash_type(remap, doc, h),
-                        None => "NoDocType".hash(h),
-                    }
-                    contribution.guarded_bootstrap.hash(h);
-                    contribution.preserve_table_literals.hash(h);
-                }),
-            );
-        }
     }
 }
 
@@ -998,15 +966,25 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
     // it may now hit. A key whose hash merely changed has no such readers - the
     // ones it has are named by the edges below.
     let structural: FxHashSet<&ExportKey> = diff.added.iter().chain(&diff.removed).collect();
+    let mut missed_readers: Vec<FileId> = Vec::new();
 
     for key in diff.keys() {
         match key {
-            ExportKey::Member(member_id) | ExportKey::AssignmentContribution(member_id) => {
+            ExportKey::Member(member_id) => {
                 let owner = LuaTypeOwner::Member(*member_id);
                 push_cached_type_refs(db, &owner, &mut type_refs);
                 nodes.push(LuaInferenceNodeId::TypeOwner(owner));
-                if let Some(owner) = db.get_member_index().get_member_owner(member_id) {
+                let member_index = db.get_member_index();
+                if let Some(owner) = member_index.get_member_owner(member_id) {
                     owners.push((owner.clone(), structural.contains(key)));
+                    // A reader whose lookup of this key found nothing cached
+                    // no type, so no reverse index below names it.
+                    if structural.contains(key)
+                        && let Some(member) = member_index.get_member(member_id)
+                    {
+                        missed_readers
+                            .extend(member_index.missed_member_readers(owner, member.get_key()));
+                    }
                 }
             }
             ExportKey::TypeDecl(type_decl_id) => {
@@ -1082,7 +1060,7 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
     }
 
     let member_index = db.get_member_index();
-    let mut dependents = FxHashSet::default();
+    let mut dependents: FxHashSet<FileId> = missed_readers.into_iter().collect();
     for (owner, structural) in &owners {
         // A reader that resolved a member through this owner cached the owner
         // itself - the class it named, the literal it indexed - so the reverse
@@ -1125,6 +1103,10 @@ pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> Fx
 
     let call_site_index = db.get_call_site_param_index();
     dependents.extend(call_site_index.collect_signature_contributor_files(&signatures));
+    dependents.extend(
+        db.get_signature_index()
+            .settled_read_dependents_for_signatures(&signatures),
+    );
     let sources: Vec<crate::CallSiteSourceId> = signatures
         .iter()
         .map(|id| crate::CallSiteSourceId::Signature(*id))

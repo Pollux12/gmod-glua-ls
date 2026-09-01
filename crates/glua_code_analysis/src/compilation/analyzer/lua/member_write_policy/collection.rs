@@ -178,7 +178,7 @@ pub(in crate::compilation::analyzer::lua) fn record_member_collection_assignment
     );
 }
 
-pub(in crate::compilation::analyzer) fn is_member_realm_compatible(
+fn is_member_realm_compatible(
     db: &DbIndex,
     current_member_id: LuaMemberId,
     related_member_id: LuaMemberId,

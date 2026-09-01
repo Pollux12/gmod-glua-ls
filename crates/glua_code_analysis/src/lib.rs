@@ -482,6 +482,15 @@ impl EmmyLuaAnalysis {
                 .is_none()
         });
         let is_removed = text.is_none();
+        let pre_edit_state =
+            existing_file_id
+                .filter(|_| !was_absent && !is_removed)
+                .map(|file_id| {
+                    let expansion = self.expand_reindex_file_ids(vec![file_id]);
+                    let files = expansion.iter().copied().collect::<FxHashSet<_>>();
+                    let guard_snapshot = self.inferred_guard_snapshot(&files);
+                    (expansion, guard_snapshot)
+                });
         if let Some(existing) = existing_file_id {
             // Before the mutation: this is the text the index was built from.
             // For a deletion it is also what says every old offset is gone.
@@ -499,7 +508,20 @@ impl EmmyLuaAnalysis {
         if was_absent || is_removed {
             self.dirty_existence_dependents(&mut dirty, file_id);
         }
-        profile::phase("edit/ripple", || self.ripple(dirty));
+        profile::phase("edit/ripple", || {
+            if dirty.is_empty() {
+                return;
+            }
+            if let Some((expansion, guard_snapshot)) = pre_edit_state {
+                self.reindex_expanded_files_with_old_snapshot(
+                    vec![file_id],
+                    expansion,
+                    guard_snapshot,
+                );
+            } else {
+                self.ripple(dirty);
+            }
+        });
         profile::phase_report("update_file_by_uri");
 
         Some(file_id)
@@ -685,8 +707,16 @@ impl EmmyLuaAnalysis {
     /// Reindex specific files: remove old index entries + run full analysis pipeline.
     /// Call this after `update_file_text_only` once the user has paused typing.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
+        let expansion = self.expand_reindex_file_ids(file_ids.clone());
+        let files = expansion.iter().copied().collect::<FxHashSet<_>>();
+        let guard_snapshot = self.inferred_guard_snapshot(&files);
         let dirty = self.self_index_and_diff(file_ids);
-        self.ripple(dirty);
+        if dirty.is_empty() {
+            return;
+        }
+        let mut sources = dirty.sources.iter().copied().collect::<Vec<_>>();
+        sources.sort_unstable();
+        self.reindex_expanded_files_with_old_snapshot(sources, expansion, guard_snapshot);
     }
 
     /// [`reindex_files`](Self::reindex_files) against an expansion that was
@@ -707,6 +737,17 @@ impl EmmyLuaAnalysis {
     /// Re-analyses `expansion` with `file_ids` as the files that changed.
     ///
     fn reindex_expanded_files_inner(&mut self, file_ids: Vec<FileId>, expansion: Vec<FileId>) {
+        let guard_fact_file_ids = expansion.iter().copied().collect::<FxHashSet<_>>();
+        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
+        self.reindex_expanded_files_with_old_snapshot(file_ids, expansion, old_guard_facts);
+    }
+
+    fn reindex_expanded_files_with_old_snapshot(
+        &mut self,
+        file_ids: Vec<FileId>,
+        expansion: Vec<FileId>,
+        old_guard_facts: InferredGuardSnapshot,
+    ) {
         let incremental_source_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
         let removed_file_ids = file_ids
             .iter()
@@ -728,7 +769,6 @@ impl EmmyLuaAnalysis {
         let mut file_ids = expansion;
         self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut file_ids);
         let guard_fact_file_ids = file_ids.iter().copied().collect::<FxHashSet<_>>();
-        let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
         self.compilation.remove_index(file_ids.clone());
         let update_file_ids = file_ids
             .iter()
@@ -930,11 +970,10 @@ impl EmmyLuaAnalysis {
     /// cached type.
     ///
     /// A call site contributes a parameter type, a callback source is matched
-    /// by path. Neither is a type cache, so neither is reachable from the
-    /// export diff: the value the dependent holds does not move when the facts
-    /// behind it do, and both are keyed by file or path with no per-key
-    /// equivalent. These edges are one hop, not the transitive closure the old
-    /// expansion took, and are only paid when the file exported something new.
+    /// by path, and an inferred return reads source files. None is a type cache,
+    /// so none is reachable from the export diff. These edges are one hop, not
+    /// a transitive expansion, and are only paid when the file exported
+    /// something new.
     ///
     /// Inference support is deliberately absent: `dependents_of` already
     /// queries it node by node for the nodes the diff names, and the
@@ -948,6 +987,10 @@ impl EmmyLuaAnalysis {
         dependents.extend(call_site_index.collect_contributor_files(&files));
         dependents.extend(
             call_site_index.collect_source_path_dependents(db.get_vfs().get_file_path(&file_id)),
+        );
+        dependents.extend(
+            db.get_signature_index()
+                .inferred_return_dependents_for_files(&files),
         );
         dependents
     }
@@ -1022,6 +1065,10 @@ impl EmmyLuaAnalysis {
                 .guard_snapshot
                 .merge(self.inferred_guard_snapshot(&batch_set));
 
+            let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+            if profile_enabled {
+                eprintln!("[profile] ripple round {round}: {} file(s)", batch.len());
+            }
             self.compilation.remove_index(batch.clone());
             self.compilation.update_index(batch.clone());
             reanalyzed.extend(batch.iter().copied());
@@ -1036,6 +1083,21 @@ impl EmmyLuaAnalysis {
                 let diff = diff_exports(&before[file_id], &after);
                 if diff.is_empty() {
                     continue;
+                }
+                if profile_enabled {
+                    let keys = diff
+                        .keys()
+                        .take(6)
+                        .map(|key| {
+                            let text = format!("{key:?}");
+                            text.chars().take(110).collect::<String>()
+                        })
+                        .collect::<Vec<_>>();
+                    eprintln!(
+                        "[profile] ripple round {round}: {:?} changed {} export(s): {keys:?}",
+                        self.compilation.get_db().get_vfs().get_file_path(file_id),
+                        diff.keys().count()
+                    );
                 }
                 let evidence = self.evidence_dependents(*file_id);
                 for dependent in dependents_of(self.compilation.get_db(), *file_id, &diff)
@@ -1163,6 +1225,16 @@ impl EmmyLuaAnalysis {
                 .get_db()
                 .get_call_site_param_index()
                 .collect_source_path_dependents(callback_source_paths);
+            let inferred_return_dependents = self
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .inferred_return_dependents_for_files(&expanded);
+            let settled_signature_dependents = self
+                .compilation
+                .get_db()
+                .get_signature_index()
+                .settled_read_dependents_for_files(&expanded);
             let mut added = false;
             for file_id in dependency_dependents
                 .into_iter()
@@ -1172,6 +1244,8 @@ impl EmmyLuaAnalysis {
                 .chain(callback_dependents)
                 .chain(contributor_dependents)
                 .chain(callback_path_dependents)
+                .chain(inferred_return_dependents)
+                .chain(settled_signature_dependents)
             {
                 added |= expanded.insert(file_id);
             }
@@ -1861,6 +1935,36 @@ mod tests {
         assert_eq!(
             analysis.expand_reindex_file_ids(vec![changed]),
             vec![changed, direct_caller, transitive_caller]
+        );
+    }
+
+    #[test]
+    fn reindex_expansion_includes_inferred_return_producers() {
+        let workspace = std::env::temp_dir().join("gmod_glua_ls_inferred_return_dependencies");
+        let producer_uri = Uri::parse_from_file_path(&workspace.join("producer.lua"))
+            .expect("producer URI should parse");
+        let returner_uri = Uri::parse_from_file_path(&workspace.join("returner.lua"))
+            .expect("returner URI should parse");
+        let mut analysis = EmmyLuaAnalysis::new();
+        analysis.add_main_workspace(workspace);
+        let producer = analysis
+            .update_file_by_uri(
+                &producer_uri,
+                Some("State = {}\nState.value = 1".to_string()),
+            )
+            .expect("producer should be indexed");
+        let returner = analysis
+            .update_file_by_uri(
+                &returner_uri,
+                Some("function GetStateValue() return State.value end".to_string()),
+            )
+            .expect("returner should be indexed");
+
+        assert!(
+            analysis
+                .expand_reindex_file_ids(vec![producer])
+                .contains(&returner),
+            "a producer edit must reindex functions whose inferred return reads it"
         );
     }
 

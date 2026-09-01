@@ -9893,8 +9893,8 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_before, 1,
-            "expected latest assignment to replace previous assignment"
+            member_count_before, 2,
+            "every writer of the slot stays visible"
         );
 
         ws.analysis
@@ -9913,8 +9913,8 @@ mod test {
             crate::LuaMemberIndexItem::Many(ids) => ids.len(),
         };
         assert_eq!(
-            member_count_after, 1,
-            "single-file reindex should retain the latest assignment"
+            member_count_after, 2,
+            "single-file reindex keeps every writer of the slot"
         );
     }
 

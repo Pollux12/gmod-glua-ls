@@ -363,17 +363,17 @@ mod tests {
             .get_member_index()
             .get_current_owner_members_for_key(&owner, &key);
         assert_eq!(history.len(), 2);
-        let latest_member_id = history
+        let mut history_ids = history
             .iter()
             .map(|member| member.get_id())
-            .max_by_key(|member_id| member_id.get_position())
-            .expect("registered class history must contain the latest write");
+            .collect::<Vec<_>>();
+        history_ids.sort_by_key(|member_id| crate::db_index::member_id_sort_key(*member_id));
         let current_member_ids = db
             .get_member_index()
             .get_member_item(&owner, &key)
             .expect("registered class member must exist")
             .get_member_ids();
-        assert_eq!(current_member_ids, vec![latest_member_id]);
+        assert_eq!(current_member_ids, history_ids);
     }
 
     #[test]

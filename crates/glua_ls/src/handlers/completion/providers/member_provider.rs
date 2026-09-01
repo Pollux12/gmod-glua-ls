@@ -253,7 +253,7 @@ fn classify_slot_write(db: &DbIndex, info: &LuaMemberInfo) -> SlotWrite {
     ) {
         return SlotWrite::NotAWrite;
     }
-    if member_index.is_conditional_branch_assignment_member(*member_id) {
+    if glua_code_analysis::is_member_assignment_in_conditional_branch(db, *member_id) {
         SlotWrite::Branch
     } else {
         SlotWrite::Unconditional

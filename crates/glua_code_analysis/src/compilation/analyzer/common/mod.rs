@@ -243,6 +243,44 @@ pub(crate) fn widen_mutable_decl_literal(
     }
 }
 
+pub(crate) fn mutable_local_name_read_decl(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+) -> Option<LuaDeclId> {
+    let LuaExpr::NameExpr(name_expr) = expr else {
+        return None;
+    };
+    let name = name_expr.get_name_text()?;
+    let decl_id = db
+        .get_decl_index()
+        .get_decl_tree(&file_id)?
+        .find_local_decl(&name, name_expr.get_position())?
+        .get_id();
+    db.get_reference_index()
+        .get_decl_references(&file_id, &decl_id)
+        .is_some_and(|references| references.mutable)
+        .then_some(decl_id)
+}
+
+pub(crate) fn widen_mutable_local_name_copy(
+    db: &DbIndex,
+    file_id: FileId,
+    expr: &LuaExpr,
+    typ: LuaType,
+) -> LuaType {
+    let Some(decl_id) = mutable_local_name_read_decl(db, file_id, expr) else {
+        return typ;
+    };
+    widen_mutable_decl_literal(
+        db,
+        &LuaTypeOwner::Decl(decl_id),
+        LuaTypeCache::InferType(typ),
+    )
+    .as_type()
+    .clone()
+}
+
 /// Where a write to a declaration came from, for [`bind_decl_write`].
 #[derive(Clone, Copy)]
 pub struct DeclWrite {

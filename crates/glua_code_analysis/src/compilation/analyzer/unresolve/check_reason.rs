@@ -1,9 +1,7 @@
 use rustc_hash::FxHashMap;
 
-use glua_parser::LuaAstNode;
-
 use crate::{
-    DbIndex, InFiled, InferFailReason, LuaDocReturnInfo, LuaType, LuaTypeCache, ReturnTypeKind,
+    DbIndex, InferFailReason, LuaDocReturnInfo, LuaType, LuaTypeCache, ReturnTypeKind,
     SignatureReturnStatus,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
@@ -127,14 +125,14 @@ pub fn resolve_as_unknown(
                 TypeCacheWriteMode::InsertOnly,
             );
         }
-        InferFailReason::UnResolveExpr(expr) => {
-            let key = InFiled::new(expr.file_id, expr.value.get_syntax_id());
-            write_type_cache(
-                db,
-                key.into(),
-                LuaTypeCache::InferType(LuaType::Unknown),
-                TypeCacheWriteMode::InsertOnly,
-            );
+        // An expression's slot in the type index is the `@as` cast slot that
+        // `infer_expr` consults before inferring anything. Flooring it would
+        // make a placeholder read as a cast of the expression to `unknown`,
+        // permanently and however its operands settle. The blocked items stay
+        // blocked instead; an expression that never infers leaves them typed
+        // as nothing rather than as a fabricated answer.
+        InferFailReason::UnResolveExpr(_) => {
+            return Some(());
         }
         InferFailReason::UnResolveSignatureReturn(signature_id) => {
             // Same deferral as the member-type arm above, for the same
@@ -156,6 +154,8 @@ pub fn resolve_as_unknown(
                     return_kind: ReturnTypeKind::default(),
                 }];
                 signature.resolve_return = SignatureReturnStatus::InferResolve;
+                db.get_signature_index_mut()
+                    .note_return_write(*signature_id);
             }
         }
         InferFailReason::UnResolveModuleExport(file_id) => {

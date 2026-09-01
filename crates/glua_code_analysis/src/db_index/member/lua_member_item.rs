@@ -6,12 +6,12 @@ use std::{
 use crate::{
     DbIndex, FileId, InferFailReason, LuaFunctionType, LuaSemanticDeclId, LuaType, TypeOps,
     db_index::{WorkspaceKind, WorkspaceResolutionKey, gmod_infer::GmodRealm},
-    is_table_assignment_merge_type, widen_file_define_member_type,
+    is_table_assignment_merge_type, widen_literal_type_for_assignment,
 };
 use glua_parser::{BinaryOperator, LuaAssignStat, LuaAstNode, LuaExpr, PathTrait};
 use rowan::TextSize;
 
-use super::LuaMemberId;
+use super::{LuaMemberId, LuaMemberOwner};
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum LuaMemberIndexItem {
@@ -254,13 +254,54 @@ fn visible_member_ids_at_offset(
     caller_file_id: &FileId,
     caller_position: TextSize,
 ) -> Vec<LuaMemberId> {
-    member_ids
+    let visible = member_ids
         .iter()
         .copied()
         .filter(|member_id| {
             member_visible_at_offset(db, *member_id, caller_file_id, caller_position)
         })
+        .collect();
+    drop_overwritten_writers(db, visible)
+}
+
+/// A plain top-level write, `x.y = v` outside any function and any branch,
+/// replaces whatever the same file wrote to the slot before it, so a reader
+/// who sees that write does not see those earlier writers.
+fn drop_overwritten_writers(db: &DbIndex, visible: Vec<LuaMemberId>) -> Vec<LuaMemberId> {
+    let overwriters = visible
+        .iter()
+        .copied()
+        .filter(|member_id| is_top_level_overwriting_assignment(db, *member_id))
+        .collect::<Vec<_>>();
+    if overwriters.is_empty() {
+        return visible;
+    }
+    visible
+        .into_iter()
+        .filter(|member_id| {
+            !db.get_member_index()
+                .get_member(member_id)
+                .is_some_and(|member| member.get_feature().is_file_define())
+                || !overwriters.iter().any(|overwriter| {
+                    overwriter.file_id == member_id.file_id
+                        && member_id.get_position() < overwriter.get_position()
+                })
+        })
         .collect()
+}
+
+fn is_top_level_overwriting_assignment(db: &DbIndex, member_id: LuaMemberId) -> bool {
+    let member_index = db.get_member_index();
+    let Some(member) = member_index.get_member(&member_id) else {
+        return false;
+    };
+    member.get_feature().is_file_define()
+        && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
+        && !matches!(member.get_key(), super::LuaMemberKey::ExprType(_))
+        && member_index
+            .member_function_scope_range(member_id)
+            .is_none()
+        && !member_index.is_non_overwriting_assignment_member(member_id)
 }
 
 fn expand_member_ids_with_owner_key_history(
@@ -433,6 +474,50 @@ fn expr_access_path(expr: &LuaExpr) -> Option<smol_str::SmolStr> {
     }
 }
 
+/// A table literal that is the table a class-annotated path was declared with
+/// reads as that class: `X.k = X.k or {}` in a second file hands back the very
+/// table the first file annotated, so the two are one type, not `C|table`.
+fn class_table_as_class(db: &DbIndex, typ: &LuaType) -> LuaType {
+    let LuaType::TableConst(range) = typ else {
+        return typ.clone();
+    };
+    match db
+        .get_member_index()
+        .canonical_owner(LuaMemberOwner::Element(range.clone()))
+        .get_type_id()
+    {
+        Some(class) => LuaType::Ref(class.clone()),
+        None => typ.clone(),
+    }
+}
+
+/// Whether this writer spells the table it assigns, `x.y = {...}`, rather
+/// than naming one that already exists. Spelled literals are one runtime table
+/// however many files spell it, so they merge; a reference is a candidate of
+/// its own, and two writers naming different tables are a conflict to keep.
+fn writer_spells_table(db: &DbIndex, member_id: LuaMemberId, typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TableConst(range) => {
+            (range.file_id == member_id.file_id && range.value.start() >= member_id.get_position())
+                || db
+                    .get_member_index()
+                    .is_non_overwriting_assignment_member(member_id)
+        }
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .all(|typ| writer_spells_table(db, member_id, typ)),
+        LuaType::Union(union) => union
+            .types()
+            .all(|typ| typ.is_nil() || writer_spells_table(db, member_id, typ)),
+        LuaType::MultiLineUnion(multi) => multi
+            .get_unions()
+            .iter()
+            .all(|(typ, _)| typ.is_nil() || writer_spells_table(db, member_id, typ)),
+        _ => true,
+    }
+}
+
 fn resolve_member_type(
     db: &DbIndex,
     member_item: &LuaMemberIndexItem,
@@ -476,15 +561,6 @@ fn resolve_member_type(
                     db.get_member_index()
                         .is_non_overwriting_assignment_member(member.get_id())
                 });
-            let should_widen_table_literals = should_widen_file_defines
-                && !all_non_overwriting_assignment_file_defines
-                && members.iter().all(|member| {
-                    db.get_type_index()
-                        .get_type_cache(&member.get_id().into())
-                        .is_some_and(|cache| {
-                            cache.is_doc() || is_table_assignment_merge_type(cache.as_type())
-                        })
-                });
             if db.get_emmyrc().strict.meta_override_file_define {
                 for member in &members {
                     let feature = member.get_feature();
@@ -510,14 +586,16 @@ fn resolve_member_type(
                             continue;
                         }
 
-                        let member_type = member_type_cache.as_type();
-                        if !is_table_assignment_merge_type(member_type) {
+                        let member_type = class_table_as_class(db, member_type_cache.as_type());
+                        if !is_table_assignment_merge_type(&member_type)
+                            || !writer_spells_table(db, member.get_id(), &member_type)
+                        {
                             all_are_table_merges = false;
                         }
                         let member_type = if should_widen_file_defines {
-                            widen_file_define_member_type(member_type, should_widen_table_literals)
+                            widen_literal_type_for_assignment(&member_type)
                         } else {
-                            member_type.clone()
+                            member_type
                         };
                         collected_types.push(member_type);
                     }
@@ -1339,24 +1417,6 @@ mod tests {
     }
 
     #[test]
-    fn file_define_member_widening_preserves_nested_table_consts_inside_unions() {
-        let typ = LuaType::from_vec(vec![table_const(1, 2), LuaType::String]);
-
-        let widened = super::widen_file_define_member_type(&typ, true);
-
-        let LuaType::Union(union) = widened else {
-            panic!("expected file-define widened union");
-        };
-        assert!(
-            union
-                .types()
-                .any(|typ| matches!(typ, LuaType::TableConst(_)))
-        );
-        assert!(union.types().any(|typ| matches!(typ, LuaType::String)));
-        assert!(!union.types().any(|typ| matches!(typ, LuaType::Table)));
-    }
-
-    #[test]
     fn table_assignment_merge_type_includes_open_table_shapes_only() {
         assert!(super::is_table_assignment_merge_type(&LuaType::Table));
         assert!(super::is_table_assignment_merge_type(&table_const(1, 2)));
@@ -2062,8 +2122,11 @@ mod tests {
         let collapsed = db
             .get_member_index()
             .get_member_item(&owner, &key)
-            .expect("runtime assignments collapse to the latest member");
-        assert_eq!(collapsed, &LuaMemberIndexItem::One(later_member));
+            .expect("both runtime assignments stay in the slot");
+        assert_eq!(
+            collapsed,
+            &LuaMemberIndexItem::Many(vec![earlier_member, later_member])
+        );
         let collapsed_visible =
             collapsed.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
         assert_eq!(collapsed_visible, vec![earlier_member, later_member]);
@@ -2175,8 +2238,11 @@ mod tests {
         let item = db
             .get_member_index()
             .get_member_item(&owner, &key)
-            .expect("runtime assignments collapse to the latest member");
-        assert_eq!(item, &LuaMemberIndexItem::One(later_member));
+            .expect("both runtime assignments stay in the slot");
+        assert_eq!(
+            item,
+            &LuaMemberIndexItem::Many(vec![earlier_member, later_member])
+        );
 
         let visible =
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(20));
@@ -2215,7 +2281,7 @@ mod tests {
         let latest_item = db
             .get_member_index()
             .get_member_item(&owner, &key)
-            .expect("runtime assignments collapse to the latest member");
+            .expect("both runtime assignments stay in the slot");
         let pre_expanded_history = LuaMemberIndexItem::Many(vec![earlier_member, later_member]);
 
         let expanded_visible = latest_item.visible_member_ids_with_realm_at_offset(
@@ -2265,7 +2331,7 @@ mod tests {
         let item = db
             .get_member_index()
             .get_member_item(&owner, &key)
-            .expect("runtime assignments collapse to the latest member");
+            .expect("both runtime assignments stay in the slot");
         let visible =
             item.visible_member_ids_with_realm_at_offset(&db, &caller_file, TextSize::new(40));
 

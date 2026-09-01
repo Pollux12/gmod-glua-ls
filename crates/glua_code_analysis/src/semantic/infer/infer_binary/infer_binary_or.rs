@@ -98,7 +98,12 @@ pub fn try_bootstrap_or(
         return None;
     }
 
-    if !matches!(left, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
+    // Only the self-bootstrap `X = X or {}` is answered before its left read
+    // resolves: that read is the slot being defined, so waiting on it would
+    // wait forever. Any other `X or {}` is a read of `X`, and answering with
+    // the fresh table alone commits the state of the index at the moment the
+    // file was walked, so it waits for the read like any other operand.
+    if !is_self_referential_bootstrap(left) {
         return None;
     }
 
@@ -231,7 +236,7 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
 /// parameter `x = x or {}` is a narrowing idiom over a declared type rather than a
 /// definition of the table, and unresolved globals are already handled below.
 fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
-    if !matches!(left_expr, LuaExpr::IndexExpr(_)) {
+    if !matches!(left_expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
         return false;
     }
 

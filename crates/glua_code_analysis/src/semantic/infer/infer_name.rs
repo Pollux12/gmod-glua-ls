@@ -128,31 +128,12 @@ pub fn infer_name_expr(
                         LuaExpr::NameExpr(name_expr.clone()),
                         var_ref_id,
                     );
-                    if decl_id.is_none() {
-                        if let Ok(ref typ) = narrow_res {
-                            let should_fallback =
-                                typ.is_nil() || matches!(typ, LuaType::TableConst(_));
-                            if should_fallback {
-                                if let Ok(global_type) = infer_global_type(
-                                    db,
-                                    Some(file_id),
-                                    Some(name_expr.get_position()),
-                                    name,
-                                ) {
-                                    if global_type.is_custom_type()
-                                        || (!global_type.is_nil()
-                                            && !global_type.is_nullable()
-                                            && !global_type.is_unknown()
-                                            && !matches!(
-                                                global_type,
-                                                LuaType::Any | LuaType::Never
-                                            ))
-                                    {
-                                        return Ok(global_type);
-                                    }
-                                }
-                            }
-                        }
+                    if decl_id.is_none()
+                        && let Ok(typ) = &narrow_res
+                        && let Some(global_type) =
+                            positional_global_table_fallback(db, file_id, &name_expr, typ)
+                    {
+                        return Ok(global_type);
                     }
                     narrow_res.or_else(|_| {
                         infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
@@ -242,27 +223,11 @@ fn infer_local_decl_name_type(
         .get_decl(&decl_id)
         .is_some_and(|decl| decl.is_global());
 
-    if is_global {
-        if let Ok(ref typ) = result {
-            let should_fallback = typ.is_nil() || matches!(typ, LuaType::TableConst(_));
-            if should_fallback {
-                if let Some(name_token) = name_expr.get_name_token() {
-                    let name = name_token.get_name_text();
-                    if let Ok(global_type) =
-                        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name)
-                    {
-                        if global_type.is_custom_type()
-                            || (!global_type.is_nil()
-                                && !global_type.is_nullable()
-                                && !global_type.is_unknown()
-                                && !matches!(global_type, LuaType::Any | LuaType::Never))
-                        {
-                            return Ok(global_type);
-                        }
-                    }
-                }
-            }
-        }
+    if is_global
+        && let Ok(typ) = &result
+        && let Some(global_type) = positional_global_table_fallback(db, file_id, name_expr, typ)
+    {
+        return Ok(global_type);
     }
 
     if let Ok(typ) = &result
@@ -274,6 +239,12 @@ fn infer_local_decl_name_type(
             name_expr.get_position(),
         )
     {
+        if is_global
+            && let Some(global_type) =
+                positional_global_table_fallback(db, file_id, name_expr, &initializer_type)
+        {
+            return Ok(global_type);
+        }
         return Ok(initializer_type);
     }
 
@@ -285,6 +256,27 @@ fn infer_local_decl_name_type(
     }
 
     result
+}
+
+fn positional_global_table_fallback(
+    db: &DbIndex,
+    file_id: FileId,
+    name_expr: &LuaNameExpr,
+    typ: &LuaType,
+) -> Option<LuaType> {
+    if !typ.is_nil() && !matches!(typ, LuaType::TableConst(_) | LuaType::MergedTable(_)) {
+        return None;
+    }
+    let name_token = name_expr.get_name_token()?;
+    let name = name_token.get_name_text();
+    let global_type =
+        infer_global_type(db, Some(file_id), Some(name_expr.get_position()), name).ok()?;
+    (global_type.is_custom_type()
+        || (!global_type.is_nil()
+            && !global_type.is_nullable()
+            && !global_type.is_unknown()
+            && !matches!(global_type, LuaType::Any | LuaType::Never)))
+    .then_some(global_type)
 }
 
 /// Recognises the in-place `ipairs` transform idiom
@@ -2930,7 +2922,7 @@ fn infer_method_prefix_type(
 mod test {
     use super::{
         direct_table_field_from_member_id, find_param_type_from_contextual_member,
-        find_self_ref_id, get_name_expr_var_ref_id, infer_name_expr,
+        find_self_ref_id, get_name_expr_var_ref_id, infer_global_type, infer_name_expr,
     };
     use crate::{
         Emmyrc, FileId, LuaInferCache, LuaMemberId, LuaSignatureId, LuaType, LuaTypeCache,
@@ -2999,6 +2991,72 @@ mod test {
             .into_iter()
             .next()
             .expect("expected closure")
+    }
+
+    #[test]
+    fn merged_global_table_falls_back_to_the_reader_realm() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        let file_ids = ws.def_files(vec![
+            (
+                "lua/autorun/client/dispatch_writer.lua",
+                "areas = { client = true }",
+            ),
+            (
+                "lua/autorun/server/dispatch_writer.lua",
+                "areas = { server = true }",
+            ),
+            (
+                "lua/autorun/client/dispatch_reader.lua",
+                "local AllAreas = areas",
+            ),
+        ]);
+        let file_id = |suffix: &str| {
+            file_ids
+                .iter()
+                .copied()
+                .find(|file_id| {
+                    ws.analysis
+                        .compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_path(file_id)
+                        .is_some_and(|path| path.ends_with(suffix))
+                })
+                .expect("fixture file")
+        };
+        let client_file_id = file_id("lua/autorun/client/dispatch_writer.lua");
+        let reader_file_id = file_id("lua/autorun/client/dispatch_reader.lua");
+        let model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(reader_file_id)
+            .expect("reader semantic model");
+        let areas = model
+            .get_root()
+            .descendants::<LuaNameExpr>()
+            .find(|expr| expr.get_name_text().as_deref() == Some("areas"))
+            .expect("areas read");
+        let mut cache = LuaInferCache::new(reader_file_id, Default::default());
+
+        let direct = infer_global_type(
+            model.get_db(),
+            Some(reader_file_id),
+            Some(areas.get_position()),
+            "areas",
+        )
+        .expect("positional global type");
+        assert!(
+            matches!(&direct, LuaType::TableConst(table) if table.file_id == client_file_id),
+            "expected positional lookup to return the client table, got {direct:?}"
+        );
+
+        match infer_name_expr(model.get_db(), &mut cache, areas).expect("areas type") {
+            LuaType::TableConst(table) => assert_eq!(table.file_id, client_file_id),
+            other => panic!("expected the client table, got {other:?}"),
+        }
     }
 
     fn find_closure_signature_ids(
