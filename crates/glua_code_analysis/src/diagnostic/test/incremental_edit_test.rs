@@ -1,8 +1,8 @@
 #[cfg(test)]
 mod tests {
     use crate::{
-        DiagnosticCode, Emmyrc, ExportMap, FileId, FileRemap, PositionMap, VirtualWorkspace,
-        export_map,
+        DiagnosticCode, Emmyrc, ExportMap, FileId, FileRemap, LuaMemberKey, LuaType, PositionMap,
+        VirtualWorkspace, export_map,
     };
     use googletest::prelude::*;
     use lsp_types::Uri;
@@ -36,6 +36,34 @@ mod tests {
         ws.analysis
             .update_file_by_uri(uri, Some(text.to_string()))
             .expect("file id")
+    }
+
+    fn write_deferred(ws: &mut VirtualWorkspace, uri: &Uri, text: &str) -> FileId {
+        let file_id = ws
+            .analysis
+            .update_file_text_only(uri, text.to_string())
+            .expect("file id");
+        let dirty = ws.analysis.self_index_and_diff(vec![file_id]);
+        ws.analysis.ripple(dirty);
+        file_id
+    }
+
+    fn decl_type(ws: &VirtualWorkspace, file_id: FileId, name: &str) -> LuaType {
+        let db = ws.analysis.compilation.get_db();
+        let decl_id = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .and_then(|tree| {
+                tree.get_decls()
+                    .values()
+                    .find(|decl| decl.get_name() == name)
+                    .map(|decl| decl.get_id())
+            })
+            .expect("declaration");
+        db.get_type_index()
+            .get_type_cache(&decl_id.into())
+            .map(|cache| cache.as_type().clone())
+            .expect("declaration type")
     }
 
     /// A `@return` edit changes no arity, so a fingerprint that hashes only the
@@ -451,6 +479,13 @@ mod tests {
             config.Mode = "client"
             "#,
         );
+        expect_that!(after, not(eq(&before)));
+    }
+
+    #[gtest]
+    fn fingerprint_moves_when_a_global_table_field_value_changes() {
+        let (before, after) =
+            fingerprint_after_edit("State = { value = 1 }", "State = { value = \"new\" }");
         expect_that!(after, not(eq(&before)));
     }
 
@@ -1616,12 +1651,6 @@ function meta:Custom() end
                 held.extend(ranges.into_iter().map(move |range| (label, range)));
             };
             push("member owner", member_index.element_owner_ranges());
-            push(
-                "contribution",
-                member_index
-                    .member_assignment_contributions()
-                    .table_ranges(),
-            );
             push("dynamic field", db.get_dynamic_field_index().table_ranges());
 
             let mut out: Vec<String> = held
@@ -1840,5 +1869,308 @@ function meta:Custom() end
             "#,
         );
         expect_that!(after, not(eq(&before)));
+    }
+
+    #[test]
+    fn editing_a_nested_record_refreshes_cross_file_pairs_value_caches() {
+        const CONSUMER: &str = r#"
+            for _, value in pairs(cityrp.configuration["Contraband"]) do end
+            "#;
+        const BEFORE: &str = r#"
+            cityrp = {}
+            cityrp.configuration = {}
+            cityrp.configuration["Contraband"] = {}
+            cityrp.configuration["Contraband"]["first"] = {
+                damageReduction = 0.05,
+            }
+            cityrp.configuration["Contraband"]["second"] = {
+                maximum = 2,
+            }
+            "#;
+        const AFTER: &str = r#"
+            -- shifted during the edit
+            cityrp = {}
+            cityrp.configuration = {}
+            cityrp.configuration["Contraband"] = {}
+            cityrp.configuration["Contraband"]["first"] = {
+                damageReduction = 0.06,
+            }
+            cityrp.configuration["Contraband"]["second"] = {
+                maximum = 2,
+            }
+            "#;
+
+        fn pairs_value_field(ws: &VirtualWorkspace, file_id: FileId) -> LuaType {
+            let db = ws.analysis.compilation.get_db();
+            let value_id = db
+                .get_decl_index()
+                .get_decl_tree(&file_id)
+                .and_then(|tree| {
+                    tree.get_decls()
+                        .values()
+                        .find(|decl| decl.get_name() == "value")
+                        .map(|decl| decl.get_id())
+                })
+                .expect("pairs value declaration");
+            let LuaType::Object(value) = db
+                .get_type_index()
+                .get_type_cache(&value_id.into())
+                .map(|cache| cache.as_type())
+                .expect("pairs value type")
+            else {
+                panic!("pairs value should be a compact record");
+            };
+            value
+                .get_field(&LuaMemberKey::Name("damageReduction".into()))
+                .cloned()
+                .expect("damageReduction field")
+        }
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let provider_uri = warm.virtual_url_generator.new_uri("lua/a_config.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (provider_uri.clone(), Some(BEFORE.to_string())),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let consumer_id = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        write(&mut warm, &provider_uri, AFTER);
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_provider_uri = fresh.virtual_url_generator.new_uri("lua/a_config.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (fresh_provider_uri, Some(AFTER.to_string())),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer_id = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        let warm_field = pairs_value_field(&warm, consumer_id);
+        let fresh_field = pairs_value_field(&fresh, fresh_consumer_id);
+        assert_eq!(warm.humanize_type(warm_field.clone()), "0.06?");
+        assert_eq!(warm_field, fresh_field);
+    }
+
+    #[test]
+    fn semantic_edit_rebuilds_an_ordinary_structural_generic_cache() {
+        const CONSUMER: &str = r#"
+            ---@generic T: table, U: table
+            ---@param a T
+            ---@param b U
+            ---@return Merge<T, U>
+            local function extend(a, b) end
+
+            local merged = extend(Provider, {})
+            local observed = merged.value
+            "#;
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let provider_uri = warm.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (
+                provider_uri.clone(),
+                Some("Provider = { value = 1 }".to_string()),
+            ),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let consumer_id = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        write(&mut warm, &provider_uri, "Provider = { value = \"new\" }");
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_provider_uri = fresh.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (
+                fresh_provider_uri,
+                Some("Provider = { value = \"new\" }".to_string()),
+            ),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer_id = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        let warm_observed = decl_type(&warm, consumer_id, "observed");
+        let fresh_observed = decl_type(&fresh, fresh_consumer_id, "observed");
+        assert!(
+            matches!(&warm_observed, LuaType::StringConst(value) if value.as_str() == "new"),
+            "edited structural cache should contain the new source value, got {warm_observed:?}"
+        );
+        assert_eq!(warm_observed, fresh_observed);
+        assert_eq!(
+            decl_type(&warm, consumer_id, "merged"),
+            decl_type(&fresh, fresh_consumer_id, "merged")
+        );
+    }
+
+    #[test]
+    fn producer_edit_refreshes_cross_file_inferred_return_consumers() {
+        const RETURNER: &str = "function GetStateValue() return State.value end";
+        const MOVED_RETURNER: &str =
+            "local padding = true\nfunction GetStateValue() return State.value end";
+        const CONSUMER: &str = "local observed = GetStateValue()";
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let producer_uri = warm.virtual_url_generator.new_uri("lua/a_producer.lua");
+        let returner_uri = warm.virtual_url_generator.new_uri("lua/b_returner.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/c_consumer.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (
+                producer_uri.clone(),
+                Some("State = { value = 1 }".to_string()),
+            ),
+            (returner_uri.clone(), Some(RETURNER.to_string())),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let producer_id = warm
+            .analysis
+            .get_file_id(&producer_uri)
+            .expect("producer file id");
+        let returner_id = warm
+            .analysis
+            .get_file_id(&returner_uri)
+            .expect("returner file id");
+        let consumer_id = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        let expansion = warm.analysis.expand_reindex_file_ids(vec![producer_id]);
+        assert!(expansion.contains(&returner_id));
+        assert!(expansion.contains(&consumer_id));
+        write_deferred(&mut warm, &returner_uri, MOVED_RETURNER);
+        write_deferred(&mut warm, &producer_uri, "State = { value = \"new\" }");
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_producer_uri = fresh.virtual_url_generator.new_uri("lua/a_producer.lua");
+        let fresh_returner_uri = fresh.virtual_url_generator.new_uri("lua/b_returner.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/c_consumer.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (
+                fresh_producer_uri,
+                Some("State = { value = \"new\" }".to_string()),
+            ),
+            (fresh_returner_uri, Some(MOVED_RETURNER.to_string())),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer_id = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        let warm_observed = decl_type(&warm, consumer_id, "observed");
+        assert!(
+            matches!(&warm_observed, LuaType::StringConst(value) if value.as_str() == "new"),
+            "edited inferred return should contain the new source value, got {warm_observed:?}"
+        );
+        assert_eq!(
+            warm_observed,
+            decl_type(&fresh, fresh_consumer_id, "observed")
+        );
+    }
+
+    #[test]
+    fn member_addition_refreshes_cross_file_failed_lookup_consumers() {
+        const CONSUMER: &str = "local observed = Provider.value";
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let provider_uri = warm.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (provider_uri.clone(), Some("Provider = {}".to_string())),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let provider_id = warm
+            .analysis
+            .get_file_id(&provider_uri)
+            .expect("provider file id");
+        let consumer_id = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        let expansion = warm.analysis.expand_reindex_file_ids(vec![provider_id]);
+        assert!(expansion.contains(&consumer_id));
+        write_deferred(&mut warm, &provider_uri, "Provider = { value = \"new\" }");
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_provider_uri = fresh.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (
+                fresh_provider_uri,
+                Some("Provider = { value = \"new\" }".to_string()),
+            ),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer_id = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        let warm_observed = decl_type(&warm, consumer_id, "observed");
+        assert!(
+            matches!(&warm_observed, LuaType::StringConst(value) if value.as_str() == "new"),
+            "new member should replace the failed lookup, got {warm_observed:?}"
+        );
+        assert_eq!(
+            warm_observed,
+            decl_type(&fresh, fresh_consumer_id, "observed")
+        );
+    }
+
+    #[test]
+    fn failed_lookup_survives_anonymous_table_owner_remap() {
+        const INITIAL: &str = "function GetContainer() return { inner = {} } end";
+        const MOVED: &str = "function GetContainer() return { -- shift\n inner = {} } end";
+        const POPULATED: &str =
+            "function GetContainer() return { -- shift\n inner = { value = \"new\" } } end";
+        const CONSUMER: &str =
+            "local container = GetContainer()\nlocal observed = container.inner.value";
+
+        let mut warm = VirtualWorkspace::new_with_init_std_lib();
+        let provider_uri = warm.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let consumer_uri = warm.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        warm.analysis.update_files_by_uri_sorted(vec![
+            (provider_uri.clone(), Some(INITIAL.to_string())),
+            (consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let consumer_id = warm
+            .analysis
+            .get_file_id(&consumer_uri)
+            .expect("consumer file id");
+        write_deferred(&mut warm, &provider_uri, MOVED);
+        write_deferred(&mut warm, &provider_uri, POPULATED);
+
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_provider_uri = fresh.virtual_url_generator.new_uri("lua/a_provider.lua");
+        let fresh_consumer_uri = fresh.virtual_url_generator.new_uri("lua/b_consumer.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (fresh_provider_uri, Some(POPULATED.to_string())),
+            (fresh_consumer_uri.clone(), Some(CONSUMER.to_string())),
+        ]);
+        let fresh_consumer_id = fresh
+            .analysis
+            .get_file_id(&fresh_consumer_uri)
+            .expect("fresh consumer file id");
+
+        let warm_observed = decl_type(&warm, consumer_id, "observed");
+        assert!(
+            matches!(&warm_observed, LuaType::StringConst(value) if value.as_str() == "new"),
+            "new member should replace the remapped failed lookup, got {warm_observed:?}"
+        );
+        assert_eq!(
+            warm_observed,
+            decl_type(&fresh, fresh_consumer_id, "observed")
+        );
     }
 }

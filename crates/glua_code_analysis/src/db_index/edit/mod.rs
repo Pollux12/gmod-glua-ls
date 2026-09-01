@@ -32,9 +32,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> FxHashSet<FileId>
 
     // The member index drives the assignment-contribution store, so its
     // signature half is threaded through it.
-    let (forgotten, member_dirty) = db
-        .get_member_index_mut()
-        .remap_file_element_owners(remap, &signatures);
+    let (forgotten, member_dirty) = db.get_member_index_mut().remap_file_element_owners(remap);
     dirty.extend(member_dirty);
     if !forgotten.is_empty() {
         db.get_type_index_mut()
@@ -45,6 +43,7 @@ pub fn remap_into_file(db: &mut DbIndex, remap: &FileRemap) -> FxHashSet<FileId>
         db.get_call_site_param_index_mut()
             .remap_file_signatures(remap),
     );
+    dirty.extend(db.get_signature_index_mut().remap_settled_reads(remap));
     dirty.extend(db.get_type_index_mut().remap_file_identities(remap));
     dirty.extend(
         db.get_dynamic_field_index_mut()

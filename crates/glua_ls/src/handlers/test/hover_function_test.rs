@@ -659,7 +659,6 @@ mod tests {
     #[gtest]
     fn test_fix_global_index_function_2() -> Result<()> {
         let mut ws = ProviderVirtualWorkspace::new();
-        // TODO: 构建完整的访问路径
         check!(ws.check_hover(
             r#"
             M = {
@@ -669,7 +668,7 @@ mod tests {
             end
             "#,
             VirtualHoverResult {
-                value: "```lua\nfunction Value()\n```".to_string(),
+                value: "```lua\nfunction M.K.Value()\n```".to_string(),
             },
         ));
         Ok(())

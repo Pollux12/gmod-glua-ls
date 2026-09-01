@@ -155,6 +155,30 @@ impl InferCacheManager {
             .map(|(file_id, cache)| (*file_id, cache.take_inferred_guard_dependencies()))
             .collect()
     }
+
+    pub fn drain_inferred_return_reads(
+        &mut self,
+    ) -> Vec<(
+        crate::LuaSignatureId,
+        crate::db_index::read_set::InferredReturnReadRecord,
+    )> {
+        self.infer_map
+            .values_mut()
+            .flat_map(|cache| cache.take_inferred_return_reads())
+            .collect()
+    }
+
+    pub fn drain_missed_member_reads(
+        &mut self,
+    ) -> Vec<(
+        FileId,
+        FxHashSet<(crate::LuaMemberOwner, crate::LuaMemberKey)>,
+    )> {
+        self.infer_map
+            .iter_mut()
+            .map(|(file_id, cache)| (*file_id, cache.take_missed_member_reads()))
+            .collect()
+    }
 }
 
 #[cfg(test)]

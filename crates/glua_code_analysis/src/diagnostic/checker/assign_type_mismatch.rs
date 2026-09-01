@@ -206,15 +206,17 @@ fn check_index_expr(
 
     // Prefer the pre-write member type to avoid the current assignment
     // widening the target field type before comparison.
-    let source_type = pre_write_index_expr_type(semantic_model, index_expr).or_else(|| {
-        infer_index_expr(
-            semantic_model.get_db(),
-            &mut semantic_model.get_cache().borrow_mut(),
-            index_expr.clone(),
-            false,
-        )
-        .ok()
-    });
+    let source_type = pre_write_index_expr_type(semantic_model, index_expr)
+        .or_else(|| prior_writers_type(semantic_model, index_expr))
+        .or_else(|| {
+            infer_index_expr(
+                semantic_model.get_db(),
+                &mut semantic_model.get_cache().borrow_mut(),
+                index_expr.clone(),
+                false,
+            )
+            .ok()
+        });
 
     let value_type = semantic_model.infer_expr_list_value_type_at(exprs, value_idx)?;
     check_assign_type_mismatch(
@@ -278,43 +280,61 @@ fn is_only_current_inferred_member_assignment(
     let Some(owner) = member_index.get_member_owner(&member_id) else {
         return false;
     };
-    !has_visible_prior_member_for_owner_key(
-        semantic_model,
-        owner,
-        member.get_key(),
-        member_id,
-        index_expr.get_range().start(),
-    )
+    // Every writer of the slot is visible and a reader unions them, so a write
+    // of a new type widens an inferred slot rather than violating it. Only a
+    // doc-typed sibling states a type this write can mismatch.
+    !member_index
+        .get_current_owner_members_for_key(owner, member.get_key())
+        .into_iter()
+        .filter(|sibling| sibling.get_id() != member_id)
+        .any(|sibling| {
+            semantic_model
+                .get_db()
+                .get_type_index()
+                .get_type_cache(&sibling.get_id().into())
+                .is_some_and(|cache| cache.is_doc())
+        })
 }
 
-fn has_visible_prior_member_for_owner_key(
+/// A class field's type as the writers visible before this write left it. The
+/// slot itself unions every writer, this one included, so reading it back
+/// would compare the write against itself. An anonymous table's fields are
+/// shaped by all their writes, so only class-owned fields are held to this.
+fn prior_writers_type(
     semantic_model: &SemanticModel,
-    owner: &crate::LuaMemberOwner,
-    member_key: &LuaMemberKey,
-    current_member_id: crate::LuaMemberId,
-    position: rowan::TextSize,
-) -> bool {
-    let member_ids = semantic_model
-        .get_db()
-        .get_member_index()
-        .get_current_owner_members_for_key(owner, member_key)
+    index_expr: &LuaIndexExpr,
+) -> Option<LuaType> {
+    let db = semantic_model.get_db();
+    let member_id =
+        crate::LuaMemberId::new(index_expr.get_syntax_id(), semantic_model.get_file_id());
+    let member_index = db.get_member_index();
+    let member = member_index.get_member(&member_id)?;
+    let owner = member_index.get_member_owner(&member_id)?;
+    if !matches!(owner, crate::LuaMemberOwner::Type(_)) {
+        return None;
+    }
+    let position = index_expr.get_range().start();
+    let prior_ids = member_index
+        .get_current_owner_members_for_key(owner, member.get_key())
         .into_iter()
-        .filter(|member| {
-            let member_id = member.get_id();
-            member_id != current_member_id
-                && (member_id.file_id != semantic_model.get_file_id()
-                    || member_id.get_position() < position)
+        .map(|sibling| sibling.get_id())
+        .filter(|sibling_id| {
+            *sibling_id != member_id
+                && (sibling_id.file_id != member_id.file_id || sibling_id.get_position() < position)
         })
-        .map(|member| member.get_id())
-        .collect();
-
-    !crate::LuaMemberIndexItem::Many(member_ids)
+        .collect::<Vec<_>>();
+    let visible_ids = crate::LuaMemberIndexItem::Many(prior_ids)
         .visible_member_ids_with_realm_at_offset_from_history(
-            semantic_model.get_db(),
+            db,
             &semantic_model.get_file_id(),
             position,
-        )
-        .is_empty()
+        );
+    if visible_ids.is_empty() {
+        return None;
+    }
+    crate::LuaMemberIndexItem::Many(visible_ids)
+        .resolve_type(db)
+        .ok()
 }
 
 /// Resolve the **pre-write** source type for an indexed assignment target by

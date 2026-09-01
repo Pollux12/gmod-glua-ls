@@ -4,7 +4,7 @@ use rowan::TextSize;
 use smol_str::SmolStr;
 
 use crate::{
-    DbIndex, FileId, GlobalId, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
+    DbIndex, FileId, GlobalId, InFiled, InferFailReason, InferGuard, InferGuardRef, LuaGenericType,
     LuaMemberIndexItem, LuaMemberKey, LuaMemberOwner, LuaMergedTableType, LuaObjectType,
     LuaTupleType, LuaType, LuaTypeDeclId, TypeOps, check_type_compact,
     semantic::{
@@ -214,11 +214,17 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     member_key: &LuaMemberKey,
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
+    source_min_position: Option<InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
     let member_index = db.get_member_index();
     if let Some(member_item) = member_index.get_member_item(&member_owner, member_key) {
-        let exact_type =
-            resolve_member_item_with_realm(db, member_item, caller_file_id, caller_position)?;
+        let exact_type = resolve_member_item_with_realm(
+            db,
+            member_item,
+            caller_file_id,
+            caller_position,
+            source_min_position.as_ref(),
+        )?;
         // A dynamic write answers a dynamic read, but it is not evidence that
         // the integer entries beside it are absent: `t[n]` on a table filled
         // by both `t[1] = "a"` and `t[k] = 5` holds either, since a literal
@@ -240,7 +246,14 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
             .into_iter()
             .filter_map(|key| member_index.get_member_item(&member_owner, key))
             .filter_map(|item| {
-                resolve_member_item_with_realm(db, item, caller_file_id, caller_position).ok()
+                resolve_member_item_with_realm(
+                    db,
+                    item,
+                    caller_file_id,
+                    caller_position,
+                    source_min_position.as_ref(),
+                )
+                .ok()
             })
             .fold(exact_type, |acc, member_type| {
                 TypeOps::Union.apply(db, &acc, &member_type)
@@ -274,9 +287,13 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
         }
 
         let member_item = LuaMemberIndexItem::One(member.get_id());
-        if let Ok(member_type) =
-            resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
-        {
+        if let Ok(member_type) = resolve_member_item_with_realm(
+            db,
+            &member_item,
+            caller_file_id,
+            caller_position,
+            source_min_position.as_ref(),
+        ) {
             saw_match = true;
             result_type = TypeOps::Union.apply(db, &result_type, &member_type);
         }
@@ -301,12 +318,56 @@ pub(crate) fn resolve_member_item_with_realm(
     member_item: &LuaMemberIndexItem,
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> RawGetMemberTypeResult {
+    if let Some(source_min_position) = source_min_position {
+        let mut member_ids = if let Some(pos) = caller_position {
+            member_item.visible_member_ids_with_realm_at_offset(db, &caller_file_id, pos)
+        } else {
+            member_item.visible_member_ids_with_realm(db, &caller_file_id)
+        };
+        member_ids.retain(|member_id| {
+            source_survives_table_generation_cutoff(
+                db,
+                member_id.file_id,
+                member_id.get_position(),
+                source_min_position,
+            )
+        });
+        if member_ids.is_empty() {
+            return Err(InferFailReason::FieldNotFound);
+        }
+        let item = match member_ids.as_slice() {
+            [member_id] => LuaMemberIndexItem::One(*member_id),
+            _ => LuaMemberIndexItem::Many(member_ids),
+        };
+        return item.resolve_type(db);
+    }
+
     if let Some(pos) = caller_position {
         member_item.resolve_type_with_realm_at_offset(db, &caller_file_id, pos)
     } else {
         member_item.resolve_type_with_realm(db, &caller_file_id)
     }
+}
+
+pub(crate) fn source_survives_table_generation_cutoff(
+    db: &DbIndex,
+    source_file_id: FileId,
+    source_position: TextSize,
+    source_min_position: &InFiled<TextSize>,
+) -> bool {
+    if source_file_id != source_min_position.file_id || source_position >= source_min_position.value
+    {
+        return true;
+    }
+
+    let member_index = db.get_member_index();
+    let source_function =
+        member_index.enclosing_function_scope_range(source_file_id, source_position);
+    let generation_function = member_index
+        .enclosing_function_scope_range(source_min_position.file_id, source_min_position.value);
+    source_function.is_some() && source_function != generation_function
 }
 
 fn infer_custom_type_raw_member_type(

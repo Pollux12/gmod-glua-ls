@@ -1883,12 +1883,24 @@ fn get_type_at_assign_stat(
         }
 
         if maybe_ref_id != *var_ref_id {
-            if var_ref_id.start_with(&maybe_ref_id)
-                && let Some(expr_type) = infer_expr_list_value_type_at(db, cache, &exprs, i)?
-                && let Some(member_type) =
-                    assigned_prefix_member_type(db, cache, var_ref_id, &maybe_ref_id, &expr_type)?
-            {
-                return Ok(ResultTypeOrContinue::Result(member_type));
+            if var_ref_id.start_with(&maybe_ref_id) {
+                let expr_type = infer_expr_list_value_type_at(db, cache, &exprs, i)?;
+                if let Some(expr_type) = expr_type
+                    && let Some(member_type) = assigned_prefix_member_type(
+                        db,
+                        cache,
+                        var_ref_id,
+                        &maybe_ref_id,
+                        &expr_type,
+                    )?
+                {
+                    return Ok(ResultTypeOrContinue::Result(member_type));
+                }
+                if exprs.get(i).is_some_and(expr_is_table_constructor) {
+                    return Ok(ResultTypeOrContinue::Result(get_var_ref_type(
+                        db, cache, var_ref_id,
+                    )?));
+                }
             }
 
             continue;
@@ -3300,10 +3312,14 @@ fn assignment_flow_info_cannot_match(
         return false;
     }
 
-    !info
-        .index_paths
-        .iter()
-        .any(|path| path.deref().as_str() == query_path.deref().as_str())
+    !info.index_paths.iter().any(|path| {
+        let path = path.deref().as_str();
+        let query_path = query_path.deref().as_str();
+        query_path == path
+            || query_path
+                .strip_prefix(path)
+                .is_some_and(|rest| rest.starts_with('.'))
+    })
 }
 
 fn maybe_get_collection_append_assignment_type(

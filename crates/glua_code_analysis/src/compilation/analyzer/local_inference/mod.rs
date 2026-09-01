@@ -58,7 +58,19 @@ pub(super) fn stabilize_unknown_locals(
                 .is_none_or(|cache| {
                     cache.is_infer() && matches!(cache.as_type(), LuaType::Unknown | LuaType::Never)
                 });
-            if !uninformative {
+            // A fact this pass published earlier was read off whatever the
+            // slots its uses feed held at the time; a later run re-derives it
+            // against what they hold now.
+            let contextual = !uninformative
+                && db
+                    .get_type_index()
+                    .get_type_fact(&(*decl_id).into())
+                    .is_some_and(|fact| {
+                        fact.provenance().iter().any(|step| {
+                            step.event.kind == crate::LuaInferenceProvenanceKind::ContextualUnknown
+                        })
+                    });
+            if !uninformative && !contextual {
                 continue;
             }
             candidates.push((file_id, *decl_id, decl_references.clone()));
@@ -1181,11 +1193,16 @@ pub(super) fn publish_inferred_positive_guards(
         };
         let signature_id = LuaSignatureId::from_closure(file_id, &closure);
         let owner = inferred_guard_owner(db, signature_id, &closure);
+        let mut return_changed = false;
         if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
             && signature.resolve_return == SignatureReturnStatus::UnResolve
         {
             signature.return_docs = returns;
             signature.resolve_return = SignatureReturnStatus::InferResolve;
+            return_changed = true;
+        }
+        if return_changed {
+            db.get_signature_index_mut().note_return_write(signature_id);
         }
         if let Some(owner) = owner {
             db.get_signature_index_mut()

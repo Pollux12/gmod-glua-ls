@@ -221,7 +221,7 @@ fn infer_metatable_index_type(
         ReceiverOwnerType::Rejected => return Ok(MetatableIndex::NoIndex(LuaType::Unknown)),
         ReceiverOwnerType::NotReceiver => infer_expr(db, cache, metatable)?,
     };
-    match exact_table_index_type(db, cache, &meta_type) {
+    match exact_table_index_type(db, cache, &meta_type, metatable_expr.get_position()) {
         ExactMetatableIndexType::Exact(index_type) => {
             return Ok(MetatableIndex::Index(index_type));
         }
@@ -229,8 +229,9 @@ fn infer_metatable_index_type(
         ExactMetatableIndexType::None => {}
     }
 
+    // Every `__index` writer, so writers that disagree are seen to disagree.
     if let Some(meta_members) =
-        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), false)
+        find_members_with_key(db, &meta_type, LuaMemberKey::Name("__index".into()), true)
     {
         let mut index_types = Vec::with_capacity(meta_members.len());
         for meta_member in meta_members {
@@ -411,7 +412,7 @@ enum ExactMetatableIndexType {
     Exact(LuaType),
 }
 
-enum MetatableIndexCandidate {
+pub(crate) enum MetatableIndexCandidate {
     Unsupported,
     Supported(LuaType),
 }
@@ -420,6 +421,7 @@ fn exact_table_index_type(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     meta_type: &LuaType,
+    caller_position: rowan::TextSize,
 ) -> ExactMetatableIndexType {
     let table_range = match meta_type {
         LuaType::TableConst(range) => range,
@@ -428,12 +430,16 @@ fn exact_table_index_type(
     };
     let owner = LuaMemberOwner::Element(table_range.clone());
     let key = LuaMemberKey::Name("__index".into());
-    let mut member_ids = db
-        .get_member_index()
-        .get_members_for_owner_key(&owner, &key)
-        .into_iter()
-        .map(|member| member.get_id())
-        .collect::<Vec<_>>();
+    // The writers a reader at the call sees: a later plain write in the same
+    // file has replaced the earlier ones by then.
+    let mut member_ids = crate::LuaMemberIndexItem::Many(
+        db.get_member_index()
+            .get_members_for_owner_key(&owner, &key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .collect(),
+    )
+    .visible_member_ids_with_realm_at_offset(db, &cache.get_file_id(), caller_position);
     member_ids.sort_by_key(|id| (id.file_id.id, u32::from(id.get_position())));
     if member_ids.is_empty() {
         let Some(index_type) = last_table_literal_index_type(db, cache, table_range) else {
@@ -549,7 +555,7 @@ fn last_table_literal_index_value(table: &LuaTableExpr) -> Option<LuaExpr> {
     })
 }
 
-fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
+pub(crate) fn classify_metatable_index_candidate(typ: &LuaType) -> MetatableIndexCandidate {
     match typ {
         LuaType::Union(union) => match union.nullable_inner() {
             Some(inner) => classify_metatable_index_candidate(inner),

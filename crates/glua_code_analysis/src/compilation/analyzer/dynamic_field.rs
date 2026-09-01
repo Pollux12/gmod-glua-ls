@@ -253,11 +253,16 @@ fn collect_dynamic_fields_for_file(
         Vec::new();
     let mut collected_finite_members = Vec::new();
     let mut field_setter_helpers = field_setter_helpers.clone();
+    // The records are what this pass is building. A cold build has none yet,
+    // and a re-index of some files has the rest of the workspace's, with the
+    // re-indexed files' contributions removed: a partial record that names a
+    // different table than the complete one will. Neither is read here, so
+    // both builds decide the same way.
     let mut cache = crate::LuaInferCache::new(
         file_id,
         crate::CacheOptions {
             analysis_phase: crate::LuaAnalysisPhase::Force,
-            dynamic_fields_visible: true,
+            dynamic_fields_visible: false,
             building_dynamic_field_index: true,
         },
     );

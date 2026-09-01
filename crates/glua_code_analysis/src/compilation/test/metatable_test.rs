@@ -1685,4 +1685,74 @@ mod test {
             "#,
         ));
     }
+
+    #[test]
+    fn concrete_inferred_returns_follow_late_member_types_to_a_fixpoint() {
+        let mut ws = VirtualWorkspace::new();
+        let player_path = "lua/a_player.lua";
+        let player_source = r#"
+            Player = Player or {}
+
+            function Player:GetGender()
+                return self._Gender or GENDER_NEUTRAL
+            end
+
+            local genders = Config.gender
+            function Player:GetTitle()
+                return genders[self:GetGender()].title
+            end
+
+            function Player:GetLabel()
+                return self:GetTitle()
+            end
+        "#;
+        ws.def_files(vec![
+            (player_path, player_source),
+            ("lua/b_male_write.lua", "Player._Gender = GENDER_MALE"),
+            ("lua/c_female_write.lua", "Player._Gender = GENDER_FEMALE"),
+            (
+                "lua/d_config.lua",
+                r#"
+                Config = { gender = {
+                    [GENDER_NEUTRAL] = { title = "neutral" },
+                    [GENDER_MALE] = { title = "male" },
+                    [GENDER_FEMALE] = { title = "female" },
+                } }
+                "#,
+            ),
+            (
+                "lua/e_enums.lua",
+                "GENDER_NEUTRAL = \"Neutral\"\nGENDER_MALE = \"Male\"\nGENDER_FEMALE = \"Female\"",
+            ),
+        ]);
+
+        let player_uri = ws.virtual_url_generator.new_uri(player_path);
+        let player_file = ws
+            .analysis
+            .get_file_id(&player_uri)
+            .expect("expected player file");
+        let title_return = signature_return_type(&ws, player_file, "GetTitle");
+        let label_return = signature_return_type(&ws, player_file, "GetLabel");
+        let cold = (
+            ws.humanize_type_detailed(title_return),
+            ws.humanize_type_detailed(label_return),
+        );
+        let expected = (
+            "(\"female\"|\"male\"|\"neutral\")".to_string(),
+            "(\"female\"|\"male\"|\"neutral\")".to_string(),
+        );
+        assert_eq!(cold, expected);
+
+        ws.analysis
+            .update_file_text_only(&player_uri, format!("{player_source}\n"));
+        ws.analysis.reindex_files(vec![player_file]);
+
+        let title_return = signature_return_type(&ws, player_file, "GetTitle");
+        let label_return = signature_return_type(&ws, player_file, "GetLabel");
+        let warm = (
+            ws.humanize_type_detailed(title_return),
+            ws.humanize_type_detailed(label_return),
+        );
+        assert_eq!(warm, expected);
+    }
 }

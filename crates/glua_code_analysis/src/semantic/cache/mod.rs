@@ -10,7 +10,7 @@ use std::{collections::HashSet, sync::Arc};
 
 use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
-    LuaMemberId, LuaMemberKey, LuaSemanticDeclId, VarRefId, VarRefRootId,
+    LuaMemberId, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
     semantic::infer::{InferFailReason, ParamInferenceSource},
 };
@@ -178,6 +178,13 @@ pub struct LuaInferCache {
     /// once the index settles. See `settled_sibling_merge_read_candidates`.
     pub sibling_merge_reads: u32,
     inferred_guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
+    inferred_return_reads:
+        FxHashMap<LuaSignatureId, crate::db_index::read_set::InferredReturnReadRecord>,
+    /// Member reads that found no member. A read that fails records no type
+    /// cache and so no dependency edge, yet the file's answer changes the
+    /// moment another file defines the member; these are what the analyzer
+    /// files as that edge. See `LuaMemberIndex::set_missed_member_reads`.
+    missed_member_reads: FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)>,
 }
 
 impl LuaInferCache {
@@ -218,6 +225,8 @@ impl LuaInferCache {
             signature_is_generic_cache: FxHashMap::default(),
             sibling_merge_reads: 0,
             inferred_guard_dependencies: FxHashSet::default(),
+            inferred_return_reads: FxHashMap::default(),
+            missed_member_reads: FxHashSet::default(),
         }
     }
 
@@ -269,6 +278,29 @@ impl LuaInferCache {
 
     pub fn take_inferred_guard_dependencies(&mut self) -> FxHashSet<LuaInferredGuardOwner> {
         std::mem::take(&mut self.inferred_guard_dependencies)
+    }
+
+    pub(crate) fn record_inferred_return_reads(
+        &mut self,
+        signature_id: LuaSignatureId,
+        record: crate::db_index::read_set::InferredReturnReadRecord,
+    ) {
+        self.inferred_return_reads.insert(signature_id, record);
+    }
+
+    pub(crate) fn take_inferred_return_reads(
+        &mut self,
+    ) -> FxHashMap<LuaSignatureId, crate::db_index::read_set::InferredReturnReadRecord> {
+        std::mem::take(&mut self.inferred_return_reads)
+    }
+
+    pub fn record_missed_member_read(&mut self, owner: crate::LuaMemberOwner, key: LuaMemberKey) {
+        crate::db_index::read_set::record_missing_member_slot(&owner, &key);
+        self.missed_member_reads.insert((owner, key));
+    }
+
+    pub fn take_missed_member_reads(&mut self) -> FxHashSet<(crate::LuaMemberOwner, LuaMemberKey)> {
+        std::mem::take(&mut self.missed_member_reads)
     }
 
     pub fn clear(&mut self) {

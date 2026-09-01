@@ -2046,22 +2046,16 @@ fn analyze_return(
             body: Some(block.clone()),
             return_points: return_points.clone(),
         });
-    let return_correlations = analyze_return_correlations(
+    let (return_correlations, returns) = derive_inferred_return_with_reads(
         analyzer.db,
         analyzer
             .context
             .infer_manager
             .get_infer_cache(analyzer.file_id),
+        *signature_id,
         &return_points,
     );
-    let returns = match analyze_return_point(
-        analyzer.db,
-        analyzer
-            .context
-            .infer_manager
-            .get_infer_cache(analyzer.file_id),
-        &return_points,
-    ) {
+    let returns = match returns {
         Ok(returns) => returns,
         Err(InferFailReason::None) => {
             vec![LuaDocReturnInfo {
@@ -2091,11 +2085,39 @@ fn analyze_return(
         .get_or_create(*signature_id);
 
     signature.resolve_return = SignatureReturnStatus::InferResolve;
-
     signature.return_docs = returns;
     signature.set_return_correlations(return_correlations);
+    analyzer
+        .db
+        .get_signature_index_mut()
+        .note_return_write(*signature_id);
 
     Some(())
+}
+
+pub fn derive_inferred_return_with_reads(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    signature_id: LuaSignatureId,
+    return_points: &Vec<LuaReturnPoint>,
+) -> (
+    Vec<LuaReturnCorrelation>,
+    Result<Vec<LuaDocReturnInfo>, InferFailReason>,
+) {
+    crate::db_index::read_set::arm();
+    let correlations = analyze_return_correlations(db, cache, return_points);
+    let returns = analyze_return_point(db, cache, return_points);
+    let mut reads = crate::db_index::read_set::disarm();
+    reads.signatures.remove(&signature_id);
+    cache.record_inferred_return_reads(
+        signature_id,
+        crate::db_index::read_set::InferredReturnReadRecord {
+            reads,
+            type_epoch: db.get_type_index().type_writes(),
+            return_epoch: db.get_signature_index().return_writes(),
+        },
+    );
+    (correlations, returns)
 }
 
 fn signature_has_uninformative_return(signature: &crate::LuaSignature) -> bool {
@@ -2160,6 +2182,12 @@ pub fn analyze_return_point(
         match point {
             LuaReturnPoint::Expr(expr) => {
                 let expr_type = infer_expr(db, cache, expr.clone())?;
+                let expr_type = super::super::common::widen_mutable_local_name_copy(
+                    db,
+                    cache.get_file_id(),
+                    expr,
+                    expr_type,
+                );
                 return_type = Some(match return_type {
                     Some(current) => union_return_expr(db, current, expr_type),
                     None => expr_type,
@@ -2169,6 +2197,12 @@ pub fn analyze_return_point(
                 let mut multi_return = vec![];
                 for expr in exprs {
                     let expr_type = infer_expr(db, cache, expr.clone())?;
+                    let expr_type = super::super::common::widen_mutable_local_name_copy(
+                        db,
+                        cache.get_file_id(),
+                        expr,
+                        expr_type,
+                    );
                     multi_return.push(expr_type);
                 }
                 let typ = LuaType::Variadic(VariadicType::Multi(multi_return).into());
@@ -2314,11 +2348,15 @@ fn union_return_expr(db: &DbIndex, left: LuaType, right: LuaType) -> LuaType {
         {
             left.clone()
         }
+        // A branch returning `any` must not swallow the branches that return
+        // something concrete, so the `any` stays an arm instead of absorbing
+        // the union. It is not rewritten to `unknown`: `unknown` marks a read
+        // that has not settled, and this one has.
         (LuaType::Any, right) if should_union_any_as_unknown(right) => {
-            LuaType::from_vec(vec![LuaType::Unknown, right.clone()])
+            LuaType::from_vec_structural(vec![right.clone(), LuaType::Any])
         }
         (left, LuaType::Any) if should_union_any_as_unknown(left) => {
-            LuaType::from_vec(vec![left.clone(), LuaType::Unknown])
+            LuaType::from_vec_structural(vec![left.clone(), LuaType::Any])
         }
         (LuaType::Unknown, LuaType::Unknown) => LuaType::Unknown,
         (LuaType::Unknown, _) | (_, LuaType::Unknown) => {

@@ -584,7 +584,7 @@ mod test {
         );
 
         let wheel_ty = ws.expr_ty("ENT:CreateWheel()");
-        let expected = ws.ty("glide_wheel|unknown");
+        let expected = ws.ty("glide_wheel|any");
         assert_eq!(wheel_ty, expected);
     }
 
@@ -2328,7 +2328,47 @@ mod test {
         let expected = ws.ty("DCategoryList");
         assert_eq!(base, expected);
         let unknown_ty = ws.expr_ty("b");
-        assert!(unwrap_instance(&unknown_ty).is_nullable());
+        assert!(
+            unwrap_instance(&unknown_ty).is_nullable(),
+            "unknown VGUI class must preserve the declared nullable return, got {} ({unknown_ty:?})",
+            ws.humanize_type_detailed(unknown_ty.clone())
+        );
+    }
+
+    #[gtest]
+    fn test_vgui_explicit_class_supersedes_generated_placeholder_for_nullability() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+
+        ws.def(
+            r#"
+                ---@class Panel
+                ---@class DCategoryList: Panel
+                known = vgui.Create("DCategoryList")
+                placeholder = vgui.Create("LatePanel")
+            "#,
+        );
+        let first_ty = ws.expr_ty("placeholder");
+        assert!(
+            unwrap_instance(&first_ty).is_nullable(),
+            "generated placeholder must keep the declared nullable return, got {} ({first_ty:?})",
+            ws.humanize_type_detailed(first_ty.clone())
+        );
+
+        ws.def(
+            r#"
+                ---@class LatePanel: Panel
+            "#,
+        );
+        let declared_ty = ws.expr_ty("vgui.Create('LatePanel')");
+        assert!(
+            !unwrap_instance(&declared_ty).is_nullable(),
+            "explicit panel declaration must supersede the generated placeholder, got {} ({declared_ty:?})",
+            ws.humanize_type_detailed(declared_ty.clone())
+        );
     }
 
     #[gtest]

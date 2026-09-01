@@ -32,6 +32,7 @@ use resolve_closure::{
 };
 
 pub(crate) use resolve::get_wrapped_callable_target_expr;
+pub(crate) use resolve::is_unsettled_inferred_return;
 pub(crate) use resolve::{
     IterVarTypeUpdate, resolve_settled_iter_var_readonly, try_resolve_member,
     try_resolve_return_point,
@@ -127,6 +128,7 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         let _p = Profile::cond_new("resolve analyze", context.tree_list.len() > 1);
         let log_enabled = log::log_enabled!(log::Level::Info) || unresolve_profile_enabled();
         let mut infer_manager = std::mem::take(&mut context.infer_manager);
+        let finalize = context.finalize_unresolves;
 
         let mat_start = log_enabled.then(std::time::Instant::now);
         materialize_pending_str_tpl_type_decls(db, &mut infer_manager);
@@ -156,12 +158,24 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         }
 
         let mut loop_count = 0;
+        let mut force_finalized = Vec::new();
+        let mut provisional = Vec::new();
+        let mut late_resolved_decls = rustc_hash::FxHashSet::default();
         while !reason_resolve.is_empty() {
             let iter_start = log_enabled.then(std::time::Instant::now);
 
             let resolve_start = log_enabled.then(std::time::Instant::now);
             let profile = crate::profile::phase("unresolve/try_resolve", || {
-                try_resolve(db, &mut infer_manager, &mut reason_resolve, log_enabled)
+                try_resolve(
+                    db,
+                    &mut infer_manager,
+                    &mut reason_resolve,
+                    log_enabled,
+                    finalize && loop_count >= 1,
+                    &mut force_finalized,
+                    &mut provisional,
+                    &mut late_resolved_decls,
+                )
             });
             if let Some(resolve_start) = resolve_start {
                 log::info!(
@@ -206,6 +220,13 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
                 );
             }
 
+            // A settling run has no answer for what is left: the waves above
+            // already ran until nothing moved, and the items go back to the
+            // context for the run after the next fact source.
+            if !finalize {
+                break;
+            }
+
             if loop_count == 0 {
                 infer_manager.set_force();
             }
@@ -236,8 +257,27 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
             loop_count += 1;
         }
 
+        if finalize && std::env::var_os("GLUALS_NO_FIXPOINT").is_none() {
+            settle_floored_fixpoint(
+                db,
+                &mut infer_manager,
+                &mut reason_resolve,
+                &mut force_finalized,
+                &mut provisional,
+                &mut late_resolved_decls,
+                log_enabled,
+            );
+        }
+
         // Applied once per pipeline run rather than per resolution: every apply
         // rebuilds the index's whole derived contribution state.
+        context.force_finalized.extend(force_finalized);
+        context.late_resolved_decls.extend(late_resolved_decls);
+        context.unresolves.extend(
+            provisional
+                .into_iter()
+                .map(|unresolve| (unresolve, InferFailReason::None)),
+        );
         let changed_signatures = db
             .get_call_site_param_index_mut()
             .flush_deferred_contributions();
@@ -279,6 +319,80 @@ impl AnalysisPipeline for UnResolveAnalysisPipeline {
         // reuse cached inference results rather than recomputing from scratch
         // when no deferred resolution changed the indexes.
         context.infer_manager = infer_manager;
+    }
+}
+
+/// Re-derives what settled against a floor until nothing moves.
+///
+/// An item that resolved once the wave had begun flooring read placeholders
+/// for the items still blocked then. Those items settle afterwards, and what
+/// read them holds a stale answer, as does whatever read *that*. Each round
+/// re-derives every item the previous round settled; a round that changes no
+/// type cache and no inferred return has reached the fixpoint.
+pub(super) fn settle_floored_fixpoint(
+    db: &mut DbIndex,
+    infer_manager: &mut InferCacheManager,
+    reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
+    force_finalized: &mut Vec<UnResolve>,
+    provisional: &mut Vec<UnResolve>,
+    late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
+    log_enabled: bool,
+) {
+    let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
+    let mut round = 0usize;
+    while !force_finalized.is_empty() {
+        let writes_before =
+            db.get_type_index().type_writes() + db.get_signature_index().return_writes();
+        // A return is re-derived from an unresolved status so the apply rule
+        // lets a settled answer move; what it held is kept, because a
+        // re-derivation that fails (a self-recursive body reads its own
+        // return) must leave the answer in place rather than nothing.
+        let mut held_returns = Vec::new();
+        for unresolve in force_finalized.drain(..) {
+            if let UnResolve::Return(return_) = &unresolve
+                && let Some(signature) = db.get_signature_index_mut().get_mut(&return_.signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::UnResolve;
+                held_returns.push((return_.signature_id, signature.return_docs.clone()));
+            }
+            reason_resolve
+                .entry(InferFailReason::None)
+                .or_default()
+                .push(unresolve);
+        }
+        infer_manager.clear();
+        let attempted: usize = reason_resolve.values().map(Vec::len).sum();
+        try_resolve(
+            db,
+            infer_manager,
+            reason_resolve,
+            log_enabled,
+            true,
+            force_finalized,
+            provisional,
+            late_resolved_decls,
+        );
+        for (signature_id, return_docs) in held_returns {
+            if let Some(signature) = db.get_signature_index_mut().get_mut(&signature_id)
+                && signature.resolve_return == crate::SignatureReturnStatus::UnResolve
+            {
+                signature.resolve_return = crate::SignatureReturnStatus::InferResolve;
+                signature.return_docs = return_docs;
+            }
+        }
+        let moved = db.get_type_index().type_writes() + db.get_signature_index().return_writes()
+            - writes_before;
+        round += 1;
+        if profile_enabled {
+            eprintln!(
+                "[profile] finalize round {round}: attempted={attempted} moved={moved} requeued={}",
+                force_finalized.len()
+            );
+        }
+        if moved == 0 {
+            force_finalized.clear();
+        }
     }
 }
 
@@ -326,7 +440,16 @@ fn requeue_flushed_call_site_returns(
     // dynamic-field visibility live on the manager and survive it.
     infer_manager.clear();
 
-    let _ = try_resolve(db, infer_manager, &mut requeued, log_enabled);
+    let _ = try_resolve(
+        db,
+        infer_manager,
+        &mut requeued,
+        log_enabled,
+        true,
+        &mut context.force_finalized,
+        &mut Vec::new(),
+        &mut context.late_resolved_decls,
+    );
     materialize_pending_str_tpl_type_decls(db, infer_manager);
 
     // Whatever is still unresolved rejoins the retained set, so it leaves this
@@ -427,6 +550,10 @@ fn try_resolve(
     infer_manager: &mut InferCacheManager,
     reason_resolve: &mut FxHashMap<InferFailReason, Vec<UnResolve>>,
     profile_enabled: bool,
+    after_floor: bool,
+    force_finalized: &mut Vec<UnResolve>,
+    provisional: &mut Vec<UnResolve>,
+    late_resolved_decls: &mut rustc_hash::FxHashSet<crate::LuaTypeOwner>,
 ) -> Option<TryResolveProfile> {
     let mut profile = profile_enabled.then(TryResolveProfile::default);
     let mut cached_sorted_keys: Option<Vec<InferFailReason>> = None;
@@ -534,8 +661,45 @@ fn try_resolve(
                 match resolve_result {
                     Ok(_) => {
                         changed = true;
+                        // A local this wave settles had a placeholder during
+                        // the walk, and the writes that read it then hold that
+                        // placeholder's answer. See
+                        // `queue_settled_decl_dependents`.
+                        match &unresolve {
+                            UnResolve::Decl(decl) => {
+                                late_resolved_decls.insert(decl.decl_id.into());
+                            }
+                            UnResolve::IterDecl(iter_var) => {
+                                for var in &iter_var.iter_vars {
+                                    late_resolved_decls.insert(
+                                        LuaDeclId::new(iter_var.file_id, var.get_position()).into(),
+                                    );
+                                }
+                            }
+                            _ => {}
+                        }
+                        // An item settled once the wave had begun flooring
+                        // blocked reasons, or under the force shims, was read
+                        // against those placeholders; what settles afterwards
+                        // can change it. See `requeue_force_finalized`.
+                        if after_floor || cache.get_config().analysis_phase.is_force() {
+                            force_finalized.push(unresolve);
+                        } else if resolved_value_is_uninformative(db, &unresolve) {
+                            // Resolving to `unknown` is not an answer: the
+                            // input the item needed was itself still a
+                            // placeholder. The item is tried again in the
+                            // next wave, once that input may have landed.
+                            provisional.push(unresolve);
+                        }
                     }
-                    Err(InferFailReason::None | InferFailReason::RecursiveInfer) => {}
+                    Err(reason @ (InferFailReason::None | InferFailReason::RecursiveInfer)) => {
+                        // Nothing names what the item is waiting for, but a
+                        // settling run has no floor to give it either; it is
+                        // kept for the run after the next fact source.
+                        if !cache.get_config().analysis_phase.is_force() {
+                            retain_unresolve.push((unresolve, reason));
+                        }
+                    }
                     Err(InferFailReason::FieldNotFound) => {
                         if !cache.get_config().analysis_phase.is_force() {
                             retain_unresolve.push((unresolve, InferFailReason::FieldNotFound));
@@ -856,6 +1020,9 @@ enum UnResolveDiscriminator {
     None,
     ParamIdx(usize),
     Owner(LuaSemanticDeclId),
+    /// The write a deferred local binding came from: a local with several
+    /// deferred writes carries one item per write.
+    Write(u32),
 }
 
 /// Identifies an unresolve item across waves: the same syntax position in the
@@ -864,8 +1031,11 @@ enum UnResolveDiscriminator {
 type UnResolveIdentity = (u8, u32, u32, UnResolveDiscriminator);
 
 fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
-    let (file_id, position) = unresolve.sort_key();
+    let (file_id, position) = unresolve.sort_key_site();
     let discriminator = match unresolve {
+        UnResolve::Decl(d) => {
+            UnResolveDiscriminator::Write(u32::from(d.expr.syntax().text_range().start()))
+        }
         UnResolve::ClosureParams(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::ClosureReturn(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
         UnResolve::CallSiteContribution(d) => UnResolveDiscriminator::ParamIdx(d.param_idx),
@@ -878,6 +1048,43 @@ fn unresolve_identity(unresolve: &UnResolve) -> UnResolveIdentity {
         position,
         discriminator,
     )
+}
+
+/// Whether the item's resolution left its target holding no type information:
+/// `unknown`, `never`, or nothing at all.
+fn resolved_value_is_uninformative(db: &DbIndex, unresolve: &UnResolve) -> bool {
+    fn cache_is_uninformative(db: &DbIndex, owner: &crate::LuaTypeOwner) -> bool {
+        db.get_type_index()
+            .get_type_cache(owner)
+            .is_none_or(|cache| {
+                cache.is_infer() && (cache.as_type().is_unknown() || cache.as_type().is_never())
+            })
+    }
+    match unresolve {
+        UnResolve::Decl(decl) => cache_is_uninformative(db, &decl.decl_id.into()),
+        UnResolve::Member(member) => {
+            cache_is_uninformative(db, &member.member_id.into())
+                || (member.expr.is_some()
+                    && db
+                        .get_type_index()
+                        .get_type_cache(&member.member_id.into())
+                        .is_some_and(|cache| cache.is_infer() && cache.as_type().is_any()))
+        }
+        UnResolve::IterDecl(iter_var) => iter_var.iter_vars.iter().any(|var| {
+            cache_is_uninformative(
+                db,
+                &LuaDeclId::new(iter_var.file_id, var.get_position()).into(),
+            )
+        }),
+        UnResolve::Return(return_) => db
+            .get_signature_index()
+            .get(&return_.signature_id)
+            .is_some_and(|signature| {
+                signature.resolve_return == crate::SignatureReturnStatus::InferResolve
+                    && is_unsettled_inferred_return(&signature.get_return_type())
+            }),
+        _ => false,
+    }
 }
 
 fn unresolve_stable_cmp(a: &UnResolve, b: &UnResolve) -> Ordering {
@@ -944,10 +1151,22 @@ impl UnResolve {
         }
     }
 
-    /// Returns a deterministic sort key (file_id, text_position) for stable ordering.
-    /// This ensures unresolves are processed in a consistent order regardless of
-    /// FxHashMap iteration order or other non-deterministic sources during collection.
-    fn sort_key(&self) -> (u32, u32) {
+    /// Returns a deterministic sort key (file_id, text_position, write_position)
+    /// for stable ordering. This ensures unresolves are processed in a consistent
+    /// order regardless of FxHashMap iteration order or other non-deterministic
+    /// sources during collection. A local with several deferred writes carries
+    /// one item per write, and which of them binds last decides the cache, so
+    /// the write's own position breaks the tie in source order.
+    fn sort_key(&self) -> (u32, u32, u32) {
+        let (file_id, position) = self.sort_key_site();
+        let write_position = match self {
+            UnResolve::Decl(d) => u32::from(d.expr.syntax().text_range().start()),
+            _ => 0,
+        };
+        (file_id, position, write_position)
+    }
+
+    fn sort_key_site(&self) -> (u32, u32) {
         match self {
             UnResolve::Decl(d) => (d.file_id.id, u32::from(d.decl_id.position)),
             UnResolve::IterDecl(d) => (
@@ -1191,12 +1410,39 @@ mod tests {
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr, LuaParser, ParserConfig};
     use rowan::TextSize;
 
-    use crate::{FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaTypeDeclId};
+    use crate::{
+        DbIndex, FileId, InferFailReason, LuaDeclId, LuaMemberId, LuaType, LuaTypeCache,
+        LuaTypeDeclId,
+    };
 
     use super::{
         UnResolve, UnResolveIterVar, UnResolveMember, partition_pre_dynamic_unresolves,
-        sorted_reason_keys,
+        resolved_value_is_uninformative, sorted_reason_keys,
     };
+
+    #[test]
+    fn resolved_any_member_value_remains_provisional() {
+        let tree = LuaParser::parse("owner.field = source.value", ParserConfig::default());
+        let index_exprs = tree
+            .get_chunk_node()
+            .descendants::<LuaIndexExpr>()
+            .collect::<Vec<_>>();
+        let target = &index_exprs[0];
+        let file_id = FileId::new(1);
+        let member_id = LuaMemberId::new(target.get_syntax_id(), file_id);
+        let candidate = UnResolveMember {
+            file_id,
+            member_id,
+            expr: Some(LuaExpr::IndexExpr(index_exprs[1].clone())),
+            prefix: None,
+            ret_idx: 0,
+        };
+        let mut db = DbIndex::default();
+        db.get_type_index_mut()
+            .force_bind_type(member_id.into(), LuaTypeCache::InferType(LuaType::Any));
+
+        assert!(resolved_value_is_uninformative(&db, &candidate.into()));
+    }
 
     #[test]
     fn reason_group_order_is_stable_across_hashmap_insertion_order() {

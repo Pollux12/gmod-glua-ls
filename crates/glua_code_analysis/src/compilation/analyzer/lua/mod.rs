@@ -5,39 +5,39 @@ pub(in crate::compilation::analyzer) mod func_body;
 mod member_write_policy;
 mod metatable;
 mod module;
-mod settled_contributions;
 mod stats;
 
 use rustc_hash::FxHashMap;
 use std::sync::Arc;
 
 use closure::analyze_closure;
-pub use closure::{analyze_return_correlations, analyze_return_point};
+pub use closure::{analyze_return_point, derive_inferred_return_with_reads};
 use for_range_stat::analyze_for_range_stat;
 pub use for_range_stat::{infer_for_range_iter_expr_func, iterates_table_member_map};
 pub use func_body::LuaReturnPoint;
 use glua_parser::{LuaAst, LuaAstNode, LuaExpr};
 pub(in crate::compilation::analyzer) use member_write_policy::resolve_index_expr_member_owner_for_file;
 use member_write_policy::{
-    DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey,
-    MemberAssignmentWideningState, MemberWideningCache,
+    DynamicKeyCollectionWideningKey, MemberAssignmentWideningCacheKey, MemberWideningCache,
 };
 use metatable::analyze_setmetatable;
 use module::analyze_chunk_return;
 pub use module::compute_module_semantic_id;
-pub(in crate::compilation::analyzer) use settled_contributions::rederive_contributed_member_assignments;
-pub(crate) use stats::dominating_guarded_table_bootstrap_range;
-pub(in crate::compilation::analyzer) use stats::resettle_guarded_table_bootstraps;
+pub use stats::is_member_assignment_in_conditional_branch;
 use stats::{
     analyze_assign_stat, analyze_func_stat, analyze_local_func_stat, analyze_local_stat,
     analyze_table_field, flush_pending_dynamic_key_collection_widenings,
 };
+pub(in crate::compilation::analyzer) use stats::{
+    canonical_guarded_table_bootstrap_type, resettle_guarded_table_bootstraps,
+};
+pub(crate) use stats::{
+    dominating_guarded_table_bootstrap_range, is_guarded_table_definition_site,
+};
 pub(crate) use stats::{expr_fills_own_default, expr_reads_out_of_decl};
 pub(in crate::compilation::analyzer) use stats::{
-    get_widened_member_assignment_type, has_multiple_distinct_index_expr_member_owners,
-    is_guarded_table_assignment_index_expr, mark_resolved_member_assignment,
-    preserve_guarded_table_assignment_members, record_resolved_member_assignment_contribution,
-    slot_has_guarded_table_bootstrap,
+    has_multiple_distinct_index_expr_member_owners, is_guarded_table_assignment_index_expr,
+    mark_resolved_member_assignment,
 };
 
 use log::info;
@@ -424,10 +424,6 @@ struct LuaAnalyzer<'a> {
     /// Whether the last [`Self::infer_expr`] merged sibling members under a
     /// computed key.
     sibling_merge_read: bool,
-    member_assignment_widening_cache: FxHashMap<
-        MemberAssignmentWideningCacheKey,
-        MemberWideningCache<MemberAssignmentWideningState>,
-    >,
     member_collection_assignment_widening_cache:
         FxHashMap<MemberAssignmentWideningCacheKey, MemberWideningCache<LuaType>>,
     pending_dynamic_key_collection_widenings: FxHashMap<DynamicKeyCollectionWideningKey, LuaType>,
@@ -456,7 +452,6 @@ impl LuaAnalyzer<'_> {
             is_scripted_class_scope,
             special_call_direct_matcher,
             sibling_merge_read: false,
-            member_assignment_widening_cache: FxHashMap::default(),
             member_collection_assignment_widening_cache: FxHashMap::default(),
             pending_dynamic_key_collection_widenings: FxHashMap::default(),
             guarded_table_assignment_type_cache: FxHashMap::default(),

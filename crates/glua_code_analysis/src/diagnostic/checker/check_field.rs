@@ -510,6 +510,7 @@ fn has_unresolved_metatable_index(
                 &index_member_key,
                 semantic_model.get_file_id(),
                 position,
+                None,
             );
 
             // A present but unresolved Lua `__index` can provide fields at runtime, so field
@@ -689,6 +690,7 @@ fn is_valid_member_inner(
                 &key,
                 semantic_model.get_file_id(),
                 Some(index_expr.get_position()),
+                None,
             ) {
                 Ok(_) => return Some(()),
                 Err(InferFailReason::FieldNotFound)

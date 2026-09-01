@@ -15,7 +15,10 @@ use crate::{
     CacheEntry, FileId, GenericTpl, GlobalId, InFiled, InferGuardRef, LuaAliasCallKind, LuaDeclId,
     LuaInferCache, LuaInstanceType, LuaMemberOwner, LuaOperatorOwner, TypeOps,
     compilation::{
-        analyzer::{dominating_guarded_table_bootstrap_range, for_range_pairs_source_for_var},
+        analyzer::{
+            dominating_guarded_table_bootstrap_range, for_range_pairs_source_for_var,
+            is_guarded_table_definition_site,
+        },
         get_scripted_class_info_for_file, get_scripted_class_type_decl_id,
     },
     db_index::{
@@ -48,6 +51,7 @@ use crate::{
         member::merge_open_table_types,
         member::resolve_dynamic_field_member,
         member::resolve_member_item_with_realm,
+        member::source_survives_table_generation_cutoff,
         type_check::{self, check_type_compact},
         visible_super_types_in_workspace_for_file_at_offset,
     },
@@ -559,17 +563,32 @@ fn infer_table_member_owner(
     table_member_lookup_guard: &mut TableMemberLookupGuard,
 ) -> InferResult {
     let owner = LuaMemberOwner::Element(inst.clone());
+    let member_index = db.get_member_index();
+    let owner_is_definition_site = member_index.canonical_owner(owner.clone()) != owner;
+    let source_min_position =
+        owner_is_definition_site.then(|| InFiled::new(inst.file_id, inst.value.start()));
     let index_key = index_expr.get_index_key().ok_or(InferFailReason::None)?;
     let key = match LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key) {
         Ok(key) => key,
         Err(err)
-            if is_unknown_dynamic_key_without_table_data(db, &owner, &inst, &index_key, &err) =>
+            if is_unknown_dynamic_key_without_table_data(
+                db,
+                &owner,
+                &inst,
+                &index_key,
+                &err,
+                source_min_position.as_ref(),
+            ) =>
         {
             if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                 // Presence is proven, the element type is not.
                 return Ok(LuaType::Unknown);
             }
-            return Ok(nullable_any_type());
+            return Ok(empty_table_dynamic_access_type(
+                db,
+                &inst,
+                source_min_position.as_ref(),
+            ));
         }
         Err(err) => return Err(err),
     };
@@ -582,6 +601,7 @@ fn infer_table_member_owner(
             &key,
             cache.get_file_id(),
             index_expr.get_position(),
+            source_min_position.as_ref(),
         )
     {
         return Ok(member_type);
@@ -594,22 +614,39 @@ fn infer_table_member_owner(
     // bypass them. Only a same-file write states the value at this branch --
     // which is all this lookup could ever find before one owner per global
     // path brought every file's writes into one bucket.
-    let same_file_expr_key_item =
-        db.get_member_index()
-            .get_member_item(&owner, &key)
-            .filter(|item| {
-                !matches!(key, LuaMemberKey::ExprType(_))
-                    || item
-                        .get_member_ids()
-                        .iter()
-                        .any(|member_id| member_id.file_id == cache.get_file_id())
-            });
-    if let Some(member_item) = same_file_expr_key_item {
-        let member_type = member_item.resolve_type_with_realm_at_offset(
+    let exact_item = member_index.get_member_item(&owner, &key).and_then(|item| {
+        let mut member_ids = item.visible_member_ids_with_realm_at_offset(
             db,
             &cache.get_file_id(),
             index_expr.get_position(),
-        )?;
+        );
+        if let Some(source_min_position) = &source_min_position {
+            // Definition sites share a global-path bucket; a fresh table cannot
+            // inherit members written to an earlier same-file table generation.
+            member_ids.retain(|member_id| {
+                source_survives_table_generation_cutoff(
+                    db,
+                    member_id.file_id,
+                    member_id.get_position(),
+                    source_min_position,
+                )
+            });
+        }
+        if matches!(key, LuaMemberKey::ExprType(_))
+            && !member_ids
+                .iter()
+                .any(|member_id| member_id.file_id == cache.get_file_id())
+        {
+            return None;
+        }
+        match member_ids.as_slice() {
+            [] => None,
+            [member_id] => Some(LuaMemberIndexItem::One(*member_id)),
+            _ => Some(LuaMemberIndexItem::Many(member_ids)),
+        }
+    });
+    if let Some(member_item) = exact_item {
+        let member_type = member_item.resolve_type(db)?;
         if is_literal_table_field_access(&index_key)
             && owner_has_finite_named_dynamic_assignment(db, &owner)
             && let Some(dynamic_field) = resolve_dynamic_field_member(
@@ -634,6 +671,7 @@ fn infer_table_member_owner(
             &key,
             cache.get_file_id(),
             Some(index_expr.get_position()),
+            source_min_position.as_ref(),
             true,
         ) && !type_is_uninformative(&dynamic_member_type)
         {
@@ -649,8 +687,13 @@ fn infer_table_member_owner(
     // shaped table-of-table literals keep their per-row element type under a
     // non-constant index.
     if dynamic_numeric_index_key(&key)
-        && let Some(base) =
-            resolve_table_const_array_base(db, cache, &owner, index_expr.get_position())?
+        && let Some(base) = resolve_table_const_array_base(
+            db,
+            cache,
+            &owner,
+            index_expr.get_position(),
+            source_min_position.as_ref(),
+        )?
     {
         return Ok(base);
     }
@@ -663,6 +706,7 @@ fn infer_table_member_owner(
             &key,
             cache.get_file_id(),
             index_expr.get_position(),
+            source_min_position.as_ref(),
         )
     {
         return Ok(member_type);
@@ -698,13 +742,15 @@ fn infer_table_member_owner(
         }
     }
 
-    match infer_owner_raw_member_type_with_realm(
+    let raw_member_type = infer_owner_raw_member_type_with_realm(
         db,
         owner.clone(),
         &key,
         cache.get_file_id(),
         Some(index_expr.get_position()),
-    ) {
+        source_min_position.clone(),
+    );
+    match raw_member_type {
         Ok(typ) => {
             if type_is_uninformative(&typ)
                 && let Some(dynamic_member_type) = infer_table_dynamic_key_member_type(
@@ -713,6 +759,7 @@ fn infer_table_member_owner(
                     &key,
                     cache.get_file_id(),
                     Some(index_expr.get_position()),
+                    source_min_position.as_ref(),
                     true,
                 )
                 && !type_is_uninformative(&dynamic_member_type)
@@ -761,6 +808,7 @@ fn infer_table_member_owner(
                     &key,
                     cache.get_file_id(),
                     Some(index_expr.get_position()),
+                    source_min_position.as_ref(),
                     true,
                 ) && !type_is_uninformative(&dynamic_member_type)
                 {
@@ -775,6 +823,7 @@ fn infer_table_member_owner(
                 &key,
                 cache.get_file_id(),
                 Some(index_expr.get_position()),
+                source_min_position.as_ref(),
                 false,
             ) && !type_is_uninformative(&dynamic_member_type)
             {
@@ -811,23 +860,38 @@ fn infer_table_member_owner(
             // a `for _, v in pairs(REG)` write files under -- states the value,
             // and giving up with `any?` while that member exists would be the
             // walk's answer rather than the program's.
-            if let Ok(global_path_type) =
-                infer_global_path_member(db, cache, index_expr.clone(), Some(key.clone()))
-            {
+            if let Ok(global_path_type) = infer_global_path_member(
+                db,
+                cache,
+                index_expr.clone(),
+                Some(key.clone()),
+                source_min_position.clone(),
+            ) {
                 return Ok(global_path_type);
             }
 
-            if is_dynamic_expr_key_without_table_data(db, &owner, &inst, &key) {
+            if is_dynamic_expr_key_without_table_data(
+                db,
+                &owner,
+                &inst,
+                &key,
+                source_min_position.as_ref(),
+            ) {
                 if is_dynamic_index_proven_in_range(db, cache, &index_expr, &index_key) {
                     // Presence is proven, the element type is not.
                     return Ok(LuaType::Unknown);
                 }
-                return Ok(nullable_any_type());
+                return Ok(empty_table_dynamic_access_type(
+                    db,
+                    &inst,
+                    source_min_position.as_ref(),
+                ));
             }
 
             if is_table_const_from_doc_tag(db, &inst) {
                 Ok(nullable_any_type())
             } else {
+                cache.record_missed_member_read(owner, key);
                 Err(InferFailReason::FieldNotFound)
             }
         }
@@ -850,13 +914,19 @@ fn infer_table_metatable_member(
 
     let meta_owner = LuaMemberOwner::Element(metatable.clone());
     let index_member_key = LuaMemberKey::Name("__index".into());
+    // Every `__index` writer is visible; a slot whose writers disagree (a
+    // table in one place, a function or another table elsewhere) names no
+    // single lookup table, so nothing is resolved through it.
     if let Ok(index_type) = infer_owner_raw_member_type_with_realm(
         db,
         meta_owner.clone(),
         &index_member_key,
         cache.get_file_id(),
         Some(index_expr.get_position()),
-    ) && !metatable_index_type_points_to_table(&index_type, table_range)
+        None,
+    ) && let super::infer_call::MetatableIndexCandidate::Supported(index_type) =
+        super::infer_call::classify_metatable_index_candidate(&index_type)
+        && !metatable_index_type_points_to_table(&index_type, table_range)
         && let Ok(typ) = infer_member_by_member_key_with_table_guard(
             db,
             cache,
@@ -910,6 +980,7 @@ fn infer_table_dynamic_key_member_type(
     key: &LuaMemberKey,
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
+    source_min_position: Option<&InFiled<TextSize>>,
     allow_unobserved_named_access: bool,
 ) -> Option<LuaType> {
     // Apply a table's dynamic-key value type to named fields only after the
@@ -929,7 +1000,13 @@ fn infer_table_dynamic_key_member_type(
         let table_type = LuaType::TableConst(inst.clone());
         if find_members_with_key(db, &table_type, key.clone(), true)
             .is_none_or(|members| members.is_empty())
-            && !owner_has_precise_dynamic_value(db, owner, caller_file_id, caller_position)
+            && !owner_has_precise_dynamic_value(
+                db,
+                owner,
+                caller_file_id,
+                caller_position,
+                source_min_position,
+            )
         {
             return None;
         }
@@ -957,9 +1034,13 @@ fn infer_table_dynamic_key_member_type(
         }
 
         let member_item = LuaMemberIndexItem::One(member.get_id());
-        if let Ok(member_type) =
-            resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
-        {
+        if let Ok(member_type) = resolve_member_item_with_realm(
+            db,
+            &member_item,
+            caller_file_id,
+            caller_position,
+            source_min_position,
+        ) {
             result_type = TypeOps::Union.apply(db, &result_type, &member_type);
         }
     }
@@ -972,6 +1053,7 @@ fn owner_has_precise_dynamic_value(
     owner: &LuaMemberOwner,
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> bool {
     let Some(members) = db.get_member_index().get_expr_key_members(owner) else {
         return false;
@@ -979,8 +1061,14 @@ fn owner_has_precise_dynamic_value(
 
     members.iter().any(|member| {
         let member_item = LuaMemberIndexItem::One(member.get_id());
-        resolve_member_item_with_realm(db, &member_item, caller_file_id, caller_position)
-            .is_ok_and(|typ| is_precise_unknown_wildcard_value_type(&typ))
+        resolve_member_item_with_realm(
+            db,
+            &member_item,
+            caller_file_id,
+            caller_position,
+            source_min_position,
+        )
+        .is_ok_and(|typ| is_precise_unknown_wildcard_value_type(&typ))
     })
 }
 
@@ -1007,6 +1095,7 @@ fn infer_gmod_same_file_expr_key_member_type(
     key: &LuaMemberKey,
     access_file_id: FileId,
     access_position: TextSize,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> Option<LuaType> {
     if !db.get_emmyrc().gmod.enabled || !db.get_emmyrc().gmod.infer_dynamic_fields {
         return None;
@@ -1044,9 +1133,13 @@ fn infer_gmod_same_file_expr_key_member_type(
         }
 
         let member_item = crate::db_index::LuaMemberIndexItem::One(member.get_id());
-        let Ok(member_type) =
-            member_item.resolve_type_with_realm_at_offset(db, &access_file_id, access_position)
-        else {
+        let Ok(member_type) = resolve_member_item_with_realm(
+            db,
+            &member_item,
+            access_file_id,
+            Some(access_position),
+            source_min_position,
+        ) else {
             continue;
         };
 
@@ -1429,15 +1522,28 @@ fn nullable_any_type() -> LuaType {
     LuaType::Union(LuaUnionType::from_vec(vec![LuaType::Any, LuaType::Nil]).into())
 }
 
+fn empty_table_dynamic_access_type(
+    db: &DbIndex,
+    inst: &InFiled<TextRange>,
+    source_min_position: Option<&InFiled<TextSize>>,
+) -> LuaType {
+    if source_min_position.is_some() && !is_guarded_table_definition_site(db, inst) {
+        LuaType::Nil
+    } else {
+        nullable_any_type()
+    }
+}
+
 fn is_unknown_dynamic_key_without_table_data(
     db: &DbIndex,
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
     index_key: &LuaIndexKey,
     err: &InferFailReason,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> bool {
     matches!(index_key, LuaIndexKey::Expr(_))
-        && table_const_has_no_specific_data(db, owner, inst)
+        && table_const_has_no_specific_data(db, owner, inst, source_min_position)
         && matches!(
             err,
             InferFailReason::None
@@ -1451,8 +1557,10 @@ fn is_dynamic_expr_key_without_table_data(
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
     key: &LuaMemberKey,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> bool {
-    matches!(key, LuaMemberKey::ExprType(_)) && table_const_has_no_specific_data(db, owner, inst)
+    matches!(key, LuaMemberKey::ExprType(_))
+        && table_const_has_no_specific_data(db, owner, inst, source_min_position)
 }
 
 fn is_dynamic_index_proven_in_range(
@@ -1482,14 +1590,23 @@ fn table_const_has_no_specific_data(
     db: &DbIndex,
     owner: &LuaMemberOwner,
     inst: &InFiled<TextRange>,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> bool {
     let has_specific_member = db
         .get_member_index()
         .get_members(owner)
         .is_some_and(|members| {
-            members
-                .iter()
-                .any(|member| is_literal_member_key(member.get_key()))
+            members.iter().any(|member| {
+                is_literal_member_key(member.get_key())
+                    && source_min_position.is_none_or(|source_min_position| {
+                        source_survives_table_generation_cutoff(
+                            db,
+                            member.get_file_id(),
+                            member.get_id().get_position(),
+                            source_min_position,
+                        )
+                    })
+            })
         });
     !has_specific_member && db.get_metatable_index().get(inst).is_none()
 }
@@ -1503,7 +1620,9 @@ fn infer_plain_table_member(
         return Ok(member_type);
     }
 
-    if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None) {
+    if let Ok(global_path_type) =
+        infer_global_path_member(db, cache, index_expr.clone(), None, None)
+    {
         return Ok(global_path_type);
     }
 
@@ -1954,6 +2073,7 @@ fn infer_custom_type_member(
         }
     }
 
+    cache.record_missed_member_read(owner, key);
     Err(InferFailReason::FieldNotFound)
 }
 
@@ -2282,7 +2402,9 @@ fn finish_union_member_inference(
     if missing_arm {
         member_types.push(LuaType::Nil);
     }
-    Ok(LuaType::from_vec(member_types))
+    Ok(normalize_uninformative_member_union(LuaType::from_vec(
+        member_types,
+    )))
 }
 
 fn infer_merged_table_member(
@@ -2314,13 +2436,21 @@ fn infer_merged_table_member(
     }
 
     if member_types.is_empty() {
-        if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None)
+        if let Ok(global_path_type) =
+            infer_global_path_member(db, cache, index_expr.clone(), None, None)
         {
             return Ok(global_path_type);
         }
         return Err(last_resolve_reason);
     }
 
+    // Components that are one slot (two literals of one global path) answer
+    // identically; merging that answer with itself would fold a union of
+    // rival tables into one table.
+    member_types.dedup();
+    if let [member_type] = member_types.as_slice() {
+        return Ok(member_type.clone());
+    }
     Ok(merge_open_table_types(db, member_types))
 }
 
@@ -2591,7 +2721,8 @@ fn infer_member_by_index_merged_table(
     }
 
     if member_types.is_empty() {
-        if let Ok(global_path_type) = infer_global_path_member(db, cache, index_expr.clone(), None)
+        if let Ok(global_path_type) =
+            infer_global_path_member(db, cache, index_expr.clone(), None, None)
         {
             return Ok(global_path_type);
         }
@@ -2606,6 +2737,7 @@ fn infer_global_path_member(
     cache: &mut LuaInferCache,
     index_expr: LuaIndexMemberExpr,
     resolved_key: Option<LuaMemberKey>,
+    source_min_position: Option<InFiled<TextSize>>,
 ) -> InferResult {
     let Some(prefix_expr) = index_expr.get_prefix_expr() else {
         return Err(InferFailReason::FieldNotFound);
@@ -2627,11 +2759,30 @@ fn infer_global_path_member(
     };
 
     let access_position = index_expr.get_position();
-    let resolved =
-        member_item.resolve_type_with_realm_at_offset(db, &cache.get_file_id(), access_position);
+    let mut visible_member_ids = member_item.visible_member_ids_with_realm_at_offset(
+        db,
+        &cache.get_file_id(),
+        access_position,
+    );
+    if let Some(source_min_position) = source_min_position {
+        visible_member_ids.retain(|member_id| {
+            source_survives_table_generation_cutoff(
+                db,
+                member_id.file_id,
+                member_id.get_position(),
+                &source_min_position,
+            )
+        });
+    }
+    let visible_item = match visible_member_ids.as_slice() {
+        [] => return Err(InferFailReason::FieldNotFound),
+        [member_id] => LuaMemberIndexItem::One(*member_id),
+        _ => LuaMemberIndexItem::Many(visible_member_ids),
+    };
+    let resolved = visible_item.resolve_type(db);
     let decl_backed_type = resolve_decl_backed_global_path_member_type(
         db,
-        member_item,
+        &visible_item,
         &cache.get_file_id(),
         member_key.clone(),
         Some(access_position),
@@ -2770,6 +2921,8 @@ fn infer_member_by_index_table(
             let owner = LuaMemberOwner::Element(table_range.clone());
             let access_key = LuaMemberKey::from_index_key_or_unknown(db, cache, &index_key).ok();
             let member_index = db.get_member_index();
+            let source_min_position = (member_index.canonical_owner(owner.clone()) != owner)
+                .then(|| InFiled::new(table_range.file_id, table_range.value.start()));
             // A literal key matches a literal member key only when the two are
             // equal, so the candidates are that one key plus the
             // expression-keyed members.
@@ -2797,27 +2950,28 @@ fn infer_member_by_index_table(
                 // (MergedTable/Union components), mirroring `infer_table_member`.
                 let mut saw_match = false;
                 for member in members {
-                    if member_key_matches_type(db, &key_type, member.get_key()) {
-                        saw_match = true;
-                        matched_inferred_index_key |=
-                            is_inferred_index_member_key(member.get_key());
-                        // Resolve the member type instead of reading the raw
-                        // cache, which may still be Unknown mid-analysis.
-                        let member_type = db
-                            .get_member_index()
-                            .get_member_item(&owner, member.get_key())
-                            .and_then(|item| {
-                                item.resolve_type_with_realm_at_offset(
-                                    db,
-                                    &cache.get_file_id(),
-                                    index_expr.get_position(),
-                                )
-                                .ok()
-                            })
-                            .unwrap_or(LuaType::Unknown);
-
-                        result_type = TypeOps::Union.apply(db, &result_type, &member_type);
+                    if !member_key_matches_type(db, &key_type, member.get_key()) {
+                        continue;
                     }
+                    let Some(member_type) = db
+                        .get_member_index()
+                        .get_member_item(&owner, member.get_key())
+                        .and_then(|item| {
+                            resolve_member_item_with_realm(
+                                db,
+                                item,
+                                cache.get_file_id(),
+                                Some(index_expr.get_position()),
+                                source_min_position.as_ref(),
+                            )
+                            .ok()
+                        })
+                    else {
+                        continue;
+                    };
+                    saw_match = true;
+                    matched_inferred_index_key |= is_inferred_index_member_key(member.get_key());
+                    result_type = TypeOps::Union.apply(db, &result_type, &member_type);
                 }
 
                 if saw_match {
@@ -2886,6 +3040,7 @@ fn resolve_table_const_array_base(
     cache: &LuaInferCache,
     owner: &LuaMemberOwner,
     position: TextSize,
+    source_min_position: Option<&InFiled<TextSize>>,
 ) -> Result<Option<LuaType>, InferFailReason> {
     // Only true shaped sequential table literals should receive array-like
     // treatment. Mixed/object literals with integer-keyed members must not
@@ -2905,16 +3060,24 @@ fn resolve_table_const_array_base(
         if !matches!(member.get_key(), LuaMemberKey::Integer(_)) {
             continue;
         }
-        saw_integer_member = true;
         let member_type = match db
             .get_member_index()
             .get_member_item(owner, member.get_key())
         {
-            Some(item) => {
-                item.resolve_type_with_realm_at_offset(db, &cache.get_file_id(), position)?
-            }
+            Some(item) => match resolve_member_item_with_realm(
+                db,
+                item,
+                cache.get_file_id(),
+                Some(position),
+                source_min_position,
+            ) {
+                Ok(member_type) => member_type,
+                Err(InferFailReason::FieldNotFound) => continue,
+                Err(reason) => return Err(reason),
+            },
             None => LuaType::Unknown,
         };
+        saw_integer_member = true;
         let widened = match &member_type {
             LuaType::IntegerConst(int) => LuaType::DocIntegerConst(*int),
             LuaType::FloatConst(_) => LuaType::Number,
@@ -3069,7 +3232,31 @@ fn infer_member_by_index_union(
         return Err(InferFailReason::FieldNotFound);
     }
 
-    Ok(member_type)
+    Ok(normalize_uninformative_member_union(member_type))
+}
+
+fn normalize_uninformative_member_union(typ: LuaType) -> LuaType {
+    let LuaType::Union(union) = &typ else {
+        return typ;
+    };
+    let mut has_any = false;
+    let mut has_nil = false;
+    for member in union.types() {
+        match member {
+            LuaType::Any => has_any = true,
+            LuaType::Nil => has_nil = true,
+            LuaType::Unknown => {}
+            _ => return typ,
+        }
+    }
+    if !has_any {
+        return typ;
+    }
+    if has_nil {
+        nullable_any_type()
+    } else {
+        LuaType::Any
+    }
 }
 
 fn infer_member_by_index_intersection(
@@ -3377,8 +3564,32 @@ mod union_member_tests {
     use glua_parser::{LuaAstNode, LuaExpr, LuaIndexExpr};
     use rowan::TextSize;
 
-    use super::finish_union_member_inference;
+    use super::{finish_union_member_inference, normalize_uninformative_member_union};
     use crate::{Emmyrc, FileId, InferFailReason, LuaDeclId, LuaType, VirtualWorkspace};
+
+    #[test]
+    fn inferred_member_union_collapses_only_uninformative_arms() {
+        let nullable_any =
+            LuaType::from_vec_structural(vec![LuaType::Nil, LuaType::Unknown, LuaType::Any]);
+        assert_eq!(
+            normalize_uninformative_member_union(nullable_any),
+            LuaType::from_vec(vec![LuaType::Any, LuaType::Nil])
+        );
+
+        let any = LuaType::from_vec_structural(vec![LuaType::Unknown, LuaType::Any]);
+        assert_eq!(normalize_uninformative_member_union(any), LuaType::Any);
+
+        let informative = LuaType::from_vec_structural(vec![LuaType::String, LuaType::Any]);
+        assert_eq!(
+            normalize_uninformative_member_union(informative.clone()),
+            informative
+        );
+
+        assert_eq!(
+            finish_union_member_inference(vec![LuaType::Unknown, LuaType::Any], true, None,),
+            Ok(LuaType::from_vec(vec![LuaType::Any, LuaType::Nil]))
+        );
+    }
 
     #[test]
     fn successful_union_arm_does_not_materialize_deferred_failure_as_nil() {
