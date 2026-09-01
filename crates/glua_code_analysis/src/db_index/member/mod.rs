@@ -5,7 +5,6 @@ mod lua_member_item;
 mod lua_member_owner;
 mod lua_owner_members;
 
-use glua_parser::LuaSyntaxKind;
 use rowan::{TextRange, TextSize};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::collections::BTreeMap;
@@ -1019,16 +1018,12 @@ impl LuaMemberIndex {
     }
 
     fn is_assignment_file_define_member(&self, id: LuaMemberId) -> bool {
-        self.get_member(&id).is_some_and(|member| {
-            member.get_feature().is_file_define()
-                && member.get_syntax_id().get_kind() == LuaSyntaxKind::IndexExpr
-        })
+        self.get_member(&id)
+            .is_some_and(LuaMember::is_assignment_define)
     }
 
     fn assignment_file_define_scope_for_member(&self, member: &LuaMember) -> Option<TextRange> {
-        if !member.get_feature().is_file_define()
-            || member.get_syntax_id().get_kind() != LuaSyntaxKind::IndexExpr
-        {
+        if !member.is_assignment_define() {
             return None;
         }
 
