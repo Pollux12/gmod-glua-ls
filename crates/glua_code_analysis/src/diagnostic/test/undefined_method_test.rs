@@ -785,6 +785,67 @@ mod tests {
     }
 
     #[test]
+    fn vgui_parent_call_through_member_receiver_is_collected_on_a_cold_build() {
+        let mut ws = VirtualWorkspace::new();
+        let mut emmyrc = Emmyrc::default();
+        emmyrc.gmod.enabled = true;
+        ws.update_emmyrc(emmyrc);
+        ws.def_gmod_call_arg_builtins();
+        let file_id = ws.def(
+            r#"
+            ---@class Panel
+            ---@field GetParent fun(self: Panel): Panel
+            ---@class DScrollPanel: Panel
+            local PANEL = {}
+            function PANEL:CardMethod() end
+            function PANEL:Init()
+                self.infoPanel = self:Add("DScrollPanel")
+                local row = self.infoPanel:Add("cityrpListRow")
+            end
+            vgui.Register("cityrp_character_card", PANEL, "Panel")
+
+            local ROW = {}
+            function ROW:Think()
+                self:GetParent():GetParent():CardMethod()
+                self:GetParent():GetParent():Missing()
+            end
+            vgui.Register("cityrpListRow", ROW, "Panel")
+            "#,
+        );
+
+        let metadata = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_gmod_class_metadata_index();
+        assert_eq!(
+            metadata.get_vgui_panel_parent_chain(&crate::LuaTypeDeclId::global("cityrpListRow")),
+            Some(
+                [
+                    crate::LuaTypeDeclId::global("DScrollPanel"),
+                    crate::LuaTypeDeclId::global("cityrp_character_card"),
+                ]
+                .as_slice()
+            )
+        );
+
+        let undefined_methods = ws
+            .analysis
+            .diagnose_file(file_id, CancellationToken::new())
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|diagnostic| {
+                diagnostic.code
+                    == Some(NumberOrString::String(
+                        DiagnosticCode::UndefinedMethod.get_name().to_string(),
+                    ))
+            })
+            .map(|diagnostic| diagnostic.message)
+            .collect::<Vec<_>>();
+        assert_eq!(undefined_methods, ["Undefined method `Missing`. "]);
+    }
+
+    #[test]
     fn test_vgui_focus_parent_chain_preserves_drag_base_methods_for_content_container() {
         let mut ws = VirtualWorkspace::new();
         let mut emmyrc = Emmyrc::default();

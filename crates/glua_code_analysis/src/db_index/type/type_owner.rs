@@ -164,7 +164,7 @@ fn uninformative_key(typ: &LuaType) -> Option<(u8, u8)> {
 }
 
 /// Whether `wider` is the widened primitive of the literal `narrower`.
-fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
+pub(crate) fn widens_primitive(wider: &LuaType, narrower: &LuaType) -> bool {
     matches!(
         (wider, narrower),
         (

@@ -220,6 +220,14 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             refresh_initializer_caches(db, &mut context);
         }
 
+        // The receiver of a `panel:Add(child)` written through a member is typed
+        // by the passes above, so the parent calls the scripted-class scan had
+        // to defer can be collected now.
+        {
+            let _p = Profile::new("resolve_deferred_vgui_parent_calls");
+            gmod::resolve_deferred_vgui_parent_calls(db, &mut context);
+        }
+
         context.resolve_call_site_return_consumers(db);
 
         // Unguarded-child inference is a fallback. Run it only after dynamic
@@ -352,7 +360,12 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     dynamic_field::rederive_settled_dynamic_fields(db, &mut context);
                 let (moved, iter_var_owners) =
                     rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
-                if !moved && !dynamic_fields_moved {
+                let quiet = !moved && !dynamic_fields_moved;
+                // The first round re-reads the initializers whether or not a
+                // loop variable moved: the settled passes before this loop
+                // widened and attached writers the walk's answers were taken
+                // from, and nothing else re-reads them.
+                if quiet && moved_owners.is_some() {
                     break;
                 }
                 // Everything that read a loop variable resolved while it still
@@ -364,6 +377,9 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     refresh_settled_initializer_caches(db, &mut context, moved_owners.as_ref());
                 round_owners.extend(iter_var_owners);
                 refresh_settled_expr_type_member_keys(db, &mut context);
+                if quiet {
+                    break;
+                }
                 // A dynamic-field record is not a type owner, so the read-set
                 // filter cannot see it move; re-derive every candidate next
                 // round instead of a filtered subset.
@@ -377,6 +393,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_global_read_candidates.clear();
             context.settled_multi_decl_global_read_candidates.clear();
             context.settled_dynamic_field_candidates.clear();
+            context.settled_sibling_merge_read_candidates.clear();
         }
 
         {
@@ -900,7 +917,9 @@ fn rederive_settled_global_reads(db: &mut DbIndex, context: &mut AnalyzeContext)
 /// read still answers a vgui panel type, so a decl typed by other means is
 /// left alone.
 pub(crate) fn rederive_vgui_parent_fallbacks(db: &mut DbIndex, context: &mut AnalyzeContext) {
-    let files = std::mem::take(&mut context.vgui_parent_fallback_files);
+    // Kept on the context: the deferred parent calls resolve their relations
+    // after this first runs, and the same readers have to be re-derived again.
+    let files = context.vgui_parent_fallback_files.clone();
     if files.is_empty() {
         return;
     }
@@ -1600,6 +1619,32 @@ fn settled_widens_cached_literals(inferred: &LuaType, current: &LuaType) -> bool
         })
 }
 
+/// Whether the settled answer is the cached one with more of the writer set
+/// folded in: every arm the cache holds is either an arm of the settled answer
+/// or a literal that one of its arms widens to.
+///
+/// [`union_widens_cached_type`] and [`settled_widens_cached_literals`] each
+/// cover one shape of this; a sibling merge produces both at once, `"a"|"b"`
+/// against `string|number` when a computed-key writer joins widened literal
+/// entries. A `nil` arm is covered only by a `nil` arm, so the collapse never
+/// drops one.
+fn settled_covers_cached_type(inferred: &LuaType, current: &LuaType) -> bool {
+    fn arms(typ: &LuaType) -> Vec<LuaType> {
+        match typ {
+            LuaType::Union(union) => known_arms(union),
+            other => vec![other.clone()],
+        }
+    }
+    let inferred_arms = arms(inferred);
+    let current_arms = arms(current);
+    !current_arms.is_empty()
+        && current_arms.iter().all(|cached| {
+            inferred_arms.iter().any(|settled| {
+                settled == cached || crate::db_index::widens_primitive(settled, cached)
+            })
+        })
+}
+
 /// The union arms that carry information. An `unknown` arm stands for a type
 /// that has not settled yet, so it can neither widen a cache nor block one.
 fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
@@ -1615,8 +1660,17 @@ fn refresh_member_initializer_caches(
     context: &mut AnalyzeContext,
     pass: InitializerPass<'_>,
 ) -> HashSet<LuaTypeOwner> {
+    // A sibling merge is only worth re-reading once the writers it merged have
+    // settled, which the full pass runs ahead of.
+    let no_sibling_merges = HashSet::default();
+    let sibling_merges = if pass.is_settled() {
+        &context.settled_sibling_merge_read_candidates
+    } else {
+        &no_sibling_merges
+    };
     if context.member_initializer_reinfer_candidates.is_empty()
         && context.guarded_member_read_candidates.is_empty()
+        && sibling_merges.is_empty()
     {
         return HashSet::default();
     }
@@ -1627,6 +1681,7 @@ fn refresh_member_initializer_caches(
         .member_initializer_reinfer_candidates
         .iter()
         .chain(guarded)
+        .chain(sibling_merges)
     {
         candidates_by_file
             .entry(member_id.file_id)
@@ -1685,8 +1740,10 @@ fn refresh_member_initializer_caches(
             let copies_settled_iter_var =
                 pass.is_settled() && common::reads_settling_iter_var(db, file_id, &expr);
             let reads_field_exist_guard = guarded.contains(member_id);
+            let reads_sibling_merge = sibling_merges.contains(member_id);
             if !copies_settled_iter_var
                 && !reads_field_exist_guard
+                && !reads_sibling_merge
                 && !current_is_uninformative
                 && single_nominal_type_id(current_cache.as_type()).is_none()
             {
@@ -1706,6 +1763,13 @@ fn refresh_member_initializer_caches(
                 // The guard's narrowing has since seen every type that owns the
                 // key, so the settled answer is the cached one with the owners
                 // the walk had not reached folded in.
+                true
+            } else if reads_sibling_merge
+                && settled_covers_cached_type(&inferred_type, current_cache.as_type())
+            {
+                // The merge has since seen every writer, each holding its
+                // settled type, so the settled answer is the cached snapshot
+                // with the rest of the writer set folded in.
                 true
             } else if current_is_uninformative {
                 // A placeholder is not an answer: it only records that the
@@ -1850,6 +1914,9 @@ fn select_result_fact(fact: LuaTypeFact, result_idx: usize) -> LuaTypeFact {
 
 fn member_initializer_expr(root: &LuaSyntaxNode, member_id: LuaMemberId) -> Option<LuaExpr> {
     let node = member_id.get_syntax_id().to_node_from_root(root)?;
+    if let Some(field) = LuaTableField::cast(node.clone()) {
+        return field.get_value_expr();
+    }
     let index_expr = glua_parser::LuaIndexExpr::cast(node)?;
     let assign_stat = index_expr.get_parent::<glua_parser::LuaAssignStat>()?;
     let (vars, exprs) = assign_stat.get_var_and_expr_list();
@@ -2167,6 +2234,12 @@ pub struct AnalyzeContext {
     /// Member writes whose value read through a field-exist guard. See
     /// [`AnalyzeContext::request_guarded_member_read_reinfer`].
     guarded_member_read_candidates: HashSet<LuaMemberId>,
+    /// Members whose value was answered by merging a table's sibling members
+    /// under a computed key. That merge reads whichever writers the batch had
+    /// indexed, with the types they held at the time; the settled passes widen
+    /// those writers and attach the cross-file ones, so the value is re-read
+    /// once they have. Cleared with the other settled candidate sets.
+    settled_sibling_merge_read_candidates: HashSet<LuaMemberId>,
     infer_manager: InferCacheManager,
     inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
@@ -2207,6 +2280,9 @@ pub struct AnalyzeContext {
     /// are finished in the gmod-post pass, after which those reads (and anything
     /// derived from them) are re-derived; see `rederive_vgui_parent_fallbacks`.
     vgui_parent_fallback_files: HashSet<FileId>,
+    /// Parent calls whose receiver had no type when the scripted-class scan ran,
+    /// per file. See [`gmod::resolve_deferred_vgui_parent_calls`].
+    deferred_vgui_parent_call_sites: HashMap<FileId, HashSet<LuaSyntaxId>>,
     call_site_return_invalidation_changed: bool,
     pub workspace_id: Option<WorkspaceId>,
 }
@@ -2229,6 +2305,7 @@ impl AnalyzeContext {
             uninformative_local_decl_candidates: HashSet::default(),
             member_initializer_reinfer_candidates: HashSet::default(),
             guarded_member_read_candidates: HashSet::default(),
+            settled_sibling_merge_read_candidates: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::default(),
             inferred_guard_candidates: Vec::new(),
@@ -2243,6 +2320,7 @@ impl AnalyzeContext {
             settled_multi_decl_global_read_candidates: Vec::new(),
             settled_dynamic_field_candidates: Vec::new(),
             vgui_parent_fallback_files: HashSet::default(),
+            deferred_vgui_parent_call_sites: HashMap::default(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
         }
@@ -2336,6 +2414,17 @@ impl AnalyzeContext {
 
     pub(crate) fn record_vgui_parent_fallback_file(&mut self, file_id: FileId) {
         self.vgui_parent_fallback_files.insert(file_id);
+    }
+
+    pub(crate) fn record_deferred_vgui_parent_call(
+        &mut self,
+        file_id: FileId,
+        syntax_id: LuaSyntaxId,
+    ) {
+        self.deferred_vgui_parent_call_sites
+            .entry(file_id)
+            .or_default()
+            .insert(syntax_id);
     }
 
     pub(crate) fn record_settled_guarded_bootstrap_candidate(&mut self, member_id: LuaMemberId) {
@@ -2634,6 +2723,12 @@ impl AnalyzeContext {
     /// those types the batch had walked. Re-derived once they all stand.
     pub fn request_guarded_member_read_reinfer(&mut self, member_id: LuaMemberId) {
         self.guarded_member_read_candidates.insert(member_id);
+    }
+
+    /// Queues a member write whose value merged a table's sibling members
+    /// under a computed key. See `settled_sibling_merge_read_candidates`.
+    pub fn request_sibling_merge_read_reinfer(&mut self, member_id: LuaMemberId) {
+        self.settled_sibling_merge_read_candidates.insert(member_id);
     }
 
     fn add_inferred_guard_dependencies(

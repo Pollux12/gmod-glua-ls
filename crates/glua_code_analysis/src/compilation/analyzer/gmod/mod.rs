@@ -744,7 +744,7 @@ fn formatted_hook_prefixes(db: &DbIndex) -> Vec<String> {
 
 fn collect_annotated_scripted_class_calls(
     db: &mut DbIndex,
-    context: &AnalyzeContext,
+    context: &mut AnalyzeContext,
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
 ) {
     let prefixes = formatted_hook_prefixes(db);
@@ -758,6 +758,9 @@ fn collect_annotated_scripted_class_calls(
 /// applied afterwards in the original file-then-call order.
 enum PendingCallSite {
     VguiParent(GmodVguiParentCallMetadata),
+    /// A parent call whose receiver the index could not type yet. See
+    /// [`resolve_deferred_vgui_parent_calls`].
+    DeferredVguiParent(LuaSyntaxId),
     ScriptedClass(GmodScriptedClassCallKind, GmodScriptedClassCallMetadata),
     Dependency(LuaDependencySite),
 }
@@ -766,7 +769,7 @@ enum PendingCallSite {
 /// dependency) call sites for every file in one workspace group.
 fn collect_annotated_call_sites_with(
     db: &mut DbIndex,
-    context: &AnalyzeContext,
+    context: &mut AnalyzeContext,
     formatted_hook_prefixes: &[String],
     annotated_global_call_roles: &AnnotatedGmodGlobalCallRoleMap,
     include_load: bool,
@@ -832,6 +835,9 @@ fn collect_annotated_call_sites_with(
                 PendingCallSite::VguiParent(call) => db
                     .get_gmod_class_metadata_index_mut()
                     .add_vgui_parent_call(*file_id, call),
+                PendingCallSite::DeferredVguiParent(syntax_id) => {
+                    context.record_deferred_vgui_parent_call(*file_id, syntax_id)
+                }
                 PendingCallSite::ScriptedClass(kind, call) => db
                     .get_gmod_class_metadata_index_mut()
                     .add_call(*file_id, kind, call),
@@ -10065,21 +10071,107 @@ fn call_expr_local_root_decl_id(
     }
 }
 
+/// Whether a call can only be matched to a VGUI parent role through the type
+/// of its receiver.
+///
+/// A local access path such as self.tabContainer:AddPanel cannot match the
+/// annotated DHorizontalScroller.AddPanel path, but its member signature can.
+/// Most calls have no VGUI parent role, so semantic inference is reserved for
+/// the method names that carry one.
+fn inferred_receiver_method_candidate(call_expr: &LuaCallExpr, call_path: &str) -> bool {
+    matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
+        && matches!(
+            call_path.rsplit('.').next(),
+            Some("Add" | "AddPanel" | "SetParent")
+        )
+}
+
+/// Whether the receiver of a method call has no type yet, as opposed to a type
+/// that carries no parent role.
+fn receiver_type_undetermined(db: &DbIndex, file_id: FileId, call_expr: &LuaCallExpr) -> bool {
+    let Some(LuaExpr::IndexExpr(method_index)) = call_expr.get_prefix_expr() else {
+        return false;
+    };
+    let Some(receiver) = method_index.get_prefix_expr() else {
+        return false;
+    };
+    let mut cache = LuaInferCache::new(file_id, Default::default());
+    match infer_expr(db, &mut cache, receiver) {
+        Ok(typ) => super::type_is_uninformative(&typ),
+        Err(_) => true,
+    }
+}
+
+/// Re-collects the parent calls [`collect_annotated_scripted_class_call_metadata`]
+/// deferred, now that the index can type their receivers, and resolves the
+/// relations they add.
+pub(crate) fn resolve_deferred_vgui_parent_calls(db: &mut DbIndex, context: &mut AnalyzeContext) {
+    let deferred = std::mem::take(&mut context.deferred_vgui_parent_call_sites);
+    if deferred.is_empty() {
+        return;
+    }
+    let Some((_, global_roles)) = context.gmod_global_call_roles.clone() else {
+        return;
+    };
+    let mut file_ids = deferred.keys().copied().collect::<Vec<_>>();
+    file_ids.sort_by_key(|file_id| file_id.id);
+    let per_file = super::parallel::map_files_collect(db, &file_ids, |db, file_id| {
+        let Some(tree) = db.get_vfs().get_syntax_tree(&file_id) else {
+            return Vec::new();
+        };
+        let root = tree.get_red_root();
+        let chunk = tree.get_chunk_node();
+        let annotated_call_roles =
+            AnnotatedGmodCallRoleMap::build(db, file_id, &chunk, &global_roles);
+        let mut syntax_ids = deferred[&file_id].iter().copied().collect::<Vec<_>>();
+        syntax_ids
+            .sort_by_key(|syntax_id| (syntax_id.get_range().start(), syntax_id.get_range().end()));
+        let mut pending = Vec::new();
+        for syntax_id in syntax_ids {
+            let Some(call_expr) = syntax_id
+                .to_node_from_root(&root)
+                .and_then(LuaCallExpr::cast)
+            else {
+                continue;
+            };
+            collect_annotated_scripted_class_call_metadata(
+                db,
+                file_id,
+                &annotated_call_roles,
+                call_expr,
+                &mut pending,
+            );
+        }
+        pending
+    });
+
+    let mut added_file_ids = Vec::new();
+    for (file_id, pending) in file_ids.iter().zip(per_file) {
+        for write in pending {
+            // Every other write for these sites landed on the first scan, and a
+            // receiver still untyped now stays untyped.
+            if let PendingCallSite::VguiParent(call) = write {
+                db.get_gmod_class_metadata_index_mut()
+                    .add_vgui_parent_call(*file_id, call);
+                added_file_ids.push(*file_id);
+            }
+        }
+    }
+    added_file_ids.dedup();
+    if added_file_ids.is_empty() {
+        return;
+    }
+    resolve_vgui_parent_relations(db, context, &added_file_ids);
+    crate::compilation::analyzer::rederive_vgui_parent_fallbacks(db, context);
+}
+
 fn roles_from_inferred_receiver_method(
     db: &DbIndex,
     file_id: FileId,
     call_expr: &LuaCallExpr,
     call_path: &str,
 ) -> Option<AnnotatedGmodCallRoles> {
-    // A local access path such as self.tabContainer:AddPanel cannot match the
-    // annotated DHorizontalScroller.AddPanel path, but its member signature can.
-    // Most calls have no VGUI parent role, so avoid semantic inference for them.
-    if !matches!(call_expr.get_prefix_expr(), Some(LuaExpr::IndexExpr(_)))
-        || !matches!(
-            call_path.rsplit('.').next(),
-            Some("Add" | "AddPanel" | "SetParent")
-        )
-    {
+    if !inferred_receiver_method_candidate(call_expr, call_path) {
         return None;
     }
     let mut cache = LuaInferCache::new(file_id, Default::default());
@@ -10504,6 +10596,17 @@ fn collect_annotated_scripted_class_call_metadata(
                 origin: GmodVguiParentCallOrigin::Annotated,
             }));
         }
+    } else if inferred_receiver_method_candidate(&call_expr, &call_path)
+        && receiver_type_undetermined(db, file_id, &call_expr)
+    {
+        // `self.panel:Add(child)` is a parent call only if `self.panel` is a
+        // panel, and on a cold build that member is typed after this scan: the
+        // walk defers it until the dynamic-field index seals. Retried once the
+        // index has settled, so the relation does not depend on whether a
+        // retained cache happened to answer.
+        pending.push(PendingCallSite::DeferredVguiParent(
+            call_expr.get_syntax_id(),
+        ));
     }
 
     if let Some((kind, inheritance_roles)) =

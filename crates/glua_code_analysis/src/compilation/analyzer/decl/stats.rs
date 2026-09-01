@@ -86,6 +86,40 @@ fn initializer_table_expr(expr: &LuaExpr) -> Option<LuaTableExpr> {
     }
 }
 
+/// Registers the literal a global path is written with as a definition site of
+/// the path, and each of its fields written with a literal as one of the
+/// nested path.
+///
+/// The `configuration = {}` in `cityrp = cityrp or { configuration = {} }`
+/// initialises `cityrp.configuration` exactly as `cityrp.configuration = {}`
+/// would. Without the nested site a write through the literal, which is what
+/// a re-index resolves the prefix to, and a write through the path, which is
+/// what a cold walk files it under, would be two owners for one slot.
+fn set_definition_sites(
+    member_index: &mut crate::LuaMemberIndex,
+    path: GlobalId,
+    table_expr: &LuaTableExpr,
+    file_id: crate::FileId,
+) {
+    member_index.set_definition_site(path.clone(), InFiled::new(file_id, table_expr.get_range()));
+    for field in table_expr.get_fields() {
+        let name = match field.get_field_key() {
+            Some(LuaIndexKey::Name(name)) => name.get_name_text().to_string(),
+            Some(LuaIndexKey::String(text)) => text.get_value(),
+            _ => continue,
+        };
+        let Some(nested) = field
+            .get_value_expr()
+            .as_ref()
+            .and_then(initializer_table_expr)
+        else {
+            continue;
+        };
+        let nested_path = GlobalId::new(&format!("{}.{name}", path.get_name()));
+        set_definition_sites(member_index, nested_path, &nested, file_id);
+    }
+}
+
 pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> Option<()> {
     // An incomplete statement (`SKIN.Field` with no `=`, common mid-edit) also
     // parses as an assignment. It defines no member, so registering one here
@@ -150,9 +184,11 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 // expression is already in hand: it is a definition site of the
                 // path, and the path owns the literal's members.
                 if let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr) {
-                    analyzer.db.get_member_index_mut().set_definition_site(
+                    set_definition_sites(
+                        analyzer.db.get_member_index_mut(),
                         GlobalId::new(name),
-                        InFiled::new(file_id, table_expr.get_range()),
+                        &table_expr,
+                        file_id,
                     );
                 }
             }
@@ -192,9 +228,11 @@ pub fn analyze_assign_stat(analyzer: &mut DeclAnalyzer, stat: LuaAssignStat) -> 
                 if let Some(global_id) = &global_id
                     && let Some(table_expr) = value_exprs.get(idx).and_then(initializer_table_expr)
                 {
-                    analyzer.db.get_member_index_mut().set_definition_site(
+                    set_definition_sites(
+                        analyzer.db.get_member_index_mut(),
                         global_id.clone(),
-                        InFiled::new(file_id, table_expr.get_range()),
+                        &table_expr,
+                        file_id,
                     );
                 }
                 let member = LuaMember::new(member_id, key.clone(), decl_feature, global_id);
