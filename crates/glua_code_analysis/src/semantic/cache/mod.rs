@@ -283,6 +283,7 @@ impl LuaInferCache {
         self.self_base_seed = None;
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
+        self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.local_class_table_member_ids_cache.clear();
@@ -359,6 +360,9 @@ impl LuaInferCache {
             .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
         self.for_range_iter_var_type_cache
             .retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
+        // The transform's element type comes from inferring the loop body's
+        // right-hand side, which a resolved signature return can change.
+        self.in_place_ipairs_transform_cache.clear();
     }
 
     /// Clears inference results that can become stale as deferred declarations,
@@ -388,6 +392,7 @@ impl LuaInferCache {
         self.self_base_seed = None;
         self.decl_cache.clear();
         self.for_range_iter_var_type_cache.clear();
+        self.in_place_ipairs_transform_cache.clear();
         self.dynamic_field_scope_metatable_cache.clear();
         self.dynamic_field_resolution_cache.clear();
         self.local_class_table_member_ids_cache.clear();
