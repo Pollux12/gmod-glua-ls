@@ -159,6 +159,19 @@ impl Vfs {
         self.file_path_map.get(&id.id)
     }
 
+    /// The file's place in a stable cross-file ordering.
+    ///
+    /// File ids are handed out in whatever order a batch reached the files, so
+    /// they are not the same between a cold build and an incremental session.
+    /// Anything that has to elect one file's write over another's — merged
+    /// documentation, table writers, load sites — orders on this instead. A file
+    /// the VFS does not know sorts last.
+    pub fn file_order_key(&self, id: &FileId) -> Arc<str> {
+        self.get_file_path(id)
+            .map(|path| Arc::from(normalize_path_for_ordering(&path.to_string_lossy())))
+            .unwrap_or_else(|| Arc::from(""))
+    }
+
     /// Whether `data` parses to the same significant token stream (kind,
     /// range and text) as the tree currently stored for `file_id`. Comments
     /// count as significant — annotations live in them — so only pure

@@ -48,6 +48,17 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
 
+/// Ordering key for a file that has no id yet.
+///
+/// The batch entry points sort their input before anything is added to the VFS,
+/// so they cannot use [`Vfs::file_order_key`]; a URI that does not name a path
+/// falls back to its own text.
+fn uri_sort_key(uri: &Uri) -> String {
+    uri_to_file_path(uri)
+        .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
+        .unwrap_or_else(|| uri.as_str().to_string())
+}
+
 /// Stack size for any thread that runs analysis.
 ///
 /// Inference and the type-graph walks recurse to the depth of the source, which
@@ -1873,11 +1884,7 @@ impl EmmyLuaAnalysis {
         let mut removed_files = FxHashSet::default();
         let mut updated_files = FxHashSet::default();
         let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| {
-            uri_to_file_path(uri)
-                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-                .unwrap_or_else(|| uri.as_str().to_string())
-        });
+        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
         let old_source_file_ids = files
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))
@@ -2039,11 +2046,7 @@ impl EmmyLuaAnalysis {
         files: Vec<(Uri, Option<String>)>,
     ) -> Vec<FileId> {
         let mut files = files;
-        files.sort_by_cached_key(|(uri, _)| {
-            uri_to_file_path(uri)
-                .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-                .unwrap_or_else(|| uri.as_str().to_string())
-        });
+        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
         let old_source_file_ids = files
             .iter()
             .filter_map(|(uri, _)| self.compilation.get_db().get_vfs().get_file_id(uri))

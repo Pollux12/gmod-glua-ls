@@ -73,29 +73,14 @@ impl AnalysisPipeline for DocAnalysisPipeline {
 }
 
 /// A class documented in several files shares one property. Tell the property index how those
-/// files order against each other: annotations and other libraries before the main workspace,
-/// then lowest normalized path.
+/// files order against each other. A file in no known workspace sorts after every ranked one.
 fn register_property_merge_order(db: &mut DbIndex, file_id: FileId) {
-    let workspace_rank = match db
-        .get_module_index()
+    let module_index = db.get_module_index();
+    let workspace_rank = module_index
         .get_workspace_id(file_id)
-        .map(|workspace_id| db.get_module_index().get_workspace_kind(workspace_id))
-    {
-        Some(crate::WorkspaceKind::Std) => 0,
-        Some(crate::WorkspaceKind::Library) => 1,
-        Some(crate::WorkspaceKind::Remote) => 2,
-        Some(crate::WorkspaceKind::Main) => 3,
-        None => 4,
-    };
-    let path = db
-        .get_vfs()
-        .get_file_path(&file_id)
-        .map(|path| {
-            std::sync::Arc::from(crate::vfs::normalize_path_for_ordering(
-                &path.to_string_lossy(),
-            ))
-        })
-        .unwrap_or_else(|| std::sync::Arc::from(""));
+        .map(|workspace_id| module_index.get_workspace_kind(workspace_id).merge_rank())
+        .unwrap_or(crate::WorkspaceKind::MERGE_RANK_NONE);
+    let path = db.get_vfs().file_order_key(&file_id);
     db.get_property_index_mut()
         .set_file_merge_order(file_id, workspace_rank, path);
 }

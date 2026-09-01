@@ -5283,13 +5283,8 @@ fn build_class_file_map(db: &DbIndex) -> HashMap<String, Vec<FileId>> {
     // not stable between a cold build and an incremental session; normalized path is.
     map.into_iter()
         .map(|(class_name, mut file_ids)| {
-            file_ids.sort_by_cached_key(|(is_init, file_id)| {
-                let path = vfs
-                    .get_file_path(file_id)
-                    .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-                    .unwrap_or_default();
-                (!*is_init, path)
-            });
+            file_ids
+                .sort_by_cached_key(|(is_init, file_id)| (!*is_init, vfs.file_order_key(file_id)));
             (
                 class_name,
                 file_ids.into_iter().map(|(_, file_id)| file_id).collect(),
@@ -14313,12 +14308,11 @@ fn source_states_for_load_site(
     }
 }
 
-fn load_site_sort_key(db: &DbIndex, site: &LuaDependencySite) -> (String, u32, u32, u8, String) {
-    let source_path = db
-        .get_vfs()
-        .get_file_path(&site.source_file_id)
-        .map(|path| crate::vfs::normalize_path_for_ordering(&path.to_string_lossy()))
-        .unwrap_or_default();
+fn load_site_sort_key(
+    db: &DbIndex,
+    site: &LuaDependencySite,
+) -> (std::sync::Arc<str>, u32, u32, u8, String) {
+    let source_path = db.get_vfs().file_order_key(&site.source_file_id);
     let kind_rank = match site.kind {
         LuaDependencyKind::Require => 0,
         LuaDependencyKind::Include => 1,

@@ -73,16 +73,7 @@ pub fn analyze_setmetatable(analyzer: &mut LuaAnalyzer, call_expr: LuaCallExpr) 
 /// Ordering key for the writing file, so several writers of one table literal resolve the same
 /// way in a cold build and an incremental session.
 fn writer_sort_key(analyzer: &LuaAnalyzer) -> std::sync::Arc<str> {
-    analyzer
-        .db
-        .get_vfs()
-        .get_file_path(&analyzer.file_id)
-        .map(|path| {
-            std::sync::Arc::from(crate::vfs::normalize_path_for_ordering(
-                &path.to_string_lossy(),
-            ))
-        })
-        .unwrap_or_else(|| std::sync::Arc::from(""))
+    analyzer.db.get_vfs().file_order_key(&analyzer.file_id)
 }
 
 fn setmetatable_factory_binding(
