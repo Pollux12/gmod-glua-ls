@@ -655,19 +655,7 @@ impl EmmyLuaAnalysis {
             self.self_index_and_diff(vec![file_id])
         });
         if was_absent || is_removed {
-            // A file appearing or vanishing changes what every `include` of it
-            // resolves to, which is not a fact the file itself exports.
-            let dependents = self
-                .compilation
-                .get_db()
-                .get_file_dependencies_index()
-                .get_file_dependencies()
-                .collect_file_dependents(vec![file_id]);
-            dirty.files.extend(dependents);
-            let unresolved =
-                self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
-            dirty.files.extend(unresolved);
-            dirty.files.remove(&file_id);
+            self.dirty_existence_dependents(&mut dirty, file_id);
         }
         profile::phase("edit/ripple", || self.ripple(dirty));
         profile::phase_report("update_file_by_uri");
@@ -765,17 +753,7 @@ impl EmmyLuaAnalysis {
         if trigger_reindex {
             let mut dirty = self.self_index_and_diff(vec![file_id]);
             if was_absent || is_removed {
-                let dependents = self
-                    .compilation
-                    .get_db()
-                    .get_file_dependencies_index()
-                    .get_file_dependencies()
-                    .collect_file_dependents(vec![file_id]);
-                dirty.files.extend(dependents);
-                let unresolved =
-                    self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
-                dirty.files.extend(unresolved);
-                dirty.files.remove(&file_id);
+                self.dirty_existence_dependents(&mut dirty, file_id);
             }
             self.ripple(dirty);
         }
@@ -1416,6 +1394,28 @@ impl EmmyLuaAnalysis {
         reindex_file_ids.push(seed_file_id);
         reindex_file_ids.sort_unstable();
         reindex_file_ids.dedup();
+    }
+
+    /// Marks the files that have to be re-analysed because `file_id` appeared or
+    /// vanished, rather than because its contents changed.
+    ///
+    /// Whether a file exists is not a fact that file exports, so the export diff
+    /// cannot see it. Every `include` of the path resolves differently now, both
+    /// the ones that resolved to it and the ones that failed to resolve at all.
+    /// The file itself is dropped from the set: the caller has already indexed
+    /// it, or it is gone.
+    fn dirty_existence_dependents(&self, dirty: &mut DirtySet, file_id: FileId) {
+        let dependents = self
+            .compilation
+            .get_db()
+            .get_file_dependencies_index()
+            .get_file_dependencies()
+            .collect_file_dependents(vec![file_id]);
+        dirty.files.extend(dependents);
+        let unresolved =
+            self.unresolved_path_dependency_dependents(&FxHashSet::from_iter([file_id]));
+        dirty.files.extend(unresolved);
+        dirty.files.remove(&file_id);
     }
 
     fn unresolved_path_dependency_dependents(&self, file_ids: &FxHashSet<FileId>) -> Vec<FileId> {
