@@ -43,8 +43,13 @@ fn worker_count(file_count: usize) -> usize {
     cores.clamp(1, 16).min(file_count)
 }
 
-/// Size rayon's global pool to the same 16-thread cap the scoped pool used.
-/// `build_global` is a no-op error if something already initialized the pool.
+/// Size rayon's global pool to the same 16-thread cap the scoped pool used, and
+/// give its workers the stack analysis needs.
+///
+/// Workers run the same recursive inference and type-graph walks the caller's
+/// thread does, so they get [`crate::ANALYSIS_STACK_SIZE`] rather than the
+/// default. `build_global` is a no-op error if something already initialized the
+/// pool, in which case the workers are not ours to size.
 pub(crate) fn init_pool() {
     static INIT: Once = Once::new();
     INIT.call_once(|| {
@@ -53,6 +58,7 @@ pub(crate) fn init_pool() {
             .unwrap_or(1);
         let _ = rayon::ThreadPoolBuilder::new()
             .num_threads(cores.clamp(1, 16))
+            .stack_size(crate::ANALYSIS_STACK_SIZE)
             .build_global();
     });
 }

@@ -10,7 +10,7 @@ static GLOBAL: MiMalloc = MiMalloc;
 /// thread has a far smaller stack than a spawned one.
 fn main() -> Result<(), Box<dyn Error + Sync + Send>> {
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
