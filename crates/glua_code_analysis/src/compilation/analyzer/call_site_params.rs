@@ -295,14 +295,18 @@ fn call_result_consumer_needs_refresh(
     consumer: &CallSiteReturnConsumer,
     return_type: &LuaType,
 ) -> bool {
-    if consumer.ret_idx == 0 {
-        return false;
-    }
-    let LuaType::Variadic(variadic) = return_type else {
-        return false;
-    };
-    let Some(expected) = variadic.get_type(consumer.ret_idx) else {
-        return false;
+    // The first result is read the same way as any later one: a single-valued
+    // return answers it directly. Skipping it left the batch-derived refresh
+    // set covering only the tail, so a cold build never revisited a first
+    // result the walk had already answered from a narrower type, while a warm
+    // re-index reached it through the consumers its index had retained.
+    let expected = match return_type {
+        LuaType::Variadic(variadic) => match variadic.get_type(consumer.ret_idx) {
+            Some(expected) => expected,
+            None => return false,
+        },
+        return_type if consumer.ret_idx == 0 => return_type,
+        _ => return false,
     };
     if expected.is_any() || expected.is_unknown() || expected.is_nil() || expected.is_never() {
         return false;

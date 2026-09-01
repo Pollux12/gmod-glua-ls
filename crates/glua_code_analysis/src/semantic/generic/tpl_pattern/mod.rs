@@ -217,6 +217,19 @@ pub fn tpl_pattern_match(
         return Ok(());
     }
 
+    // A merged table is one table seen through the several literals that wrote
+    // it, so a parameter binds off it exactly as it binds off any one of them.
+    // Every arm below matches a single table shape, so without this the merge
+    // falls through unmatched and the parameter is left as a raw template ref —
+    // and whether a slot holds the merge or one literal is decided by how far
+    // the batch had run when the read was taken.
+    if let LuaType::MergedTable(merged) = &target {
+        for constituent in merged.get_types() {
+            tpl_pattern_match(context, pattern, constituent)?;
+        }
+        return Ok(());
+    }
+
     match pattern {
         LuaType::TplRef(tpl) => {
             if tpl.get_tpl_id().is_func() {

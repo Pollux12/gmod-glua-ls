@@ -336,15 +336,10 @@ impl LuaMemberIndex {
         if is_decl {
             return match item {
                 LuaMemberIndexItem::One(old_id) if *old_id == id => MemberInsertAction::Noop,
-                LuaMemberIndexItem::One(old_id) => {
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(vec![*old_id, id]))
-                }
                 LuaMemberIndexItem::Many(ids) if ids.contains(&id) => MemberInsertAction::Noop,
-                LuaMemberIndexItem::Many(ids) => {
-                    let mut ids = ids.clone();
-                    ids.push(id);
-                    MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
-                }
+                // Sorted, because readers of the item answer from its order and
+                // the declaration can arrive on either side of the write.
+                _ => MemberInsertAction::Store(sorted_item_with(member_ids_from_item(item), id)),
             };
         }
 
@@ -369,6 +364,25 @@ impl LuaMemberIndex {
                     MemberInsertAction::Store(LuaMemberIndexItem::Many(ids))
                 }
             };
+        }
+
+        // A declaration in another file does not rival a write: `function
+        // holdem.action()` in the server file and `holdem.action = { ... }` in
+        // the client one both stand, which is what the `is_decl` arm above
+        // records when the write reaches the slot first. Keeping both here too
+        // stops the pair depending on which file the batch walked first.
+        //
+        // Only across files. Two writes in one file run in source order, so the
+        // later one genuinely supersedes -- `ain_node.__tostring = function ...`
+        // and a `function ain_node:__tostring()` further down the same file are
+        // the same field written twice, not two realms contributing.
+        let ids = member_ids_from_item(item);
+        if self.is_assignment_file_define_member(id)
+            && ids
+                .iter()
+                .all(|old_id| self.is_decl_member(*old_id) && old_id.file_id != id.file_id)
+        {
+            return MemberInsertAction::Store(sorted_item_with(ids, id));
         }
 
         if !self.is_item_only_file_define(item) {
@@ -417,16 +431,12 @@ impl LuaMemberIndex {
             // that arrived last -- the rule the mixed-feature fall-through
             // below already applies. Within a file the two agree, because
             // the sort key leads with source position.
-            let candidates = || old_member_ids.iter().copied().chain(std::iter::once(id));
-            let winner = candidates()
-                .filter(|candidate| {
-                    !self.non_overwriting_assignment_members.contains(candidate)
-                        || !candidates().any(|other| {
-                            other.file_id != candidate.file_id
-                                && !self.non_overwriting_assignment_members.contains(&other)
-                        })
-                })
-                .max_by_key(|candidate| member_id_sort_key(*candidate))
+            let mut candidates = old_member_ids.clone();
+            if !candidates.contains(&id) {
+                candidates.push(id);
+            }
+            let winner = self
+                .elect_assignment_file_define_winner(&candidates)
                 .unwrap_or_else(|| latest_defined_member(&old_member_ids, id));
 
             return match item {
@@ -483,6 +493,132 @@ impl LuaMemberIndex {
                 }
             }
         }
+    }
+
+    /// The write that survives a slot whose writers are all assignment file
+    /// defines: the latest defined among them, less the guarded
+    /// self-assignments a real writer in another file outranks.
+    ///
+    /// Reads only the candidate set and the placeholder marks, so two batches
+    /// that end with the same writers elect the same one.
+    fn elect_assignment_file_define_winner(
+        &self,
+        candidates: &[LuaMemberId],
+    ) -> Option<LuaMemberId> {
+        candidates
+            .iter()
+            .copied()
+            .filter(|candidate| {
+                !self.non_overwriting_assignment_members.contains(candidate)
+                    || !candidates.iter().any(|other| {
+                        other.file_id != candidate.file_id
+                            && !self.non_overwriting_assignment_members.contains(other)
+                    })
+            })
+            .max_by_key(|candidate| member_id_sort_key(*candidate))
+    }
+
+    /// Re-elects every slot a guarded self-assignment shares with a real writer.
+    ///
+    /// A write is known to be guarded only once its own assignment has been
+    /// analysed, while [`Self::classify_member_insert`] elects the slot as each
+    /// write arrives, against the marks standing at that moment. A writer
+    /// inserted — or re-inserted, when its file is re-indexed — on the other
+    /// side of that mark elects a different winner from the same sources.
+    /// Re-running the election over the writers the batch ended with settles the
+    /// slot on what the workspace contains instead.
+    pub fn settle_non_overwriting_slots(&mut self) {
+        let mut members = self
+            .non_overwriting_assignment_members
+            .iter()
+            .copied()
+            .collect::<Vec<_>>();
+        members.sort_unstable_by_key(|id| member_id_sort_key(*id));
+
+        let mut settled: HashSet<(LuaMemberOwner, LuaMemberKey)> = HashSet::default();
+        for member_id in members {
+            let Some(owner) = self.member_current_owner.get(&member_id).cloned() else {
+                continue;
+            };
+            let Some(key) = self
+                .get_member(&member_id)
+                .map(|member| member.get_key().clone())
+            else {
+                continue;
+            };
+            if !settled.insert((owner.clone(), key.clone())) {
+                continue;
+            }
+            let Some(item) = self.non_overwriting_slot_item(&owner, &key) else {
+                continue;
+            };
+            if let Some(owner_members) = self.owner_members.get_mut(&owner)
+                && owner_members.get_member(&key) != Some(&item)
+            {
+                owner_members.add_member(key, item);
+            }
+        }
+    }
+
+    /// The settled item for one slot, or `None` where another rule owns it: a
+    /// conditional-branch slot, a slot holding anything but assignment file
+    /// defines, and a slot of nothing but guarded writes, which
+    /// [`Self::should_preserve_assignment_file_define_member`] keeps whole.
+    ///
+    /// A declaration in another file does not compete with the writes —
+    /// `function holdem.action()` in one realm's file stands alongside
+    /// `holdem.action = { ... }` in another's — so it is not a candidate, and
+    /// survives below with the aliases. A declaration sharing a file with a
+    /// write is that file's later statement, and source order settles the two;
+    /// the slot is left alone.
+    fn non_overwriting_slot_item(
+        &self,
+        owner: &LuaMemberOwner,
+        key: &LuaMemberKey,
+    ) -> Option<LuaMemberIndexItem> {
+        let (declared, candidates): (Vec<_>, Vec<_>) = self
+            .get_current_owner_members_for_key(owner, key)
+            .into_iter()
+            .map(|member| member.get_id())
+            .partition(|id| self.is_decl_member(*id));
+        if declared.iter().any(|declared_id| {
+            candidates
+                .iter()
+                .any(|candidate| candidate.file_id == declared_id.file_id)
+        }) {
+            return None;
+        }
+        if candidates.len() < 2
+            || !candidates
+                .iter()
+                .all(|candidate| self.is_assignment_file_define_member(*candidate))
+            || candidates.iter().any(|candidate| {
+                self.conditional_branch_assignment_members
+                    .contains(candidate)
+            })
+            || candidates
+                .iter()
+                .all(|candidate| self.non_overwriting_assignment_members.contains(candidate))
+        {
+            return None;
+        }
+        let winner = self.elect_assignment_file_define_winner(&candidates)?;
+
+        // Ids the slot only aliases belong to another owner, and declarations
+        // are not writes, so neither is a candidate and both survive the
+        // election untouched.
+        let current = self.owner_members.get(owner)?.get_member(key)?;
+        let mut visible = member_ids_from_item(current)
+            .into_iter()
+            .filter(|id| !candidates.contains(id))
+            .collect::<Vec<_>>();
+        visible.push(winner);
+        visible.sort_unstable_by_key(|id| member_id_sort_key(*id));
+        visible.dedup();
+        Some(match visible.as_slice() {
+            [only] => LuaMemberIndexItem::One(*only),
+            _ => LuaMemberIndexItem::Many(visible),
+        })
     }
 
     /// Resolves an owner/key slot that any conditional-branch write
@@ -620,9 +756,6 @@ impl LuaMemberIndex {
         may_open_slot: bool,
     ) -> Option<()> {
         let owner = self.member_current_owner.get(&member_id)?.clone();
-        if matches!(owner, LuaMemberOwner::GlobalPath(_)) {
-            return None;
-        }
         let key = self.get_member(&member_id)?.get_key().clone();
         if !may_open_slot
             && self
@@ -994,6 +1127,11 @@ impl LuaMemberIndex {
         }
 
         false
+    }
+
+    fn is_decl_member(&self, id: LuaMemberId) -> bool {
+        self.get_member(&id)
+            .is_some_and(|member| member.get_feature().is_decl())
     }
 
     fn is_item_only_file_define(&self, item: &LuaMemberIndexItem) -> bool {
@@ -2362,6 +2500,18 @@ fn latest_defined_member(existing_ids: &[LuaMemberId], incoming_id: LuaMemberId)
         .chain(std::iter::once(incoming_id))
         .max_by_key(|candidate| member_id_sort_key(*candidate))
         .unwrap_or(incoming_id)
+}
+
+/// The item holding `ids` plus `id`, ordered by [`member_id_sort_key`] so it is
+/// a function of the set rather than of the order the writes arrived in.
+fn sorted_item_with(mut ids: Vec<LuaMemberId>, id: LuaMemberId) -> LuaMemberIndexItem {
+    ids.push(id);
+    ids.sort_unstable_by_key(|id| member_id_sort_key(*id));
+    ids.dedup();
+    match ids.as_slice() {
+        [only] => LuaMemberIndexItem::One(*only),
+        _ => LuaMemberIndexItem::Many(ids),
+    }
 }
 
 fn member_ids_from_item(item: &LuaMemberIndexItem) -> Vec<LuaMemberId> {

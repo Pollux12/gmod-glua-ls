@@ -1,4 +1,4 @@
-use rustc_hash::FxHashSet;
+use rustc_hash::{FxHashMap, FxHashSet};
 
 use crate::{
     DbIndex, FileId, LuaTypeCache, LuaTypeOwner,
@@ -40,9 +40,9 @@ pub(in crate::compilation::analyzer) fn rederive_contributed_member_assignments(
 
 /// The canonical merge for one owner/key group.
 ///
-/// Every answer is computed from the recorded contributions alone and applied
-/// afterwards, so no member's result can depend on another's being written
-/// first.
+/// Every answer is computed from the recorded contributions and the answers this
+/// pass has already derived for the group's earlier writers, never from the order
+/// the batch happened to write them in.
 fn collect_group_updates(
     db: &DbIndex,
     store_key: &MemberAssignmentContributionKey,
@@ -78,6 +78,13 @@ fn collect_group_updates(
     }
     contributions.sort_by_key(|(member_id, _)| sort_key(*member_id));
 
+    // A sibling's cache still holds the walk's provisional answer, which is the
+    // very thing this pass is re-deriving. Feeding it to the next writer's merge
+    // carries the walk's mistake down the group -- the `unknown` an unsettled
+    // contributor left in the first widening reappears in every later one. The
+    // answers derived here are what those siblings are about to hold.
+    let mut derived = FxHashMap::default();
+
     for (member_id, contribution) in &contributions {
         // A guarded bootstrap keeps its siblings visible and runs its own
         // literal-preserving merge, so it is not what the pruning destroyed.
@@ -106,6 +113,11 @@ fn collect_group_updates(
             .take_while(|(other_id, _)| other_id != member_id)
             .filter(|(other_id, _)| is_member_realm_compatible(db, *member_id, *other_id))
             .filter_map(|(other_id, other)| {
+                if let Some(derived_type) = derived.get(other_id) {
+                    return (!is_uninformative(derived_type)).then(|| {
+                        MemberAssignmentWideningState::from_assigned_type(derived_type, None)
+                    });
+                }
                 // The sibling's cache is the settled answer where it exists; the
                 // recorded contribution stands in for the writers the merge
                 // could not see, not for the ones it could.
@@ -142,8 +154,9 @@ fn collect_group_updates(
         };
 
         if widened_type != current_type {
-            updates.push((*member_id, widened_type));
+            updates.push((*member_id, widened_type.clone()));
         }
+        derived.insert(*member_id, widened_type);
     }
 
     Some(())

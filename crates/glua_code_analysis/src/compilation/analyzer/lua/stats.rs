@@ -19,8 +19,8 @@ use crate::{
 };
 use glua_parser::{
     BinaryOperator, LuaAssignStat, LuaAstNode, LuaBinaryExpr, LuaClosureExpr, LuaExpr, LuaFuncStat,
-    LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat, LuaNameExpr,
-    LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
+    LuaIfStat, LuaIndexExpr, LuaIndexKey, LuaLiteralToken, LuaLocalFuncStat, LuaLocalStat,
+    LuaNameExpr, LuaSyntaxKind, LuaTableExpr, LuaTableField, LuaVarExpr, PathTrait,
 };
 use rustc_hash::FxHashMap;
 
@@ -1152,6 +1152,17 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
                 .request_member_initializer_reinfer(*member_id);
         }
 
+        // A read whose receiver an `if x.k then` guard narrowed answers from the
+        // set of types that own `k`, and that set grows as the batch walks the
+        // files declaring them. See `reads_field_exist_guarded_member`.
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && reads_field_exist_guarded_member(expr)
+        {
+            analyzer
+                .context
+                .request_guarded_member_read_reinfer(*member_id);
+        }
+
         let mut expr_type =
             member_assignment_or_source_type(analyzer, &type_owner, expr, expr_type);
 
@@ -1612,6 +1623,44 @@ fn is_call_or_index_expr(expr: &LuaExpr) -> bool {
 
 fn may_improve_after_resolve(expr: &LuaExpr) -> bool {
     crate::compilation::analyzer::initializer_may_improve_after_resolve(expr)
+}
+
+/// Whether `expr` reads an access path that an enclosing `if` tested for
+/// existence.
+///
+/// `if self.k then ... self.k ... end` narrows the receiver to the types that
+/// own `k`, which `collect_field_exist_narrow_candidates` reads straight off the
+/// member index. Which of those owners have been walked when the read is taken
+/// is a property of how far the batch has run, not of the source, so the answer
+/// is provisional until every file declaring `k` has landed.
+///
+/// Syntax only -- the paths are compared as written, so this costs one ancestor
+/// walk per member assignment and never asks for a type.
+fn reads_field_exist_guarded_member(expr: &LuaExpr) -> bool {
+    let read_paths = expr
+        .descendants::<LuaIndexExpr>()
+        .filter_map(|index_expr| index_expr.get_access_path())
+        .collect::<Vec<_>>();
+    if read_paths.is_empty() {
+        return false;
+    }
+
+    expr.ancestors::<LuaIfStat>().any(|if_stat| {
+        if_stat
+            .get_condition_expr()
+            .into_iter()
+            .chain(
+                if_stat
+                    .get_all_clause()
+                    .filter_map(|clause| clause.get_condition_expr()),
+            )
+            .any(|condition| {
+                condition
+                    .descendants::<LuaIndexExpr>()
+                    .filter_map(|index_expr| index_expr.get_access_path())
+                    .any(|guarded| read_paths.contains(&guarded))
+            })
+    })
 }
 
 /// Whether `expr` is a bare read of a global name, whose type is the merge of

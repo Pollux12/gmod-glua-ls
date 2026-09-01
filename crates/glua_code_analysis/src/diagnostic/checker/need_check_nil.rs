@@ -725,6 +725,11 @@ fn check_index_expr(
             is_expr_guarded_by_prior_nil_early_return(semantic_model, &prefix)
                 || is_expr_guarded_by_correlated_multi_return(semantic_model, &prefix)
                 || is_expr_proven_by_falsy_param_nil_free_return_slot(semantic_model, &prefix)
+                // `if x then x.f end` proves `x` truthy for a field read exactly
+                // as it does for `x:m()`, which reads the same guard through
+                // `report_unsafe_receiver`. Without it the guard held for the
+                // call form and not the index form of the same access.
+                || is_expr_guarded_by_current_truthiness_condition(semantic_model, &prefix)
         };
         if guarded {
             return Some(());
@@ -1350,6 +1355,14 @@ fn is_expr_guarded_by_current_truthiness_condition(
     };
 
     for ancestor in expr.syntax().ancestors() {
+        // A guard outside a closure proved the value when the closure was
+        // built, not when it runs. A deferred callback reads it later, by
+        // which time anything may have written it, so the test does not carry
+        // across the boundary.
+        if LuaClosureExpr::cast(ancestor.clone()).is_some() {
+            break;
+        }
+
         if let Some(if_stat) = LuaIfStat::cast(ancestor.clone()) {
             if guard_holds(
                 if_stat.get_block(),
