@@ -459,9 +459,6 @@ impl GmodPreProfile {
     }
 }
 
-/// Post-analysis phase: runs AFTER lua_analyze.
-/// Synthesizes members that depend on metadata collected during lua_analyze
-/// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
 /// Collects GMod `net` message flows.
 ///
 /// This runs at the very end of the batch, after declaration, doc, lua and
@@ -607,6 +604,10 @@ fn collect_file_network_flows(
     )
 }
 
+/// Post-analysis phase: runs AFTER lua_analyze.
+///
+/// Synthesizes members that depend on metadata collected during lua_analyze
+/// (gmod_class_metadata_index: AccessorFunc, NetworkVar, VGUI register calls).
 pub struct GmodPostAnalysisPipeline;
 
 impl AnalysisPipeline for GmodPostAnalysisPipeline {
@@ -8329,6 +8330,22 @@ fn bind_inline_vgui_panel_table(
         .insert(table_range, class_type);
 }
 
+/// Owners a *global* panel-table variable's members can be sitting on.
+///
+/// Decl analysis parks `PANEL.Field` / `function PANEL:Method()` under
+/// `GlobalPath("PANEL")`; once the path's `---@class` is recorded, the canonical
+/// owner of that path becomes the class, which for GMod workspaces is the
+/// annotation `@class PANEL`. Both are checked so the lookup works whichever
+/// side of that the member is on.
+fn global_panel_member_owners(db: &DbIndex, var_name: &str) -> Vec<LuaMemberOwner> {
+    let mut owners = vec![LuaMemberOwner::GlobalPath(GlobalId::new(var_name))];
+    let type_decl_id = LuaTypeDeclId::global(var_name);
+    if db.get_type_index().get_type_decl(&type_decl_id).is_some() {
+        owners.push(LuaMemberOwner::Type(type_decl_id));
+    }
+    owners
+}
+
 /// Collect the candidate `Element` owner ranges that may hold this
 /// registration region's members, deduped and most-specific first.
 ///
@@ -8343,22 +8360,6 @@ fn bind_inline_vgui_panel_table(
 ///
 /// Callers slice the resulting members by source position to attribute them to
 /// the correct region.
-/// Owners a *global* panel-table variable's members can be sitting on.
-///
-/// Decl analysis parks `PANEL.Field` / `function PANEL:Method()` under
-/// `GlobalPath("PANEL")`; the global-member migration then re-homes them onto
-/// whatever the `PANEL` declaration resolved to, which for GMod workspaces is
-/// the annotation `@class PANEL`. Both are checked so the transfer works
-/// whichever stage the member reached.
-fn global_panel_member_owners(db: &DbIndex, var_name: &str) -> Vec<LuaMemberOwner> {
-    let mut owners = vec![LuaMemberOwner::GlobalPath(GlobalId::new(var_name))];
-    let type_decl_id = LuaTypeDeclId::global(var_name);
-    if db.get_type_index().get_type_decl(&type_decl_id).is_some() {
-        owners.push(LuaMemberOwner::Type(type_decl_id));
-    }
-    owners
-}
-
 fn collect_panel_member_source_ranges(
     cache: &mut VguiSynthesisCache,
     db: &DbIndex,
