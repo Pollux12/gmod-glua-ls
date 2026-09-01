@@ -1658,4 +1658,40 @@ mod test {
 
         assert_eq!(tags, Some(1));
     }
+
+    /// LDoc spells a return tag `@treturn`, and puts modifiers this analyzer
+    /// does not model in a bracketed group before the type. Both have to reach
+    /// the same return type as the plain form, and the bracket's contents must
+    /// not be taken for part of it.
+    #[test]
+    fn ldoc_return_forms_give_the_same_return_type() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def(
+            r#"
+        ---@return string
+        function plain() end
+
+        ---@treturn string
+        function aliased() end
+
+        ---@return[opt] string
+        function bracketed() end
+
+        ---@treturn[opt=1] string
+        function both() end
+        "#,
+        );
+
+        let plain_ty = ws.expr_ty("plain()");
+        let plain = ws.humanize_type(plain_ty);
+        assert_eq!(plain, "string");
+        for call in ["aliased()", "bracketed()", "both()"] {
+            let call_ty = ws.expr_ty(call);
+            let ty = ws.humanize_type(call_ty);
+            assert_eq!(
+                ty, plain,
+                "`{call}` should return the same type as `plain()`"
+            );
+        }
+    }
 }
