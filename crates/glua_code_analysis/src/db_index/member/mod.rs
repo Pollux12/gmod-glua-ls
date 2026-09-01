@@ -22,15 +22,70 @@ pub use lua_member_feature::LuaMemberFeature;
 pub use lua_member_item::LuaMemberIndexItem;
 pub use lua_member_owner::LuaMemberOwner;
 
+/// Members filed by owner and then by key.
+///
+/// Two of these are kept. The visible one answers lookups; the history one also
+/// keeps members a later write displaced, so a removal can still find where they
+/// were filed.
+type OwnerKeyMap = HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>;
+
+/// Appends `id` to its slot unless the slot already holds it.
+fn push_owner_key_id_unique(
+    target: &mut OwnerKeyMap,
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+    id: LuaMemberId,
+) {
+    let member_ids = target.entry(owner).or_default().entry(key).or_default();
+    if !member_ids.contains(&id) {
+        member_ids.push(id);
+    }
+}
+
+/// Appends `id` to its slot, which the caller knows does not hold it yet.
+fn push_owner_key_id(
+    target: &mut OwnerKeyMap,
+    owner: LuaMemberOwner,
+    key: LuaMemberKey,
+    id: LuaMemberId,
+) {
+    target
+        .entry(owner)
+        .or_default()
+        .entry(key)
+        .or_default()
+        .push(id);
+}
+
+/// Drops `id` from its slot, and the slot and owner once they are empty.
+fn remove_owner_key_id(
+    target: &mut OwnerKeyMap,
+    owner: &LuaMemberOwner,
+    key: &LuaMemberKey,
+    id: LuaMemberId,
+) {
+    let Some(owner_items) = target.get_mut(owner) else {
+        return;
+    };
+    if let Some(member_ids) = owner_items.get_mut(key) {
+        member_ids.retain(|member_id| *member_id != id);
+        if member_ids.is_empty() {
+            owner_items.remove(key);
+        }
+    }
+    if owner_items.is_empty() {
+        target.remove(owner);
+    }
+}
+
 #[derive(Debug)]
 pub struct LuaMemberIndex {
     members: HashMap<LuaMemberId, LuaMember>,
     in_filed: HashMap<FileId, HashSet<MemberOrOwner>>,
     owner_members: HashMap<LuaMemberOwner, LuaOwnerMembers>,
     member_current_owner: HashMap<LuaMemberId, LuaMemberOwner>,
-    member_owner_key_index: HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
-    member_owner_key_history_index:
-        HashMap<LuaMemberOwner, HashMap<LuaMemberKey, Vec<LuaMemberId>>>,
+    member_owner_key_index: OwnerKeyMap,
+    member_owner_key_history_index: OwnerKeyMap,
     /// The owners under which a file's members were filed in the two
     /// owner-key indexes. A file sweep only has to visit these owners, rather
     /// than every owner in the workspace. Entries may outlive the members that
@@ -170,8 +225,7 @@ impl LuaMemberIndex {
                 .or_default()
                 .insert(member_id_sort_key(id), id);
             self.add_in_file_object(file_id, MemberOrOwner::Owner(owner.clone()));
-            self.add_new_member_to_owner_key_index(owner.clone(), id);
-            self.add_new_member_to_owner_key_history_index(owner.clone(), id);
+            self.add_new_member_to_owner_key_indexes(owner.clone(), id);
             self.add_member_to_owner(owner.clone(), id);
         }
         id
@@ -220,8 +274,7 @@ impl LuaMemberIndex {
 
         if let Some(owner) = owner {
             self.add_current_member_key(member_id);
-            self.add_member_to_owner_key_index(owner.clone(), member_id);
-            self.add_member_to_owner_key_history_index(owner.clone(), member_id);
+            self.add_member_to_owner_key_indexes(owner.clone(), member_id);
             self.add_member_to_owner(owner, member_id);
             // The old key's slot was resolved as a conditional-branch slot;
             // the new key's has only been through `classify_member_insert`,
@@ -251,8 +304,7 @@ impl LuaMemberIndex {
         let key = member.get_key().clone();
         let is_decl = member.get_feature().is_decl();
         if self.member_current_owner.get(&id) != Some(&owner) {
-            self.add_member_to_owner_key_index(owner.clone(), id);
-            self.add_member_to_owner_key_history_index(owner.clone(), id);
+            self.add_member_to_owner_key_indexes(owner.clone(), id);
         }
 
         self.owner_members
@@ -714,8 +766,7 @@ impl LuaMemberIndex {
         let key = member.get_key().clone();
 
         if self.member_current_owner.get(&id) != Some(&owner) {
-            self.add_member_to_owner_key_index(owner.clone(), id);
-            self.add_member_to_owner_key_history_index(owner.clone(), id);
+            self.add_member_to_owner_key_indexes(owner.clone(), id);
         }
 
         self.alias_contributed_slots
@@ -817,52 +868,38 @@ impl LuaMemberIndex {
         }
     }
 
-    fn add_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_member_id_to_owner_key_map(owner, id, false);
-    }
-
-    fn add_member_to_owner_key_history_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_member_id_to_owner_key_map(owner, id, true);
-    }
-
-    fn add_new_member_to_owner_key_index(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
-        self.add_new_member_id_to_owner_key_map(owner, id, false);
-    }
-
-    fn add_new_member_to_owner_key_history_index(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-    ) {
-        self.add_new_member_id_to_owner_key_map(owner, id, true);
-    }
-
-    fn add_member_id_to_owner_key_map(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
+    /// Files `id` under its owner and key in both owner-key indexes, ignoring a
+    /// slot that already holds it.
+    fn add_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
 
         self.record_owner_key_index_owner(id.file_id, &owner);
-        {
-            let target_index = if history {
-                &mut self.member_owner_key_history_index
-            } else {
-                &mut self.member_owner_key_index
-            };
-            let member_ids = target_index
-                .entry(owner)
-                .or_default()
-                .entry(key.clone())
-                .or_default();
-            if !member_ids.contains(&id) {
-                member_ids.push(id);
-            }
-        }
+        push_owner_key_id_unique(
+            &mut self.member_owner_key_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        );
+        push_owner_key_id_unique(&mut self.member_owner_key_history_index, owner, key, id);
+    }
+
+    /// [`add_member_to_owner_key_indexes`](Self::add_member_to_owner_key_indexes)
+    /// for a member the caller knows neither index holds yet.
+    fn add_new_member_to_owner_key_indexes(&mut self, owner: LuaMemberOwner, id: LuaMemberId) {
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+
+        self.record_owner_key_index_owner(id.file_id, &owner);
+        push_owner_key_id(
+            &mut self.member_owner_key_index,
+            owner.clone(),
+            key.clone(),
+            id,
+        );
+        push_owner_key_id(&mut self.member_owner_key_history_index, owner, key, id);
     }
 
     fn record_owner_key_index_owner(&mut self, file_id: FileId, owner: &LuaMemberOwner) {
@@ -875,36 +912,17 @@ impl LuaMemberIndex {
         }
     }
 
-    fn add_new_member_id_to_owner_key_map(
-        &mut self,
-        owner: LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
-        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
-            return;
-        };
-
-        self.record_owner_key_index_owner(id.file_id, &owner);
-        let target_index = if history {
-            &mut self.member_owner_key_history_index
-        } else {
-            &mut self.member_owner_key_index
-        };
-        target_index
-            .entry(owner)
-            .or_default()
-            .entry(key)
-            .or_default()
-            .push(id);
-    }
-
+    /// Drops `id` from the visible index only, leaving the history index to
+    /// remember that this owner once held it.
     fn remove_member_from_visible_owner_key_index(
         &mut self,
         owner: &LuaMemberOwner,
         id: LuaMemberId,
     ) {
-        self.remove_member_from_owner_key_map(owner, id, false);
+        let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
+            return;
+        };
+        remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
     }
 
     fn remove_member_from_all_owner_key_indexes(
@@ -912,39 +930,11 @@ impl LuaMemberIndex {
         owner: &LuaMemberOwner,
         id: LuaMemberId,
     ) {
-        self.remove_member_from_visible_owner_key_index(owner, id);
-        self.remove_member_from_owner_key_map(owner, id, true);
-    }
-
-    fn remove_member_from_owner_key_map(
-        &mut self,
-        owner: &LuaMemberOwner,
-        id: LuaMemberId,
-        history: bool,
-    ) {
         let Some(key) = self.get_member(&id).map(|member| member.get_key().clone()) else {
             return;
         };
-
-        let mut remove_owner_entry = false;
-        let target_index = if history {
-            &mut self.member_owner_key_history_index
-        } else {
-            &mut self.member_owner_key_index
-        };
-        if let Some(owner_items) = target_index.get_mut(owner) {
-            if let Some(member_ids) = owner_items.get_mut(&key) {
-                member_ids.retain(|member_id| *member_id != id);
-                if member_ids.is_empty() {
-                    owner_items.remove(&key);
-                }
-            }
-            remove_owner_entry = owner_items.is_empty();
-        }
-
-        if remove_owner_entry {
-            target_index.remove(owner);
-        }
+        remove_owner_key_id(&mut self.member_owner_key_index, owner, &key, id);
+        remove_owner_key_id(&mut self.member_owner_key_history_index, owner, &key, id);
     }
 
     fn remove_files_members_from_owner_key_indexes(&mut self, removed: &HashSet<FileId>) {
@@ -1055,8 +1045,7 @@ impl LuaMemberIndex {
             .or_default()
             .insert(member_id_sort_key(id), id);
 
-        self.add_member_to_owner_key_index(owner.clone(), id);
-        self.add_member_to_owner_key_history_index(owner.clone(), id);
+        self.add_member_to_owner_key_indexes(owner.clone(), id);
         if self.member_function_scope_range(id).is_none()
             && let Some(member) = self.get_member(&id)
         {
