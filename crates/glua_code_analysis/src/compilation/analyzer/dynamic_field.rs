@@ -1407,8 +1407,7 @@ fn get_field_names(
             may_have_other_string_names: false,
         },
         LuaIndexKey::Expr(expr) => {
-            let for_range_names =
-                field_names_from_for_range_pairs_key(db, cache.get_file_id(), expr.clone());
+            let for_range_names = field_names_from_for_range_pairs_key(db, cache, expr.clone());
             if let Some(for_range_names) = for_range_names {
                 let local_reassignment_positions =
                     local_reassignment_positions.get_or_insert_with(|| {
@@ -1763,7 +1762,7 @@ pub(crate) fn for_range_pairs_source_for_var(
 
 fn field_names_from_for_range_pairs_key(
     db: &DbIndex,
-    file_id: crate::FileId,
+    cache: &mut crate::LuaInferCache,
     key_expr: LuaExpr,
 ) -> Option<ForRangePairsFieldNames> {
     let LuaExpr::NameExpr(name_expr) = key_expr else {
@@ -1772,13 +1771,20 @@ fn field_names_from_for_range_pairs_key(
     let ForRangePairsSource {
         iter_decl_id,
         source_expr,
-    } = for_range_pairs_source_for_var(db, file_id, &name_expr, 0)?;
-    let LuaExpr::TableExpr(table_expr) = source_expr else {
-        return None;
-    };
+    } = for_range_pairs_source_for_var(db, cache.get_file_id(), &name_expr, 0)?;
 
-    let (mut names, may_have_other_string_names) =
-        field_names_from_pairs_table_expr_keys(&table_expr);
+    let (mut names, may_have_other_string_names) = match source_expr {
+        LuaExpr::TableExpr(table_expr) => field_names_from_pairs_table_expr_keys(&table_expr),
+        // The keys a table was written with are read off its members, not
+        // off the loop variable's type: that type is the union of those keys
+        // only until a computed-key write joins the table, when it collapses
+        // to `string` and names nothing -- and whether that write has joined
+        // yet is a property of how far the batch has settled.
+        source_expr => {
+            let source_type = infer_expr(db, cache, source_expr).ok()?;
+            field_names_from_member_keys(db, &source_type)?
+        }
+    };
     names.sort();
     names.dedup();
     Some(ForRangePairsFieldNames {
@@ -1786,6 +1792,99 @@ fn field_names_from_for_range_pairs_key(
         iter_decl_id,
         may_have_other_string_names,
     })
+}
+
+/// The names a table's members were written with, read off the syntax of
+/// each write, plus whether any member was written through a computed key.
+///
+/// A member minted under the name a computed key happened to resolve to does
+/// not count as a name the source states: it is one of the "other" names.
+fn field_names_from_member_keys(
+    db: &DbIndex,
+    source_type: &LuaType,
+) -> Option<(Vec<SmolStr>, bool)> {
+    let mut owners = Vec::new();
+    if !collect_pairs_source_owners(source_type, &mut owners) {
+        return None;
+    }
+    let member_index = db.get_member_index();
+    let mut names = Vec::new();
+    let mut may_have_other_string_names = false;
+    for owner in owners {
+        let Some(members) = member_index.get_members(&owner) else {
+            may_have_other_string_names = true;
+            continue;
+        };
+        for member in members {
+            match member.get_key() {
+                LuaMemberKey::Name(name) if member_key_is_written_literally(db, member) => {
+                    names.push(SmolStr::from(name.as_str()));
+                }
+                LuaMemberKey::Name(_) | LuaMemberKey::ExprType(_) => {
+                    may_have_other_string_names = true;
+                }
+                LuaMemberKey::Integer(_) | LuaMemberKey::None => {}
+            }
+        }
+    }
+    Some((names, may_have_other_string_names))
+}
+
+/// The owners whose members a `pairs` loop over `typ` enumerates, or `false`
+/// when an arm names no table the index holds.
+fn collect_pairs_source_owners(typ: &LuaType, owners: &mut Vec<LuaMemberOwner>) -> bool {
+    match typ {
+        LuaType::TableConst(range) => {
+            owners.push(LuaMemberOwner::Element(range.clone()));
+            true
+        }
+        LuaType::Instance(instance) => {
+            owners.push(LuaMemberOwner::Element(instance.get_range().clone()));
+            true
+        }
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            owners.push(LuaMemberOwner::Type(type_id.clone()));
+            true
+        }
+        LuaType::MergedTable(merged) => merged
+            .get_types()
+            .iter()
+            .all(|arm| collect_pairs_source_owners(arm, owners)),
+        LuaType::Union(union) => union
+            .types()
+            .filter(|arm| !arm.is_nil())
+            .all(|arm| collect_pairs_source_owners(arm, owners)),
+        _ => false,
+    }
+}
+
+/// Whether a member's key is spelled literally at its write.
+fn member_key_is_written_literally(db: &DbIndex, member: &crate::LuaMember) -> bool {
+    let Some(root) = db
+        .get_vfs()
+        .get_syntax_tree(&member.get_file_id())
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    let Some(node) = member.get_syntax_id().to_node_from_root(&root) else {
+        return false;
+    };
+    let key = if let Some(index_expr) = glua_parser::LuaIndexExpr::cast(node.clone()) {
+        index_expr.get_index_key()
+    } else if let Some(field) = glua_parser::LuaTableField::cast(node) {
+        field.get_field_key()
+    } else {
+        // Declared in an annotation or synthesized: the name is the source's.
+        return true;
+    };
+    match key {
+        Some(LuaIndexKey::Name(_) | LuaIndexKey::String(_)) => true,
+        Some(LuaIndexKey::Expr(LuaExpr::LiteralExpr(literal))) => {
+            matches!(literal.get_literal(), Some(LuaLiteralToken::String(_)))
+        }
+        _ => false,
+    }
 }
 
 fn is_provably_builtin_pairs_call(

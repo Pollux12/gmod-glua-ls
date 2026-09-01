@@ -1591,4 +1591,123 @@ mod test {
 
         assert_eq!(ws.expr_ty("cycleValue.missingField"), LuaType::Nil);
     }
+
+    #[test]
+    fn test_dynamic_read_unions_exact_dynamic_writer_with_literal_keyed_siblings() {
+        let mut ws = VirtualWorkspace::new();
+        ws.def_file(
+            "shared/sh_property.lua",
+            r#"
+            property = property or {}
+            property.owner = property.owner or {}
+            "#,
+        );
+        ws.def_file(
+            "shared/map_a.lua",
+            r#"
+            property.owner[1] = "Public Area"
+            property.owner[2] = "Owned by the Government"
+            "#,
+        );
+        ws.def_file(
+            "server/sv_buy.lua",
+            r#"
+            local function buy(propertynumber)
+                local uniqueID = 1234
+                property.owner[propertynumber] = uniqueID
+            end
+            "#,
+        );
+        let reader = ws.def_file(
+            "shared/sh_reader.lua",
+            r#"
+            local function sync(propertynumber)
+                local owner = property.owner[propertynumber]
+            end
+            "#,
+        );
+
+        let ty =
+            infer_index_expr_type_by_text_in_file(&ws, reader, "property.owner[propertynumber]");
+        let LuaType::Union(union) = &ty else {
+            panic!("expected a union of every writer, got {ty:?}");
+        };
+        let arms = union.types().cloned().collect::<Vec<_>>();
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::String | LuaType::StringConst(_))),
+            "missing the literal-keyed string writers: {ty:?}"
+        );
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::Integer | LuaType::IntegerConst(_))),
+            "missing the dynamic-keyed integer writer: {ty:?}"
+        );
+    }
+
+    #[test]
+    fn test_member_bound_from_sibling_merge_takes_the_settled_writer_set() {
+        let mut ws = VirtualWorkspace::new();
+        let file_ids = ws.def_files(vec![
+            (
+                "shared/sh_property.lua",
+                r#"
+                property = property or {}
+                property.owner = property.owner or {}
+                "#,
+            ),
+            (
+                "shared/map_a.lua",
+                r#"
+                property.owner[1] = "Public Area"
+                "#,
+            ),
+            (
+                "server/sv_buy.lua",
+                r#"
+                local function buy(propertynumber)
+                    local uniqueID = 1234
+                    property.owner[propertynumber] = uniqueID
+                end
+                "#,
+            ),
+            (
+                "shared/sh_reader.lua",
+                r#"
+                local function sync(propertynumber)
+                    local access = { owner = property.owner[propertynumber] }
+                end
+                "#,
+            ),
+        ]);
+        let reader = *file_ids.last().expect("reader file");
+
+        let db = ws.analysis.compilation.get_db();
+        let member = db
+            .get_member_index()
+            .get_file_members(reader)
+            .into_iter()
+            .find(|member| member.get_key() == &LuaMemberKey::Name("owner".into()))
+            .expect("the table field member");
+        let cached = db
+            .get_type_index()
+            .get_type_cache(&member.get_id().into())
+            .expect("the table field cache")
+            .as_type()
+            .clone();
+        let LuaType::Union(union) = &cached else {
+            panic!("expected every writer in the settled cache, got {cached:?}");
+        };
+        let arms = union.types().cloned().collect::<Vec<_>>();
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::String | LuaType::StringConst(_))),
+            "missing the literal-keyed string writer: {cached:?}"
+        );
+        assert!(
+            arms.iter()
+                .any(|arm| matches!(arm, LuaType::Integer | LuaType::IntegerConst(_))),
+            "missing the computed-key integer writer attached after the walk: {cached:?}"
+        );
+    }
 }

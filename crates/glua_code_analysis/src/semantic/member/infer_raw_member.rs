@@ -215,11 +215,37 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     caller_file_id: FileId,
     caller_position: Option<TextSize>,
 ) -> RawGetMemberTypeResult {
-    if let Some(member_item) = db
-        .get_member_index()
-        .get_member_item(&member_owner, member_key)
-    {
-        return resolve_member_item_with_realm(db, member_item, caller_file_id, caller_position);
+    let member_index = db.get_member_index();
+    if let Some(member_item) = member_index.get_member_item(&member_owner, member_key) {
+        let exact_type =
+            resolve_member_item_with_realm(db, member_item, caller_file_id, caller_position)?;
+        // A dynamic write answers a dynamic read, but it is not evidence that
+        // the integer entries beside it are absent: `t[n]` on a table filled
+        // by both `t[1] = "a"` and `t[k] = 5` holds either, since a literal
+        // index and a computed one address the same entries. Named fields do
+        // not join: beside a computed write they are the table's own schema,
+        // and a key computed at runtime is the registry entry, not a field.
+        let LuaMemberKey::ExprType(access_key_type) = member_key else {
+            return Ok(exact_type);
+        };
+        let mut integer_keys = member_index
+            .get_member_keys(&member_owner)
+            .filter(|key| {
+                matches!(key, LuaMemberKey::Integer(_))
+                    && member_key_matches_type(db, access_key_type, key)
+            })
+            .collect::<Vec<_>>();
+        integer_keys.sort();
+        let result_type = integer_keys
+            .into_iter()
+            .filter_map(|key| member_index.get_member_item(&member_owner, key))
+            .filter_map(|item| {
+                resolve_member_item_with_realm(db, item, caller_file_id, caller_position).ok()
+            })
+            .fold(exact_type, |acc, member_type| {
+                TypeOps::Union.apply(db, &acc, &member_type)
+            });
+        return Ok(result_type);
     }
 
     let Some(access_key_type) = member_key_as_type(member_key) else {
@@ -229,7 +255,6 @@ pub(crate) fn infer_owner_raw_member_type_with_realm(
     // Two literal keys match only when they are equal, which the exact-key
     // lookup above already covered, so a literal access that reaches here can
     // only be answered by an expression-keyed member.
-    let member_index = db.get_member_index();
     let owner_members = if matches!(member_key, LuaMemberKey::Name(_) | LuaMemberKey::Integer(_)) {
         member_index.get_expr_key_members(&member_owner)
     } else {

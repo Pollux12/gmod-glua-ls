@@ -761,14 +761,16 @@ fn collect_distinct_index_expr_member_owners(
             }
             false
         }
-        LuaType::MergedTable(merged_table) => {
-            for typ in merged_table.get_types() {
-                if collect_distinct_index_expr_member_owners(typ, owners) {
-                    return true;
-                }
-            }
-            false
-        }
+        // The settled form of one slot's several bootstrap literals is one
+        // table, not a choice between alternatives: a write through it lands on
+        // the arm the writing file prefers. Counting every arm made the answer
+        // depend on whether the slot had settled yet -- the walk reads the one
+        // literal it has reached on a cold build and the merge on a re-index.
+        LuaType::MergedTable(merged_table) => merged_table
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner)
+            .is_some_and(|owner| insert_index_expr_member_owner(owners, owner)),
         LuaType::MultiLineUnion(union) => {
             for (typ, _) in union.get_unions() {
                 if collect_distinct_index_expr_member_owners(typ, owners) {
@@ -778,6 +780,35 @@ fn collect_distinct_index_expr_member_owners(
             false
         }
         _ => false,
+    }
+}
+
+/// The first owner a type names, in the type's canonical arm order.
+fn representative_index_expr_member_owner(typ: &LuaType) -> Option<LuaMemberOwner> {
+    match typ {
+        LuaType::TableConst(in_file_range) => Some(LuaMemberOwner::Element(in_file_range.clone())),
+        LuaType::Def(type_id) | LuaType::Ref(type_id) => {
+            Some(LuaMemberOwner::Type(type_id.clone()))
+        }
+        LuaType::Instance(instance) => Some(LuaMemberOwner::Element(instance.get_range().clone())),
+        LuaType::TableOf(inner) => representative_index_expr_member_owner(inner),
+        LuaType::TypeGuard(inner) => representative_index_expr_member_owner(inner),
+        LuaType::Union(union) => union
+            .types()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::Intersection(intersection) => intersection
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::MergedTable(merged_table) => merged_table
+            .get_types()
+            .iter()
+            .find_map(representative_index_expr_member_owner),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .find_map(|(typ, _)| representative_index_expr_member_owner(typ)),
+        _ => None,
     }
 }
 
@@ -1012,6 +1043,7 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
         let declared_empty_table_type = declared_empty_table_assignment_type(analyzer, &var, expr);
         set_index_expr_owner(analyzer, var.clone());
 
+        analyzer.sibling_merge_read = false;
         let expr_type = match declared_empty_table_type
             .map(Ok)
             .unwrap_or_else(|| analyzer.infer_expr(expr))
@@ -1161,6 +1193,13 @@ pub fn analyze_assign_stat(analyzer: &mut LuaAnalyzer, assign_stat: LuaAssignSta
             analyzer
                 .context
                 .request_guarded_member_read_reinfer(*member_id);
+        }
+        if let LuaTypeOwner::Member(member_id) = &type_owner
+            && analyzer.sibling_merge_read
+        {
+            analyzer
+                .context
+                .request_sibling_merge_read_reinfer(*member_id);
         }
 
         let mut expr_type =
@@ -2306,6 +2345,12 @@ fn collect_or_expr_arms(expr: &LuaExpr, arms: &mut Vec<LuaExpr>) -> Option<()> {
     Some(())
 }
 
+/// Whether the write's key is computed.
+///
+/// Read off the syntax, not off the member's key: a computed key whose
+/// expression the walk could resolve is minted under the name it resolved
+/// to, and whether it could resolve is a property of how far the batch had
+/// got when the write was walked.
 fn is_dynamic_expr_key_member_assignment(
     analyzer: &LuaAnalyzer,
     type_owner: &LuaTypeOwner,
@@ -2313,11 +2358,20 @@ fn is_dynamic_expr_key_member_assignment(
     let LuaTypeOwner::Member(member_id) = type_owner else {
         return false;
     };
-    analyzer
+    let Some(root) = analyzer
         .db
-        .get_member_index()
-        .get_member(member_id)
-        .is_some_and(|member| member.get_key().is_expr())
+        .get_vfs()
+        .get_syntax_tree(&member_id.file_id)
+        .map(|tree| tree.get_red_root())
+    else {
+        return false;
+    };
+    member_id
+        .get_syntax_id()
+        .to_node_from_root(&root)
+        .and_then(LuaIndexExpr::cast)
+        .and_then(|index_expr| index_expr.get_index_key())
+        .is_some_and(|key| matches!(key, LuaIndexKey::Expr(_)))
 }
 
 fn is_global_decl_owner(analyzer: &LuaAnalyzer, type_owner: &LuaTypeOwner) -> bool {
@@ -3300,7 +3354,13 @@ pub fn analyze_table_field(analyzer: &mut LuaAnalyzer, field: LuaTableField) -> 
     if field.is_assign_field() || is_shaped_array_value_field(&field) {
         let value_expr = field.get_value_expr()?;
         let member_id = LuaMemberId::new(field.get_syntax_id(), analyzer.file_id);
-        let value_type = match analyzer.infer_expr(&value_expr.clone()) {
+        let inferred = analyzer.infer_expr(&value_expr.clone());
+        if analyzer.sibling_merge_read {
+            analyzer
+                .context
+                .request_sibling_merge_read_reinfer(member_id);
+        }
+        let value_type = match inferred {
             Ok(value_type) => match value_type {
                 LuaType::Def(ref_id) => LuaType::Ref(ref_id),
                 other => {
@@ -3733,6 +3793,13 @@ mod tests {
     fn duplicate_table_owner_is_not_ambiguous() {
         let table = table_const(1, 2);
         let typ = LuaMergedTableType::new(vec![table.clone(), table]).into();
+
+        assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
+    }
+
+    #[test]
+    fn merged_bootstrap_literals_are_one_owner() {
+        let typ = LuaMergedTableType::new(vec![table_const(1, 2), table_const(3, 4)]).into();
 
         assert!(!has_multiple_distinct_index_expr_member_owners(&typ));
     }
@@ -4630,25 +4697,49 @@ mod tests {
         });
     }
 
+    /// The classification reads the write's syntax: a computed key the walk
+    /// resolved to a name is still a computed key.
     #[test]
     fn expr_key_members_are_detected_as_dynamic_assignments() {
-        let mut db = DbIndex::new();
-        let member_id = member_id_at(1);
-        add_typed_file_define_member(
-            &mut db,
-            LuaMemberOwner::Element(InFiled::new(
-                FileId::new(0),
-                TextRange::new(TextSize::new(10), TextSize::new(11)),
-            )),
-            member_id,
-            LuaMemberKey::ExprType(LuaType::String),
-            LuaType::Table,
+        let mut ws = crate::VirtualWorkspace::new();
+        let file_id = ws.def_file(
+            "lua/keys.lua",
+            "local t = {}\nlocal k = \"named\"\nt[k] = 1\nt.plain = 2\n",
         );
+        let db = ws.analysis.compilation.get_db_mut();
+        let chunk = db
+            .get_vfs()
+            .get_syntax_tree(&file_id)
+            .expect("the file's tree")
+            .get_chunk_node();
+        let writes = chunk
+            .descendants::<LuaIndexExpr>()
+            .map(|index_expr| {
+                (
+                    index_expr.syntax().text().to_string(),
+                    LuaMemberId::new(index_expr.get_syntax_id(), file_id),
+                )
+            })
+            .collect::<Vec<_>>();
+        let computed = writes
+            .iter()
+            .find(|(text, _)| text == "t[k]")
+            .expect("t[k]")
+            .1;
+        let plain = writes
+            .iter()
+            .find(|(text, _)| text == "t.plain")
+            .expect("t.plain")
+            .1;
 
-        with_analyzer(&mut db, |analyzer| {
+        with_analyzer(db, |analyzer| {
             assert!(is_dynamic_expr_key_member_assignment(
                 analyzer,
-                &LuaTypeOwner::Member(member_id)
+                &LuaTypeOwner::Member(computed)
+            ));
+            assert!(!is_dynamic_expr_key_member_assignment(
+                analyzer,
+                &LuaTypeOwner::Member(plain)
             ));
         });
     }

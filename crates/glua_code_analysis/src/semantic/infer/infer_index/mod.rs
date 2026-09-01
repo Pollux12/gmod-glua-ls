@@ -736,6 +736,9 @@ fn infer_table_member_owner(
                 return Ok(nullable_if_needed(db, member_type));
             }
 
+            if matches!(key, LuaMemberKey::ExprType(_)) {
+                cache.sibling_merge_reads += 1;
+            }
             Ok(typ)
         }
         Err(InferFailReason::FieldNotFound) => {

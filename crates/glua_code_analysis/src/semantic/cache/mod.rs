@@ -172,6 +172,11 @@ pub struct LuaInferCache {
     /// expression. Consulted per call-site during inference, so re-inferring
     /// the call prefix each time is avoided.
     pub signature_is_generic_cache: FxHashMap<LuaSyntaxId, Option<bool>>,
+    /// How many computed-key reads were answered by merging the sibling
+    /// members of a table. Each of those answers is a snapshot of whichever
+    /// writers the batch had indexed, so a value bound from one is re-derived
+    /// once the index settles. See `settled_sibling_merge_read_candidates`.
+    pub sibling_merge_reads: u32,
     inferred_guard_dependencies: FxHashSet<LuaInferredGuardOwner>,
 }
 
@@ -211,6 +216,7 @@ impl LuaInferCache {
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
             signature_is_generic_cache: FxHashMap::default(),
+            sibling_merge_reads: 0,
             inferred_guard_dependencies: FxHashSet::default(),
         }
     }
