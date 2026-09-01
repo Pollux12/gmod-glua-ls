@@ -650,8 +650,9 @@ impl LuaMemberIndex {
         }
     }
 
-    /// Records that `id`'s owner was decided by scripted-class synthesis, so the
-    /// global-member migration must leave it alone.
+    /// Records that `id`'s owner was decided by scripted-class synthesis, so
+    /// [`Self::set_global_path_class`] leaves it where it is instead of moving
+    /// it onto the annotated class.
     pub fn pin_synthesized_owner(&mut self, id: LuaMemberId) {
         self.synthesized_owner_members.insert(id);
     }
@@ -1824,7 +1825,7 @@ impl LuaMemberIndex {
                     .filter(|member| member.get_key() == key)
             })
             .collect::<Vec<_>>();
-        members.sort_by_key(|member| stable_member_sort_key(member));
+        members.sort_by_key(|member| member_id_sort_key(member.get_id()));
         members
     }
 
@@ -1977,11 +1978,6 @@ fn site_sort_key(site: &crate::InFiled<TextRange>) -> (u32, u32, u32) {
         site.value.start().into(),
         site.value.end().into(),
     )
-}
-
-fn stable_member_sort_key(member: &LuaMember) -> (u32, u32, u32, u16) {
-    let member_id = member.get_id();
-    member_id_sort_key(member_id)
 }
 
 // The owner-level sorted member-id cache depends on these file id, position,
@@ -3367,9 +3363,9 @@ mod tests {
 
     /// `cityrp.progresshud = {}` is written by both `cl_progress_hud.lua` and
     /// `sv_progress_hud.lua`. Only one can hold the visible slot, and the
-    /// global-path reconciliation re-homes whichever one that is onto the
-    /// elected table — so if arrival decided the survivor, a re-index moved the
-    /// member's owner on unchanged source.
+    /// canonical owner of the path is what the survivor is filed under — so if
+    /// arrival decided the survivor, a re-index moved the member's owner on
+    /// unchanged source.
     #[test]
     fn cross_file_assignment_writers_elect_the_visible_slot_by_source_order() {
         let owner = LuaMemberOwner::GlobalPath(crate::GlobalId::new("cityrp"));
