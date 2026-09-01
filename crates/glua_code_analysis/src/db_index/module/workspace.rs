@@ -8,6 +8,27 @@ pub enum WorkspaceKind {
     Library,
 }
 
+impl WorkspaceKind {
+    /// Rank for a file that belongs to no known workspace, which sorts after
+    /// every kind [`Self::merge_rank`] ranks.
+    pub const MERGE_RANK_NONE: u8 = 4;
+
+    /// Where this workspace's contribution sorts when several files document
+    /// one class.
+    ///
+    /// Annotations and other libraries are the baseline a workspace refines, so
+    /// they merge before the main workspace and the main workspace's wording
+    /// wins. Ties fall through to the file's own ordering key.
+    pub fn merge_rank(self) -> u8 {
+        match self {
+            WorkspaceKind::Std => 0,
+            WorkspaceKind::Library => 1,
+            WorkspaceKind::Remote => 2,
+            WorkspaceKind::Main => 3,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Workspace {
     pub root: PathBuf,
