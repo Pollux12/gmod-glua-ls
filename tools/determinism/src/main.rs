@@ -2309,7 +2309,7 @@ fn reindex_exact(analysis: &mut EmmyLuaAnalysis, codebase: &Path, relatives: &[S
 /// threads, which get a larger stack than a Windows process main thread.
 fn main() {
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(run)
         .expect("determinism worker thread should spawn")
         .join()

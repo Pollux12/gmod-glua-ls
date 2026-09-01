@@ -416,7 +416,7 @@ fn discover_config_files(root: &Path) -> Vec<PathBuf> {
 /// on Windows, so the tools have to ask for one explicitly.
 fn main() {
     std::thread::Builder::new()
-        .stack_size(256 * 1024 * 1024)
+        .stack_size(glua_code_analysis::ANALYSIS_STACK_SIZE)
         .spawn(|| {
             tokio::runtime::Builder::new_multi_thread()
                 .enable_all()

@@ -48,6 +48,16 @@ use tokio_util::sync::CancellationToken;
 use url::Url;
 pub use vfs::*;
 
+/// Stack size for any thread that runs analysis.
+///
+/// Inference and the type-graph walks recurse to the depth of the source, which
+/// a generated or deeply nested GLua file can push past a default thread stack.
+/// The binaries spawn their analysis thread with this; the worker pool uses it
+/// too, so how deep a file may nest does not depend on which thread picked it
+/// up. The reservation is virtual and committed lazily, so a worker that never
+/// recurses costs nothing.
+pub const ANALYSIS_STACK_SIZE: usize = 256 * 1024 * 1024;
+
 /// The cross-file facts an edit can invalidate, captured before
 /// re-analysis.
 #[derive(Clone, Debug, Default)]
