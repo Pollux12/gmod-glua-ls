@@ -31,16 +31,19 @@ use crate::{FileId, profile::Profile};
 /// out to a worker pool.
 const MIN_PARALLEL_FILES: usize = 8;
 
-/// Number of worker threads to use for per-file analysis passes. Capped at 16 to
-/// match the diagnostics path and avoid oversubscription on large machines.
-fn worker_count(file_count: usize) -> usize {
+/// Whether this batch is better run on the caller's thread than handed to the
+/// pool: too few files to pay the dispatch, or nothing to run in parallel on.
+///
+/// The pool's size is [`init_pool`]'s business; this only decides whether to
+/// reach for it at all.
+fn runs_inline(file_count: usize) -> bool {
     if file_count < MIN_PARALLEL_FILES {
-        return 1;
+        return true;
     }
-    let cores = std::thread::available_parallelism()
+    std::thread::available_parallelism()
         .map(|n| n.get())
-        .unwrap_or(1);
-    cores.clamp(1, 16).min(file_count)
+        .unwrap_or(1)
+        <= 1
 }
 
 /// Size rayon's global pool to the same 16-thread cap the scoped pool used, and
@@ -75,9 +78,7 @@ where
     F: Fn(&DbIndex, FileId) -> T + Sync,
 {
     let n = file_ids.len();
-    let workers = worker_count(n);
-
-    if workers <= 1 {
+    if runs_inline(n) {
         return file_ids.iter().map(|&id| f(db, id)).collect();
     }
 
@@ -97,7 +98,7 @@ where
     };
     let done = AtomicUsize::new(0);
 
-    let computed: Vec<(usize, T)> = dispatch
+    let mut computed: Vec<(usize, T)> = dispatch
         .par_iter()
         .map(|&idx| {
             if report_step != 0 {
@@ -110,15 +111,10 @@ where
         })
         .collect();
 
-    let mut results: Vec<Option<T>> = (0..n).map(|_| None).collect();
-    for (idx, value) in computed {
-        results[idx] = Some(value);
-    }
-
-    results
-        .into_iter()
-        .map(|slot| slot.expect("slot written"))
-        .collect()
+    // Each result carries the index it was computed for, so putting them back in
+    // input order is a sort rather than a scatter into pre-filled slots.
+    computed.sort_unstable_by_key(|(idx, _)| *idx);
+    computed.into_iter().map(|(_, value)| value).collect()
 }
 
 /// Indices into `file_ids`, ordered largest source first so the long poles are
