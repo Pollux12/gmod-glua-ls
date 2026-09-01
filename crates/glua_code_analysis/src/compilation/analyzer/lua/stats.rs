@@ -2330,12 +2330,7 @@ fn get_cached_widened_member_assignment_type(
         return Some(None);
     }
 
-    match decide_member_assignment_widening(
-        analyzer.db,
-        incoming_type,
-        true,
-        compatible_states.iter(),
-    ) {
+    match decide_member_assignment_widening(analyzer.db, incoming_type, compatible_states.iter()) {
         MemberAssignmentWideningDecision::Widened(widened_type) => Some(Some(widened_type)),
         MemberAssignmentWideningDecision::ClassBootstrapRejected => None,
         MemberAssignmentWideningDecision::NoPreviousAssignments => Some(None),
@@ -2728,29 +2723,20 @@ pub(in crate::compilation::analyzer) fn get_widened_member_assignment_type(
         return None;
     }
 
-    let widened_type = match decide_member_assignment_widening(
-        db,
-        incoming_type,
-        !preserve_table_literals,
-        previous_states.iter(),
-    ) {
-        MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
-        MemberAssignmentWideningDecision::ClassBootstrapRejected => {
-            union_member_assignment_widening(
-                db,
-                incoming_type,
-                !preserve_table_literals,
-                previous_states.iter(),
-            )
-        }
-        // Only reachable once a preceding writer has been seen but every one of
-        // them was skipped for having no type yet: siblings exist, and not one
-        // of them is evidence. Widening the literal here guesses at writers this
-        // pass has not read, and how many it has read is how far the batch has
-        // run, not anything about the source. Leave the write as it stands and
-        // let the settled re-derivation decide against the complete set.
-        MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
-    };
+    let widened_type =
+        match decide_member_assignment_widening(db, incoming_type, previous_states.iter()) {
+            MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
+            MemberAssignmentWideningDecision::ClassBootstrapRejected => {
+                union_member_assignment_widening(db, incoming_type, previous_states.iter())
+            }
+            // Only reachable once a preceding writer has been seen but every one of
+            // them was skipped for having no type yet: siblings exist, and not one
+            // of them is evidence. Widening the literal here guesses at writers this
+            // pass has not read, and how many it has read is how far the batch has
+            // run, not anything about the source. Leave the write as it stands and
+            // let the settled re-derivation decide against the complete set.
+            MemberAssignmentWideningDecision::NoPreviousAssignments => return None,
+        };
 
     Some(if preserve_table_literals {
         crate::prune_redundant_guarded_table_bootstrap_type(db, widened_type)

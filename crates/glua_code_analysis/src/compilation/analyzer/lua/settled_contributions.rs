@@ -128,7 +128,6 @@ fn collect_group_updates(
         let widened_type = match decide_member_assignment_widening(
             db,
             &contribution.source_type,
-            true,
             previous_states.iter(),
         ) {
             MemberAssignmentWideningDecision::Widened(widened_type) => widened_type,
@@ -136,7 +135,6 @@ fn collect_group_updates(
                 union_member_assignment_widening(
                     db,
                     &contribution.source_type,
-                    true,
                     previous_states.iter(),
                 )
             }
