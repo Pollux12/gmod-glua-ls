@@ -2800,7 +2800,7 @@ fn write_may_declare_on_owner(db: &crate::DbIndex, member_id: LuaMemberId) -> bo
     // of the hierarchy, while the types that declare this key at all are few and
     // each answers with one walk up its own supers.
     let type_index = db.get_type_index();
-    !type_index.get_all_types().into_iter().any(|type_decl| {
+    !type_index.iter_type_decls().any(|type_decl| {
         let candidate_id = type_decl.get_id();
         if candidate_id == owner_id {
             return false;
@@ -2831,10 +2831,7 @@ pub(super) fn is_assignment_file_define_member(
 ) -> bool {
     db.get_member_index()
         .get_member(&member_id)
-        .is_some_and(|member| {
-            member.get_feature() == LuaMemberFeature::FileDefine
-                && member.get_syntax_id().get_kind() == glua_parser::LuaSyntaxKind::IndexExpr
-        })
+        .is_some_and(crate::LuaMember::is_assignment_define)
 }
 
 pub(in crate::compilation::analyzer) fn is_guarded_table_assignment_member(

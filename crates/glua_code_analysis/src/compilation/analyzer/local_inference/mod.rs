@@ -1532,7 +1532,7 @@ fn precompute_direct_subtype_members(db: &crate::DbIndex) -> DirectSubtypeMember
     let mut candidates =
         FxHashMap::<LuaTypeDeclId, FxHashMap<LuaMemberKey, FxHashSet<LuaTypeDeclId>>>::default();
 
-    for child in type_index.get_all_types() {
+    for child in type_index.iter_type_decls() {
         let child_id = child.get_id();
         let owner = LuaMemberOwner::Type(child_id.clone());
         let members = member_index.get_members(&owner);
