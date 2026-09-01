@@ -622,7 +622,19 @@ impl GmodClassMetadataIndex {
         {
             *existing = call;
         } else {
-            calls.push(call);
+            // Kept in source order: calls arrive in whatever order the scan
+            // and the forwarding passes produce them, which differs between a
+            // cold build and a re-index of the same file.
+            let insert_at = calls.partition_point(|existing| {
+                (
+                    existing.syntax_id.get_range().start(),
+                    existing.syntax_id.get_range().end(),
+                ) < (
+                    call.syntax_id.get_range().start(),
+                    call.syntax_id.get_range().end(),
+                )
+            });
+            calls.insert(insert_at, call);
         }
     }
 
