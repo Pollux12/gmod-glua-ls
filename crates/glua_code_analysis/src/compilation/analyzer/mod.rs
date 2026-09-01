@@ -325,9 +325,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             loop {
                 let _round = Profile::new("settled_tail_round");
                 rederive_settled_global_reads(db, &mut context);
+                // Runs inside the loop: the records it adds are read by the
+                // iterated-table answers below, and its own prefixes read the
+                // loop variables those answers settle — each direction needs
+                // the other's previous round.
+                let dynamic_fields_moved =
+                    dynamic_field::rederive_settled_dynamic_fields(db, &mut context);
                 let (moved, iter_var_owners) =
                     rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
-                if !moved {
+                if !moved && !dynamic_fields_moved {
                     break;
                 }
                 // Everything that read a loop variable resolved while it still
@@ -339,11 +345,19 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                     refresh_settled_initializer_caches(db, &mut context, moved_owners.as_ref());
                 round_owners.extend(iter_var_owners);
                 refresh_settled_expr_type_member_keys(db, &mut context);
-                moved_owners = Some(round_owners);
+                // A dynamic-field record is not a type owner, so the read-set
+                // filter cannot see it move; re-derive every candidate next
+                // round instead of a filtered subset.
+                moved_owners = if dynamic_fields_moved {
+                    None
+                } else {
+                    Some(round_owners)
+                };
             }
             context.settled_iter_var_candidates.clear();
             context.settled_global_read_candidates.clear();
             context.settled_multi_decl_global_read_candidates.clear();
+            context.settled_dynamic_field_candidates.clear();
         }
 
         {
@@ -1273,10 +1287,14 @@ fn refresh_local_decl_initializer_caches(
             // the batch, not of the source: cold cached `false` for
             // `local on = LocalPlayer()._flag or false` where re-analysing the
             // same unchanged file cached `true`.
-            let inferred_fact = select_result_fact(
-                infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone()),
-                ret_idx,
-            );
+            let inferred_full_fact = infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone());
+            // A bottom taken out of a resolved multi-return is a real runtime
+            // `nil` — the call produces fewer values than the statement binds.
+            // A bottom fabricated by selecting past a non-variadic answer says
+            // only that the call did not resolve, which is no evidence.
+            let resolved_variadic_tail =
+                ret_idx > 0 && matches!(inferred_full_fact.typ(), LuaType::Variadic(_));
+            let inferred_fact = select_result_fact(inferred_full_fact, ret_idx);
             let inferred_type = inferred_fact.typ().clone();
 
             // Only asked when nothing else would let the settled read through
@@ -1332,6 +1350,23 @@ fn refresh_local_decl_initializer_caches(
                     result.updates.push(InitializerCacheUpdate::Overwrite {
                         owner: type_owner,
                         fact: inferred_fact.with_runtime_type(LuaType::Unknown),
+                    });
+                } else if is_bottom(&inferred_type)
+                    && resolved_variadic_tail
+                    && current_cache
+                        .as_ref()
+                        .is_none_or(|current| current.as_type().is_unknown())
+                {
+                    // The walk cached `unknown` because the read had not
+                    // resolved yet; the settled read resolves it to a bottom.
+                    // A re-index walks the same read against the settled state
+                    // and caches that bottom directly, so leaving `unknown`
+                    // here would make the cache depend on which path derived
+                    // it. `Bind` refuses an uninformative replacement, so this
+                    // goes through the force path.
+                    result.updates.push(InitializerCacheUpdate::Overwrite {
+                        owner: type_owner,
+                        fact: inferred_fact,
                     });
                 } else if current_cache.as_ref().is_some_and(|current| {
                     LuaTypeCache::InferType(inferred_type.clone()).supersedes(current)
@@ -2042,6 +2077,10 @@ pub struct AnalyzeContext {
     /// so the read against the complete set of backing tables is authoritative
     /// over the read the walk took against whichever ones it had reached.
     settled_multi_decl_global_read_candidates: Vec<(LuaDeclId, LuaExpr)>,
+    /// Dynamic-write sites whose prefix held no nameable table when the
+    /// dynamic-field pass ran. See
+    /// [`dynamic_field::rederive_settled_dynamic_fields`].
+    pub(crate) settled_dynamic_field_candidates: Vec<(FileId, glua_parser::LuaSyntaxId)>,
     /// Files where a `panel:GetParent()` read resolved to the broad `Panel`
     /// fallback because the vgui parent chain was not complete yet. The chains
     /// are finished in the gmod-post pass, after which those reads (and anything
@@ -2080,6 +2119,7 @@ impl AnalyzeContext {
             settled_read_sets: HashMap::default(),
             settled_global_read_candidates: Vec::new(),
             settled_multi_decl_global_read_candidates: Vec::new(),
+            settled_dynamic_field_candidates: Vec::new(),
             vgui_parent_fallback_files: HashSet::default(),
             call_site_return_invalidation_changed: false,
             workspace_id: None,
@@ -2138,6 +2178,17 @@ impl AnalyzeContext {
     /// member passes have finished attaching them.
     pub(crate) fn record_settled_iter_var_candidate(&mut self, iter_var: UnResolveIterVar) {
         self.settled_iter_var_candidates.push(iter_var);
+    }
+
+    /// Remembers a dynamic write whose prefix had no nameable table type yet,
+    /// so its wildcard can be taken again once the batch has settled.
+    pub(crate) fn record_settled_dynamic_field_candidate(
+        &mut self,
+        file_id: FileId,
+        syntax_id: glua_parser::LuaSyntaxId,
+    ) {
+        self.settled_dynamic_field_candidates
+            .push((file_id, syntax_id));
     }
 
     /// Remembers `local x = SomeGlobal`. A global's type is the merge of every
