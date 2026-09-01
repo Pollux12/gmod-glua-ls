@@ -499,6 +499,11 @@ fn resolve_closure_member_type(
                 if !signature.is_resolve_return() {
                     return Err(InferFailReason::UnResolveSignatureReturn(*id));
                 }
+                // See `filter_signature_type`: params this pass copied off a
+                // sibling's receiver are that sibling's answer, not the slot's.
+                if signature.params_filled_from_slot {
+                    return Ok(());
+                }
                 let fake_doc_function = signature.to_doc_func_type();
                 resolve_doc_function(db, closure_params, &fake_doc_function, self_type)
             } else {
@@ -671,6 +676,7 @@ fn resolve_doc_function(
         doc_params[0].1 = Some(self_type);
     }
 
+    signature.params_filled_from_slot |= !doc_params.is_empty();
     for (index, param) in doc_params.iter().enumerate() {
         let name = signature.params.get(index).unwrap_or(&param.0);
         signature.param_docs.insert(
@@ -894,11 +900,16 @@ fn filter_signature_type(
                         // When preserve_returns is true (hook hover path), emit even for return-
                         // only hooks so that `@return`-annotated hooks with no params display
                         // correctly as `function() -> boolean` rather than silently degrading.
+                        // A peer closure filling the same slot has params only
+                        // because this pass copied them off its own receiver.
+                        // Inheriting them would make this closure's receiver a
+                        // question of which sibling the batch resolved first.
+                        let annotated_params =
+                            !sig.param_docs.is_empty() && !sig.params_filled_from_slot;
                         let has_useful_info = if preserve_returns {
-                            !sig.param_docs.is_empty() || !sig.get_return_type().is_nil()
+                            annotated_params || !sig.get_return_type().is_nil()
                         } else {
-                            !sig.param_docs.is_empty()
-                                || (preserve_implicit_receiver && sig.is_colon_define)
+                            annotated_params || (preserve_implicit_receiver && sig.is_colon_define)
                         };
                         if has_useful_info {
                             let params = sig.get_type_params();

@@ -615,6 +615,75 @@ mod tests {
     }
 
     #[test]
+    fn a_declaration_and_a_write_coexist_whichever_reaches_the_slot_first() {
+        let owner = path("holdem");
+        let key = LuaMemberKey::Name("action".into());
+        // `function holdem.action(...)` in the server file.
+        let declared = make_index_member_id(FileId::new(6), 30);
+        // `holdem.action = { ... }` in the client file.
+        let written = make_index_member_id(FileId::new(5), 20);
+
+        let item_for = |first, second| {
+            let mut index = LuaMemberIndex::new();
+            for (member_id, feature) in [first, second] {
+                index.add_member(
+                    owner.clone(),
+                    LuaMember::new(member_id, key.clone(), feature, None),
+                );
+            }
+            index.get_member_item(&owner, &key).cloned()
+        };
+
+        let both = Some(LuaMemberIndexItem::Many(vec![written, declared]));
+        assert_eq!(
+            item_for(
+                (written, LuaMemberFeature::FileDefine),
+                (declared, LuaMemberFeature::FileMethodDecl),
+            ),
+            both
+        );
+        assert_eq!(
+            item_for(
+                (declared, LuaMemberFeature::FileMethodDecl),
+                (written, LuaMemberFeature::FileDefine),
+            ),
+            both
+        );
+    }
+
+    #[test]
+    fn a_guarded_write_loses_its_slot_however_late_the_real_writer_is_reinserted() {
+        let owner = path("cityrp.deco");
+        let key = LuaMemberKey::Name("stock".into());
+        let real_writer = make_index_member_id(FileId::new(4), 10);
+        let guarded_writer = make_index_member_id(FileId::new(5), 20);
+
+        let mut index = LuaMemberIndex::new();
+        for member_id in [real_writer, guarded_writer] {
+            index.add_member(
+                owner.clone(),
+                LuaMember::new(member_id, key.clone(), LuaMemberFeature::FileDefine, None),
+            );
+        }
+        // Both writes are in before either is known to be guarded, so the slot
+        // holds the latest defined one.
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::One(guarded_writer))
+        );
+
+        // The mark lands after the insert that read it. A placeholder never
+        // displaces a real writer in another file, whichever order the two
+        // reached the index in.
+        index.mark_non_overwriting_assignment_member(guarded_writer);
+        index.settle_non_overwriting_slots();
+        assert_eq!(
+            index.get_member_item(&owner, &key),
+            Some(&LuaMemberIndexItem::One(real_writer))
+        );
+    }
+
+    #[test]
     fn retained_file_define_keeps_owner_key_history() {
         let owner = LuaMemberOwner::Type(LuaTypeDeclId::global("OwnedType"));
         let key = LuaMemberKey::Name("field".into());
@@ -856,11 +925,15 @@ mod tests {
         let earlier_member_id = make_member_id(FileId::new(1), 10);
         let later_member_id = make_member_id(FileId::new(2), 20);
 
-        // Decl inserts append in arrival order, so adding the later id first
-        // leaves the stored item unsorted.
+        // Not every path that builds an item sorts it, so pin the merge against
+        // one that does not.
         let mut index = LuaMemberIndex::new();
         index.add_member(owner.clone(), make_member(later_member_id, "field"));
         index.add_member(owner.clone(), make_member(earlier_member_id, "field"));
+        index.preserve_members_for_owner_key(
+            later_member_id,
+            vec![later_member_id, earlier_member_id],
+        );
         assert_eq!(
             index.get_member_item(&owner, &key),
             Some(&LuaMemberIndexItem::Many(vec![

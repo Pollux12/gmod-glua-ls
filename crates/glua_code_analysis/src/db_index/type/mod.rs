@@ -28,7 +28,7 @@ use std::sync::Arc;
 pub use type_decl::{LuaDeclLocation, LuaDeclTypeKind, LuaTypeDecl, LuaTypeDeclId, LuaTypeFlag};
 pub use type_ops::TypeOps;
 pub(crate) use type_owner::is_undetermined_type;
-pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type};
+pub use type_owner::{LuaTypeCache, LuaTypeOwner, is_informative_type, leaks_unsubstituted_tpl};
 pub use type_visit_trait::TypeVisitTrait;
 pub use types::*;
 

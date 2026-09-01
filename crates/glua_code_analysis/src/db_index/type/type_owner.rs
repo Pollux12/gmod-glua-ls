@@ -133,6 +133,29 @@ pub(crate) fn uninformative_rank(typ: &LuaType) -> Option<u8> {
     }
 }
 
+/// Whether `typ` carries a template parameter in value position — on its own or
+/// as a union arm.
+///
+/// Such a parameter is not a type: it records that the generic call it came out
+/// of was never instantiated, so an answer carrying one is a placeholder rather
+/// than an inference. Deliberately kept out of [`is_informative_type`], which
+/// the checkers read — the arms beside the leak are real, so narrowing and
+/// nil-checking against them stay sound.
+///
+/// Only value positions are checked: a function or table type that is generic
+/// *over* a parameter is a real type.
+pub fn leaks_unsubstituted_tpl(typ: &LuaType) -> bool {
+    match typ {
+        LuaType::TplRef(_) | LuaType::StrTplRef(_) | LuaType::ConstTplRef(_) => true,
+        LuaType::Union(union) => union.types().any(leaks_unsubstituted_tpl),
+        LuaType::MultiLineUnion(union) => union
+            .get_unions()
+            .iter()
+            .any(|(typ, _)| leaks_unsubstituted_tpl(typ)),
+        _ => false,
+    }
+}
+
 /// Total order over the "carries no type information" band:
 /// [`uninformative_rank`] first, then the nullable variant ahead of the
 /// bare one.

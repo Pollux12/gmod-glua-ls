@@ -8629,4 +8629,43 @@ _2 = a[1]
             desc
         );
     }
+
+    /// A truthy guard proves its subject non-nil for a field read, not only for
+    /// a method call. `x:m()` already read the guard off the source when the
+    /// value was too unresolved for flow narrowing; `x.f` reported instead.
+    #[test]
+    fn truthy_guard_proves_an_unresolved_local_for_a_field_read() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        assert!(ws.check_code_for(
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class EntityObject
+            ---@field origin any
+
+            ---@class BspHolder
+            local meta = {}
+
+            ---@return EntityObject[]
+            function meta:GetEntities() end
+
+            local function cachedBrushes(self)
+                if self.__funcBrush then return self.__funcBrush end
+                local entities = self:GetEntities()
+                self.__funcBrush = { [0] = entities[0] }
+                for _, v in pairs(entities) do
+                    self.__funcBrush[1] = v
+                end
+                return self.__funcBrush
+            end
+
+            function meta:Probe(bNum)
+                local brush = cachedBrushes(self)[bNum]
+                if brush then
+                    return brush.origin
+                end
+            end
+            "#
+        ));
+    }
 }

@@ -194,6 +194,16 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             || inferred_guard_changed;
 
         if infer_dynamic_fields {
+            // Before the dynamic-field pass, not only after it: that pass files
+            // a write under whatever table its prefix reads as, and a prefix
+            // that names a slot a guarded self-assignment took before it was
+            // marked reads as the placeholder's table. Every write in the batch
+            // is marked once the walk is done, which is all this election needs,
+            // and re-indexing one file re-inserts its writer without the
+            // co-writer that would take the slot back — so the pass saw the
+            // settled slot on a cold build and the pre-settle one on a warm
+            // re-index, and filed different owners from the same source.
+            db.get_member_index_mut().settle_non_overwriting_slots();
             run_analysis::<dynamic_field::DynamicFieldAnalysisPipeline>(db, &mut context);
             db.get_dynamic_field_index_mut().set_sealed(true);
             context.infer_manager.clear();
@@ -297,6 +307,15 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             db.get_member_index_mut().settle_conditional_branch_slots();
         }
 
+        // A guarded self-assignment is only known to be one after its own
+        // assignment has been analysed, so the slots it shares with a real
+        // writer were elected against an incomplete set of marks. Re-elect them
+        // now that every write in the batch has been marked.
+        {
+            let _p = Profile::new("settle_non_overwriting_slots");
+            db.get_member_index_mut().settle_non_overwriting_slots();
+        }
+
         // A loop over a global has to enumerate the table every realm's file
         // contributed to, so the copies of that global settle first; and only
         // now is every member attached, so a loop that enumerates a table can
@@ -383,6 +402,11 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         }
 
         if std::env::var_os("GLUALS_PROFILE").is_some() {
+            eprintln!(
+                "[profile] member_initializer_candidates={} guarded_member_read_candidates={}",
+                context.member_initializer_reinfer_candidates.len(),
+                context.guarded_member_read_candidates.len(),
+            );
             eprintln!(
                 "[profile] member_assignment_contributions entries={}",
                 db.get_member_index()
@@ -1267,12 +1291,19 @@ fn refresh_local_decl_initializer_caches(
                 && current_cache
                     .as_ref()
                     .is_some_and(|current| cached_provisional_slot_union(current.as_type()));
+            // An `unknown` arm is the read saying it could not settle that part
+            // of the union yet. See [`union_has_unsettled_arm`].
+            let cached_an_unsettled_union = !current_is_uninformative
+                && current_cache
+                    .as_ref()
+                    .is_some_and(|current| union_has_unsettled_arm(current.as_type()));
             if !copies_settled_iter_var
                 && pass.is_settled()
                 && !current_is_uninformative
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
                 && !cached_a_provisional_slot_union
+                && !cached_an_unsettled_union
             {
                 continue;
             }
@@ -1288,12 +1319,8 @@ fn refresh_local_decl_initializer_caches(
             // `local on = LocalPlayer()._flag or false` where re-analysing the
             // same unchanged file cached `true`.
             let inferred_full_fact = infer_expr_fact_with_cache(db, &mut infer_cache, expr.clone());
-            // A bottom taken out of a resolved multi-return is a real runtime
-            // `nil` — the call produces fewer values than the statement binds.
-            // A bottom fabricated by selecting past a non-variadic answer says
-            // only that the call did not resolve, which is no evidence.
             let resolved_variadic_tail =
-                ret_idx > 0 && matches!(inferred_full_fact.typ(), LuaType::Variadic(_));
+                ret_idx > 0 && selects_resolved_result(inferred_full_fact.typ(), ret_idx);
             let inferred_fact = select_result_fact(inferred_full_fact, ret_idx);
             let inferred_type = inferred_fact.typ().clone();
 
@@ -1330,6 +1357,7 @@ fn refresh_local_decl_initializer_caches(
                 && !can_refine_nominal_type
                 && !can_upgrade_authority
                 && !cached_a_blind_dynamic_field_read
+                && !cached_an_unsettled_union
             {
                 continue;
             }
@@ -1368,15 +1396,25 @@ fn refresh_local_decl_initializer_caches(
                         owner: type_owner,
                         fact: inferred_fact,
                     });
-                } else if current_cache.as_ref().is_some_and(|current| {
-                    LuaTypeCache::InferType(inferred_type.clone()).supersedes(current)
-                }) {
+                } else if pass.is_settled()
+                    && current_cache.as_ref().is_some_and(|current| {
+                        LuaTypeCache::InferType(inferred_type.clone()).supersedes(current)
+                    })
+                {
                     // Both answers carry no type information, but one of them
                     // admits more values — `any|nil` over `any`, the difference
                     // between reporting a nil check and not. Which one is cached
                     // otherwise comes down to how far the batch had run when the
                     // read was taken, so the settled one is taken here on the
                     // same rule the type index itself applies.
+                    //
+                    // Settled passes only. The rule is a one-way ratchet: it
+                    // lets a more permissive answer replace the cache and never
+                    // the reverse, so a full pass placing `any` outranks every
+                    // settled round that answers `nil`, and the transient one
+                    // stands. Which pass read the more complete index is a
+                    // property of the batch — a warm re-index kept `any` for
+                    // `report.data[1]` where a cold build kept `nil`.
                     result.updates.push(InitializerCacheUpdate::Bind {
                         owner: type_owner,
                         fact: inferred_fact,
@@ -1410,15 +1448,25 @@ fn refresh_local_decl_initializer_caches(
                 && current_cache.as_ref().is_some_and(|current| {
                     is_strict_nominal_refinement(db, &inferred_type, current.as_type())
                 });
-            let is_settled_widening = current_cache
+            let is_settled_widening = current_cache.as_ref().is_some_and(|current| {
+                union_widens_cached_type(&inferred_type, current.as_type())
+                    || settled_widens_cached_literals(&inferred_type, current.as_type())
+            });
+            // A cache carrying an unsubstituted template parameter records that
+            // the generic call it came from never got instantiated, and the
+            // settled read has now instantiated it. `Bind` weighs the two as
+            // types, and the leak reads as a real one, so this goes through the
+            // force path.
+            let cached_a_tpl_leak = current_cache
                 .as_ref()
-                .is_some_and(|current| union_widens_cached_type(&inferred_type, current.as_type()));
-            if current_is_uninformative {
+                .is_some_and(|current| crate::db_index::leaks_unsubstituted_tpl(current.as_type()));
+            if current_is_uninformative && !cached_a_tpl_leak {
                 result.updates.push(InitializerCacheUpdate::Bind {
                     owner: type_owner,
                     fact: inferred_fact,
                 });
-            } else if copies_settled_iter_var
+            } else if cached_a_tpl_leak
+                || copies_settled_iter_var
                 || has_stronger_declared_authority
                 || is_nominal_refinement
                 || is_settled_widening
@@ -1469,18 +1517,37 @@ fn refresh_local_decl_initializer_caches(
 ///
 /// A settled merge answers `MergedTable`, never this shape, so re-reading is
 /// idempotent: the repaired cache no longer matches.
+///
+/// An arm carrying no type of its own is not one of the slot's writers: the
+/// read adds `nil` for a branch it found no member on and `any` for a sibling
+/// it could not resolve. Letting one veto the shape left the repair unable to
+/// see the very unions it exists for — a double dynamic index over a table
+/// several files write reads as `nil|any|<2052 literals>`.
 fn cached_provisional_slot_union(typ: &LuaType) -> bool {
     let LuaType::Union(union) = typ else {
         return false;
     };
     let mut count = 0;
     for component in union.types() {
+        if !crate::db_index::is_informative_type(component) {
+            continue;
+        }
         if !matches!(component, LuaType::TableConst(_)) {
             return false;
         }
         count += 1;
     }
     count > 1
+}
+
+/// Whether the cached answer is a union one of whose arms never settled.
+///
+/// An `unknown` arm is not a value the slot can hold; it is the read reporting
+/// that the contributor behind that arm had not resolved when the answer was
+/// taken. Whether it had is a property of how far the batch got, so the read is
+/// provisional and worth taking again once everything has landed.
+fn union_has_unsettled_arm(typ: &LuaType) -> bool {
+    matches!(typ, LuaType::Union(union) if union.types().any(|arm| matches!(arm, LuaType::Unknown)))
 }
 
 /// Whether the re-derived type is a union that already contains everything the
@@ -1505,6 +1572,34 @@ pub(crate) fn union_widens_cached_type(inferred: &LuaType, current: &LuaType) ->
     }
 }
 
+/// Whether the settled answer is the primitive every arm of the cached union
+/// widens to.
+///
+/// The cache then lists the literals this batch had reached when the read was
+/// taken, and the settled read answers with the primitive the whole writer set
+/// shares — `""|"Public Area"|"Public Property"` against `string` for a map
+/// table several files write. Which literals were in it is decided by how far
+/// the batch had run, so the collapsed answer replaces them.
+/// [`union_widens_cached_type`] covers the same snapshot where the settled
+/// answer is itself a union; this is that answer already collapsed.
+///
+/// Every arm has to be a literal the settled answer is the primitive *of*.
+/// An arm carrying no type of its own is not one: `supersedes` would take a
+/// `nil` arm as replaceable and the collapse would drop it, turning
+/// `string|nil` into `string` and silencing every nil check on the slot.
+fn settled_widens_cached_literals(inferred: &LuaType, current: &LuaType) -> bool {
+    let LuaType::Union(union) = current else {
+        return false;
+    };
+    let mut arms = union.types().peekable();
+    arms.peek().is_some()
+        && arms.all(|arm| {
+            crate::db_index::is_informative_type(arm)
+                && LuaTypeCache::InferType(inferred.clone())
+                    .supersedes(&LuaTypeCache::InferType(arm.clone()))
+        })
+}
+
 /// The union arms that carry information. An `unknown` arm stands for a type
 /// that has not settled yet, so it can neither widen a cache nor block one.
 fn known_arms(union: &LuaUnionType) -> Vec<LuaType> {
@@ -1520,12 +1615,19 @@ fn refresh_member_initializer_caches(
     context: &mut AnalyzeContext,
     pass: InitializerPass<'_>,
 ) -> HashSet<LuaTypeOwner> {
-    if context.member_initializer_reinfer_candidates.is_empty() {
+    if context.member_initializer_reinfer_candidates.is_empty()
+        && context.guarded_member_read_candidates.is_empty()
+    {
         return HashSet::default();
     }
 
+    let guarded = &context.guarded_member_read_candidates;
     let mut candidates_by_file = HashMap::<FileId, Vec<LuaMemberId>>::default();
-    for member_id in &context.member_initializer_reinfer_candidates {
+    for member_id in context
+        .member_initializer_reinfer_candidates
+        .iter()
+        .chain(guarded)
+    {
         candidates_by_file
             .entry(member_id.file_id)
             .or_default()
@@ -1533,6 +1635,9 @@ fn refresh_member_initializer_caches(
     }
     for candidates in candidates_by_file.values_mut() {
         candidates.sort_by_key(LuaMemberId::get_position);
+        // The two candidate sets overlap: a guarded read can also be a nominal
+        // one, and re-deriving it twice would only repeat the same answer.
+        candidates.dedup();
     }
     let mut file_ids = candidates_by_file.keys().copied().collect::<Vec<_>>();
     file_ids.retain(|file_id| context.settled_file_reads_moved(*file_id, pass.moved()));
@@ -1579,7 +1684,9 @@ fn refresh_member_initializer_caches(
             // it holds now is no evidence against re-reading it.
             let copies_settled_iter_var =
                 pass.is_settled() && common::reads_settling_iter_var(db, file_id, &expr);
+            let reads_field_exist_guard = guarded.contains(member_id);
             if !copies_settled_iter_var
+                && !reads_field_exist_guard
                 && !current_is_uninformative
                 && single_nominal_type_id(current_cache.as_type()).is_none()
             {
@@ -1592,6 +1699,13 @@ fn refresh_member_initializer_caches(
                 continue;
             }
             let takes_inferred_type = if copies_settled_iter_var {
+                true
+            } else if reads_field_exist_guard
+                && union_widens_cached_type(&inferred_type, current_cache.as_type())
+            {
+                // The guard's narrowing has since seen every type that owns the
+                // key, so the settled answer is the cached one with the owners
+                // the walk had not reached folded in.
                 true
             } else if current_is_uninformative {
                 // A placeholder is not an answer: it only records that the
@@ -1708,6 +1822,18 @@ fn apply_initializer_cache_updates(db: &mut DbIndex, updates: Vec<InitializerCac
         }
     }
     db.publish_inference_facts(fact_updates);
+}
+
+/// Whether selecting result `result_idx` out of a call answering `typ` reads a
+/// value the call actually produced.
+///
+/// [`select_result_fact`] answers `nil` for any index past a non-variadic type.
+/// Out of a resolved multi-return that `nil` is real — the call returns fewer
+/// values than the statement binds. Out of an answer that never resolved to a
+/// multi-return it is fabricated, and records only that the call did not
+/// resolve, which is no evidence about the value.
+fn selects_resolved_result(typ: &LuaType, result_idx: usize) -> bool {
+    result_idx == 0 || matches!(typ, LuaType::Variadic(_))
 }
 
 fn select_result_fact(fact: LuaTypeFact, result_idx: usize) -> LuaTypeFact {
@@ -1838,15 +1964,7 @@ fn is_bottom(typ: &LuaType) -> bool {
 }
 
 fn type_is_uninformative(typ: &LuaType) -> bool {
-    match typ {
-        LuaType::Any | LuaType::Unknown | LuaType::Nil | LuaType::Never => true,
-        LuaType::Union(union) => union.types().all(type_is_uninformative),
-        LuaType::MultiLineUnion(union) => union
-            .get_unions()
-            .iter()
-            .all(|(typ, _)| type_is_uninformative(typ)),
-        _ => false,
-    }
+    !crate::db_index::is_informative_type(typ) || crate::db_index::leaks_unsubstituted_tpl(typ)
 }
 
 fn synthesize_accessorfunc_members(db: &mut DbIndex, file_ids: &[FileId]) {
@@ -2046,6 +2164,9 @@ pub struct AnalyzeContext {
     pending_unresolve_decl_ids: HashSet<LuaDeclId>,
     uninformative_local_decl_candidates: HashSet<LuaDeclId>,
     member_initializer_reinfer_candidates: HashSet<LuaMemberId>,
+    /// Member writes whose value read through a field-exist guard. See
+    /// [`AnalyzeContext::request_guarded_member_read_reinfer`].
+    guarded_member_read_candidates: HashSet<LuaMemberId>,
     infer_manager: InferCacheManager,
     inferred_guard_dependencies: HashMap<FileId, HashSet<LuaInferredGuardOwner>>,
     inferred_guard_candidates: Vec<InFiled<LuaSyntaxId>>,
@@ -2107,6 +2228,7 @@ impl AnalyzeContext {
             pending_unresolve_decl_ids: HashSet::default(),
             uninformative_local_decl_candidates: HashSet::default(),
             member_initializer_reinfer_candidates: HashSet::default(),
+            guarded_member_read_candidates: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::default(),
             inferred_guard_candidates: Vec::new(),
@@ -2384,10 +2506,36 @@ impl AnalyzeContext {
             );
             for (file_id, owner, expr, ret_idx) in &self.call_site_return_targets {
                 let cache = self.infer_manager.get_infer_cache(*file_id);
-                let fact = select_result_fact(
-                    infer_expr_fact_with_cache(db, cache, expr.clone()),
-                    *ret_idx,
-                );
+                let full = infer_expr_fact_with_cache(db, cache, expr.clone());
+                // Publishing the fabricated `nil` would overwrite whatever the
+                // walk derived with a record that this consumer's call is still
+                // unresolved. Which consumers run at all depends on which
+                // signatures this batch requeued, so that overwrite lands on a
+                // warm re-index and not on a cold build. Leaving the slot alone
+                // keeps both on the answer the walk reached.
+                if !selects_resolved_result(full.typ(), *ret_idx) {
+                    continue;
+                }
+                let fact = select_result_fact(full, *ret_idx);
+                // Same reasoning one step further. A declaration whose slot an
+                // ordered write claimed has had its writers arbitrated already:
+                // `bind_decl_write` ranks `any` against the informative ones and
+                // leaves two uninformative answers to the type index's own
+                // order. A result that loses that ranking would overrule the
+                // arbitration only on the runs where the batch happened to
+                // requeue this consumer's signature.
+                if !crate::db_index::is_informative_type(fact.typ())
+                    && matches!(owner, LuaTypeOwner::Decl(decl_id)
+                        if db.get_type_index().decl_write_claim(decl_id).is_some())
+                    && db
+                        .get_type_index()
+                        .get_type_cache(owner)
+                        .is_some_and(|current| {
+                            !LuaTypeCache::InferType(fact.typ().clone()).supersedes(current)
+                        })
+                {
+                    continue;
+                }
                 fact_updates.push((LuaInferenceNodeId::TypeOwner(owner.clone()), fact.clone()));
                 if let Some(definitions) = self.call_site_return_definition_refreshes.get(owner) {
                     for definition in definitions {
@@ -2476,6 +2624,16 @@ impl AnalyzeContext {
 
     pub fn request_member_initializer_reinfer(&mut self, member_id: LuaMemberId) {
         self.member_initializer_reinfer_candidates.insert(member_id);
+    }
+
+    /// Queues a member write whose value read a member the enclosing `if`
+    /// tested for existence.
+    ///
+    /// That guard narrows the receiver to the types owning the key, taken
+    /// straight off the member index, so the read answers from however many of
+    /// those types the batch had walked. Re-derived once they all stand.
+    pub fn request_guarded_member_read_reinfer(&mut self, member_id: LuaMemberId) {
+        self.guarded_member_read_candidates.insert(member_id);
     }
 
     fn add_inferred_guard_dependencies(
@@ -2634,7 +2792,10 @@ fn return_point_contains_range(point: &LuaReturnPoint, range: rowan::TextRange) 
 
 #[cfg(test)]
 mod union_widening_tests {
-    use super::union_widens_cached_type;
+    use super::{
+        cached_provisional_slot_union, settled_widens_cached_literals, union_has_unsettled_arm,
+        union_widens_cached_type,
+    };
     use crate::LuaType;
 
     fn union(arms: Vec<LuaType>) -> LuaType {
@@ -2675,10 +2836,93 @@ mod union_widening_tests {
     }
 
     #[test]
+    fn spots_a_provisional_slot_union_beside_an_uninformative_arm() {
+        let literals = |extra: Vec<LuaType>| {
+            let mut arms = vec![
+                LuaType::TableConst(crate::InFiled::new(
+                    crate::FileId::new(1),
+                    rowan::TextRange::new(0.into(), 1.into()),
+                )),
+                LuaType::TableConst(crate::InFiled::new(
+                    crate::FileId::new(1),
+                    rowan::TextRange::new(2.into(), 3.into()),
+                )),
+            ];
+            arms.extend(extra);
+            union(arms)
+        };
+        // The read's own `nil`/`any` arms do not stop the rest being the
+        // provisional flat-literal shape.
+        assert!(cached_provisional_slot_union(&literals(vec![])));
+        assert!(cached_provisional_slot_union(&literals(vec![LuaType::Nil])));
+        assert!(cached_provisional_slot_union(&literals(vec![
+            LuaType::Nil,
+            LuaType::Any
+        ])));
+        // A real non-table arm still does.
+        assert!(!cached_provisional_slot_union(&literals(vec![
+            LuaType::String
+        ])));
+        // And one literal is not the shape, however many placeholders sit
+        // beside it.
+        assert!(!cached_provisional_slot_union(&union(vec![
+            LuaType::TableConst(crate::InFiled::new(
+                crate::FileId::new(1),
+                rowan::TextRange::new(0.into(), 1.into()),
+            )),
+            LuaType::Nil,
+            LuaType::Any,
+        ])));
+    }
+
+    #[test]
     fn rejects_an_equal_union() {
         let settled = union(vec![LuaType::Number, LuaType::Any]);
         let cached = union(vec![LuaType::Number, LuaType::Any]);
         assert!(!union_widens_cached_type(&settled, &cached));
+    }
+
+    #[test]
+    fn collapses_a_cached_literal_union_to_its_primitive() {
+        let cached = union(vec![
+            LuaType::StringConst(smol_str::SmolStr::new("").into()),
+            LuaType::StringConst(smol_str::SmolStr::new("Public Area").into()),
+        ]);
+        assert!(settled_widens_cached_literals(&LuaType::String, &cached));
+    }
+
+    #[test]
+    fn keeps_a_cached_union_the_settled_primitive_does_not_cover() {
+        // A `nil` arm has no primitive to widen to, so collapsing would drop it.
+        let with_nil = union(vec![
+            LuaType::StringConst(smol_str::SmolStr::new("a").into()),
+            LuaType::Nil,
+        ]);
+        assert!(!settled_widens_cached_literals(&LuaType::String, &with_nil));
+        // A literal of another primitive is not covered either.
+        let mixed = union(vec![
+            LuaType::StringConst(smol_str::SmolStr::new("a").into()),
+            LuaType::IntegerConst(1),
+        ]);
+        assert!(!settled_widens_cached_literals(&LuaType::String, &mixed));
+        // And a non-union cache is never this shape.
+        assert!(!settled_widens_cached_literals(
+            &LuaType::String,
+            &LuaType::StringConst(smol_str::SmolStr::new("a").into())
+        ));
+    }
+
+    #[test]
+    fn spots_the_unsettled_arm_of_a_cached_union() {
+        assert!(union_has_unsettled_arm(&union(vec![
+            LuaType::String,
+            LuaType::Unknown
+        ])));
+        assert!(!union_has_unsettled_arm(&union(vec![
+            LuaType::String,
+            LuaType::Nil
+        ])));
+        assert!(!union_has_unsettled_arm(&LuaType::Unknown));
     }
 
     #[test]
