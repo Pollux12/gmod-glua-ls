@@ -1502,6 +1502,13 @@ impl LuaTypeIndex {
         self.full_name_type_map.values().collect()
     }
 
+    /// [`get_all_types`](Self::get_all_types) without collecting, for the
+    /// analyzer paths that only scan and would otherwise allocate a vector of
+    /// every type in the workspace on each call.
+    pub fn iter_type_decls(&self) -> impl Iterator<Item = &LuaTypeDecl> {
+        self.full_name_type_map.values()
+    }
+
     pub fn get_file_namespaces(&self) -> Vec<String> {
         self.file_namespace
             .values()
