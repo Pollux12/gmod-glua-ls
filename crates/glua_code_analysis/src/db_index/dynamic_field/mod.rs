@@ -155,13 +155,14 @@ impl DynamicFieldIndex {
         Self::default()
     }
 
+    /// Returns whether the definition site was new to the index.
     pub fn add_field(
         &mut self,
         owner: DynamicFieldOwner,
         field_name: SmolStr,
         file_id: FileId,
         range: TextRange,
-    ) {
+    ) -> bool {
         let definition = InFiled::new(file_id, range);
         let direct_definitions = self
             .direct_field_definitions
@@ -172,7 +173,7 @@ impl DynamicFieldIndex {
         if !direct_definitions.contains(&definition) {
             direct_definitions.push(definition);
         }
-        self.add_field_inner(owner, field_name, file_id, range);
+        self.add_field_inner(owner, field_name, file_id, range)
     }
 
     pub fn add_propagated_field(
@@ -191,7 +192,7 @@ impl DynamicFieldIndex {
         field_name: SmolStr,
         file_id: FileId,
         range: TextRange,
-    ) {
+    ) -> bool {
         self.owner_fields
             .entry(owner.clone())
             .or_default()
@@ -223,14 +224,16 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push((owner, field_name, range));
         }
+        is_new_definition
     }
 
+    /// Returns whether the definition site was new to the index.
     pub fn add_wildcard_definition(
         &mut self,
         owner: DynamicFieldOwner,
         file_id: FileId,
         range: TextRange,
-    ) {
+    ) -> bool {
         let definitions = self.wildcard_definitions.entry(owner.clone()).or_default();
         let definition = InFiled::new(file_id, range);
         let is_new_definition = !definitions.contains(&definition);
@@ -241,6 +244,7 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push((owner, range));
         }
+        is_new_definition
     }
 
     pub fn add_unattributed_field(&mut self, field_name: SmolStr, file_id: FileId) {
@@ -255,6 +259,26 @@ impl DynamicFieldIndex {
                 .or_default()
                 .push(field_name);
         }
+    }
+
+    /// Takes back an unattributed record once a settled retry has attributed
+    /// the write to a real owner.
+    /// Returns whether a record was actually removed.
+    pub fn remove_unattributed_field(&mut self, field_name: &str, file_id: FileId) -> bool {
+        let mut removed = false;
+        if let Some(files) = self.unattributed_fields.get_mut(field_name) {
+            removed = files.remove(&file_id);
+            if removed && files.is_empty() {
+                self.unattributed_fields.remove(field_name);
+            }
+        }
+        if let Some(names) = self.unattributed_file_contributions.get_mut(&file_id) {
+            names.retain(|name| name != field_name);
+            if names.is_empty() {
+                self.unattributed_file_contributions.remove(&file_id);
+            }
+        }
+        removed
     }
 
     /// Re-keys the table-literal owners in the edited file and drops the
@@ -557,6 +581,39 @@ impl DynamicFieldIndex {
         self.wildcard_definitions
             .get(owner)
             .is_some_and(|definitions| !definitions.is_empty())
+    }
+
+    /// Every owner's assigning-file records, for whole-index snapshots.
+    pub fn iter_all_owner_fields(
+        &self,
+    ) -> impl Iterator<Item = (&DynamicFieldOwner, &HashMap<SmolStr, HashSet<FileId>>)> {
+        self.owner_fields.iter()
+    }
+
+    /// Every owner's field-definition sites, for whole-index snapshots.
+    pub fn iter_all_field_definitions(
+        &self,
+    ) -> impl Iterator<
+        Item = (
+            &DynamicFieldOwner,
+            &HashMap<SmolStr, Vec<InFiled<TextRange>>>,
+        ),
+    > {
+        self.field_definitions.iter()
+    }
+
+    /// Every unattributed-field record, for whole-index snapshots.
+    pub fn iter_all_unattributed_fields(
+        &self,
+    ) -> impl Iterator<Item = (&SmolStr, &HashSet<FileId>)> {
+        self.unattributed_fields.iter()
+    }
+
+    /// Every finite-named-member record, for whole-index snapshots.
+    pub fn iter_all_finite_named_members(
+        &self,
+    ) -> impl Iterator<Item = (&DynamicFieldOwner, &HashSet<LuaMemberId>)> {
+        self.finite_named_members.iter()
     }
 
     pub fn get_all_wildcard_definitions(&self) -> Vec<InFiled<TextRange>> {

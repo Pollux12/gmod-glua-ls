@@ -243,8 +243,10 @@ fn collect_dynamic_fields_for_file(
     Vec<FiniteNamedMemberEvidence>,
     rustc_hash::FxHashSet<LuaInferredGuardOwner>,
     Vec<SmolStr>,
+    Vec<glua_parser::LuaSyntaxId>,
 ) {
     let mut collected_unattributed: Vec<SmolStr> = Vec::new();
+    let mut dynamic_field_retry: Vec<glua_parser::LuaSyntaxId> = Vec::new();
     let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
         Vec::new();
     let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
@@ -301,12 +303,20 @@ fn collect_dynamic_fields_for_file(
             let prefix_type = if let Some(cached_type) = prefix_type_cache.get(&cache_key) {
                 match cached_type {
                     Some(prefix_type) => prefix_type.clone(),
-                    None => continue,
+                    None => {
+                        if should_collect_wildcard {
+                            dynamic_field_retry.push(index_expr.get_syntax_id());
+                        }
+                        continue;
+                    }
                 }
             } else {
                 let inferred = infer_expr(db, cache, prefix_expr.clone()).ok();
                 prefix_type_cache.insert(cache_key, inferred.clone());
                 let Some(prefix_type) = inferred else {
+                    if should_collect_wildcard {
+                        dynamic_field_retry.push(index_expr.get_syntax_id());
+                    }
                     continue;
                 };
                 prefix_type
@@ -320,12 +330,20 @@ fn collect_dynamic_fields_for_file(
                 prefix_type
             };
             if should_collect_wildcard {
+                let before = collected_wildcards.len();
                 collect_wildcard_for_type(
                     &effective_type,
                     file_id,
                     definition_range,
                     &mut collected_wildcards,
                 );
+                // The write is dynamic and real, but the prefix's type held no
+                // nameable table yet. Whether it does is a property of how far
+                // the batch had settled, so the site is retried once settling
+                // is done. See `rederive_settled_dynamic_fields`.
+                if collected_wildcards.len() == before {
+                    dynamic_field_retry.push(index_expr.get_syntax_id());
+                }
             }
 
             if is_dynamic_index_key(&index_expr) && !field_names.names.is_empty() {
@@ -371,9 +389,12 @@ fn collect_dynamic_fields_for_file(
                     );
                     // The write is real but landed on no owner the index can
                     // name, so record that the field exists somewhere even
-                    // though no table claims it.
+                    // though no table claims it — and queue the site for the
+                    // settled retry, which attributes it properly once the
+                    // prefix's type has finished settling.
                     if collected.len() == before {
                         collected_unattributed.push(field_name.clone());
+                        dynamic_field_retry.push(index_expr.get_syntax_id());
                     }
                 }
             }
@@ -405,6 +426,7 @@ fn collect_dynamic_fields_for_file(
         collected_finite_members,
         cache.take_inferred_guard_dependencies(),
         collected_unattributed,
+        dynamic_field_retry,
     )
 }
 
@@ -451,6 +473,7 @@ fn analyze_dynamic_fields(
                 Vec::new(),
                 Default::default(),
                 Vec::new(),
+                Vec::new(),
             );
         };
         collect_dynamic_fields_for_file(db, file_id, &root, mode, &field_setter_helpers)
@@ -461,7 +484,14 @@ fn analyze_dynamic_fields(
     let merge_start = profile_enabled.then(std::time::Instant::now);
     let mut collected_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
     for (
-        (file_collected, file_wildcards, file_finite_members, dependencies, file_unattributed),
+        (
+            file_collected,
+            file_wildcards,
+            file_finite_members,
+            dependencies,
+            file_unattributed,
+            file_dynamic_field_retry,
+        ),
         file_id,
     ) in per_file.into_iter().zip(file_ids)
     {
@@ -473,6 +503,9 @@ fn analyze_dynamic_fields(
                 .into_iter()
                 .map(|field_name| (field_name, file_id)),
         );
+        for syntax_id in file_dynamic_field_retry {
+            context.record_settled_dynamic_field_candidate(file_id, syntax_id);
+        }
         context.add_inferred_guard_dependencies(file_id, dependencies);
     }
     if let (Some(profile), Some(merge_start)) = (profile.as_mut(), merge_start) {
@@ -1879,6 +1912,133 @@ fn collect_string_const_names(typ: &LuaType, names: &mut Vec<SmolStr>) {
     }
 }
 
+/// Re-derives the dynamic-field sites whose prefix held no nameable table
+/// when the dynamic-field pass ran: wildcards that were silently dropped, and
+/// named writes that landed unattributed.
+///
+/// That pass runs before the unresolve waves and the settled tail, so a prefix
+/// fed by a late-settling fact (a member still widening, an iterator variable
+/// over one) answers with nothing — and whether it does depends on how far
+/// the batch had settled, not on the source. Taking the answer again after
+/// settling makes the field and wildcard sets a property of the code. A named
+/// write the retry attributes takes its unattributed record with it, which is
+/// what an in-phase attribution would have produced.
+/// Returns whether it changed the dynamic-field index at all, so the settled
+/// tail knows to run another round: the records it adds feed the same reads
+/// (member maps, iterated tables) the other settled passes re-derive from.
+pub(crate) fn rederive_settled_dynamic_fields(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+) -> bool {
+    // Kept, not taken: the settled tail runs to a fixpoint and each round
+    // re-derives the same candidates against what the previous one landed.
+    let mut candidates = context.settled_dynamic_field_candidates.clone();
+    if candidates.is_empty() {
+        return false;
+    }
+    candidates.sort_by_key(|(file_id, syntax_id)| (*file_id, syntax_id.get_range().start()));
+    candidates.dedup();
+
+    let mut collected: Vec<(DynamicFieldOwner, SmolStr, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    let mut collected_wildcards: Vec<(DynamicFieldOwner, crate::FileId, rowan::TextRange)> =
+        Vec::new();
+    let mut attributed_unattributed: Vec<(SmolStr, crate::FileId)> = Vec::new();
+    let mut current_file: Option<(
+        crate::FileId,
+        glua_parser::LuaChunk,
+        crate::LuaInferCache,
+        Option<FxHashMap<LuaDeclId, Vec<TextSize>>>,
+    )> = None;
+    for (file_id, syntax_id) in candidates {
+        if current_file
+            .as_ref()
+            .is_none_or(|(id, _, _, _)| *id != file_id)
+        {
+            let Some(chunk) = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .map(|tree| tree.get_chunk_node())
+            else {
+                continue;
+            };
+            let cache = crate::LuaInferCache::new(
+                file_id,
+                crate::CacheOptions {
+                    analysis_phase: crate::LuaAnalysisPhase::Force,
+                    dynamic_fields_visible: true,
+                    building_dynamic_field_index: true,
+                },
+            );
+            current_file = Some((file_id, chunk, cache, None));
+        }
+        let Some((_, root, cache, local_reassignment_positions)) = current_file.as_mut() else {
+            continue;
+        };
+        let Some(index_expr) = syntax_id
+            .to_node_from_root(root.syntax())
+            .and_then(glua_parser::LuaIndexExpr::cast)
+        else {
+            continue;
+        };
+        let Some(prefix_expr) = index_expr.get_prefix_expr() else {
+            continue;
+        };
+        let Some(definition_range) = index_expr.get_index_key().and_then(|k| k.get_range()) else {
+            continue;
+        };
+        let Ok(prefix_type) = infer_expr(db, cache, prefix_expr.clone()) else {
+            continue;
+        };
+        let effective_type =
+            infer_setmetatable_target_type(db, cache, &prefix_expr, index_expr.get_range())
+                .unwrap_or(prefix_type);
+
+        let field_names =
+            get_field_names(db, cache, root, local_reassignment_positions, &index_expr);
+        if is_dynamic_index_key(&index_expr) && field_names.may_have_other_string_names {
+            collect_wildcard_for_type(
+                &effective_type,
+                file_id,
+                definition_range,
+                &mut collected_wildcards,
+            );
+        }
+        for field_name in field_names.names {
+            let before = collected.len();
+            collect_for_type(
+                &effective_type,
+                &field_name,
+                file_id,
+                definition_range,
+                &mut collected,
+            );
+            if collected.len() > before {
+                attributed_unattributed.push((field_name, file_id));
+            }
+        }
+    }
+
+    for (owner, _, _, _) in &mut collected {
+        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+    }
+    for (owner, _, _) in &mut collected_wildcards {
+        *owner = crate::canonical_dynamic_field_owner(db, owner.clone());
+    }
+    let index = db.get_dynamic_field_index_mut();
+    let mut changed = false;
+    for (owner, field_name, file_id, range) in collected {
+        changed |= index.add_field(owner, field_name, file_id, range);
+    }
+    for (owner, file_id, range) in collected_wildcards {
+        changed |= index.add_wildcard_definition(owner, file_id, range);
+    }
+    for (field_name, file_id) in attributed_unattributed {
+        changed |= index.remove_unattributed_field(&field_name, file_id);
+    }
+    changed
+}
+
 fn collect_wildcard_for_type(
     typ: &LuaType,
     file_id: crate::FileId,
@@ -1904,6 +2064,13 @@ fn collect_wildcard_for_type(
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
+                collect_wildcard_for_type(t, file_id, range, result);
+            }
+        }
+        // See `collect_for_type`: a merged table stands for its backing
+        // literals.
+        LuaType::MergedTable(merged) => {
+            for t in merged.get_types() {
                 collect_wildcard_for_type(t, file_id, range, result);
             }
         }
@@ -1943,6 +2110,14 @@ fn collect_for_type(
         }
         LuaType::Union(union_type) => {
             for t in union_type.types() {
+                collect_for_type(t, field_name, file_id, range, result);
+            }
+        }
+        // A merged table is the same runtime table seen through several
+        // backing literals; the write belongs to each of them, exactly as it
+        // does when inference answers with the literals unmerged.
+        LuaType::MergedTable(merged) => {
+            for t in merged.get_types() {
                 collect_for_type(t, field_name, file_id, range, result);
             }
         }
@@ -1999,6 +2174,20 @@ fn collect_finite_member_for_type(
         }
         LuaType::Union(union_type) => {
             for typ in union_type.types() {
+                collect_finite_member_for_type(
+                    typ,
+                    member_id,
+                    file_id,
+                    range,
+                    has_finite_domain,
+                    result,
+                );
+            }
+        }
+        // See `collect_for_type`: a merged table stands for its backing
+        // literals.
+        LuaType::MergedTable(merged) => {
+            for typ in merged.get_types() {
                 collect_finite_member_for_type(
                     typ,
                     member_id,

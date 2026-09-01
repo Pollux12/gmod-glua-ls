@@ -97,6 +97,18 @@ pub fn analyze_local_stat(analyzer: &mut LuaAnalyzer, local_stat: LuaLocalStat) 
             analyzer
                 .context
                 .request_uninformative_local_decl_reinfer(decl_id);
+            // The names past the expression list bind this call's extra
+            // return values, so their caches read through the same call and
+            // need the same settled re-infer. They take no type here — the
+            // multi-return binding does that.
+            if i + 1 == expr_count {
+                for tail_name in name_list.iter().skip(expr_count) {
+                    let tail_decl_id = LuaDeclId::new(analyzer.file_id, tail_name.get_position());
+                    analyzer
+                        .context
+                        .request_uninformative_local_decl_reinfer(tail_decl_id);
+                }
+            }
         }
         // A read through a multi-declaration global answers from whichever backing
         // tables the walk had reached; a decl deferred to the unresolve wave never

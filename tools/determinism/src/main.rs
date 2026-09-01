@@ -128,6 +128,12 @@
 //!                     reindex   full clear + rebuild, the ground truth
 //!                     order     rebuild with the file list reversed
 //!                     split:N   rebuild in N batches instead of one
+//!                     batchexpand  re-walk each DET_TARGETS entry's expansion
+//!                               in one `reindex_expanded_files` batch with the
+//!                               text untouched. Localises sites that flip when
+//!                               re-derived against a settled retained
+//!                               neighborhood, without the edit signal `burst`
+//!                               carries
 //!                     mainreindex  re-analyse every main-workspace file at
 //!                               once, deliberately *without* the dependency
 //!                               expansion
@@ -157,13 +163,14 @@
 //!                   modules, globals, diagnostics (and their disable
 //!                   actions), operators, dependency sites, gmod load/hook/
 //!                   system/realm/scoped-class/network/class metadata,
-//!                   dynamic-field wildcards, accessor-func calls,
+//!                   dynamic-field wildcards, dynamic-field owner/field maps
+//!                   (with unattributed names and finite members), accessor-func
+//!                   calls,
 //!                   properties, and metatables. Not covered: flow index
 //!                   (signature casts, special-call effects), the
-//!                   name-keyed accessor-func annotation table, dynamic-field
-//!                   owner/field maps beyond wildcards, and numeric-range
-//!                   population -- none expose a public whole-index
-//!                   iterator
+//!                   name-keyed accessor-func annotation table, and
+//!                   numeric-range population -- none expose a public
+//!                   whole-index iterator
 //!   DET_DUMP_INDEX  directory to write each index snapshot to as `<label>.idx`.
 //!                   The stage diffs only compare snapshots *within* one process;
 //!                   this writes them out so two runs of the same binary on the
@@ -720,6 +727,7 @@ struct IndexSnapshot {
     gmod_network_wire_coverage: HashDumpResult,
     gmod_class_file_metadata: HashDumpResult,
     dynamic_field_wildcards: HashDumpResult,
+    dynamic_fields: HashDumpResult,
     accessor_func_calls: HashDumpResult,
     properties: HashDumpResult,
     metatables: HashDumpResult,
@@ -1188,6 +1196,48 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         dynamic_field_wildcards.insert(format!("{entry:?}"), format!("{entry:?}"));
     }
 
+    // The named-field maps, unattributed names and finite members the wildcard
+    // bucket does not cover. Hash-set values render sorted so two processes
+    // agree on the text.
+    let mut dynamic_fields = HashDump::new("dynamic_fields");
+    let dynamic_field_index = db.get_dynamic_field_index();
+    for (owner, fields) in dynamic_field_index.iter_all_owner_fields() {
+        for (field_name, files) in fields {
+            let mut files = files.iter().map(|f| f.id).collect::<Vec<_>>();
+            files.sort_unstable();
+            dynamic_fields.insert(
+                format!("OWNERFIELD {owner:?}|{field_name}"),
+                format!("{files:?}"),
+            );
+        }
+    }
+    for (owner, fields) in dynamic_field_index.iter_all_field_definitions() {
+        for (field_name, definitions) in fields {
+            let mut definitions = definitions
+                .iter()
+                .map(|d| format!("{d:?}"))
+                .collect::<Vec<_>>();
+            definitions.sort_unstable();
+            dynamic_fields.insert(
+                format!("FIELDDEF {owner:?}|{field_name}"),
+                format!("{definitions:?}"),
+            );
+        }
+    }
+    for (field_name, files) in dynamic_field_index.iter_all_unattributed_fields() {
+        let mut files = files.iter().map(|f| f.id).collect::<Vec<_>>();
+        files.sort_unstable();
+        dynamic_fields.insert(format!("UNATTRIBUTED {field_name}"), format!("{files:?}"));
+    }
+    for (owner, member_ids) in dynamic_field_index.iter_all_finite_named_members() {
+        let mut member_ids = member_ids
+            .iter()
+            .map(|m| format!("{m:?}"))
+            .collect::<Vec<_>>();
+        member_ids.sort_unstable();
+        dynamic_fields.insert(format!("FINITE {owner:?}"), format!("{member_ids:?}"));
+    }
+
     let mut accessor_func_calls = HashDump::new("accessor_func_calls");
     for (file_id, calls) in db.get_accessor_func_call_index().iter() {
         accessor_func_calls.insert(file_label(analysis, *file_id), format!("{calls:?}"));
@@ -1245,6 +1295,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
         gmod_network_wire_coverage: gmod_network_wire_coverage.finish(),
         gmod_class_file_metadata: gmod_class_file_metadata.finish(),
         dynamic_field_wildcards: dynamic_field_wildcards.finish(),
+        dynamic_fields: dynamic_fields.finish(),
         accessor_func_calls: accessor_func_calls.finish(),
         properties: properties.finish(),
         metatables: metatables.finish(),
@@ -1295,6 +1346,7 @@ fn collect_index(analysis: &EmmyLuaAnalysis, label: &str) -> IndexSnapshot {
             ("GWIRE", &snapshot.gmod_network_wire_coverage),
             ("GCLASS", &snapshot.gmod_class_file_metadata),
             ("DYNWILD", &snapshot.dynamic_field_wildcards),
+            ("DYNFIELD", &snapshot.dynamic_fields),
             ("ACCCALL", &snapshot.accessor_func_calls),
             ("PROP", &snapshot.properties),
             ("METATBL", &snapshot.metatables),
@@ -1523,6 +1575,12 @@ fn diff_index(base_label: &str, base: &IndexSnapshot, label: &str, other: &Index
             "DYNWILD",
             &base.dynamic_field_wildcards,
             &other.dynamic_field_wildcards,
+        ),
+        (
+            "dynamic_fields",
+            "DYNFIELD",
+            &base.dynamic_fields,
+            &other.dynamic_fields,
         ),
         (
             "accessor_func_calls",
@@ -2192,7 +2250,7 @@ fn burst_edit(
 
     // Three keystroke groups: change meaning, shift offsets only, and introduce
     // a class definition partway through.
-    let step_text = |target: &Target, step: usize| -> String {
+    let step_text = move |target: &Target, step: usize| -> String {
         let mut text = target.original.replace(find.as_str(), replace.as_str());
         if step >= 1 {
             text.push_str("\n-- burst\n");
@@ -2560,6 +2618,34 @@ fn run() {
 
     if stages.iter().any(|s| s == "burst") {
         burst_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
+    }
+
+    // Bisect stage: re-walk the target's expansion in one batch with the text
+    // untouched. Localises which sites flip when re-derived against a settled
+    // retained neighborhood, without the edit signal `burst` carries.
+    if stages.iter().any(|s| s == "batchexpand") {
+        let cold_index = collect_index(&analysis, "cold");
+        for target in &targets {
+            let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+            let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+                continue;
+            };
+            let Some(file_id) = analysis.get_file_id(&uri) else {
+                continue;
+            };
+            let expansion = analysis.expand_reindex_file_ids(vec![file_id]);
+            let t = Instant::now();
+            let expansion_len = expansion.len();
+            analysis.reindex_expanded_files(vec![file_id], expansion);
+            eprintln!(
+                "[batchexpand] {target}: re-walked {expansion_len} files in one batch ({:.2}s)",
+                t.elapsed().as_secs_f64()
+            );
+        }
+        let after_index = collect_index(&analysis, "after_batchexpand");
+        diff_index("cold", &cold_index, "after_batchexpand", &after_index);
+        let after = collect(&analysis, "after_batchexpand");
+        diff("cold", &cold, "after_batchexpand", &after);
     }
 
     if stages.iter().any(|s| s == "indexrepeat") {
