@@ -12845,6 +12845,44 @@ mod test {
     }
 
     #[test]
+    fn test_truthiness_guard_does_not_suppress_repeated_call_expr() {
+        // The positive form of `test_negation_guard_does_not_suppress_repeated_call_expr`:
+        // `if maybeEnt() then` proves only that the call it made returned
+        // non-nil, so a second call inside the block is still unguarded.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+
+        let diagnostics = diagnostics_for_code(
+            &mut ws,
+            DiagnosticCode::NeedCheckNil,
+            r#"
+            ---@class Entity
+            ---@field GetPos fun(self: Entity): Vector
+
+            ---@return Entity?
+            local function maybeEnt() end
+
+            local function useEntity()
+                if maybeEnt() then
+                    maybeEnt():GetPos()
+                end
+            end
+            "#,
+        );
+
+        let call_warnings: Vec<_> = diagnostics
+            .iter()
+            .filter(|d| d.message.contains("may be nil"))
+            .collect();
+        assert_that!(
+            call_warnings,
+            not(is_empty()),
+            "`if maybeEnt() then` should NOT suppress the nil diagnostic on the \
+             second `maybeEnt()` call — each call may return a different value. \
+             Diagnostics: {diagnostics:#?}"
+        );
+    }
+
+    #[test]
     fn test_negation_guard_invalidated_by_indexed_key_reassignment() {
         let mut ws = VirtualWorkspace::new_with_init_std_lib();
         let mut emmyrc = Emmyrc::default();

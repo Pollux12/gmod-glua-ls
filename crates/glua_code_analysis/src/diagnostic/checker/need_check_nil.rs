@@ -1389,6 +1389,10 @@ fn is_expr_guarded_by_current_truthiness_condition(
 /// A bare truthiness test does, and so does `expr ~= nil`. Only `and` chains
 /// carry that through: every operand of a truthy `and` held, while an `or`
 /// proves nothing about either side.
+///
+/// The tested expression has to be one that reads the same value twice, so the
+/// match goes through [`stable_expr_text_matches`]: `if f() then f():m() end`
+/// spells the same text either side of the guard but calls the function again.
 fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
     match condition {
         LuaExpr::ParenExpr(paren) => paren
@@ -1404,14 +1408,20 @@ fn condition_proves_expr_truthy(condition: &LuaExpr, expr: &LuaExpr) -> bool {
                         || condition_proves_expr_truthy(&right, expr)
                 }),
                 BinaryOperator::OpNe => binary.get_exprs().is_some_and(|(left, right)| {
-                    (is_nil_literal_expr(&right) && expr_text_matches(&left, expr))
-                        || (is_nil_literal_expr(&left) && expr_text_matches(&right, expr))
+                    (is_nil_literal_expr(&right) && stable_expr_text_matches(&left, expr))
+                        || (is_nil_literal_expr(&left) && stable_expr_text_matches(&right, expr))
                 }),
                 _ => false,
             }
         }
-        _ => expr_text_matches(condition, expr),
+        _ => stable_expr_text_matches(condition, expr),
     }
+}
+
+/// [`expr_text_matches`], restricted to expressions that name the same value
+/// each time they are evaluated.
+fn stable_expr_text_matches(condition: &LuaExpr, expr: &LuaExpr) -> bool {
+    is_stable_guard_expr(condition) && expr_text_matches(condition, expr)
 }
 
 fn is_nil_literal_expr(expr: &LuaExpr) -> bool {
