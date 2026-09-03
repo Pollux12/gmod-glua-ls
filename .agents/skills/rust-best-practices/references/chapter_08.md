@@ -127,7 +127,7 @@ Use `///` doc comments to document:
 
 ```rust
 /// Loads [`User`] profile from disk
-/// 
+///
 /// # Error
 /// - Returns [`MyError`] if the file is missing [`MyError::FileNotFound`].
 /// - Returns [`MyError`] if the content is an invalid Json, [`MyError::InvalidJson`].
@@ -139,9 +139,9 @@ fn load_user(path: &Path) -> Result<User, MyError> {...}
 ```rust
 /// Returns the square of the integer part of any number.
 /// Square is limited to `u128`.
-/// 
+///
 /// # Examples
-/// 
+///
 /// ```rust
 /// assert_eq!(square(4.3), 16)
 /// ```
@@ -203,9 +203,9 @@ pub fn add(a: i32, b: i32) -> i32 {
 Use `//!` when you want to document the **purpose of a module or a crate**. It is places at the top of a `lib.rs` or `mod.rs` file, for example `engine/mod.rs`:
 ```rust
 //! This module implements a custom chess engine.
-//! 
+//!
 //! It handles board state, move generation and check detection.
-//! 
+//!
 //! # Example
 //! ```
 //! let board = chess::engine::Board::default();

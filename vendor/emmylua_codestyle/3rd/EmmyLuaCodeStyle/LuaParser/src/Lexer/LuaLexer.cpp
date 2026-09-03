@@ -1,4 +1,4 @@
-﻿#include "LuaParser/Lexer/LuaLexer.h"
+#include "LuaParser/Lexer/LuaLexer.h"
 #include "LuaParser/File/LuaSource.h"
 #include "LuaParser/Lexer/LuaDefine.h"
 #include "LuaParser/Lexer/LuaIdentify.h"

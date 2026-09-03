@@ -352,7 +352,7 @@ mod tests {
             ---@param b number
             ---@param a? number
             function surface.SetDrawColor(r, g, b, a) end
-            
+
             surface.SetDrawColor(255, 0, 0)
         "#,
         );
@@ -366,7 +366,7 @@ mod tests {
             ---@param g number
             ---@param b number
             function surface.SetDrawColor(r, g, b) end
-            
+
             surface.SetDrawColor(255, 0, 0)
         "#,
         );

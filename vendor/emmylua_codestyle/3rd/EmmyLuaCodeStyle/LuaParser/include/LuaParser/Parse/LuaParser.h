@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "LuaAttribute.h"
 #include "LuaOperatorType.h"

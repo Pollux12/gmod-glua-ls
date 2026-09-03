@@ -169,7 +169,7 @@ hello_greet(Cow::Owned("Naomi".to_string()));
 
 ## 3.3 Stack vs Heap: Be size-smart!
 
-### ✅ Good Practices 
+### ✅ Good Practices
 
 * Keep small types (`impl Copy`, `usize`, `bool`, etc) **on the stack**.
 * Avoid passing huge types (`> 512 bytes`) by value or transferring ownership. Prefer pass by reference (e.g. `&T` and `&mut T`).

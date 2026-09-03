@@ -1,4 +1,4 @@
-﻿#pragma once
+#pragma once
 
 #include "LuaParser/Types/EndOfLineType.h"
 #include "LuaStyleEnum.h"

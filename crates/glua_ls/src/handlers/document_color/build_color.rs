@@ -531,7 +531,7 @@ mod tests {
             ---@param b number
             ---@param a? number
             function surface.SetDrawColor(r, g, b, a) end
-            
+
             surface.SetDrawColor(255, 0, 0)
             surface.SetDrawColor(255, 0, 0, 255)
             "#,
@@ -632,7 +632,7 @@ mod tests {
             ---@param b number
             ---@param a? number
             function Color(r, g, b, a) end
-            
+
             local c = Color(255, 0, 0)
             "#,
         );
@@ -688,7 +688,7 @@ mod tests {
             ---@param y number
             ---@param z number
             function SetPos(x, y, z) end
-            
+
             SetPos(255, 0, 0)
             "#,
         );
