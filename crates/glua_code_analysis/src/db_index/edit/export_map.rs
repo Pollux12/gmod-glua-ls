@@ -953,7 +953,13 @@ fn push_cached_type_refs(db: &DbIndex, owner: &LuaTypeOwner, out: &mut Vec<crate
 /// lookups are set unions, and one call per key would turn a diff of a few
 /// hundred keys into a few hundred index walks.
 pub fn dependents_of(db: &DbIndex, file_id: FileId, diff: &ChangedExports) -> FxHashSet<FileId> {
-    let mut type_refs: Vec<crate::TypeCacheRef> = Vec::new();
+    // A `---@module` reader caches `LuaType::ModuleRef(file_id)`, filed in the
+    // reverse index under the providing file rather than under any symbol it
+    // exports. No export key names that identity, so seeding the file itself is
+    // the only thing that reaches those readers. It cannot be narrowed to the
+    // keys that moved: a module can hand back the same table identity and still
+    // change a member's type, leaving every key the reader named untouched.
+    let mut type_refs: Vec<crate::TypeCacheRef> = vec![crate::TypeCacheRef::Module(file_id)];
     let mut nodes: Vec<LuaInferenceNodeId> = Vec::new();
     let mut signatures: Vec<LuaSignatureId> = Vec::new();
     // Each owner, and whether the key that named it appeared or vanished.

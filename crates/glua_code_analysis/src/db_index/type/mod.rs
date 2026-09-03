@@ -189,188 +189,256 @@ fn replace_table_consts_in_type<S: std::hash::BuildHasher>(
     }
 }
 
-/// The identities one edited file moved, as old -> new.
+/// What remapping one stored type through a [`crate::FileRemap`] found.
 ///
-/// Borrowed rather than owned so building one costs nothing: it is threaded
-/// through every arm of the type walk.
-#[derive(Clone, Copy)]
-pub struct TypeIdentityRemap<'a> {
-    pub tables: &'a rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
-    pub signatures: &'a rustc_hash::FxHashMap<LuaSignatureId, LuaSignatureId>,
+/// `typ` is the rewritten type when something in it moved; `lost` reports a
+/// nested identity that did not survive. A value that is both moved and lost
+/// reports `lost` with no rewrite: the holder keeps its stored value and its
+/// owning file is re-analysed instead of being left on a guessed mix of old
+/// and new coordinates.
+#[derive(Debug, Clone)]
+pub struct TypeRemapResult {
+    pub typ: Option<LuaType>,
+    pub lost: bool,
 }
 
-impl TypeIdentityRemap<'_> {
-    pub fn is_empty(&self) -> bool {
-        self.tables.is_empty() && self.signatures.is_empty()
+impl TypeRemapResult {
+    fn unchanged() -> Self {
+        Self {
+            typ: None,
+            lost: false,
+        }
+    }
+
+    fn moved(typ: LuaType) -> Self {
+        Self {
+            typ: Some(typ),
+            lost: false,
+        }
+    }
+
+    fn lost() -> Self {
+        Self {
+            typ: None,
+            lost: true,
+        }
+    }
+
+    fn from_child_list(
+        remapped: crate::Remap<Vec<LuaType>>,
+        rebuild: impl FnOnce(Vec<LuaType>) -> LuaType,
+    ) -> Self {
+        match remapped {
+            crate::Remap::Lost => Self::lost(),
+            crate::Remap::Unrelated => Self::unchanged(),
+            crate::Remap::Moved(types) => Self::moved(rebuild(types)),
+        }
+    }
+
+    fn from_single(result: TypeRemapResult, rebuild: impl FnOnce(LuaType) -> LuaType) -> Self {
+        if result.lost {
+            Self::lost()
+        } else if let Some(inner) = result.typ {
+            Self::moved(rebuild(inner))
+        } else {
+            Self::unchanged()
+        }
+    }
+}
+
+/// Remaps one homogeneous child list, sharing the loop every composite arm
+/// would otherwise repeat.
+///
+/// Returns `Lost` as soon as any child is lost (the caller publishes no
+/// partial rewrite), `Moved` with the rebuilt child vec when anything moved,
+/// and `Unrelated` when nothing changed. Nothing is cloned while the list is
+/// unchanged: the prefix is cloned only once the first moved child appears.
+fn remap_child_types<'a>(
+    children: impl IntoIterator<
+        Item = &'a LuaType,
+        IntoIter: ExactSizeIterator<Item = &'a LuaType> + Clone,
+    >,
+    remap: &crate::FileRemap,
+) -> crate::Remap<Vec<LuaType>> {
+    let source = children.into_iter();
+    let len = source.len();
+    let mut rebuilt: Option<Vec<LuaType>> = None;
+    for (idx, child) in source.clone().enumerate() {
+        let result = remap_identities_in_type(child, remap);
+        if result.lost {
+            return crate::Remap::Lost;
+        }
+        match (result.typ, rebuilt.as_mut()) {
+            (Some(moved), Some(vec)) => vec.push(moved),
+            (Some(moved), None) => {
+                let mut vec = Vec::with_capacity(len);
+                vec.extend(source.clone().take(idx).cloned());
+                vec.push(moved);
+                rebuilt = Some(vec);
+            }
+            (None, Some(vec)) => vec.push(child.clone()),
+            (None, None) => {}
+        }
+    }
+    match rebuilt {
+        Some(vec) => crate::Remap::Moved(vec),
+        None => crate::Remap::Unrelated,
     }
 }
 
 /// Rewrites every position-carrying identity inside a stored type.
 ///
+/// Identities are resolved directly through `remap` (`signature_id`,
+/// `table_range` for both `TableConst` and the `Instance` range), so a nested
+/// identity no store enumerates is still moved or reported lost. `lost`
+/// propagates out of every nested arm: a holder of a lost identity keeps its
+/// stored value and its owning file is dirtied instead.
+///
 /// The arm list must stay in step with `db_index::edit::export_map::hash_type`:
 /// a composite one walk descends into and the other does not leaves a nested
 /// identity unmoved while the diff still calls the export unchanged.
-pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Option<LuaType> {
+pub fn remap_identities_in_type(typ: &LuaType, remap: &crate::FileRemap) -> TypeRemapResult {
     match typ {
-        LuaType::Signature(old) => map.signatures.get(old).map(|new| LuaType::Signature(*new)),
-        LuaType::TableConst(old) => map
-            .tables
-            .get(old)
-            .map(|new| LuaType::TableConst(new.clone())),
+        LuaType::Signature(old) => match remap.signature_id(*old) {
+            crate::Remap::Moved(new) if new != *old => {
+                TypeRemapResult::moved(LuaType::Signature(new))
+            }
+            crate::Remap::Moved(_) | crate::Remap::Unrelated => TypeRemapResult::unchanged(),
+            crate::Remap::Lost => TypeRemapResult::lost(),
+        },
+        LuaType::TableConst(old) => match remap.table_range(old) {
+            crate::Remap::Moved(new) if new != *old => {
+                TypeRemapResult::moved(LuaType::TableConst(new))
+            }
+            crate::Remap::Moved(_) | crate::Remap::Unrelated => TypeRemapResult::unchanged(),
+            crate::Remap::Lost => TypeRemapResult::lost(),
+        },
         LuaType::Instance(inst) => {
             let mut changed = false;
+            let mut lost = false;
             let mut new_base = inst.get_base().clone();
-            if let Some(nb) = remap_identities_in_type(inst.get_base(), map) {
+            let base = remap_identities_in_type(inst.get_base(), remap);
+            if base.lost {
+                lost = true;
+            } else if let Some(nb) = base.typ {
                 new_base = nb;
                 changed = true;
             }
             let mut new_range = inst.get_range().clone();
-            if let Some(mapped) = map.tables.get(inst.get_range()) {
-                new_range = mapped.clone();
-                changed = true;
+            match remap.table_range(inst.get_range()) {
+                crate::Remap::Moved(mapped) if mapped != *inst.get_range() => {
+                    new_range = mapped;
+                    changed = true;
+                }
+                crate::Remap::Moved(_) | crate::Remap::Unrelated => {}
+                crate::Remap::Lost => lost = true,
             }
-            if changed {
-                Some(LuaType::Instance(Arc::new(
+            if lost {
+                TypeRemapResult::lost()
+            } else if changed {
+                TypeRemapResult::moved(LuaType::Instance(Arc::new(
                     crate::db_index::r#type::types::LuaInstanceType::new(new_base, new_range),
                 )))
             } else {
-                None
+                TypeRemapResult::unchanged()
             }
         }
-        LuaType::Union(union) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = union
-                .into_vec()
-                .into_iter()
-                .map(|sub| {
-                    remap_identities_in_type(&sub, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or(sub)
+        LuaType::Union(union) => match union.as_ref() {
+            crate::LuaUnionType::Multi(types) => TypeRemapResult::from_child_list(
+                remap_child_types(types.iter(), remap),
+                LuaType::from_vec,
+            ),
+            crate::LuaUnionType::Nullable(inner) => {
+                TypeRemapResult::from_single(remap_identities_in_type(inner, remap), |new_inner| {
+                    LuaType::from_vec(vec![new_inner, LuaType::Nil])
                 })
-                .collect();
-            changed.then(|| LuaType::from_vec(new_types))
-        }
-        LuaType::Intersection(inter) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = inter
-                .get_types()
-                .iter()
-                .map(|sub| {
-                    remap_identities_in_type(sub, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| sub.clone())
-                })
-                .collect();
-            changed.then(|| {
-                LuaType::Intersection(Arc::new(crate::LuaIntersectionType::new(new_types)))
-            })
-        }
-        LuaType::MergedTable(merged) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = merged
-                .get_types()
-                .iter()
-                .map(|sub| {
-                    remap_identities_in_type(sub, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| sub.clone())
-                })
-                .collect();
-            changed
-                .then(|| LuaType::MergedTable(Arc::new(crate::LuaMergedTableType::new(new_types))))
-        }
-        LuaType::Array(arr) => remap_identities_in_type(arr.get_base(), map).map(|new_base| {
-            LuaType::Array(Arc::new(crate::LuaArrayType::new(
-                new_base,
-                arr.get_len().clone(),
-            )))
-        }),
-        LuaType::Tuple(tuple) => {
-            let mut changed = false;
-            let new_types: Vec<LuaType> = tuple
-                .get_types()
-                .iter()
-                .map(|sub| {
-                    remap_identities_in_type(sub, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| sub.clone())
-                })
-                .collect();
-            if changed {
-                Some(LuaType::Tuple(Arc::new(crate::LuaTupleType::new(
-                    new_types,
-                    tuple.status,
-                ))))
-            } else {
-                None
             }
-        }
+        },
+        LuaType::Intersection(inter) => TypeRemapResult::from_child_list(
+            remap_child_types(inter.get_types().iter(), remap),
+            |new_types| LuaType::Intersection(Arc::new(crate::LuaIntersectionType::new(new_types))),
+        ),
+        LuaType::MergedTable(merged) => TypeRemapResult::from_child_list(
+            remap_child_types(merged.get_types().iter(), remap),
+            |new_types| LuaType::MergedTable(Arc::new(crate::LuaMergedTableType::new(new_types))),
+        ),
+        LuaType::Array(arr) => TypeRemapResult::from_single(
+            remap_identities_in_type(arr.get_base(), remap),
+            |new_base| {
+                LuaType::Array(Arc::new(crate::LuaArrayType::new(
+                    new_base,
+                    arr.get_len().clone(),
+                )))
+            },
+        ),
+        LuaType::Tuple(tuple) => TypeRemapResult::from_child_list(
+            remap_child_types(tuple.get_types().iter(), remap),
+            |new_types| LuaType::Tuple(Arc::new(crate::LuaTupleType::new(new_types, tuple.status))),
+        ),
         LuaType::Object(obj) => {
             let mut changed = false;
+            let mut lost = false;
             let mut new_fields = std::collections::BTreeMap::new();
             for (k, v) in obj.get_fields() {
-                if let Some(nv) = remap_identities_in_type(v, map) {
+                let remapped = remap_identities_in_type(v, remap);
+                if remapped.lost {
+                    lost = true;
+                }
+                if let Some(nv) = remapped.typ {
                     changed = true;
                     new_fields.insert(k.clone(), nv);
                 } else {
                     new_fields.insert(k.clone(), v.clone());
                 }
             }
-            let mut new_index_access = Vec::new();
+            let mut new_index_access = Vec::with_capacity(obj.get_index_access().len());
             for (k, v) in obj.get_index_access() {
-                let nk = remap_identities_in_type(k, map).unwrap_or_else(|| k.clone());
-                let nv = remap_identities_in_type(v, map).unwrap_or_else(|| v.clone());
+                let remapped_k = remap_identities_in_type(k, remap);
+                let remapped_v = remap_identities_in_type(v, remap);
+                if remapped_k.lost || remapped_v.lost {
+                    lost = true;
+                }
+                let nk = remapped_k.typ.unwrap_or_else(|| k.clone());
+                let nv = remapped_v.typ.unwrap_or_else(|| v.clone());
                 if &nk != k || &nv != v {
                     changed = true;
                 }
                 new_index_access.push((nk, nv));
             }
-            if changed {
-                Some(LuaType::Object(Arc::new(
+            if lost {
+                TypeRemapResult::lost()
+            } else if changed {
+                TypeRemapResult::moved(LuaType::Object(Arc::new(
                     crate::LuaObjectType::new_with_fields(new_fields, new_index_access),
                 )))
             } else {
-                None
+                TypeRemapResult::unchanged()
             }
         }
-        LuaType::Generic(r#gen) => {
-            let mut changed = false;
-            let new_params: Vec<LuaType> = r#gen
-                .get_params()
-                .iter()
-                .map(|p| {
-                    remap_identities_in_type(p, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| p.clone())
-                })
-                .collect();
-            if changed {
-                Some(LuaType::Generic(Arc::new(crate::LuaGenericType::new(
+        LuaType::Generic(r#gen) => TypeRemapResult::from_child_list(
+            remap_child_types(r#gen.get_params().iter(), remap),
+            |new_params| {
+                LuaType::Generic(Arc::new(crate::LuaGenericType::new(
                     r#gen.get_base_type_id(),
                     new_params,
-                ))))
-            } else {
-                None
-            }
-        }
-        LuaType::TableGeneric(params) => {
-            let mut changed = false;
-            let new_params: Vec<LuaType> = params
-                .iter()
-                .map(|p| {
-                    remap_identities_in_type(p, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| p.clone())
-                })
-                .collect();
-            changed.then(|| LuaType::TableGeneric(Arc::new(new_params)))
-        }
+                )))
+            },
+        ),
+        LuaType::TableGeneric(params) => TypeRemapResult::from_child_list(
+            remap_child_types(params.iter(), remap),
+            |new_params| LuaType::TableGeneric(Arc::new(new_params)),
+        ),
         LuaType::DocFunction(func) => {
             let mut changed = false;
-            let mut new_params = Vec::new();
+            let mut lost = false;
+            let mut new_params = Vec::with_capacity(func.get_params().len());
             for (name, ty) in func.get_params() {
                 if let Some(ty) = ty {
-                    if let Some(nt) = remap_identities_in_type(ty, map) {
+                    let remapped = remap_identities_in_type(ty, remap);
+                    if remapped.lost {
+                        lost = true;
+                    }
+                    if let Some(nt) = remapped.typ {
                         changed = true;
                         new_params.push((name.clone(), Some(nt)));
                     } else {
@@ -380,13 +448,17 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
                     new_params.push((name.clone(), None));
                 }
             }
-            let new_ret = remap_identities_in_type(func.get_ret(), map)
-                .inspect(|_| changed = true)
-                .unwrap_or_else(|| func.get_ret().clone());
+            let remapped_ret = remap_identities_in_type(func.get_ret(), remap);
+            if remapped_ret.lost {
+                lost = true;
+            }
+            let new_ret = remapped_ret.typ.unwrap_or_else(|| func.get_ret().clone());
             if &new_ret != func.get_ret() {
                 changed = true;
             }
-            if changed {
+            if lost {
+                TypeRemapResult::lost()
+            } else if changed {
                 let new_func = crate::LuaFunctionType::new(
                     func.get_async_state(),
                     func.is_colon_define(),
@@ -396,61 +468,66 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
                 )
                 .with_optional_params(func.get_optional_params().to_vec())
                 .with_call_arg_roles(func.get_call_arg_roles().to_vec());
-                Some(LuaType::DocFunction(Arc::new(new_func)))
+                TypeRemapResult::moved(LuaType::DocFunction(Arc::new(new_func)))
             } else {
-                None
+                TypeRemapResult::unchanged()
             }
         }
         LuaType::Variadic(var) => match var.as_ref() {
-            crate::VariadicType::Multi(types) => {
-                let mut changed = false;
-                let new_types: Vec<LuaType> = types
-                    .iter()
-                    .map(|t| {
-                        remap_identities_in_type(t, map)
-                            .inspect(|_| changed = true)
-                            .unwrap_or_else(|| t.clone())
-                    })
-                    .collect();
-                changed.then(|| LuaType::Variadic(Arc::new(crate::VariadicType::Multi(new_types))))
+            crate::VariadicType::Multi(types) => TypeRemapResult::from_child_list(
+                remap_child_types(types.iter(), remap),
+                |new_types| LuaType::Variadic(Arc::new(crate::VariadicType::Multi(new_types))),
+            ),
+            crate::VariadicType::Base(base) => {
+                TypeRemapResult::from_single(remap_identities_in_type(base, remap), |new_base| {
+                    LuaType::Variadic(Arc::new(crate::VariadicType::Base(new_base)))
+                })
             }
-            crate::VariadicType::Base(base) => remap_identities_in_type(base, map)
-                .map(|nb| LuaType::Variadic(Arc::new(crate::VariadicType::Base(nb)))),
         },
         LuaType::MultiLineUnion(mlu) => {
-            let mut changed = false;
-            let new_unions: Vec<(LuaType, Option<String>)> = mlu
-                .get_unions()
-                .iter()
-                .map(|(ty, doc)| {
-                    if let Some(nt) = remap_identities_in_type(ty, map) {
-                        changed = true;
-                        (nt, doc.clone())
-                    } else {
-                        (ty.clone(), doc.clone())
-                    }
-                })
-                .collect();
-            changed.then(|| {
-                LuaType::MultiLineUnion(Arc::new(crate::LuaMultiLineUnion::new(new_unions)))
-            })
+            fn project(pair: &(LuaType, Option<String>)) -> &LuaType {
+                &pair.0
+            }
+            TypeRemapResult::from_child_list(
+                remap_child_types(mlu.get_unions().iter().map(project as fn(_) -> _), remap),
+                |new_types| {
+                    let unions = new_types
+                        .into_iter()
+                        .zip(mlu.get_unions().iter().map(|(_, doc)| doc.clone()))
+                        .collect();
+                    LuaType::MultiLineUnion(Arc::new(crate::LuaMultiLineUnion::new(unions)))
+                },
+            )
         }
         LuaType::TypeGuard(inner) => {
-            remap_identities_in_type(inner, map).map(|nt| LuaType::TypeGuard(Arc::new(nt)))
+            TypeRemapResult::from_single(remap_identities_in_type(inner, remap), |new_inner| {
+                LuaType::TypeGuard(Arc::new(new_inner))
+            })
         }
         LuaType::Conditional(cond) => {
-            let mut changed = false;
-            let new_cond = remap_identities_in_type(cond.get_condition(), map)
-                .inspect(|_| changed = true)
+            let mut lost = false;
+            let remapped_cond = remap_identities_in_type(cond.get_condition(), remap);
+            let remapped_true = remap_identities_in_type(cond.get_true_type(), remap);
+            let remapped_false = remap_identities_in_type(cond.get_false_type(), remap);
+            if remapped_cond.lost || remapped_true.lost || remapped_false.lost {
+                lost = true;
+            }
+            let new_cond = remapped_cond
+                .typ
                 .unwrap_or_else(|| cond.get_condition().clone());
-            let new_true = remap_identities_in_type(cond.get_true_type(), map)
-                .inspect(|_| changed = true)
+            let new_true = remapped_true
+                .typ
                 .unwrap_or_else(|| cond.get_true_type().clone());
-            let new_false = remap_identities_in_type(cond.get_false_type(), map)
-                .inspect(|_| changed = true)
+            let new_false = remapped_false
+                .typ
                 .unwrap_or_else(|| cond.get_false_type().clone());
-            if changed {
-                Some(LuaType::Conditional(Arc::new(
+            let changed = &new_cond != cond.get_condition()
+                || &new_true != cond.get_true_type()
+                || &new_false != cond.get_false_type();
+            if lost {
+                TypeRemapResult::lost()
+            } else if changed {
+                TypeRemapResult::moved(LuaType::Conditional(Arc::new(
                     crate::LuaConditionalType::new(
                         new_cond,
                         new_true,
@@ -460,40 +537,34 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
                     ),
                 )))
             } else {
-                None
+                TypeRemapResult::unchanged()
             }
         }
-        LuaType::Mapped(mapped) => remap_identities_in_type(&mapped.value, map).map(|nv| {
-            LuaType::Mapped(Arc::new(crate::LuaMappedType::new(
-                mapped.param.clone(),
-                nv,
-                mapped.is_readonly,
-                mapped.is_optional,
-            )))
-        }),
+        LuaType::Mapped(mapped) => TypeRemapResult::from_single(
+            remap_identities_in_type(&mapped.value, remap),
+            |new_value| {
+                LuaType::Mapped(Arc::new(crate::LuaMappedType::new(
+                    mapped.param.clone(),
+                    new_value,
+                    mapped.is_readonly,
+                    mapped.is_optional,
+                )))
+            },
+        ),
         LuaType::TableOf(inner) => {
-            remap_identities_in_type(inner, map).map(|nt| LuaType::TableOf(Box::new(nt)))
+            TypeRemapResult::from_single(remap_identities_in_type(inner, remap), |new_inner| {
+                LuaType::TableOf(Box::new(new_inner))
+            })
         }
-        LuaType::Call(call) => {
-            let mut changed = false;
-            let new_ops: Vec<LuaType> = call
-                .get_operands()
-                .iter()
-                .map(|op| {
-                    remap_identities_in_type(op, map)
-                        .inspect(|_| changed = true)
-                        .unwrap_or_else(|| op.clone())
-                })
-                .collect();
-            if changed {
-                Some(LuaType::Call(Arc::new(crate::LuaAliasCallType::new(
+        LuaType::Call(call) => TypeRemapResult::from_child_list(
+            remap_child_types(call.get_operands().iter(), remap),
+            |new_ops| {
+                LuaType::Call(Arc::new(crate::LuaAliasCallType::new(
                     call.get_call_kind(),
                     new_ops,
-                ))))
-            } else {
-                None
-            }
-        }
+                )))
+            },
+        ),
         // The remaining variants nest no type that can carry a table literal's
         // range, so there is nothing under them to move. Listed rather than
         // matched with a wildcard so that a new `LuaType` variant fails to
@@ -530,7 +601,7 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
         | LuaType::Language(_)
         | LuaType::ModuleRef(_)
         | LuaType::DocAttribute(_)
-        | LuaType::ConditionalInfer(_) => None,
+        | LuaType::ConditionalInfer(_) => TypeRemapResult::unchanged(),
     }
 }
 
@@ -542,7 +613,6 @@ pub fn remap_identities_in_type(typ: &LuaType, map: TypeIdentityRemap<'_>) -> Op
 fn remap_provenance(
     provenance: &[LuaInferenceStep],
     remap: &crate::FileRemap,
-    map: TypeIdentityRemap<'_>,
     lost: &mut bool,
 ) -> Option<Arc<[LuaInferenceStep]>> {
     fn node(
@@ -563,6 +633,25 @@ fn remap_provenance(
                 *lost = true;
                 current.clone()
             }
+        }
+    }
+
+    fn remap_step_type(
+        current: &Arc<LuaType>,
+        remap: &crate::FileRemap,
+        changed: &mut bool,
+        lost: &mut bool,
+    ) -> Arc<LuaType> {
+        let result = remap_identities_in_type(current, remap);
+        if result.lost {
+            *lost = true;
+        }
+        match result.typ {
+            Some(new) => {
+                *changed = true;
+                Arc::new(new)
+            }
+            None => current.clone(),
         }
     }
 
@@ -592,26 +681,14 @@ fn remap_provenance(
         // position can cross a neighbour, so the order is re-established
         // rather than inherited.
         support.sort_by(|left, right| left.stable_cmp(right));
-        let inferred_type =
-            step.inferred_type
-                .as_ref()
-                .map(|typ| match remap_identities_in_type(typ, map) {
-                    Some(new) => {
-                        changed = true;
-                        Arc::new(new)
-                    }
-                    None => typ.clone(),
-                });
-        let found_type =
-            step.found_type
-                .as_ref()
-                .map(|typ| match remap_identities_in_type(typ, map) {
-                    Some(new) => {
-                        changed = true;
-                        Arc::new(new)
-                    }
-                    None => typ.clone(),
-                });
+        let inferred_type = step
+            .inferred_type
+            .as_ref()
+            .map(|typ| remap_step_type(typ, remap, &mut changed, lost));
+        let found_type = step
+            .found_type
+            .as_ref()
+            .map(|typ| remap_step_type(typ, remap, &mut changed, lost));
         steps.push(LuaInferenceStep {
             event: LuaInferenceEventId {
                 node: event_node,
@@ -1921,74 +1998,56 @@ impl LuaTypeIndex {
         }
     }
 
-    pub fn remap_table_const(
-        &mut self,
-        map: &rustc_hash::FxHashMap<InFiled<TextRange>, InFiled<TextRange>>,
-    ) {
-        let signatures = rustc_hash::FxHashMap::default();
-        self.remap_identities(TypeIdentityRemap {
-            tables: map,
-            signatures: &signatures,
-        });
-    }
-
     /// Rewrites every cached type, definition fact and inference-support array
     /// that names an identity in the edited file.
     ///
     /// Returns the files whose entry named something the edit destroyed: those
     /// cannot be rewritten and have to be re-analysed instead.
     pub fn remap_file_identities(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
-        let mut tables = rustc_hash::FxHashMap::default();
-        let mut signatures = rustc_hash::FxHashMap::default();
         let mut dirty = HashSet::default();
 
-        let refs: Vec<TypeCacheRef> = self
+        // Only caches that actually name an identity in the edited file can
+        // contain something the edit moved or destroyed, and `cache_refs`
+        // already records which files those are. Scanning every cache in the
+        // workspace here would put a full-index walk on the per-keystroke path.
+        let candidate_owners: Vec<LuaTypeOwner> = self
             .cache_refs
-            .refs_into_file(remap.file_id)
+            .owners_referencing_file(remap.file_id)
+            .filter_map(|owner_file_id| self.in_filed_type_owner.get(&owner_file_id))
+            .flatten()
             .cloned()
             .collect();
-        for type_ref in refs {
-            let lost = match &type_ref {
-                TypeCacheRef::Table(range) | TypeCacheRef::Instance(range) => {
-                    match remap.table_range(range) {
-                        crate::Remap::Moved(new) => {
-                            if &new != range {
-                                tables.insert(range.clone(), new);
-                            }
-                            false
-                        }
-                        crate::Remap::Unrelated => false,
-                        crate::Remap::Lost => true,
-                    }
-                }
-                TypeCacheRef::Signature(signature_id) => match remap.signature_id(*signature_id) {
-                    crate::Remap::Moved(new) => {
-                        if new != *signature_id {
-                            signatures.insert(*signature_id, new);
-                        }
-                        false
-                    }
-                    crate::Remap::Unrelated => false,
-                    crate::Remap::Lost => true,
-                },
-                TypeCacheRef::Module(_) | TypeCacheRef::Decl(_) => false,
+
+        let mut updates = Vec::new();
+        for owner in candidate_owners {
+            let Some(cache) = self.types.get(&owner) else {
+                continue;
             };
-            if lost && let Some(owners) = self.cache_refs.owners(&type_ref) {
-                dirty.extend(owners.iter().copied());
+            let result = remap_identities_in_type(cache.as_type(), remap);
+            if result.lost {
+                // A lost nested identity is left in place; the owner is
+                // re-analysed instead of being rewritten to a guessed value.
+                dirty.insert(owner.get_file_id());
+            } else if let Some(new_type) = result.typ {
+                let new_cache = match cache {
+                    LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
+                    LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
+                };
+                updates.push((owner, new_cache));
             }
         }
-
-        self.remap_identities(TypeIdentityRemap {
-            tables: &tables,
-            signatures: &signatures,
-        });
-        dirty.extend(self.remap_inference_facts(
-            remap,
-            TypeIdentityRemap {
-                tables: &tables,
-                signatures: &signatures,
-            },
-        ));
+        // `candidate_owners` comes out of a hash set, so the writes are ordered
+        // before they are applied.
+        updates.sort_unstable_by_key(|(owner, _)| format!("{:?}", owner));
+        let mut changed_files = HashSet::default();
+        for (owner, new_cache) in updates {
+            changed_files.insert(owner.get_file_id());
+            self.insert_type_cache(owner, new_cache);
+        }
+        if !changed_files.is_empty() {
+            self.mark_inference_derived_state_dirty();
+        }
+        dirty.extend(self.remap_inference_facts(remap));
         dirty.extend(self.remap_settled_reads(remap));
         dirty.remove(&remap.file_id);
         dirty
@@ -2004,17 +2063,12 @@ impl LuaTypeIndex {
     /// `cache_refs`, so both are visited here rather than located by a reverse
     /// index - the same walk `flush_inference_derived_state` already makes on
     /// every analyse.
-    fn remap_inference_facts(
-        &mut self,
-        remap: &crate::FileRemap,
-        map: TypeIdentityRemap<'_>,
-    ) -> HashSet<FileId> {
+    fn remap_inference_facts(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
         let mut dirty = HashSet::default();
         let mut metadata_updates = Vec::new();
         for (owner, metadata) in &self.fact_metadata {
             let mut lost = false;
-            if let Some(provenance) = remap_provenance(&metadata.provenance, remap, map, &mut lost)
-            {
+            if let Some(provenance) = remap_provenance(&metadata.provenance, remap, &mut lost) {
                 metadata_updates.push((
                     owner.clone(),
                     LuaTypeFactMetadata {
@@ -2035,13 +2089,16 @@ impl LuaTypeIndex {
         let mut fact_updates = Vec::new();
         for (definition, fact) in &self.definition_facts {
             let mut lost = false;
-            let typ = remap_identities_in_type(fact.typ(), map);
-            let provenance = remap_provenance(fact.provenance(), remap, map, &mut lost);
-            if typ.is_some() || provenance.is_some() {
+            let remapped = remap_identities_in_type(fact.typ(), remap);
+            if remapped.lost {
+                lost = true;
+            }
+            let provenance = remap_provenance(fact.provenance(), remap, &mut lost);
+            if remapped.typ.is_some() || provenance.is_some() {
                 fact_updates.push((
                     *definition,
                     LuaTypeFact::from_normalized_parts(
-                        typ.unwrap_or_else(|| fact.typ().clone()),
+                        remapped.typ.unwrap_or_else(|| fact.typ().clone()),
                         fact.confidence(),
                         fact.base_provenance_kind(),
                         provenance.unwrap_or_else(|| fact.provenance().into()),
@@ -2056,54 +2113,6 @@ impl LuaTypeIndex {
             self.definition_facts.insert(definition, fact);
         }
         dirty
-    }
-
-    fn remap_identities(&mut self, map: TypeIdentityRemap<'_>) -> HashSet<FileId> {
-        if map.is_empty() {
-            return HashSet::default();
-        }
-        // Only caches that actually name an identity in one of the edited
-        // files can contain something the map moves, and `cache_refs` already
-        // records which files those are. Scanning every cache in the workspace
-        // here would put a full-index walk on the per-keystroke path.
-        let source_files: HashSet<FileId> = map
-            .tables
-            .keys()
-            .map(|range| range.file_id)
-            .chain(map.signatures.keys().map(|id| id.get_file_id()))
-            .collect();
-        let candidate_owners: HashSet<&LuaTypeOwner> = source_files
-            .iter()
-            .flat_map(|file_id| self.cache_refs.owners_referencing_file(*file_id))
-            .filter_map(|owner_file_id| self.in_filed_type_owner.get(&owner_file_id))
-            .flatten()
-            .collect();
-
-        let mut updates = Vec::new();
-        for owner in candidate_owners {
-            let Some(cache) = self.types.get(owner) else {
-                continue;
-            };
-            if let Some(new_type) = remap_identities_in_type(cache.as_type(), map) {
-                let new_cache = match cache {
-                    LuaTypeCache::DocType(_) => LuaTypeCache::DocType(new_type),
-                    LuaTypeCache::InferType(_) => LuaTypeCache::InferType(new_type),
-                };
-                updates.push((owner.clone(), new_cache));
-            }
-        }
-        // `candidate_owners` comes out of a hash set, so the writes are ordered
-        // before they are applied.
-        updates.sort_unstable_by_key(|(owner, _)| format!("{:?}", owner));
-        let mut changed_files = HashSet::default();
-        for (owner, new_cache) in updates {
-            changed_files.insert(owner.get_file_id());
-            self.insert_type_cache(owner, new_cache);
-        }
-        if !changed_files.is_empty() {
-            self.mark_inference_derived_state_dirty();
-        }
-        changed_files
     }
 
     pub fn files_with_type_caches_referencing_files<S: std::hash::BuildHasher>(
@@ -2763,6 +2772,72 @@ mod batch_removal_tests {
             batched
                 .files_depending_on_inference_support(&[first].into_iter().collect::<HashSet<_>>()),
             [survivor].into_iter().collect::<HashSet<_>>()
+        );
+    }
+}
+
+#[cfg(test)]
+mod remap_walker_tests {
+    use rowan::{TextRange, TextSize};
+
+    use super::*;
+    use crate::db_index::edit::{FileRemap, PositionMap};
+
+    fn file_id(id: u32) -> FileId {
+        FileId::new(id)
+    }
+
+    fn table(file: u32, start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(InFiled::new(
+            file_id(file),
+            TextRange::new(TextSize::new(start), TextSize::new(end)),
+        ))
+    }
+
+    fn signature(file: u32, position: u32) -> LuaType {
+        LuaType::Signature(LuaSignatureId::new(file_id(file), TextSize::new(position)))
+    }
+
+    #[test]
+    fn moved_table_and_signature_nested_in_union_are_rewritten() {
+        let edited = file_id(1);
+        // Insertion at offset 3 shifts everything after it by two.
+        let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
+        let composite = LuaType::from_vec(vec![table(1, 4, 6), signature(1, 5), LuaType::String]);
+
+        let result = remap_identities_in_type(&composite, &remap);
+        assert!(!result.lost, "a shift must not report loss");
+        let rewritten = result.typ.expect("a shift must rewrite the composite");
+        let expected = LuaType::from_vec(vec![table(1, 6, 8), signature(1, 7), LuaType::String]);
+        assert_eq!(rewritten, expected);
+    }
+
+    #[test]
+    fn lost_table_and_signature_nested_in_union_are_reported_without_rewrite() {
+        let edited = file_id(1);
+        // Deletion of offsets 3..5 destroys what sits inside it.
+        let remap = FileRemap::unvalidated(edited, PositionMap::new("abcXXdef", "abcdef"));
+        let composite = LuaType::from_vec(vec![table(1, 3, 4), signature(1, 4)]);
+
+        let result = remap_identities_in_type(&composite, &remap);
+        assert!(result.lost, "a destroyed identity must report loss");
+        assert!(
+            result.typ.is_none(),
+            "a lost identity must not be rewritten to a guessed value"
+        );
+    }
+
+    #[test]
+    fn unrelated_identities_are_unchanged() {
+        let edited = file_id(1);
+        let remap = FileRemap::unvalidated(edited, PositionMap::new("abcdef", "abcXXdef"));
+        let composite = LuaType::from_vec(vec![table(2, 4, 6), signature(2, 5), LuaType::String]);
+
+        let result = remap_identities_in_type(&composite, &remap);
+        assert!(!result.lost, "another file's identities are never lost");
+        assert!(
+            result.typ.is_none(),
+            "another file's identities must remain unchanged"
         );
     }
 }

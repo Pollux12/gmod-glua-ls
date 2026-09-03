@@ -91,22 +91,29 @@ impl LuaFlowIndex {
     ///
     /// `type_ref` is the callee's declared out-param type, so it can name a
     /// table literal or signature in a file other than the caller this effect
-    /// is filed under.
-    pub fn remap_special_call_effect_types(&mut self, map: crate::db_index::TypeIdentityRemap<'_>) {
-        if map.is_empty() {
-            return;
+    /// is filed under. A holder whose type names something the edit destroyed
+    /// keeps its stored value and is reported dirty for re-analysis instead.
+    pub fn remap_special_call_effect_types(
+        &mut self,
+        remap: &crate::FileRemap,
+    ) -> rustc_hash::FxHashSet<FileId> {
+        if remap.map.is_identity() {
+            return rustc_hash::FxHashSet::default();
         }
-        for effects in self.special_call_effects.values_mut() {
+        let mut dirty = rustc_hash::FxHashSet::default();
+        for (holder, effects) in self.special_call_effects.iter_mut() {
             for effects in effects.values_mut() {
-                for effect in effects {
-                    if let Some(typ) =
-                        crate::db_index::remap_identities_in_type(&effect.type_ref, map)
-                    {
+                for effect in effects.iter_mut() {
+                    let result = crate::db_index::remap_identities_in_type(&effect.type_ref, remap);
+                    if result.lost {
+                        dirty.insert(*holder);
+                    } else if let Some(typ) = result.typ {
                         effect.type_ref = typ;
                     }
                 }
             }
         }
+        dirty
     }
 
     pub fn get_special_call_effects(

@@ -31,10 +31,11 @@ pub use signature::{
     LuaDocParamInfo, LuaDocReturnInfo, LuaGenericParamInfo, LuaNoDiscard, LuaOutParamInfo,
     LuaOutParamRoot, LuaReturnCorrelation, LuaSignature, LuaSignatureId,
     OVERLOAD_CALL_ARG_ATTRIBUTE, OVERLOAD_CALL_ARG_FIELD_ATTRIBUTE, ReturnTypeKind,
-    SignatureReturnStatus, find_call_arg_role_from_type, visit_call_arg_roles_from_type,
+    SignaturePayloadRemap, SignatureReturnStatus, find_call_arg_role_from_type,
+    visit_call_arg_roles_from_type,
 };
 
-use crate::{FileId, GmodStateMask, LuaType, db_index::LuaDeclId};
+use crate::{FileId, GmodStateMask, LuaType, TypeVisitTrait, db_index::LuaDeclId};
 
 use super::traits::LuaIndex;
 
@@ -54,6 +55,8 @@ pub struct LuaSignatureIndex {
     inferred_return_consumers: HashMap<FileId, HashSet<LuaSignatureId>>,
     settled_reads_by_file: HashMap<FileId, HashSet<LuaSignatureId>>,
     settled_read_dependents: HashMap<LuaSignatureId, HashSet<FileId>>,
+    payload_sources_by_holder: HashMap<FileId, HashSet<FileId>>,
+    payload_holders_by_source: HashMap<FileId, HashSet<FileId>>,
     inferred_positive_guards_changed: bool,
     /// Count of inferred-return changes, for telling a pass that moved a
     /// return from one that did not.
@@ -159,6 +162,8 @@ impl LuaSignatureIndex {
             inferred_return_consumers: HashMap::default(),
             settled_reads_by_file: HashMap::default(),
             settled_read_dependents: HashMap::default(),
+            payload_sources_by_holder: HashMap::default(),
+            payload_holders_by_source: HashMap::default(),
             inferred_positive_guards_changed: false,
             return_writes: 0,
             return_write_versions: HashMap::default(),
@@ -520,6 +525,195 @@ impl LuaSignatureIndex {
         dirty
     }
 
+    /// Indexed per-holder payload population shared by snapshot and remap.
+    ///
+    /// `in_file_signatures[holder]` owns the holder's signature ids (position
+    /// sorted); looking each id up in `inferred_positive_guards` covers the
+    /// holder's positive guards without scanning the workspace map.
+    /// `inferred_guard_owners_by_file[holder]` owns the holder's guard-fact
+    /// owners directly. Owner order does not affect the observable `HashSet`
+    /// outputs, so owners are left unsorted.
+    fn holder_payload_keys(
+        &self,
+        holder: FileId,
+    ) -> (Vec<LuaSignatureId>, Vec<LuaInferredGuardOwner>) {
+        let mut signature_ids: Vec<_> = self
+            .in_file_signatures
+            .get(&holder)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        signature_ids.sort_by_key(|id| u32::from(id.get_position()));
+        let fact_owners: Vec<_> = self
+            .inferred_guard_owners_by_file
+            .get(&holder)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        (signature_ids, fact_owners)
+    }
+
+    /// Rebuilds the file-granularity reverse edges for one holder file.
+    ///
+    /// Inspects every signature owned by `holder` plus the typed
+    /// inferred-guard payloads owned/filed there, collecting the source files
+    /// named by nested `TableConst`, `Instance` and `Signature` identities.
+    /// The holder's old reverse edges are removed and the new ones added
+    /// atomically, so reanalysis never leaves stale edges behind. Self-file
+    /// references are excluded from the cross-file set.
+    pub(crate) fn snapshot_payload_refs(&mut self, holder: FileId) {
+        let mut sources = HashSet::default();
+        let mut collect = |ty: &LuaType| {
+            ty.visit_type(&mut |inner| match inner {
+                LuaType::TableConst(range) => {
+                    if range.file_id != holder {
+                        sources.insert(range.file_id);
+                    }
+                }
+                LuaType::Instance(instance) => {
+                    let source = instance.get_range().file_id;
+                    if source != holder {
+                        sources.insert(source);
+                    }
+                }
+                LuaType::Signature(signature_id) => {
+                    let source = signature_id.get_file_id();
+                    if source != holder {
+                        sources.insert(source);
+                    }
+                }
+                _ => {}
+            });
+        };
+
+        let (signature_ids, fact_owners) = self.holder_payload_keys(holder);
+        for signature_id in &signature_ids {
+            if let Some(signature) = self.signatures.get(signature_id) {
+                signature.visit_payload_types(&mut |ty| collect(ty));
+            }
+            if let Some(guard) = self.inferred_positive_guards.get(signature_id) {
+                collect(&guard.narrowed_type);
+            }
+        }
+
+        for owner in &fact_owners {
+            if let Some(guard) = self.inferred_guard_facts.get(owner) {
+                collect(&guard.narrowed_type);
+            }
+        }
+
+        let old_sources = self
+            .payload_sources_by_holder
+            .get(&holder)
+            .cloned()
+            .unwrap_or_default();
+        if old_sources == sources {
+            return;
+        }
+        let mut old_sorted: Vec<FileId> = old_sources.into_iter().collect();
+        old_sorted.sort();
+        for source in old_sorted {
+            if let Some(holders) = self.payload_holders_by_source.get_mut(&source) {
+                holders.remove(&holder);
+                if holders.is_empty() {
+                    self.payload_holders_by_source.remove(&source);
+                }
+            }
+        }
+        let mut new_sorted: Vec<FileId> = sources.iter().copied().collect();
+        new_sorted.sort();
+        for source in new_sorted {
+            self.payload_holders_by_source
+                .entry(source)
+                .or_default()
+                .insert(holder);
+        }
+        if sources.is_empty() {
+            self.payload_sources_by_holder.remove(&holder);
+        } else {
+            self.payload_sources_by_holder.insert(holder, sources);
+        }
+    }
+
+    fn drop_payload_holder_edges(&mut self, holder: FileId) {
+        let Some(old_sources) = self.payload_sources_by_holder.remove(&holder) else {
+            return;
+        };
+        let mut old_sorted: Vec<FileId> = old_sources.into_iter().collect();
+        old_sorted.sort();
+        for source in old_sorted {
+            if let Some(holders) = self.payload_holders_by_source.get_mut(&source) {
+                holders.remove(&holder);
+                if holders.is_empty() {
+                    self.payload_holders_by_source.remove(&source);
+                }
+            }
+        }
+    }
+
+    /// Rewrites foreign signature payloads that name the edited file.
+    ///
+    /// Candidates come only from the reverse payload map, never from a scan.
+    /// Each affected signature/guard payload is atomic: a lost nested identity
+    /// leaves that payload untouched and dirties its holder file instead.
+    /// Coordinate-only moves never call `note_return_write`, so export hashing
+    /// with the same `FileRemap` stays stable.
+    pub(crate) fn remap_payload_types(&mut self, remap: &crate::FileRemap) -> HashSet<FileId> {
+        let mut candidates: Vec<FileId> = self
+            .payload_holders_by_source
+            .get(&remap.file_id)
+            .cloned()
+            .unwrap_or_default()
+            .into_iter()
+            .collect();
+        candidates.sort();
+        let mut dirty = HashSet::default();
+        for holder in candidates {
+            if holder == remap.file_id {
+                continue;
+            }
+            let mut holder_lost = false;
+            let (signature_ids, fact_owners) = self.holder_payload_keys(holder);
+            for signature_id in signature_ids {
+                if let Some(signature) = self.signatures.get_mut(&signature_id) {
+                    let outcome = signature.remap_payload_types(remap);
+                    if outcome.lost {
+                        holder_lost = true;
+                    }
+                }
+                if let Some(guard) = self.inferred_positive_guards.get_mut(&signature_id) {
+                    let result =
+                        crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
+                    if result.lost {
+                        holder_lost = true;
+                    } else if let Some(new_ty) = result.typ {
+                        guard.narrowed_type = new_ty;
+                    }
+                }
+            }
+
+            for owner in fact_owners {
+                if let Some(guard) = self.inferred_guard_facts.get_mut(&owner) {
+                    let result =
+                        crate::db_index::remap_identities_in_type(&guard.narrowed_type, remap);
+                    if result.lost {
+                        holder_lost = true;
+                    } else if let Some(new_ty) = result.typ {
+                        guard.narrowed_type = new_ty;
+                    }
+                }
+            }
+
+            if holder_lost {
+                dirty.insert(holder);
+            }
+        }
+        dirty.remove(&remap.file_id);
+        dirty
+    }
+
     pub fn clear_inferred_positive_guards_for_file(&mut self, file_id: FileId) {
         let old_owners = self
             .inferred_guard_owners_by_file
@@ -586,6 +780,9 @@ impl LuaSignatureIndex {
 
 impl LuaIndex for LuaSignatureIndex {
     fn remove(&mut self, file_id: FileId) {
+        // Drop only the removed file's holder edges. Reverse edges where it is
+        // the referenced source stay so a later remap can still report loss.
+        self.drop_payload_holder_edges(file_id);
         self.clear_settled_reads(file_id);
         self.clear_inferred_guard_dependencies(file_id);
         if let Some(signature_ids) = self.in_file_signatures.remove(&file_id) {
@@ -638,6 +835,8 @@ impl LuaIndex for LuaSignatureIndex {
         self.inferred_return_consumers.clear();
         self.settled_reads_by_file.clear();
         self.settled_read_dependents.clear();
+        self.payload_sources_by_holder.clear();
+        self.payload_holders_by_source.clear();
         self.inferred_positive_guards_changed = false;
         self.receiver_out_param_member_names.clear();
         self.in_file_receiver_out_param_member_names.clear();
@@ -707,5 +906,231 @@ mod tests {
         assert!(index.inferred_guard_owners_by_file.is_empty());
         assert!(index.inferred_guard_dependencies.is_empty());
         assert!(index.inferred_guard_consumers.is_empty());
+    }
+
+    fn table_ref(source: FileId, start: u32, end: u32) -> LuaType {
+        LuaType::TableConst(crate::InFiled::new(
+            source,
+            rowan::TextRange::new(start.into(), end.into()),
+        ))
+    }
+
+    fn signature_ref(source: FileId, position: u32) -> LuaType {
+        LuaType::Signature(LuaSignatureId::new(source, position.into()))
+    }
+
+    #[test]
+    fn payload_snapshot_replaces_stale_reverse_edges() {
+        let holder = FileId::new(10);
+        let source_a = FileId::new(20);
+        let source_b = FileId::new(30);
+        let source_c = FileId::new(40);
+        let mut index = LuaSignatureIndex::new();
+
+        let signature_id = LuaSignatureId::new(holder, 0.into());
+        {
+            let signature = index.get_or_create(signature_id);
+            signature
+                .return_docs
+                .push(crate::db_index::signature::LuaDocReturnInfo {
+                    name: None,
+                    type_ref: table_ref(source_a, 0, 1),
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: crate::db_index::signature::ReturnTypeKind::Reference,
+                });
+            signature.generic_params.push(std::sync::Arc::new(
+                crate::db_index::signature::LuaGenericParamInfo::new(
+                    "T".to_string(),
+                    Some(signature_ref(source_a, 7)),
+                    None,
+                ),
+            ));
+        }
+        index.set_inferred_positive_guard(
+            signature_id,
+            LuaInferredPositiveGuard {
+                param_idx: 0,
+                narrowed_type: table_ref(source_b, 0, 1),
+            },
+        );
+        let fact_owner = LuaInferredGuardOwner::GlobalPath {
+            signature_id: LuaSignatureId::new(holder, 5.into()),
+            state_mask: GmodStateMask::empty(),
+            path: vec!["Fact".into()].into_boxed_slice(),
+        };
+        index.set_owned_inferred_positive_guard(
+            fact_owner.signature_id(),
+            fact_owner.clone(),
+            LuaInferredPositiveGuard {
+                param_idx: 0,
+                narrowed_type: table_ref(source_c, 0, 1),
+            },
+        );
+
+        index.snapshot_payload_refs(holder);
+
+        assert_eq!(
+            index
+                .payload_sources_by_holder
+                .get(&holder)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([source_a, source_b, source_c]),
+        );
+        for source in [source_a, source_b, source_c] {
+            assert!(
+                index
+                    .payload_holders_by_source
+                    .get(&source)
+                    .is_some_and(|holders| holders.contains(&holder)),
+                "reverse edge for {source:?} should hold {holder:?}",
+            );
+        }
+
+        // Drop the signature payloads; only the guard/fact edges survive.
+        if let Some(signature) = index.signatures.get_mut(&signature_id) {
+            for ret in &mut signature.return_docs {
+                ret.type_ref = LuaType::String;
+            }
+            for generic in &mut signature.generic_params {
+                let rebuilt = crate::db_index::signature::LuaGenericParamInfo::new(
+                    generic.name.clone(),
+                    None,
+                    generic.attributes.clone(),
+                );
+                *generic = std::sync::Arc::new(rebuilt);
+            }
+        }
+        index.snapshot_payload_refs(holder);
+
+        assert_eq!(
+            index
+                .payload_sources_by_holder
+                .get(&holder)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([source_b, source_c]),
+        );
+        assert!(
+            !index.payload_holders_by_source.contains_key(&source_a),
+            "stale reverse edge for {source_a:?} should be gone",
+        );
+        for source in [source_b, source_c] {
+            assert!(
+                index
+                    .payload_holders_by_source
+                    .get(&source)
+                    .is_some_and(|holders| holders.contains(&holder)),
+            );
+        }
+
+        // Self-file references never enter the cross-file set.
+        if let Some(signature) = index.signatures.get_mut(&signature_id) {
+            for ret in &mut signature.return_docs {
+                ret.type_ref = table_ref(holder, 0, 1);
+            }
+        }
+        index
+            .inferred_positive_guards
+            .get_mut(&signature_id)
+            .expect("guard")
+            .narrowed_type = LuaType::String;
+        index
+            .inferred_guard_facts
+            .get_mut(&fact_owner)
+            .expect("fact")
+            .narrowed_type = LuaType::String;
+        index.snapshot_payload_refs(holder);
+
+        assert!(
+            index
+                .payload_sources_by_holder
+                .get(&holder)
+                .cloned()
+                .unwrap_or_default()
+                .is_empty()
+                || !index
+                    .payload_sources_by_holder
+                    .get(&holder)
+                    .cloned()
+                    .unwrap_or_default()
+                    .contains(&holder),
+            "self-file refs must stay out of the forward set",
+        );
+        assert!(!index.payload_holders_by_source.contains_key(&holder));
+        assert!(!index.payload_holders_by_source.contains_key(&source_b));
+        assert!(!index.payload_holders_by_source.contains_key(&source_c));
+    }
+
+    #[test]
+    fn removing_holder_cleans_payload_edges_but_removing_source_preserves_them() {
+        let holder_a = FileId::new(11);
+        let holder_b = FileId::new(12);
+        let source = FileId::new(20);
+        let mut index = LuaSignatureIndex::new();
+
+        for (holder, position) in [(holder_a, 0), (holder_b, 10)] {
+            let signature_id = LuaSignatureId::new(holder, position.into());
+            let signature = index.get_or_create(signature_id);
+            signature
+                .return_docs
+                .push(crate::db_index::signature::LuaDocReturnInfo {
+                    name: None,
+                    type_ref: table_ref(source, 0, 1),
+                    default_value: None,
+                    description: None,
+                    attributes: None,
+                    return_kind: crate::db_index::signature::ReturnTypeKind::Reference,
+                });
+            index.snapshot_payload_refs(holder);
+        }
+
+        assert_eq!(
+            index
+                .payload_holders_by_source
+                .get(&source)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([holder_a, holder_b]),
+        );
+
+        index.remove(holder_a);
+
+        assert!(!index.payload_sources_by_holder.contains_key(&holder_a));
+        assert_eq!(
+            index
+                .payload_holders_by_source
+                .get(&source)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([holder_b]),
+        );
+
+        // The removed source held no payloads of its own; foreign holders that
+        // still name it must stay so a later remap can report the loss.
+        index.remove(source);
+
+        assert_eq!(
+            index
+                .payload_holders_by_source
+                .get(&source)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([holder_b]),
+        );
+        assert_eq!(
+            index
+                .payload_sources_by_holder
+                .get(&holder_b)
+                .cloned()
+                .unwrap_or_default(),
+            HashSet::from_iter([source]),
+        );
+
+        index.clear();
+        assert!(index.payload_sources_by_holder.is_empty());
+        assert!(index.payload_holders_by_source.is_empty());
     }
 }

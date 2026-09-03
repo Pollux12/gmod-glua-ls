@@ -31,7 +31,8 @@ use crate::{
         lua::{
             compute_module_semantic_id, derive_inferred_return_with_reads,
             has_multiple_distinct_index_expr_member_owners, infer_for_range_iter_expr_func,
-            is_guarded_table_assignment_index_expr, resolve_index_expr_member_owner_for_file,
+            is_guarded_table_assignment_index_expr, mark_resolved_member_assignment,
+            resolve_index_expr_member_owner_for_file,
         },
         unresolve::UnResolveSpecialCall,
     },
@@ -240,25 +241,34 @@ fn create_deferred_index_expr_member(
         LuaMemberFeature::FileDefine
     };
     let guarded = is_guarded_table_assignment_index_expr(&index_expr);
+    let member = LuaMember::new(member_id, member_key, feature, None);
+    {
+        let member_index = db.get_member_index_mut();
+        member_index.add_member(owner, member);
+        // The owner above came from a prefix type read mid-fixpoint, so this
+        // placement is provisional: the post-settle re-home is the authority on
+        // where the member ends up, and it needs to know it may detach this one.
+        member_index.mark_deferred_index_expr_member(member_id);
+        // `add_member` records the enclosing function scope for `FileDefine`
+        // index-expr members only; for the rest it stores `None`. Same follow-up
+        // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
+        if !matches!(feature, LuaMemberFeature::FileDefine) {
+            let function_scope = member_index
+                .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
+            member_index.set_member_function_scope_range(member_id, function_scope);
+        }
+    }
+    // Marks must run after the member exists: `mark_non_overwriting_assignment_member`
+    // readmits co-writers through the member's current owner, which is a no-op
+    // before insertion, and `mark_resolved_member_assignment` requires the member
+    // to exist. The explicit guarded mark preserves `MetaDefine` bootstrap
+    // semantics where `mark_resolved_member_assignment` early-returns; the shared
+    // call covers the conditional/loop-body policy.
     if guarded {
         db.get_member_index_mut()
             .mark_non_overwriting_assignment_member(member_id);
     }
-    let member = LuaMember::new(member_id, member_key, feature, None);
-    let member_index = db.get_member_index_mut();
-    member_index.add_member(owner, member);
-    // The owner above came from a prefix type read mid-fixpoint, so this
-    // placement is provisional: the post-settle re-home is the authority on
-    // where the member ends up, and it needs to know it may detach this one.
-    member_index.mark_deferred_index_expr_member(member_id);
-    // `add_member` records the enclosing function scope for `FileDefine`
-    // index-expr members only; for the rest it stores `None`. Same follow-up
-    // the Lua pass does in `apply_index_expr_member_owner_with_guarded`.
-    if !matches!(feature, LuaMemberFeature::FileDefine) {
-        let function_scope = member_index
-            .enclosing_function_scope_range(member_id.file_id, member_id.get_position());
-        member_index.set_member_function_scope_range(member_id, function_scope);
-    }
+    mark_resolved_member_assignment(db, member_id);
     Some(())
 }
 
@@ -663,10 +673,11 @@ pub fn try_resolve_return_point(
             .iter()
             .map(|doc| &doc.type_ref)
             .ne(return_docs.iter().map(|doc| &doc.type_ref));
+        let correlations_moved = signature.return_correlations() != return_correlations.as_slice();
         signature.resolve_return = SignatureReturnStatus::InferResolve;
         signature.return_docs = return_docs;
         signature.set_return_correlations(return_correlations);
-        if moved {
+        if moved || correlations_moved {
             db.get_signature_index_mut()
                 .note_return_write(return_.signature_id);
         }
@@ -2510,11 +2521,19 @@ fn try_resolve_constructor_param(
         if let Some(type_decl) = db.get_type_index().get_type_decl(&root_type_id)
             && type_decl.is_class()
         {
+            let source_range = get_call_arg_expr(
+                call_expr,
+                param_info.param_idx,
+                param_info.is_colon_define,
+                call_expr.is_colon_call(),
+            )
+            .map(|arg| arg.get_range())
+            .unwrap_or_else(|| call_expr.get_range());
             let root_type = LuaType::Ref(root_type_id.clone());
             db.get_type_index_mut().add_super_type_if_missing(
                 target_id.clone(),
                 file_id,
-                call_expr.get_range(),
+                source_range,
                 root_type,
             );
         }
@@ -2991,6 +3010,98 @@ mod tests {
             alpha_first_selected.get_prefix(),
             beta_first_selected.get_prefix(),
             "string template selection should be independent of union member order"
+        );
+    }
+
+    fn never_return_doc() -> crate::LuaDocReturnInfo {
+        crate::LuaDocReturnInfo {
+            name: None,
+            type_ref: LuaType::Never,
+            default_value: None,
+            description: None,
+            attributes: None,
+            return_kind: crate::ReturnTypeKind::default(),
+        }
+    }
+
+    fn stale_correlation() -> crate::LuaReturnCorrelation {
+        crate::LuaReturnCorrelation {
+            discriminant_slot: 0,
+            implied_non_nil_slots: vec![1],
+        }
+    }
+
+    #[test]
+    fn return_write_version_advances_on_correlation_only_change() {
+        use crate::{LuaInferCache, LuaSignatureId, SignatureReturnStatus};
+        use rowan::TextSize;
+
+        let file_id = FileId::new(77);
+        let signature_id = LuaSignatureId::new(file_id, TextSize::new(0));
+        let mut db = make_db();
+        {
+            let signature = db.get_signature_index_mut().get_or_create(signature_id);
+            signature.resolve_return = SignatureReturnStatus::UnResolve;
+            signature.return_docs = vec![never_return_doc()];
+            signature.set_return_correlations(vec![stale_correlation()]);
+        }
+        let before = db.get_signature_index().return_write_version(&signature_id);
+
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let mut unresolve = super::UnResolveReturn {
+            file_id,
+            signature_id,
+            body: None,
+            return_points: Vec::new(),
+        };
+        super::try_resolve_return_point(&mut db, &mut cache, &mut unresolve)
+            .expect("empty return points resolve to never");
+
+        let after = db.get_signature_index().return_write_version(&signature_id);
+        assert!(
+            after > before,
+            "correlation-only change must advance return_write_version"
+        );
+        assert!(
+            db.get_signature_index()
+                .get(&signature_id)
+                .expect("signature")
+                .return_correlations()
+                .is_empty(),
+            "stale correlation must be replaced by the re-derived empty set"
+        );
+    }
+
+    #[test]
+    fn return_write_version_stays_on_same_correlation_noop() {
+        use crate::{LuaInferCache, LuaSignatureId, SignatureReturnStatus};
+        use rowan::TextSize;
+
+        let file_id = FileId::new(78);
+        let signature_id = LuaSignatureId::new(file_id, TextSize::new(0));
+        let mut db = make_db();
+        {
+            let signature = db.get_signature_index_mut().get_or_create(signature_id);
+            signature.resolve_return = SignatureReturnStatus::UnResolve;
+            signature.return_docs = vec![never_return_doc()];
+            signature.set_return_correlations(Vec::new());
+        }
+        let before = db.get_signature_index().return_write_version(&signature_id);
+
+        let mut cache = LuaInferCache::new(file_id, Default::default());
+        let mut unresolve = super::UnResolveReturn {
+            file_id,
+            signature_id,
+            body: None,
+            return_points: Vec::new(),
+        };
+        super::try_resolve_return_point(&mut db, &mut cache, &mut unresolve)
+            .expect("empty return points resolve to never");
+
+        let after = db.get_signature_index().return_write_version(&signature_id);
+        assert_eq!(
+            before, after,
+            "identical docs and correlations must not advance return_write_version"
         );
     }
 }
