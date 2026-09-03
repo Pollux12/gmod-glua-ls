@@ -53,6 +53,7 @@
   Bisect/debug only (expected to diverge): `mainreindex`, `exact`, `split:N`, `editmid`, `restabilize`, `perfile`, `expandwhy`, `faithful`.
   Use `DET_TARGETS=gamemode/core/sh_data.lua` by default for edit target, `sh_configuration` is good for performance related tests (many related files).
 - Perf: `GLUALS_PROFILE=1` for phase timings; `cargo run --release -p benchmark` for large-workspace. For `samply` (ETW on Windows, needs elevation and therefore user permission first) three things have to be right or the profile is useless: build with `CARGO_PROFILE_RELEASE_DEBUG=1 cargo build --release -p benchmark` so the PDB exists; run from `target/release`, because samply resolves the PDB by the relative path recorded in the exe; and do not pass `--main-thread-only`, because analysis runs on a spawned big-stack thread and the main thread only shows a join. Example: `cd target/release && BENCH_CODEBASE=<path> samply record --save-only --unstable-presymbolicate -o out.json.gz ./benchmark.exe`. That writes `out.json.gz` plus an `out.json.syms.json` sidecar; the profile holds only addresses, so symbol names come from joining the two by `libs[].debugName` and the frame address against each module's `symbol_table` rva ranges.
+- Before running Samply on Windows, check `tools/samply-bridge.ps1 -Status` and use that bridge when available.
 
 ## Commands
 
