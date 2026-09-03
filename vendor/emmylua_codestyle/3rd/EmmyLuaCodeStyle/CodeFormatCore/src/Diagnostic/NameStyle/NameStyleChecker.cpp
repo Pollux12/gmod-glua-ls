@@ -1,4 +1,4 @@
-﻿#include "CodeFormatCore/Diagnostic/NameStyle/NameStyleChecker.h"
+#include "CodeFormatCore/Diagnostic/NameStyle/NameStyleChecker.h"
 #include "CodeFormatCore/Config/LanguageTranslator.h"
 #include "CodeFormatCore/Diagnostic/DiagnosticBuilder.h"
 #include "CodeFormatCore/Diagnostic/NameStyle/NameStyleRuleMatcher.h"

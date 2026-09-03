@@ -1,4 +1,4 @@
-﻿#include "CodeFormatCore/Diagnostic/NameStyle/NameStyleRuleMatcher.h"
+#include "CodeFormatCore/Diagnostic/NameStyle/NameStyleRuleMatcher.h"
 #include "Util/StringUtil.h"
 
 

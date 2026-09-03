@@ -2,7 +2,7 @@
 
 Many higher level languages hide memory management, typically **passing by value** (copy data) or **passing by reference** (reference to shared data) without worrying about allocation, heap, stack, ownership and lifetimes, it is all delegated to the garbage collector or VM. Here is a comparison on this topic between a few languages:
 
-### 📌 Language Comparison 
+### 📌 Language Comparison
 
 | Language | Value Types | Reference/Pointer Types | Async Model & Types | Manual Memory |
 |------------ |------------------------------------- |----------------------------------------------------------- |---------------------------------------------------------------------------- |------------------------------ |
@@ -178,7 +178,7 @@ use std::{cell::OnceCell, rc::Rc};
 #[derive(Debug, Default)]
 struct MyStruct {
     distance: usize,
-    root: Option<Rc<OnceCell<MyStruct>>>, 
+    root: Option<Rc<OnceCell<MyStruct>>>,
 }
 
 fn main() {

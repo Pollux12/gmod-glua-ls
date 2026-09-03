@@ -34,7 +34,7 @@ Potential additions elements to add:
 
 > Example at ApolloGraphQL
 >
-> In the `Router` project there is a `xtask` configured for linting that can be executed with `cargo xtask lint`. 
+> In the `Router` project there is a `xtask` configured for linting that can be executed with `cargo xtask lint`.
 
 ## 2.3 Important Clippy Lints to Respect
 
@@ -69,7 +69,7 @@ enum Message {
 ```
 
 > The fix would be:
-> 
+>
 > ```rust
 > // Faster matching is preferred over size efficiency
 > #[expect(clippy::large_enum_variant)]

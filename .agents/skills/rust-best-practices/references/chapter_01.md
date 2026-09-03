@@ -2,7 +2,7 @@
 
 ## 1.1 Borrowing Over Cloning
 
-Rust's ownership system encourages **borrow** (`&T`) instead of **cloning** (`T.clone()`). 
+Rust's ownership system encourages **borrow** (`&T`) instead of **cloning** (`T.clone()`).
 > ❗ Performance recommendation
 
 ### ✅ When to `Clone`:
@@ -361,7 +361,7 @@ Well-written Rust code, with expressive types and good naming, often speaks for 
 
 Still, there are **moments where code alone isn't enough** - when there are performance quirks, external constraints, or non-obvious tradeoffs that require a nudge to the reader. In those cases, a concise comment can prevent hours of head-scratching or searching git history.
 
-### ✅ Good comments 
+### ✅ Good comments
 
 * Safety concerns:
 ```rust
@@ -398,8 +398,8 @@ let subgraph_tls_root_store: RootCertStore = configuration
 
 * Wall-of-text explanations: long comments and multiline comments
 ```rust
-// Lorem Ipsum is simply dummy text of the printing and typesetting industry. 
-// Lorem Ipsum has been the industry's standard dummy text ever since the 1500s, 
+// Lorem Ipsum is simply dummy text of the printing and typesetting industry.
+// Lorem Ipsum has been the industry's standard dummy text ever since the 1500s,
 // when an unknown printer took a galley
 fn do_something_odd() {
     …
@@ -480,7 +480,7 @@ There are a few gotchas when calling comments "living documentation":
 * Many large comments make people avoid reading them.
 * Team becomes fearful of delete irrelevant comments.
 
-If you find a comment, **don't trust it blindly**. Read it in context. If it's wrong or outdated, fix or remove it. A misleading comment is worse than no comments at all. 
+If you find a comment, **don't trust it blindly**. Read it in context. If it's wrong or outdated, fix or remove it. A misleading comment is worse than no comments at all.
 
 > Comments should bother you - they demand re-verification, just like stale tests.
 

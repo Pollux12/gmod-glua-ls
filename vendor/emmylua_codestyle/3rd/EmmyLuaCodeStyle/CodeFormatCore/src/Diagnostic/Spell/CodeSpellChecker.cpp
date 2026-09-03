@@ -1,4 +1,4 @@
-﻿#include "CodeFormatCore/Diagnostic/Spell/CodeSpellChecker.h"
+#include "CodeFormatCore/Diagnostic/Spell/CodeSpellChecker.h"
 #include "CodeFormatCore/Diagnostic/DiagnosticBuilder.h"
 #include "CodeFormatCore/Diagnostic/DiagnosticType.h"
 #include "CodeFormatCore/Diagnostic/Spell/Util.h"

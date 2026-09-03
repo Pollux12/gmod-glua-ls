@@ -1,4 +1,4 @@
-﻿#include "LuaParser/Ast/LuaSyntaxNode.h"
+#include "LuaParser/Ast/LuaSyntaxNode.h"
 #include "LuaParser/Ast/LuaSyntaxTree.h"
 #include "LuaParser/Lexer/LuaTokenTypeDetail.h"
 #include "Util/Utf8.h"
