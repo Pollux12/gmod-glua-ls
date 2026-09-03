@@ -420,6 +420,211 @@ impl LuaSignature {
                 .with_optional_params(optional_params);
         Arc::new(func_type)
     }
+
+    /// Every top-level `LuaType` this signature stores.
+    ///
+    /// Covers generic constraints, overload params/returns, param doc
+    /// `type_ref`s, out-param `type_ref`s and return doc `type_ref`s. Fields
+    /// holding only indexes, names or correlations carry no `LuaType` and are
+    /// intentionally absent.
+    pub(crate) fn visit_payload_types(&self, visitor: &mut impl FnMut(&LuaType)) {
+        for generic in &self.generic_params {
+            if let Some(constraint) = &generic.constraint {
+                visitor(constraint);
+            }
+        }
+        for overload in &self.overloads {
+            for (_, param_ty) in overload.get_params() {
+                if let Some(ty) = param_ty {
+                    visitor(ty);
+                }
+            }
+            visitor(overload.get_ret());
+        }
+        for param in self.param_docs.values() {
+            visitor(&param.type_ref);
+        }
+        for out in &self.out_params {
+            visitor(&out.type_ref);
+        }
+        for ret in &self.return_docs {
+            visitor(&ret.type_ref);
+        }
+    }
+
+    /// Rewrites every nested position-bearing identity in the typed payloads.
+    ///
+    /// Atomic per signature: when any nested identity is lost nothing is
+    /// rewritten and `lost` is reported, so the caller dirties the holder
+    /// instead of leaving a guessed mix of old and new coordinates.
+    pub(crate) fn remap_payload_types(
+        &mut self,
+        remap: &crate::FileRemap,
+    ) -> SignaturePayloadRemap {
+        let mut lost = false;
+        let mut changed = false;
+
+        let mut new_constraints: Vec<Option<LuaType>> =
+            Vec::with_capacity(self.generic_params.len());
+        for generic in &self.generic_params {
+            match &generic.constraint {
+                Some(constraint) => {
+                    let result = crate::db_index::remap_identities_in_type(constraint, remap);
+                    if result.lost {
+                        lost = true;
+                    }
+                    if result.typ.is_some() {
+                        changed = true;
+                    }
+                    new_constraints.push(result.typ);
+                }
+                None => new_constraints.push(None),
+            }
+        }
+
+        let mut new_overloads: Vec<Option<Arc<LuaFunctionType>>> =
+            Vec::with_capacity(self.overloads.len());
+        for overload in &self.overloads {
+            let mut overload_changed = false;
+            let mut new_params = Vec::with_capacity(overload.get_params().len());
+            for (name, ty) in overload.get_params() {
+                match ty {
+                    Some(ty) => {
+                        let result = crate::db_index::remap_identities_in_type(ty, remap);
+                        if result.lost {
+                            lost = true;
+                        }
+                        match result.typ {
+                            Some(new_ty) => {
+                                overload_changed = true;
+                                new_params.push((name.clone(), Some(new_ty)));
+                            }
+                            None => new_params.push((name.clone(), Some(ty.clone()))),
+                        }
+                    }
+                    None => new_params.push((name.clone(), None)),
+                }
+            }
+            let ret_result = crate::db_index::remap_identities_in_type(overload.get_ret(), remap);
+            if ret_result.lost {
+                lost = true;
+            }
+            let new_ret = match ret_result.typ {
+                Some(new_ty) => {
+                    overload_changed = true;
+                    new_ty
+                }
+                None => overload.get_ret().clone(),
+            };
+            if overload_changed {
+                changed = true;
+                let rebuilt = LuaFunctionType::new(
+                    overload.get_async_state(),
+                    overload.is_colon_define(),
+                    overload.is_variadic(),
+                    new_params,
+                    new_ret,
+                )
+                .with_optional_params(overload.get_optional_params().to_vec())
+                .with_call_arg_roles(overload.get_call_arg_roles().to_vec());
+                new_overloads.push(Some(Arc::new(rebuilt)));
+            } else {
+                new_overloads.push(None);
+            }
+        }
+
+        let mut new_param_types: std::collections::HashMap<usize, LuaType> =
+            std::collections::HashMap::new();
+        for (idx, info) in &self.param_docs {
+            let result = crate::db_index::remap_identities_in_type(&info.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if let Some(new_ty) = result.typ {
+                changed = true;
+                new_param_types.insert(*idx, new_ty);
+            }
+        }
+
+        let mut new_out_types: Vec<Option<LuaType>> = Vec::with_capacity(self.out_params.len());
+        for out in &self.out_params {
+            let result = crate::db_index::remap_identities_in_type(&out.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if result.typ.is_some() {
+                changed = true;
+            }
+            new_out_types.push(result.typ);
+        }
+
+        let mut new_return_types: Vec<Option<LuaType>> = Vec::with_capacity(self.return_docs.len());
+        for ret in &self.return_docs {
+            let result = crate::db_index::remap_identities_in_type(&ret.type_ref, remap);
+            if result.lost {
+                lost = true;
+            }
+            if result.typ.is_some() {
+                changed = true;
+            }
+            new_return_types.push(result.typ);
+        }
+
+        if lost {
+            return SignaturePayloadRemap {
+                lost: true,
+                changed: false,
+            };
+        }
+        if !changed {
+            return SignaturePayloadRemap {
+                lost: false,
+                changed: false,
+            };
+        }
+
+        for (generic, new_constraint) in self.generic_params.iter_mut().zip(new_constraints) {
+            if let Some(new_ty) = new_constraint {
+                let rebuilt = LuaGenericParamInfo::new(
+                    generic.name.clone(),
+                    Some(new_ty),
+                    generic.attributes.clone(),
+                );
+                *generic = Arc::new(rebuilt);
+            }
+        }
+        for (overload, new_overload) in self.overloads.iter_mut().zip(new_overloads) {
+            if let Some(new_ty) = new_overload {
+                *overload = new_ty;
+            }
+        }
+        for (idx, new_ty) in new_param_types {
+            if let Some(info) = self.param_docs.get_mut(&idx) {
+                info.type_ref = new_ty;
+            }
+        }
+        for (out, new_ty) in self.out_params.iter_mut().zip(new_out_types) {
+            if let Some(new_ty) = new_ty {
+                out.type_ref = new_ty;
+            }
+        }
+        for (ret, new_ty) in self.return_docs.iter_mut().zip(new_return_types) {
+            if let Some(new_ty) = new_ty {
+                ret.type_ref = new_ty;
+            }
+        }
+        SignaturePayloadRemap {
+            lost: false,
+            changed: true,
+        }
+    }
+}
+
+/// Whether remapping one signature's typed payloads moved or lost anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SignaturePayloadRemap {
+    pub lost: bool,
+    pub changed: bool,
 }
 
 fn visit_call_arg_roles_from_param_attribute<F>(

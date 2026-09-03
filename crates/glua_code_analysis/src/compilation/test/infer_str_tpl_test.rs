@@ -2447,4 +2447,112 @@ mod test {
             "DColorMixer reassignment should replace the older local panel type, got {diagnostics:?}"
         );
     }
+
+    #[gtest]
+    fn test_str_tpl_constructor_call_contributes_single_supertype_edge() {
+        use glua_parser::LuaCallExpr;
+
+        let mut ws = VirtualWorkspace::new();
+
+        ws.def_file(
+            "defs.lua",
+            r#"
+                ---@attribute constructor(name: string, root_class: string?, strip_self: boolean?, return_self: boolean?)
+
+                ---@class Entity
+
+                ents = {}
+
+                ---@generic T: Entity
+                ---@[constructor("__init", "Entity")]
+                ---@param class `T`
+                ---@return T[]
+                function ents.FindByClass(class)
+                end
+            "#,
+        );
+
+        let caller_text = r#"local found = ents.FindByClass("prop_vehicle_jeep")"#;
+        let caller_path = "caller.lua";
+        let caller_id = ws.def_file(caller_path, caller_text);
+
+        let generated_id = LuaTypeDeclId::global("prop_vehicle_jeep");
+        let entity_ty = LuaType::Ref(LuaTypeDeclId::global("Entity"));
+
+        let super_types: Vec<_> = ws
+            .get_db_mut()
+            .get_type_index()
+            .get_super_types_iter(&generated_id)
+            .map(|iter| iter.cloned().collect())
+            .unwrap_or_default();
+        assert!(
+            super_types.contains(&entity_ty),
+            "expected `prop_vehicle_jeep` to inherit `Entity`, got {super_types:?}"
+        );
+
+        let collect_caller_entity_edges = |ws: &VirtualWorkspace| {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .get_super_type_entries(&generated_id)
+                .map(|entries| {
+                    entries
+                        .iter()
+                        .filter(|entry| entry.file_id == caller_id && entry.value.typ == entity_ty)
+                        .map(|entry| entry.value.source_range)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+
+        let semantic_model = ws
+            .analysis
+            .compilation
+            .get_semantic_model(caller_id)
+            .expect("expected semantic model");
+        let root = semantic_model.get_root();
+        let call_expr = root
+            .descendants::<LuaCallExpr>()
+            .next()
+            .expect("expected FindByClass call");
+        let call_range = call_expr.get_range();
+        let arg_expr = call_expr
+            .get_args_list()
+            .expect("expected args")
+            .get_args()
+            .next()
+            .expect("expected class arg");
+        let arg_range = arg_expr.get_range();
+
+        let edges = collect_caller_entity_edges(&ws);
+        assert_eq!(
+            edges.len(),
+            1,
+            "expected exactly one raw `prop_vehicle_jeep -> Entity` edge from the caller, got {edges:?} (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+        assert_eq!(
+            edges[0], arg_range,
+            "supertype edge must use the string argument range, got {:?} (arg_range={arg_range:?}, call_range={call_range:?})",
+            edges[0],
+        );
+        assert_ne!(
+            edges[0], call_range,
+            "supertype edge must not use the enclosing call range (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+
+        ws.def_file(caller_path, &format!("{caller_text}\n"));
+
+        let edges_after = collect_caller_entity_edges(&ws);
+        assert_eq!(
+            edges_after.len(),
+            1,
+            "reindex must not accumulate duplicate supertype edges, got {edges_after:?} (arg_range={arg_range:?}, call_range={call_range:?})"
+        );
+        assert_eq!(
+            edges_after[0], arg_range,
+            "reindexed supertype edge must keep the string argument range, got {:?} (arg_range={arg_range:?}, call_range={call_range:?})",
+            edges_after[0],
+        );
+    }
 }

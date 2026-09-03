@@ -1755,4 +1755,76 @@ mod test {
         );
         assert_eq!(warm, expected);
     }
+
+    #[test]
+    fn inferred_returns_follow_late_settled_dynamic_fields_to_a_fixpoint() {
+        // The writer's `Ranks[rank]` prefix only resolves once the
+        // `pairs(Ranks)` loop variables settle, so `iconMat` lands after the
+        // returner's `.iconMat` read was taken. Sorting the returner first
+        // forces that late publication on a cold build.
+        let mut ws = VirtualWorkspace::new();
+        let returner_path = "lua/a_returner.lua";
+        let returner_source = r#"
+            ---@class IMaterial
+            ---@return IMaterial
+            function Material(path) end
+
+            function GetRankData(rank)
+                return Ranks[rank]
+            end
+
+            function GetRankIconMaterial(rank)
+                return GetRankData(rank).iconMat
+            end
+
+            function GetRankMissing(rank)
+                return GetRankData(rank).nope
+            end
+        "#;
+        ws.def_files(vec![
+            (returner_path, returner_source),
+            (
+                "lua/b_ranks.lua",
+                r#"
+                Ranks = {
+                    admin = { title = "Admin" },
+                    user = { title = "User" },
+                }
+
+                for rank, data in pairs(Ranks) do
+                    Ranks[rank].iconMat = Material("icon.vmt")
+                end
+                "#,
+            ),
+        ]);
+
+        let returner_uri = ws.virtual_url_generator.new_uri(returner_path);
+        let returner_file = ws
+            .analysis
+            .get_file_id(&returner_uri)
+            .expect("expected returner file");
+        let cold_icon = ws.humanize_type_detailed(signature_return_type(
+            &ws,
+            returner_file,
+            "GetRankIconMaterial",
+        ));
+        let cold_missing =
+            ws.humanize_type_detailed(signature_return_type(&ws, returner_file, "GetRankMissing"));
+        assert_eq!(cold_icon, "IMaterial");
+        assert_eq!(cold_missing, "nil");
+
+        ws.analysis
+            .update_file_text_only(&returner_uri, format!("{returner_source}\n"));
+        ws.analysis.reindex_files(vec![returner_file]);
+
+        let warm_icon = ws.humanize_type_detailed(signature_return_type(
+            &ws,
+            returner_file,
+            "GetRankIconMaterial",
+        ));
+        let warm_missing =
+            ws.humanize_type_detailed(signature_return_type(&ws, returner_file, "GetRankMissing"));
+        assert_eq!(warm_icon, "IMaterial");
+        assert_eq!(warm_missing, "nil");
+    }
 }

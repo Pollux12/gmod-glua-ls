@@ -114,6 +114,58 @@ mod tests {
         );
     }
 
+    /// A `---@module` reader caches `LuaType::ModuleRef(provider)`. The reverse
+    /// index files that under the providing file, not under any symbol the
+    /// provider exports, so no key in the export diff names it and the reader is
+    /// reached only because the provider's own file identity is seeded.
+    #[gtest]
+    fn module_annotation_reader_sees_provider_edit() {
+        let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
+        let provider_uri = ws.virtual_url_generator.new_uri("modprovider.lua");
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            local M = {}
+            M.value = 1
+            return M
+            "#,
+        );
+
+        let consumer_uri = ws.virtual_url_generator.new_uri("modconsumer.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            ---@module "modprovider"
+            ModuleProvider = {}
+
+            local observed = ModuleProvider.value
+            "#,
+        );
+
+        expect_that!(
+            decl_type(&ws, consumer_id, "observed"),
+            eq(&LuaType::IntegerConst(1))
+        );
+
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            local M = {}
+            M.value = "text"
+            return M
+            "#,
+        );
+
+        let observed = decl_type(&ws, consumer_id, "observed");
+        expect_true!(
+            matches!(&observed, LuaType::StringConst(value) if value.as_str() == "text"),
+            "module reader kept {observed:?} instead of the provider's new string"
+        );
+    }
+
     /// A string literal is a value, not a shape. Collapsing it to `string` in
     /// the fingerprint hides the change from every file that narrows on it.
     #[gtest]
@@ -2171,6 +2223,192 @@ function meta:Custom() end
         assert_eq!(
             warm_observed,
             decl_type(&fresh, fresh_consumer_id, "observed")
+        );
+    }
+
+    /// Cold-versus-single-file assignment-policy regression: a `target[k] = v`
+    /// write inside a loop body must carry the non-overwriting mark no matter
+    /// which pass created the member.
+    ///
+    /// The writer sorts before the file that defines its tables, so during the
+    /// cold batch the `Target` prefix is not inferable while the writer is
+    /// walked and the loop-body member is created later by the deferred
+    /// index-expression path. A single-file re-index finds the prefix
+    /// immediately and marks the member through
+    /// `is_member_assignment_in_conditional_branch`. The export map hashes the
+    /// mark, so a cold member that misses it makes every unrelated edit to the
+    /// file look like an export change and ripples dependents.
+    #[test]
+    fn deferred_loop_body_write_marks_non_overwriting_from_cold_index() {
+        use glua_parser::LuaAstNode;
+
+        const DEFS: &str = r#"
+Source = {
+    alpha = 1,
+    beta = 2,
+}
+Target = {}
+"#;
+        const WRITER: &str = r#"
+for k in pairs(Source) do
+    Target[k] = true
+end
+"#;
+        const READER: &str = r#"
+local direct = Target.alpha
+for _, value in pairs(Target) do
+    local _ = value
+end
+"#;
+        const WRITER_CHANGED: &str = r#"
+for k in pairs(Source) do
+    Target[k] = 1
+end
+"#;
+
+        /// The loop write's member, located from syntax rather than from a
+        /// hard-coded offset: the member id is the write's own syntax node in
+        /// this file.
+        fn loop_write_member_id(ws: &VirtualWorkspace, file_id: FileId) -> crate::LuaMemberId {
+            let db = ws.analysis.compilation.get_db();
+            let tree = db
+                .get_vfs()
+                .get_syntax_tree(&file_id)
+                .expect("writer syntax tree");
+            let chunk = tree.get_chunk_node();
+            for assign_stat in LuaAstNode::descendants::<glua_parser::LuaAssignStat>(&chunk) {
+                let (vars, _) = assign_stat.get_var_and_expr_list();
+                for var in vars {
+                    if var.syntax().text() == "Target[k]"
+                        && let glua_parser::LuaVarExpr::IndexExpr(index_expr) = var
+                    {
+                        return crate::LuaMemberId::new(index_expr.get_syntax_id(), file_id);
+                    }
+                }
+            }
+            panic!("loop write `Target[k] = true` not found in writer");
+        }
+
+        fn is_non_overwriting(ws: &VirtualWorkspace, member_id: crate::LuaMemberId) -> bool {
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_member_index()
+                .is_non_overwriting_assignment_member(member_id)
+        }
+
+        // Cold build: every file lands in one batch with the writer ordered
+        // first, so the writer's `Target` prefix only settles after its own
+        // Lua walk and the loop-body member goes through deferred creation.
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let writer_uri = ws.virtual_url_generator.new_uri("lua/a_writer.lua");
+        let defs_uri = ws.virtual_url_generator.new_uri("lua/b_defs.lua");
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/c_reader.lua");
+        ws.analysis.update_files_by_uri_sorted(vec![
+            (writer_uri.clone(), Some(WRITER.to_string())),
+            (defs_uri.clone(), Some(DEFS.to_string())),
+            (reader_uri.clone(), Some(READER.to_string())),
+        ]);
+        let writer_id = ws
+            .analysis
+            .get_file_id(&writer_uri)
+            .expect("writer file id");
+        let reader_id = ws
+            .analysis
+            .get_file_id(&reader_uri)
+            .expect("reader file id");
+
+        let member_id = loop_write_member_id(&ws, writer_id);
+        {
+            let db = ws.analysis.compilation.get_db();
+            let member_index = db.get_member_index();
+            let member = member_index
+                .get_member(&member_id)
+                .expect("cold index must create the loop-body member");
+            assert!(
+                member_index.is_non_overwriting_assignment_member(member_id),
+                "cold loop-body write must carry the non-overwriting mark; \
+                 got non_overwriting=false for member {member_id:?} \
+                 key={:?} owner={:?} feature={:?}",
+                member.get_key(),
+                member_index.get_member_owner(&member_id),
+                member.get_feature(),
+            );
+        }
+
+        let codes_before = codes_in(&ws, reader_id);
+        let direct_before = decl_type(&ws, reader_id, "direct");
+        let value_before = decl_type(&ws, reader_id, "value");
+
+        // Production staged edit path for a semantic no-op: text first, then
+        // phase 1, then ripple. It must move no export — including the
+        // assignment-policy mark — and owe dependents no work.
+        let noop = format!("{WRITER}-- unrelated touch\n");
+        let staged = ws
+            .analysis
+            .update_file_text_only(&writer_uri, noop)
+            .expect("staged file id");
+        assert_eq!(staged, writer_id);
+        let dirty = ws.analysis.self_index_and_diff(vec![writer_id]);
+        assert!(
+            dirty.changed_sources().is_empty(),
+            "unrelated EOF comment must move no export"
+        );
+        assert!(
+            dirty.is_empty(),
+            "unrelated EOF comment owes dependents no work"
+        );
+        ws.analysis.ripple(dirty);
+
+        // The EOF comment shifts no loop offset, so the member keeps its
+        // identity and mark, and downstream facts are untouched.
+        assert_eq!(loop_write_member_id(&ws, writer_id), member_id);
+        assert!(is_non_overwriting(&ws, member_id));
+        assert_eq!(codes_in(&ws, reader_id), codes_before);
+        assert_eq!(decl_type(&ws, reader_id, "direct"), direct_before);
+        assert_eq!(decl_type(&ws, reader_id, "value"), value_before);
+
+        // Paired real edit: changing what the loop stores must still reach the
+        // dependent, or the no-op assertions above could be met by never
+        // invalidating anything.
+        let staged = ws
+            .analysis
+            .update_file_text_only(&writer_uri, WRITER_CHANGED.to_string())
+            .expect("staged file id");
+        assert_eq!(staged, writer_id);
+        let dirty = ws.analysis.self_index_and_diff(vec![writer_id]);
+        assert!(
+            dirty.changed_sources().contains(&writer_id),
+            "loop-semantics change must move the writer's exports"
+        );
+        assert!(
+            dirty.files().contains(&reader_id),
+            "loop-semantics change must dirty the target reader"
+        );
+        ws.analysis.ripple(dirty);
+
+        // The rippled workspace agrees with a fresh cold build of the same
+        // texts: no stale dependent facts survive the propagation.
+        let mut fresh = VirtualWorkspace::new_with_init_std_lib();
+        let fresh_writer_uri = fresh.virtual_url_generator.new_uri("lua/a_writer.lua");
+        let fresh_defs_uri = fresh.virtual_url_generator.new_uri("lua/b_defs.lua");
+        let fresh_reader_uri = fresh.virtual_url_generator.new_uri("lua/c_reader.lua");
+        fresh.analysis.update_files_by_uri_sorted(vec![
+            (fresh_writer_uri, Some(WRITER_CHANGED.to_string())),
+            (fresh_defs_uri, Some(DEFS.to_string())),
+            (fresh_reader_uri.clone(), Some(READER.to_string())),
+        ]);
+        let fresh_reader_id = fresh
+            .analysis
+            .get_file_id(&fresh_reader_uri)
+            .expect("fresh reader file id");
+        assert_eq!(
+            decl_type(&ws, reader_id, "value"),
+            decl_type(&fresh, fresh_reader_id, "value")
+        );
+        assert_eq!(
+            decl_type(&ws, reader_id, "direct"),
+            decl_type(&fresh, fresh_reader_id, "direct")
         );
     }
 }

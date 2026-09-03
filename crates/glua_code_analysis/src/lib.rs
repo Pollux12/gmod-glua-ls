@@ -482,15 +482,6 @@ impl EmmyLuaAnalysis {
                 .is_none()
         });
         let is_removed = text.is_none();
-        let pre_edit_state =
-            existing_file_id
-                .filter(|_| !was_absent && !is_removed)
-                .map(|file_id| {
-                    let expansion = self.expand_reindex_file_ids(vec![file_id]);
-                    let files = expansion.iter().copied().collect::<FxHashSet<_>>();
-                    let guard_snapshot = self.inferred_guard_snapshot(&files);
-                    (expansion, guard_snapshot)
-                });
         if let Some(existing) = existing_file_id {
             // Before the mutation: this is the text the index was built from.
             // For a deletion it is also what says every old offset is gone.
@@ -508,20 +499,7 @@ impl EmmyLuaAnalysis {
         if was_absent || is_removed {
             self.dirty_existence_dependents(&mut dirty, file_id);
         }
-        profile::phase("edit/ripple", || {
-            if dirty.is_empty() {
-                return;
-            }
-            if let Some((expansion, guard_snapshot)) = pre_edit_state {
-                self.reindex_expanded_files_with_old_snapshot(
-                    vec![file_id],
-                    expansion,
-                    guard_snapshot,
-                );
-            } else {
-                self.ripple(dirty);
-            }
-        });
+        profile::phase("edit/ripple", || self.ripple(dirty));
         profile::phase_report("update_file_by_uri");
 
         Some(file_id)
@@ -704,19 +682,15 @@ impl EmmyLuaAnalysis {
         Some(file_id)
     }
 
-    /// Reindex specific files: remove old index entries + run full analysis pipeline.
-    /// Call this after `update_file_text_only` once the user has paused typing.
+    /// Settles the index after these files' text changed under
+    /// [`update_file_text_only`](Self::update_file_text_only).
+    ///
+    /// Both phases of an edit: re-index the changed files and re-home the
+    /// references into them, then re-analyse whatever read a fact the edit
+    /// moved.
     pub fn reindex_files(&mut self, file_ids: Vec<FileId>) {
-        let expansion = self.expand_reindex_file_ids(file_ids.clone());
-        let files = expansion.iter().copied().collect::<FxHashSet<_>>();
-        let guard_snapshot = self.inferred_guard_snapshot(&files);
         let dirty = self.self_index_and_diff(file_ids);
-        if dirty.is_empty() {
-            return;
-        }
-        let mut sources = dirty.sources.iter().copied().collect::<Vec<_>>();
-        sources.sort_unstable();
-        self.reindex_expanded_files_with_old_snapshot(sources, expansion, guard_snapshot);
+        self.ripple(dirty);
     }
 
     /// [`reindex_files`](Self::reindex_files) against an expansion that was

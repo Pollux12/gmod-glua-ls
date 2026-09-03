@@ -452,6 +452,7 @@ fn infer_generic_types_from_call(
         if !func_param_type.contain_tpl() {
             continue;
         }
+        context.source_range = call_arg_expr.get_range();
 
         if !func_param_type.is_variadic()
             && check_expr_can_later_infer(context, func_param_type, call_arg_expr)?
@@ -529,6 +530,7 @@ fn infer_generic_types_from_call(
 
     if !context.substitutor.is_infer_all_tpl() {
         for (func_param_type, call_arg_expr) in unresolve_tpls {
+            context.source_range = call_arg_expr.get_range();
             let closure_type = infer_expr(db, context.cache, call_arg_expr)?;
 
             tpl_pattern_match(context, &func_param_type, &closure_type)?;

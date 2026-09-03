@@ -407,6 +407,8 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 .set_settled_reads(*reader_file_id, reads.type_owners);
             db.get_signature_index_mut()
                 .set_settled_reads(*reader_file_id, reads.signatures);
+            db.get_signature_index_mut()
+                .snapshot_payload_refs(*reader_file_id);
         }
         if std::env::var_os("GLUALS_PROFILE").is_some() {
             eprintln!(
@@ -1401,6 +1403,7 @@ fn refresh_decl_initializer_caches(
     }
     let analysis_phase = context.infer_manager.current_phase();
     let dynamic_fields_visible = context.infer_manager.dynamic_fields_visible();
+    let pass_is_settled = pass.is_settled();
 
     // Initializer inference reads the stabilized indexes and records candidate
     // cache writes without mutating the database. Process that read-only work
@@ -1431,10 +1434,14 @@ fn refresh_decl_initializer_caches(
                 continue;
             }
             // A slot with no cache belongs to a deferred item that has not
-            // resolved yet; a refresh re-reads answers, it does not seed them,
-            // and a seed here would be read against whatever the index held at
-            // this pass and then hold the item's answer out.
-            if current_cache.is_none() {
+            // resolved yet. Mid-batch a seed here would be read against whatever
+            // the index held at this pass and then hold the item's real answer
+            // out, so the full pass leaves it alone. Once the index has settled
+            // there is no later answer to hold out, and skipping instead strands
+            // the slot: `stabilize_unknown_locals` takes it for genuinely
+            // unresolved and derives it from a use, so an initializer that
+            // settled facts can answer loses to usage context.
+            if current_cache.is_none() && !pass_is_settled {
                 continue;
             }
             let current_is_uninformative = type_cache_is_uninformative(current_cache.as_ref());
@@ -2693,6 +2700,15 @@ impl AnalyzeContext {
                     !db.get_member_index()
                         .get_members_for_owner_key(owner, key)
                         .is_empty()
+                        || matches!(key, LuaMemberKey::Name(name)
+                        if crate::dynamic_field_owner_of(db, owner).is_some_and(
+                            |dynamic_owner| {
+                                !db
+                                    .get_dynamic_field_index()
+                                    .field_definitions(&dynamic_owner, name.as_str())
+                                    .is_empty()
+                            },
+                        ))
                 })
     }
 

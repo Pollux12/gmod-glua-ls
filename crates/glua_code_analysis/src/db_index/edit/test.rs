@@ -4,7 +4,8 @@ use rowan::{TextRange, TextSize};
 
 use super::{ExportKey, FileRemap, PositionMap, export_map, remap_into_file};
 use crate::{
-    DbIndex, Emmyrc, FileId, LuaType, LuaTypeOwner, TypeVisitTrait, VirtualWorkspace, diff_exports,
+    DbIndex, Emmyrc, FileId, InFiled, LuaSignatureId, LuaType, LuaTypeOwner, SignatureReturnStatus,
+    TypeVisitTrait, VirtualWorkspace, diff_exports,
 };
 
 fn range(start: u32, end: u32) -> TextRange {
@@ -398,6 +399,310 @@ fn a_destroyed_table_reports_its_dependent_as_dirty() {
     );
 
     let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+    expect_that!(dirty, contains(eq(&consumer_id)));
+}
+
+/// A foreign inferred return names the provider's table literal by range. An
+/// insertion above it shifts that range; the stored return must follow without
+/// re-analysing the consumer.
+#[gtest]
+fn a_foreign_inferred_return_table_follows_an_offset_shift() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/tables.lua");
+    let first = "registry = { first = 1 }\n";
+    let second = "local padding = 1\n_ = padding\nregistry = { first = 1 }\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/fetch.lua");
+    let consumer_id = write(
+        &mut ws,
+        &consumer_uri,
+        "function fetchRegistry() return registry end\n",
+    );
+
+    // Fixture guard: the consumer owns one inferred return embedding the
+    // provider's table, and no type cache names it, so only the signature
+    // payload can carry the shift.
+    let (consumer_sig, old_range) = {
+        let db = ws.analysis.compilation.get_db();
+        let consumer_sig = *db
+            .get_signature_index()
+            .get_file_signature_ids(consumer_id)
+            .expect("consumer signatures")
+            .iter()
+            .next()
+            .expect("consumer signature");
+        let sig = db
+            .get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature");
+        expect_that!(sig.resolve_return, eq(SignatureReturnStatus::InferResolve));
+        expect_that!(sig.return_docs.len(), eq(1));
+        let LuaType::TableConst(old_range) = sig.return_docs[0].type_ref.clone() else {
+            panic!(
+                "consumer inferred return should embed the provider table, got {:?}",
+                sig.return_docs[0].type_ref
+            );
+        };
+        expect_that!(old_range.file_id, eq(provider_id));
+        expect_that!(old_range.value, eq(range(11, 24)));
+        expect_that!(
+            cached_identities(db, consumer_id)
+                .iter()
+                .any(|id| id.contains("InFiled")),
+            is_false()
+        );
+        (consumer_sig, old_range)
+    };
+
+    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let db = ws.analysis.compilation.get_db();
+    let after = db
+        .get_signature_index()
+        .get(&consumer_sig)
+        .expect("consumer signature")
+        .return_docs[0]
+        .type_ref
+        .clone();
+    let expected_range = PositionMap::new(first, second)
+        .map_range(old_range.value)
+        .expect("the shift maps the table range");
+    let expected = LuaType::TableConst(InFiled::new(provider_id, expected_range));
+    // The remapped payload must name the live literal ...
+    expect_that!(
+        live_table_ranges(db, provider_id)
+            .iter()
+            .any(|s| s == &format!("{expected_range:?}")),
+        is_true()
+    );
+    // ... and be exactly the remapped old identity.
+    expect_that!(after, eq(&expected));
+}
+
+/// The same for a `Signature` identity: returning the provider's function
+/// stores its id in the consumer's inferred return, which must follow the
+/// provider's offset shift.
+#[gtest]
+fn a_foreign_inferred_return_signature_follows_an_offset_shift() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first = "provider = provider or {}\nfunction provider.Describe() end\n";
+    let second = "provider = provider or {}\nlocal padding = 1\n_ = padding\nfunction provider.Describe() end\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/fetch.lua");
+    let consumer_id = write(
+        &mut ws,
+        &consumer_uri,
+        "function fetchDescribe() return provider.Describe end\n",
+    );
+
+    let (consumer_sig, old_id) = {
+        let db = ws.analysis.compilation.get_db();
+        let consumer_sig = *db
+            .get_signature_index()
+            .get_file_signature_ids(consumer_id)
+            .expect("consumer signatures")
+            .iter()
+            .next()
+            .expect("consumer signature");
+        let sig = db
+            .get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature");
+        expect_that!(sig.resolve_return, eq(SignatureReturnStatus::InferResolve));
+        expect_that!(sig.return_docs.len(), eq(1));
+        let LuaType::Signature(old_id) = sig.return_docs[0].type_ref.clone() else {
+            panic!(
+                "consumer inferred return should embed the provider signature, got {:?}",
+                sig.return_docs[0].type_ref
+            );
+        };
+        expect_that!(old_id.get_file_id(), eq(provider_id));
+        expect_that!(
+            db.get_signature_index()
+                .get_file_signature_ids(provider_id)
+                .is_some_and(|ids| ids.contains(&old_id)),
+            is_true()
+        );
+        let old_debug = format!("{old_id:?}");
+        expect_that!(
+            cached_identities(db, consumer_id)
+                .iter()
+                .any(|id| id == &old_debug),
+            is_false()
+        );
+        (consumer_sig, old_id)
+    };
+
+    edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let db = ws.analysis.compilation.get_db();
+    let after = db
+        .get_signature_index()
+        .get(&consumer_sig)
+        .expect("consumer signature")
+        .return_docs[0]
+        .type_ref
+        .clone();
+    let expected_pos = PositionMap::new(first, second)
+        .map(old_id.get_position())
+        .expect("the shift maps the signature position");
+    let expected_id = LuaSignatureId::new(provider_id, expected_pos);
+    let expected = LuaType::Signature(expected_id);
+    expect_that!(
+        db.get_signature_index()
+            .get_file_signature_ids(provider_id)
+            .is_some_and(|ids| ids.contains(&expected_id)),
+        is_true()
+    );
+    expect_that!(after, eq(&expected));
+}
+
+/// Destroying the table a foreign inferred return names cannot be rewritten,
+/// so the signature owner has to be re-analysed instead. The consumer holds
+/// no type-cache reference to the table, so only signature-payload loss can
+/// dirty it.
+#[gtest]
+fn a_destroyed_table_in_a_foreign_inferred_return_dirties_its_owner() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/tables.lua");
+    let first = "registry = { first = 1 }\n";
+    let second = "registry = nil\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/fetch.lua");
+    let consumer_id = write(
+        &mut ws,
+        &consumer_uri,
+        "function fetchRegistry() return registry end\n",
+    );
+
+    let (consumer_sig, old_range) = {
+        let db = ws.analysis.compilation.get_db();
+        let consumer_sig = *db
+            .get_signature_index()
+            .get_file_signature_ids(consumer_id)
+            .expect("consumer signatures")
+            .iter()
+            .next()
+            .expect("consumer signature");
+        let sig = db
+            .get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature");
+        expect_that!(sig.resolve_return, eq(SignatureReturnStatus::InferResolve));
+        let LuaType::TableConst(old_range) = sig.return_docs[0].type_ref.clone() else {
+            panic!(
+                "consumer inferred return should embed the provider table, got {:?}",
+                sig.return_docs[0].type_ref
+            );
+        };
+        expect_that!(old_range.file_id, eq(provider_id));
+        expect_that!(
+            cached_identities(db, consumer_id)
+                .iter()
+                .any(|id| id.contains("InFiled")),
+            is_false()
+        );
+        let deps = db
+            .get_type_index()
+            .files_with_type_caches_referencing_files(&std::collections::HashSet::from([
+                provider_id,
+            ]));
+        expect_that!(deps.contains(&consumer_id), is_false());
+        (consumer_sig, old_range)
+    };
+
+    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let db = ws.analysis.compilation.get_db();
+    // The literal is gone ...
+    expect_that!(live_table_ranges(db, provider_id), is_empty());
+    // ... and the owner is dirty rather than left dangling on the old range.
+    expect_that!(
+        db.get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature")
+            .return_docs[0]
+            .type_ref
+            .clone(),
+        eq(&LuaType::TableConst(old_range))
+    );
+    expect_that!(dirty, contains(eq(&consumer_id)));
+}
+
+/// Destroying the signature a foreign inferred return names must dirty the
+/// signature owner. The consumer holds no type-cache reference to it, so only
+/// signature-payload loss can dirty it.
+#[gtest]
+fn a_destroyed_signature_in_a_foreign_inferred_return_dirties_its_owner() {
+    let mut ws = workspace();
+    let provider_uri = ws.virtual_url_generator.new_uri("lua/provider.lua");
+    let first = "provider = provider or {}\nfunction provider.Describe() end\n";
+    let second = "provider = provider or {}\nprovider.Describe = 1\n";
+    let provider_id = write(&mut ws, &provider_uri, first);
+
+    let consumer_uri = ws.virtual_url_generator.new_uri("lua/fetch.lua");
+    let consumer_id = write(
+        &mut ws,
+        &consumer_uri,
+        "function fetchDescribe() return provider.Describe end\n",
+    );
+
+    let (consumer_sig, old_id) = {
+        let db = ws.analysis.compilation.get_db();
+        let consumer_sig = *db
+            .get_signature_index()
+            .get_file_signature_ids(consumer_id)
+            .expect("consumer signatures")
+            .iter()
+            .next()
+            .expect("consumer signature");
+        let sig = db
+            .get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature");
+        expect_that!(sig.resolve_return, eq(SignatureReturnStatus::InferResolve));
+        let LuaType::Signature(old_id) = sig.return_docs[0].type_ref.clone() else {
+            panic!(
+                "consumer inferred return should embed the provider signature, got {:?}",
+                sig.return_docs[0].type_ref
+            );
+        };
+        expect_that!(old_id.get_file_id(), eq(provider_id));
+        let old_debug = format!("{old_id:?}");
+        expect_that!(
+            cached_identities(db, consumer_id)
+                .iter()
+                .any(|id| id == &old_debug),
+            is_false()
+        );
+        let deps = db
+            .get_type_index()
+            .files_with_type_caches_referencing_files(&std::collections::HashSet::from([
+                provider_id,
+            ]));
+        expect_that!(deps.contains(&consumer_id), is_false());
+        (consumer_sig, old_id)
+    };
+
+    let dirty = edit_and_remap(&mut ws, &provider_uri, provider_id, first, second);
+
+    let db = ws.analysis.compilation.get_db();
+    // The provider signature is gone ...
+    expect_that!(db.get_signature_index().get(&old_id).is_none(), is_true());
+    // ... and the owner is dirty rather than left dangling on it.
+    expect_that!(
+        db.get_signature_index()
+            .get(&consumer_sig)
+            .expect("consumer signature")
+            .return_docs[0]
+            .type_ref
+            .clone(),
+        eq(&LuaType::Signature(old_id))
+    );
     expect_that!(dirty, contains(eq(&consumer_id)));
 }
 
