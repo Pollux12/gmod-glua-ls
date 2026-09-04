@@ -1735,18 +1735,16 @@ function meta:Custom() end
         }
     }
 
-    /// What the batch reports, and what it does not.
+    /// What the batch reports.
     ///
-    /// It reports the files it settled and leaves untouched files out. It does
-    /// **not** report every file whose diagnostics moved, and cannot: this
-    /// consumer starts reporting a mismatch without ever becoming a dependent,
-    /// because it resolves the provider's return type when it is diagnosed
-    /// rather than caching a fact the diff could name. The settle set is an
-    /// index-dependency set; the set of files that diagnose differently is
-    /// strictly larger and is not derivable from the export diff.
+    /// It reports the files it settled plus diagnostic-refresh-only textual
+    /// candidates: this consumer starts reporting a mismatch without ever
+    /// becoming a change-driven dependent, because it resolves the provider's
+    /// return type when it is diagnosed rather than caching a fact the diff
+    /// could name. The settle set is an index-dependency set; the refresh set
+    /// widens it textually via `files_referencing_name` without reindexing.
     ///
-    /// A caller that pushes diagnostics therefore cannot use this result as its
-    /// whole refresh set.
+    /// A caller that pushes diagnostics uses the whole result as its refresh set.
     #[gtest]
     fn a_filesystem_batch_reports_the_dependents_it_settled() {
         let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
@@ -1786,8 +1784,17 @@ function meta:Custom() end
             not(contains(eq(DiagnosticCode::AssignTypeMismatch.get_name())))
         );
 
-        // The provider's return type moves, so the consumer has to be re-analysed
-        // even though nothing edited it.
+        let consumer_revision_before = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_reference_index()
+            .file_reference_revision(consumer_id);
+        let consumer_exports_before = fingerprint_of(&ws, consumer_id);
+
+        // The provider's return type moves, so the consumer has to be re-diagnosed
+        // even though nothing edited it. It arrives as a textual refresh candidate,
+        // not as a change-driven dependent.
         let affected = ws.analysis.apply_file_system_changes(vec![(
             provider_uri.clone(),
             Some(
@@ -1802,13 +1809,279 @@ function meta:Custom() end
 
         let provider_id = ws.analysis.get_file_id(&provider_uri).expect("provider id");
         expect_that!(affected, contains(eq(&provider_id)));
+        expect_that!(affected, contains(eq(&consumer_id)));
         expect_that!(affected, not(contains(eq(&unrelated_id))));
-        // The consumer's diagnostics move even though the settle never had to
-        // touch it, which is the gap the doc comment above describes.
+        // Deterministic output: sorted and deduped.
+        let mut sorted = affected.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        expect_that!(affected, eq(&sorted));
+        // Refresh-only: no reindex, so the revision and exports are untouched.
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_reference_index()
+                .file_reference_revision(consumer_id),
+            eq(consumer_revision_before)
+        );
+        expect_that!(
+            fingerprint_of(&ws, consumer_id),
+            eq(&consumer_exports_before)
+        );
+        // The consumer's diagnostics still move, which is why it is returned.
         expect_that!(
             codes_in(&ws, consumer_id),
             contains(eq(DiagnosticCode::AssignTypeMismatch.get_name()))
         );
+    }
+
+    /// A refresh candidate owes diagnostics, not reanalysis.
+    ///
+    /// The same return-type move through the staged edit path (`text_only` +
+    /// `self_index_and_diff`) leaves the uncached consumer out of the dirty
+    /// set entirely, so `dirty_len` never sees it; only the watched-file path's
+    /// textual widening returns it, and its reference revision stays put.
+    #[gtest]
+    fn watched_refresh_candidate_keeps_reference_revision() {
+        let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
+        let first = r#"
+            fsprovider = fsprovider or {}
+            ---@return string
+            function fsprovider.Describe() end
+            "#;
+        let second = r#"
+            fsprovider = fsprovider or {}
+            ---@return number
+            function fsprovider.Describe() end
+            "#;
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/revprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, first);
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/revconsumer.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            ---@type string
+            local described = fsprovider.Describe()
+            "#,
+        );
+
+        // Change-driven settle alone: the consumer is not a dependent.
+        ws.analysis
+            .update_file_text_only(&provider_uri, second.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        expect_that!(dirty.files(), not(contains(eq(&consumer_id))));
+        let dirty_len = dirty.dirty_len();
+        // The export change is real (so the textual path has something to name),
+        // but the dirty set still does not owe the consumer.
+        expect_that!(dirty.changed_sources(), contains(eq(&provider_id)));
+        ws.analysis.ripple(dirty);
+        // Staged settle re-derived the same diagnostics a watched batch would,
+        // so reset to the first text and exercise the watched path from clean.
+        write(&mut ws, &provider_uri, first);
+        let revision_before = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_reference_index()
+            .file_reference_revision(consumer_id);
+        let exports_before = fingerprint_of(&ws, consumer_id);
+
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(provider_uri.clone(), Some(second.to_string()))]);
+        expect_that!(affected, contains(eq(&consumer_id)));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_reference_index()
+                .file_reference_revision(consumer_id),
+            eq(revision_before)
+        );
+        expect_that!(fingerprint_of(&ws, consumer_id), eq(&exports_before));
+        // `dirty_len` above never included the candidate; the watched result only
+        // widens diagnostics. The staged dirty set owed `dirty_len` files and no
+        // more.
+        expect_that!(dirty_len, eq(0));
+    }
+
+    /// A textual collision is still diagnostic-only.
+    ///
+    /// Both files reference the member key `Field`, but on different owners, so
+    /// the provider's type change has no semantic edge to the collider. The
+    /// collider is still returned (same textual name), yet its exports, revision
+    /// and diagnostics are unchanged. A library file referencing the same name
+    /// is not returned: annotations are not diagnostic targets.
+    #[gtest]
+    fn textual_collision_keeps_unchanged_index_snapshot() {
+        let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
+        let library_root = ws.virtual_url_generator.new_path("textual_collision_lib");
+        ws.analysis.add_library_workspace(library_root);
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/collideprovider.lua");
+        write(&mut ws, &provider_uri, "OwnerA = { Field = 1 }\n");
+        let collider_uri = ws.virtual_url_generator.new_uri("lua/collideother.lua");
+        let collider_id = write(
+            &mut ws,
+            &collider_uri,
+            r#"
+            OwnerB = { Field = "kept" }
+            ---@type string
+            local observed = OwnerB.Field
+            "#,
+        );
+        let library_uri = ws
+            .virtual_url_generator
+            .new_uri("textual_collision_lib/annot.lua");
+        let library_id = write(
+            &mut ws,
+            &library_uri,
+            "OwnerC = { Field = 1 }\nlocal _ = OwnerC.Field\n",
+        );
+        // Sanity: the collider actually references `Field`, or the test is vacuous.
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_reference_index()
+                .files_referencing_name(&"Field".into()),
+            contains(eq(&collider_id))
+        );
+
+        let revision_before = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_reference_index()
+            .file_reference_revision(collider_id);
+        let exports_before = fingerprint_of(&ws, collider_id);
+        let codes_before = codes_in(&ws, collider_id);
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri.clone(),
+            Some("OwnerA = { Field = \"changed\" }\n".to_string()),
+        )]);
+
+        expect_that!(affected, contains(eq(&collider_id)));
+        expect_that!(affected, not(contains(eq(&library_id))));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_reference_index()
+                .file_reference_revision(collider_id),
+            eq(revision_before)
+        );
+        expect_that!(fingerprint_of(&ws, collider_id), eq(&exports_before));
+        expect_that!(codes_in(&ws, collider_id), eq(&codes_before));
+    }
+
+    /// Renames and removals cover both the old and the new name.
+    ///
+    /// The provider renames the member `Old` to `New` on the same owner and at
+    /// the same position, so the export diff holds one changed key whose
+    /// post-edit entry names `New` while only the pre-edit snapshot still holds
+    /// `Old` (a removed entry's `get_member` returns `None`, verified
+    /// empirically). Both referencers are returned, without reindexing either.
+    #[gtest]
+    fn rename_and_removal_cover_old_and_new_names() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedField]);
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/renameprovider.lua");
+        write(&mut ws, &provider_uri, "RenameLib = { Old = 1 }\n");
+
+        let old_consumer_uri = ws.virtual_url_generator.new_uri("lua/renameold.lua");
+        let old_consumer_id = write(&mut ws, &old_consumer_uri, "local _ = RenameLib.Old\n");
+        let new_consumer_uri = ws.virtual_url_generator.new_uri("lua/renamenew.lua");
+        let new_consumer_id = write(&mut ws, &new_consumer_uri, "local _ = RenameLib.New\n");
+        expect_that!(codes_in(&ws, old_consumer_id), is_empty());
+        expect_that!(
+            codes_in(&ws, new_consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri.clone(),
+            Some("RenameLib = { New = 1 }\n".to_string()),
+        )]);
+
+        expect_that!(affected, contains(eq(&old_consumer_id)));
+        expect_that!(affected, contains(eq(&new_consumer_id)));
+        // Old referencer now dangles; new referencer now resolves.
+        expect_that!(
+            codes_in(&ws, old_consumer_id),
+            contains(eq(DiagnosticCode::UndefinedField.get_name()))
+        );
+        expect_that!(codes_in(&ws, new_consumer_id), is_empty());
+    }
+
+    /// Duplicate changed names yield one sorted, deduped entry.
+    ///
+    /// Two files in one batch change the same global `Dup`; the single
+    /// consumer referencing it must appear exactly once and the whole result
+    /// must already be sorted.
+    #[gtest]
+    fn duplicate_changed_names_yield_sorted_deduped_output() {
+        let mut ws = workspace_with(vec![]);
+        let provider_a_uri = ws.virtual_url_generator.new_uri("lua/dupa.lua");
+        write(&mut ws, &provider_a_uri, "Dup = 1\n");
+        let provider_b_uri = ws.virtual_url_generator.new_uri("lua/dupb.lua");
+        write(&mut ws, &provider_b_uri, "Dup = 2\n");
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/dupconsumer.lua");
+        let consumer_id = write(&mut ws, &consumer_uri, "local observed = Dup\n");
+
+        let affected = ws.analysis.apply_file_system_changes(vec![
+            (provider_b_uri.clone(), Some("Dup = \"b\"\n".to_string())),
+            (provider_a_uri.clone(), Some("Dup = \"a\"\n".to_string())),
+        ]);
+
+        expect_that!(affected, contains(eq(&consumer_id)));
+        expect_that!(
+            affected.iter().filter(|id| **id == consumer_id).count(),
+            eq(1)
+        );
+        let mut sorted = affected.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        expect_that!(affected, eq(&sorted));
+    }
+
+    /// A hub name fans out to every referencer, with no cap.
+    ///
+    /// Twenty-five consumers all reference `HubField`; changing its type must
+    /// return all of them. The count is asserted exactly so any truncation or
+    /// budget would fail the test.
+    #[gtest]
+    fn hub_name_fanout_is_reported_without_cap() {
+        const CONSUMERS: usize = 25;
+        let mut ws = workspace_with(vec![]);
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/hubprovider.lua");
+        write(&mut ws, &provider_uri, "Hub = { HubField = 1 }\n");
+
+        let mut consumer_ids = Vec::new();
+        for index in 0..CONSUMERS {
+            let uri = ws
+                .virtual_url_generator
+                .new_uri(&format!("lua/hubconsumer{index}.lua"));
+            let file_id = write(&mut ws, &uri, "local observed = Hub.HubField\n");
+            consumer_ids.push(file_id);
+        }
+
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri.clone(),
+            Some("Hub = { HubField = \"changed\" }\n".to_string()),
+        )]);
+
+        for consumer_id in &consumer_ids {
+            expect_that!(affected, contains(eq(consumer_id)));
+        }
+        let returned_consumers = affected
+            .iter()
+            .filter(|file_id| consumer_ids.contains(file_id))
+            .count();
+        expect_that!(returned_consumers, eq(CONSUMERS));
     }
 
     /// A deletion through the filesystem batch detaches the URI rather than
@@ -2540,5 +2813,92 @@ end
             decl_type(&ws, reader_id, "direct"),
             decl_type(&fresh, fresh_reader_id, "direct")
         );
+    }
+
+    /// A `---@module` holder caches `LuaType::ModuleRef(provider)` without
+    /// reading any member, so no key in the export diff names it. The provider
+    /// keeps the same table identity across the edit, so the diff holds no
+    /// file-level key either and neither the reverse type index nor the file
+    /// dependencies can reach the holder: only the seeded provider identity
+    /// does. Without it the holder stays settled.
+    #[gtest]
+    fn module_holder_is_dirtied_by_a_member_type_change() {
+        let mut ws = workspace_with(vec![]);
+        let first = r#"
+            local M = {}
+            M.value = 1
+            return M
+            "#;
+        let second = r#"
+            local M = {}
+            M.value = "text"
+            return M
+            "#;
+        let provider_uri = ws.virtual_url_generator.new_uri("modprovider.lua");
+        let provider_id = write(&mut ws, &provider_uri, first);
+
+        let consumer_uri = ws.virtual_url_generator.new_uri("modconsumer.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            ---@module "modprovider"
+            ModuleProvider = {}
+
+            local holder = ModuleProvider
+            "#,
+        );
+        // The holder has to actually cache the module reference, or the
+        // assertion below would hold for a file that reads nothing.
+        expect_that!(
+            decl_type(&ws, consumer_id, "holder"),
+            eq(&LuaType::ModuleRef(provider_id))
+        );
+
+        let before = fingerprint_before_edit(&ws, provider_id, first, second);
+        ws.analysis
+            .update_file_text_only(&provider_uri, second.to_string())
+            .expect("staged provider text");
+        let dirty = ws.analysis.self_index_and_diff(vec![provider_id]);
+        let after = fingerprint_of(&ws, provider_id);
+        let diff = crate::diff_exports(&before, &after);
+
+        // The export change is real, but names no file-level section, so the
+        // file-dependency expansion cannot be what dirties the holder.
+        expect_that!(dirty.changed_sources(), contains(eq(&provider_id)));
+        expect_that!(
+            diff.keys().any(|key| matches!(
+                key,
+                crate::ExportKey::ModuleExport
+                    | crate::ExportKey::LoadEdges
+                    | crate::ExportKey::Namespace
+                    | crate::ExportKey::FileRealmMetadata
+            )),
+            is_false()
+        );
+        // The holder never reads the changed member, so the inference-node
+        // lookup the changed key drives cannot be what dirties it either:
+        // without the seeded module identity nothing would.
+        let member_id = ws
+            .analysis
+            .compilation
+            .get_db()
+            .get_member_index()
+            .get_file_members(provider_id)
+            .iter()
+            .find(|member| member.get_key() == &crate::LuaMemberKey::Name("value".into()))
+            .map(|member| member.get_id())
+            .expect("provider value member");
+        let node = crate::LuaInferenceNodeId::TypeOwner(crate::LuaTypeOwner::Member(member_id));
+        expect_that!(
+            ws.analysis
+                .compilation
+                .get_db()
+                .get_type_index()
+                .files_depending_on_inference_nodes(std::slice::from_ref(&node))
+                .contains(&consumer_id),
+            is_false()
+        );
+        expect_that!(dirty.files(), contains(eq(&consumer_id)));
     }
 }

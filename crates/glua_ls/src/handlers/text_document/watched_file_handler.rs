@@ -80,15 +80,23 @@ pub async fn on_did_change_watched_files(
         }
     } // workspace read lock released here, before any write lock
 
-    // Apply mutations under the write lock
+    // Apply mutations under the write lock. Changes and deletions settle in one
+    // batch: the analyser derives its facts over a whole batch, and a branch
+    // switch that deletes several files would otherwise pay one ripple each.
     let file_ids = {
         let mut analysis = context.analysis().write().await;
 
-        for uri in &deleted_lua_uris {
-            analysis.remove_file_by_uri(uri);
-        }
+        let mut batch = watched_lua_files;
+        batch.extend(deleted_lua_uris.iter().cloned().map(|uri| (uri, None)));
 
-        let file_ids = analysis.update_files_by_uri(watched_lua_files);
+        // The files the settle touched, which is what still needs diagnosing.
+        // It is not every file whose diagnostics could differ — a reader that
+        // resolves a changed fact only when it is diagnosed caches nothing the
+        // export diff can name — but that is already true of every keystroke:
+        // the edit path publishes for the edited file and leaves the rest to a
+        // pull. Paying a full dependency expansion here bought a refresh the
+        // dominant path never performed.
+        let file_ids = analysis.apply_file_system_changes(batch);
         if !file_ids.is_empty() || !deleted_lua_uris.is_empty() {
             context
                 .file_diagnostic()
