@@ -12,7 +12,10 @@ use crate::{
     DbIndex, FileId, FlowId, GmodRealm, InFiled, LuaDeclId, LuaFunctionType, LuaInferredGuardOwner,
     LuaMemberId, LuaMemberKey, LuaSemanticDeclId, LuaSignatureId, VarRefId, VarRefRootId,
     db_index::{LuaType, LuaTypeDeclId},
-    semantic::infer::{InferFailReason, ParamInferenceSource},
+    semantic::{
+        generic::FuncGenericBinding,
+        infer::{InferFailReason, ParamInferenceSource},
+    },
 };
 
 pub type FlowCacheInnerKey = (FlowId, GmodRealm, FlowOrigin);
@@ -88,6 +91,25 @@ pub struct PendingStrTplTypeDecl {
     pub super_type: LuaType,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GenericCallBindings {
+    Known(Vec<FuncGenericBinding>),
+    Ambiguous,
+}
+
+impl GenericCallBindings {
+    pub fn record(&mut self, new_bindings: Vec<FuncGenericBinding>) {
+        match self {
+            GenericCallBindings::Known(existing) => {
+                if existing != &new_bindings {
+                    *self = GenericCallBindings::Ambiguous;
+                }
+            }
+            GenericCallBindings::Ambiguous => {}
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct LuaInferCache {
     file_id: FileId,
@@ -97,6 +119,7 @@ pub struct LuaInferCache {
         FxHashMap<(LuaSyntaxId, Option<usize>, LuaType), CacheEntry<Arc<LuaFunctionType>>>,
     pub call_arg_types_cache:
         FxHashMap<(LuaSyntaxId, Option<usize>), Arc<Vec<(LuaType, TextRange)>>>,
+    pub generic_call_bindings: FxHashMap<LuaSyntaxId, GenericCallBindings>,
     pub flow_node_cache:
         FxHashMap<VarRefCacheKey, FxHashMap<FlowCacheInnerKey, CacheEntry<LuaType>>>,
     pub flow_query_realm: Option<GmodRealm>,
@@ -223,6 +246,7 @@ impl LuaInferCache {
             local_function_call_sites_cache: FxHashMap::default(),
             call_returns_never_cache: FxHashMap::default(),
             signature_is_generic_cache: FxHashMap::default(),
+            generic_call_bindings: FxHashMap::default(),
             sibling_merge_reads: 0,
             inferred_guard_dependencies: FxHashSet::default(),
             inferred_return_reads: FxHashMap::default(),
@@ -244,6 +268,31 @@ impl LuaInferCache {
 
     pub fn set_phase(&mut self, phase: LuaAnalysisPhase) {
         self.config.analysis_phase = phase;
+    }
+
+    pub fn record_generic_call_bindings(
+        &mut self,
+        syntax_id: LuaSyntaxId,
+        bindings: Vec<FuncGenericBinding>,
+    ) {
+        match self.generic_call_bindings.entry(syntax_id) {
+            std::collections::hash_map::Entry::Occupied(mut entry) => {
+                entry.get_mut().record(bindings);
+            }
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(GenericCallBindings::Known(bindings));
+            }
+        }
+    }
+
+    pub fn get_generic_call_bindings(
+        &self,
+        syntax_id: &LuaSyntaxId,
+    ) -> Option<&[FuncGenericBinding]> {
+        match self.generic_call_bindings.get(syntax_id) {
+            Some(GenericCallBindings::Known(bindings)) => Some(bindings),
+            _ => None,
+        }
     }
 
     pub fn add_pending_str_tpl_type_decl(
@@ -332,6 +381,7 @@ impl LuaInferCache {
         self.vgui_parent_chain_calls.clear();
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
+        self.generic_call_bindings.clear();
     }
 
     /// Drops every narrowing answer this file has memoised.
@@ -388,6 +438,7 @@ impl LuaInferCache {
         // `false` to `true`, so it cannot survive a wave.
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
+        self.generic_call_bindings.clear();
         self.flow_node_cache.retain(|_, inner| {
             inner.retain(|_, entry| !matches!(entry, CacheEntry::Error(_)));
             !inner.is_empty()
@@ -418,6 +469,7 @@ impl LuaInferCache {
         self.param_type_source_cache.clear();
         self.call_returns_never_cache.clear();
         self.signature_is_generic_cache.clear();
+        self.generic_call_bindings.clear();
         // Local reference identities come directly from immutable reference
         // indexes and are safe to retain. Global/member/self roots can be
         // selected through types and overloads that unresolve is about to

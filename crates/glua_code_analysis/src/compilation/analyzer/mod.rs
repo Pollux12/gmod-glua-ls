@@ -13,6 +13,7 @@ mod setmetatable_factory;
 pub(crate) mod unresolve;
 
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
+pub(crate) use dynamic_field::is_provably_builtin_pairs_call;
 pub use lua::is_member_assignment_in_conditional_branch;
 pub(crate) use lua::{
     dominating_guarded_table_bootstrap_range, infer_for_range_iter_expr_func,

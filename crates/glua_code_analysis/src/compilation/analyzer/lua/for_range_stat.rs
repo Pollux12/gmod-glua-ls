@@ -2,11 +2,13 @@ use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 
 use crate::{
-    DbIndex, FileId, InferFailReason, LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache,
-    LuaMemberKey, LuaMemberOwner, LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache,
-    TplContext, TypeOps, TypeSubstitutor, VariadicType,
+    DbIndex, FileId, FuncGenericBinding, FuncGenericBindingState, GenericTplId, InferFailReason,
+    LuaAliasCallKind, LuaAliasCallType, LuaDeclId, LuaInferCache, LuaMemberKey, LuaMemberOwner,
+    LuaObjectType, LuaOperatorMetaMethod, LuaType, LuaTypeCache, TplContext, TypeOps,
+    TypeSubstitutor, VariadicType,
     compilation::analyzer::{
         common::{TypeCacheWriteMode, write_type_cache},
+        is_provably_builtin_pairs_call,
         unresolve::UnResolveIterVar,
     },
     get_member_map, infer_expr, instantiate_doc_function, tpl_pattern_match_args,
@@ -110,11 +112,27 @@ pub fn iterates_table_member_map(
     is_global_pairs_call(db, file_id, &call_expr)
 }
 
+#[derive(Debug, Clone)]
+pub struct IterVarInference {
+    pub types: VariadicType,
+    pub settled_overrides: Vec<Option<LuaType>>,
+}
+
+impl IterVarInference {
+    pub fn get_type(&self, idx: usize) -> Option<&LuaType> {
+        self.types.get_type(idx)
+    }
+
+    pub fn contain_tpl(&self) -> bool {
+        self.types.contain_tpl()
+    }
+}
+
 pub fn infer_for_range_iter_expr_func(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     iter_exprs: &[LuaExpr],
-) -> Result<VariadicType, InferFailReason> {
+) -> Result<IterVarInference, InferFailReason> {
     if iter_exprs.is_empty() {
         return Err(InferFailReason::None);
     }
@@ -130,8 +148,21 @@ pub fn infer_for_range_iter_expr_func(
     if let Some(iter_types) =
         try_infer_pairs_iter_types_from_table_members(db, cache, &iter_exprs[0], &first_expr_type)?
     {
-        return Ok(iter_types);
+        return Ok(IterVarInference {
+            types: iter_types,
+            settled_overrides: Vec::new(),
+        });
     }
+
+    let pairs_bindings = if let Some(LuaExpr::CallExpr(call_expr)) = iter_exprs.first()
+        && is_provably_builtin_pairs_call(db, cache.get_file_id(), call_expr)
+    {
+        cache
+            .get_generic_call_bindings(&call_expr.get_syntax_id())
+            .map(|bindings| bindings.to_vec())
+    } else {
+        None
+    };
 
     let doc_function = match first_expr_type {
         LuaType::DocFunction(func) => func,
@@ -195,7 +226,12 @@ pub fn infer_for_range_iter_expr_func(
     };
 
     let Some(status_param) = status_param else {
-        return Ok(doc_function.get_variadic_ret());
+        let types = doc_function.get_variadic_ret();
+        let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
+        return Ok(IterVarInference {
+            types,
+            settled_overrides,
+        });
     };
     let mut substitutor = TypeSubstitutor::new();
     let mut context = TplContext {
@@ -221,7 +257,45 @@ pub fn infer_for_range_iter_expr_func(
         doc_function
     };
 
-    Ok(instantiate_func.get_variadic_ret())
+    let types = instantiate_func.get_variadic_ret();
+    let settled_overrides = compute_proven_settled_overrides(pairs_bindings.as_deref(), &types);
+    Ok(IterVarInference {
+        types,
+        settled_overrides,
+    })
+}
+
+fn compute_proven_settled_overrides(
+    bindings: Option<&[FuncGenericBinding]>,
+    types: &VariadicType,
+) -> Vec<Option<LuaType>> {
+    let Some(bindings) = bindings else {
+        return Vec::new();
+    };
+    if !bindings
+        .iter()
+        .any(|b| matches!(b.state, FuncGenericBindingState::Unbound { .. }))
+    {
+        return Vec::new();
+    }
+    let slot_count = match types {
+        VariadicType::Multi(types) => types.len(),
+        VariadicType::Base(_) => 1,
+    };
+    (0..slot_count)
+        .map(|idx| {
+            let want = GenericTplId::Func(idx as u32);
+            bindings.iter().find_map(|b| {
+                if b.id != want {
+                    return None;
+                }
+                match &b.state {
+                    FuncGenericBindingState::Unbound { fallback } => Some(fallback.clone()),
+                    FuncGenericBindingState::Bound => None,
+                }
+            })
+        })
+        .collect()
 }
 
 fn try_infer_pairs_iter_types_from_table_members(

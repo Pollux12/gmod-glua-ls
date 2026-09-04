@@ -21,7 +21,10 @@ use super::type_substitutor::{SubstitutorValue, TypeSubstitutor};
 use crate::TypeVisitTrait;
 use crate::semantic::member::find_members_with_key;
 pub(crate) use instantiate_func_generic::check_vgui_panel_ref_role;
-pub use instantiate_func_generic::{build_self_type, infer_self_type, instantiate_func_generic};
+pub use instantiate_func_generic::{
+    FuncGenericBinding, FuncGenericBindingState, GenericFunctionInstantiation, build_self_type,
+    infer_self_type, instantiate_func_generic, instantiate_func_generic_with_bindings,
+};
 pub use instantiate_special_generic::get_keyof_members;
 pub use instantiate_special_generic::instantiate_alias_call;
 

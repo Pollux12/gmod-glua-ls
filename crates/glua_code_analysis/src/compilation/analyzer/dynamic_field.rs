@@ -1892,7 +1892,7 @@ fn member_key_is_written_literally(db: &DbIndex, member: &crate::LuaMember) -> b
     }
 }
 
-fn is_provably_builtin_pairs_call(
+pub(crate) fn is_provably_builtin_pairs_call(
     db: &DbIndex,
     file_id: crate::FileId,
     call_expr: &LuaCallExpr,
