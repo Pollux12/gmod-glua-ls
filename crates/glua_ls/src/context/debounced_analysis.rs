@@ -70,6 +70,11 @@ pub struct DebouncedAnalysis {
     /// notification handler, before the didChange task is spawned) so that any
     /// request handler dispatched afterwards sees the flag immediately.
     has_pending_changes: AtomicBool,
+    /// False once the supervisor has given up restarting the debounce loop
+    /// (see `LS_DEBOUNCE_LOOP_DEAD`). Freshness can then never arrive, so
+    /// waiters fail fast instead of parking until their request is cancelled.
+    /// Set once, never re-armed: a dead loop stays dead for process lifetime.
+    debounce_loop_alive: AtomicBool,
     in_flight_changes: AtomicUsize,
     /// Requests aimed at one document that are waiting for, or reading against,
     /// that document's own index entries.
@@ -111,6 +116,7 @@ impl DebouncedAnalysis {
             reindexing_files: Mutex::new(HashSet::new()),
             blocked_documents: Mutex::new(HashMap::new()),
             has_pending_changes: AtomicBool::new(false),
+            debounce_loop_alive: AtomicBool::new(true),
             in_flight_changes: AtomicUsize::new(0),
             pending_readers: AtomicUsize::new(0),
             readers_idle_notify: Notify::new(),
@@ -153,6 +159,21 @@ impl DebouncedAnalysis {
         self.has_pending_changes.store(true, Ordering::Release);
         self.notify.notify_waiters();
         InFlightChangeGuard::new(self.clone(), 1)
+    }
+
+    /// Record that the supervising loop has given up restarting the debounce
+    /// loop (`LS_DEBOUNCE_LOOP_DEAD`). Freshness can never arrive afterwards,
+    /// so [`Self::wait_until_fresh_for`] and [`Self::wait_until_file_fresh_for`]
+    /// fail fast instead of parking until the request is cancelled. Wakes
+    /// parked waiters: a waiter past its stuck-warning timer has no active
+    /// sleep left and would otherwise never re-check the flag.
+    pub(crate) fn note_debounce_loop_dead(&self) {
+        self.debounce_loop_alive.store(false, Ordering::Release);
+        self.reindex_notify.notify_waiters();
+    }
+
+    fn debounce_loop_alive(&self) -> bool {
+        self.debounce_loop_alive.load(Ordering::Acquire)
     }
 
     pub async fn finish_in_flight_changes(&self, count: usize) {
@@ -310,6 +331,10 @@ impl DebouncedAnalysis {
                 return true;
             }
 
+            if !self.debounce_loop_alive() {
+                return false;
+            }
+
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
@@ -357,6 +382,10 @@ impl DebouncedAnalysis {
                 return true;
             }
 
+            if !self.debounce_loop_alive() {
+                return false;
+            }
+
             let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
 
             tokio::select! {
@@ -393,6 +422,17 @@ impl DebouncedAnalysis {
             if !self.has_pending_changes.load(Ordering::Acquire) {
                 return (
                     true,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+
+            if !self.debounce_loop_alive() {
+                return (
+                    false,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -457,6 +497,17 @@ impl DebouncedAnalysis {
             if self.file_is_answerable(uri).await {
                 return (
                     true,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+
+            if !self.debounce_loop_alive() {
+                return (
+                    false,
                     FreshWaitBreakdown {
                         total: started_at.elapsed(),
                         in_flight,
@@ -536,8 +587,10 @@ impl DebouncedAnalysis {
         );
     }
 
-    /// Wait until the given file is no longer pending reindex.
-    pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) {
+    /// Wait until the given file is no longer pending reindex. Returns false
+    /// without diagnosing when the debounce loop is dead (freshness can never
+    /// arrive); callers must abort rather than diagnose stale data.
+    pub async fn wait_for_reindex(&self, file_id: FileId, cancel_token: CancellationToken) -> bool {
         loop {
             let notified = self.reindex_notify.notified();
             tokio::pin!(notified);
@@ -549,11 +602,14 @@ impl DebouncedAnalysis {
                 pending.contains(&file_id) || reindexing.contains(&file_id)
             };
             if !is_pending {
-                return;
+                return true;
+            }
+            if !self.debounce_loop_alive() {
+                return false;
             }
             tokio::select! {
                 _ = notified => {}
-                _ = cancel_token.cancelled() => return,
+                _ = cancel_token.cancelled() => return false,
             }
         }
     }
@@ -1109,7 +1165,7 @@ impl Drop for InFlightChangeGuard {
 #[cfg(test)]
 mod tests {
     use std::sync::Arc;
-    use std::sync::atomic::AtomicU8;
+    use std::sync::atomic::{AtomicU8, Ordering};
     use std::time::{Duration, Instant};
 
     use super::{MAX_RIPPLE_DEFERRAL, READER_HANDOFF_GRACE};
@@ -1196,6 +1252,114 @@ mod tests {
 
             verify_that!(debounced_analysis.in_flight_change_count(), eq(0))?;
             verify_that!(debounced_analysis.is_dirty(), eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// Once the supervisor has given up on the loop, freshness can never
+    /// arrive: waiters must fail fast instead of parking until cancelled.
+    #[gtest]
+    fn dead_loop_fails_freshness_wait_fast() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            debounced_analysis
+                .has_pending_changes
+                .store(true, Ordering::Release);
+            debounced_analysis.note_debounce_loop_dead();
+            let token = CancellationToken::new();
+            let fresh = tokio::time::timeout(
+                Duration::from_secs(10),
+                debounced_analysis.wait_until_fresh_for(&token, "test"),
+            )
+            .await
+            .expect("freshness wait must fail fast once the loop is dead");
+            verify_that!(fresh, eq(false))?;
+            Ok(())
+        })
+    }
+
+    /// A waiter already parked when the loop dies must also be released: past
+    /// the stuck warning it has no active timer left, so only a wakeup lets
+    /// it re-check the alive flag.
+    #[gtest]
+    fn dead_loop_releases_already_parked_waiter() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            debounced_analysis
+                .has_pending_changes
+                .store(true, Ordering::Release);
+            let token = CancellationToken::new();
+            let waiter = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move {
+                    debounced_analysis
+                        .wait_until_fresh_for(&token, "test")
+                        .await
+                }
+            });
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while debounced_analysis.freshness_wait_count() == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("waiter should reach the freshness wait promptly");
+            // Let the waiter complete a full park iteration first, so this
+            // exercises release-from-parked rather than fail-fast-on-entry
+            // (without the wakeup it would sit out the 5s stuck timer here).
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            debounced_analysis.note_debounce_loop_dead();
+            let fresh = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("parked waiter must be released promptly")
+                .expect("waiter task must not panic");
+            verify_that!(fresh, eq(false))?;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "release took {:?}, expected prompt wakeup not the stuck timer",
+                started.elapsed()
+            );
+            Ok(())
+        })
+    }
+
+    /// `wait_for_reindex` parks diagnostic tasks, not requests, so it has no
+    /// cancel token of its own to rely on: without the alive check a dead
+    /// loop parks it forever on a file that will never reindex.
+    #[gtest]
+    fn dead_loop_releases_reindex_waiter() -> Result<()> {
+        let runtime = tokio::runtime::Runtime::new().expect("tokio runtime should build");
+        runtime.block_on(async {
+            let debounced_analysis = test_debounced_analysis();
+            debounced_analysis
+                .pending_files
+                .lock()
+                .await
+                .insert(FileId::new(7));
+            let waiter = tokio::spawn({
+                let debounced_analysis = debounced_analysis.clone();
+                async move {
+                    debounced_analysis
+                        .wait_for_reindex(FileId::new(7), CancellationToken::new())
+                        .await
+                }
+            });
+            let started = Instant::now();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            debounced_analysis.note_debounce_loop_dead();
+            let reindexed = tokio::time::timeout(Duration::from_secs(10), waiter)
+                .await
+                .expect("parked reindex waiter must be released promptly")
+                .expect("waiter task must not panic");
+            verify_that!(reindexed, eq(false))?;
+            assert!(
+                started.elapsed() < Duration::from_secs(5),
+                "release took {:?}, expected prompt wakeup not the stuck timer",
+                started.elapsed()
+            );
             Ok(())
         })
     }

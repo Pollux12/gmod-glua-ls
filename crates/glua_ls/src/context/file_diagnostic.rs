@@ -227,7 +227,9 @@ impl FileDiagnostic {
             tokio::select! {
                 _ = tokio::time::sleep(Duration::from_millis(interval)) => {
                     if let Some(da) = debounced_analysis {
-                        da.wait_for_reindex(file_id_clone, cancel_token.clone()).await;
+                        if !da.wait_for_reindex(file_id_clone, cancel_token.clone()).await {
+                            return;
+                        }
                     }
                     if cancel_token.is_cancelled() {
                         return;

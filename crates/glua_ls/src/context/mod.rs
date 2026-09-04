@@ -171,7 +171,8 @@ impl ServerContext {
         ));
 
         // Supervise the debounce loop: freshness waiters park on it with no
-        // deadline, so if it dies the whole server silently goes quiet.
+        // deadline, so if it dies the waiters fail fast via the alive flag
+        // instead of the whole server silently going quiet.
         {
             let da = debounced_analysis.clone();
             let shutdown = debounced_shutdown.clone();
@@ -189,10 +190,11 @@ impl ServerContext {
                             restarts += 1;
                             if restarts > DEBOUNCE_RESTART_LIMIT {
                                 log::error!(
-                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits park until their request is cancelled: {}",
+                                    "LS_DEBOUNCE_LOOP_DEAD debounced analysis loop panicked {} times; giving up, so edits stop being re-indexed and freshness waits fail fast: {}",
                                     restarts,
                                     err
                                 );
+                                da.note_debounce_loop_dead();
                                 return;
                             }
                             log::error!(
