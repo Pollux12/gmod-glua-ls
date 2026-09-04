@@ -184,6 +184,17 @@ pub async fn output_result(
         }
     }
 
+    // The channel closes early only when worker tasks died before sending
+    // (see the `drop(sender)` above the spawn loop): never report a partial
+    // file set as a complete result. Bail loudly instead of hanging (before)
+    // or passing CI on partial diagnostics (worse).
+    if count != total_count {
+        eprintln!(
+            "glua_check: only {count} of {total_count} file results arrived; a worker task likely panicked"
+        );
+        return 1;
+    }
+
     collected_diagnostics.sort_by(compare_output_diagnostics);
     let mut current_file_id = None;
     let mut current_normalized_path = None;
