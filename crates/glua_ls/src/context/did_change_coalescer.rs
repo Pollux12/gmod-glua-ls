@@ -8,6 +8,7 @@ use crate::handlers::on_did_change_text_document;
 struct QueuedDidChange {
     params: DidChangeTextDocumentParams,
     in_flight: InFlightChangeGuard,
+    enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
 }
 
 /// Coalesces rapid `textDocument/didChange` notifications.
@@ -37,8 +38,17 @@ impl DidChangeCoalescer {
     /// Enqueue a didChange notification.
     /// If the worker is busy, the params accumulate in the channel and
     /// the worker drains + deduplicates them in the next batch.
-    pub fn enqueue(&self, params: DidChangeTextDocumentParams, in_flight: InFlightChangeGuard) {
-        if let Err(err) = self.tx.send(QueuedDidChange { params, in_flight }) {
+    pub fn enqueue(
+        &self,
+        params: DidChangeTextDocumentParams,
+        in_flight: InFlightChangeGuard,
+        enqueue_profile: Option<crate::util::ls_profile::DidChangeEnqueue>,
+    ) {
+        if let Err(err) = self.tx.send(QueuedDidChange {
+            params,
+            in_flight,
+            enqueue_profile,
+        }) {
             log::error!(
                 "LS_COALESCER_SEND_FAILED didChange worker channel is closed; settling dropped change"
             );
@@ -77,10 +87,43 @@ impl DidChangeCoalescer {
 
             // Process only the latest version for each URI.
             for (uri, queued) in latest {
+                if !crate::util::ls_profile::ls_profile_enabled()
+                    || queued.enqueue_profile.is_none()
+                {
+                    let task_context = context.clone();
+                    let handle = tokio::spawn(async move {
+                        on_did_change_text_document(task_context, queued.params).await;
+                    });
+                    if let Err(err) = handle.await {
+                        log::error!(
+                            "LS_COALESCER_ITEM_PANIC uri={:?} didChange handler failed: {}",
+                            uri,
+                            err
+                        );
+                    }
+                    queued.in_flight.finish().await;
+                    continue;
+                }
+
+                // Profiled path: scope one accumulator so preparse, write
+                // wait/hold, and schedule timings observed inside
+                // `on_did_change_text_document` accumulate into a single
+                // `[profile] ls_did_change` line. Superseded (coalesced away)
+                // versions never reach here and emit nothing.
+                let profile = queued.enqueue_profile.expect("profile checked above");
+                let accum = std::sync::Arc::new(crate::util::ls_profile::DidChangeAccum::new());
+                let dequeue_at = std::time::Instant::now();
+                let coalescer_wait = dequeue_at.saturating_duration_since(profile.enqueue_at);
                 let task_context = context.clone();
-                let handle = tokio::spawn(async move {
-                    on_did_change_text_document(task_context, queued.params).await;
-                });
+                let accum_scope = accum.clone();
+                let params = queued.params;
+                let in_flight = queued.in_flight;
+                let handle = tokio::spawn(crate::util::ls_profile::LS_DID_CHANGE_ACCUM.scope(
+                    accum_scope,
+                    async move {
+                        on_did_change_text_document(task_context, params).await;
+                    },
+                ));
                 if let Err(err) = handle.await {
                     log::error!(
                         "LS_COALESCER_ITEM_PANIC uri={:?} didChange handler failed: {}",
@@ -88,7 +131,19 @@ impl DidChangeCoalescer {
                         err
                     );
                 }
-                queued.in_flight.finish().await;
+                in_flight.finish().await;
+                let timings = accum.snapshot();
+                let total = profile.enqueue_at.elapsed();
+                crate::util::ls_profile::emit_ls_did_change(
+                    profile.seq,
+                    profile.version,
+                    coalescer_wait,
+                    timings.preparse,
+                    timings.write_wait,
+                    timings.write_hold,
+                    timings.notify_to_schedule,
+                    total,
+                );
             }
         }
     }

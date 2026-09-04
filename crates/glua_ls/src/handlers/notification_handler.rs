@@ -86,9 +86,15 @@ pub async fn on_notification_handler(
             // Mark analysis dirty BEFORE handing the update to the coalescer so
             // follow-up requests see the stale state immediately.
             let in_flight = snapshot.debounced_analysis_arc().begin_in_flight_change();
+            // Profiling: capture the notification receipt (version + seq +
+            // clock) so the coalescer worker can report `coalescer_wait_ms`
+            // and `total_ms` spanning notification through schedule. `None`
+            // when unset: zero clock reads, zero output.
+            let enqueue_profile =
+                crate::util::ls_profile::DidChangeEnqueue::capture(params.text_document.version);
             server_context
                 .did_change_coalescer()
-                .enqueue(params, in_flight);
+                .enqueue(params, in_flight, enqueue_profile);
         }
         return Ok(());
     }

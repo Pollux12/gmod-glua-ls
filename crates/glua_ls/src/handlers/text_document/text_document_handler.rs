@@ -45,10 +45,28 @@ async fn apply_document_update_without_queuing(
 
     // Fair-queued `write().await`, not a `try_write` spin, which can starve
     // for seconds under a stream of readers.
+    //
+    // Profiling: when a didChange accumulator is scoped, split the wait for
+    // the write lock from the hold so `[profile] ls_did_change` can report
+    // `analysis_write_wait_ms` vs `analysis_write_hold_ms`. Zero clock reads
+    // when unset or when called outside a didChange (e.g. didOpen).
+    let profile = crate::util::ls_profile::ls_profile_enabled()
+        && crate::util::ls_profile::LS_DID_CHANGE_ACCUM
+            .try_with(|_| ())
+            .is_ok();
+    let wait_start = profile.then(std::time::Instant::now);
     let mut analysis = context.analysis().write().await;
+    if let Some(start) = wait_start {
+        crate::util::ls_profile::record_did_change_write_wait(start.elapsed());
+    }
+    let hold_start = profile.then(std::time::Instant::now);
 
     // The lock wait is unbounded, so re-check staleness now that we hold it.
     if should_drop_stale_version(context, uri, version) {
+        drop(analysis);
+        if let Some(start) = hold_start {
+            crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
+        }
         return None;
     }
 
@@ -66,13 +84,19 @@ async fn apply_document_update_without_queuing(
                 None,
             )
         } else {
-            let (file_id, deferred_drop) = analysis.update_file_preparsed_deferred(
+            let Some((file_id, deferred_drop)) = analysis.update_file_preparsed_deferred(
                 uri.clone(),
                 Some(text),
                 preparsed.tree,
                 preparsed.line_index,
                 Some(version),
-            )?;
+            ) else {
+                drop(analysis);
+                if let Some(start) = hold_start {
+                    crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
+                }
+                return None;
+            };
             (Some(file_id), Some(deferred_drop))
         }
     } else if trigger_reindex {
@@ -89,6 +113,9 @@ async fn apply_document_update_without_queuing(
             .invalidate_shared_diagnostic_data();
     }
     drop(analysis);
+    if let Some(start) = hold_start {
+        crate::util::ls_profile::record_did_change_write_hold(start.elapsed());
+    }
 
     if let Some(deferred_drop) = deferred_drop {
         spawn_deferred_drop(deferred_drop);
@@ -366,7 +393,18 @@ pub async fn on_did_change_text_document(
     }
 
     let interval = emmyrc.diagnostics.diagnostic_interval.unwrap_or(500);
+    // Profiling: time the off-lock parse so `ls_did_change` can report
+    // `preparse_ms`. Only when a didChange accumulator is scoped; didOpen and
+    // unprofiled runs pay no clock read.
+    let preparse_start = (crate::util::ls_profile::ls_profile_enabled()
+        && crate::util::ls_profile::LS_DID_CHANGE_ACCUM
+            .try_with(|_| ())
+            .is_ok())
+    .then(std::time::Instant::now);
     let preparsed = preparse_document(text.clone(), emmyrc.clone()).await;
+    if let Some(start) = preparse_start {
+        crate::util::ls_profile::record_did_change_preparse(start.elapsed());
+    }
     let syntax_diagnostics = preparsed
         .as_ref()
         .map_or_else(Vec::new, |parsed| parsed.syntax_diagnostics.clone());
@@ -400,12 +438,24 @@ pub async fn on_did_change_text_document(
             });
     }
 
-    // Schedule debounced reindex — rapid edits into a single reindex
+    // Schedule debounced reindex — rapid edits into a single reindex.
+    //
+    // Profiling: `notify_to_schedule_ms` covers the applied-version note
+    // through `schedule()` returning (the handoff that lets a waiting
+    // request observe the edit).
     if let Some(file_id) = file_id {
+        let schedule_start = (crate::util::ls_profile::ls_profile_enabled()
+            && crate::util::ls_profile::LS_DID_CHANGE_ACCUM
+                .try_with(|_| ())
+                .is_ok())
+        .then(std::time::Instant::now);
         context
             .debounced_analysis()
             .schedule(file_id, uri.clone())
             .await;
+        if let Some(start) = schedule_start {
+            crate::util::ls_profile::record_did_change_notify_to_schedule(start.elapsed());
+        }
     }
 
     // Handle reindex without holding locks

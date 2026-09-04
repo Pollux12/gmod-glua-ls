@@ -180,10 +180,29 @@ impl ServerContextSnapshot {
         &self,
         cancel_token: &CancellationToken,
     ) -> Option<RwLockReadGuard<'_, EmmyLuaAnalysis>> {
-        tokio::select! {
+        if !crate::util::ls_profile::ls_profile_enabled() {
+            return tokio::select! {
+                guard = self.analysis().read() => Some(guard),
+                _ = cancel_token.cancelled() => None,
+            };
+        }
+
+        // Profiled path: time the lock wait and attribute it to the request
+        // accumulator scoped in the fresh-index dispatch arm, so the per
+        // request summary line can report `analysis_read_wait_ms` without
+        // changing handler signatures. Callers outside that scope (other
+        // dispatch arms) simply have nowhere to record and drop the sample.
+        let start = std::time::Instant::now();
+        let guard = tokio::select! {
             guard = self.analysis().read() => Some(guard),
             _ = cancel_token.cancelled() => None,
+        };
+        if guard.is_some() {
+            let elapsed = start.elapsed();
+            let _ = crate::util::ls_profile::LS_REQUEST_ACCUM
+                .try_with(|accum| accum.add_read_wait(elapsed));
         }
+        guard
     }
 
     /// Acquire a read lock on the workspace manager, racing against a

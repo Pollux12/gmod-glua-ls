@@ -133,45 +133,130 @@ macro_rules! dispatch_request {
                         let task_metadata = request_task_metadata(<$fresh_req_type>::METHOD, &params);
                         let target_uri = task_metadata.uri.clone();
                         $context.task(id.clone(), task_metadata, |cancel_token| async move {
-                            // Symbol resolution against a stale index silently
-                            // returns empty; wait for the reindex. A request
-                            // aimed at one file only needs that file's own
-                            // entries to match its text, so it waits for those
-                            // rather than for the edit's whole dependency
-                            // ripple — seconds apart on a large gamemode.
-                            // The handoff is held across the handler so the
-                            // ripple waits for this request to take its read
-                            // lock rather than putting it behind the ripple it
-                            // was just released from.
-                            let (fresh, _handoff) = match target_uri.as_ref() {
-                                Some(uri) => {
-                                    let debounced = snapshot.debounced_analysis_arc();
-                                    let handoff = debounced.begin_reader_handoff();
-                                    let fresh = debounced
-                                        .wait_until_file_fresh_for(
-                                            &cancel_token,
-                                            <$fresh_req_type>::METHOD,
-                                            uri,
-                                        )
-                                        .await;
-                                    (fresh, Some(handoff))
+                            if !crate::util::ls_profile::ls_profile_enabled() {
+                                // Symbol resolution against a stale index silently
+                                // returns empty; wait for the reindex. A request
+                                // aimed at one file only needs that file's own
+                                // entries to match its text, so it waits for those
+                                // rather than for the edit's whole dependency
+                                // ripple — seconds apart on a large gamemode.
+                                // The handoff is held across the handler so the
+                                // ripple waits for this request to take its read
+                                // lock rather than putting it behind the ripple it
+                                // was just released from.
+                                let (fresh, _handoff) = match target_uri.as_ref() {
+                                    Some(uri) => {
+                                        let debounced = snapshot.debounced_analysis_arc();
+                                        let handoff = debounced.begin_reader_handoff();
+                                        let fresh = debounced
+                                            .wait_until_file_fresh_for(
+                                                &cancel_token,
+                                                <$fresh_req_type>::METHOD,
+                                                uri,
+                                            )
+                                            .await;
+                                        (fresh, Some(handoff))
+                                    }
+                                    None => {
+                                        let fresh = snapshot
+                                            .debounced_analysis()
+                                            .wait_until_fresh_for(
+                                                &cancel_token,
+                                                <$fresh_req_type>::METHOD,
+                                            )
+                                            .await;
+                                        (fresh, None)
+                                    }
+                                };
+                                if !fresh {
+                                    return None;
                                 }
-                                None => {
-                                    let fresh = snapshot
-                                        .debounced_analysis()
-                                        .wait_until_fresh_for(
-                                            &cancel_token,
-                                            <$fresh_req_type>::METHOD,
-                                        )
-                                        .await;
-                                    (fresh, None)
-                                }
-                            };
-                            if !fresh {
-                                return None;
+                                let result = $fresh_handler(snapshot, params, cancel_token).await;
+                                Some(Response::new_ok(id, result))
+                            } else {
+                                // Profiled path: identical wake-up and handoff
+                                // behavior, plus one `[profile] ls_request` line
+                                // accumulating fresh-wait by observed state.
+                                // `analysis_read_wait` is contributed by
+                                // `read_analysis` via the scoped accumulator;
+                                // `handler_ms` comes from the completion
+                                // handler's guard when present, else from the
+                                // dispatch-side measurement.
+                                let seq = crate::util::ls_profile::next_ls_seq();
+                                let total_start = std::time::Instant::now();
+                                let id_string = format!("{:?}", id);
+                                let method = <$fresh_req_type>::METHOD;
+                                let accum =
+                                    std::sync::Arc::new(crate::util::ls_profile::LsRequestAccum::new());
+                                let accum_scope = accum.clone();
+                                crate::util::ls_profile::LS_REQUEST_ACCUM
+                                    .scope(accum_scope, async move {
+                                        let (fresh, _handoff, breakdown) = match target_uri.as_ref() {
+                                            Some(uri) => {
+                                                let debounced = snapshot.debounced_analysis_arc();
+                                                let handoff = debounced.begin_reader_handoff();
+                                                let (fresh, breakdown) = debounced
+                                                    .wait_until_file_fresh_for_profiled(
+                                                        &cancel_token,
+                                                        <$fresh_req_type>::METHOD,
+                                                        uri,
+                                                    )
+                                                    .await;
+                                                (fresh, Some(handoff), breakdown)
+                                            }
+                                            None => {
+                                                let (fresh, breakdown) = snapshot
+                                                    .debounced_analysis()
+                                                    .wait_until_fresh_for_profiled(
+                                                        &cancel_token,
+                                                        <$fresh_req_type>::METHOD,
+                                                    )
+                                                    .await;
+                                                (fresh, None, breakdown)
+                                            }
+                                        };
+                                        if !fresh {
+                                            let total = total_start.elapsed();
+                                            let read_wait = accum.take_read_wait();
+                                            let handler_ms =
+                                                accum.take_handler_time().unwrap_or_default();
+                                            crate::util::ls_profile::emit_ls_request(
+                                                seq,
+                                                &id_string,
+                                                method,
+                                                total,
+                                                breakdown.total,
+                                                breakdown.in_flight,
+                                                breakdown.blocked,
+                                                read_wait,
+                                                handler_ms,
+                                            );
+                                            return None;
+                                        }
+                                        let handler_start = std::time::Instant::now();
+                                        let result =
+                                            $fresh_handler(snapshot, params, cancel_token).await;
+                                        let handler_measured = handler_start.elapsed();
+                                        let handler_ms = accum
+                                            .take_handler_time()
+                                            .unwrap_or(handler_measured);
+                                        let read_wait = accum.take_read_wait();
+                                        let total = total_start.elapsed();
+                                        crate::util::ls_profile::emit_ls_request(
+                                            seq,
+                                            &id_string,
+                                            method,
+                                            total,
+                                            breakdown.total,
+                                            breakdown.in_flight,
+                                            breakdown.blocked,
+                                            read_wait,
+                                            handler_ms,
+                                        );
+                                        Some(Response::new_ok(id, result))
+                                    })
+                                    .await
                             }
-                            let result = $fresh_handler(snapshot, params, cancel_token).await;
-                            Some(Response::new_ok(id, result))
                         }).await;
                         return Ok(());
                     }

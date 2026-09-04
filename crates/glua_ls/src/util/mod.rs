@@ -1,6 +1,7 @@
 mod analysis_progress;
 mod desc;
 mod long_running_watchdog;
+pub mod ls_profile;
 mod module_name_convert;
 mod time_cancel_token;
 
