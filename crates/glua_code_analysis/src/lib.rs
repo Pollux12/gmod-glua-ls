@@ -975,9 +975,15 @@ impl EmmyLuaAnalysis {
     /// Each round re-analyses a batch and diffs each file's exports against
     /// the map taken just before it, so a file that re-derives the same facts
     /// adds nothing. A file is re-analysed at most once per ripple.
-    pub fn ripple(&mut self, mut dirty: DirtySet) {
+    ///
+    /// Returns every live file whose diagnostics this edit may have moved:
+    /// the files re-analysed, propagation included, plus the readers the diff
+    /// named that needed no re-index of their own. A caller that publishes
+    /// diagnostics needs that set and not just the files whose text changed —
+    /// the point of the ripple is the files nobody edited.
+    pub fn ripple(&mut self, mut dirty: DirtySet) -> Vec<FileId> {
         if dirty.is_empty() {
-            return;
+            return Vec::new();
         }
         self.compilation
             .get_db_mut()
@@ -989,6 +995,13 @@ impl EmmyLuaAnalysis {
         let mut reanalyzed = dirty.sources.iter().copied().collect::<Vec<_>>();
         reanalyzed.sort_unstable();
         let mut pending = std::mem::take(&mut dirty.files);
+        // Every file the diff named, whether or not it ends up re-indexed. A
+        // reader can need no new index entries and still diagnose differently,
+        // because it resolves the fact that moved when it is diagnosed rather
+        // than when it is indexed. Reporting only what was re-analysed leaves
+        // exactly those files holding a stale report.
+        let mut touched: FxHashSet<FileId> = dirty.sources.iter().copied().collect();
+        touched.extend(pending.iter().copied());
         let mut round = 0usize;
 
         while !pending.is_empty() {
@@ -1078,6 +1091,7 @@ impl EmmyLuaAnalysis {
                     .into_iter()
                     .chain(evidence)
                 {
+                    touched.insert(dependent);
                     if !settled.contains(&dependent) {
                         pending.insert(dependent);
                     }
@@ -1092,13 +1106,28 @@ impl EmmyLuaAnalysis {
                 .refresh_file_source_dependencies(*file_id);
         }
         let guard_fact_file_ids = dirty.guard_snapshot.snapshot_file_ids().clone();
-        self.reindex_changed_inferred_guard_references(
+        let guard_reindexed = self.reindex_changed_inferred_guard_references(
             &guard_fact_file_ids,
             &dirty.guard_snapshot,
             &reanalyzed,
             &dirty.sources,
         );
-        self.reindex_changed_inferred_param_consumers(&dirty.guard_snapshot, &reanalyzed);
+        let param_reindexed =
+            self.reindex_changed_inferred_param_consumers(&dirty.guard_snapshot, &reanalyzed);
+
+        reanalyzed.extend(guard_reindexed);
+        reanalyzed.extend(param_reindexed);
+        reanalyzed.extend(touched);
+        reanalyzed.retain(|file_id| {
+            self.compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(file_id)
+                .is_some()
+        });
+        reanalyzed.sort_unstable();
+        reanalyzed.dedup();
+        reanalyzed
     }
 
     /// Rebuilds only these files' own index entries.
@@ -1606,69 +1635,147 @@ impl EmmyLuaAnalysis {
         updated_files
     }
 
+    /// Removes a file the way the filesystem did.
+    ///
+    /// One deletion is a one-item batch. The whole-file purge the removal used
+    /// to do by hand — a `PositionMap::whole_file` remap, so members other files
+    /// own on this file's table literals lose every offset — is what
+    /// `take_position_map` already returns once the VFS holds no text for the
+    /// file, and the batch feeds the owners it reports back into the dirty set
+    /// instead of discarding them. The contribution-signature seed the expansion
+    /// needed has no counterpart here because a contributed parameter is an
+    /// exported fact: the diff against an emptied export map names its readers.
     pub fn remove_file_by_uri(&mut self, uri: &Uri) -> Option<FileId> {
-        if let Some(file_id) = self.compilation.get_db().get_vfs().get_file_id(uri) {
-            let mut reindex_file_ids = self.expand_reindex_file_ids(vec![file_id]);
-            reindex_file_ids.extend(
-                self.compilation
-                    .get_db()
-                    .get_call_site_param_index()
-                    .collect_contribution_signature_files(&FxHashSet::from_iter([file_id])),
-            );
-            reindex_file_ids.sort_unstable();
-            reindex_file_ids.dedup();
-            let removed_file_ids = FxHashSet::from_iter([file_id]);
-            self.add_vgui_forwarding_removal_seed(&removed_file_ids, &mut reindex_file_ids);
-            let guard_fact_file_ids = reindex_file_ids.iter().copied().collect::<FxHashSet<_>>();
-            let old_guard_facts = self.inferred_guard_snapshot(&guard_fact_file_ids);
-            // Members other files own on this file's table literals are filed
-            // under *their* file, so `remove_index` never reaches them. A
-            // whole-file map loses every offset, which is what purges them.
-            let removed_len = self
-                .compilation
-                .get_db()
-                .get_vfs()
-                .get_file_content(&file_id)
-                .map_or(0, |text| text.len());
-            self.compilation
-                .get_db_mut()
-                .get_vfs_mut()
-                .remove_file(uri)?;
-            log::info!(
-                "remove_file_by_uri: uri={} file_id={:?}",
-                uri.as_str(),
-                file_id
-            );
-            self.compilation.remove_index(reindex_file_ids.clone());
-            let update_file_ids = reindex_file_ids
-                .iter()
-                .copied()
-                .filter(|id| *id != file_id)
-                .collect::<Vec<_>>();
-            if !update_file_ids.is_empty() {
-                self.compilation.update_index(update_file_ids);
+        let file_id = self.compilation.get_db().get_vfs().get_file_id(uri)?;
+        log::info!(
+            "remove_file_by_uri: uri={} file_id={:?}",
+            uri.as_str(),
+            file_id
+        );
+        self.apply_file_system_changes(vec![(uri.clone(), None)]);
+        Some(file_id)
+    }
+
+    /// Applies a batch of filesystem changes — the creates, changes and deletes
+    /// a watched-file notification delivers together — and returns every live
+    /// file whose diagnostics the batch may have moved.
+    ///
+    /// One [`self_index_and_diff`](Self::self_index_and_diff) over the whole
+    /// batch and one [`ripple`](Self::ripple), so a branch switch costs the
+    /// files the change reached rather than the union of their dependency
+    /// expansions. The batch is one call rather than one per file because the
+    /// analyser derives its facts over a whole batch; settling the files one at
+    /// a time does not land where a cold build of the same set does.
+    ///
+    /// The returned set is what a caller has to re-diagnose. It is deliberately
+    /// not just the files whose text changed: the files the ripple settled are
+    /// the ones nobody edited and nobody would otherwise refresh.
+    ///
+    /// `None` means the file is gone from disk. Unlike
+    /// [`update_file_by_uri`](Self::update_file_by_uri), which leaves a
+    /// tombstone, the URI is detached once the settle is done so a later file at
+    /// the same path is a new [`FileId`]. The detach has to come last: until
+    /// then the path is what finds the files whose reads of it have to be
+    /// re-derived.
+    pub fn apply_file_system_changes(&mut self, files: Vec<(Uri, Option<String>)>) -> Vec<FileId> {
+        let mut files = files;
+        files.sort_by_cached_key(|(uri, _)| uri_sort_key(uri));
+        // One URI can arrive several times in a burst; only the last event is
+        // the state on disk.
+        let mut latest: Vec<(Uri, Option<String>)> = Vec::with_capacity(files.len());
+        for (uri, text) in files {
+            match latest.last_mut() {
+                Some(last) if last.0 == uri => last.1 = text,
+                _ => latest.push((uri, text)),
             }
-            self.compilation
-                .get_db_mut()
-                .get_call_site_param_index_mut()
-                .refresh_file_source_dependencies(file_id);
-            self.reindex_changed_inferred_guard_references(
-                &guard_fact_file_ids,
-                &old_guard_facts,
-                &reindex_file_ids,
-                &FxHashSet::default(),
-            );
-            let remap = FileRemap::validated(
-                self.compilation.get_db(),
-                file_id,
-                PositionMap::whole_file(removed_len, 0),
-            );
-            remap_into_file(self.compilation.get_db_mut(), &remap);
-            self.pending_indexed_text.remove(&file_id);
-            return Some(file_id);
         }
 
-        None
+        let mut changed = Vec::new();
+        let mut existence_changed = Vec::new();
+        let mut removed_uris = Vec::new();
+        for (uri, text) in latest {
+            let existing = self.compilation.get_db().get_vfs().get_file_id(&uri);
+            if let Some(file_id) = existing
+                && let (Some(new_text), Some(old_text)) = (
+                    text.as_deref(),
+                    self.compilation
+                        .get_db()
+                        .get_vfs()
+                        .get_file_content(&file_id)
+                        .map(String::as_str),
+                )
+                && old_text == new_text
+            {
+                // Same bytes. Already indexed means nothing to do; an index that
+                // was cleared still owes its rebuild, and with no stash the
+                // remap is the identity, which is what an unchanged file wants.
+                if self
+                    .compilation
+                    .get_db()
+                    .get_module_index()
+                    .get_module(file_id)
+                    .is_none()
+                {
+                    changed.push(file_id);
+                }
+                continue;
+            }
+            if existing.is_none() && text.is_none() {
+                continue;
+            }
+
+            let was_absent = existing.is_none_or(|file_id| {
+                self.compilation
+                    .get_db()
+                    .get_vfs()
+                    .get_syntax_tree(&file_id)
+                    .is_none()
+            });
+            let is_removed = text.is_none();
+            if let Some(file_id) = existing {
+                self.stash_indexed_text(file_id);
+            }
+            let file_id = self
+                .compilation
+                .get_db_mut()
+                .get_vfs_mut()
+                .set_file_content(&uri, text);
+            if was_absent || is_removed {
+                existence_changed.push(file_id);
+            }
+            if is_removed {
+                removed_uris.push(uri);
+            }
+            changed.push(file_id);
+        }
+
+        if changed.is_empty() {
+            return Vec::new();
+        }
+        changed.sort_unstable();
+        changed.dedup();
+
+        let mut dirty = self.self_index_and_diff(changed.clone());
+        for file_id in existence_changed {
+            self.dirty_existence_dependents(&mut dirty, file_id);
+        }
+        let mut affected = changed;
+        affected.extend(self.ripple(dirty));
+
+        for uri in &removed_uris {
+            self.compilation.get_db_mut().get_vfs_mut().remove_file(uri);
+        }
+
+        affected.retain(|file_id| {
+            self.compilation
+                .get_db()
+                .get_vfs()
+                .get_syntax_tree(file_id)
+                .is_some()
+        });
+        affected.sort_unstable();
+        affected.dedup();
+        affected
     }
 
     pub fn update_files_by_path(&mut self, files: Vec<(PathBuf, Option<String>)>) -> Vec<FileId> {
