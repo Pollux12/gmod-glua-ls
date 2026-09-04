@@ -611,12 +611,16 @@ impl GmodInferIndex {
         self.gm_method_realm_annotations.iter()
     }
 
-    /// Set per-file member realm ranges (sorted). Empty clears.
+    /// Records this file's `---@realm` decl ranges, sorted.
+    ///
+    /// An empty vector is recorded rather than dropped: the entry is what says
+    /// the file was scanned, and a file with no annotation is the common case,
+    /// not an absent answer. Dropping it made
+    /// [`has_member_realm_ranges`](Self::has_member_realm_ranges) report the
+    /// scanned-and-empty file as never scanned, which is the one thing it exists
+    /// to tell apart. Removal of the file's entries is
+    /// [`LuaIndex::remove`](crate::LuaIndex::remove)'s job.
     pub fn set_member_realm_ranges(&mut self, file_id: FileId, mut ranges: Vec<GmodRealmRange>) {
-        if ranges.is_empty() {
-            self.member_realm_ranges.remove(&file_id);
-            return;
-        }
         ranges.sort_by_key(|r| r.range.start());
         self.member_realm_ranges.insert(file_id, ranges);
     }

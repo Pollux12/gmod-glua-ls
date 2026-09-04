@@ -346,9 +346,14 @@ impl AnalysisPipeline for GmodPreAnalysisPipeline {
                 if let Some(profile) = profile.as_mut() {
                     profile.member_realm_ranges += member_ranges.len();
                 }
-                db.get_gmod_infer_index_mut()
-                    .set_member_realm_ranges(file_id, member_ranges);
             }
+            // Every analyzed file records an entry, so the index answers for all
+            // of them and no reader has to walk the tree itself to find out.
+            // A file whose content never mentions `@realm` cannot carry a realm
+            // doc tag, so its empty vector is derived, not assumed: the producer
+            // skips the walk and this records the same answer it would have got.
+            db.get_gmod_infer_index_mut()
+                .set_member_realm_ranges(file_id, member_ranges);
 
             if let Some(file_params) = file_params
                 && !file_params.is_empty()
@@ -644,10 +649,25 @@ impl AnalysisPipeline for GmodPostAnalysisPipeline {
         // Same per-file cached scan the net pass uses. Folding the signature
         // index directly here took its `HashMap` iteration order, so a call path
         // defined by two files resolved differently between processes.
-        let (_, annotated_global_call_roles) =
-            crate::profile::phase("gmodpost/call_roles_and_registry", || {
-                build_call_roles_and_registry(db)
-            });
+        //
+        // The earlier passes in this batch already derived these roles. Lua
+        // analysis since then can have grown the signature index, so they are
+        // only reusable while the revision they were built at still holds; the
+        // registry beside them is not wanted here.
+        let helper_revision = helper_registry_revision(db);
+        let reusable_roles = context
+            .gmod_global_call_roles
+            .as_ref()
+            .filter(|(revision, _)| *revision == helper_revision)
+            .map(|(_, roles)| roles.clone());
+        let annotated_global_call_roles = match reusable_roles {
+            Some(roles) => roles,
+            None => crate::profile::phase("gmodpost/call_roles_and_registry", || {
+                let (_, roles) = build_call_roles_and_registry(db);
+                context.gmod_global_call_roles = Some((helper_revision, roles.clone()));
+                roles
+            }),
+        };
         crate::profile::phase("gmodpost/scripted_class_calls", || {
             collect_annotated_scripted_class_calls(db, context, &annotated_global_call_roles)
         });

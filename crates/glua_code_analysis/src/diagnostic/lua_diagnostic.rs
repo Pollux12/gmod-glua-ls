@@ -127,7 +127,6 @@ impl LuaDiagnostic {
         // precompute off the critical path. The per-workspace realm loop keeps its
         // own sequential ordering inside a single task (insertion order is
         // significant for the "first definition wins" realm-candidate rule).
-        let workspace_file_ids_ref = &workspace_file_ids;
         let realm_candidate_file_ids_ref = &realm_candidate_file_ids;
         crate::compilation::analyzer::parallel::init_pool();
         let mut workspace_realm_data = None;
@@ -135,7 +134,6 @@ impl LuaDiagnostic {
         let mut await_candidates = None;
         let mut param_type_candidates = None;
         let mut nodiscard_candidates = None;
-        let mut decl_annotation_realms = None;
         let mut sorted_send_flows = None;
         let mut property_name_candidates = None;
         rayon::scope(|s| {
@@ -173,12 +171,6 @@ impl LuaDiagnostic {
             s.spawn(|_| nodiscard_candidates = Some(precompute_nodiscard_candidates(db)));
             s.spawn(|_| property_name_candidates = Some(precompute_property_name_candidates(db)));
             s.spawn(|_| {
-                decl_annotation_realms = Some(precompute_decl_annotation_realms(
-                    db,
-                    workspace_file_ids_ref,
-                ))
-            });
-            s.spawn(|_| {
                 sorted_send_flows = Some(Arc::new(precompute_sorted_send_flows(
                     db.get_gmod_network_index(),
                     db.get_vfs(),
@@ -194,8 +186,6 @@ impl LuaDiagnostic {
             param_type_candidates.expect("precompute_param_type_candidates ran");
         let nodiscard_candidates =
             nodiscard_candidates.expect("precompute_nodiscard_candidates ran");
-        let decl_annotation_realms =
-            decl_annotation_realms.expect("precompute_decl_annotation_realms ran");
         let sorted_send_flows = sorted_send_flows.expect("precompute_sorted_send_flows ran");
         let property_name_candidates =
             property_name_candidates.expect("precompute_property_name_candidates ran");
@@ -211,7 +201,6 @@ impl LuaDiagnostic {
             param_type_candidates: Arc::new(param_type_candidates),
             nodiscard_candidates: Arc::new(nodiscard_candidates),
             property_name_candidates: Arc::new(property_name_candidates),
-            decl_annotation_realms: Arc::new(decl_annotation_realms),
             sorted_send_flows,
         })
     }
@@ -271,19 +260,4 @@ impl LuaDiagnostic {
 
         Some(context.get_diagnostics())
     }
-}
-
-fn precompute_decl_annotation_realms(
-    db: &crate::DbIndex,
-    workspace_file_ids: &[FileId],
-) -> FxHashMap<FileId, Vec<super::checker::AnnotatedRealmRange>> {
-    use super::checker::collect_decl_annotation_realms_for_file_precompute;
-    let mut cache = FxHashMap::default();
-    for &file_id in workspace_file_ids {
-        let realms = collect_decl_annotation_realms_for_file_precompute(db, &file_id);
-        if !realms.is_empty() {
-            cache.insert(file_id, realms);
-        }
-    }
-    cache
 }
