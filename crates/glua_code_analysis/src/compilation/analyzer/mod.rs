@@ -12,6 +12,7 @@ pub(crate) mod parallel;
 mod setmetatable_factory;
 pub(crate) mod unresolve;
 
+pub(crate) use common::FixpointFuse;
 pub(crate) use dynamic_field::for_range_pairs_source_for_var;
 pub(crate) use dynamic_field::is_provably_builtin_pairs_call;
 pub use lua::is_member_assignment_in_conditional_branch;
@@ -288,11 +289,20 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
         // that enumerates it, to the key a dynamic write is filed under.
         // Looping rounds is what lets the later hops see the earlier ones.
         //
-        // No round cap: the loop ends when a round moves no type write. Each
-        // round re-derives the same candidates against a strictly more complete
-        // database than the last, so the answers stop moving once every hop of
-        // the chain has seen the hop before it. On CityRP cold that is four
-        // rounds, three of them productive.
+        // The loop ends when a round moves no type write and no non-type
+        // state either (dynamic-field records, inferred signature returns,
+        // expression-member keys). Each round re-derives the same candidates
+        // against a strictly more complete database than the last, so the
+        // answers stop moving once every hop of the chain has seen the hop
+        // before it. On CityRP cold that is four rounds, three of them
+        // productive. That convergence is measured on the net boundary state
+        // below, never on any pass's mid-round report. Two guards watch the
+        // loop itself (see `common::FixpointFuse`): exact state-repetition
+        // detection is primary — the same complete post-round boundary state
+        // recurring confirms an oscillation bug and breaks out — and a high
+        // absolute round cap sits behind it as a pure hang guard. Neither is
+        // a round cap on healthy behavior: a converging wavefront advances
+        // every round and never trips either one.
         {
             let _p = Profile::new("settled_tail_fixpoint");
             // `None` on the first round: every candidate is re-derived once.
@@ -302,8 +312,25 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             let mut moved_owners: Option<HashSet<LuaTypeOwner>> = None;
             let late_resolved_decls = std::mem::take(&mut context.late_resolved_decls);
             queue_settled_decl_dependents(db, &mut context, &late_resolved_decls);
+            // Termination safety nets; see `common::FixpointFuse` (fuses, not
+            // performance budgets): `observe_boundary` confirms oscillation
+            // from the exact post-round state, and `trip` bounds total rounds
+            // as a pure hang guard.
+            let mut fuse = common::FixpointFuse::new("settled_tail_fixpoint");
             loop {
                 let _round = Profile::new("settled_tail_round");
+                if fuse.trip() {
+                    break;
+                }
+                // Whole-tail convergence reads the net boundary state only.
+                // Each pass below reports its own gross moves, and mid-round
+                // reports can ping-pong — one pass moving an owner the next
+                // moves back — while the boundary holds still. Snapshotting
+                // every movable owner first and diffing after cancels that:
+                // continuation, dependent queueing, and the next round's
+                // read-set filter all see only owners whose cached type
+                // actually differs across the round boundary.
+                let boundary_before = snapshot_settled_tail_boundary(db, &context);
                 let global_owners = rederive_settled_global_reads(db, &mut context);
                 // Runs inside the loop: the records it adds are read by the
                 // iterated-table answers below, and its own prefixes read the
@@ -311,14 +338,20 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                 // the other's previous round.
                 let dynamic_fields_moved =
                     dynamic_field::rederive_settled_dynamic_fields(db, &mut context);
-                let (moved, iter_var_owners) =
+                let (_iter_moved, _iter_var_owners) =
                     rederive_settled_iter_vars(db, &mut context, moved_owners.as_ref());
                 let returns_moved = rederive_settled_inferred_returns(db, &mut context);
-                let return_consumer_owners = if returns_moved {
-                    context.resolve_call_site_return_consumers(db)
-                } else {
-                    HashSet::default()
-                };
+                if returns_moved {
+                    // Side effects only: this resolves the return targets the
+                    // boundary snapshot covers, so the net diff below already
+                    // sees the owners it moves.
+                    context.resolve_call_site_return_consumers(db);
+                }
+                // Assignments onto locals that read a decl the passes above
+                // just moved (`selected = key` after the loop variable
+                // settled): re-derived through the same source-order claim a
+                // direct commit would have applied.
+                let _assign_owners = rederive_settled_assign_reads(db, &mut context);
                 // Everything that read a loop variable resolved while it still
                 // held the answer the partial map gave, so moving one means
                 // re-reading the initializers that could still take a better
@@ -333,24 +366,52 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
                         owners
                     })
                 };
-                let initializer_owners =
+                let _initializer_owners =
                     refresh_settled_initializer_caches(db, &mut context, refresh_owners.as_ref());
-                let mut round_owners = initializer_owners;
-                round_owners.extend(global_owners);
-                round_owners.extend(iter_var_owners);
-                round_owners.extend(return_consumer_owners);
-                queue_settled_decl_dependents(db, &mut context, &round_owners);
-                refresh_settled_expr_type_member_keys(db, &mut context);
-                if !moved && !dynamic_fields_moved && !returns_moved && round_owners.is_empty() {
+                // The net boundary diff: owners whose cached type actually
+                // differs across this round. Mid-round ping-pong cancels here.
+                let net_moved = diff_settled_tail_boundary(db, &boundary_before);
+                queue_settled_decl_dependents(db, &mut context, &net_moved);
+                let member_keys_moved = refresh_settled_expr_type_member_keys(db, &mut context);
+                // Dynamic-field records, inferred signature returns, and member
+                // keys are not type-owner state, so the boundary fingerprint
+                // below cannot see them move. A recurring fingerprint amid that
+                // progress is continued convergence, not a cycle: forget the
+                // sightings instead of confirming an oscillation that never
+                // happened.
+                let non_type_progressed =
+                    dynamic_fields_moved || returns_moved || member_keys_moved;
+                if non_type_progressed {
+                    fuse.reset_boundary_sightings();
+                }
+                if !net_moved.is_empty() {
+                    // Exact cycle detection over the COMPLETE post-round
+                    // movable-owner state, not just this round's net delta: a
+                    // delta that recurs while another part of the boundary
+                    // advances presents a different complete state every
+                    // round and must not break the loop. The fingerprint is
+                    // only a lookup accelerator; the fuse confirms byte-exact
+                    // canonical-state equality on a repeat sighting.
+                    let canonical = canonical_settled_tail_state(db, &context);
+                    if fuse.observe_boundary(
+                        fingerprint_settled_tail_state(&canonical),
+                        false,
+                        &format!("{:?}", canonical),
+                    ) {
+                        break;
+                    }
+                }
+                if net_moved.is_empty() && !non_type_progressed {
                     break;
                 }
-                // A dynamic-field record is not a type owner, so the read-set
-                // filter cannot see it move; re-derive every candidate next
-                // round instead of a filtered subset.
-                moved_owners = if dynamic_fields_moved {
+                // A dynamic-field record is not a type owner — nor are an
+                // inferred signature return payload or a member key — so the
+                // read-set filter cannot see them move; re-derive every
+                // candidate next round instead of a filtered subset.
+                moved_owners = if non_type_progressed {
                     None
                 } else {
-                    Some(round_owners)
+                    Some(net_moved)
                 };
             }
             context.settled_iter_var_candidates.clear();
@@ -359,6 +420,7 @@ pub fn analyze(db: &mut DbIndex, need_analyzed_files: Vec<InFiled<LuaChunk>>) {
             context.settled_dynamic_field_candidates.clear();
             context.settled_sibling_merge_read_candidates.clear();
             context.settled_decl_copy_candidates.clear();
+            context.settled_assign_candidates.clear();
         }
 
         {
@@ -532,7 +594,11 @@ fn requeue_force_finalized(db: &mut DbIndex, context: &mut AnalyzeContext) {
 /// Re-resolves body-inferred returns after every type and member input settles.
 fn rederive_settled_inferred_returns(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut changed = false;
+    let mut fuse = common::FixpointFuse::new("rederive_settled_inferred_returns");
     loop {
+        if fuse.trip() {
+            break;
+        }
         context.drain_inferred_return_reads();
         let mut candidates = context
             .inferred_return_candidates
@@ -775,7 +841,11 @@ fn rederive_settled_iter_vars(
 /// its identity, so once the settled passes have moved the types the key was
 /// minted from, the member moves to the slot the settled key names instead of a
 /// second key being minted and the first left orphaned.
-fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut AnalyzeContext) {
+///
+/// Returns whether any member key moved. A rekeyed member-map reader may answer
+/// differently now, so the settled tail continues the loop — and re-derives
+/// every candidate unfiltered next round — when it does.
+fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut AnalyzeContext) -> bool {
     let mut file_ids = context
         .analyzed_file_ids()
         .into_iter()
@@ -787,7 +857,7 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
         })
         .collect::<Vec<_>>();
     if file_ids.is_empty() {
-        return;
+        return false;
     }
     file_ids.sort_unstable();
 
@@ -858,12 +928,19 @@ fn refresh_settled_expr_type_member_keys(db: &mut DbIndex, context: &mut Analyze
         updates
     });
 
+    let mut moved = false;
     for updates in results {
         for (member_id, settled_key) in updates {
-            db.get_member_index_mut()
-                .rekey_member(member_id, settled_key);
+            if db
+                .get_member_index_mut()
+                .rekey_member(member_id, settled_key)
+                .is_some()
+            {
+                moved = true;
+            }
         }
     }
+    moved
 }
 
 /// Re-derives `local x = SomeGlobal` reads.
@@ -992,6 +1069,452 @@ fn rederive_settled_global_reads(
         })
         .collect::<HashSet<_>>();
     moved
+}
+
+/// Every owner the settled tail can move in one round: the assignment,
+/// global, iterator-variable, initializer, copy, member, and call-site
+/// return-target candidates.
+///
+/// The tail converges on the net boundary state over this set (see
+/// [`snapshot_settled_tail_boundary`]), so it must cover every owner any
+/// pass of the round can write.
+fn settled_tail_movable_owners(context: &AnalyzeContext) -> HashSet<LuaTypeOwner> {
+    let mut owners = HashSet::default();
+    owners.extend(
+        context
+            .settled_assign_candidates
+            .iter()
+            .map(|(decl_id, _, _)| LuaTypeOwner::Decl(*decl_id)),
+    );
+    owners.extend(
+        context
+            .settled_global_read_candidates
+            .iter()
+            .chain(context.settled_multi_decl_global_read_candidates.iter())
+            .map(|(decl_id, _)| LuaTypeOwner::Decl(*decl_id)),
+    );
+    owners.extend(
+        context
+            .settled_iter_var_candidates
+            .iter()
+            .flat_map(|iter_var| {
+                iter_var.iter_vars.iter().map(|var_name| {
+                    LuaDeclId::new(
+                        iter_var.file_id,
+                        glua_parser::LuaAstToken::get_position(var_name),
+                    )
+                })
+            })
+            .map(LuaTypeOwner::Decl),
+    );
+    owners.extend(
+        context
+            .settled_decl_initializer_candidates
+            .iter()
+            .map(|decl_id| LuaTypeOwner::Decl(*decl_id)),
+    );
+    owners.extend(context.settled_decl_copy_candidates.iter().cloned());
+    owners.extend(
+        context
+            .member_initializer_reinfer_candidates
+            .iter()
+            .chain(context.guarded_member_read_candidates.iter())
+            .chain(context.settled_sibling_merge_read_candidates.iter())
+            .map(|member_id| LuaTypeOwner::Member(*member_id)),
+    );
+    owners.extend(
+        context
+            .call_site_return_targets
+            .iter()
+            .map(|(_, owner, _, _)| owner.clone()),
+    );
+    owners
+}
+
+/// Snapshots the cached type of every owner the settled tail can move.
+///
+/// Taken at the top of each tail round; [`diff_settled_tail_boundary`] diffs
+/// it at the bottom. Mid-round reports cancel in that diff, so the loop
+/// converges on what actually changed across the boundary.
+fn snapshot_settled_tail_boundary(
+    db: &DbIndex,
+    context: &AnalyzeContext,
+) -> HashMap<LuaTypeOwner, Option<LuaType>> {
+    settled_tail_movable_owners(context)
+        .into_iter()
+        .map(|owner| {
+            let cached = db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .map(|cache| cache.as_type().clone());
+            (owner, cached)
+        })
+        .collect()
+}
+
+/// Owners whose cached type differs from the round's opening snapshot.
+///
+/// Owners the round never wrote compare equal and drop out, and so does an
+/// owner one pass moved and a later pass moved back: only the net boundary
+/// state remains.
+fn diff_settled_tail_boundary(
+    db: &DbIndex,
+    before: &HashMap<LuaTypeOwner, Option<LuaType>>,
+) -> HashSet<LuaTypeOwner> {
+    before
+        .iter()
+        .filter(|(owner, cached)| {
+            db.get_type_index()
+                .get_type_cache(owner)
+                .map(|cache| cache.as_type())
+                != cached.as_ref()
+        })
+        .map(|(owner, _)| owner.clone())
+        .collect()
+}
+
+/// Canonical post-round state of every owner the settled tail can move:
+/// sorted owner→type pairs.
+///
+/// [`FixpointFuse::observe_boundary`] takes this alongside the fingerprint.
+/// The fingerprint (a u64 over this same state) is only a lookup accelerator:
+/// on a repeat sighting the fuse confirms exact equality of this state before
+/// calling it a cycle, so the same net delta recurring while another part of
+/// the boundary advances — or a plain hash collision — can never break the
+/// loop early. The sort keeps both forms deterministic across hash-map and
+/// thread-pool orderings; neither form ever decides an answer, only whether
+/// the loop has stopped converging.
+fn canonical_settled_tail_state(
+    db: &DbIndex,
+    context: &AnalyzeContext,
+) -> Vec<(u8, u32, u32, Option<String>)> {
+    let mut entries = settled_tail_movable_owners(context)
+        .into_iter()
+        .map(|owner| {
+            let kind = match owner {
+                LuaTypeOwner::Decl(_) => 0u8,
+                LuaTypeOwner::Member(_) => 1u8,
+                LuaTypeOwner::SyntaxId(_) => 2u8,
+            };
+            let cached = db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .map(|cache| format!("{:?}", cache.as_type()));
+            (
+                kind,
+                owner.get_file_id().id,
+                u32::from(owner.get_position()),
+                cached,
+            )
+        })
+        .collect::<Vec<_>>();
+    entries.sort();
+    entries
+}
+
+/// Equality-only fingerprint of [`canonical_settled_tail_state`] for
+/// [`FixpointFuse::observe_boundary`]: compared for equality only, never used
+/// to order, index, or otherwise decide answers (see the fuse docs).
+fn fingerprint_settled_tail_state(canonical: &[(u8, u32, u32, Option<String>)]) -> u64 {
+    use std::hash::{Hash, Hasher};
+
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    canonical.hash(&mut hasher);
+    hasher.finish()
+}
+
+/// Re-derives local assignments whose right-hand side reads a local the
+/// settled tail has since moved (`selected = key` after the loop variable
+/// settled).
+///
+/// The walk bound these writes to whatever the source held when the file was
+/// walked, and unlike `local x = <expr>` copies they read no initializer cache
+/// of their own the read-set filter could see move.
+///
+/// Each write goes through [`bind_decl_write`](common::bind_decl_write), so
+/// the replay keeps the source-order claim and write-authority semantics a
+/// direct commit would have applied: an earlier writer still owns the slot,
+/// and only this assignment's own right-hand side is re-read — never the
+/// initializer alone, and never every write to a mutable local at once.
+///
+/// One round commits at most one write per declaration, picked from a stable
+/// pre-round snapshot with the claim holder first and the earliest
+/// widening/superseding write after it, so the same cache is never replaced
+/// twice in a row. A commit lands when the settled answer structurally widens
+/// what the round opened with (a union holding every cached arm, a primitive
+/// collapsing the cached literals, or a merge covering both at once), when it
+/// supersedes it by the cache's own replacement order, or through the
+/// sideways/placeholder leg ([`settled_assign_write_committable`]): the claim
+/// holder replaces its own contribution with any informative, leak-free
+/// settled answer — even a structurally unrelated one, which is what a
+/// multi-declaration global merge is; a floored placeholder (`unknown`, `nil`,
+/// `never`) or a leaked template parameter takes any informative, leak-free
+/// settled answer from any write; and an informative settled answer displaces
+/// `any`. The settled answer must always say something leak-free: the walk
+/// never trades an answer for `nil`, `unknown`, or `any`, and never seeds a
+/// leak, so neither does the replay — in particular the holder cannot move
+/// backward (`any -> nil`). Anything else keeps the walk-time answer, exactly
+/// as builds without this pass do.
+///
+/// A trailing variadic right-hand side supplies one slot per extra target
+/// (`first, second = echo(key)`): each queued target carries its return index
+/// and selects that slot out of the settled answer, falling back to `nil`
+/// exactly as the walk does. Extra slots over a non-variadic answer are
+/// skipped: the walk answered those without reading the right-hand side's
+/// type, so there is nothing to re-derive.
+fn rederive_settled_assign_reads(
+    db: &mut DbIndex,
+    context: &mut AnalyzeContext,
+) -> HashSet<LuaTypeOwner> {
+    let mut candidates = context.settled_assign_candidates.clone();
+    if candidates.is_empty() {
+        return HashSet::default();
+    }
+    candidates.sort_by_key(|(decl_id, expr, ret_idx)| {
+        (
+            decl_id.file_id,
+            decl_id.position,
+            expr.get_range().start(),
+            *ret_idx,
+        )
+    });
+
+    // Stable pre-round snapshot: the claim holder and the cached answer every
+    // commit decision below reads. Deciding against the live cache would let
+    // an earlier commit of this same round elect the next winner, replacing
+    // one cache twice in a row.
+    let mut snapshots = HashMap::<LuaDeclId, (Option<LuaType>, Option<rowan::TextSize>)>::default();
+    for (decl_id, _, _) in &candidates {
+        snapshots.entry(*decl_id).or_insert_with(|| {
+            let cached = db
+                .get_type_index()
+                .get_type_cache(&LuaTypeOwner::Decl(*decl_id))
+                .map(|cache| cache.as_type().clone());
+            let claim = db
+                .get_type_index()
+                .decl_write_claim(decl_id)
+                .map(|(position, _)| position);
+            (cached, claim)
+        });
+    }
+
+    let files = candidates
+        .iter()
+        .map(|(decl_id, _, _)| decl_id.file_id)
+        .collect::<HashSet<_>>();
+    context.infer_manager.clear_files_deferred_results(&files);
+
+    // The settled slot type per candidate, in candidate order. `None` is not
+    // a verdict on the declaration, only on this write: another write to the
+    // same declaration may still win the round.
+    let mut settled = Vec::<Option<LuaType>>::with_capacity(candidates.len());
+    for (decl_id, expr, ret_idx) in &candidates {
+        let type_owner = LuaTypeOwner::Decl(*decl_id);
+        if db
+            .get_type_index()
+            .get_type_cache(&type_owner)
+            .is_some_and(|cached| cached.is_doc())
+        {
+            settled.push(None);
+            continue;
+        }
+        let cache = context.infer_manager.get_infer_cache(decl_id.file_id);
+        let Ok(inferred) = crate::semantic::infer_expr(db, cache, expr.clone()) else {
+            settled.push(None);
+            continue;
+        };
+        match inferred {
+            LuaType::Variadic(multi) => {
+                settled.push(Some(
+                    multi.get_type(*ret_idx).cloned().unwrap_or(LuaType::Nil),
+                ));
+            }
+            inferred => {
+                if *ret_idx > 0 {
+                    settled.push(None);
+                } else {
+                    settled.push(Some(inferred));
+                }
+            }
+        }
+    }
+
+    // At most one winning write per declaration: the claim holder first (the
+    // only write allowed a sideways replace of its own contribution), then
+    // the earliest committable write in source order.
+    let mut winners = Vec::<(LuaDeclId, LuaExpr, LuaType)>::new();
+    let mut group_start = 0;
+    while group_start < candidates.len() {
+        let group_decl = candidates[group_start].0;
+        let mut group_end = group_start + 1;
+        while group_end < candidates.len() && candidates[group_end].0 == group_decl {
+            group_end += 1;
+        }
+        let (cached, claim) = &snapshots[&group_decl];
+        let mut order: Vec<usize> = (group_start..group_end).collect();
+        if let Some(claim) = claim
+            && let Some(holder) = order
+                .iter()
+                .position(|idx| candidates[*idx].1.get_position() == *claim)
+        {
+            let holder = order.remove(holder);
+            order.insert(0, holder);
+        }
+        for idx in order {
+            let Some(settled_type) = &settled[idx] else {
+                continue;
+            };
+            if cached.as_ref().is_some_and(|cached| cached == settled_type) {
+                continue;
+            }
+            let (_, rhs, _) = &candidates[idx];
+            let holder = claim
+                .as_ref()
+                .copied()
+                .is_some_and(|claim| claim == rhs.get_position());
+            // An assignment is never the declaration's own initializer, but
+            // spell out the same write the file walk would have committed so
+            // a later competing write faces identical arbitration.
+            //
+            // Settle-only monotonicity: the tail loops until no round moves,
+            // so a replay must never trade sideways or backwards. Walk-time
+            // arbitration can displace a settled answer and lose it back next
+            // round (observed: the same owners alternating every round,
+            // hanging cold builds), so only a replay that widens the cached
+            // answer, supersedes it by the cache's own replacement order, or
+            // passes the sideways/placeholder gate below may commit. See
+            // [`settled_assign_write_committable`].
+            let committable =
+                settled_assign_write_committable(holder, settled_type, cached.as_ref());
+            if committable {
+                let (_, rhs, _) = &candidates[idx];
+                winners.push((group_decl, rhs.clone(), settled_type.clone()));
+                break;
+            }
+        }
+        group_start = group_end;
+    }
+
+    for (decl_id, rhs, settled_type) in winners {
+        let type_owner = LuaTypeOwner::Decl(decl_id);
+        let may_improve = initializer_may_improve_after_resolve(&rhs);
+        let write = common::DeclWrite {
+            position: rhs.get_position(),
+            may_improve_after_resolve: may_improve,
+            reads_out_of_decl: lua::expr_reads_out_of_decl(db, decl_id.file_id, decl_id, &rhs),
+            may_narrow_uninformative: initializer_reads_through_call_or_index(&rhs),
+            resolved_initializer: false,
+            fills_own_default: lua::expr_fills_own_default(db, decl_id.file_id, decl_id, &rhs),
+        };
+        let before_commit = db
+            .get_type_index()
+            .get_type_cache(&type_owner)
+            .map(|cache| cache.as_type().clone());
+        common::bind_decl_write(
+            db,
+            decl_id,
+            LuaTypeCache::InferType(settled_type.clone()),
+            write,
+        );
+        let refused = db
+            .get_type_index()
+            .get_type_cache(&type_owner)
+            .map(|cache| cache.as_type().clone())
+            == before_commit;
+        if refused {
+            // The ordered write refused the slot — a later holder owns it, or
+            // the fallback only merges — but this round's arbitration picked
+            // this write, so it replaces the previous contribution outright
+            // instead of re-merging it.
+            common::write_type_cache(
+                db,
+                type_owner,
+                LuaTypeCache::InferType(settled_type),
+                common::TypeCacheWriteMode::ForceOverwrite,
+            );
+        }
+    }
+    let moved = snapshots
+        .into_iter()
+        .filter_map(|(decl_id, (before, _))| {
+            let owner = LuaTypeOwner::Decl(decl_id);
+            let after = db
+                .get_type_index()
+                .get_type_cache(&owner)
+                .map(|cache| cache.as_type());
+            (after != before.as_ref()).then_some(owner)
+        })
+        .collect::<HashSet<_>>();
+    moved
+}
+
+/// Commit gate for one settled assign-replay write: whether `settled_type`
+/// may replace `cached` this round.
+///
+/// `None` seeds an empty slot, which always takes the read. Otherwise a write
+/// commits when the settled answer structurally widens the cached one, when
+/// it supersedes it by the cache's own replacement order, or through the
+/// sideways/placeholder leg below.
+pub(crate) fn settled_assign_write_committable(
+    holder: bool,
+    settled_type: &LuaType,
+    cached: Option<&LuaType>,
+) -> bool {
+    let Some(cached) = cached else {
+        return true;
+    };
+    union_widens_cached_type(settled_type, cached)
+        || settled_widens_cached_literals(settled_type, cached)
+        || settled_covers_cached_type(settled_type, cached)
+        || LuaTypeCache::InferType(settled_type.clone())
+            .supersedes(&LuaTypeCache::InferType(cached.clone()))
+        || settled_assign_sideways_committable(holder, settled_type, cached)
+}
+
+/// Sideways/placeholder leg of the settled assign-replay commit gate.
+///
+/// Three explicit clauses, in order:
+///
+/// 1. Holder sideways: the write holds the declaration's current write claim,
+///    so the slot keeps this write's own contribution. Any informative,
+///    leak-free settled answer replaces it — even a structurally unrelated
+///    one, which is what a multi-declaration global merge is. The informative
+///    bar is what rejects backward moves: `any -> nil` cannot commit here
+///    because `nil` says nothing about the value.
+///
+/// 2. Placeholder/leak replacement: a floored placeholder or a leaked template
+///    parameter is not an answer at all, so the settled read takes it the way
+///    the walk seeds an empty slot. A placeholder is `unknown`, `nil`, or
+///    `never` ([`is_undetermined_type`](crate::db_index::is_undetermined_type))
+///    — deliberately not bare "uninformative", so `any`, which states the
+///    value is unconstrained, is never treated as an unfinished placeholder.
+///    Any write may take these, which is what lets a deferred multi-target
+///    (`first, second = echo(key)`) land its settled slot over the floored
+///    placeholder — neither widening nor `supersedes` relates the two — and
+///    what lets a leaked template resolve to concrete.
+///
+/// 3. Informative over `any`: `any` is authoritative, not unfinished, so only
+///    a genuinely informative settled type displaces it. (`supersedes` ranks
+///    inside the uninformative band but never lets an informative type beat
+///    `any`; this clause is that ranking.)
+fn settled_assign_sideways_committable(holder: bool, settled: &LuaType, cached: &LuaType) -> bool {
+    // A settled answer that says nothing, or one carrying a leak, never
+    // commits through this leg: the walk never trades an answer for `nil`,
+    // `unknown`, or `any`, and never seeds a slot with a leak.
+    if !crate::db_index::is_informative_type(settled)
+        || crate::db_index::leaks_unsubstituted_tpl(settled)
+    {
+        return false;
+    }
+    if holder {
+        return true;
+    }
+    if crate::db_index::is_undetermined_type(cached)
+        || crate::db_index::leaks_unsubstituted_tpl(cached)
+    {
+        return true;
+    }
+    !crate::db_index::is_informative_type(cached) && !crate::db_index::is_undetermined_type(cached)
 }
 
 /// Re-derives decls whose `panel:GetParent()` read was answered against a vgui
@@ -1329,20 +1852,74 @@ fn queue_settled_decl_dependents(
                 let Some(idx) = exprs.iter().position(contains_read) else {
                     continue;
                 };
-                let Some(glua_parser::LuaVarExpr::IndexExpr(index_expr)) = vars.get(idx) else {
-                    continue;
-                };
-                let member_id =
-                    LuaMemberId::new(LuaSyntaxId::from_node(index_expr.syntax()), file_id);
-                if db.get_member_index().get_member(&member_id).is_none() {
-                    continue;
+                let rhs = exprs[idx].clone();
+                // A trailing call supplies one slot per extra target
+                // (`first, second = echo(key)`): every target the read's
+                // right-hand side supplies queues with its return index, so
+                // the replay selects that slot out of the settled variadic
+                // answer instead of replaying only the paired target.
+                let trailing_extras = (idx + 1 == exprs.len() && vars.len() > exprs.len())
+                    .then(|| idx + 1..vars.len())
+                    .into_iter()
+                    .flatten();
+                for var_pos in std::iter::once(idx).chain(trailing_extras) {
+                    let ret_idx = var_pos - idx;
+                    match vars.get(var_pos) {
+                        Some(glua_parser::LuaVarExpr::IndexExpr(index_expr)) => {
+                            let member_id = LuaMemberId::new(
+                                LuaSyntaxId::from_node(index_expr.syntax()),
+                                file_id,
+                            );
+                            if db.get_member_index().get_member(&member_id).is_none() {
+                                continue;
+                            }
+                            context
+                                .member_initializer_reinfer_candidates
+                                .insert(member_id);
+                            context
+                                .settled_decl_copy_candidates
+                                .insert(LuaTypeOwner::Member(member_id));
+                        }
+                        Some(glua_parser::LuaVarExpr::NameExpr(target)) => {
+                            // An assignment onto a local reads no initializer cache
+                            // of its own, so the read-set filter cannot see it move.
+                            // Queue the write itself: the settled tail re-derives it
+                            // through `bind_decl_write`, which keeps the source-order
+                            // claim and write-authority semantics a direct commit
+                            // would have applied.
+                            let Some(target_decl_id) = db
+                                .get_reference_index()
+                                .get_local_reference(&file_id)
+                                .and_then(|refs| refs.get_decl_id(&target.get_range()))
+                            else {
+                                continue;
+                            };
+                            if target_decl_id == decl_id {
+                                continue;
+                            }
+                            // A read out of the assigned decl never seeds it; the
+                            // walk refuses such writes outright, so there is nothing
+                            // to replay here either.
+                            if lua::expr_reads_out_of_decl(db, file_id, target_decl_id, &rhs) {
+                                continue;
+                            }
+                            if !context.settled_assign_candidates.iter().any(
+                                |(queued_decl, queued_expr, queued_ret_idx)| {
+                                    *queued_decl == target_decl_id
+                                        && queued_expr.get_range() == rhs.get_range()
+                                        && *queued_ret_idx == ret_idx
+                                },
+                            ) {
+                                context.settled_assign_candidates.push((
+                                    target_decl_id,
+                                    rhs.clone(),
+                                    ret_idx,
+                                ));
+                            }
+                        }
+                        _ => {}
+                    }
                 }
-                context
-                    .member_initializer_reinfer_candidates
-                    .insert(member_id);
-                context
-                    .settled_decl_copy_candidates
-                    .insert(LuaTypeOwner::Member(member_id));
             } else if let Some(local_stat) = glua_parser::LuaLocalStat::cast(stat) {
                 let Some(value) = local_stat.get_value_exprs().find(contains_read) else {
                     continue;
@@ -2536,6 +3113,16 @@ pub struct AnalyzeContext {
     /// name. The walk bound them to what the local held then, so they take
     /// the settled re-read outright. See [`queue_settled_decl_copies`].
     settled_decl_copy_candidates: HashSet<LuaTypeOwner>,
+    /// Local assignments whose right-hand side reads a local the settled tail
+    /// has since moved (`selected = key`). Unlike member writes and immutable
+    /// locals, these read no cache of their own, so the settled tail replays
+    /// the write itself through `bind_decl_write`. Queued by
+    /// [`queue_settled_decl_dependents`], re-derived by
+    /// [`rederive_settled_assign_reads`]. Each entry carries the return index
+    /// the target takes out of a trailing variadic right-hand side
+    /// (`first, second = echo(key)` queues `(first, rhs, 0)` and
+    /// `(second, rhs, 1)`); a lone right-hand side always queues index `0`.
+    settled_assign_candidates: Vec<(LuaDeclId, LuaExpr, usize)>,
     /// Locals the unresolve waves settled after the walk bound their readers.
     /// See [`queue_settled_decl_dependents`].
     pub(crate) late_resolved_decls: HashSet<LuaTypeOwner>,
@@ -2612,6 +3199,7 @@ impl AnalyzeContext {
             guarded_member_read_candidates: HashSet::default(),
             settled_sibling_merge_read_candidates: HashSet::default(),
             settled_decl_copy_candidates: HashSet::default(),
+            settled_assign_candidates: Vec::new(),
             late_resolved_decls: HashSet::default(),
             infer_manager: InferCacheManager::new(),
             inferred_guard_dependencies: HashMap::default(),
@@ -2956,7 +3544,11 @@ impl AnalyzeContext {
         // the batch rather than of the source. Iterate until publishing stops
         // moving anything, so a partial re-index and a cold build agree.
         let mut moved = false;
+        let mut fuse = common::FixpointFuse::new("resolve_call_site_return_consumers");
         loop {
+            if fuse.trip() {
+                break;
+            }
             self.infer_manager.clear();
             let mut fact_updates = Vec::with_capacity(
                 self.call_site_return_targets.len()

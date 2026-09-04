@@ -239,7 +239,11 @@ impl EmmyLuaAnalysis {
         let mut frontier_old_facts = old_snapshot.facts.clone();
         let mut frontier_old_consumers = old_snapshot.consumers.clone();
 
+        let mut fuse = crate::compilation::analyzer::FixpointFuse::new("guard_frontier");
         while !changed_owners.is_empty() {
+            if fuse.trip() {
+                break;
+            }
             let mut reference_files = FxHashSet::default();
             for owner in &changed_owners {
                 let newly_added =

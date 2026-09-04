@@ -340,7 +340,12 @@ pub(super) fn settle_floored_fixpoint(
 ) {
     let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
     let mut round = 0usize;
+    let mut fuse = super::common::FixpointFuse::new("settle_floored_fixpoint");
     while !force_finalized.is_empty() {
+        if fuse.trip() {
+            force_finalized.clear();
+            break;
+        }
         let writes_before =
             db.get_type_index().type_writes() + db.get_signature_index().return_writes();
         // A return is re-derived from an unresolved status so the apply rule
