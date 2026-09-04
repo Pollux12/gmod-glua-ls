@@ -99,17 +99,25 @@
 //!                               Always diffs the index, DET_INDEX_DIFF or not.
 //!                               Needs DET_EDIT_FIND; without it the stage
 //!                               skips loudly instead of gating anything.
+//!                     blast     how many files ONE edit to each DET_TARGETS
+//!                               entry dirties, gated against DET_BLAST_MAX
+//!                               (default 50). The only stage that measures the
+//!                               work an edit costs rather than the answer it
+//!                               produces, and the only one that exits non-zero:
+//!                               every result gate stays green when a settle
+//!                               path re-analyses the whole workspace to reach
+//!                               the right answer. Needs DET_EDIT_FIND.
 //!                     burst     three edits per DET_TARGETS entry, each one
-//!                               self-indexed on its own, then ONE ripple over
-//!                               the union of the three separately-captured
-//!                               expansions — the sequence a debounce that
-//!                               defers the ripple behind a longer idle timer
-//!                               produces. Gates that union against a cold build
-//!                               of the final text. An expansion recomputed
-//!                               after a self-index under-expands badly (739
-//!                               files collapsed to 8), so union is the only
-//!                               shape that can work; this measures whether it
-//!                               does. Needs DET_EDIT_FIND; without it the stage
+//!                               self-indexed on its own with its dirty set
+//!                               accumulated, then ONE ripple over the union —
+//!                               exactly what `DebouncedAnalysis::run` holds in
+//!                               `owed_ripple` when a typing burst defers the
+//!                               ripple behind its idle timer. Gates the settled
+//!                               result against a cold build of the final text,
+//!                               and reports `control` (the same edits settled
+//!                               one at a time) beside it so a failure separates
+//!                               the deferral from the path underneath it.
+//!                               Needs DET_EDIT_FIND; without it the stage
 //!                               skips loudly instead of gating anything.
 //!                     exact     reindex DET_TARGETS with no text change and no
 //!                               dependency expansion (bisects which file's
@@ -479,7 +487,8 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use glua_code_analysis::{
-    EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files, load_configs,
+    DirtySet, EmmyLuaAnalysis, Emmyrc, FileId, WorkspaceFolder, collect_workspace_files,
+    load_configs,
 };
 use lsp_types::{DiagnosticSeverity, NumberOrString};
 use tokio_util::sync::CancellationToken;
@@ -2138,18 +2147,88 @@ fn real_edit(
     }
 }
 
-/// Gate the deferred ripple: several self-indexes, then one re-index over the
-/// union of their separately-captured expansions.
+/// Gate how much work one edit costs, rather than what it produces.
 ///
-/// The LSP debounce re-indexes the edited file on a short timer and owes the
+/// Every other stage compares results, so all of them stay green when an edit
+/// still lands on the right answer by re-analysing the entire workspace to get
+/// there. That is exactly how a settle path regressed from three files to 1507
+/// without a single gate noticing.
+///
+/// The dirty set names the files the edit invalidated, so its size is the blast
+/// radius directly. `DET_BLAST_MAX` is the ceiling per target, defaulting to a
+/// value far below any dependency expansion but far above a real edit's fanout.
+/// Exceeding it is a hard failure: this stage is the one that makes the process
+/// exit non-zero.
+fn blast_radius(analysis: &mut EmmyLuaAnalysis, codebase: &Path, targets: &[String]) -> bool {
+    let Ok(find) = std::env::var("DET_EDIT_FIND") else {
+        eprintln!("[blast] SKIPPED: DET_EDIT_FIND is not set, so no blast gate ran");
+        return true;
+    };
+    let replace = std::env::var("DET_EDIT_REPLACE").unwrap_or_default();
+    let max = std::env::var("DET_BLAST_MAX")
+        .ok()
+        .and_then(|raw| raw.parse::<usize>().ok())
+        .unwrap_or(50);
+
+    let mut ok = true;
+    for target in targets {
+        let path = codebase.join(target.replace('/', std::path::MAIN_SEPARATOR_STR));
+        let Some(uri) = glua_code_analysis::file_path_to_uri(&path) else {
+            continue;
+        };
+        let Some(file_id) = analysis.get_file_id(&uri) else {
+            eprintln!("[blast] file not indexed: {}", path.display());
+            continue;
+        };
+        let Some(original) = analysis
+            .compilation
+            .get_db()
+            .get_vfs()
+            .get_file_content(&file_id)
+            .cloned()
+        else {
+            continue;
+        };
+        if !original.contains(find.as_str()) {
+            eprintln!("[blast] {find:?} not present in {}", path.display());
+            continue;
+        }
+
+        let edited = original.replace(find.as_str(), replace.as_str());
+        analysis.update_file_text_only(&uri, edited);
+        let dirty = analysis.self_index_and_diff(vec![file_id]);
+        let dirty_len = dirty.dirty_len();
+        analysis.ripple(dirty);
+
+        if dirty_len > max {
+            ok = false;
+            eprintln!(
+                "[blast] FAIL {target}: the edit dirtied {dirty_len} file(s), over the {max} ceiling"
+            );
+        } else {
+            eprintln!("[blast] PASS {target}: the edit dirtied {dirty_len} file(s) (max {max})");
+        }
+
+        analysis.update_file_by_uri(&uri, Some(original));
+    }
+    ok
+}
+
+/// Gate the deferred ripple: several self-indexes, then one ripple over the
+/// dirty sets they accumulated.
+///
+/// The LSP debounce self-indexes each drained edit on a short timer and owes the
 /// dependency ripple afterwards. Deferring that ripple behind a longer idle
 /// timer means a typing burst produces several self-indexes before one ripple,
-/// so the ripple runs against a union of expansions captured at different
-/// points.
+/// so the ripple runs against the union of dirty sets those self-indexes
+/// produced — which is what `DebouncedAnalysis::run` accumulates in `owed_ripple`
+/// and what this stage reproduces.
 ///
-/// An expansion recomputed after a self-index under-expands, which is why the
-/// production path captures before self-indexing. The union can still miss a
-/// dependent present in no capture, which is what this stage measures.
+/// A dirty set names the files that read a fact an edit moved. Accumulating
+/// several before rippling can only be correct if a later edit's set does not
+/// invalidate what an earlier one already reported, which is what this stage
+/// measures. `control` applies the same edits one settle at a time, so a failure
+/// separates the deferral from the path underneath it.
 fn burst_edit(
     analysis: &mut EmmyLuaAnalysis,
     codebase: &Path,
@@ -2220,34 +2299,35 @@ fn burst_edit(
         text
     };
 
-    let mut owed_files: BTreeSet<FileId> = BTreeSet::new();
-    let mut owed_expansion: BTreeSet<FileId> = BTreeSet::new();
-
+    // The shape `DebouncedAnalysis::run` drives in production: each drained edit
+    // installs its text and self-indexes under one lock, the dirty set it
+    // produces joins the one already owed, and a single ripple settles the whole
+    // burst once typing stops. Gating the expansion instead measured a path
+    // production no longer takes.
+    let mut owed: Option<DirtySet> = None;
     let t = Instant::now();
     for step in 0..3 {
         for target in &resolved {
-            // Production order: didChange installs the text, then phase A
-            // captures the expansion and self-indexes under one lock.
             analysis.update_file_text_only(&target.uri, step_text(target, step));
-            let expansion = analysis.expand_reindex_file_ids(vec![target.file_id]);
-            analysis.self_index_files(vec![target.file_id]);
-            owed_files.insert(target.file_id);
-            owed_expansion.extend(expansion);
+            let dirty = analysis.self_index_and_diff(vec![target.file_id]);
+            match &mut owed {
+                Some(owed) => owed.extend(dirty),
+                None => owed = Some(dirty),
+            }
         }
     }
 
     let self_indexed = t.elapsed();
+    let owed_len = owed.as_ref().map_or(0, DirtySet::dirty_len);
     let t = Instant::now();
-    analysis.reindex_expanded_files(
-        owed_files.iter().copied().collect(),
-        owed_expansion.iter().copied().collect(),
-    );
+    if let Some(owed) = owed {
+        analysis.ripple(owed);
+    }
     eprintln!(
-        "[burst] {} file(s) x 3 edits: {} self-index(es) in {:.2}s, then one ripple over {} files ({:.2}s)",
+        "[burst] {} file(s) x 3 edits: {} self-index(es) in {:.2}s, then one ripple over {owed_len} owed file(s) ({:.2}s)",
         resolved.len(),
         resolved.len() * 3,
         self_indexed.as_secs_f64(),
-        owed_expansion.len(),
         t.elapsed().as_secs_f64()
     );
 
@@ -2579,6 +2659,11 @@ fn run() {
         burst_edit(&mut analysis, &codebase, &annotations, &targets, &cold);
     }
 
+    let mut blast_ok = true;
+    if stages.iter().any(|s| s == "blast") {
+        blast_ok = blast_radius(&mut analysis, &codebase, &targets);
+    }
+
     // Bisect stage: re-walk the target's expansion in one batch with the text
     // untouched. Localises which sites flip when re-derived against a settled
     // retained neighborhood, without the edit signal `burst` carries.
@@ -2643,4 +2728,11 @@ fn run() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(30),
     );
+
+    // Every other stage reports and leaves the verdict to whoever reads the log.
+    // The blast gate has a machine-checkable answer, so it is worth failing on.
+    if !blast_ok {
+        eprintln!("[blast] gate failed");
+        std::process::exit(1);
+    }
 }

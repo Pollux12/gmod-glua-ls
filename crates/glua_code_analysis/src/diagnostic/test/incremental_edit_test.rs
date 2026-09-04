@@ -1735,6 +1735,136 @@ function meta:Custom() end
         }
     }
 
+    /// What the batch reports, and what it does not.
+    ///
+    /// It reports the files it settled and leaves untouched files out. It does
+    /// **not** report every file whose diagnostics moved, and cannot: this
+    /// consumer starts reporting a mismatch without ever becoming a dependent,
+    /// because it resolves the provider's return type when it is diagnosed
+    /// rather than caching a fact the diff could name. The settle set is an
+    /// index-dependency set; the set of files that diagnose differently is
+    /// strictly larger and is not derivable from the export diff.
+    ///
+    /// A caller that pushes diagnostics therefore cannot use this result as its
+    /// whole refresh set.
+    #[gtest]
+    fn a_filesystem_batch_reports_the_dependents_it_settled() {
+        let mut ws = workspace_with(vec![DiagnosticCode::AssignTypeMismatch]);
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/fsprovider.lua");
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            fsprovider = fsprovider or {}
+            ---@return string
+            function fsprovider.Describe() end
+            "#,
+        );
+
+        let consumer_uri = ws.virtual_url_generator.new_uri("lua/fsconsumer.lua");
+        let consumer_id = write(
+            &mut ws,
+            &consumer_uri,
+            r#"
+            ---@type string
+            local described = fsprovider.Describe()
+            "#,
+        );
+
+        let unrelated_uri = ws.virtual_url_generator.new_uri("lua/fsunrelated.lua");
+        let unrelated_id = write(
+            &mut ws,
+            &unrelated_uri,
+            r#"
+            local untouched = 1
+            "#,
+        );
+
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            not(contains(eq(DiagnosticCode::AssignTypeMismatch.get_name())))
+        );
+
+        // The provider's return type moves, so the consumer has to be re-analysed
+        // even though nothing edited it.
+        let affected = ws.analysis.apply_file_system_changes(vec![(
+            provider_uri.clone(),
+            Some(
+                r#"
+            fsprovider = fsprovider or {}
+            ---@return number
+            function fsprovider.Describe() end
+            "#
+                .to_string(),
+            ),
+        )]);
+
+        let provider_id = ws.analysis.get_file_id(&provider_uri).expect("provider id");
+        expect_that!(affected, contains(eq(&provider_id)));
+        expect_that!(affected, not(contains(eq(&unrelated_id))));
+        // The consumer's diagnostics move even though the settle never had to
+        // touch it, which is the gap the doc comment above describes.
+        expect_that!(
+            codes_in(&ws, consumer_id),
+            contains(eq(DiagnosticCode::AssignTypeMismatch.get_name()))
+        );
+    }
+
+    /// A deletion through the filesystem batch detaches the URI rather than
+    /// leaving a tombstone, and the detach happens after the settle, not before
+    /// it: until the settle is done the path is what finds the files whose reads
+    /// of it have to be re-derived.
+    ///
+    /// The reader here resolved the deleted file through `include`, so it has to
+    /// come back to the state a workspace that never had the provider would be
+    /// in, and the provider's path has to be free for a later file to take.
+    #[gtest]
+    fn a_filesystem_deletion_detaches_the_uri_after_settling_its_readers() {
+        let mut ws = workspace_with(vec![DiagnosticCode::UndefinedGlobal]);
+
+        let provider_uri = ws.virtual_url_generator.new_uri("lua/detachprovider.lua");
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            DetachProvided = 1
+            "#,
+        );
+        let provider_id = ws.analysis.get_file_id(&provider_uri).expect("provider id");
+
+        let reader_uri = ws.virtual_url_generator.new_uri("lua/detachreader.lua");
+        let reader_id = write(
+            &mut ws,
+            &reader_uri,
+            r#"
+            local _ = DetachProvided
+            "#,
+        );
+        expect_that!(codes_in(&ws, reader_id), is_empty());
+
+        let affected = ws
+            .analysis
+            .apply_file_system_changes(vec![(provider_uri.clone(), None)]);
+
+        // The deleted file is gone, so it cannot be in a set of live files.
+        expect_that!(affected, not(contains(eq(&provider_id))));
+        // Detached, not tombstoned: the path is free again.
+        expect_that!(ws.analysis.get_file_id(&provider_uri), none());
+        // Its reader was settled against the deletion.
+        expect_that!(codes_in(&ws, reader_id), not(is_empty()));
+
+        // A new file at the same path is a new file, and restores the reader.
+        write(
+            &mut ws,
+            &provider_uri,
+            r#"
+            DetachProvided = 1
+            "#,
+        );
+        expect_that!(codes_in(&ws, reader_id), is_empty());
+    }
+
     /// Deleting a file purges every `Element` owner in it, including literals
     /// no anchor could name. Recreating it must leave the workspace exactly as
     /// it was - an over-eager purge would take members belonging to files the

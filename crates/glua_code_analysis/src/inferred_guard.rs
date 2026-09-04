@@ -181,13 +181,15 @@ fn call_resolves_to_inferred_guard_owner(
 }
 
 impl EmmyLuaAnalysis {
+    /// Returns every file this propagation re-analysed, so an edit can report
+    /// the full set it settled rather than only the files whose text changed.
     pub(crate) fn reindex_changed_inferred_guard_references(
         &mut self,
         source_file_ids: &FxHashSet<FileId>,
         old_snapshot: &InferredGuardSnapshot,
         already_reindexed: &[FileId],
         incremental_source_file_ids: &FxHashSet<FileId>,
-    ) {
+    ) -> FxHashSet<FileId> {
         let profile_enabled = std::env::var_os("GLUALS_PROFILE").is_some();
         let mut profile_changed_facts = 0usize;
         let mut profile_reference_edges = 0usize;
@@ -230,7 +232,7 @@ impl EmmyLuaAnalysis {
                     "[profile] inferred_guard_incremental changed_facts=0 reference_edges=0 waves=0 reindexed_files=0"
                 );
             }
-            return;
+            return propagation_reindexed_files;
         }
         profile_changed_facts += changed_owners.len();
         sort_inferred_guard_owners(&mut changed_owners);
@@ -347,6 +349,7 @@ impl EmmyLuaAnalysis {
                 reindexed_files: profile_reindexed_files,
             };
         }
+        propagation_reindexed_files
     }
 
     pub(crate) fn inferred_guard_snapshot(
@@ -379,11 +382,13 @@ impl EmmyLuaAnalysis {
 
     /// Re-analyses callee files whose call-site-inferred parameter types
     /// changed.
+    /// Returns every file this pass re-analysed, including whatever its own
+    /// ripple reached.
     pub(crate) fn reindex_changed_inferred_param_consumers(
         &mut self,
         old_snapshot: &InferredGuardSnapshot,
         already_reindexed: &[FileId],
-    ) {
+    ) -> Vec<FileId> {
         let new_params = self
             .compilation
             .get_db()
@@ -391,7 +396,7 @@ impl EmmyLuaAnalysis {
             .inferred_params_for_contributor_files(&old_snapshot.snapshot_file_ids);
         let old_params = &old_snapshot.inferred_params;
         if old_params.is_empty() && new_params.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let already_reindexed = already_reindexed
@@ -409,7 +414,7 @@ impl EmmyLuaAnalysis {
         changed_files.sort_unstable();
         changed_files.dedup();
         if changed_files.is_empty() {
-            return;
+            return Vec::new();
         }
 
         let changed_files = changed_files
@@ -423,15 +428,17 @@ impl EmmyLuaAnalysis {
             })
             .collect::<Vec<_>>();
         if changed_files.is_empty() {
-            return;
+            return Vec::new();
         }
         // The parameter's consumers are the bodies that read it, which are the
         // files owning these signatures. Whatever those bodies then derive
         // differently is found by diffing their exports, the same way any
         // other edit ripples; expanding to every dependency re-analysed the
         // workspace for one parameter.
+        let mut reanalyzed = changed_files.clone();
         let dirty = self.self_index_and_diff(changed_files);
-        self.ripple(dirty);
+        reanalyzed.extend(self.ripple(dirty));
+        reanalyzed
     }
 
     pub(crate) fn reconcile_equivalent_inferred_guard_owners(
