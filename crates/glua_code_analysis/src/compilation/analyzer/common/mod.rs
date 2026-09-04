@@ -1,6 +1,10 @@
 use glua_parser::{LuaAstNode, LuaAstToken, LuaExpr, LuaForRangeStat};
 use rowan::{TextRange, TextSize};
 
+mod fixpoint_fuse;
+
+pub use fixpoint_fuse::FixpointFuse;
+
 use crate::{
     FileId, InFiled, LuaDeclId, LuaMemberId, LuaTypeCache, LuaTypeOwner,
     compilation::analyzer::lua::iterates_table_member_map,
