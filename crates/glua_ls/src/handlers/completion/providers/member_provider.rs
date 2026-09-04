@@ -650,9 +650,9 @@ fn is_gmod_hook_member_info(db: &DbIndex, info: &LuaMemberInfo) -> bool {
 /// `---@realm` annotations are the same for every member declared in it. Both
 /// used to be re-derived per member, which meant walking the declaring file's
 /// entire syntax tree once per candidate — 98ms of a 200ms completion on a
-/// gamemode workspace. The analyzer already indexes those ranges, so prefer its
-/// binary search and fall back to one cached walk per file, exactly as the
-/// realm-misuse checker does.
+/// gamemode workspace. The analyzer indexes those ranges for every file it
+/// analyses, so this reads its binary search; the cached walk below only covers
+/// a file that never reached the analyzer at all.
 struct RealmFilter {
     enabled: bool,
     call_mask: GmodStateMask,

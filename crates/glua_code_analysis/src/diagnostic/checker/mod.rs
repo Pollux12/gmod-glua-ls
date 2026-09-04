@@ -56,8 +56,6 @@ use rustc_hash::{FxHashMap as HashMap, FxHashSet as HashSet};
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
-use rustc_hash::FxHashMap;
-
 use crate::{
     FileId, LuaSemanticDeclId, LuaType, LuaTypeDeclId, RenderLevel, SemanticDeclLevel, WorkspaceId,
     db_index::DbIndex, humanize_type, semantic::SemanticModel,
@@ -73,11 +71,9 @@ pub use await_in_sync::{PrecomputedAwaitCandidates, precompute_await_candidates}
 pub use discard_returns::{PrecomputedNoDiscardCandidates, precompute_nodiscard_candidates};
 pub use gmod_network::SortedSendFlowCache;
 pub use gmod_network::precompute_sorted_send_flows;
-pub use gmod_realm_misuse::AnnotatedRealmRange;
 pub use gmod_realm_misuse::GmMethodRealmMap;
 pub use gmod_realm_misuse::PrecomputedCalleeRealmMap;
 pub use gmod_realm_misuse::PrecomputedRealmCallCandidates;
-pub(crate) use gmod_realm_misuse::collect_decl_annotation_realms_for_file_precompute;
 pub use gmod_realm_misuse::precompute_callee_realm_data_for_workspace;
 pub use gmod_realm_misuse::precompute_gm_method_realms;
 pub use missing_fields::precompute_missing_required_fields;
@@ -297,9 +293,6 @@ pub struct SharedDiagnosticData {
     pub nodiscard_candidates: Arc<PrecomputedNoDiscardCandidates>,
     /// Names the deprecated, readonly and visibility checkers could report on.
     pub property_name_candidates: Arc<PrecomputedPropertyNameCandidates>,
-    /// Precomputed declaration annotation realms for all workspace files.
-    /// Avoids re-scanning syntax trees for @realm annotations per file.
-    pub decl_annotation_realms: Arc<FxHashMap<FileId, Vec<AnnotatedRealmRange>>>,
     /// Precomputed sorted send flows by message name. Built once per batch
     /// run instead of per-file, avoiding repeated VFS path lookups and sorts.
     pub sorted_send_flows: Arc<SortedSendFlowCache>,
@@ -353,10 +346,6 @@ impl<'a> DiagnosticContext<'a> {
 
     pub fn get_shared_data_arc(&self) -> Option<Arc<SharedDiagnosticData>> {
         self.shared_data.clone()
-    }
-
-    pub fn get_shared_data(&self) -> Option<&SharedDiagnosticData> {
-        self.shared_data.as_deref()
     }
 
     pub fn get_db(&self) -> &DbIndex {
