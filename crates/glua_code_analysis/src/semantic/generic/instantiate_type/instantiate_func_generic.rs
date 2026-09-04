@@ -32,7 +32,45 @@ use crate::{
 };
 use crate::{LuaMemberOwner, SemanticDeclLevel, infer_node_semantic_decl};
 
-use super::TypeSubstitutor;
+use super::{SubstitutorValue, TypeSubstitutor};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct GenericFunctionInstantiation {
+    pub function: LuaFunctionType,
+    pub bindings: Vec<FuncGenericBinding>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FuncGenericBinding {
+    pub id: GenericTplId,
+    pub state: FuncGenericBindingState,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FuncGenericBindingState {
+    Bound,
+    Unbound { fallback: LuaType },
+}
+
+fn find_generic_constraint(func: &LuaFunctionType, id: GenericTplId) -> Option<LuaType> {
+    let mut constraint = None;
+    func.visit_type(&mut |t| match t {
+        LuaType::TplRef(generic_tpl) | LuaType::ConstTplRef(generic_tpl)
+            if generic_tpl.get_tpl_id() == id =>
+        {
+            if constraint.is_none() {
+                constraint = generic_tpl.get_constraint().cloned();
+            }
+        }
+        LuaType::StrTplRef(str_tpl) if str_tpl.get_tpl_id() == id => {
+            if constraint.is_none() {
+                constraint = str_tpl.get_constraint().cloned();
+            }
+        }
+        _ => {}
+    });
+    constraint
+}
 
 /// Resolve a flow-valid inferred string default for a call argument expression.
 ///
@@ -316,12 +354,12 @@ fn resolve_vgui_panel_ref_from_arg(
     ))
 }
 
-pub fn instantiate_func_generic(
+pub fn instantiate_func_generic_with_bindings(
     db: &DbIndex,
     cache: &mut LuaInferCache,
     func: &LuaFunctionType,
     call_expr: LuaCallExpr,
-) -> Result<LuaFunctionType, InferFailReason> {
+) -> Result<GenericFunctionInstantiation, InferFailReason> {
     let file_id = cache.get_file_id().clone();
     let mut generic_tpls = HashSet::default();
     let mut contain_self = false;
@@ -360,6 +398,21 @@ pub fn instantiate_func_generic(
         call_expr: Some(call_expr.clone()),
         source_range: call_expr.get_range(),
     };
+
+    let callee_generic_ids: Vec<GenericTplId> = {
+        let mut ids: Vec<_> = generic_tpls.iter().copied().collect();
+        ids.sort_by_key(|id| {
+            (
+                match id {
+                    GenericTplId::Func(_) => 0,
+                    GenericTplId::Type(_) => 1,
+                },
+                id.get_idx(),
+            )
+        });
+        ids
+    };
+
     if !generic_tpls.is_empty() {
         context.substitutor.add_need_infer_tpls(generic_tpls);
 
@@ -383,11 +436,44 @@ pub fn instantiate_func_generic(
         substitutor.add_self_type(self_type);
     }
 
-    if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, &substitutor) {
-        Ok(f.deref().clone())
-    } else {
-        Ok(func.clone())
+    let mut bindings = Vec::with_capacity(callee_generic_ids.len());
+    for id in callee_generic_ids {
+        let state = match substitutor.get(id) {
+            Some(SubstitutorValue::None) => {
+                let fallback = find_generic_constraint(func, id).unwrap_or(LuaType::Any);
+                FuncGenericBindingState::Unbound { fallback }
+            }
+            Some(
+                SubstitutorValue::Type(_)
+                | SubstitutorValue::Params(_)
+                | SubstitutorValue::MultiTypes(_)
+                | SubstitutorValue::MultiBase(_),
+            ) => FuncGenericBindingState::Bound,
+            None => {
+                let fallback = find_generic_constraint(func, id).unwrap_or(LuaType::Any);
+                FuncGenericBindingState::Unbound { fallback }
+            }
+        };
+        bindings.push(FuncGenericBinding { id, state });
     }
+
+    let function = if let LuaType::DocFunction(f) = instantiate_doc_function(db, func, &substitutor)
+    {
+        f.deref().clone()
+    } else {
+        func.clone()
+    };
+
+    Ok(GenericFunctionInstantiation { function, bindings })
+}
+
+pub fn instantiate_func_generic(
+    db: &DbIndex,
+    cache: &mut LuaInferCache,
+    func: &LuaFunctionType,
+    call_expr: LuaCallExpr,
+) -> Result<LuaFunctionType, InferFailReason> {
+    instantiate_func_generic_with_bindings(db, cache, func, call_expr).map(|res| res.function)
 }
 
 fn apply_call_generic_type_list(

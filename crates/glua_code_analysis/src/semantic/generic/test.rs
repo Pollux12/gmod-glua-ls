@@ -4,9 +4,181 @@ mod test {
     use smol_str::SmolStr;
 
     use crate::{
-        DiagnosticCode, GenericTpl, GenericTplId, LuaMergedTableType, LuaType, RenderLevel,
+        DiagnosticCode, FileId, GenericTpl, GenericTplId, LuaMergedTableType, LuaType, RenderLevel,
         TypeSubstitutor, VirtualWorkspace, humanize_type, instantiate_type_generic,
     };
+
+    fn local_type(ws: &VirtualWorkspace, file_id: FileId, name: &str) -> LuaType {
+        let db = ws.analysis.compilation.get_db();
+        let decl_id = db
+            .get_decl_index()
+            .get_decl_tree(&file_id)
+            .and_then(|tree| {
+                tree.get_decls()
+                    .values()
+                    .find(|decl| decl.get_name() == name)
+                    .map(|decl| decl.get_id())
+            })
+            .unwrap_or_else(|| panic!("no declaration named {name}"));
+        db.get_type_index()
+            .get_type_cache(&decl_id.into())
+            .unwrap_or_else(|| panic!("no cached type for {name}"))
+            .as_type()
+            .clone()
+    }
+
+    /// `pairs` is declared `---@generic K, V, I` over
+    /// `table<K, V> | V[] | {[K]: V}` (`resources/std/global.lua:244-247`), so
+    /// `for k, v in pairs(t)` binds `k` and `v` through the iterator's `K` and
+    /// `V`. When `t`'s members are known they bind to real types.
+    ///
+    /// When they are not — an empty literal, or the `x or {}` fallback that is
+    /// idiomatic Lua — there is nothing to bind them to, and what must not be
+    /// left behind is `pairs`'s own declared type parameter. A `TplRef` is an
+    /// internal placeholder, and the cache it lands in is the one hover and
+    /// completion read, so it escapes to the user as `K` and `V`.
+    ///
+    /// Normal inference retains the unbound template as a retry marker for
+    /// unresolve. Once settled, loop-variable finalization consumes recorded
+    /// call-binding provenance to replace proven unbound callee generics with
+    /// their constraint or fallback, avoiding leaks without disturbing legitimate
+    /// enclosing caller generics.
+    #[test]
+    fn pairs_over_a_shapeless_table_does_not_leak_its_type_parameters() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            local known = { alpha = 1 }
+            for knownKey, knownValue in pairs(known) do end
+
+            local empty = {}
+            for emptyKey, emptyValue in pairs(empty) do end
+
+            local function opaque() end
+            local fallback = opaque() or {}
+            for fallbackKey, fallbackValue in pairs(fallback) do end
+            "#,
+        );
+
+        // Control: a table whose members are known still binds them. This is the
+        // behaviour a fix must not trade away.
+        assert!(
+            matches!(local_type(&ws, file_id, "knownKey"), LuaType::StringConst(ref key) if key.as_str() == "alpha"),
+            "knownKey was {:?}",
+            local_type(&ws, file_id, "knownKey")
+        );
+        assert!(
+            matches!(
+                local_type(&ws, file_id, "knownValue"),
+                LuaType::IntegerConst(1)
+            ),
+            "knownValue was {:?}",
+            local_type(&ws, file_id, "knownValue")
+        );
+
+        for name in ["emptyKey", "emptyValue", "fallbackKey", "fallbackValue"] {
+            let ty = local_type(&ws, file_id, name);
+            assert!(
+                !matches!(ty, LuaType::TplRef(_)),
+                "{name} kept pairs's own declared type parameter: {ty:?}"
+            );
+            // `Any` is this analyzer's conservative "no information available".
+            // A `TplRef` only looks more structured; it carries nothing.
+            assert_eq!(ty, LuaType::Any, "{name} settled on an unexpected type");
+        }
+    }
+
+    #[test]
+    fn pairs_over_shapeless_table_inside_generic_function_does_not_leak_or_collide() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@generic K, V
+            local function shapelessInsideGeneric()
+                local empty = {}
+                for k, v in pairs(empty) do end
+            end
+            "#,
+        );
+
+        let k_ty = local_type(&ws, file_id, "k");
+        let v_ty = local_type(&ws, file_id, "v");
+        assert_eq!(k_ty, LuaType::Any, "k should settle to Any");
+        assert_eq!(v_ty, LuaType::Any, "v should settle to Any");
+    }
+
+    #[test]
+    fn pairs_over_legitimate_caller_generic_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@generic K, V
+            ---@param t table<K, V>
+            local function genericTable(t)
+                for k, v in pairs(t) do end
+            end
+            "#,
+        );
+
+        let k_ty = local_type(&ws, file_id, "k");
+        let v_ty = local_type(&ws, file_id, "v");
+        assert_ne!(k_ty, LuaType::Any, "k should not be Any");
+        assert_ne!(v_ty, LuaType::Any, "v should not be Any");
+        assert!(
+            matches!(k_ty, LuaType::TplRef(_)),
+            "k should be enclosing TplRef, got {:?}",
+            k_ty
+        );
+        assert!(
+            matches!(v_ty, LuaType::TplRef(_)),
+            "v should be enclosing TplRef, got {:?}",
+            v_ty
+        );
+        let k_debug = format!("{k_ty:?}");
+        let v_debug = format!("{v_ty:?}");
+        assert!(
+            k_debug.contains("\"K\""),
+            "k TplRef should be K, got {k_debug}"
+        );
+        assert!(
+            v_debug.contains("\"V\""),
+            "v TplRef should be V, got {v_debug}"
+        );
+    }
+
+    #[test]
+    fn pairs_over_caller_bound_composite_generic_table() {
+        let mut ws = VirtualWorkspace::new_with_init_std_lib();
+        let file_id = ws.def(
+            r#"
+            ---@generic K, V
+            ---@param t table<K, V[]>
+            local function genericTableComposite(t)
+                for k, v in pairs(t) do end
+            end
+            "#,
+        );
+
+        let k_ty = local_type(&ws, file_id, "k");
+        let v_ty = local_type(&ws, file_id, "v");
+        assert_ne!(k_ty, LuaType::Any, "k should not be Any");
+        assert_ne!(v_ty, LuaType::Any, "v should not be Any");
+        assert!(
+            matches!(k_ty, LuaType::TplRef(_)),
+            "k should be enclosing TplRef, got {:?}",
+            k_ty
+        );
+        let k_debug = format!("{k_ty:?}");
+        assert!(
+            k_debug.contains("\"K\""),
+            "k TplRef should be K, got {k_debug}"
+        );
+        let v_debug = format!("{v_ty:?}");
+        assert!(
+            matches!(v_ty, LuaType::Array(_)) && v_debug.contains("\"V\""),
+            "v should be Array of enclosing V, got {v_debug}"
+        );
+    }
 
     #[test]
     fn test_variadic_func() {

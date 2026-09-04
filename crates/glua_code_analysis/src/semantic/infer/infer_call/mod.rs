@@ -31,7 +31,7 @@ use crate::{
 };
 use crate::{
     SemanticDeclGuard, SemanticDeclLevel, build_self_type, infer_self_type,
-    instantiate_func_generic, semantic::infer_expr,
+    instantiate_func_generic, instantiate_func_generic_with_bindings, semantic::infer_expr,
 };
 use infer_require::infer_require_call;
 use infer_setmetatable::infer_setmetatable_call;
@@ -683,8 +683,10 @@ fn infer_doc_function(
     prefix_signature_id: Option<LuaSignatureId>,
 ) -> InferCallFuncResult {
     if func.contain_tpl() {
-        let result = instantiate_func_generic(db, cache, func, call_expr.clone())?;
-        return Ok(Arc::new(result));
+        let instantiation =
+            instantiate_func_generic_with_bindings(db, cache, func, call_expr.clone())?;
+        cache.record_generic_call_bindings(call_expr.get_syntax_id(), instantiation.bindings);
+        return Ok(Arc::new(instantiation.function));
     }
 
     // Handle self-type substitution for functions with SelfInfer in return type
@@ -962,8 +964,14 @@ fn infer_signature_doc_function(
         )
         .with_optional_params(signature.get_param_optional_flags());
         if is_generic {
-            fake_doc_function =
-                instantiate_func_generic(db, cache, &fake_doc_function, call_expr.clone())?;
+            let instantiation = instantiate_func_generic_with_bindings(
+                db,
+                cache,
+                &fake_doc_function,
+                call_expr.clone(),
+            )?;
+            cache.record_generic_call_bindings(call_expr.get_syntax_id(), instantiation.bindings);
+            fake_doc_function = instantiation.function;
         }
 
         let fake_doc_function =

@@ -599,7 +599,7 @@ mod tests {
         );
 
         let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
-        assert_that!(engine_type.contains("any"), eq(false));
+        assert_that!(engine_type, eq("1"));
     }
 
     #[gtest]
@@ -641,6 +641,6 @@ mod tests {
         );
 
         let engine_type = inferred_field_type(&ws, debug_file, "engineTypeId");
-        assert_that!(engine_type.contains("any"), eq(false));
+        assert_that!(engine_type, eq("any"));
     }
 }

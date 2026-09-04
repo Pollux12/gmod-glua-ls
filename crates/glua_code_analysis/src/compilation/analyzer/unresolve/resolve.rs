@@ -831,6 +831,16 @@ fn compute_iter_var_updates(
             _ => ret_type,
         };
 
+        let ret_type = if settled {
+            if let Some(Some(proven)) = iter_var_types.settled_overrides.get(idx) {
+                proven.clone()
+            } else {
+                ret_type
+            }
+        } else {
+            ret_type
+        };
+
         let owner: LuaTypeOwner = decl_id.into();
         let cached = db.get_type_index().get_type_cache(&owner);
         let mode = if settled {
