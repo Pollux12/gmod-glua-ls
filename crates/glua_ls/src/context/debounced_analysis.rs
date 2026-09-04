@@ -36,6 +36,20 @@ const MAX_RIPPLE_DEFERRAL: Duration = Duration::from_secs(5);
 /// ripple proceeds and the stragglers wait it out as they did before.
 const READER_HANDOFF_GRACE: Duration = Duration::from_millis(250);
 
+/// Breakdown of a freshness wait by observed state, so one summary line
+/// can report where the wait went without per-iteration logging.
+///
+/// `in_flight` covers text applied by no task yet (`in_flight_changes > 0`);
+/// `blocked` covers the self-index not having rebuilt this document's own
+/// entries yet (or, for workspace waits, the ripple owed). `total` is the
+/// whole wait.
+#[derive(Default, Clone, Copy)]
+pub struct FreshWaitBreakdown {
+    pub total: Duration,
+    pub in_flight: Duration,
+    pub blocked: Duration,
+}
+
 /// Debounced analysis: accumulates file IDs from rapid edits and runs `reindex_files` once the user pauses typing.
 pub struct DebouncedAnalysis {
     pending_files: Mutex<HashSet<FileId>>,
@@ -212,7 +226,27 @@ impl DebouncedAnalysis {
     /// Returns as soon as none are outstanding, or after
     /// [`READER_HANDOFF_GRACE`] so a stream of requests cannot starve the
     /// ripple.
-    async fn await_reader_handoff(&self) {
+    async fn await_reader_handoff(
+        &self,
+        timing: Option<&mut crate::util::ls_profile::HandoffTiming>,
+    ) {
+        let profile = timing.is_some();
+        let start = profile.then(Instant::now);
+        // Whether any reader was ever observed: distinguishes `idle` (none at
+        // entry) from `released` (drained within the grace).
+        let mut saw_reader = false;
+        let outcome = self.await_reader_handoff_inner(&mut saw_reader).await;
+        if let (Some(timing), Some(start)) = (timing, start) {
+            timing.wait = start.elapsed();
+            timing.outcome = Some(outcome);
+        }
+    }
+
+    async fn await_reader_handoff_inner(
+        &self,
+        saw_reader: &mut bool,
+    ) -> crate::util::ls_profile::HandoffOutcome {
+        use crate::util::ls_profile::HandoffOutcome;
         let deadline = Instant::now() + READER_HANDOFF_GRACE;
 
         loop {
@@ -222,18 +256,29 @@ impl DebouncedAnalysis {
             idle.as_mut().enable();
 
             if self.pending_readers.load(Ordering::Acquire) == 0 {
-                return;
+                return if *saw_reader {
+                    HandoffOutcome::Released
+                } else {
+                    HandoffOutcome::Idle
+                };
             }
+            *saw_reader = true;
 
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() {
-                return;
+                return HandoffOutcome::Timeout;
             }
 
             tokio::select! {
                 _ = idle => {}
-                _ = tokio::time::sleep(remaining) => return,
-                _ = self.shutdown.cancelled() => return,
+                _ = tokio::time::sleep(remaining) => return HandoffOutcome::Timeout,
+                _ = self.shutdown.cancelled() => {
+                    return if self.pending_readers.load(Ordering::Acquire) == 0 {
+                        if *saw_reader { HandoffOutcome::Released } else { HandoffOutcome::Idle }
+                    } else {
+                        HandoffOutcome::Timeout
+                    };
+                }
             }
         }
     }
@@ -325,6 +370,133 @@ impl DebouncedAnalysis {
         }
     }
 
+    /// Profiled form of [`Self::wait_until_fresh_for`]: identical wake-up
+    /// behavior, plus time accumulated by observed state.
+    pub async fn wait_until_fresh_for_profiled(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+    ) -> (bool, FreshWaitBreakdown) {
+        #[cfg(test)]
+        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
+
+        let started_at = Instant::now();
+        let mut warned_stuck = false;
+        let mut in_flight = Duration::ZERO;
+        let mut blocked = Duration::ZERO;
+
+        loop {
+            let notified = self.reindex_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if !self.has_pending_changes.load(Ordering::Acquire) {
+                return (
+                    true,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+
+            let iter_start = Instant::now();
+            let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
+            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
+
+            let cancelled = tokio::select! {
+                _ = notified => false,
+                _ = cancel_token.cancelled() => true,
+                _ = tokio::time::sleep(remaining), if !warned_stuck => {
+                    self.log_freshness_stuck(request_method, started_at).await;
+                    warned_stuck = true;
+                    false
+                }
+            };
+            let elapsed = iter_start.elapsed();
+            if observed_in_flight {
+                in_flight += elapsed;
+            } else {
+                blocked += elapsed;
+            }
+            if cancelled {
+                return (
+                    false,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+        }
+    }
+
+    /// Profiled form of [`Self::wait_until_file_fresh_for`]: identical
+    /// wake-up behavior, plus time accumulated by observed state.
+    pub async fn wait_until_file_fresh_for_profiled(
+        &self,
+        cancel_token: &CancellationToken,
+        request_method: &'static str,
+        uri: &Uri,
+    ) -> (bool, FreshWaitBreakdown) {
+        #[cfg(test)]
+        self.freshness_waits.fetch_add(1, Ordering::AcqRel);
+
+        let started_at = Instant::now();
+        let mut warned_stuck = false;
+        let mut in_flight = Duration::ZERO;
+        let mut blocked = Duration::ZERO;
+
+        loop {
+            let notified = self.reindex_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+
+            if self.file_is_answerable(uri).await {
+                return (
+                    true,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+
+            let iter_start = Instant::now();
+            let observed_in_flight = self.in_flight_changes.load(Ordering::Acquire) > 0;
+            let remaining = FRESHNESS_STUCK_WARN_AFTER.saturating_sub(started_at.elapsed());
+
+            let cancelled = tokio::select! {
+                _ = notified => false,
+                _ = cancel_token.cancelled() => true,
+                _ = tokio::time::sleep(remaining), if !warned_stuck => {
+                    self.log_freshness_stuck(request_method, started_at).await;
+                    warned_stuck = true;
+                    false
+                }
+            };
+            let elapsed = iter_start.elapsed();
+            if observed_in_flight {
+                in_flight += elapsed;
+            } else {
+                blocked += elapsed;
+            }
+            if cancelled {
+                return (
+                    false,
+                    FreshWaitBreakdown {
+                        total: started_at.elapsed(),
+                        in_flight,
+                        blocked,
+                    },
+                );
+            }
+        }
+    }
+
     /// Whether a request aimed at `uri` can be answered against entries that
     /// match its text.
     ///
@@ -392,23 +564,38 @@ impl DebouncedAnalysis {
     /// This takes the write lock and gives it back, which is the whole point: a
     /// freshness flag published while the lock is still held buys a waiting
     /// request nothing, since it cannot read the index until the lock is free.
-    async fn self_index_without_queuing(&self, file_ids: Vec<FileId>) -> Option<DirtySet> {
+    async fn self_index_without_queuing(
+        &self,
+        file_ids: Vec<FileId>,
+        timing: Option<&mut crate::util::ls_profile::SelfWriteTimings>,
+    ) -> Option<DirtySet> {
+        let profile = timing.is_some();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
         tokio::select! {
             _ = self.shutdown.cancelled() => None,
             result = tokio::task::spawn_blocking(move || {
+                let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
+                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
+                let hold_start = profile.then(Instant::now);
                 // Change-aware: the dirty set holds only the files that read a
                 // fact this edit actually moved. Most keystrokes (typing inside
                 // a function, trailing comment, local rename) export nothing
                 // new and leave it empty.
                 let dirty = guard.self_index_and_diff(file_ids);
                 cache.invalidate();
-                dirty
+                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
+                (dirty, wait, hold)
             }) => match result {
-                Ok(result) => Some(result),
+                Ok((result, wait, hold)) => {
+                    if let Some(timing) = timing {
+                        timing.wait = wait;
+                        timing.hold = hold;
+                    }
+                    Some(result)
+                }
                 Err(err) => {
                     log::error!("self-index task failed: {}", err);
                     None
@@ -417,7 +604,12 @@ impl DebouncedAnalysis {
         }
     }
 
-    async fn ripple_without_queuing(&self, dirty: DirtySet) -> bool {
+    async fn ripple_without_queuing(
+        &self,
+        dirty: DirtySet,
+        timing: Option<&mut crate::util::ls_profile::RippleWriteTimings>,
+    ) -> bool {
+        let profile = timing.is_some();
         let analysis = self.analysis.clone();
         let cache = self.shared_diagnostic_data_cache.clone();
 
@@ -426,17 +618,30 @@ impl DebouncedAnalysis {
         tokio::select! {
             _ = self.shutdown.cancelled() => false,
             result = tokio::task::spawn_blocking(move || {
+                let wait_start = profile.then(Instant::now);
                 let mut guard = analysis.blocking_write();
+                let wait = wait_start.map(|start| start.elapsed()).unwrap_or_default();
+                let hold_start = profile.then(Instant::now);
                 guard.ripple(dirty);
                 // Invalidate under the write lock so no reader can observe the
                 // fresh index next to the stale shared diagnostic data.
                 cache.invalidate();
+                let hold = hold_start.map(|start| start.elapsed()).unwrap_or_default();
+                (wait, hold)
             }) => {
-                if let Err(err) = result {
-                    log::error!("reindex task failed: {}", err);
-                    return false;
+                match result {
+                    Ok((wait, hold)) => {
+                        if let Some(timing) = timing {
+                            timing.wait = wait;
+                            timing.hold = hold;
+                        }
+                        true
+                    }
+                    Err(err) => {
+                        log::error!("reindex task failed: {}", err);
+                        false
+                    }
                 }
-                true
             }
         }
     }
@@ -446,23 +651,74 @@ impl DebouncedAnalysis {
     /// Returns `true` when the caller should run the ripple now, `false` when
     /// another edit arrived and the loop should self-index that first — the
     /// ripple it owes then joins the one already outstanding.
-    async fn ripple_quiet_elapsed(&self, burst_started_at: Instant) -> bool {
+    async fn ripple_quiet_elapsed(
+        &self,
+        burst_started_at: Instant,
+        timing: Option<&mut crate::util::ls_profile::QuietTiming>,
+    ) -> bool {
+        use crate::util::ls_profile::QuietOutcome;
+        let profile = timing.is_some();
+        let start = profile.then(Instant::now);
         let extra = RIPPLE_QUIET.saturating_sub(self.debounce_duration);
         let deferral_left = MAX_RIPPLE_DEFERRAL.saturating_sub(burst_started_at.elapsed());
+        // Capped by the deferral budget rather than by quiet: sustained typing
+        // must not hold diagnostics off indefinitely.
+        let capped_by_deferral = deferral_left <= extra;
         if extra.is_zero() || deferral_left.is_zero() {
+            if let (Some(timing), Some(start)) = (timing, start) {
+                timing.wait = start.elapsed();
+                timing.outcome = Some(if deferral_left.is_zero() && !extra.is_zero() {
+                    QuietOutcome::MaxDeferral
+                } else if extra.is_zero() && deferral_left.is_zero() {
+                    // Both exhausted: the deferral cap is what forces the run.
+                    QuietOutcome::MaxDeferral
+                } else {
+                    QuietOutcome::Timer
+                });
+            }
             return true;
         }
 
-        tokio::select! {
-            biased;
-            _ = self.shutdown.cancelled() => return true,
-            _ = self.notify.notified() => return false,
-            _ = tokio::time::sleep(extra.min(deferral_left)) => {}
+        enum QuietWait {
+            Shutdown,
+            Edit,
+            Timer,
         }
-
-        // A notify landing before the select registered would be lost, so the
-        // timer expiring is not on its own proof that nothing arrived.
-        self.pending_files.lock().await.is_empty()
+        let wait_outcome = tokio::select! {
+            biased;
+            _ = self.shutdown.cancelled() => QuietWait::Shutdown,
+            _ = self.notify.notified() => QuietWait::Edit,
+            _ = tokio::time::sleep(extra.min(deferral_left)) => QuietWait::Timer,
+        };
+        let run_now = match wait_outcome {
+            QuietWait::Edit => false,
+            QuietWait::Shutdown => true,
+            QuietWait::Timer => {
+                // A notify landing before the select registered would be lost, so the
+                // timer expiring is not on its own proof that nothing arrived.
+                self.pending_files.lock().await.is_empty()
+            }
+        };
+        if let (Some(timing), Some(start)) = (timing, start) {
+            timing.wait = start.elapsed();
+            timing.outcome = Some(match wait_outcome {
+                QuietWait::Edit => QuietOutcome::Edit,
+                QuietWait::Shutdown => QuietOutcome::Timer,
+                QuietWait::Timer => {
+                    if run_now {
+                        if capped_by_deferral {
+                            QuietOutcome::MaxDeferral
+                        } else {
+                            QuietOutcome::Timer
+                        }
+                    } else {
+                        // Timer fired but an edit landed just before the check.
+                        QuietOutcome::Edit
+                    }
+                }
+            });
+        }
+        run_now
     }
 
     /// Background loop: waits for events, debounces, then runs reindex.
@@ -492,6 +748,9 @@ impl DebouncedAnalysis {
             }
 
             // Debounce: keep resetting the timer while new events arrive.
+            let profile_cycle = crate::util::ls_profile::ls_profile_enabled();
+            let cycle_id = profile_cycle.then(crate::util::ls_profile::next_reindex_cycle);
+            let debounce_start = crate::util::ls_profile::profile_instant();
             loop {
                 tokio::select! {
                     biased;
@@ -500,6 +759,13 @@ impl DebouncedAnalysis {
                     _ = tokio::time::sleep(self.debounce_duration) => break,
                 }
             }
+            let debounce_elapsed = debounce_start
+                .map(|start| start.elapsed())
+                .unwrap_or_default();
+            let mut self_timings = crate::util::ls_profile::SelfWriteTimings::default();
+            let mut handoff_timing = crate::util::ls_profile::HandoffTiming::default();
+            let mut quiet_timing = crate::util::ls_profile::QuietTiming::default();
+            let mut ripple_timings = crate::util::ls_profile::RippleWriteTimings::default();
 
             // Timer expired — drain pending files and reindex
             let file_ids: Vec<FileId> = {
@@ -526,7 +792,11 @@ impl DebouncedAnalysis {
                 // instead of waiting out the whole dependency ripple. The
                 // ripple is by far the larger half — measured on a gamemode
                 // workspace, 106ms against 5.1s.
-                let Some(dirty) = self.self_index_without_queuing(file_ids.clone()).await else {
+                let self_timing = profile_cycle.then_some(&mut self_timings);
+                let Some(dirty) = self
+                    .self_index_without_queuing(file_ids.clone(), self_timing)
+                    .await
+                else {
                     if self.shutdown.is_cancelled() {
                         return;
                     }
@@ -543,6 +813,21 @@ impl DebouncedAnalysis {
                     drop(reindexing);
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
+                    if let Some(cycle) = cycle_id {
+                        use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
+                        crate::util::ls_profile::emit_ls_reindex(
+                            cycle,
+                            debounce_elapsed,
+                            self_timings.wait,
+                            self_timings.hold,
+                            std::time::Duration::ZERO,
+                            HandoffOutcome::Idle,
+                            std::time::Duration::ZERO,
+                            QuietOutcome::Timer,
+                            std::time::Duration::ZERO,
+                            std::time::Duration::ZERO,
+                        );
+                    }
                     continue;
                 };
 
@@ -557,7 +842,8 @@ impl DebouncedAnalysis {
                 // The requests just released still have to be polled before
                 // they can queue their read. Taking the write lock back now
                 // would put them behind the whole ripple.
-                self.await_reader_handoff().await;
+                let handoff_opt = profile_cycle.then_some(&mut handoff_timing);
+                self.await_reader_handoff(handoff_opt).await;
 
                 if dirty.is_empty() {
                     // Nothing else reads a fact this edit moved - the
@@ -573,6 +859,21 @@ impl DebouncedAnalysis {
                     self.refresh_dirty_state().await;
                     self.reindex_notify.notify_waiters();
                     if owed_ripple.is_none() {
+                        if let Some(cycle) = cycle_id {
+                            use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
+                            crate::util::ls_profile::emit_ls_reindex(
+                                cycle,
+                                debounce_elapsed,
+                                self_timings.wait,
+                                self_timings.hold,
+                                handoff_timing.wait,
+                                handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
+                                std::time::Duration::ZERO,
+                                QuietOutcome::Timer,
+                                std::time::Duration::ZERO,
+                                std::time::Duration::ZERO,
+                            );
+                        }
                         continue;
                     }
                 } else {
@@ -595,8 +896,27 @@ impl DebouncedAnalysis {
             // sends us back for its own self-index, and the ripple it owes
             // joins this one.
             let burst_started_at_instant = burst_started_at.unwrap_or_else(Instant::now);
-            if !self.ripple_quiet_elapsed(burst_started_at_instant).await {
+            let quiet_opt = profile_cycle.then_some(&mut quiet_timing);
+            if !self
+                .ripple_quiet_elapsed(burst_started_at_instant, quiet_opt)
+                .await
+            {
                 owed_ripple = Some(owed);
+                if let Some(cycle) = cycle_id {
+                    use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
+                    crate::util::ls_profile::emit_ls_reindex(
+                        cycle,
+                        debounce_elapsed,
+                        self_timings.wait,
+                        self_timings.hold,
+                        handoff_timing.wait,
+                        handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
+                        quiet_timing.wait,
+                        quiet_timing.outcome.unwrap_or(QuietOutcome::Edit),
+                        std::time::Duration::ZERO,
+                        std::time::Duration::ZERO,
+                    );
+                }
                 continue;
             }
 
@@ -613,7 +933,8 @@ impl DebouncedAnalysis {
                     RIPPLE_QUIET.as_millis()
                 );
 
-                let reindex_completed = self.ripple_without_queuing(owed).await;
+                let ripple_opt = profile_cycle.then_some(&mut ripple_timings);
+                let reindex_completed = self.ripple_without_queuing(owed, ripple_opt).await;
 
                 {
                     let mut reindexing = self.reindexing_files.lock().await;
@@ -625,6 +946,21 @@ impl DebouncedAnalysis {
                 burst_started_at = None;
 
                 self.reindex_notify.notify_waiters();
+                if let Some(cycle) = cycle_id {
+                    use crate::util::ls_profile::{HandoffOutcome, QuietOutcome};
+                    crate::util::ls_profile::emit_ls_reindex(
+                        cycle,
+                        debounce_elapsed,
+                        self_timings.wait,
+                        self_timings.hold,
+                        handoff_timing.wait,
+                        handoff_timing.outcome.unwrap_or(HandoffOutcome::Idle),
+                        quiet_timing.wait,
+                        quiet_timing.outcome.unwrap_or(QuietOutcome::Timer),
+                        ripple_timings.wait,
+                        ripple_timings.hold,
+                    );
+                }
                 if !reindex_completed {
                     // Only shutdown stops the loop; a panicked reindex must
                     // fall through so `refresh_dirty_state()` releases waiters.
@@ -881,7 +1217,7 @@ mod tests {
 
             let run_the_ripple = tokio::time::timeout(
                 Duration::from_millis(500),
-                debounced_analysis.ripple_quiet_elapsed(Instant::now()),
+                debounced_analysis.ripple_quiet_elapsed(Instant::now(), None),
             )
             .await
             .expect("an edit should send the ripple back well inside the quiet window");
@@ -906,7 +1242,7 @@ mod tests {
 
             let run_the_ripple = tokio::time::timeout(
                 Duration::from_millis(100),
-                debounced_analysis.ripple_quiet_elapsed(started_at),
+                debounced_analysis.ripple_quiet_elapsed(started_at, None),
             )
             .await
             .expect("the cap should release the ripple immediately");
@@ -927,7 +1263,7 @@ mod tests {
             // Nothing outstanding: the ripple must not pay the grace.
             tokio::time::timeout(
                 Duration::from_millis(50),
-                debounced_analysis.await_reader_handoff(),
+                debounced_analysis.await_reader_handoff(None),
             )
             .await
             .expect("no readers should let the ripple straight through");
@@ -935,7 +1271,7 @@ mod tests {
             let handoff = debounced_analysis.begin_reader_handoff();
             let held = tokio::time::timeout(
                 Duration::from_millis(50),
-                debounced_analysis.await_reader_handoff(),
+                debounced_analysis.await_reader_handoff(None),
             )
             .await;
             verify_that!(held.is_err(), eq(true))?;
@@ -943,7 +1279,7 @@ mod tests {
             drop(handoff);
             tokio::time::timeout(
                 Duration::from_millis(250),
-                debounced_analysis.await_reader_handoff(),
+                debounced_analysis.await_reader_handoff(None),
             )
             .await
             .expect("dropping the last handoff should release the ripple");
@@ -961,7 +1297,7 @@ mod tests {
             let _never_dropped = debounced_analysis.begin_reader_handoff();
 
             let started_at = Instant::now();
-            debounced_analysis.await_reader_handoff().await;
+            debounced_analysis.await_reader_handoff(None).await;
 
             verify_that!(started_at.elapsed() >= READER_HANDOFF_GRACE, eq(true))?;
             verify_that!(started_at.elapsed() < READER_HANDOFF_GRACE * 4, eq(true))?;
@@ -1088,11 +1424,11 @@ mod tests {
                 test_lsp_features(),
             );
             let dirty = debounced_analysis
-                .self_index_without_queuing(vec![api_file_id])
+                .self_index_without_queuing(vec![api_file_id], None)
                 .await
                 .expect("self-index should complete");
             verify_that!(
-                debounced_analysis.ripple_without_queuing(dirty).await,
+                debounced_analysis.ripple_without_queuing(dirty, None).await,
                 eq(true)
             )?;
 

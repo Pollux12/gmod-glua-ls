@@ -32,6 +32,11 @@ pub async fn on_completion_handler(
     params: CompletionParams,
     cancel_token: CancellationToken,
 ) -> Option<CompletionResponse> {
+    // Profiling: the fresh-index dispatch arm scopes a request accumulator;
+    // this guard records `handler_ms` into it on every return path so the
+    // single `[profile] ls_request` line stays accurate. `analysis_read_wait`
+    // is recorded inside `read_analysis` via the same scope.
+    let _handler_timer = crate::util::ls_profile::HandlerTimer::scoped();
     if cancel_token.is_cancelled() {
         return None;
     }
