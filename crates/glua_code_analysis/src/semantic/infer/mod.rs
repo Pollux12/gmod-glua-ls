@@ -47,7 +47,7 @@ use rowan::TextRange;
 use smol_str::SmolStr;
 
 use crate::{
-    InFiled, InferGuard, LuaMemberKey, VariadicType,
+    InFiled, InferGuard, LuaMemberKey, VariadicType, analysis_stack_exhausted,
     db_index::{DbIndex, LuaOperator, LuaOperatorMetaMethod, LuaSignatureId, LuaType},
 };
 
@@ -97,6 +97,12 @@ pub fn infer_expr(db: &DbIndex, cache: &mut LuaInferCache, expr: LuaExpr) -> Inf
             .expr_cache
             .insert(key, CacheEntry::Cache(bind_type_cache.as_type().clone()));
         return Ok(bind_type_cache.as_type().clone());
+    }
+
+    // The reserve check sits below the cache fast paths: cache hits return
+    // without recursing, so they need no stack.
+    if analysis_stack_exhausted() {
+        return Err(InferFailReason::RecursiveInfer);
     }
 
     cache.expr_cache.insert(key, CacheEntry::Ready);

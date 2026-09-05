@@ -11,7 +11,7 @@ use crate::{
     parser_error::LuaParseError,
 };
 
-use super::ParseResult;
+use super::{ParseResult, parser_stack_exhausted};
 
 pub fn parse_chunk(p: &mut LuaParser) {
     let m = p.mark(LuaSyntaxKind::Block);
@@ -74,6 +74,13 @@ pub fn parse_chunk(p: &mut LuaParser) {
 }
 
 fn parse_block(p: &mut LuaParser) -> ParseResult {
+    if parser_stack_exhausted() {
+        p.push_error(LuaParseError::syntax_error_from(
+            "block is too deeply nested",
+            p.current_token_range(),
+        ));
+        return Err(ParseFailReason::UnexpectedToken);
+    }
     let m = p.mark(LuaSyntaxKind::Block);
 
     parse_stats(p);

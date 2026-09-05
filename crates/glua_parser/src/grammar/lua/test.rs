@@ -1224,4 +1224,121 @@ local y = 2
             );
         }
     }
+
+    // Regression test: deep call nesting must degrade to a parse error,
+    // never abort the process with a stack overflow.
+    #[test]
+    fn deeply_nested_calls_parse_to_error_not_abort() {
+        let depth = 3000;
+        let mut body = String::from("local function f(x) return x end\nlocal v = ");
+        for _ in 0..depth {
+            body.push_str("f(");
+        }
+        body.push('1');
+        for _ in 0..depth {
+            body.push(')');
+        }
+        body.push('\n');
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: `not` chains recurse through `parse_sub_expr` itself,
+    // bypassing any guard placed only on `parse_expr`. They must bail to
+    // errors (resuming chunk by chunk as the stack unwinds), never abort.
+    #[test]
+    fn deeply_nested_unary_exprs_parse_to_error_not_abort() {
+        let depth = 30000;
+        let mut body = String::from("local v = ");
+        for _ in 0..depth {
+            body.push_str("not ");
+        }
+        body.push_str("x\n");
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep unary nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: right-associative operators (`^`, `..`) recurse through
+    // `parse_sub_expr` for every level, bypassing any guard placed only on
+    // `parse_expr`. They must bail to errors, never abort.
+    #[test]
+    fn deeply_nested_right_assoc_chain_parses_to_error_not_abort() {
+        let depth = 20000;
+        let mut body = String::from("local v = 1");
+        for _ in 0..depth {
+            body.push_str("^1");
+        }
+        body.push('\n');
+        let tree = LuaParser::parse(&body, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep right-associative nesting must degrade to parse errors, not abort"
+        );
+    }
+
+    // Regression test: a stack-reserve bail consumes nothing, so when the
+    // innermost token is a statement start the recovery loop used to retry the
+    // same token at the same depth forever. `parse_stats` now breaks on
+    // no-progress instead. The watchdog turns a regression into a failure
+    // rather than a hung suite, and the tree is intentionally leaked: a
+    // guard-tripped block nest is deeper than a small stack can recursively
+    // drop, so the worker reports its assertions and forgets the tree instead
+    // of racing the next test with the drop.
+    #[test]
+    fn deeply_nested_blocks_with_statement_start_terminates() {
+        let depth = 3000;
+        let mut body = String::new();
+        for _ in 0..depth {
+            body.push_str("do ");
+        }
+        body.push('x');
+        for _ in 0..depth {
+            body.push_str(" end");
+        }
+        body.push('\n');
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let tree = LuaParser::parse(&body, ParserConfig::default());
+            let errors = tree.get_errors();
+            let report = (
+                errors.len(),
+                errors
+                    .iter()
+                    .any(|error| error.message.contains("too deeply nested")),
+            );
+            std::mem::forget(tree);
+            let _ = tx.send(report);
+        });
+        let (error_count, tripped) = rx
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("deeply nested blocks must terminate with errors, not hang");
+        worker.join().expect("worker must not overflow its stack");
+        assert!(
+            tripped,
+            "{depth}-deep blocks must trip the stack reserve guard"
+        );
+        assert!(
+            error_count > 0,
+            "{depth}-deep blocks must degrade to parse errors"
+        );
+    }
+
+    // A failed statement that consumes nothing while sitting on a statement
+    // start must not spin `parse_stats` forever, even far from any stack
+    // limit: recovery without progress breaks out and lets `parse_chunk`
+    // consume the token.
+    #[test]
+    fn statement_start_without_progress_terminates() {
+        let tree = LuaParser::parse("foo bar", ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "unconsumed statement start must degrade to parse errors, not hang"
+        );
+    }
 }

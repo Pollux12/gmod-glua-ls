@@ -3545,4 +3545,44 @@ Syntax(Chunk)@0..60
 
         assert_ast_eq!(code, result);
     }
+
+    // Regression test: deeply nested doc generics must degrade to a doc
+    // error, never abort the process with a stack overflow (see the Lua-side
+    // `deeply_nested_calls_parse_to_error_not_abort`).
+    #[test]
+    fn deeply_nested_doc_generics_parse_to_error_not_abort() {
+        let depth = 3000;
+        let mut code = String::from("---@param x ");
+        for _ in 0..depth {
+            code.push_str("A<");
+        }
+        code.push('T');
+        for _ in 0..depth {
+            code.push('>');
+        }
+        code.push('\n');
+        let tree = LuaParser::parse(&code, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep doc nesting must degrade to errors, not abort"
+        );
+    }
+
+    // Regression test: `-` chains recurse through `parse_sub_type` itself,
+    // bypassing any guard placed only on `parse_type`. They must bail to a
+    // doc error, never abort the process.
+    #[test]
+    fn deeply_nested_doc_unary_types_parse_to_error_not_abort() {
+        let depth = 60000;
+        let mut code = String::from("---@param x ");
+        for _ in 0..depth {
+            code.push_str("- ");
+        }
+        code.push_str("1\n");
+        let tree = LuaParser::parse(&code, ParserConfig::default());
+        assert!(
+            !tree.get_errors().is_empty(),
+            "{depth}-deep doc unary nesting must degrade to errors, not abort"
+        );
+    }
 }

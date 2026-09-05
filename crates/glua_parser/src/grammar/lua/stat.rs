@@ -161,6 +161,7 @@ fn parse_variable_name_list(p: &mut LuaParser, support_attrib: bool) -> ParseRes
 pub fn parse_stats(p: &mut LuaParser) {
     while !block_follow(p) {
         let level = p.get_mark_level();
+        let token_index = p.current_token_index();
         match parse_stat(p) {
             Ok(_) => {}
             Err(_) => {
@@ -184,7 +185,11 @@ pub fn parse_stats(p: &mut LuaParser) {
                     p.bump();
                 }
 
-                if can_continue {
+                // A failed statement that consumed nothing (a stack-reserve
+                // bail, or malformed input sitting on a statement start)
+                // would otherwise retry the same token forever: only continue
+                // when recovery advanced past the failure.
+                if can_continue && p.current_token_index() != token_index {
                     continue;
                 }
                 break;
