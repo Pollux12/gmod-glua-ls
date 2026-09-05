@@ -235,7 +235,7 @@ pub fn infer_binary_expr_or(db: &DbIndex, left: LuaType, right: LuaType) -> Infe
 /// it feeds, e.g. `X.a[k] = X.a[k] or {}`. Name targets are excluded: for a local or
 /// parameter `x = x or {}` is a narrowing idiom over a declared type rather than a
 /// definition of the table, and unresolved globals are already handled below.
-fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
+pub(crate) fn is_self_referential_bootstrap(left_expr: &LuaExpr) -> bool {
     if !matches!(left_expr, LuaExpr::NameExpr(_) | LuaExpr::IndexExpr(_)) {
         return false;
     }
