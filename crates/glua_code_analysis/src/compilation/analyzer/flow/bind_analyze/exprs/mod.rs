@@ -6,7 +6,7 @@ use glua_parser::{
 };
 
 use crate::{
-    FlowId, FlowNodeKind,
+    FlowId, FlowNodeKind, analysis_stack_exhausted,
     compilation::analyzer::flow::{
         bind_analyze::{bind_each_child, exprs::bind_binary_expr::is_binary_logical},
         binder::FlowBinder,
@@ -21,6 +21,11 @@ pub fn bind_condition_expr(
     true_target: FlowId,
     false_target: FlowId,
 ) {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted. Must precede all binder state saves/mutations.
+    if analysis_stack_exhausted() {
+        return;
+    }
     let old_true_target = binder.true_target;
     let old_false_target = binder.false_target;
 
@@ -48,6 +53,11 @@ pub fn bind_condition_expr(
 }
 
 pub fn bind_expr(binder: &mut FlowBinder, expr: LuaExpr, current: FlowId) -> FlowId {
+    // Crash-safety guard (not a budget): skip the subtree when the stack
+    // reserve is exhausted. No flow nodes means conservative un-narrowed reads.
+    if analysis_stack_exhausted() {
+        return current;
+    }
     match expr {
         LuaExpr::NameExpr(name_expr) => bind_name_expr(binder, name_expr, current),
         LuaExpr::CallExpr(call_expr) => bind_call_expr(binder, call_expr, current),
